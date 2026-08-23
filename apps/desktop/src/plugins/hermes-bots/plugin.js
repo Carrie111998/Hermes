@@ -2192,8 +2192,7 @@ async function duplicateBot(bot, roster) {
 
   await requestForBot(bot, 'profiles.create', {
     name,
-    clone_from: base,
-    description: bot.description || ''
+    clone_from: base
   })
 
   // Same look: avatar shape/color/image and a "(copy)" title so the two
@@ -7206,6 +7205,27 @@ function composeSoul({ name, title, description, roster, customSoul }) {
   return serverInjectsProtocol ? identity : identity + '\n\n' + messagingProtocolSection(name, roster)
 }
 
+/** A Bot mission belongs only in SOUL.md. Generic profile descriptions are
+ * kanban routing metadata, not a second copy of the Bot's responsibilities. */
+function buildBotProfileCreateParams({ name, cloneFrom, noSkills, shareAuth, soul, model = '', provider = '' }) {
+  const payload = {
+    name,
+    clone_from: cloneFrom,
+    no_skills: Boolean(noSkills),
+    share_auth: Boolean(shareAuth),
+    soul
+  }
+  const normalizedModel = model.trim()
+  const normalizedProvider = provider.trim()
+
+  if (normalizedModel && normalizedProvider) {
+    payload.model = normalizedModel
+    payload.provider = normalizedProvider
+  }
+
+  return payload
+}
+
 // ── human-readable row helpers ───────────────────────────────────────────────
 
 /** Bot-to-bot delivery prefix (see messagingProtocolSection): either the
@@ -8526,7 +8546,6 @@ function EditProfileDialog({ bot, open, onClose }) {
   const [color, setColor] = useState(appearance.color)
   const [image, setImage] = useState(appearance.image)
   const [title, setTitle] = useState(meta?.title || '')
-  const [description, setDescription] = useState(bot?.description || '')
   const [busy, setBusy] = useState(false)
   const [advanced, setAdvanced] = useState(false)
   const [adv, setAdv] = useState(emptyAdvancedState())
@@ -8541,7 +8560,6 @@ function EditProfileDialog({ bot, open, onClose }) {
       setColor(appearance.color)
       setImage(appearance.image)
       setTitle(meta?.title || '')
-      setDescription(bot.description || '')
       setBusy(false)
       setAdvanced(false)
       setAdv(emptyAdvancedState())
@@ -8579,18 +8597,6 @@ function EditProfileDialog({ bot, open, onClose }) {
       queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
     }
 
-    const desc = description.trim()
-    if (desc !== (bot.description || '').trim()) {
-      try {
-        await requestForBot(bot, 'cli.exec', {
-          argv: ['profile', 'describe', bot.name, '--text', desc]
-        })
-        queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
-      } catch (err) {
-        host.notifyError(err, 'Saved look locally; description update failed')
-      }
-    }
-
     if (adv.loaded && (adv.dirtyModel || adv.dirtySoul || adv.dirtySkills || adv.dirtyToolsets || adv.dirtyMcp)) {
       try {
         const res = await applyAdvancedConfig(bot, adv)
@@ -8626,7 +8632,7 @@ function EditProfileDialog({ bot, open, onClose }) {
         jsxs(DialogHeader, {
           children: [
             jsx(DialogTitle, { children: 'Edit Profile' }),
-            jsx(DialogDescription, { children: `Appearance and role for ${displayName(bot, null)} (${bot.name}).` })
+            jsx(DialogDescription, { children: `Appearance and identity for ${displayName(bot, null)} (${bot.name}).` })
           ]
         }),
         jsxs('div', {
@@ -8643,7 +8649,7 @@ function EditProfileDialog({ bot, open, onClose }) {
               onShape: setShape,
               onColor: setColor,
               onImage: setImage,
-              generateSeed: { name: bot.name, title, description }
+              generateSeed: { name: bot.name, title }
             }),
             labeled(
               'Title',
@@ -8651,15 +8657,6 @@ function EditProfileDialog({ bot, open, onClose }) {
                 placeholder: displayName(bot, null),
                 value: title,
                 onChange: event => setTitle(event.target.value)
-              })
-            ),
-            labeled(
-              'Description',
-              jsx(Textarea, {
-                className: 'min-h-16',
-                placeholder: 'What should this agent help with?',
-                value: description,
-                onChange: event => setDescription(event.target.value)
               })
             ),
             jsxs('button', {
@@ -8705,7 +8702,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
   // createdRef must stay a slug string for its sibling consumers.
   const flightRef = useRef(null)
   const [title, setTitle] = useState('')
-  const [description, setDescription] = useState('')
+  const [mission, setMission] = useState('')
   // Default shapes mode: deterministic blob face drawn from the agent's name
   // (falls back to the legacy shape vocabulary on older SDKs).
   const [shape, setShape] = useState(blobatarSvg ? 'blobatar' : 'circle')
@@ -8807,7 +8804,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const reset = () => {
     setName('')
     setTitle('')
-    setDescription('')
+    setMission('')
     setShape(blobatarSvg ? 'blobatar' : 'circle')
     setColor(AVATAR_COLORS[3])
     setImage(null)
@@ -8906,24 +8903,22 @@ function CreateAgentDialog({ open, onClose, roster }) {
         return null
       }
 
-      const descriptionText = [title, description].filter(Boolean).join(' — ')
-
-      await requestForTarget('profiles.create', {
+      await requestForTarget('profiles.create', buildBotProfileCreateParams({
         name: slug,
-        description: descriptionText,
         // Clone sources are profiles of the TARGET backend. The picker's
         // roster is the local one, so a remote create always starts from the
         // remote machine's default (or fresh) — never a local profile name
         // the remote box doesn't have.
-        clone_from: cloneFrom === '__none__' ? null : remoteTarget ? 'default' : cloneFrom,
-        no_skills: noSkills,
+        cloneFrom: cloneFrom === '__none__' ? null : remoteTarget ? 'default' : cloneFrom,
+        noSkills,
         // Shared (not copied) auth keeps ONE OAuth/token pool with the main
         // profile, so refreshes can't invalidate each other. Older gateways
         // ignore the param and copy — still functional, just forked.
-        share_auth: shareAuth,
-        soul: composeSoul({ name: slug, title, description, roster, customSoul: soul }),
-        ...(model.trim() && provider.trim() ? { model: model.trim(), provider: provider.trim() } : {})
-      })
+        shareAuth,
+        soul: composeSoul({ name: slug, title, description: mission, roster, customSoul: soul }),
+        model,
+        provider
+      }))
 
       createdRef.current = slug
 
@@ -9082,7 +9077,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
               onShape: setShape,
               onColor: setColor,
               onImage: setImage,
-              generateSeed: { name: slug || 'agent', title, description }
+              generateSeed: { name: slug || 'agent', title, description: mission }
             }),
             labeled(
               'Name',
@@ -9158,12 +9153,12 @@ function CreateAgentDialog({ open, onClose, roster }) {
               })
             ),
             labeled(
-              'Description',
+              'Mission',
               jsx(Textarea, {
                 className: 'min-h-16',
-                placeholder: 'What should this Bot help with?',
-                value: description,
-                onChange: event => setDescription(event.target.value)
+                placeholder: 'What should this Bot help with? This seeds SOUL.md.',
+                value: mission,
+                onChange: event => setMission(event.target.value)
               })
             ),
             jsxs('button', {

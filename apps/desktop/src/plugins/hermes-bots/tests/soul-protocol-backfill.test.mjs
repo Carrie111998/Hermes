@@ -12,7 +12,7 @@ function loadSoulHelpers({ serverInjects = false } = {}) {
   assert.notEqual(end, -1, 'soul-helper section delimiter is missing')
   const context = { serverInjectsProtocol: serverInjects }
   vm.runInNewContext(
-    `${source.slice(start, end)}\nObject.assign(globalThis, { botHandle, hasMessagingProtocol, ensureMessagingProtocol, composeSoul, messagingProtocolSection })`,
+    `${source.slice(start, end)}\nObject.assign(globalThis, { botHandle, hasMessagingProtocol, ensureMessagingProtocol, composeSoul, buildBotProfileCreateParams, messagingProtocolSection })`,
     context
   )
   return context
@@ -66,12 +66,37 @@ test('composeSoul does not double-append when custom SOUL already has the protoc
     roster,
     customSoul: ''
   })
+  assert.match(withProtocol, /\*\*Mission:\*\* literature review/)
   const cloned = composeSoul({
     name: 'researcher',
     roster,
     customSoul: withProtocol
   })
   assert.equal(cloned.split('## Messaging other agents').length, 2)
+})
+
+test('bot creation keeps its mission in SOUL without duplicating profile description', () => {
+  const { buildBotProfileCreateParams } = loadSoulHelpers()
+  const params = buildBotProfileCreateParams({
+    name: 'researcher',
+    cloneFrom: 'default',
+    noSkills: false,
+    shareAuth: true,
+    soul: '# Researcher\n\n**Mission:** Review papers',
+    model: '  model-id  ',
+    provider: '  provider-id  '
+  })
+
+  assert.deepEqual({ ...params }, {
+    name: 'researcher',
+    clone_from: 'default',
+    no_skills: false,
+    share_auth: true,
+    soul: '# Researcher\n\n**Mission:** Review papers',
+    model: 'model-id',
+    provider: 'provider-id'
+  })
+  assert.equal('description' in params, false)
 })
 
 test('backfill is one-shot: describe-only when protocol exists, configure when missing', async () => {
