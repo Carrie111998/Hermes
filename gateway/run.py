@@ -45,7 +45,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Optional, Any, List, Set, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -6880,6 +6880,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (agent_id, Platform) -> reconnect task guard (mirrors
         # _profile_failed_platforms for multiplexed profiles).
         self._agent_failed_platforms: Dict[tuple, asyncio.Task] = {}
+        # (agent_id, Platform) slots whose STARTUP connect failed before
+        # self._running flipped true. _schedule_agent_adapter_reconnect
+        # refuses to spawn tasks pre-running (shutdown safety), so these
+        # are parked here and flushed right after self._running = True —
+        # otherwise a relay that is down at boot strands its agents until
+        # a manual gateway restart even though the same outage mid-run
+        # would recover automatically.
+        self._agent_pending_startup_reconnects: Set[tuple] = set()
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -13289,6 +13297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
+        self._flush_pending_startup_reconnects()
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
@@ -16058,11 +16067,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter.fatal_error_retryable:
             self._schedule_agent_adapter_reconnect(agent_id, platform)
 
+    def _flush_pending_startup_reconnects(self) -> None:
+        """Schedule reconnects parked by pre-``_running`` startup failures.
+
+        Called by ``start()`` immediately after ``self._running = True`` —
+        the per-agent adapters connect before the running flag flips, so a
+        relay that is down at boot parks its agents here instead of
+        stranding them until a manual restart (the same outage mid-run
+        already recovers via the fatal-error handler).
+
+        ``getattr``: runners are routinely constructed without ``__init__``
+        (``object.__new__`` in tests — see the AGENTS.md pitfall), so the
+        pending set may not exist. No pending set means nothing was parked.
+        """
+        pending = getattr(self, "_agent_pending_startup_reconnects", None)
+        if not pending:
+            return
+        for _agent_id, _platform in sorted(
+            pending, key=lambda k: (k[0], k[1].value),
+        ):
+            self._schedule_agent_adapter_reconnect(_agent_id, _platform)
+        pending.clear()
+
     def _schedule_agent_adapter_reconnect(
         self, agent_id: str, platform: Platform
     ) -> None:
-        """Schedule one reconnect task per (agent, platform) slot."""
+        """Schedule one reconnect task per (agent, platform) slot.
+
+        Pre-``_running`` calls (startup connect failures — the per-agent
+        adapters connect before the gateway flips running) are parked in
+        ``_agent_pending_startup_reconnects`` and flushed by ``start()``
+        right after ``self._running = True``; spawning the backoff task
+        early would race the running flag and exit without retrying.
+        """
         if not self._running:
+            # setdefault via getattr: partial-init runners (object.__new__
+            # in tests) may lack the set — create it on first park.
+            pending = getattr(self, "_agent_pending_startup_reconnects", None)
+            if pending is None:
+                pending = set()
+                self._agent_pending_startup_reconnects = pending
+            pending.add((agent_id, platform))
+            logger.info(
+                "%s startup connect failed (agent: %s) — reconnect deferred "
+                "until the gateway is running",
+                platform.value, agent_id,
+            )
             return
         key = (agent_id, platform)
         existing = self._agent_failed_platforms.get(key)

@@ -744,3 +744,51 @@ class TestRunnerAgentAdapterLifecycle:
         assert fake._connect_adapter_with_timeout.await_args.kwargs.get(
             "is_reconnect"
         ) is True
+
+    @pytest.mark.asyncio
+    async def test_startup_connect_failure_parks_then_flushes_reconnect(
+        self, tmp_path, monkeypatch, _env_gated_buzz_registry
+    ):
+        """A relay that is down at BOOT must not strand the agent. The
+        per-agent adapters connect before ``self._running`` flips true, so
+        the scheduler used to drop the reconnect on its running-flag guard
+        — startup failures were manual-restart-only (found in production:
+        Docker/relay outage at boot stranded all 11 identities). Now the
+        failure is parked and the ``start()`` flush schedules it."""
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("CHIP_TEST_NSEC", "nsec1chipkey")
+        fake = _fake_runner(tmp_path)
+        fake._running = False  # startup: the flag has not flipped yet
+        fake._agent_pending_startup_reconnects = set()
+        fake._background_tasks = set()
+        # Real scheduler + flush (the shared fake mocks the scheduler out).
+        fake._schedule_agent_adapter_reconnect = (
+            lambda aid, plat: GatewayRunner._schedule_agent_adapter_reconnect(
+                fake, aid, plat
+            )
+        )
+        fake._flush_pending_startup_reconnects = (
+            lambda: GatewayRunner._flush_pending_startup_reconnects(fake)
+        )
+        fake._run_agent_adapter_reconnect = AsyncMock()
+        fake._connect_initial_adapter_with_timeout = AsyncMock(return_value=False)
+
+        platform = Platform("buzz")
+        assert await GatewayRunner._start_agent_platform_adapters(fake) == 0
+
+        # Parked, not scheduled: no backoff task may spawn pre-running.
+        assert ("chip", platform) in fake._agent_pending_startup_reconnects
+        assert fake._agent_failed_platforms == {}
+        fake._run_agent_adapter_reconnect.assert_not_called()
+
+        # start() flips the flag then flushes — reproduce that sequence.
+        fake._running = True
+        fake._flush_pending_startup_reconnects()
+
+        assert fake._agent_pending_startup_reconnects == set()
+        task = fake._agent_failed_platforms[("chip", platform)]
+        await task
+        fake._run_agent_adapter_reconnect.assert_called_once_with("chip", platform)
+        # Done-callback hygiene: the finished task released its slot guard.
+        assert ("chip", platform) not in fake._agent_failed_platforms
