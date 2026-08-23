@@ -107,7 +107,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base=530028c213ae9eed5d7f1a826451e0edf24a11d2
+          base=7a54ab22e648a0d2d7e740fad908dda93f025820
           implementation=db32f7bb0864f5944c6ed9f505d0b979bedc8f2f
           git fetch --no-tags --depth=1 https://github.com/NousResearch/hermes-agent.git "$base"
           git switch --detach "$base"
@@ -172,13 +172,13 @@ jobs:
           git config user.email "andrexibiza@gmail.com"
           git commit \
             -m "fix(desktop): make Windows package replacement fully transactional (#91079)" \
-            -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire the temporary materializer, and recompose the package transaction on exact upstream main 530028c213ae9eed5d7f1a826451e0edf24a11d2. Preserve current-main package-script changes while binding build, test, and beforePack authority to the recovery implementation."
+            -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire the temporary materializer, and recompose the package transaction on exact upstream main 7a54ab22e648a0d2d7e740fad908dda93f025820. Preserve current-main package-script changes while binding build, test, and beforePack authority to the recovery implementation."
 
       - name: Verify and publish canonical branch tree
         shell: bash
         run: |
           set -euo pipefail
-          base=530028c213ae9eed5d7f1a826451e0edf24a11d2
+          base=7a54ab22e648a0d2d7e740fad908dda93f025820
           branch=fix/windows-desktop-pack-transaction
           test "$(git rev-parse HEAD^)" = "$base"
           test "$(git rev-list --count "$base"..HEAD)" = "1"
