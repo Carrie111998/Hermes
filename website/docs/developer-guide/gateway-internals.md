@@ -131,6 +131,32 @@ if _quick_key in self._running_agents:
 
 Bypass commands (`/stop`, `/new`, `/approve`, `/deny`, `/queue`, `/status`) have special handling.
 
+### Per-Session Runtime Options
+
+`/model`, `/reasoning`, `/fast` and the structured host API
+`GatewayRunner.apply_session_options(source, options)` (`gateway/session_options.py`)
+all change the same per-session triple — model override, reasoning override,
+service tier — and share two primitives:
+
+- **`commit_session_runtime_options()`** — the single durable-first write-through.
+  The complete snapshot is persisted via `AsyncSessionStore.set_runtime_options`
+  first; live `SessionState` is assigned only after the save succeeds; a failed
+  save raises with live state untouched, so a slash command fails explicitly
+  instead of replying "set" while disk disagrees. Persisted: model override
+  (credentials stripped — the API key is re-resolved from live config on
+  rehydrate), reasoning override, service tier. Never persisted: `/model --once`
+  and the `/moa` one-shot (live-only by contract).
+- **`session_admission_lock(runner, key)`** — one `asyncio.Lock` per session key.
+  `_handle_message` holds it across its synchronous idle→running claim (uncontended
+  acquire never yields, so the "claim before any await" rule still holds); every
+  slash write-through and the API's commit section hold it across busy-check →
+  persist → live mutation. A turn therefore cannot be admitted between the API
+  observing "idle" and its commit landing. The lock is not re-entrant.
+
+The API validates (model resolution may hit the network) outside the lock and
+re-reads the live triple under it; if a user slash command changed the triple in
+between it returns `rejected` / `conflict` — later user commands stay authoritative.
+
 ## Config Sources
 
 The gateway reads configuration from multiple sources:

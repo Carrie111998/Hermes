@@ -159,3 +159,35 @@ async def test_session_missing_when_entry_vanishes_between_create_and_persist(
     result = await runner.apply_session_options(source, {"reasoning_effort": "high"})
     assert (result["status"], result["code"]) == ("rejected", "session_missing")
     assert runner._session_state(key).conversation.reasoning_override is None
+
+
+# --- multiplex: the API runs the same fail-closed profile-routing gate -------
+# as the inbound message path (#92185 "normal routing path").
+
+
+@pytest.mark.asyncio
+async def test_explicitly_rejected_profile_route_is_refused(store):
+    runner = _make_runner(store)
+    source = _make_source()
+    source.profile_route_rejected = True
+    result = await runner.apply_session_options(source, {"reasoning_effort": "high"})
+    assert (result["status"], result["code"]) == ("rejected", "invalid_session")
+    assert store.list_sessions() == []
+
+
+@pytest.mark.asyncio
+async def test_unstamped_source_is_routed_and_refused_when_route_targets_unserved_profile(store):
+    from gateway.profile_routing import ProfileRouteRejected
+
+    runner = _make_runner(store)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+
+    def _route(_source):
+        raise ProfileRouteRejected("unserved")
+
+    runner._profile_name_for_source = _route
+    source = _make_source()
+    result = await runner.apply_session_options(source, {"reasoning_effort": "high"})
+    assert (result["status"], result["code"]) == ("rejected", "invalid_session")
+    assert source.profile_route_rejected is True
+    assert store.list_sessions() == []

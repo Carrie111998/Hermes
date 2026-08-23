@@ -2832,7 +2832,7 @@ class SessionStore:
 
     def _heal_compression_tip_locked(
         self,
-        entry: "SessionEntry",
+        entry: SessionEntry,
         original_session_id: Optional[str],
         canonical_session_id: Optional[str],
     ) -> bool:
@@ -3394,17 +3394,23 @@ class SessionStore:
     def set_reasoning_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
     ) -> None:
-        """Persist or clear the sanitized session-scoped /reasoning override."""
+        """Persist or clear the sanitized session-scoped /reasoning override.
+
+        Single-field convenience over :meth:`set_runtime_options`: the model
+        and service-tier snapshot are carried through unchanged and the
+        write gets the same rollback-on-failed-save guarantee.
+        """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return
-            cleaned = sanitize_reasoning_override(override)
-            if entry.reasoning_override == cleaned:
-                return
-            entry.reasoning_override = cleaned
-            self._save()
+            self._set_runtime_options_locked(
+                entry,
+                model_override=entry.model_override,
+                reasoning_override=override,
+                service_tier_override=entry.service_tier_override,
+            )
 
     def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the persisted /reasoning override for *session_key*."""
@@ -3436,32 +3442,48 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
-            cleaned_model = sanitize_model_override(model_override)
-            cleaned_reasoning = sanitize_reasoning_override(reasoning_override)
-            changed = (
-                entry.model_override != cleaned_model
-                or entry.reasoning_override != cleaned_reasoning
-                or entry.service_tier_override != service_tier_override
+            self._set_runtime_options_locked(
+                entry,
+                model_override=model_override,
+                reasoning_override=reasoning_override,
+                service_tier_override=service_tier_override,
             )
-            if not changed:
-                return True
-            previous_model = entry.model_override
-            previous_reasoning = entry.reasoning_override
-            previous_tier = entry.service_tier_override
-            entry.model_override = cleaned_model
-            entry.reasoning_override = cleaned_reasoning
-            entry.service_tier_override = service_tier_override
-            try:
-                self._save()
-            except Exception:
-                # Keep the in-memory store transactional with the durable
-                # write. A failed save must not leave this process using a
-                # configuration that a restart would silently discard.
-                entry.model_override = previous_model
-                entry.reasoning_override = previous_reasoning
-                entry.service_tier_override = previous_tier
-                raise
             return True
+
+    def _set_runtime_options_locked(
+        self,
+        entry: SessionEntry,
+        *,
+        model_override: Optional[Dict[str, Any]],
+        reasoning_override: Optional[Dict[str, Any]],
+        service_tier_override: Optional[str],
+    ) -> None:
+        """Write the sanitized triple onto *entry* and save; caller holds the lock."""
+        cleaned_model = sanitize_model_override(model_override)
+        cleaned_reasoning = sanitize_reasoning_override(reasoning_override)
+        changed = (
+            entry.model_override != cleaned_model
+            or entry.reasoning_override != cleaned_reasoning
+            or entry.service_tier_override != service_tier_override
+        )
+        if not changed:
+            return
+        previous_model = entry.model_override
+        previous_reasoning = entry.reasoning_override
+        previous_tier = entry.service_tier_override
+        entry.model_override = cleaned_model
+        entry.reasoning_override = cleaned_reasoning
+        entry.service_tier_override = service_tier_override
+        try:
+            self._save()
+        except Exception:
+            # Keep the in-memory store transactional with the durable
+            # write. A failed save must not leave this process using a
+            # configuration that a restart would silently discard.
+            entry.model_override = previous_model
+            entry.reasoning_override = previous_reasoning
+            entry.service_tier_override = previous_tier
+            raise
 
     def get_runtime_options(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the durable host-selected options for ``session_key``."""

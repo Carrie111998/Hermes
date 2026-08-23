@@ -250,6 +250,28 @@ async def apply_gateway_session_options(
             "invalid_options", f"unknown session option(s): {', '.join(unknown)}"
         )
 
+    # Same fail-closed profile-routing gate as the inbound message path
+    # (GatewayRunner._handle_message): a source that was not stamped by
+    # adapter.build_source() is routed here, and one whose explicit route
+    # targets an unserved profile is refused rather than silently falling
+    # back to the active profile's session namespace.
+    if (
+        getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+        and not getattr(source, "profile", None)
+        and getattr(source, "profile_route_rejected", False) is not True
+    ):
+        from gateway.profile_routing import ProfileRouteRejected
+
+        try:
+            source.profile = runner._profile_name_for_source(source)
+        except ProfileRouteRejected:
+            source.profile_route_rejected = True
+    if getattr(source, "profile_route_rejected", False) is True:
+        return _rejected(
+            "invalid_session",
+            "session source's profile route targets an unserved profile",
+        )
+
     normalized_source = await asyncio.to_thread(
         runner._normalize_source_for_session_key, source
     )
