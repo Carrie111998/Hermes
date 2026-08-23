@@ -1,17 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as clarifyStore from '@/store/clarify'
+
 const { setClarifyRequestMock } = vi.hoisted(() => ({ setClarifyRequestMock: vi.fn() }))
 
 vi.mock('@/store/clarify', async importOriginal => {
-  const actual = await importOriginal<typeof import('@/store/clarify')>()
+  const actual = await importOriginal<typeof clarifyStore>()
 
   return {
     ...actual,
     setClarifyRequest: setClarifyRequestMock
   }
 })
-
-import type { SessionResumeResponse } from '@/types/hermes'
 
 import { restorePendingClarifyForTest } from './restore-pending-clarify'
 
