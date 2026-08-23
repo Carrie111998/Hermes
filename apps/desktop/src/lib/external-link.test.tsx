@@ -11,6 +11,7 @@ import {
   hostPathLabel,
   isTitleFetchable,
   LinkifiedText,
+  MarkdownLinkText,
   PrettyLink,
   urlSlugTitleLabel
 } from './external-link'
@@ -132,6 +133,21 @@ describe('external link helpers', () => {
 
     expect(openExternal).not.toHaveBeenCalled()
     await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
+  })
+
+  // A setup step sends you to a console you are signed into in your own
+  // browser, to fill in a form and copy a secret back. The in-app pane has
+  // none of that session and is the wrong destination even for web URLs.
+  it('sends a setup-step link straight to the OS browser', () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+
+    render(<MarkdownLinkText text="Enable the [Docs API](https://console.cloud.google.com/apis/library) first." />)
+
+    fireEvent.click(screen.getByRole('link', { name: 'Docs API' }))
+
+    expect(openExternal).toHaveBeenCalledWith('https://console.cloud.google.com/apis/library')
+    expect($previewTabs.get()).toHaveLength(0)
   })
 
   // A webview can't do anything useful with these, so they always hand off.
