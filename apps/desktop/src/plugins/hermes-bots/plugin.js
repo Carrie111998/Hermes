@@ -4104,6 +4104,30 @@ function PetTab({ image, onImage }) {
  *  Gates every SOUL.md protocol append below. */
 let serverInjectsProtocol = false
 
+/** Resolve the route that owns the gateway currently backing Bot Mode.
+ *  Multi-source requests must stay on that exact (connection, profile) pair;
+ *  older SDKs without route inventory keep using the active gateway door. */
+async function activeBotRoute() {
+  if (typeof host.profileRoutes !== 'function') {
+    return null
+  }
+
+  const profile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+  const connectionId = String(
+    host.state.connectionId?.get?.() ||
+    (typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : '') ||
+    'local'
+  ).trim() || 'local'
+  const routes = await host.profileRoutes()
+  const route = routes.find(candidate => candidate?.connectionId === connectionId && candidate?.profile === profile)
+
+  if (!route && typeof host.agents === 'function') {
+    throw new Error(`No route for active bot ${connectionId}::${profile}`)
+  }
+
+  return route || null
+}
+
 function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
 

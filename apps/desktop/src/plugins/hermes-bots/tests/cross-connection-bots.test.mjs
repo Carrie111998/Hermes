@@ -51,7 +51,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__x = { botConnectionRoute, scopedBotParams, botBackendProfileScope, requestForBot, groupMemberKey, parseGroupChatMentions, resolveGroupResponders, formatGroupChatLine, buildGroupChatTurnPrompt };\n'
+      '\nglobalThis.__x = { activeBotRoute, botConnectionRoute, scopedBotParams, botBackendProfileScope, requestForBot, groupMemberKey, parseGroupChatMentions, resolveGroupResponders, formatGroupChatLine, buildGroupChatTurnPrompt };\n'
     )
   vm.runInNewContext(code, context, { filename: 'plugin.js' })
   return context
@@ -100,6 +100,35 @@ test('requestForBot: source-scoped members go through requestProfile', async () 
   assert.equal(calls[2][0], 'routed')
   assert.equal(calls[2][1], 'mac-mini')
   assert.equal(calls[2][2], 'prompt.submit')
+})
+
+test('activeBotRoute: resolves the live source/profile pair and fails closed when it is missing', async () => {
+  const ctx = runtime()
+  const { activeBotRoute } = ctx.__x
+
+  ctx.host.profileRoutes = async () => [
+    { connectionId: 'local', mode: 'local', profile: 'default', targetProfile: 'default' },
+    { connectionId: 'work', mode: 'remote', profile: 'reviewer', targetProfile: 'backend-reviewer' }
+  ]
+  ctx.host.state.connectionId.get = () => 'work'
+  ctx.host.state.profile.get = () => 'reviewer'
+
+  assert.deepEqual(JSON.parse(JSON.stringify(await activeBotRoute())), {
+    connectionId: 'work',
+    mode: 'remote',
+    profile: 'reviewer',
+    targetProfile: 'backend-reviewer'
+  })
+
+  ctx.host.state.profile.get = () => 'missing'
+  ctx.host.agents = async () => ({ agents: [] })
+  await assert.rejects(activeBotRoute(), /No route for active bot work::missing/)
+})
+
+test('activeBotRoute: older SDKs keep the active-gateway fallback', async () => {
+  const ctx = runtime()
+
+  assert.equal(await ctx.__x.activeBotRoute(), null)
 })
 
 test('requestForBot: non-identity aliases translate every backend profile RPC shape', async () => {
