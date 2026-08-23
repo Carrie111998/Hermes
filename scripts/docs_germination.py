@@ -15,10 +15,11 @@ The germination model (graph-gated):
     (fences, link targets, code spans, anchors) with heading drift reported
     as roadmap debt, never silently.
 
-  * New languages germinate from the manifest below (top-10 global languages
-    by total speakers, Ethnologue 26th ed. order). The pipeline is:
-    extract (span inventory) -> translate (template) -> assemble (merge)
-    -> check (parity gate) -> ship.
+  * New languages germinate from the manifest below: the top 10 non-English
+    documentation locales by worldwide `All Users` (L1+L2), Ethnologue 200,
+    29th Edition (2026). English is the canonical source, not a translation
+    target. The pipeline is: extract (span inventory) -> translate (template)
+    -> assemble (merge) -> check (parity gate) -> ship.
 
 Pure stdlib. No network. No LLM calls in this file — it is the *gate*; the
 translation itself happens out-of-band (human or agent) and is verified here.
@@ -36,27 +37,41 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Manifest — the top-10 global languages (by total speakers, Ethnologue
-# 26th edition order). This is the roadmap: status is either "germinated"
-# (full parity gate), "manual" (existing translation, mechanical gate +
-# reported heading debt), or "pending" (roadmap; no file yet).
+# Manifest — the top 10 non-English documentation locales by worldwide usage,
+# Ethnologue 200, 29th Edition (2026), `All Users` (L1+L2). English is the
+# canonical source graph and is intentionally excluded from translation-target
+# counting. Status is either "germinated" (full parity gate), "manual"
+# (grandfathered existing translation, mechanical gate + reported heading
+# debt), or "pending" (claimed or unclaimed roadmap lane; no landed files yet).
 #
-# Provenance records who produced the seed translation — credit ledger.
+# Provenance records who produced or owns the implementation — credit ledger
+# and duplicate-work lock.
 # ─────────────────────────────────────────────────────────────────────────────
 
 ROOT_DOCS = ("README.md", "CONTRIBUTING.md", "SECURITY.md")
 
-TOP_10_LANGUAGES = (
-    "zh-CN",   # Mandarin Chinese (existing translation)
-    "hi",      # Hindi (issue #4763 in flight)
-    "es",      # Spanish (existing translation)
-    "fr",      # French (this campaign; seed by iacker via #63660)
-    "ar",      # Modern Standard Arabic
-    "bn",      # Bengali (PR #51306 in flight)
-    "pt",      # Portuguese
-    "ru",      # Russian (PR #69658 in flight)
-    "ur-pk",   # Urdu (existing translation)
-    "id",      # Indonesian (next in line after the top-10)
+TARGET_LOCALE_CONTRACT = {
+    "version": "ethnologue-200-29e-2026-all-users-top-10-non-english",
+    "scope": "top 10 non-English documentation locales",
+    "source": "Ethnologue 200",
+    "edition": 29,
+    "year": 2026,
+    "metric": "All Users",
+    "speaker_basis": "L1+L2",
+    "canonical_source_locale": "en",
+}
+
+TARGET_LOCALES = (
+    "zh-CN",   # Mandarin Chinese (global #2; existing translation)
+    "hi",      # Hindi (global #3; issue #4763 in flight)
+    "es",      # Spanish (global #4; existing translation)
+    "ar",      # Modern Standard Arabic (global #5)
+    "fr",      # French (global #6; seed by iacker via #63660)
+    "bn",      # Bengali (global #7; PR #51306 in flight)
+    "pt",      # Portuguese (global #8)
+    "id",      # Indonesian (global #9; claimed by #92191 / #92192)
+    "ur-pk",   # Urdu (global #10; existing translation)
+    "ru",      # Russian (global #11; tenth non-English target)
 )
 
 MANIFEST = {
@@ -87,15 +102,6 @@ MANIFEST = {
         "provenance": "existing in-tree translation",
         "notes": "legacy; CONTRIBUTING.es.md lags English (602 vs 1009 lines)",
     },
-    "fr": {
-        "name": "French",
-        "native": "Français",
-        "badge": "Français",
-        "color": "blue",
-        "status": "germinated",
-        "provenance": "seed: iacker (#63660), cherry-picked with authorship; refreshed against current main by the germination pipeline",
-        "notes": "full parity gate",
-    },
     "ar": {
         "name": "Arabic",
         "native": "العربية",
@@ -104,6 +110,15 @@ MANIFEST = {
         "status": "pending",
         "provenance": "—",
         "notes": "RTL layout review required when germinating",
+    },
+    "fr": {
+        "name": "French",
+        "native": "Français",
+        "badge": "Français",
+        "color": "blue",
+        "status": "germinated",
+        "provenance": "seed: iacker (#63660), cherry-picked with authorship; refreshed against current main by the germination pipeline",
+        "notes": "full parity gate",
     },
     "bn": {
         "name": "Bengali",
@@ -123,14 +138,14 @@ MANIFEST = {
         "provenance": "—",
         "notes": "",
     },
-    "ru": {
-        "name": "Russian",
-        "native": "Русский",
-        "badge": "Русский",
-        "color": "purple",
+    "id": {
+        "name": "Indonesian",
+        "native": "Bahasa Indonesia",
+        "badge": "Bahasa",
+        "color": "blue",
         "status": "pending",
-        "provenance": "—",
-        "notes": "PR #69658 (README.ru.md) in flight — interlocked",
+        "provenance": "claimed implementation: issue #92191 / PR #92192",
+        "notes": "full README/CONTRIBUTING/SECURITY trio; gate-first interlock",
     },
     "ur-pk": {
         "name": "Urdu",
@@ -141,14 +156,14 @@ MANIFEST = {
         "provenance": "existing in-tree translation",
         "notes": "RTL layout; legacy heading parity debt reported, not gating",
     },
-    "id": {
-        "name": "Indonesian",
-        "native": "Bahasa Indonesia",
-        "badge": "Bahasa",
-        "color": "blue",
+    "ru": {
+        "name": "Russian",
+        "native": "Русский",
+        "badge": "Русский",
+        "color": "purple",
         "status": "pending",
         "provenance": "—",
-        "notes": "11th by speakers — next in line",
+        "notes": "PR #69658 in flight; retained because English is canonical source, not a target locale",
     },
 }
 
@@ -724,6 +739,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             out = {
                 "root_docs": list(ROOT_DOCS),
+                "target_locale_contract": TARGET_LOCALE_CONTRACT,
+                "target_locales": list(TARGET_LOCALES),
                 "languages": [
                     {"code": c, **{k: v for k, v in m.items() if k != "notes"}}
                     for c, m in MANIFEST.items()
