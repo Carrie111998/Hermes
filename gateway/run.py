@@ -108,6 +108,13 @@ _USER_BOUNDARY_END_REASONS = (
     "session_switch",
     "new_session",
 )
+# Upper bound on the ``model_config._delegate_from`` chain walked by
+# _resolve_async_delegation_session when canonicalizing a delegate child to its
+# human-facing gateway parent (#92611). Real nesting is bounded far lower by
+# delegation.max_spawn_depth (default 2); this only stops a corrupt chain from
+# turning one completion event into an unbounded run of sequential session
+# reads. Exceeding it is fail-closed, like every other unresolved provenance.
+_MAX_DELEGATE_PROVENANCE_HOPS = 16
 # Round-2 #2: upper bound on a single stall-notify adapter.send so a wedged
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
@@ -16218,6 +16225,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         never let a late completion override an unrelated /new or restored
         route.  Unknown ownership remains fail-closed; the result is still
         available in the delegation records.
+
+        A pinned *delegate* row is likewise canonicalized to its human-facing
+        parent through ``model_config._delegate_from`` before any route check
+        or mutation (#92611).  Unresolvable provenance — a cycle, a missing
+        parent, a malformed config, or a chain longer than
+        ``_MAX_DELEGATE_PROVENANCE_HOPS`` — drops the injection rather than
+        falling back to the current route entry.  That is deliberate: routing
+        an internal child's output into a session whose ownership was never
+        verified is the same class of defect this canonicalization fixes, and
+        the completion remains readable in the delegation records either way.
         """
         session_db = cast(Any, self._session_db)
         if session_db is None:
@@ -16251,8 +16268,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Follow that durable provenance before any route verification or
         # mutation; otherwise switch_session() can end the real parent and
         # rebind the platform chat to an internal child (#92611).
+        #
+        # Real nesting is bounded by delegation.max_spawn_depth (default 2), so
+        # the hop cap only guards a corrupt/hand-edited chain: without it a
+        # single completion event could fan out into hundreds of sequential
+        # get_session() reads before terminating.
         delegate_chain: set[str] = set()
-        while True:
+        for _ in range(_MAX_DELEGATE_PROVENANCE_HOPS + 1):
             if pinned_session_id in delegate_chain:
                 logger.warning(
                     "Async-delegation completion has cyclic delegate provenance "
@@ -16298,6 +16320,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             pinned_session_id = delegate_parent_id
             pinned_row = delegate_parent_row
+        else:
+            logger.warning(
+                "Async-delegation completion exceeded %d delegate provenance "
+                "hops (last session %s); dropping injection (#92611).",
+                _MAX_DELEGATE_PROVENANCE_HOPS,
+                pinned_session_id,
+            )
+            return None
 
         target_session_id = pinned_session_id
         follows_compression = False
