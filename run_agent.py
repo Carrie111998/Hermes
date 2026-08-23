@@ -2392,6 +2392,15 @@ class AIAgent:
                     )
                     or 300.0,
                 )
+                # Propagate durable row ids to the live message dicts so
+                # steer injection can UPDATE the exact row instead of
+                # re-inserting (see hermes_state.update_message_content_by_id).
+                for _r, _m in zip(_batch_rows, _batch_msgs):
+                    try:
+                        if isinstance(_r, dict) and "_row_id" in _r:
+                            _m["_row_id"] = _r["_row_id"]
+                    except Exception:
+                        pass
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

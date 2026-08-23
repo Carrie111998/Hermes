@@ -4347,19 +4347,44 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
     marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
+    target_msg = messages[target_idx]
+    existing_content = target_msg.get("content", "")
     if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
         try:
             blocks = list(existing_content) if existing_content else []
             blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
+            target_msg["content"] = blocks
+            new_content = blocks
         except Exception:
-            # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
+            target_msg["content"] = f"{existing_content}{marker}"
+            new_content = target_msg["content"]
     else:
-        messages[target_idx]["content"] = existing_content + marker
+        new_content = existing_content + marker
+        target_msg["content"] = new_content
+    # Persist the amended content atomically.  The target row was already
+    # flushed by the per-tool incremental persist, so an APPEND would skip
+    # it (marker already stamped) and the marker would live only in memory
+    # until turn-end WAL checkpoint -- which is exactly the bug that made
+    # SELECT content LIKE miss and let a WAL/disk I/O failure lose it.
+    # UPDATE the existing row instead; the messages_fts_update trigger keeps
+    # the FTS index in sync automatically.  Best-effort: never let a persist
+    # failure lose the in-memory steer.
+    try:
+        session_id = getattr(agent, "session_id", None)
+        row_id = target_msg.get("_row_id") if isinstance(target_msg, dict) else None
+        sdb = getattr(agent, "_session_db", None)
+        if session_id and row_id is not None and sdb is not None and hasattr(sdb, "update_message_content_by_id"):
+            sdb.update_message_content_by_id(session_id, int(row_id), new_content)
+        else:
+            if row_id is None and hasattr(agent, "_flush_messages_to_session_db"):
+                try:
+                    target_msg.pop("_db_persisted", None)
+                    target_msg.pop("_DB_PERSISTED_MARKER", None)
+                except Exception:
+                    pass
+                agent._flush_messages_to_session_db(messages)
+    except Exception:
+        logger.debug("steer marker persist failed; in-memory marker still delivered", exc_info=True)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

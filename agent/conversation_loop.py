@@ -2049,15 +2049,39 @@ def run_conversation(
                     marker = format_steer_marker(_pre_api_steer)
                     existing = _sm.get("content", "")
                     if isinstance(existing, str):
-                        _sm["content"] = existing + marker
+                        _new = existing + marker
+                        _sm["content"] = _new
                     else:
-                        # Multimodal content blocks — append text block
                         try:
                             blocks = list(existing) if existing else []
                             blocks.append({"type": "text", "text": marker})
                             _sm["content"] = blocks
+                            _new = blocks
                         except Exception:
+                            _new = None
                             pass
+                        else:
+                            _new = _sm["content"]
+                    # Atomically persist the amended tool content so the
+                    # marker survives WAL/disk failures and is searchable via
+                    # SELECT content LIKE -- same contract as the post-batch
+                    # steer path (see agent_runtime_helpers).
+                    if _new is not None:
+                        try:
+                            _sid = getattr(agent, "session_id", None)
+                            _rid = _sm.get("_row_id") if isinstance(_sm, dict) else None
+                            _sdb = getattr(agent, "_session_db", None)
+                            if _sid and _rid is not None and _sdb is not None and hasattr(_sdb, "update_message_content_by_id"):
+                                _sdb.update_message_content_by_id(_sid, int(_rid), _new)
+                            elif _rid is None and hasattr(agent, "_flush_messages_to_session_db"):
+                                try:
+                                    _sm.pop("_db_persisted", None)
+                                    _sm.pop("_DB_PERSISTED_MARKER", None)
+                                except Exception:
+                                    pass
+                                agent._flush_messages_to_session_db(messages)
+                        except Exception:
+                            logger.debug("pre-API steer marker persist failed", exc_info=True)
                     _injected = True
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",

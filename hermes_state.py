@@ -10252,6 +10252,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         return self.latest_message_row_id(session_id, role="user")
 
+    def update_message_content_by_id(
+        self, session_id: str, row_id: int, new_content: Any
+    ) -> int:
+        """Atomically overwrite ``content`` for one active message row.
+
+        Used by the /steer marker path: the tool result row was already
+        appended by the per-tool incremental flush, so the marker must
+        UPDATE the existing row rather than inserting a new one (which
+        would break role alternation and duplicate the tool result).
+
+        Returns the number of rows updated (0 or 1). The
+        ``messages_fts_update`` trigger keeps FTS / CJK indexes in sync
+        automatically when ``content`` changes.
+        """
+        if not session_id or row_id is None:
+            return 0
+        # Normalize list/multimodal content to plain text before encoding
+        # so CJK steer text remains LIKE-searchable (json.dumps escapes CJK
+        # to \uXXXX and breaks SELECT content LIKE '%密%'). Mirrors the
+        # incremental flush's multimodal summary path.
+        if isinstance(new_content, list):
+            _txt_parts = []
+            for _pp in new_content:
+                if isinstance(_pp, dict) and _pp.get("type") == "text":
+                    _txt_parts.append(str(_pp.get("text", "")))
+            new_content = "\n".join(_txt_parts) if _txt_parts else None
+        elif isinstance(new_content, dict) and new_content.get("_multimodal") is True:
+            try:
+                from agent.tool_dispatch_helpers import _multimodal_text_summary as _mts
+                new_content = _mts(new_content)
+            except Exception:
+                new_content = str(new_content)
+        encoded = self._encode_content(new_content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND active = 1",
+                (encoded, int(row_id), session_id),
+            )
+            return cursor.rowcount
+
+        try:
+            return int(self._execute_write(_do) or 0)
+        except Exception:
+            return 0
+
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``.
 
