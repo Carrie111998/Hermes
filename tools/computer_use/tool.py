@@ -1303,6 +1303,34 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         if not _mime:
             _b64_prefix = cap.png_b64[:8]
             _mime = "image/jpeg" if _b64_prefix.startswith("/9j/") else "image/png"
+        # History-reuse cap: this embed is baked into the tool result and
+        # re-sent on every later turn, exactly like the vision_analyze and
+        # browser_vision native fast paths (#92699/#92725/#92748) — apply the
+        # same proactive resize so full-resolution captures can't enter
+        # immutable history uncapped. Reuses the shareable copy already
+        # written by _persist_capture_image above instead of decoding
+        # cap.png_b64 a second time. Fail-open: if that copy is unavailable
+        # (persistence is best-effort), fall back to the unresized embed
+        # rather than blocking the capture.
+        _embed_data_url = f"data:{_mime};base64,{cap.png_b64}"
+        if screenshot_path:
+            try:
+                from pathlib import Path as _Path
+
+                from tools.vision_tools import (
+                    _EMBED_MAX_DIMENSION,
+                    _EMBED_TARGET_BYTES,
+                    _resize_image_for_vision,
+                )
+
+                _embed_data_url = _resize_image_for_vision(
+                    _Path(screenshot_path),
+                    mime_type=_mime,
+                    max_base64_bytes=_EMBED_TARGET_BYTES,
+                    max_dimension=_EMBED_MAX_DIMENSION,
+                )
+            except Exception as exc:
+                logger.debug("computer_use: history-reuse embed cap skipped: %s", exc)
         # The multimodal response carries the screenshot, not the AX
         # elements array, so a "response truncated to N of M elements"
         # note would be inaccurate — skip it on this branch.
@@ -1311,7 +1339,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             "content": [
                 {"type": "text", "text": summary},
                 {"type": "image_url",
-                 "image_url": {"url": f"data:{_mime};base64,{cap.png_b64}"}},
+                 "image_url": {"url": _embed_data_url}},
             ],
             "text_summary": summary,
             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,

@@ -95,6 +95,28 @@ def _stub_aux_analysis(text: str):
     return json.dumps({"success": True, "analysis": text})
 
 
+def _make_oversized_png_b64(*, side: int = 2000) -> str:
+    """A real PNG whose longest side exceeds vision_tools._EMBED_MAX_DIMENSION
+    (1568px), so the history-reuse cap in _capture_response's native path has
+    something to actually shrink. A striped fill (not a solid color) so it
+    isn't a degenerate near-zero-byte PNG, while staying cheap to generate
+    (C-level ImageDraw calls, no per-pixel Python loop).
+    """
+    import io
+
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (side, side), "white")
+    draw = ImageDraw.Draw(img)
+    stripe = 37
+    for i, x in enumerate(range(0, side, stripe)):
+        color = (i * 53 % 256, i * 97 % 256, i * 151 % 256)
+        draw.rectangle([x, 0, x + stripe, side], fill=color)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 # ---------------------------------------------------------------------------
 # _capture_response: routing OFF (current/native behaviour)
 # ---------------------------------------------------------------------------
@@ -119,6 +141,67 @@ class TestCaptureResponseDefaultPath:
         url = image_part["image_url"]["url"]
         assert url.startswith("data:image/png;base64,")
         assert "vision_analysis" not in resp
+
+    def test_oversized_capture_is_resized_for_history_reuse(self, tmp_cache_dir):
+        """#92699/#92725's history-reuse cap must also apply to computer_use's
+        own native embed — a full-resolution capture baked into immutable
+        history uncapped can wedge the session exactly like the vision_analyze
+        and browser_vision paths it was already fixed for."""
+        import io
+
+        from PIL import Image
+
+        from tools.computer_use import tool as cu_tool
+        from tools.vision_tools import _EMBED_MAX_DIMENSION
+
+        oversized_b64 = _make_oversized_png_b64(side=2000)
+        cap = _make_capture(png_b64=oversized_b64, mode="som",
+                             width=2000, height=2000)
+
+        with patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=False):
+            resp = cu_tool._capture_response(cap)
+
+        assert isinstance(resp, dict)
+        image_part = next(
+            p for p in resp["content"] if p.get("type") == "image_url"
+        )
+        url = image_part["image_url"]["url"]
+        assert url.startswith("data:image/")
+        embedded_b64 = url.split(",", 1)[1]
+
+        # The embed must actually have shrunk — both in byte count and in
+        # decoded pixel dimensions (Anthropic enforces an 8000px cap
+        # independently of the byte cap; the model's tokenizer also
+        # downsamples past 1568px, so there is no fidelity gained by keeping
+        # the original resolution in history).
+        assert len(embedded_b64) < len(oversized_b64)
+        decoded = base64.b64decode(embedded_b64, validate=False)
+        with Image.open(io.BytesIO(decoded)) as resized_img:
+            assert max(resized_img.size) <= _EMBED_MAX_DIMENSION
+
+    def test_persist_failure_falls_back_to_unresized_embed(self):
+        """Persisting the shareable copy is best-effort (cache dir could be
+        unwritable, disk full, etc.) — a failure there must not block the
+        capture. Falling back to the original, unresized embed matches
+        pre-fix behaviour rather than raising."""
+        from tools.computer_use import tool as cu_tool
+
+        oversized_b64 = _make_oversized_png_b64(side=2000)
+        cap = _make_capture(png_b64=oversized_b64, mode="som",
+                             width=2000, height=2000)
+
+        with patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=False), \
+             patch.object(cu_tool, "_persist_capture_image", return_value=None):
+            resp = cu_tool._capture_response(cap)
+
+        assert isinstance(resp, dict)
+        image_part = next(
+            p for p in resp["content"] if p.get("type") == "image_url"
+        )
+        url = image_part["image_url"]["url"]
+        assert url == f"data:image/png;base64,{oversized_b64}"
 
 
     def test_ax_only_capture_returns_text_regardless_of_routing(self):
