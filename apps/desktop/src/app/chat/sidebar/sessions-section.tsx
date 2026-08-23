@@ -412,8 +412,10 @@ export function SidebarSessionsSection({
     const presented = presentProjects(projectOverview)
 
     if (presented) {
+      const projectsDraggable = Boolean(onReorderProjects && presented.groups.some(group => group.projects.length > 1))
+      const NativeRow = projectsDraggable ? SortableProjectOverviewRow : ProjectOverviewRow
       const nativeRow = (project: SidebarProjectTree) => (
-        <ProjectOverviewRow
+        <NativeRow
           activeProjectId={activeProjectId}
           key={project.id}
           onEnter={onEnterProject}
@@ -431,52 +433,63 @@ export function SidebarSessionsSection({
               <div className="px-2 pb-1 pt-1.5 text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
                 {group.label}
               </div>
-              {!group.collapsed && group.projects.map(nativeRow)}
+              {!group.collapsed &&
+                (projectsDraggable && onReorderProjects && group.projects.length > 1 ? (
+                  <ReorderableList
+                    ids={group.projects.map(project => project.id)}
+                    onReorder={onReorderProjects}
+                    sensors={dndSensors}
+                  >
+                    {group.projects.map(nativeRow)}
+                  </ReorderableList>
+                ) : (
+                  group.projects.map(nativeRow)
+                ))}
             </div>
           ))}
           {presented.ungrouped.map(nativeRow)}
         </>
       )
     } else {
-    // The model is already ordered (Home leads; then the default sort groups
-    // explicit-before-auto, with a manual drag-order winning when present).
-    // Render in that order and make rows drag-to-reorder when a handler is
-    // wired — Home stays outside the sortable list, it's a fixture.
-    const home = projectOverview[0]?.isNoProject ? projectOverview[0] : undefined
-    const sortableProjects = home ? projectOverview.slice(1) : projectOverview
-    const projectsDraggable = sortableProjects.length > 1 && !!onReorderProjects
-    const Row = projectsDraggable ? SortableProjectOverviewRow : ProjectOverviewRow
+      // The model is already ordered (Home leads; then the default sort groups
+      // explicit-before-auto, with a manual drag-order winning when present).
+      // Render in that order and make rows drag-to-reorder when a handler is
+      // wired — Home stays outside the sortable list, it's a fixture.
+      const home = projectOverview[0]?.isNoProject ? projectOverview[0] : undefined
+      const sortableProjects = home ? projectOverview.slice(1) : projectOverview
+      const projectsDraggable = sortableProjects.length > 1 && !!onReorderProjects
+      const Row = projectsDraggable ? SortableProjectOverviewRow : ProjectOverviewRow
 
-    const projectRow = (project: SidebarProjectTree, Component: typeof ProjectOverviewRow) => (
-      <Component
-        activeProjectId={activeProjectId}
-        key={project.id}
-        onEnter={onEnterProject}
-        onNewSession={onNewSessionInWorkspace}
-        previewSessions={projectOverviewPreviews?.[project.id]}
-        project={project}
-        renderRows={renderRows}
-      />
-    )
+      const projectRow = (project: SidebarProjectTree, Component: typeof ProjectOverviewRow) => (
+        <Component
+          activeProjectId={activeProjectId}
+          key={project.id}
+          onEnter={onEnterProject}
+          onNewSession={onNewSessionInWorkspace}
+          previewSessions={projectOverviewPreviews?.[project.id]}
+          project={project}
+          renderRows={renderRows}
+        />
+      )
 
-    const rows = sortableProjects.map(project => projectRow(project, Row))
+      const rows = sortableProjects.map(project => projectRow(project, Row))
 
-    inner = (
-      <>
-        {home && projectRow(home, ProjectOverviewRow)}
-        {projectsDraggable && onReorderProjects ? (
-          <ReorderableList
-            ids={sortableProjects.map(project => project.id)}
-            onReorder={onReorderProjects}
-            sensors={dndSensors}
-          >
-            {rows}
-          </ReorderableList>
-        ) : (
-          rows
-        )}
-      </>
-    )
+      inner = (
+        <>
+          {home && projectRow(home, ProjectOverviewRow)}
+          {projectsDraggable && onReorderProjects ? (
+            <ReorderableList
+              ids={sortableProjects.map(project => project.id)}
+              onReorder={onReorderProjects}
+              sensors={dndSensors}
+            >
+              {rows}
+            </ReorderableList>
+          ) : (
+            rows
+          )}
+        </>
+      )
     }
   } else if (groups?.length) {
     // Profile/source groups never reorder; render them flat with static rows.
