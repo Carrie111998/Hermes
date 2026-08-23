@@ -1,3 +1,4 @@
+import * as ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
 import { TRANSLATIONS } from './catalog'
@@ -7,7 +8,8 @@ import { LOCALE_OPTIONS } from './languages'
 import type { Locale, Translations } from './types'
 
 /**
- * Ceiling on the English strings each locale may leave untranslated.
+ * Exact baseline for the English strings each locale intentionally leaves
+ * untranslated today.
  *
  * This exists because an untranslated string is otherwise invisible:
  * `defineLocale` merges every locale over `en`, so a key nobody translated
@@ -15,15 +17,12 @@ import type { Locale, Translations } from './types'
  * optional, so `tsc` cannot flag it either. Nothing surfaces the gap until a
  * user reports it.
  *
- * The numbers only ever go down. Translating more of a locale is free; lowering
- * its ceiling afterwards keeps the ratchet tight. Shipping an English string
- * without translating it pushes a locale past its ceiling and fails here. *
- * A ceiling is deliberately a number and not a hard 100% gate. If a locale wants
- * to defer a feature's strings, raise its ceiling in the same commit and say why
- * — an honest gap is worth more than English text pasted in to go green, which
- * looks translated to every tool and to the user until someone reports it.
+ * This is an exact count rather than a loose ceiling. Translating more strings
+ * therefore requires lowering the baseline in the same change instead of
+ * silently creating regression headroom. If a locale deliberately defers new
+ * strings, update the baseline in that commit and explain why.
  */
-const MAX_UNTRANSLATED: Record<Locale, number> = {
+const EXPECTED_UNTRANSLATED: Record<Locale, number> = {
   en: 0,
   ar: 0,
   ja: 598,
@@ -32,12 +31,13 @@ const MAX_UNTRANSLATED: Record<Locale, number> = {
 }
 
 /**
- * Ceiling on keys a locale still defines that `en` no longer has. These are
- * dead strings: renamed or deleted upstream, left behind in the translation.
- * `tsc` catches most of them, but not under the `Record<string, string>`
- * members of `Translations` (the settings field copy), which accept any key.
+ * Exact baseline for keys a locale still defines that `en` no longer has.
+ * These are dead strings: renamed or deleted upstream, left behind in the
+ * translation. `tsc` catches most of them, but not under the
+ * `Record<string, string>` members of `Translations` (the settings field copy),
+ * which accept any key.
  */
-const MAX_UNUSED: Record<Locale, number> = {
+const EXPECTED_UNUSED: Record<Locale, number> = {
   en: 0,
   ar: 5,
   ja: 0,
@@ -82,35 +82,6 @@ function authoredKeys(locale: Locale): Set<string> {
   return leafKeys(authoredEntries(locale))
 }
 
-/** Parameter names and body text of an arrow function, from its source. */
-function signature(fn: (...args: never[]) => string): { params: string[]; body: string } | null {
-  const source = fn.toString()
-  const arrow = source.indexOf('=>')
-
-  if (arrow < 0) {
-    return null
-  }
-
-  let head = source.slice(0, arrow).trim()
-
-  if (head.startsWith('(') && head.endsWith(')')) {
-    head = head.slice(1, -1)
-  }
-
-  return {
-    params: head
-      .split(',')
-      .map(part => part.trim().split(/[:=]/)[0].trim())
-      .filter(Boolean),
-    body: source.slice(arrow + 2)
-  }
-}
-
-/** Whether `param` appears as a standalone identifier in `body`. */
-function referenced(body: string, param: string): boolean {
-  return new RegExp(`(^|[^A-Za-z0-9_$])${param}([^A-Za-z0-9_$]|$)`).test(body)
-}
-
 function leafEntries(value: unknown, prefix = '', out = new Map<string, unknown>()): Map<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     if (prefix) {
@@ -127,6 +98,65 @@ function leafEntries(value: unknown, prefix = '', out = new Map<string, unknown>
   return out
 }
 
+type ParsedArrow = {
+  params: ts.ParameterDeclaration[]
+  body: ts.ConciseBody
+  sourceFile: ts.SourceFile
+}
+
+/** Parse the runtime source of a locale arrow function with TypeScript's AST. */
+function parseArrow(fn: (...args: never[]) => string): ParsedArrow | null {
+  const sourceFile = ts.createSourceFile(
+    'locale-entry.ts',
+    `const entry = ${fn.toString()}`,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  )
+  const statement = sourceFile.statements[0]
+
+  if (!statement || !ts.isVariableStatement(statement)) {
+    return null
+  }
+
+  const initializer = statement.declarationList.declarations[0]?.initializer
+
+  if (!initializer || !ts.isArrowFunction(initializer)) {
+    return null
+  }
+
+  return { params: [...initializer.parameters], body: initializer.body, sourceFile }
+}
+
+/** Whether an identifier is actually referenced in an arrow body. */
+function referencesIdentifier(root: ts.Node, name: string): boolean {
+  let found = false
+
+  function visit(node: ts.Node): void {
+    if (found) {
+      return
+    }
+
+    if (ts.isIdentifier(node) && node.text === name) {
+      const parent = node.parent
+      const isPropertyName =
+        (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+        (ts.isPropertyAssignment(parent) && parent.name === node) ||
+        (ts.isMethodDeclaration(parent) && parent.name === node)
+
+      if (!isPropertyName) {
+        found = true
+        return
+      }
+    }
+
+    ts.forEachChild(node, visit)
+  }
+
+  visit(root)
+  return found
+}
+
 const ENGLISH_ENTRIES = leafEntries(en)
 
 describe('desktop locale coverage', () => {
@@ -135,37 +165,36 @@ describe('desktop locale coverage', () => {
   })
 
   for (const { id } of LOCALE_OPTIONS) {
-    it(`${id} leaves at most ${MAX_UNTRANSLATED[id]} strings untranslated`, () => {
+    it(`${id} matches its untranslated-string baseline of ${EXPECTED_UNTRANSLATED[id]}`, () => {
       const authored = authoredKeys(id)
       const untranslated = [...ENGLISH_KEYS].filter(key => !authored.has(key))
 
       expect(
         untranslated.length,
-        `${id} is missing ${untranslated.length} of ${ENGLISH_KEYS.size} English strings, which will render in English. ` +
-          `Translate them in ${id}.ts, or raise the ceiling only with a reason. First few: ${untranslated
-            .slice(0, 8)
-            .join(', ')}`
-      ).toBeLessThanOrEqual(MAX_UNTRANSLATED[id])
+        `${id} is missing ${untranslated.length} of ${ENGLISH_KEYS.size} English strings; baseline is ` +
+          `${EXPECTED_UNTRANSLATED[id]}. Translate new gaps, or update the baseline only for intentional debt ` +
+          `and explain why. First few: ${untranslated.slice(0, 8).join(', ')}`
+      ).toBe(EXPECTED_UNTRANSLATED[id])
     })
 
-    it(`${id} carries at most ${MAX_UNUSED[id]} strings English no longer uses`, () => {
+    it(`${id} matches its unused-string baseline of ${EXPECTED_UNUSED[id]}`, () => {
       const unused = [...authoredKeys(id)].filter(key => !ENGLISH_KEYS.has(key))
 
       expect(
         unused.length,
-        `${id} defines ${unused.length} keys absent from en.ts — dead strings to delete. First few: ${unused
-          .slice(0, 8)
-          .join(', ')}`
-      ).toBeLessThanOrEqual(MAX_UNUSED[id])
+        `${id} defines ${unused.length} keys absent from en.ts; baseline is ${EXPECTED_UNUSED[id]}. ` +
+          `First few: ${unused.slice(0, 8).join(', ')}`
+      ).toBe(EXPECTED_UNUSED[id])
     })
 
     // Key presence is not enough. A translated entry that keeps the key but
-    // drops the value the English entry interpolates renders `undefined` to the
-    // user, and counting keys cannot see it. These are hard assertions rather
-    // than ceilings: every locale satisfies them today.
-    it(`${id} keeps the English parameter list on every function entry`, () => {
+    // changes a function's call shape can silently drop caller data. Parse the
+    // actual runtime functions with TypeScript instead of relying on
+    // Function.length, which is lossy for default/rest parameters.
+    it(`${id} keeps the English parameter count on every function entry`, () => {
       const authored = leafEntries(authoredEntries(id))
       const mismatched: string[] = []
+      const unparsed: string[] = []
 
       for (const [key, englishValue] of ENGLISH_ENTRIES) {
         const localeValue = authored.get(key)
@@ -174,47 +203,90 @@ describe('desktop locale coverage', () => {
           continue
         }
 
-        if (englishValue.length !== localeValue.length) {
-          mismatched.push(`${key} (en takes ${englishValue.length}, ${id} takes ${localeValue.length})`)
+        const englishArrow = parseArrow(englishValue as (...args: never[]) => string)
+        const localeArrow = parseArrow(localeValue as (...args: never[]) => string)
+
+        if (!englishArrow || !localeArrow) {
+          unparsed.push(key)
+          continue
+        }
+
+        if (englishArrow.params.length !== localeArrow.params.length) {
+          mismatched.push(`${key} (en takes ${englishArrow.params.length}, ${id} takes ${localeArrow.params.length})`)
         }
       }
 
+      expect(unparsed, `${id} has function entries the structural guard could not parse`).toEqual([])
       expect(
         mismatched,
-        `${id} changes the parameter count of these entries, so a caller's argument goes nowhere`
+        `${id} changes the parameter count of these entries, so a caller's argument can go nowhere`
       ).toEqual([])
     })
 
-    it(`${id} uses every parameter its function entries declare`, () => {
+    it(`${id} uses every named parameter its function entries declare`, () => {
       const authored = leafEntries(authoredEntries(id))
       const ignored: string[] = []
+      const unparsed: string[] = []
 
       for (const [key, localeValue] of authored) {
         if (typeof localeValue !== 'function' || typeof ENGLISH_ENTRIES.get(key) !== 'function') {
           continue
         }
 
-        const parsed = signature(localeValue as (...args: never[]) => string)
+        const parsed = parseArrow(localeValue as (...args: never[]) => string)
 
         if (!parsed) {
+          unparsed.push(key)
           continue
         }
 
-        // A leading underscore is the established way to declare a parameter
-        // intentionally unused — en.ts does it too (see generatePet.hatchRow).
-        const dead = parsed.params.filter(param => !param.startsWith('_') && !referenced(parsed.body, param))
+        for (const parameter of parsed.params) {
+          if (!ts.isIdentifier(parameter.name)) {
+            ignored.push(`${key} [unsupported binding: ${parameter.name.getText(parsed.sourceFile)}]`)
+            continue
+          }
 
-        if (dead.length) {
-          ignored.push(`${key} [${dead.join(', ')}]`)
+          const name = parameter.name.text
+
+          // A leading underscore is the established way to declare a parameter
+          // intentionally unused — en.ts does it too (see generatePet.hatchRow).
+          if (!name.startsWith('_') && !referencesIdentifier(parsed.body, name)) {
+            ignored.push(`${key} [${name}]`)
+          }
         }
       }
 
+      expect(unparsed, `${id} has function entries the structural guard could not parse`).toEqual([])
       expect(
         ignored,
-        `${id} declares parameters it never uses, so the value the caller passes is dropped from the string. ` +
+        `${id} declares parameters it never uses, so caller data can be dropped from the translation. ` +
           `Referencing a parameter in a condition counts — translating the word it selects is often better than ` +
           `interpolating the English token.`
       ).toEqual([])
+    })
+
+    it(`${id} keeps array-valued entries the same length as English`, () => {
+      const authored = leafEntries(authoredEntries(id))
+      const mismatched: string[] = []
+
+      for (const [key, englishValue] of ENGLISH_ENTRIES) {
+        if (!Array.isArray(englishValue)) {
+          continue
+        }
+
+        const localeValue = authored.get(key)
+
+        if (!Array.isArray(localeValue)) {
+          mismatched.push(`${key} (en is an array, ${id} is not)`)
+          continue
+        }
+
+        if (englishValue.length !== localeValue.length) {
+          mismatched.push(`${key} (en has ${englishValue.length}, ${id} has ${localeValue.length})`)
+        }
+      }
+
+      expect(mismatched, `${id} changes the shape of these array-valued translation entries`).toEqual([])
     })
   }
 })
