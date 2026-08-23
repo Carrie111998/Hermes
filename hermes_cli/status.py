@@ -27,6 +27,20 @@ from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
+def _maybe_print_usage(provider: str, *, enabled: bool) -> None:
+    """Fail-open quota line for ``hermes status --all``."""
+    if not enabled:
+        return
+    try:
+        from hermes_cli.usage_cmd import compact_usage_line
+
+        line = compact_usage_line(provider)
+    except Exception:
+        return
+    if line:
+        print(f"    Usage:      {line}")
+
+
 def check_mark(ok: bool) -> str:
     if ok:
         return color("✓", Colors.GREEN)
@@ -295,6 +309,7 @@ def show_status(args):
         print(f"    Refresh:    {refresh_label}")
     if nous_error:
         print(f"    Error:      {nous_error}")
+    _maybe_print_usage("nous", enabled=bool(getattr(args, "all", False) and nous_logged_in))
 
     codex_logged_in = bool(codex_status.get("logged_in"))
     print(
@@ -309,6 +324,7 @@ def show_status(args):
         print(f"    Refreshed:  {codex_last_refresh}")
     if codex_status.get("error") and not codex_logged_in:
         print(f"    Error:      {codex_status.get('error')}")
+    _maybe_print_usage("openai-codex", enabled=bool(getattr(args, "all", False) and codex_logged_in))
 
     qwen_logged_in = bool(qwen_status.get("logged_in"))
     print(

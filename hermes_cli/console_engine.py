@@ -642,6 +642,13 @@ class HermesConsoleEngine:
                 [()],
                 set(),
             ),
+            "usage": (
+                "hermes_cli.subcommands.usage",
+                "build_usage_parser",
+                "cmd_usage",
+                [()],
+                set(),
+            ),
             "security": (
                 "hermes_cli.subcommands.security",
                 "build_security_parser",
