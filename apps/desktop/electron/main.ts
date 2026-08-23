@@ -4811,8 +4811,40 @@ function multipartBody(upload) {
   return { body, contentType: `multipart/form-data; boundary=${boundary}` }
 }
 
+// Connection-pooled HTTP agents to avoid ECONNRESET from per-call TCP sockets.
+// Each fetchJson / fetchPublicJson / downloadViaTokenToFile call shares these
+// instead of opening a fresh connection every time.
+const HTTP_KEEPALIVE_AGENT = new http.Agent({ keepAlive: true, maxSockets: 50 })
+const HTTPS_KEEPALIVE_AGENT = new https.Agent({ keepAlive: true, maxSockets: 50 })
+
+const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ERR_NETWORK'])
+
+function isRetryableError(error) {
+  if (!error) return false
+  if (RETRYABLE_CODES.has(error.code)) return true
+  const msg = String(error.message || '')
+  return msg.includes('socket hang up') || msg.includes('read ECONNRESET')
+}
+
+async function withRetry(fn, maxRetries = 2) {
+  let lastError
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      if (attempt < maxRetries && isRetryableError(error)) {
+        await new Promise(r => setTimeout(r, Math.min(200 * Math.pow(2, attempt), 2000)))
+        continue
+      }
+      throw error
+    }
+  }
+  throw lastError
+}
+
 function fetchJson(url, token, options: any = {}) {
-  return new Promise((resolve, reject) => {
+  return withRetry(() => new Promise((resolve, reject) => {
     const { body, contentType } = options.upload
       ? multipartBody(options.upload)
       : {
@@ -4822,6 +4854,7 @@ function fetchJson(url, token, options: any = {}) {
 
     const parsed = new URL(url)
     const client = parsed.protocol === 'https:' ? https : http
+    const agent = parsed.protocol === 'https:' ? HTTPS_KEEPALIVE_AGENT : HTTP_KEEPALIVE_AGENT
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
@@ -4833,6 +4866,7 @@ function fetchJson(url, token, options: any = {}) {
     const req = client.request(
       parsed,
       {
+        agent,
         method: options.method || 'GET',
         headers: {
           ...headersForRemoteRequest(url),
@@ -4904,7 +4938,7 @@ function fetchJson(url, token, options: any = {}) {
     }
 
     req.end()
-  })
+  }))
 }
 
 // Token-auth download that streams the response body straight to a
@@ -4931,11 +4965,13 @@ function downloadViaTokenToFile(url, token, ctx, options: any = {}) {
     }
 
     const client = parsed.protocol === 'https:' ? https : http
+    const agent = parsed.protocol === 'https:' ? HTTPS_KEEPALIVE_AGENT : HTTP_KEEPALIVE_AGENT
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const req = client.request(
       parsed,
       {
+        agent,
         method: 'GET',
         headers: options.bearer ? { Authorization: `Bearer ${options.bearer}` } : { 'X-Hermes-Session-Token': token }
       },
@@ -4970,7 +5006,7 @@ function fetchPublicJson(url, options: any = {}) {
   // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
   // any credentials exist, and any time we must not leak a token to an
   // endpoint that doesn't need one.
-  return new Promise((resolve, reject) => {
+  return withRetry(() => new Promise((resolve, reject) => {
     const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
     let parsed
 
@@ -4983,6 +5019,7 @@ function fetchPublicJson(url, options: any = {}) {
     }
 
     const client = parsed.protocol === 'https:' ? https : http
+    const agent = parsed.protocol === 'https:' ? HTTPS_KEEPALIVE_AGENT : HTTP_KEEPALIVE_AGENT
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
@@ -4994,6 +5031,7 @@ function fetchPublicJson(url, options: any = {}) {
     const req = client.request(
       parsed,
       {
+        agent,
         method: options.method || 'GET',
         headers: {
           ...headersForRemoteRequest(url),
@@ -5053,7 +5091,7 @@ function fetchPublicJson(url, options: any = {}) {
     }
 
     req.end()
-  })
+  }))
 }
 
 function mimeTypeForPath(filePath) {
