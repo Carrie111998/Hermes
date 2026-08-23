@@ -23,7 +23,7 @@ function render(activeGatewayProfile: string, activeConnectionId: string, refres
         refreshActiveTranscript: noop,
         refreshCronJobs: noop,
         refreshCurrentModel: noop,
-        refreshHermesConfig: noop,
+        refreshOrionConfig: noop,
         refreshMessagingSessions: noop,
         refreshSessions,
         requestGateway

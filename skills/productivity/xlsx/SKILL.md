@@ -2,11 +2,11 @@
 name: xlsx
 description: Create, read, edit Excel .xlsx workbooks and CSVs.
 version: 1.1.0
-author: Nous Research
+author: Orion
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
-  hermes:
+  orion:
     tags: [excel, spreadsheet, xlsx, csv, openpyxl, productivity]
     category: productivity
     related_skills: [docx, pdf, powerpoint]

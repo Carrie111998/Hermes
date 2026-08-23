@@ -157,7 +157,7 @@ def browser_control_developer_mode(config: Optional[dict] = None) -> bool:
             # Read-only flag probe on every browser tool call / check_fn
             # evaluation: skip load_config()'s defensive deepcopy (~135us);
             # this function only reads nested dicts and never mutates.
-            from hermes_cli.config import load_config_readonly
+            from orion_cli.config import load_config_readonly
 
             config = load_config_readonly()
         except Exception:
@@ -1051,7 +1051,7 @@ def browser_control_enabled(config: Optional[dict] = None) -> bool:
             # Read-only flag probe on every browser tool call / check_fn
             # evaluation: skip load_config()'s defensive deepcopy (~135us);
             # this function only reads nested dicts and never mutates.
-            from hermes_cli.config import load_config_readonly
+            from orion_cli.config import load_config_readonly
 
             config = load_config_readonly()
         except Exception:

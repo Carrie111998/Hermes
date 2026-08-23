@@ -33,7 +33,7 @@ function identity(overrides: Partial<BackendIdentity> = {}): BackendIdentity {
 }
 
 function ownershipEntry(overrides: Partial<BackendIdentity> = {}) {
-  return { command: 'hermes serve --port 0', ...identity(overrides) }
+  return { command: 'orion serve --port 0', ...identity(overrides) }
 }
 
 function stored(entries: object[]): string {
@@ -251,11 +251,11 @@ test('release removes only the exact identity rather than every record for its P
 })
 
 test('backend identity check matches only serve and dashboard invocation shapes', () => {
-  assert.equal(backendCommandMatches('/venv/bin/hermes serve --port 0'), true)
-  assert.equal(backendCommandMatches('python -m hermes_cli.main dashboard --no-open'), true)
-  assert.equal(backendCommandMatches('/venv/bin/hermes --profile work serve --port 0'), true)
-  assert.equal(backendCommandMatches('"C:\\Hermes Runtime\\hermes.exe" dashboard --no-open'), true)
-  assert.equal(backendCommandMatches('hermes chat --query serve'), false)
+  assert.equal(backendCommandMatches('/venv/bin/orion serve --port 0'), true)
+  assert.equal(backendCommandMatches('python -m orion_cli.main dashboard --no-open'), true)
+  assert.equal(backendCommandMatches('/venv/bin/orion --profile work serve --port 0'), true)
+  assert.equal(backendCommandMatches('"C:\\Orion Runtime\\orion.exe" dashboard --no-open'), true)
+  assert.equal(backendCommandMatches('orion chat --query serve'), false)
   assert.equal(backendCommandMatches('unrelated dashboard'), false)
 })
 

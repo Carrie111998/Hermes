@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // by the PRIMARY backend over one host, and getConnection() explicitly tags
 // the shared descriptor with `sharedPrimary`. Dialing a second WebSocket at it
 // used to fail over SSH (per-backend tunnel/ticket) and poison the active
-// gateway with a closed socket — "Hermes gateway is not connected" for every
+// gateway with a closed socket — "Orion gateway is not connected" for every
 // profile except the primary. Pooled backends (own-remote override, local
 // named profile) also carry `profile` for WS URL minting, so `profile` alone
 // cannot identify the shared-primary route. These tests pin the fix: only a
@@ -18,9 +18,9 @@ const gatewayMocks = vi.hoisted(() => ({
   setConnection: vi.fn()
 }))
 
-vi.mock('@/hermes', () => ({
+vi.mock('@/orion', () => ({
   setApiRequestConnection: vi.fn(),
-  HermesGateway: class {
+  OrionGateway: class {
     connectionState = 'closed'
     connect = async (wsUrl: string): Promise<void> => {
       await gatewayMocks.connect(wsUrl)
@@ -49,7 +49,7 @@ const {
 type DesktopStub = { getConnection: ReturnType<typeof vi.fn> }
 
 function installDesktop(stub: DesktopStub): void {
-  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = stub
+  ;(window as unknown as { orionDesktop: unknown }).orionDesktop = stub
 }
 
 function makePrimary(): { connectionState: string } {
@@ -67,7 +67,7 @@ beforeEach(() => {
 afterEach(() => {
   closeSecondaryGateways()
   vi.clearAllMocks()
-  delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+  delete (window as unknown as { orionDesktop?: unknown }).orionDesktop
 })
 
 describe('ensureGatewayForProfile under a shared global remote', () => {

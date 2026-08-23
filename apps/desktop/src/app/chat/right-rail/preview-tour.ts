@@ -1,7 +1,7 @@
 /**
  * PREVIEW TOUR — runs tour actions inside the preview pane's guest page, so a
  * tour can walk through ANY web app open in the in-app browser, not just
- * Hermes itself.
+ * Orion itself.
  *
  * The guest page is out-of-process; nothing here can touch its DOM directly.
  * Instead the first action injects a self-contained bundle over
@@ -27,23 +27,23 @@ import { activePreviewScriptRunner } from './preview-script-runner'
 function buildTourScript(action: TourAction): string {
   return `(function () {
   var w = window;
-  if (!w.__hermesTourEngine) {
+  if (!w.__orionTourEngine) {
     ${driverIife}
-    w.__hermesTourHolder = {};
-    w.__hermesTourCollect = (${collectTourTargets.toString()});
-    w.__hermesTourEngine = (${runTourEngine.toString()});
+    w.__orionTourHolder = {};
+    w.__orionTourCollect = (${collectTourTargets.toString()});
+    w.__orionTourEngine = (${runTourEngine.toString()});
   }
-  if (!document.getElementById('__hermes-tour-style')) {
+  if (!document.getElementById('__orion-tour-style')) {
     var style = document.createElement('style');
-    style.id = '__hermes-tour-style';
+    style.id = '__orion-tour-style';
     style.textContent = ${JSON.stringify(driverCss)};
     (document.head || document.documentElement).appendChild(style);
   }
-  return JSON.stringify(w.__hermesTourEngine(
+  return JSON.stringify(w.__orionTourEngine(
     w.driver.js.driver,
-    w.__hermesTourHolder,
+    w.__orionTourHolder,
     ${JSON.stringify(action)},
-    w.__hermesTourCollect,
+    w.__orionTourCollect,
     document
   ));
 })()`

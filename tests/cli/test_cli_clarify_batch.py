@@ -13,11 +13,11 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-from cli import HermesCLI
+from cli import OrionCLI
 
 
 def _make_cli_stub():
-    cli = HermesCLI.__new__(HermesCLI)
+    cli = OrionCLI.__new__(OrionCLI)
     cli._clarify_state = None
     cli._clarify_freetext = False
     cli._clarify_multi_base = None

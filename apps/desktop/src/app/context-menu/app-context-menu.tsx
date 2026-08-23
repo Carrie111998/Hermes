@@ -6,7 +6,7 @@ import { useNavigate } from 'react-router'
 import { terminalMenuHandleFor } from '@/app/right-sidebar/terminal/terminal-context-menu'
 import { toggleTargetZoneTabStrip } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
-import { HERMES_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
+import { ORION_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
 import { writeClipboardText } from '@/components/ui/copy-button'
 import {
   DropdownMenu,
@@ -116,7 +116,7 @@ function terminalSections(open: Extract<OpenContextMenu, { kind: 'terminal' }>, 
           key="terminal-paste"
           label={t.contextMenu.edit.paste}
           onSelect={() =>
-            void window.hermesDesktop?.readClipboard().then(text => (text ? terminal.paste?.(text) : undefined))
+            void window.orionDesktop?.readClipboard().then(text => (text ? terminal.paste?.(text) : undefined))
           }
         />
       ) : null,
@@ -156,7 +156,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   }
 
   const editableCommand = (command: 'copy' | 'cut' | 'paste') => {
-    withEditableFocus(() => void window.hermesDesktop?.contextMenuEdit?.(command))
+    withEditableFocus(() => void window.orionDesktop?.contextMenuEdit?.(command))
   }
 
   // Select all runs entirely in the renderer, scoped to the editable itself.
@@ -188,7 +188,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   }
 
   const spellcheckAction = (action: { kind: 'add' | 'replace'; word: string }) => {
-    withEditableFocus(() => void window.hermesDesktop?.contextMenuSpellcheck?.(action))
+    withEditableFocus(() => void window.orionDesktop?.contextMenuSpellcheck?.(action))
   }
 
   if (linkUrl) {
@@ -259,7 +259,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
           icon="file-media"
           key="image-copy"
           label={copy.image.copyImage}
-          onSelect={() => void window.hermesDesktop?.contextMenuCopyImage?.()}
+          onSelect={() => void window.orionDesktop?.contextMenuCopyImage?.()}
         />,
         target.imageUrl ? (
           <Item
@@ -274,7 +274,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
             icon="save"
             key="image-save"
             label={copy.image.saveImageAs}
-            onSelect={() => void window.hermesDesktop?.saveImageFromUrl?.(target.imageUrl)}
+            onSelect={() => void window.orionDesktop?.saveImageFromUrl?.(target.imageUrl)}
           />
         ) : null
       ].filter(Boolean)
@@ -445,7 +445,7 @@ function guestSections(open: Extract<OpenContextMenu, { kind: 'guest' }>, t: Tra
             icon="save"
             key="guest-image-save"
             label={copy.image.saveImageAs}
-            onSelect={() => void window.hermesDesktop?.saveImageFromUrl?.(imageUrl)}
+            onSelect={() => void window.orionDesktop?.saveImageFromUrl?.(imageUrl)}
           />
         ) : null
       ].filter(Boolean)
@@ -587,7 +587,7 @@ function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
       <Item
         icon="cloud-download"
         key="shell-update"
-        label={t.commandCenter.updateHermes}
+        label={t.commandCenter.updateOrion}
         onSelect={requestActiveUpdate}
       />
     ]
@@ -624,7 +624,7 @@ export function AppContextMenu() {
       // `mergeProps(slotProps, childProps)` so the child's `data-slot` wins
       // (status bar footer is `data-slot="statusbar"`). The marker is stamped
       // after `{...props}` on ContextMenuTrigger and is not overwritten.
-      if (element?.closest(`[${HERMES_CONTEXT_MENU_TRIGGER_ATTR}], [data-slot="context-menu-trigger"]`)) {
+      if (element?.closest(`[${ORION_CONTEXT_MENU_TRIGGER_ATTR}], [data-slot="context-menu-trigger"]`)) {
         return
       }
 
@@ -659,7 +659,7 @@ export function AppContextMenu() {
 
   // Spell-check facts arrive from main after the menu opens (Chromium reports
   // them on its own context-menu event); attach them to the open menu.
-  useEffect(() => window.hermesDesktop?.onContextMenuSpellcheck?.(augmentSpellcheck), [])
+  useEffect(() => window.orionDesktop?.onContextMenuSpellcheck?.(augmentSpellcheck), [])
 
   if (!open) {
     return null

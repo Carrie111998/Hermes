@@ -2,11 +2,11 @@
 name: docx
 description: Create, read, edit, template, and review Word .docx files.
 version: 1.1.0
-author: Nous Research
+author: Orion
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
-  hermes:
+  orion:
     tags: [word, docx, documents, office, templates, revisions, comments]
     category: productivity
     related_skills: [pdf, xlsx, powerpoint]

@@ -38,10 +38,10 @@ def server():
     # the whole test would poison modules first imported inside test bodies
     # (see tests/tui_gateway/test_protocol.py for the full rationale).
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
-        "hermes_cli.env_loader": MagicMock(),
-        "hermes_cli.banner": MagicMock(),
-        "hermes_state": MagicMock(),
+        "orion_constants": MagicMock(get_orion_home=MagicMock(return_value="/tmp/orion_test")),
+        "orion_cli.env_loader": MagicMock(),
+        "orion_cli.banner": MagicMock(),
+        "orion_state": MagicMock(),
     }):
         import importlib
         mod = importlib.import_module("tui_gateway.server")

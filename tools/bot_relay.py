@@ -1,7 +1,7 @@
 """Bot Mode cross-connection relay — connections ARE the peer set.
 
 Every gateway connected to the user's Desktop (local, remote URL, SSH,
-Hermes Cloud, docker) is a persistent line. This module is the gateway-side
+Orion Cloud, docker) is a persistent line. This module is the gateway-side
 half of the relay that rides those lines so agents on ANY connected gateway
 can find and message agents on ANY other, with `message_agent` as the one
 send path (Teknium ruling, Aug 2026 — the peers-vs-connections split was
@@ -24,7 +24,7 @@ How the relay works (three files under ``<root>/bot_relay/``):
 
 The gateway never holds another connection's credentials; the Desktop owns
 every socket and does all cross-connection I/O. Everything here is plain
-file plumbing on the gateway's own HERMES root — no network, never raises
+file plumbing on the gateway's own ORION root — no network, never raises
 out of the public helpers.
 """
 
@@ -91,7 +91,7 @@ def _normalize_roster_row(row: Any) -> Optional[dict]:
     if not profile or not connection_id:
         return None
     if not handle:
-        handle = "hermes" if profile == "default" else profile
+        handle = "orion" if profile == "default" else profile
     if not _HANDLE_RE.match(handle) or not _HANDLE_RE.match(profile):
         return None
     out = {
@@ -299,7 +299,7 @@ def cleanup_bot_relay_artifacts(max_age_hours: float | None = None) -> int:
     """
     del max_age_hours  # relay staleness is governed by STALE_AFTER_SECONDS
     try:
-        home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+        home = Path(os.getenv("ORION_HOME") or os.path.expanduser("~/.orion"))
         root = home.parent.parent if home.parent.name == "profiles" else home
         base = relay_root(root)
         if not base.is_dir():
@@ -350,7 +350,7 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
 def local_delivery_command(profile: str, query_file: str) -> list[str]:
     """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
     return [
-        "hermes",
+        "orion",
         "-p",
         profile,
         "chat",

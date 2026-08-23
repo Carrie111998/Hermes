@@ -8,12 +8,12 @@ import type {
   WebhookCreateResponse,
   WebhookEnableResponse,
   WebhooksResponse
-} from '@/types/hermes'
+} from '@/types/orion'
 
-import { hermesApi, profileScoped } from './client'
+import { orionApi, profileScoped } from './client'
 
 export function getMessagingPlatforms(profile?: null | string): Promise<MessagingPlatformsResponse> {
-  return hermesApi<MessagingPlatformsResponse>({
+  return orionApi<MessagingPlatformsResponse>({
     ...profileScoped(profile),
     path: '/api/messaging/platforms'
   })
@@ -24,7 +24,7 @@ export function updateMessagingPlatform(
   body: MessagingPlatformUpdate,
   profile?: null | string
 ): Promise<{ ok: boolean; platform: string }> {
-  return hermesApi<{ ok: boolean; platform: string }>({
+  return orionApi<{ ok: boolean; platform: string }>({
     ...profileScoped(profile),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}`,
     method: 'PUT',
@@ -36,7 +36,7 @@ export function testMessagingPlatform(
   platformId: string,
   profile?: null | string
 ): Promise<MessagingPlatformTestResponse> {
-  return hermesApi<MessagingPlatformTestResponse>({
+  return orionApi<MessagingPlatformTestResponse>({
     ...profileScoped(profile),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}/test`,
     method: 'POST'
@@ -51,7 +51,7 @@ export function testMessagingPlatform(
 // a row they can already see.
 
 export function getPairing(profile?: null | string): Promise<PairingResponse> {
-  return hermesApi<PairingResponse>({
+  return orionApi<PairingResponse>({
     ...profileScoped(profile),
     path: '/api/pairing'
   })
@@ -62,7 +62,7 @@ export function approvePairing(
   requestId: string,
   profile?: null | string
 ): Promise<{ ok: boolean; user: PairingUser }> {
-  return hermesApi<{ ok: boolean; user: PairingUser }>({
+  return orionApi<{ ok: boolean; user: PairingUser }>({
     ...profileScoped(profile),
     path: '/api/pairing/approve',
     method: 'POST',
@@ -73,7 +73,7 @@ export function approvePairing(
 }
 
 export function revokePairing(platform: string, userId: string, profile?: null | string): Promise<{ ok: boolean }> {
-  return hermesApi<{ ok: boolean }>({
+  return orionApi<{ ok: boolean }>({
     ...profileScoped(profile),
     path: '/api/pairing/revoke',
     method: 'POST',
@@ -87,14 +87,14 @@ export function revokePairing(platform: string, userId: string, profile?: null |
 // best-effort restarts the gateway; subscription changes hot-reload.
 
 export function getWebhooks(): Promise<WebhooksResponse> {
-  return hermesApi<WebhooksResponse>({
+  return orionApi<WebhooksResponse>({
     ...profileScoped(),
     path: '/api/webhooks'
   })
 }
 
 export function enableWebhooks(): Promise<WebhookEnableResponse> {
-  return hermesApi<WebhookEnableResponse>({
+  return orionApi<WebhookEnableResponse>({
     ...profileScoped(),
     path: '/api/webhooks/enable',
     method: 'POST'
@@ -102,7 +102,7 @@ export function enableWebhooks(): Promise<WebhookEnableResponse> {
 }
 
 export function createWebhook(body: WebhookCreatePayload): Promise<WebhookCreateResponse> {
-  return hermesApi<WebhookCreateResponse>({
+  return orionApi<WebhookCreateResponse>({
     ...profileScoped(),
     path: '/api/webhooks',
     method: 'POST',
@@ -111,7 +111,7 @@ export function createWebhook(body: WebhookCreatePayload): Promise<WebhookCreate
 }
 
 export function deleteWebhook(name: string): Promise<{ ok: boolean }> {
-  return hermesApi<{ ok: boolean }>({
+  return orionApi<{ ok: boolean }>({
     ...profileScoped(),
     path: `/api/webhooks/${encodeURIComponent(name)}`,
     method: 'DELETE'
@@ -122,7 +122,7 @@ export function setWebhookEnabled(
   name: string,
   enabled: boolean
 ): Promise<{ enabled: boolean; name: string; ok: boolean }> {
-  return hermesApi<{ enabled: boolean; name: string; ok: boolean }>({
+  return orionApi<{ enabled: boolean; name: string; ok: boolean }>({
     ...profileScoped(),
     path: `/api/webhooks/${encodeURIComponent(name)}/enabled`,
     method: 'PUT',

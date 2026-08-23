@@ -477,7 +477,7 @@ class WebhookAdapter(BasePlatformAdapter):
         Set via ``platforms.webhook.extra.routes.<name>.toolsets`` in
         config.yaml or a ``toolsets`` key on a subscription in
         ``webhook_subscriptions.json`` (manual edit — deliberately NOT
-        exposed through `hermes webhook subscribe`, so an agent-created
+        exposed through `orion webhook subscribe`, so an agent-created
         subscription cannot self-grant elevated tools).
         """
         chat_id = str(getattr(source, "chat_id", "") or "")
@@ -503,9 +503,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
-        from hermes_constants import get_hermes_home
-        hermes_home = get_hermes_home()
-        subs_path = hermes_home / _DYNAMIC_ROUTES_FILENAME
+        from orion_constants import get_orion_home
+        orion_home = get_orion_home()
+        subs_path = orion_home / _DYNAMIC_ROUTES_FILENAME
         if not subs_path.exists():
             if self._dynamic_routes:
                 self._dynamic_routes = {}
@@ -585,7 +585,7 @@ class WebhookAdapter(BasePlatformAdapter):
             # the prefix served the gateway owner's routes/config under
             # another profile's URL (#91583 defect 2).
             try:
-                from hermes_cli.profiles import profile_matches_home
+                from orion_cli.profiles import profile_matches_home
 
                 if profile_matches_home(profile):
                     return None
@@ -593,7 +593,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 pass
             return _PROFILE_REJECTED
         try:
-            from hermes_cli.profiles import profiles_to_serve
+            from orion_cli.profiles import profiles_to_serve
             served = {
                 name
                 for name, _ in profiles_to_serve(

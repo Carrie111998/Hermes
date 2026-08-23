@@ -3,13 +3,13 @@
 ``validate_media_delivery_path`` (gateway/platforms/base.py) reads its policy
 from environment variables:
 
-  - ``HERMES_MEDIA_DELIVERY_STRICT``    <- gateway.strict
-  - ``HERMES_MEDIA_ALLOW_DIRS``         <- gateway.media_delivery_allow_dirs
-  - ``HERMES_MEDIA_TRUST_RECENT_FILES`` <- gateway.trust_recent_files
+  - ``ORION_MEDIA_DELIVERY_STRICT``    <- gateway.strict
+  - ``ORION_MEDIA_ALLOW_DIRS``         <- gateway.media_delivery_allow_dirs
+  - ``ORION_MEDIA_TRUST_RECENT_FILES`` <- gateway.trust_recent_files
 
 Historically the config.yaml -> env translation ran ONLY in gateway startup
 (gateway/run.py), so any process that delivers media without booting the
-gateway — a manual ``hermes cron run`` in the CLI, ``hermes send``, a
+gateway — a manual ``orion cron run`` in the CLI, ``orion send``, a
 standalone cron tick — filtered MEDIA paths under DIFFERENT policy than the
 gateway's scheduled deliveries. In strict/allowlisted enterprise deployments
 that divergence silently dropped attachments from manual cron runs while
@@ -35,15 +35,15 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-_STRICT_ENV = "HERMES_MEDIA_DELIVERY_STRICT"
-_ALLOW_DIRS_ENV = "HERMES_MEDIA_ALLOW_DIRS"
-_TRUST_RECENT_ENV = "HERMES_MEDIA_TRUST_RECENT_FILES"
+_STRICT_ENV = "ORION_MEDIA_DELIVERY_STRICT"
+_ALLOW_DIRS_ENV = "ORION_MEDIA_ALLOW_DIRS"
+_TRUST_RECENT_ENV = "ORION_MEDIA_TRUST_RECENT_FILES"
 
 
 def _load_gateway_cfg(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if config is None:
         try:
-            from hermes_cli.config import load_config
+            from orion_cli.config import load_config
 
             config = load_config() or {}
         except Exception:

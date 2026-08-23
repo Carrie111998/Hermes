@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-12T00:00:00Z",
+  "plugins": [
+    {
+      "name": "orion-media-studio",
+      "description": "Media Studio — generative media workspace plugin for Orion Desktop (fal + Krea, durable job queue, library).",
+      "author": "Orion",
+      "tags": ["media", "image-gen", "video-gen", "dashboard", "desktop"],
+      "repo": "Orion/orion-media-studio",
+      "ref": "e8d59971d2b7901405b39dac7b03bdd616272d0d",
+      "homepage": "https://github.com/zacharyjleach-stack/Aries",
+      "capabilities": ["tools", "dashboard"],
+      "api_version": 1,
+      "added_at": "2026-08-12"
+    },
+    {
+      "name": "orion-telegram-business",
+      "description": "Observe-with-approval Telegram Business Mode (secretary bot) plugin — every drafted reply requires owner approval before it reaches the customer.",
+      "author": "Orion",
+      "tags": ["telegram", "gateway", "approvals", "messaging"],
+      "repo": "Orion/orion-telegram-business",
+      "ref": "e905f3bc5eeaa5a9dab9bc5155601b3ebec75757",
+      "homepage": "https://github.com/zacharyjleach-stack/Aries",
+      "capabilities": ["platform"],
+      "api_version": 1,
+      "added_at": "2026-08-12"
+    },
+    {
+      "name": "plugin-llm-example",
+      "description": "Reference plugin showing host-owned structured LLM access via ctx.llm.complete_structured(). Registers a /receipt-extract slash command.",
+      "author": "Orion",
+      "tags": ["example", "llm", "reference", "slash-command"],
+      "repo": "Orion/orion-example-plugins",
+      "subdir": "plugin-llm-example",
+      "ref": "38fe0fb53eff98d477f807432e965429e665ca33",
+      "homepage": "https://github.com/zacharyjleach-stack/Aries/tree/main/plugin-llm-example",
+      "capabilities": ["commands", "llm"],
+      "api_version": 1,
+      "added_at": "2026-08-12"
+    },
+    {
+      "name": "plugin-llm-async-example",
+      "description": "Reference plugin demonstrating async host-owned LLM access from plugin code — the asyncio counterpart to plugin-llm-example.",
+      "author": "Orion",
+      "tags": ["example", "llm", "async", "reference"],
+      "repo": "Orion/orion-example-plugins",
+      "subdir": "plugin-llm-async-example",
+      "ref": "38fe0fb53eff98d477f807432e965429e665ca33",
+      "homepage": "https://github.com/zacharyjleach-stack/Aries/tree/main/plugin-llm-async-example",
+      "capabilities": ["commands", "llm"],
+      "api_version": 1,
+      "added_at": "2026-08-12"
+    },
+    {
+      "name": "orion-plugin-chrome-profiles",
+      "description": "Switch Orion browser tools between Chrome profiles via CDP.",
+      "author": "anpicasso",
+      "tags": ["browser", "chrome", "cdp", "tools"],
+      "repo": "anpicasso/orion-plugin-chrome-profiles",
+      "ref": "5b9c3257b464c0f926d4355149a8aed9c8f307b4",
+      "homepage": "https://github.com/anpicasso/orion-plugin-chrome-profiles",
+      "capabilities": ["tools"],
+      "api_version": 1,
+      "added_at": "2026-08-12"
+    }
+  ]
+}

@@ -151,7 +151,7 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # Metadata key added to context compression summary messages so that frontends
 # (CLI, Desktop, gateway, TUI) can distinguish them from real assistant/user
 # messages and filter or render them appropriately without content-prefix
-# heuristics. See https://github.com/NousResearch/hermes-agent/issues/38389
+# heuristics. See https://github.com/zacharyjleach-stack/Aries/issues/38389
 #
 # Underscore-prefixed ON PURPOSE: the wire sanitizers
 # (agent/transports/chat_completions.py convert_messages and the summary-path
@@ -681,7 +681,7 @@ _PRUNE_MIN_CHARS = 200
 # the user never actually answered (timeout / no-user contexts). These must
 # not be quoted as a user answer during compaction. Sources:
 #   cli.py timeout callback, gateway/run.py timeout + delivery-failure paths,
-#   hermes_cli/oneshot.py no-user callback.
+#   orion_cli/oneshot.py no-user callback.
 _CLARIFY_NON_RESPONSE_PREFIXES = (
     "The user did not provide a response",
     "[user did not respond",
@@ -856,7 +856,7 @@ def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
 # disposable bulk), (b) demotion of old tool results to stubs that carry a
 # RECOVERY POINTER instead of deleting content outright, and (c) a
 # deterministic recovery footer naming the exact session_search call that
-# re-accesses the compacted region. Hermes already persists every
+# re-accesses the compacted region. Orion already persists every
 # pre-compaction message in state.db — session_search makes compaction
 # lossy-but-recoverable, which none of the scouted competitors have at
 # runtime.
@@ -948,7 +948,7 @@ def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
 def _build_recovery_footer(session_id: str, region_len: int) -> str:
     """Deterministic pointer to the compacted region in session history.
 
-    Hermes persists every pre-compaction message in state.db; session_search
+    Orion persists every pre-compaction message in state.db; session_search
     reaches it. The footer makes that re-access path explicit so the model
     treats compaction as deferred retrieval, not loss.
     """
@@ -1751,7 +1751,7 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
 
     Shallow copies of touched messages only; input is never mutated.
     Port of Kilo-Org/kilocode#9434 (adapted for the OpenAI-style message
-    shape the hermes compressor emits).
+    shape the orion compressor emits).
     """
     if not messages:
         return messages
@@ -3385,7 +3385,7 @@ class ContextCompressor(ContextEngine):
         """Return True when a high rough preflight estimate is known-noisy.
 
         ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates so Hermes compresses before a provider rejects the
+        overestimates so Orion compresses before a provider rejects the
         payload — but the margin is not a fixed percentage: CJK text is
         counted at ~1.7x its o200k cost and Responses-mode reasoning replay
         blobs at several times their billed cost, so heavy sessions can show
@@ -4664,14 +4664,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
         # Date-only granularity matches system_prompt.py:337 (PR #20451) and the
-        # user's configured timezone via hermes_time.now(). The compaction summary
+        # user's configured timezone via orion_time.now(). The compaction summary
         # is a mid-conversation message that is NOT part of the cached prefix, so a
         # date here never affects prompt-cache stability. Resolved defensively —
         # a clock failure must never block compaction.
         try:
-            from hermes_time import now as _hermes_now
+            from orion_time import now as _orion_now
 
-            _today_str = _hermes_now().strftime("%Y-%m-%d")
+            _today_str = _orion_now().strftime("%Y-%m-%d")
         except Exception:  # pragma: no cover - clock resolution is best-effort
             _today_str = ""
 
@@ -7746,7 +7746,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # request-build time), so ``last_head_role`` defaults to "user" and
         # the summary is emitted as role="assistant". On a session whose only
         # genuine user turn falls into the compressed middle — e.g. a
-        # ``hermes kanban`` worker seeded with a single short
+        # ``orion kanban`` worker seeded with a single short
         # ``"work kanban task <id>"`` prompt followed by nothing but
         # assistant/tool turns — that leaves the compressed transcript with
         # ZERO user-role messages. OpenAI-compatible backends (vLLM/Qwen)
@@ -7972,7 +7972,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # high-water mark until exit. The helper is glibc-gated, config-gated
         # and rate-limited, so this is a safe no-op elsewhere. (#70782)
         try:
-            from hermes_cli.mem_trim import trim_memory
+            from orion_cli.mem_trim import trim_memory
 
             trim_memory(reason="post-compression")
         except Exception as exc:

@@ -21,9 +21,9 @@ from tools import bot_relay
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    h = tmp_path / ".hermes"
+    h = tmp_path / ".orion"
     (h / "profiles" / "ops").mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(h))
+    monkeypatch.setenv("ORION_HOME", str(h))
     return h
 
 
@@ -52,7 +52,7 @@ def test_outbox_drain_returns_each_envelope_once(home):
     target = {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
               "connection_label": "", "title": "", "description": ""}
     env = bot_relay.enqueue_envelope(
-        home, target=target, message="m", sender_profile="default", sender_handle="hermes"
+        home, target=target, message="m", sender_profile="default", sender_handle="orion"
     )
     first = _result(srv._methods["bot_relay.outbox.drain"](1, {}))
     assert [e["id"] for e in first["envelopes"]] == [env["id"]]
@@ -78,12 +78,12 @@ def test_deliver_validates_profile_and_runs_transport(home, monkeypatch):
     )
     assert out["reply"] == "pong from ops"
     argv = calls["argv"]
-    assert argv[:3] == ["hermes", "-p", "ops"]
+    assert argv[:3] == ["orion", "-p", "ops"]
     assert "Bot Chat" in argv and "--query-file" in argv
 
-    # 'hermes' alias resolves to default
-    _result(srv._methods["bot_relay.deliver"](2, {"profile": "hermes", "message": "x"}))
-    assert calls["argv"][:3] == ["hermes", "-p", "default"]
+    # 'orion' alias resolves to default
+    _result(srv._methods["bot_relay.deliver"](2, {"profile": "orion", "message": "x"}))
+    assert calls["argv"][:3] == ["orion", "-p", "default"]
 
     # unknown profile refuses without spawning
     calls.clear()
@@ -137,4 +137,4 @@ def test_deliver_write_failure_still_removes_tempfile(home, monkeypatch, tmp_pat
     err = srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "x"})
     assert "error" in err
     assert made, "mkstemp was never reached"
-    assert not glob.glob(str(tmp_path / "hermes-relay-dm-*")), "tempfile leaked"
+    assert not glob.glob(str(tmp_path / "orion-relay-dm-*")), "tempfile leaked"

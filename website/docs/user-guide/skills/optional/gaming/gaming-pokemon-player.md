@@ -14,17 +14,17 @@ Play Pokemon via headless emulator + RAM reads.
 
 | | |
 |---|---|
-| Source | Optional — install with `hermes skills install official/gaming/pokemon-player` |
+| Source | Optional — install with `orion skills install official/gaming/pokemon-player` |
 | Path | `optional-skills/gaming/pokemon-player` |
 | Version | `1.0.0` |
-| Author | Teknium (teknium1), Hermes Agent |
+| Author | Teknium (teknium1), Orion Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
 
 ## Reference: full SKILL.md
 
 :::info
-The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+The following is the complete skill definition that Orion loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
 :::
 
 # Pokemon Player
@@ -40,7 +40,7 @@ Play Pokemon games via headless emulation using the `pokemon-agent` package.
 ## Startup Procedure
 
 ### 1. First-time setup (clone, venv, install)
-The repo is NousResearch/pokemon-agent on GitHub. Clone it, then
+The repo is Orion/pokemon-agent on GitHub. Clone it, then
 set up a Python 3.10+ virtual environment. Use uv (preferred for speed)
 to create the venv and install the package in editable mode with the
 pyboy extra. If uv is not available, fall back to python3 -m venv + pip.

@@ -12,7 +12,7 @@ Features:
 - Shared file store tools (upload, list, read, ingest, delete)
 - Explicit memory tools (profile, search, context, remember, forget)
 
-Config (env vars or hermes config.yaml under retaindb:):
+Config (env vars or orion config.yaml under retaindb:):
   RETAINDB_API_KEY     — API key (required)
   RETAINDB_BASE_URL    — API endpoint (default: https://api.retaindb.com)
   RETAINDB_PROJECT     — Project identifier (optional — defaults to "default")
@@ -53,7 +53,7 @@ def _load_retaindb_config() -> Dict[str, Any]:
     secret resolution rather than config.yaml.
     """
     try:
-        from hermes_cli.config import load_config_readonly
+        from orion_cli.config import load_config_readonly
 
         config = load_config_readonly()
         memory_config = config.get("memory", {}) if isinstance(config, dict) else {}
@@ -213,7 +213,7 @@ class _Client:
         h = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "x-sdk-runtime": "hermes-plugin",
+            "x-sdk-runtime": "orion-plugin",
         }
         if path.startswith(("/v1/memory", "/v1/context")):
             h["X-API-Key"] = token
@@ -312,7 +312,7 @@ class _Client:
         import requests
         url = f"{self.base_url}/v1/files"
         token = self.api_key.replace("Bearer ", "").strip()
-        headers = {"Authorization": f"Bearer {token}", "x-sdk-runtime": "hermes-plugin"}
+        headers = {"Authorization": f"Bearer {token}", "x-sdk-runtime": "orion-plugin"}
         fields = {"path": remote_path, "scope": scope.upper()}
         if project_id:
             fields["project_id"] = project_id
@@ -333,7 +333,7 @@ class _Client:
         import requests
         token = self.api_key.replace("Bearer ", "").strip()
         url = f"{self.base_url}/v1/files/{quote(file_id, safe='')}/content"
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}", "x-sdk-runtime": "hermes-plugin"}, timeout=30, allow_redirects=True)
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}", "x-sdk-runtime": "orion-plugin"}, timeout=30, allow_redirects=True)
         resp.raise_for_status()
         return resp.content
 
@@ -532,7 +532,7 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._queue: _WriteQueue | None = None
         self._user_id = "default"
         self._session_id = ""
-        self._agent_id = "hermes"
+        self._agent_id = "orion"
         self._lock = threading.Lock()
 
         # Prefetch caches
@@ -573,28 +573,28 @@ class RetainDBMemoryProvider(MemoryProvider):
         )
         base_url = re.sub(r"/+$", "", base_url_raw)
 
-        # Project resolution: RETAINDB_PROJECT > config.yaml project > hermes-<profile> > "default"
+        # Project resolution: RETAINDB_PROJECT > config.yaml project > orion-<profile> > "default"
         # If unset, the API auto-creates and uses the "default" project — no config required.
         explicit = os.environ.get("RETAINDB_PROJECT") or _config_str(provider_config.get("project"))
         if explicit:
             project = explicit
         else:
-            hermes_home = str(kwargs.get("hermes_home", ""))
-            profile_name = os.path.basename(hermes_home) if hermes_home else ""
-            project = f"hermes-{profile_name}" if (profile_name and profile_name not in {"", ".hermes"}) else "default"
+            orion_home = str(kwargs.get("orion_home", ""))
+            profile_name = os.path.basename(orion_home) if orion_home else ""
+            project = f"orion-{profile_name}" if (profile_name and profile_name not in {"", ".orion"}) else "default"
 
         self._client = _Client(api_key, base_url, project)
         self._session_id = session_id
         self._user_id = kwargs.get("user_id", "default") or "default"
-        self._agent_id = kwargs.get("agent_id", "hermes") or "hermes"
+        self._agent_id = kwargs.get("agent_id", "orion") or "orion"
 
-        from hermes_constants import get_hermes_home
-        hermes_home_path = get_hermes_home()
-        db_path = hermes_home_path / "retaindb_queue.db"
+        from orion_constants import get_orion_home
+        orion_home_path = get_orion_home()
+        db_path = orion_home_path / "retaindb_queue.db"
         self._queue = _WriteQueue(self._client, db_path)
 
         # Seed agent identity from SOUL.md in background
-        soul_path = hermes_home_path / "SOUL.md"
+        soul_path = orion_home_path / "SOUL.md"
         if soul_path.exists():
             soul_content = soul_path.read_text(encoding="utf-8", errors="replace").strip()
             if soul_content:

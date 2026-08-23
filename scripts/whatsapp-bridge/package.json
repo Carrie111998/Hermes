@@ -1,7 +1,7 @@
 {
-  "name": "hermes-whatsapp-bridge",
+  "name": "orion-whatsapp-bridge",
   "version": "1.0.0",
-  "description": "WhatsApp bridge for Hermes Agent using Baileys",
+  "description": "WhatsApp bridge for Orion Agent using Baileys",
   "private": true,
   "type": "module",
   "scripts": {

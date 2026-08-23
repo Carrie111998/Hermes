@@ -16,7 +16,7 @@ interface SshRouteConfig {
   keyPath?: string
   mode: 'ssh'
   port?: number
-  remoteHermesPath?: string
+  remoteOrionPath?: string
   remoteProfile?: string
   user?: string
 }
@@ -109,8 +109,8 @@ export function resolveDesktopRemoteRoute({
 
     if (!envToken) {
       throw new Error(
-        'HERMES_DESKTOP_REMOTE_URL is set but HERMES_DESKTOP_REMOTE_TOKEN is not. ' +
-          'Both must be provided to connect to a remote Hermes backend.'
+        'ORION_DESKTOP_REMOTE_URL is set but ORION_DESKTOP_REMOTE_TOKEN is not. ' +
+          'Both must be provided to connect to a remote Orion backend.'
       )
     }
 

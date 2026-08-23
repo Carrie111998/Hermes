@@ -8,8 +8,8 @@ import {
   openSessionInNewWindow
 } from './windows'
 
-const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
-const initialHermesDesktop = desktopWindow.hermesDesktop
+const desktopWindow = window as unknown as { orionDesktop?: Window['orionDesktop'] }
+const initialOrionDesktop = desktopWindow.orionDesktop
 
 const notifyError = vi.fn()
 
@@ -18,13 +18,13 @@ vi.mock('./notifications', () => ({
 }))
 
 function installBridge(
-  openSessionWindow?: Window['hermesDesktop']['openSessionWindow'],
-  openWindow?: Window['hermesDesktop']['openWindow']
+  openSessionWindow?: Window['orionDesktop']['openSessionWindow'],
+  openWindow?: Window['orionDesktop']['openWindow']
 ) {
-  desktopWindow.hermesDesktop = {
+  desktopWindow.orionDesktop = {
     ...(openSessionWindow ? { openSessionWindow } : {}),
     ...(openWindow ? { openWindow } : {})
-  } as unknown as Window['hermesDesktop']
+  } as unknown as Window['orionDesktop']
 }
 
 beforeEach(() => {
@@ -32,16 +32,16 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  if (initialHermesDesktop) {
-    desktopWindow.hermesDesktop = initialHermesDesktop
+  if (initialOrionDesktop) {
+    desktopWindow.orionDesktop = initialOrionDesktop
   } else {
-    delete desktopWindow.hermesDesktop
+    delete desktopWindow.orionDesktop
   }
 })
 
 describe('canOpenSessionWindow', () => {
   it('is false when the desktop bridge is absent', () => {
-    delete desktopWindow.hermesDesktop
+    delete desktopWindow.orionDesktop
     expect(canOpenSessionWindow()).toBe(false)
   })
 
@@ -77,7 +77,7 @@ describe('openSessionInNewWindow', () => {
   })
 
   it('no-ops gracefully when the bridge is absent (web fallback)', async () => {
-    delete desktopWindow.hermesDesktop
+    delete desktopWindow.orionDesktop
 
     await openSessionInNewWindow('s1')
 
@@ -123,7 +123,7 @@ describe('openSessionInNewWindow', () => {
 
 describe('canOpenNewWindow', () => {
   it('is false when the desktop bridge is absent', () => {
-    delete desktopWindow.hermesDesktop
+    delete desktopWindow.orionDesktop
     expect(canOpenNewWindow()).toBe(false)
   })
 
@@ -140,7 +140,7 @@ describe('canOpenNewWindow', () => {
 
 describe('openNewWindow', () => {
   it('no-ops gracefully when the bridge is absent (web fallback)', async () => {
-    delete desktopWindow.hermesDesktop
+    delete desktopWindow.orionDesktop
 
     await openNewWindow()
 

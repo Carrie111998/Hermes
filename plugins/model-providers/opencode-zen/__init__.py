@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hermes_cli import __version__ as _HERMES_VERSION
+from orion_cli import __version__ as _ORION_VERSION
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -19,11 +19,11 @@ from providers.base import ProviderProfile
 # to OpenRouter, Vercel AI Gateway, and Fireworks. Going through
 # profile.default_headers means they survive model switches and credential
 # rotation. Without them OpenCode only sees the OpenAI SDK's generic
-# "OpenAI/Python x.y.z" User-Agent and can't tell the traffic is Hermes Agent.
+# "OpenAI/Python x.y.z" User-Agent and can't tell the traffic is Orion Agent.
 _ATTRIBUTION_HEADERS = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+    "HTTP-Referer": "https://your-orion-docs.example",
+    "X-Title": "Orion Agent",
+    "User-Agent": f"OrionAgent/{_ORION_VERSION}",
 }
 
 

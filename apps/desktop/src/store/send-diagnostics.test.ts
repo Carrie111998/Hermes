@@ -19,14 +19,14 @@ function stubGateway(
 }
 
 function stubDesktopLogs(lines: null | string[]) {
-  const original = window.hermesDesktop
+  const original = window.orionDesktop
 
-  Object.defineProperty(window, 'hermesDesktop', {
+  Object.defineProperty(window, 'orionDesktop', {
     configurable: true,
     value: lines ? { getRecentLogs: async () => ({ lines, path: '/tmp/desktop.log' }) } : undefined
   })
 
-  return () => Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: original })
+  return () => Object.defineProperty(window, 'orionDesktop', { configurable: true, value: original })
 }
 
 describe('send-diagnostics store', () => {

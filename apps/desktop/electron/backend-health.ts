@@ -10,7 +10,7 @@ export const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 5_000
 type FetchPublicJson = (url: string, options?: { timeoutMs?: number }) => Promise<unknown>
 type FetchJson = (url: string, token?: string | null, options?: { timeoutMs?: number }) => Promise<unknown>
 
-export interface HermesReadyOptions {
+export interface OrionReadyOptions {
   fetchPublicJson: FetchPublicJson
   fetchJson: FetchJson
   token?: string | null
@@ -30,7 +30,7 @@ export interface HermesReadyOptions {
   probeHealth?: (url: string, options?: { timeoutMs?: number }) => Promise<unknown>
   /**
    * Whether `probeHealth` actually presents credentials. Distinguishes the
-   * two very different meanings of a 401 (see `waitForHermesReady`).
+   * two very different meanings of a 401 (see `waitForOrionReady`).
    */
   probeIsCredentialed?: boolean
 }
@@ -93,7 +93,7 @@ export function isServerSideHttpError(error: unknown): {
  *
  *  - OAuth WS-ticket mint (buildRemoteConnection → mintGatewayWsTicket), which
  *    runs BEFORE the readiness loop; and
- *  - readiness-probe exhaustion in waitForHermesReady().
+ *  - readiness-probe exhaustion in waitForOrionReady().
  *
  * Returns null unless the backend is a *.agents.nousresearch.com host AND the
  * error classifies as 502/503/504. When it matches, returns an error carrying:
@@ -127,7 +127,7 @@ export function makeNousCloudBackendDownError(baseUrl: string, error: unknown): 
       `(HTTP ${serverError.statusCode}: server-side fault). ` +
       'Check https://portal.nousresearch.com for backend status, ' +
       'or switch to Local mode in Settings → Gateway. ' +
-      'You can also reach out on Discord at discord.gg/NousResearch ' +
+      'You can also reach out on Discord at github.com/zacharyjleach-stack/Aries ' +
       'for immediate assistance. ' +
       `Original detail: ${detail}`
   ) as any
@@ -141,7 +141,7 @@ export function makeNousCloudBackendDownError(baseUrl: string, error: unknown): 
 }
 
 /**
- * True when the backend URL points at a Nous-managed Hermes Cloud instance
+ * True when the backend URL points at a Nous-managed Orion Cloud instance
  * (e.g. ares-3009.agents.nousresearch.com). These are Fly.io-hosted machines
  * the user cannot restart themselves — a 503 from one means the server is down
  * and the recovery path is Portal/Discord/wait.
@@ -211,7 +211,7 @@ function supersededError() {
   return error
 }
 
-export async function waitForHermesReady(baseUrl: string, options: HermesReadyOptions): Promise<void> {
+export async function waitForOrionReady(baseUrl: string, options: OrionReadyOptions): Promise<void> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_BACKEND_READY_TIMEOUT_MS
   const pollMs = options.pollMs ?? DEFAULT_BACKEND_READY_POLL_MS
   const healthProbeTimeoutMs = options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS
@@ -296,5 +296,5 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
     throw cloudError
   }
 
-  throw new Error(`Hermes backend did not become ready: ${detail}`)
+  throw new Error(`Orion backend did not become ready: ${detail}`)
 }
