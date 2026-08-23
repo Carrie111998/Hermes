@@ -1067,6 +1067,7 @@ def write_runtime_status(
     active_agents: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
+    platform_live_health: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     needs_attention: Any = _UNSET,
@@ -1122,6 +1123,8 @@ def write_runtime_status(
         platform_payload = payload["platforms"].get(platform, {})
         if platform_state is not _UNSET:
             platform_payload["state"] = platform_state
+        if platform_live_health is not _UNSET:
+            platform_payload["live_health"] = platform_live_health
         if error_code is not _UNSET:
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:
@@ -1157,6 +1160,15 @@ def write_runtime_status(
         emit_runtime_status_transition(previous_payload, payload)
     except Exception:
         pass
+
+
+def write_platform_live_health(platform: str, health: dict) -> None:
+    """Convenience helper to persist a platform's live health data.
+
+    Delegates to ``write_runtime_status()`` with the ``platform`` and
+    ``platform_live_health`` keyword arguments.
+    """
+    write_runtime_status(platform=platform, platform_live_health=health)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
