@@ -26,6 +26,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from docs_germination import (  # noqa: E402
     MANIFEST,
     ROOT_DOCS,
+    TARGET_LOCALE_CONTRACT,
+    TARGET_LOCALES,
     check_all,
     check_doc_parity,
     extract_anchors,
@@ -44,18 +46,36 @@ def _read(doc: str) -> str:
     return (REPO_ROOT / doc).read_text(encoding="utf-8")
 
 
-def test_manifest_covers_top_ten_languages_and_french():
-    """The manifest IS the roadmap: French must be germinated; the top-10
-    global languages must all be listed (in Ethnologue order)."""
-    codes = list(MANIFEST)
-    assert "fr" in codes, "French must be in the manifest"
+def test_manifest_matches_versioned_non_english_target_contract():
+    """One versioned tuple is the completeness authority; the manifest and
+    every test consume it directly rather than repeating a drifting subset."""
+    assert TARGET_LOCALE_CONTRACT == {
+        "version": "ethnologue-200-29e-2026-all-users-top-10-non-english",
+        "scope": "top 10 non-English documentation locales",
+        "source": "Ethnologue 200",
+        "edition": 29,
+        "year": 2026,
+        "metric": "All Users",
+        "speaker_basis": "L1+L2",
+        "canonical_source_locale": "en",
+    }
+    assert len(TARGET_LOCALES) == 10
+    assert len(set(TARGET_LOCALES)) == len(TARGET_LOCALES)
+    assert "en" not in TARGET_LOCALES
+    assert tuple(MANIFEST) == TARGET_LOCALES
+    for code in TARGET_LOCALES:
+        assert code in MANIFEST, f"target locale {code} missing from manifest"
+
+    assert {"id", "ru"} <= set(TARGET_LOCALES)
     assert MANIFEST["fr"]["status"] == "germinated"
-    # Top-10 global languages, minus zh-CN's slot being present:
-    for code in ("zh-CN", "hi", "es", "ar", "bn", "pt", "ru", "ur-pk"):
-        assert code in MANIFEST, f"top-10 language {code} missing from manifest"
-    # French must not be alone in germinated status (the gate must be
-    # enforceable without French being special-cased).
-    assert sum(1 for m in MANIFEST.values() if m["status"] == "germinated") >= 1
+    assert {code for code, meta in MANIFEST.items() if meta["status"] == "manual"} == {
+        "zh-CN",
+        "es",
+        "ur-pk",
+    }
+    id_contract = f"{MANIFEST['id']['provenance']} {MANIFEST['id']['notes']}"
+    assert "#92191" in id_contract and "#92192" in id_contract
+    assert "11th" not in id_contract and "next in line" not in id_contract
 
 
 def test_french_docs_are_present_and_germinated():
