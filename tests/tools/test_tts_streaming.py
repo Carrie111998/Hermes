@@ -93,6 +93,28 @@ def test_never_swaps_provider_for_streaming(monkeypatch):
     assert ts.resolve_streaming_provider({"provider": "edge"}) is None
 
 
+def test_auto_streamer_resolves_instructions_for_selected_provider(monkeypatch):
+    _register_fake(monkeypatch, "openai")
+    monkeypatch.setattr(ts, "_PROVIDER_PRIORITY", ["openai"])
+    config = {
+        "provider": "edge",
+        "instructions": "global",
+        "openai": {"instructions": "selected provider"},
+        "streaming": {"provider": "auto"},
+    }
+
+    provider = ts.resolve_streaming_provider(config)
+
+    assert provider is not None
+    assert provider.tts_config == {
+        "provider": "edge",
+        "instructions": "selected provider",
+        "openai": {"instructions": "selected provider"},
+        "streaming": {"provider": "auto"},
+    }
+    assert config["instructions"] == "global"
+
+
 # ── Built-in provider availability ───────────────────────────────────────
 
 
@@ -116,7 +138,36 @@ def test_openai_available_reflects_audio_key_resolution(monkeypatch):
     assert ts.OpenAIStreamer.available() is True
 
 
-def test_openai_streamer_prefers_configured_api_key(monkeypatch):
+@pytest.mark.parametrize(
+    ("instructions_config", "expected_instructions"),
+    [
+        pytest.param(
+            {"instructions": "global", "openai": {"instructions": "provider"}},
+            "provider",
+            id="provider-override",
+        ),
+        pytest.param(
+            {"instructions": "global", "openai": {}},
+            "global",
+            id="global-default",
+        ),
+        pytest.param(
+            {"instructions": "global", "openai": {"instructions": ""}},
+            None,
+            id="provider-empty-suppresses-global",
+        ),
+        pytest.param(
+            {"openai": {}},
+            None,
+            id="unset",
+        ),
+    ],
+)
+def test_openai_streamer_uses_resolved_config(
+    monkeypatch,
+    instructions_config,
+    expected_instructions,
+):
     captured = {}
 
     class _Response:
@@ -132,6 +183,7 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     class _StreamingCreate:
         @staticmethod
         def create(**kwargs):
+            captured["request"] = kwargs
             return _Response()
 
     class _OpenAI:
@@ -144,15 +196,35 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
     monkeypatch.setattr("openai.OpenAI", _OpenAI)
 
-    config = {
-        "provider": "openai",
-        "openai": {"api_key": "cfg-key", "base_url": "http://local-tts.example/v1"},
+    openai_config = instructions_config["openai"]
+    config = dict(instructions_config)
+    config["provider"] = "openai"
+    config["openai"] = {
+        **openai_config,
+        "api_key": "cfg-key",
+        "base_url": "http://local-tts.example/v1",
     }
     streamer = ts.resolve_streaming_provider(config)
 
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
-    assert captured["client"]["api_key"] == "cfg-key"
+
+    expected_request = {
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "input": "Streaming test.",
+        "response_format": "pcm",
+    }
+    if expected_instructions is not None:
+        expected_request["instructions"] = expected_instructions
+
+    assert captured == {
+        "client": {
+            "api_key": "cfg-key",
+            "base_url": "http://local-tts.example/v1",
+        },
+        "request": expected_request,
+    }
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
