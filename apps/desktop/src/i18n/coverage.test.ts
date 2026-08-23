@@ -116,17 +116,17 @@ function parseArrow(fn: (...args: never[]) => string): ParsedArrow | null {
   return { params, body: source.slice(arrow + 2) }
 }
 
-/** Strip comments/literal text while retaining `${...}` template expressions. */
+/** Strip literal text/comments while retaining `${...}` template expressions. */
 function searchableBody(body: string): string {
-  const withoutCommentsAndStrings = body
+  const withTemplateExpressions = body.replace(/`(?:\\.|[^`\\])*`/gs, template => {
+    return [...template.matchAll(/\$\{([^}]*)\}/g)].map(match => match[1]).join(' ')
+  })
+
+  return withTemplateExpressions
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .replace(/\/\/[^\n\r]*/g, ' ')
     .replace(/'(?:\\.|[^'\\])*'/g, "''")
     .replace(/"(?:\\.|[^"\\])*"/g, '""')
-
-  return withoutCommentsAndStrings.replace(/`(?:\\.|[^`\\])*`/gs, template => {
-    return [...template.matchAll(/\$\{([^}]*)\}/g)].map(match => match[1]).join(' ')
-  })
 }
 
 function referenced(body: string, param: string): boolean {
