@@ -19,8 +19,8 @@ import {
   $fileBrowserOpen,
   $panesFlipped,
   $sidebarOpen,
-  toggleFileBrowserOpen,
   togglePanesFlipped,
+  toggleRightSide,
   toggleSidebarOpen
 } from '@/store/layout'
 import { $unreadSessionCount } from '@/store/session-dot-state'
@@ -154,10 +154,10 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   // POSITIONAL toggles: each button shows/hides everything on its physical
   // side of the main zone (the layout tree collapses the whole side), so they
   // stay correct through flips and rearranges. $sidebarOpen ≙ left side,
-  // $fileBrowserOpen ≙ right side. Never an active highlight — plain
-  // show/hide affordances.
+  // the right side resolves from the live tree (see toggleRightSide) — the
+  // browser column, the files column, whatever is physically right.
   const leftEdge = { open: sidebarOpen, toggle: toggleSidebarOpen }
-  const rightEdge = { open: fileBrowserOpen, toggle: toggleFileBrowserOpen }
+  const rightEdge = { open: fileBrowserOpen, toggle: toggleRightSide }
   const leftLabel = leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar
   const rightLabel = rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar
 
