@@ -13343,6 +13343,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+        self._spawn_supervised(self._flight_mode_watcher, "flight_mode_watcher")
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:

@@ -1777,3 +1777,55 @@ class GatewayKanbanWatchersMixin:
                 slept += 1.0
 
         self._release_kanban_dispatcher_lock()
+
+    async def _flight_mode_watcher(self) -> None:
+        """Probe the saved normal cascade and auto-restore sessions when it works.
+
+        Online is the default. While local, keep probing the backed-up
+        cliproxy route with real inference. One successful completion is
+        enough to restore config bytes, Kanban model pins, and every
+        session's pre-flight /model override so the next turn uses the
+        normal cloud stack. Does not start a second gateway.
+        """
+        interval = 15.0
+        while getattr(self, "_running", True):
+            try:
+                from hermes_cli.flight import FlightManager, restore_session_overrides
+
+                manager = FlightManager()
+                state = await asyncio.to_thread(manager.tick, port_tasks=True)
+                if state.get("tick_action") == "exit":
+                    saved = state.get("session_overrides") or {}
+                    if saved:
+                        live = getattr(self, "_session_model_overrides", None)
+                        store = getattr(self, "session_store", None)
+
+                        def _apply(session_key: str, override):
+                            peek = getattr(self, "_peek_session_state", None)
+                            live_state = peek(session_key) if callable(peek) else None
+                            conversation = getattr(live_state, "conversation", None)
+                            if conversation is not None:
+                                conversation.model_override = (
+                                    dict(override) if override else None
+                                )
+
+                        await asyncio.to_thread(
+                            restore_session_overrides,
+                            manager.home,
+                            saved,
+                            store=store,
+                            live_overrides=live if isinstance(live, dict) else None,
+                            apply_live=_apply,
+                        )
+                        logger.info(
+                            "flight mode: restored %d session(s) to the normal cascade",
+                            len(saved),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("flight mode watcher: tick failed")
+            slept = 0.0
+            while slept < interval and getattr(self, "_running", True):
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0

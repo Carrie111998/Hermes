@@ -152,3 +152,48 @@ def test_tick_transitions_online_local_online_using_real_inference_evidence(tmp_
     persisted = json.loads((tmp_path / "flight-mode" / "state.json").read_text())
     assert persisted["last_evidence"]["normal"]["detail"] == "normal inference ok"
     assert persisted["last_transition"]["to"] == "online"
+
+
+def test_sessions_pin_locally_then_resume_on_saved_cloud_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    pinned = store.get_or_create_session(
+        SessionSource(platform=Platform.TELEGRAM, user_id="u1", chat_id="c1", chat_type="dm")
+    )
+    store.set_model_override(
+        pinned.session_key,
+        {"model": "claude-opus-5", "provider": "cliproxyapi", "base_url": "http://127.0.0.1:8318/v1"},
+    )
+    defaulted = store.get_or_create_session(
+        SessionSource(platform=Platform.TELEGRAM, user_id="u2", chat_id="c2", chat_type="dm")
+    )
+
+    saved = flight.snapshot_and_pin_sessions(
+        tmp_path,
+        local_model="qwen3.5:35b-a3b-coding-nvfp4",
+        local_provider=flight.LOCAL_PROVIDER,
+        local_base_url="http://127.0.0.1:11434/v1",
+        store=store,
+    )
+    local_pinned = store.get_model_override(pinned.session_key) or {}
+    local_defaulted = store.get_model_override(defaulted.session_key) or {}
+    assert local_pinned.get("provider") == flight.LOCAL_PROVIDER
+    assert local_defaulted.get("provider") == flight.LOCAL_PROVIDER
+    assert saved[pinned.session_key]["model"] == "claude-opus-5"
+    assert saved[defaulted.session_key] is None
+
+    live = {defaulted.session_key: {"model": "coding:latest", "provider": flight.LOCAL_PROVIDER}}
+    flight.restore_session_overrides(tmp_path, saved, store=store, live_overrides=live)
+    restored = store.get_model_override(pinned.session_key) or {}
+    assert restored.get("model") == "claude-opus-5"
+    assert store.get_model_override(defaulted.session_key) is None
+    assert defaulted.session_key not in live
+
+
+def test_one_successful_normal_inference_exits_local_mode():
+    state = flight.new_state(now=1.0, failure_threshold=3, recovery_threshold=1, cooldown_seconds=0)
+    state["mode"] = "local"
+    assert flight.observe_connectivity(state, normal_ok=True, local_ok=True, now=2.0) == "exit"

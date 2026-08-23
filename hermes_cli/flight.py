@@ -26,8 +26,8 @@ DEFAULT_LOCAL_MODEL = "hermes-flight"
 DEFAULT_LOCAL_BASE = "qwen3-coder:30b"
 DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_FAILURE_THRESHOLD = 3
-DEFAULT_RECOVERY_THRESHOLD = 2
-DEFAULT_COOLDOWN_SECONDS = 60
+DEFAULT_RECOVERY_THRESHOLD = 1
+DEFAULT_COOLDOWN_SECONDS = 15
 NETWORK_MARKERS = (
     "http://",
     "https://",
@@ -304,6 +304,65 @@ def restore_task_overrides(conn: sqlite3.Connection, saved: dict[str, dict[str, 
         kb.set_model_override(conn, task_id, override.get("model"), override.get("provider"))
 
 
+def _session_store(home: Path, store: Any = None) -> Any:
+    if store is not None:
+        return store
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    return SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+
+
+def snapshot_and_pin_sessions(
+    home: Path,
+    *,
+    local_model: str,
+    local_provider: str,
+    local_base_url: str,
+    store: Any = None,
+) -> dict[str, Any]:
+    """Snapshot each session's /model pin, then point it at local inference."""
+    session_store = _session_store(home, store)
+    saved: dict[str, Any] = {}
+    local_override = {
+        "model": local_model,
+        "provider": local_provider,
+        "base_url": local_base_url.rstrip("/"),
+    }
+    for entry in session_store.list_sessions():
+        saved[entry.session_key] = (
+            dict(entry.model_override) if entry.model_override else None
+        )
+        session_store.set_model_override(entry.session_key, local_override)
+    return saved
+
+
+def restore_session_overrides(
+    home: Path,
+    saved: dict[str, Any],
+    *,
+    store: Any = None,
+    live_overrides: Optional[dict[str, Any]] = None,
+    apply_live: Optional[Callable[[str, Optional[dict[str, Any]]], None]] = None,
+) -> int:
+    """Restore pre-flight /model pins so sessions resume on the normal cascade."""
+    session_store = _session_store(home, store)
+    restored = 0
+    for session_key, override in (saved or {}).items():
+        session_store.set_model_override(session_key, override)
+        if live_overrides is not None:
+            if override:
+                live_overrides[session_key] = dict(override)
+            else:
+                live_overrides.pop(session_key, None)
+        if apply_live is not None:
+            apply_live(session_key, override)
+        restored += 1
+    return restored
+
+
 class FlightManager:
     def __init__(
         self,
@@ -402,6 +461,16 @@ class FlightManager:
                     )
             except Exception as exc:
                 state.setdefault("warnings", []).append(f"kanban port skipped: {exc}")
+        session_overrides: dict[str, Any] = {}
+        try:
+            session_overrides = snapshot_and_pin_sessions(
+                self.home,
+                local_model=self.local_model,
+                local_provider=LOCAL_PROVIDER,
+                local_base_url=self.local_base_url,
+            )
+        except Exception as exc:
+            state.setdefault("warnings", []).append(f"session pin skipped: {exc}")
         state.update(
             {
                 "mode": "local",
@@ -411,6 +480,7 @@ class FlightManager:
                 "last_transition": {"from": "online", "to": "local", "at": now},
                 "saved_restore_target": {"profiles": [target["home"] for target in targets], "configs": targets},
                 "task_overrides": task_overrides,
+                "session_overrides": session_overrides,
             }
         )
         self._save_state(state)
@@ -436,6 +506,10 @@ class FlightManager:
                 restore_task_overrides(conn, state.get("task_overrides") or {})
         except Exception as exc:
             state.setdefault("warnings", []).append(f"kanban restore skipped: {exc}")
+        try:
+            restore_session_overrides(self.home, state.get("session_overrides") or {})
+        except Exception as exc:
+            state.setdefault("warnings", []).append(f"session restore skipped: {exc}")
         state.update(
             {
                 "mode": "online",
@@ -486,9 +560,14 @@ class FlightManager:
         action = observe_connectivity(state, normal_ok=normal_ok, local_ok=local_ok, now=now)
         self._save_state(state)
         if action == "enter":
-            return self.enter(now=now, port_tasks=port_tasks)
+            result = self.enter(now=now, port_tasks=port_tasks)
+            result["tick_action"] = "enter"
+            return result
         if action == "exit":
-            return self.exit(now=now)
+            result = self.exit(now=now)
+            result["tick_action"] = "exit"
+            return result
+        state["tick_action"] = None
         return state
 
 
@@ -499,7 +578,7 @@ def cmd_flight(args: Any) -> int:
         max_in_progress=getattr(args, "max_in_progress", None) or 2,
         failure_threshold=getattr(args, "failure_threshold", None) or DEFAULT_FAILURE_THRESHOLD,
         recovery_threshold=getattr(args, "recovery_threshold", None) or DEFAULT_RECOVERY_THRESHOLD,
-        cooldown_seconds=getattr(args, "cooldown", None) if getattr(args, "cooldown", None) is not None else DEFAULT_COOLDOWN_SECONDS,
+        cooldown_seconds=int(getattr(args, "cooldown", None) or DEFAULT_COOLDOWN_SECONDS),
     )
     command = getattr(args, "flight_command", None) or "status"
     if command == "enter":
