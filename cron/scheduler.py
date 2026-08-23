@@ -6007,6 +6007,21 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # Plan F Week 3 Day 6 (2026-08-21 prime-agent runtime 串接):
+        # 自動設定 HERMES_TASK 環境變數（讓 build_skills_system_prompt 按 per_task 過濾）
+        # 優先級: jobs.json job.task > job.skill > job.skills[0] > null
+        import os as _os_cron
+        _hermes_task = (
+            job.get("task")
+            or job.get("skill")
+            or (job.get("skills") or [None])[0]
+        )
+        if _hermes_task:
+            _os_cron.environ["HERMES_TASK"] = _hermes_task
+            logger.info("Cron job '%s' set HERMES_TASK=%s", job_id, _hermes_task)
+        else:
+            logger.debug("Cron job '%s' has no task/skill — HERMES_TASK not set", job_id)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),

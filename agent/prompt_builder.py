@@ -1722,6 +1722,10 @@ def _build_snapshot_entry(
     if isinstance(platforms, str):
         platforms = [platforms]
 
+    # Plan A tier (2026-08-21 prime-agent 升級): 讀 frontmatter status
+    _status = str(frontmatter.get("status", "active")).strip().lower()
+    _tier = str(frontmatter.get("tier", "")).strip().lower() or _infer_tier_from_status(_status)
+
     entry = {
         "skill_name": skill_name,
         "category": category,
@@ -1729,6 +1733,8 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "status": _status,  # Plan A: 支援 status 過濾
+        "tier": _tier,      # Plan A: 支援 tier 排序
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1778,17 +1784,207 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, {}, ""
 
 
+def _infer_tier_from_status(status: str) -> str:
+    """Plan A: 從 status 推導 tier (deprecated → cold, archived → cold, 其他 → active)."""
+    s = (status or "").strip().lower()
+    if s in ("deprecated", "archived", "in-transition"):
+        return "cold"
+    if s == "draft":
+        return "cold"
+    return "active"
+
+
+def _is_task_triggered(skill_meta: "dict | None", available_toolsets: "set[str] | None") -> bool:
+    """Plan A: 判斷 skill 是否被當前任務觸發（用 toolsets 對應）."""
+    if not skill_meta or not available_toolsets:
+        return False
+    skill_categories = (skill_meta.get("category") or "").lower()
+    for ts in available_toolsets:
+        if ts.lower() in skill_categories:
+            return True
+    return False
+
+
+def _get_active_skills_for_task(available_toolsets: "set[str] | None") -> "set[str] | None":
+    """Plan A v2: 根據 HERMES_TASK env 或 available_toolsets 取得當前任務觸發的 skill 集合.
+
+    Returns None 表示「沒有限制」（全部 active 都顯示，向後相容）。
+    Returns set 表示「只有這個集合裡的 active 才顯示」。
+
+    兩種觸發方式:
+      1. HERMES_TASK 環境變數（明確指定當前任務）
+      2. available_toolsets 反查 tasks.toolset_mapping
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        per_task = (cfg.get("skills") or {}).get("per_task") or {}
+    except Exception:
+        return None
+
+    if not per_task:
+        return None
+
+    # 優先用 HERMES_TASK 環境變數（明確指定）
+    current_tasks = set()
+    import os as _os
+    hermes_task = _os.environ.get("HERMES_TASK")
+    if hermes_task:
+        current_tasks.add(hermes_task)
+
+    # 也從 available_toolsets 反查
+    if not current_tasks and available_toolsets:
+        task_to_toolset = (cfg.get("tasks") or {}).get("toolset_mapping") or {}
+        inv = {}  # toolset → list of task names
+        for task_name, toolsets in task_to_toolset.items():
+            for ts in toolsets or []:
+                inv.setdefault(ts, []).append(task_name)
+        for ts in available_toolsets:
+            current_tasks.update(inv.get(ts, []))
+
+    if not current_tasks:
+        return None
+
+    # 取所有 task 對應的 skill 聯集
+    selected = set()
+    for t in current_tasks:
+        if t in per_task:
+            selected.update(per_task[t])
+
+    return selected if selected else None
+
+
+def _build_soft_warning_appendix(skills_by_category: dict) -> str:
+    """Plan F Week 3 混合模式 (2026-08-22 kaecer 拍板啟用強度):
+    硬上限 + 軟警告並行 — LLM 看到警告 + 自動 archive cap 並行
+
+    警告條件（從 config.yaml 讀）：
+      - core 上限 10 / active 上限 50 / cold 上限 100 / total_max 160
+      - 任何 tier 超過 cap → 軟警告注入 system prompt
+      - 90 天沒引用的 skill → 硬上限自動 archive
+
+    設計理念：警告而不阻塞（LLM 自主決定）+ 自動 cap 防止膨脹失控。
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        tier_limits = (cfg.get("skills") or {}).get("tier_limits") or {}
+    except Exception:
+        return ""
+
+    core_cap = int(tier_limits.get("core", 10))
+    active_cap = int(tier_limits.get("active", 50))
+    cold_cap = int(tier_limits.get("cold", 100))
+    total_max = int(tier_limits.get("total_max", 160))
+
+    # 統計 skills_by_category 中每個 tier 的數量
+    total = sum(len(v) for v in skills_by_category.values())
+
+    warnings = []
+
+    # 警告 1: total 超過 total_max
+    if total > total_max:
+        warnings.append(f"- Skills 總數 {total} 超出 total_max {total_max}")
+
+    if not warnings:
+        return ""
+
+    lines = ["\n\n## Skills Lifecycle 混合模式警告（Plan F Week 3, kaecer 8/22 拍板啟用）"]
+    lines.append("")
+    lines.append("以下 skills 已超出 tier_limits 設定：")
+    for w in warnings:
+        lines.append(w)
+    lines.append("")
+    lines.append("**硬上限生效中** (auto_archive=true): > 90 天沒引用的 skill 將自動 archive（不在 always-on index）")
+    lines.append("")
+    lines.append("**處置建議**:")
+    lines.append("1. 對超過 cap 的 skill 跑「新增必走護欄」SOP（搜尋 70% 重疊 + 寫 references/ 或拍板新增）")
+    lines.append("2. 或拍板重分類（tier=core/active/cold）")
+    lines.append("3. 或拍板 archive（auto_archive 已啟用）")
+    lines.append("")
+    lines.append("**決策權**: kaecer（LLM 可建議但不自動執行單一 skill archive）。")
+    return "\n".join(lines) + "\n"
+
+
+def _apply_tier_caps(visible_entries: "list[dict]") -> "list[dict]":
+    """Plan A v2: 套用 config.yaml 的 skills.tier_limits 上限（按需索引核心）.
+
+    v2 變更 (2026-08-21 prime-agent 修正):
+      - cold 已被 _skill_should_show 擋掉，這裡只是保險再 cap 一次
+      - 排序: core > active > cold (core 必顯示)
+      - 超過上限的不顯示
+      - active 在 v2 已被 _skill_should_show 按 task context 過濾
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        tier_limits = (cfg.get("skills") or {}).get("tier_limits") or {}
+    except Exception:
+        tier_limits = {}
+
+    core_cap = int(tier_limits.get("core", 10))
+    active_cap = int(tier_limits.get("active", 50))
+    cold_cap = int(tier_limits.get("cold", 100))  # 預設 0 = cold 完全不顯示
+
+    # 分類
+    core_list = [e for e in visible_entries if (e.get("tier") or "active") == "core"]
+    active_list = [e for e in visible_entries if (e.get("tier") or "active") == "active"]
+    cold_list = [e for e in visible_entries if (e.get("tier") or "active") == "cold"]
+
+    # 套用上限
+    selected = (
+        core_list[:core_cap]
+        + active_list[:active_cap]
+        + cold_list[:cold_cap]
+    )
+    return selected
+
+
 def _skill_should_show(
     conditions: dict,
     available_tools: "set[str] | None",
     available_toolsets: "set[str] | None",
+    skill_meta: "dict | None" = None,  # Plan A: 傳入 entry 取得 status/tier
 ) -> bool:
-    """Return False if the skill's conditional activation rules exclude it."""
-    if available_tools is None and available_toolsets is None:
+    """Return False if the skill's conditional activation rules exclude it.
+
+    Plan A 升級 (2026-08-21 prime-agent):
+      - 支援 skill_meta 參數，讀 status / tier 欄位
+      - 自動 deprecated / archived / in-transition → 不顯示
+      - tier=core → 必顯示 (always-on)
+      - tier=active → 在 active 上限內顯示
+      - tier=cold → 在 cold 上限內顯示（最末位）
+    """
+    if available_tools is None and available_toolsets is None and skill_meta is None:
         return True  # No filtering info — show everything (backward compat)
 
     at = available_tools or set()
     ats = available_toolsets or set()
+
+    # Plan A v2 (2026-08-21 prime-agent 修正): status + tier 過濾
+    if skill_meta is not None:
+        _status = (skill_meta.get("status") or "active").strip().lower()
+        _tier = (skill_meta.get("tier") or "active").strip().lower()
+        # 永不顯示：deprecated / archived
+        if _status in ("deprecated", "archived"):
+            return False
+        # draft: 不在 index 顯示（保留可主動呼叫）
+        if _status == "draft":
+            return False
+        # in-transition: 只在 task 觸發時顯示
+        if _status == "in-transition" and not _is_task_triggered(skill_meta, available_toolsets):
+            return False
+        # Plan A v2 核心修正: cold tier 完全不顯示在 always-on index
+        # 需用 skill_view / skills_list 命令主動呼叫才載入
+        if _tier == "cold":
+            return False
+        # active tier: 只在 HERMES_TASK 環境變數設定時過濾（按需索引）
+        # 沒設 HERMES_TASK → 全部 active 都顯示（backward compat / 預設 LLM session）
+        import os as _os_v2
+        if _os_v2.environ.get("HERMES_TASK"):
+            _active_skills = _get_active_skills_for_task(available_toolsets)
+            if _active_skills is not None and skill_meta.get("frontmatter_name") not in _active_skills:
+                return False
 
     # fallback_for: hide when the primary tool/toolset IS available
     for ts in conditions.get("fallback_for_toolsets", []):
@@ -1944,6 +2140,7 @@ def _build_skills_system_prompt_inner(
                 entry.get("conditions") or {},
                 available_tools,
                 available_toolsets,
+                skill_meta=entry,  # Plan A: 傳 entry 進去讀 status/tier
             ):
                 continue
             visible_entries.append(entry)
@@ -1966,6 +2163,7 @@ def _build_skills_system_prompt_inner(
                 extract_skill_conditions(frontmatter),
                 available_tools,
                 available_toolsets,
+                skill_meta=entry,  # Plan A: 傳 entry 進去讀 status/tier
             ):
                 continue
             visible_entries.append(entry)
@@ -2192,7 +2390,8 @@ def _build_skills_system_prompt_inner(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            + _build_soft_warning_appendix(skills_by_category)
+            + "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
         )
 

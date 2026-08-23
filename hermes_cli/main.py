@@ -2929,11 +2929,92 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _auto_set_hermes_task(args) -> None:
+    """Plan F Week 3 Day 6 (2026-08-21 prime-agent runtime 串接):
+    自動設定 HERMES_TASK 環境變數（讓 build_skills_system_prompt 按 per_task 過濾）
+
+    優先級:
+      1. args.task (明確指定 — chat --task task-coding)
+      2. args.skill (舊版 — 對位 per_task)
+      3. 從 args.skills[0] 反推
+      4. 已存在 HERMES_TASK env → 不覆寫
+    """
+    if os.environ.get("HERMES_TASK"):
+        return  # 已設定，不覆寫
+    task = (
+        getattr(args, "task", None)
+        or getattr(args, "skill", None)
+        or (getattr(args, "skills", None) or [None])[0]
+    )
+    # 反推 mapping（若 task 還是 skill name 而非 task name）
+    skill_to_task = {
+        "mcp-tool-interpretation": "task-financial-judgment",
+        "task-knowledge-routing": "task-knowledge-routing",
+        "task-system-health": "task-system-health",
+        "atlas-skill-inbound": "task-knowledge-routing",
+        "self-audit-reminder": "task-system-health",
+    }
+    if task and task in skill_to_task:
+        task = skill_to_task[task]
+    if task:
+        os.environ["HERMES_TASK"] = task
+
+
+def _auto_set_enabled_toolsets(args) -> None:
+    """Plan B runtime 套用 (2026-08-22 prime-agent 完整生效):
+    根據 HERMES_TASK 自動設定 enabled_toolsets（從 config.yaml tasks.toolset_mapping）
+
+    效果: tool JSON 從 59,112B → 平均 ~10,000B（任務對應 toolsets）
+
+    設置兩個地方：
+      1. HERMES_ENABLED_TOOLSETS_OVERRIDE env（讓 hermes-agent 內部讀取）
+      2. args.toolsets（讓 AIAgent __init__ 接收，傳給 enabled_toolsets 參數）
+    """
+    if getattr(args, "toolsets", None):
+        return  # 用戶已明確指定，不覆寫
+    task = os.environ.get("HERMES_TASK")
+    if not task:
+        return
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        mapping = (cfg.get("tasks") or {}).get("toolset_mapping") or {}
+        toolsets = mapping.get(task)
+        if toolsets:
+            # Plan B runtime 修正 (2026-08-23 Plan C): 展開自訂 toolset alias。
+            # config.yaml 的 toolsets: 區塊把 alias 對應到真實 toolset 名稱
+            # （governance-toolset → file/delegation/memory/...）。直接餵 alias
+            # 給 AIAgent 會得到 0 tools（registry 不認識 alias）。
+            custom = (cfg.get("toolsets") or {})
+            if isinstance(custom, dict):
+                expanded = []
+                for ts in toolsets:
+                    members = custom.get(ts)
+                    if isinstance(members, list) and members:
+                        expanded.extend(str(m) for m in members)
+                    else:
+                        expanded.append(ts)
+                # 去重且保序
+                seen = set()
+                toolsets = [t for t in expanded if not (t in seen or seen.add(t))]
+            # Plan A 依賴 skills 工具（skill_view 載入 index 指到的 skill）：
+            # 任務對應 toolsets 未含 skills 時補上，避免 index 消失。
+            if "skills" not in toolsets:
+                toolsets = toolsets + ["skills"]
+            os.environ["HERMES_ENABLED_TOOLSETS_OVERRIDE"] = ",".join(toolsets)
+            # Plan B runtime 完整生效：同時設定 args.toolsets 讓 AIAgent 直接接收
+            args.toolsets = toolsets
+    except Exception:
+        pass
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
+    _auto_set_hermes_task(args)
+    _auto_set_enabled_toolsets(args)
 
     # --in DIR: run in DIR. Must happen before any session resolution so the
     # workspace-scoped "latest"/-c lookups key off DIR, and it pins the
@@ -11867,6 +11948,8 @@ def _prepare_agent_startup(args) -> None:
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
+    _auto_set_hermes_task(args)
+    _auto_set_enabled_toolsets(args)
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
