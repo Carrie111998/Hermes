@@ -1453,7 +1453,7 @@ export function KanbanBoardPage() {
         <div
           aria-label={k.title}
           className="flex shrink-0 overflow-x-auto border-y border-(--ui-stroke-tertiary) px-4 md:hidden"
-          role="tablist"
+          role="navigation"
         >
           {filtered.columns.map((col, index) => {
             const label = columnLabel(k, col.name)
@@ -1461,8 +1461,8 @@ export function KanbanBoardPage() {
             return (
               <button
                 aria-controls={`kanban-lane-${col.name}`}
+                aria-current={selectedLane === col.name ? 'page' : undefined}
                 aria-label={label}
-                aria-selected={selectedLane === col.name}
                 className={cn(
                   'grid size-11 shrink-0 place-items-center rounded-none border-r border-(--ui-stroke-tertiary) text-[0.625rem] font-semibold uppercase outline-none first:border-l focus-visible:bg-(--ui-control-active-background)',
                   selectedLane === col.name && 'bg-(--ui-control-active-background) text-foreground'
@@ -1471,9 +1471,6 @@ export function KanbanBoardPage() {
                 key={col.name}
                 onClick={() => revealLane(col.name)}
                 onKeyDown={event => onLaneKeyDown(event, index)}
-                role="tab"
-                tabIndex={selectedLane === col.name ? 0 : -1}
-                title={label}
                 type="button"
               >
                 {label.slice(0, 2)}
@@ -1511,6 +1508,21 @@ export function KanbanBoardPage() {
           )}
           data-kanban-scroller=""
           onMouseDown={onMouseDown}
+          onScroll={event => {
+            const scroller = event.currentTarget
+            let nearestName = selectedLane
+            let nearestDistance = Number.POSITIVE_INFINITY
+
+            for (const [name, lane] of laneElements.current) {
+              const distance = Math.abs(lane.offsetLeft - scroller.scrollLeft - scroller.clientLeft)
+              if (distance < nearestDistance) {
+                nearestDistance = distance
+                nearestName = name
+              }
+            }
+
+            if (nearestName !== selectedLane) {setSelectedLane(nearestName)}
+          }}
           ref={lanesRef}
           role="region"
           tabIndex={0}

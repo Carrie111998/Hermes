@@ -94,8 +94,7 @@ async function expectContained(page: MockBackendFixture['page'], status: string)
   const lane = page.locator(`#kanban-lane-${status}`)
   await page.waitForTimeout(100)
   await expect(selector).toHaveAttribute('aria-controls', `kanban-lane-${status}`)
-  await expect(selector).toHaveAttribute('aria-selected', 'true')
-  await expect(selector).toHaveAttribute('tabindex', '0')
+  await expect(selector).toHaveAttribute('aria-current', 'page')
   await expect(selector).toBeFocused()
 
   const geometry = await lane.evaluate(element => {
@@ -277,6 +276,7 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
       nextBorder: '1px',
       trailingPeek: 12,
     })
+    await expect(page.locator('[data-kanban-lane-selector="ready"]')).toHaveAttribute('aria-current', 'page')
     const middleBytes = await page.screenshot({ fullPage: true })
     const middleFilename = `kanban-mobile-${width}-after-pointer-scroll.png`
     const middlePath = testInfo.outputPath(middleFilename)
@@ -314,12 +314,12 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
     await first.press('ArrowLeft')
     await expectContained(page, 'triage')
     for (const status of COLUMNS.slice(1)) {
-      const current = page.locator('[role="tab"][aria-selected="true"]')
+      const current = page.locator('[data-kanban-lane-selector][aria-current="page"]')
       await current.press('ArrowRight')
       await expectContained(page, status)
     }
     for (const status of [...COLUMNS].reverse().slice(1)) {
-      const current = page.locator('[role="tab"][aria-selected="true"]')
+      const current = page.locator('[data-kanban-lane-selector][aria-current="page"]')
       await current.press('ArrowLeft')
       await expectContained(page, status)
     }
