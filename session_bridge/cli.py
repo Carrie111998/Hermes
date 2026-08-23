@@ -939,6 +939,20 @@ class _Backend(Protocol):
     def abort_claude_visibility_characterization(
         self, *, expected_job_id: str, expected_reserved_claude_uuid: str
     ) -> Mapping[str, Any]: ...
+    def inspect_failed_claude_visibility_job(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]: ...
+    def repair_failed_claude_visibility_job(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]: ...
     def dismiss_claude_visibility_job(
         self, *, job_id: str, expected_error_code: str
     ) -> Mapping[str, Any]: ...
@@ -2380,6 +2394,88 @@ class ProductionBackend:
         return _public_claude_run(
             result, continuous=self.config.claude_visibility.continuous
         )
+
+    def inspect_failed_claude_visibility_job(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]:
+        """Inspect one exact terminal repair target without acquiring a lease."""
+
+        if expected_error_code != "bridge_conflict":
+            raise RolloutGateBlocked("visibility_repair_error_code_mismatch")
+        try:
+            return self._require_store().inspect_failed_claude_visibility_reconciliation(
+                expected_job_id=job_id,
+                expected_reserved_claude_uuid=reserved_claude_uuid,
+                expected_error_code=expected_error_code,
+            )
+        except ValueError as exc:
+            raise RolloutGateBlocked("visibility_repair_identity_mismatch") from exc
+
+    def repair_failed_claude_visibility_job(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]:
+        """Reconcile one exact terminal failure without native launch authority."""
+
+        if expected_error_code != "bridge_conflict":
+            raise RolloutGateBlocked("visibility_repair_error_code_mismatch")
+        store = self._require_store()
+        policy = self.config.claude_visibility
+        try:
+            claim = store.claim_failed_claude_visibility_reconciliation(
+                time.time(),
+                policy.lease_seconds,
+                expected_job_id=job_id,
+                expected_reserved_claude_uuid=reserved_claude_uuid,
+                expected_error_code=expected_error_code,
+            )
+        except ValueError as exc:
+            raise RolloutGateBlocked("visibility_repair_identity_mismatch") from exc
+        authority = (
+            getattr(claim, "lease_kind", None),
+            getattr(claim, "launch_permitted", None),
+            getattr(claim, "registration_reserved", None),
+            getattr(claim, "requires_exact_id_reconciliation", None),
+        )
+        if (
+            not getattr(claim, "claimed", False)
+            or getattr(claim, "job_id", None) != job_id
+            or getattr(claim, "reserved_claude_uuid", None) != reserved_claude_uuid
+            or authority != ("reconciliation", False, False, True)
+        ):
+            raise RolloutGateBlocked("visibility_repair_authority_mismatch")
+        marker_secret = resolve_marker_key()
+        source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
+        registrar = ClaudeNativeRegistrar(
+            store,
+            source,
+            marker_secret=marker_secret,
+            startup_theme="light",
+            claude_command=(),
+            process_timeout=policy.process_timeout_seconds,
+            discovery_timeout=policy.discovery_timeout_seconds,
+        )
+        outcome = registrar.process(claim, allow_absence=False)
+        if (
+            outcome.job_id != job_id
+            or outcome.reserved_claude_uuid != reserved_claude_uuid
+        ):
+            raise RolloutGateBlocked("visibility_repair_result_identity_mismatch")
+        if outcome.status != "visible":
+            raise RolloutGateBlocked("visibility_repair_not_committed_visible")
+        return {
+            "status": outcome.status,
+            "job_id": outcome.job_id,
+            "reserved_claude_uuid": outcome.reserved_claude_uuid,
+            "error_code": outcome.error_code,
+        }
 
     def dismiss_claude_visibility_job(
         self, *, job_id: str, expected_error_code: str
@@ -3963,6 +4059,30 @@ def build_parser() -> argparse.ArgumentParser:
     abort_claude_characterization.add_argument("--job-id", required=True)
     abort_claude_characterization.add_argument("--reserved-claude-uuid", required=True)
 
+    repair_failed_claude_visibility = commands.add_parser(
+        "claude-visibility-repair-failed",
+        help="reconcile one exact terminal Claude visibility failure",
+    )
+    repair_failed_claude_visibility.add_argument("--job-id", required=True)
+    repair_failed_claude_visibility.add_argument(
+        "--reserved-claude-uuid", required=True
+    )
+    repair_failed_claude_visibility.add_argument(
+        "--error-code", required=True, choices=("bridge_conflict",)
+    )
+    repair_failed_claude_visibility_mode = (
+        repair_failed_claude_visibility.add_mutually_exclusive_group(required=True)
+    )
+    repair_failed_claude_visibility_mode.add_argument("--dry-run", action="store_true")
+    repair_failed_claude_visibility_mode.add_argument(
+        "--apply", action="store_true"
+    )
+    repair_failed_claude_visibility.add_argument(
+        "--confirm-exact-terminal-repair",
+        action="store_true",
+        help="confirm native-only reconciliation when --apply is selected",
+    )
+
     dismiss_claude_visibility = commands.add_parser(
         "claude-visibility-dismiss",
         help="acknowledge one terminally failed job so discovery can resume",
@@ -4290,6 +4410,27 @@ def _main_unscoped(
             )
             _emit(payload)
             return EXIT_OK
+        if args.command == "claude-visibility-repair-failed":
+            if args.apply and not args.confirm_exact_terminal_repair:
+                raise RolloutGateBlocked("visibility_repair_confirmation_required")
+            operation = (
+                backend.repair_failed_claude_visibility_job
+                if args.apply
+                else backend.inspect_failed_claude_visibility_job
+            )
+            payload = dict(
+                operation(
+                    job_id=args.job_id,
+                    reserved_claude_uuid=args.reserved_claude_uuid,
+                    expected_error_code=args.error_code,
+                )
+            )
+            _emit(payload)
+            if args.apply:
+                return (
+                    EXIT_OK if payload.get("status") == "visible" else EXIT_ROLLOUT_GATE
+                )
+            return EXIT_OK if payload.get("status") == "repairable" else EXIT_ROLLOUT_GATE
         if args.command == "claude-visibility-dismiss":
             if not args.confirm_terminal_failure:
                 raise RolloutGateBlocked("visibility_dismiss_confirmation_required")

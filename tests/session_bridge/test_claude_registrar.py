@@ -1566,6 +1566,72 @@ def test_exact_uuid_provider_limit_transcript_reconciles_without_replacement(
     assert factory.spawns == []
 
 
+def test_exact_uuid_provider_limit_before_persisted_prompt_reconciles_without_replacement() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    limited = "You've hit your weekly limit · resets Aug 24, 4am (America/New_York)"
+    projection = projection_for(item, response=limited)
+    prompt, response = projection.messages
+    projection = replace(projection, messages=[response, prompt])
+    factory = FakeFactory()
+
+    result = registrar(FakeSource([projection]), factory).process(item)
+
+    assert result.status == "visible"
+    assert factory.spawns == []
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        lambda prompt, limited: [
+            replace(prompt, role="assistant", content=limited),
+            replace(prompt, native_event_id=prompt.native_event_id),
+        ],
+        lambda prompt, limited: [
+            replace(prompt, role="assistant", content=limited),
+            prompt,
+            replace(prompt, native_event_id="later", content="unrelated work"),
+        ],
+        lambda prompt, limited: [
+            replace(prompt, role="assistant", content=limited, reasoning="hidden"),
+            prompt,
+        ],
+        lambda prompt, limited: [
+            replace(
+                prompt,
+                role="assistant",
+                native_event_id="provider-limit",
+                content=f"{limited}\nUNEXPECTED TRAILING TEXT",
+            ),
+            prompt,
+        ],
+    ],
+)
+def test_provider_limit_before_prompt_does_not_bypass_strict_transcript_shape(
+    messages: Any,
+) -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(item)
+    prompt = projection.messages[0]
+    limited = "You've hit your weekly limit · resets Aug 24, 4am (America/New_York)"
+    projection = replace(projection, messages=messages(prompt, limited))
+
+    result = registrar(FakeSource([projection]), FakeFactory()).process(item)
+
+    assert result.status == "failed"
+    assert result.error_code == "bridge_conflict"
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -1717,6 +1783,26 @@ def test_reconciliation_uses_authoritative_stem_lookup_without_legacy_probe() ->
     assert result.status == "absent"
     assert source.exact_stem_calls == [item.reserved_claude_uuid]
     assert store.calls[0][0] == "absent"
+
+
+def test_reconciliation_can_refuse_launch_authorizing_exact_absence() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    source = ExactStemSource()
+    store = FakeStore()
+    factory = FakeFactory()
+
+    result = registrar(source, factory, store).process(item, allow_absence=False)
+
+    assert result.status == "absent"
+    assert result.error_code == "native_transcript_not_indexed"
+    assert source.exact_stem_calls == [item.reserved_claude_uuid]
+    assert factory.spawns == []
+    assert store.calls == []
 
 
 def test_delayed_exact_transcript_is_polled_without_replacement() -> None:

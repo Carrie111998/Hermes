@@ -1283,7 +1283,7 @@ class SessionBridgeStore:
             operation_time = _finite_number(self._clock(), "clock")
             due = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs AS job
-                   WHERE (
+                   WHERE error_detail IS NOT 'exact terminal reconciliation in progress' AND (
                        (
                            state = 'claude_retry'
                            AND NOT EXISTS (
@@ -1367,6 +1367,7 @@ class SessionBridgeStore:
                            error_detail = 'active lease expired before completion',
                            updated_at = ?
                        WHERE state = 'claude_leased' AND lease_expires_at <= ?
+                         AND error_detail IS NOT 'exact terminal reconciliation in progress'
                          AND NOT EXISTS (
                              SELECT 1
                              FROM session_claude_visibility_characterization_events AS event
@@ -1386,6 +1387,7 @@ class SessionBridgeStore:
                            updated_at = ?
                        WHERE id = ? AND state = 'claude_leased'
                          AND lease_expires_at <= ?
+                         AND error_detail IS NOT 'exact terminal reconciliation in progress'
                          AND NOT EXISTS (
                              SELECT 1
                              FROM session_claude_visibility_characterization_events AS event
@@ -1423,6 +1425,7 @@ class SessionBridgeStore:
             due = conn.execute(
                 f"""SELECT * FROM session_claude_visibility_jobs AS job
                    WHERE (? IS NULL OR id = ?)
+                      AND error_detail IS NOT 'exact terminal reconciliation in progress'
                       AND (
                           state = 'claude_retry'
                           OR (
@@ -1509,6 +1512,7 @@ class SessionBridgeStore:
                    WHERE id = ? AND state = 'claude_leased'
                      AND lease_digest = ? AND lease_expires_at > ?
                      AND lease_kind = 'reconciliation'
+                     AND error_detail IS NOT 'exact terminal reconciliation in progress'
                      AND reserved_claude_uuid = ? AND attempts = ?""",
                 (
                     evidence,
@@ -1529,7 +1533,8 @@ class SessionBridgeStore:
                        lease_kind = NULL, updated_at = ?
                    WHERE id = ? AND state = 'claude_leased'
                      AND lease_digest = ? AND lease_expires_at > ?
-                     AND lease_kind = 'reconciliation'""",
+                     AND lease_kind = 'reconciliation'
+                     AND error_detail IS NOT 'exact terminal reconciliation in progress'""",
                 (
                     reconciled_at,
                     reconciled_at,
@@ -1607,6 +1612,7 @@ class SessionBridgeStore:
                            error_detail = 'active lease expired before completion',
                            updated_at = ?
                        WHERE state = 'claude_leased' AND lease_expires_at <= ?
+                         AND error_detail IS NOT 'exact terminal reconciliation in progress'
                          AND NOT EXISTS (
                              SELECT 1
                              FROM session_claude_visibility_characterization_events AS event
@@ -1626,6 +1632,7 @@ class SessionBridgeStore:
                            updated_at = ?
                        WHERE id = ? AND state = 'claude_leased'
                          AND lease_expires_at <= ?
+                         AND error_detail IS NOT 'exact terminal reconciliation in progress'
                          AND NOT EXISTS (
                              SELECT 1
                              FROM session_claude_visibility_characterization_events AS event
@@ -2600,6 +2607,154 @@ class SessionBridgeStore:
             next_attempt_at=None,
         )
 
+    def inspect_failed_claude_visibility_reconciliation(
+        self,
+        *,
+        expected_job_id: str,
+        expected_reserved_claude_uuid: str,
+        expected_error_code: str,
+    ) -> dict[str, Any]:
+        """Inspect one exact sole terminal failure without acquiring authority."""
+
+        normalized_job = _exact_nonempty_text(
+            expected_job_id, "expected Claude visibility job ID"
+        )
+        normalized_uuid = _exact_nonempty_text(
+            expected_reserved_claude_uuid, "expected reserved Claude UUID"
+        )
+        normalized_code = _exact_nonempty_text(
+            expected_error_code, "expected Claude visibility error code"
+        )
+        if normalized_code != "bridge_conflict":
+            raise ValueError("terminal repair requires bridge_conflict")
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                """SELECT id, reserved_claude_uuid, error_code, attempts
+                   FROM session_claude_visibility_jobs
+                   WHERE id = ? AND reserved_claude_uuid = ?
+                     AND state = 'claude_failed' AND error_code = ?
+                     AND operator_cleared_at IS NULL""",
+                (normalized_job, normalized_uuid, normalized_code),
+            ).fetchone()
+            if row is None:
+                raise ValueError("exact failed Claude visibility job required")
+            other_open = conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs AS job
+                   WHERE id != ? AND operator_cleared_at IS NULL AND state IN (
+                       'claude_pending', 'claude_leased',
+                       'claude_retry', 'claude_failed'
+                   ) AND NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS event
+                       WHERE event.job_id = job.id
+                         AND event.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
+                   ) LIMIT 1""",
+                (normalized_job,),
+            ).fetchone()
+        if other_open is not None:
+            raise ValueError("sole open Claude visibility job required")
+        return {
+            "status": "repairable",
+            "job_id": row["id"],
+            "reserved_claude_uuid": row["reserved_claude_uuid"],
+            "error_code": row["error_code"],
+            "attempts": int(row["attempts"]),
+        }
+
+    def claim_failed_claude_visibility_reconciliation(
+        self,
+        now: float,
+        lease_seconds: float,
+        *,
+        expected_job_id: str,
+        expected_reserved_claude_uuid: str,
+        expected_error_code: str,
+    ) -> ClaudeVisibilityClaim:
+        """Lease one exact terminal failure for native-only reconciliation.
+
+        The bounded detail marker keeps an abandoned repair lease out of the
+        ordinary expiry/reclaim paths. Only this exact guarded API may replace
+        that repair authority; a failed apply therefore stays fail-closed.
+        """
+
+        _finite_number(now, "now")
+        lease_duration = _finite_number(lease_seconds, "lease_seconds")
+        if lease_duration <= 0:
+            raise ValueError("lease_seconds must be positive")
+        normalized_job = _exact_nonempty_text(
+            expected_job_id, "expected Claude visibility job ID"
+        )
+        normalized_uuid = _exact_nonempty_text(
+            expected_reserved_claude_uuid, "expected reserved Claude UUID"
+        )
+        normalized_code = _exact_nonempty_text(
+            expected_error_code, "expected Claude visibility error code"
+        )
+        if normalized_code != "bridge_conflict":
+            raise ValueError("terminal repair requires bridge_conflict")
+
+        def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            due = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE id = ? AND reserved_claude_uuid = ?
+                     AND error_code = ? AND operator_cleared_at IS NULL
+                     AND (
+                         state = 'claude_failed' OR (
+                             state = 'claude_leased'
+                             AND lease_kind = 'reconciliation'
+                             AND lease_expires_at <= ?
+                             AND error_detail =
+                                 'exact terminal reconciliation in progress'
+                         )
+                     )""",
+                (
+                    normalized_job,
+                    normalized_uuid,
+                    normalized_code,
+                    operation_time,
+                ),
+            ).fetchone()
+            if due is None:
+                raise ValueError("exact failed Claude visibility job required")
+            other_open = conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs AS job
+                   WHERE id != ? AND operator_cleared_at IS NULL AND state IN (
+                       'claude_pending', 'claude_leased',
+                       'claude_retry', 'claude_failed'
+                   ) AND NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS event
+                       WHERE event.job_id = job.id
+                         AND event.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
+                   ) LIMIT 1""",
+                (normalized_job,),
+            ).fetchone()
+            if other_open is not None:
+                raise ValueError("sole open Claude visibility job required")
+            lease = self._lease_claude_visibility_reconciliation(
+                conn,
+                due,
+                claim_time=operation_time,
+                lease_duration=lease_duration,
+            )
+            conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET error_detail = 'exact terminal reconciliation in progress'
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ?""",
+                (normalized_job, lease.lease_digest),
+            )
+            return lease
+
+        return self.db._execute_write(_write)
+
     def requeue_failed_claude_visibility_reconciliation(
         self, job_id: str, reserved_claude_uuid: str
     ) -> dict[str, Any]:
@@ -2767,7 +2922,8 @@ class SessionBridgeStore:
             active = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
                    WHERE id = ? AND state = 'claude_leased'
-                     AND lease_digest = ? AND lease_expires_at > ?""",
+                     AND lease_digest = ? AND lease_expires_at > ?
+                     AND error_detail IS NOT 'exact terminal reconciliation in progress'""",
                 (normalized_job_id, normalized_lease, updated_at),
             ).fetchone()
             if active is None:
@@ -2886,7 +3042,7 @@ class SessionBridgeStore:
             conn = self.db._conn
             assert conn is not None
             status_rows = conn.execute(
-                """SELECT state, error_code, lease_expires_at
+                """SELECT state, error_code, error_detail, lease_expires_at
                    FROM session_claude_visibility_jobs AS job
                    WHERE job.operator_cleared_at IS NULL AND NOT EXISTS (
                        SELECT 1
@@ -2954,7 +3110,15 @@ class SessionBridgeStore:
                     and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
                 ):
                     counts[literal_state] += 1
-                    add_fatal("unknown_error_code", literal_state, error_code)
+                    add_fatal(
+                        "bridge_conflict"
+                        if error_code == "bridge_conflict"
+                        and row["error_detail"]
+                        == "exact terminal reconciliation in progress"
+                        else "unknown_error_code",
+                        literal_state,
+                        error_code,
+                    )
                     continue
                 lease_expires_at = row["lease_expires_at"]
                 if (

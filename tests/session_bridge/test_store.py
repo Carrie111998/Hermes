@@ -13782,6 +13782,458 @@ def test_failed_malformed_registration_can_only_requeue_exact_uuid_reconciliatio
     assert claim.reserved_claude_uuid == identity.claude_uuid
 
 
+def test_terminal_bridge_conflict_repair_inspection_is_read_only(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-inspect")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    before = _rows(db, "SELECT * FROM session_claude_visibility_jobs")
+
+    result = store.inspect_failed_claude_visibility_reconciliation(
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    assert result == {
+        "status": "repairable",
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+        "error_code": "bridge_conflict",
+        "attempts": 1,
+    }
+    assert _rows(db, "SELECT * FROM session_claude_visibility_jobs") == before
+
+
+def test_terminal_bridge_conflict_repair_inspection_rejects_unrelated_open_work(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-inspect-sole")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    other_candidate, _other_identity = _claude_visibility_identity(
+        "terminal-inspect-other"
+    )
+    _enqueue_claude_visibility_job(store, other_candidate, _other_identity)
+    before = _rows(db, "SELECT * FROM session_claude_visibility_jobs ORDER BY id")
+
+    with pytest.raises(ValueError, match="sole open Claude visibility job"):
+        store.inspect_failed_claude_visibility_reconciliation(
+            expected_job_id=identity.job_id,
+            expected_reserved_claude_uuid=identity.claude_uuid,
+            expected_error_code="bridge_conflict",
+        )
+
+    assert _rows(db, "SELECT * FROM session_claude_visibility_jobs ORDER BY id") == before
+
+
+def test_expired_terminal_repair_lease_is_reclaimed_only_by_exact_repair_api(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-expired")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    usage_before = _rows(
+        db,
+        "SELECT * FROM session_claude_registration_usage ORDER BY attempt_ordinal",
+    )
+    store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+    clock[0] = 161.0
+
+    assert store.inspect_due_claude_visibility_reconciliation(161.0).status == "no_due_job"
+    assert store.claim_claude_visibility_reconciliation(161.0, 60).status == "no_due_job"
+    reclaimed = store.claim_failed_claude_visibility_reconciliation(
+        161.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+    assert reclaimed.claimed is True
+    assert reclaimed.lease_kind == "reconciliation"
+    assert reclaimed.launch_permitted is False
+    assert reclaimed.registration_reserved is False
+    assert _rows(
+        db,
+        "SELECT * FROM session_claude_registration_usage ORDER BY attempt_ordinal",
+    ) == usage_before
+    assert _rows(
+        db,
+        "SELECT state, error_code, lease_digest IS NOT NULL AS has_lease, "
+        "lease_expires_at, lease_kind FROM session_claude_visibility_jobs",
+    ) == [
+        {
+            "state": "claude_leased",
+            "error_code": "bridge_conflict",
+            "has_lease": 1,
+            "lease_expires_at": 221.0,
+            "lease_kind": "reconciliation",
+        }
+    ]
+
+
+def test_terminal_repair_lease_keeps_bridge_conflict_as_fatal_status(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-status")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    status = store.claude_visibility_status(100.0)
+
+    assert status["counts"]["claude_leased"] == 1
+    assert status["failed_codes"] == {}
+    assert status["fatal"] == [
+        {
+            "code": "bridge_conflict",
+            "state": "claude_leased",
+            "error_code": "bridge_conflict",
+            "count": 1,
+        }
+    ]
+
+
+def test_terminal_repair_lease_cannot_record_exact_absence(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-no-absence")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    claim = store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    with pytest.raises(ValueError, match="exact active Claude reconciliation lease"):
+        store.record_claude_visibility_exact_id_absent(
+            identity.job_id,
+            claim.lease_digest,
+            identity.claude_uuid,
+            claim.attempt_ordinal,
+            "a" * 64,
+        )
+
+    assert _rows(
+        db,
+        "SELECT state, error_code, error_detail FROM session_claude_visibility_jobs",
+    ) == [
+        {
+            "state": "claude_leased",
+            "error_code": "bridge_conflict",
+            "error_detail": "exact terminal reconciliation in progress",
+        }
+    ]
+    assert _rows(db, "SELECT * FROM session_claude_visibility_reconciliations") == []
+
+
+@pytest.mark.parametrize("transition", ["retry", "fail"])
+def test_terminal_repair_lease_cannot_retry_or_fail_into_an_ordinary_state(
+    db: SessionDB, transition: str
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity(f"terminal-no-{transition}")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    claim = store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    with pytest.raises(ValueError, match="exact active Claude visibility lease"):
+        if transition == "retry":
+            store.retry_claude_visibility_job(
+                identity.job_id,
+                claim.lease_digest,
+                "session_bridge_unavailable",
+                130.0,
+                "repair interrupted",
+            )
+        else:
+            store.fail_claude_visibility_job(
+                identity.job_id,
+                claim.lease_digest,
+                "duplicate_uuid",
+                "duplicate exact transcript",
+            )
+
+    assert _rows(
+        db,
+        "SELECT state, error_code, error_detail FROM session_claude_visibility_jobs "
+        "WHERE id = ?",
+        (identity.job_id,),
+    ) == [
+        {
+            "state": "claude_leased",
+            "error_code": "bridge_conflict",
+            "error_detail": "exact terminal reconciliation in progress",
+        }
+    ]
+
+
+def test_terminal_bridge_conflict_repair_lease_preserves_usage_and_forbids_launch(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-repair")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    usage_before = _rows(
+        db,
+        "SELECT job_id, attempt_ordinal, reserved_estimated_cost_usd "
+        "FROM session_claude_registration_usage ORDER BY attempt_ordinal",
+    )
+
+    claim = store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    assert claim.claimed is True
+    assert claim.job_id == identity.job_id
+    assert claim.reserved_claude_uuid == identity.claude_uuid
+    assert claim.lease_kind == "reconciliation"
+    assert claim.requires_exact_id_reconciliation is True
+    assert claim.launch_permitted is False
+    assert claim.registration_reserved is False
+    assert claim.attempt_ordinal == launch.attempt_ordinal
+    assert _rows(
+        db,
+        "SELECT job_id, attempt_ordinal, reserved_estimated_cost_usd "
+        "FROM session_claude_registration_usage ORDER BY attempt_ordinal",
+    ) == usage_before
+
+    committed = store.commit_claude_visibility_job(
+        identity.job_id,
+        claim.lease_digest,
+        "a" * 64,
+        100.0,
+    )
+    assert committed["state"] == "claude_visible"
+    assert committed["attempts"] == launch.attempt_ordinal
+    assert _rows(
+        db,
+        "SELECT job_id, attempt_ordinal, reserved_estimated_cost_usd "
+        "FROM session_claude_registration_usage ORDER BY attempt_ordinal",
+    ) == usage_before
+    assert _rows(
+        db,
+        "SELECT outcome, reserved_claude_uuid, attempt_ordinal "
+        "FROM session_claude_visibility_reconciliations",
+    ) == [
+        {
+            "outcome": "exact_match",
+            "reserved_claude_uuid": identity.claude_uuid,
+            "attempt_ordinal": launch.attempt_ordinal,
+        }
+    ]
+
+
+@pytest.mark.parametrize("operation", ["inspect", "claim"])
+def test_terminal_repair_api_accepts_only_bridge_conflict(
+    db: SessionDB, operation: str
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity(f"terminal-code-{operation}")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "source_conflict",
+        "source identity conflict",
+    )
+    before = _rows(db, "SELECT * FROM session_claude_visibility_jobs")
+
+    with pytest.raises(ValueError, match="bridge_conflict"):
+        if operation == "inspect":
+            store.inspect_failed_claude_visibility_reconciliation(
+                expected_job_id=identity.job_id,
+                expected_reserved_claude_uuid=identity.claude_uuid,
+                expected_error_code="source_conflict",
+            )
+        else:
+            store.claim_failed_claude_visibility_reconciliation(
+                100.0,
+                60,
+                expected_job_id=identity.job_id,
+                expected_reserved_claude_uuid=identity.claude_uuid,
+                expected_error_code="source_conflict",
+            )
+
+    assert _rows(db, "SELECT * FROM session_claude_visibility_jobs") == before
+
+
+def test_terminal_repair_lease_requires_sole_open_job(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-sole")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    other_candidate, other_identity = _claude_visibility_identity("terminal-other")
+    _enqueue_claude_visibility_job(store, other_candidate, other_identity)
+
+    with pytest.raises(ValueError, match="sole open Claude visibility job"):
+        store.claim_failed_claude_visibility_reconciliation(
+            100.0,
+            60,
+            expected_job_id=identity.job_id,
+            expected_reserved_claude_uuid=identity.claude_uuid,
+            expected_error_code="bridge_conflict",
+        )
+
+    assert _rows(
+        db,
+        "SELECT id, state, lease_digest FROM session_claude_visibility_jobs ORDER BY id",
+    ) == sorted(
+        [
+            {"id": identity.job_id, "state": "claude_failed", "lease_digest": None},
+            {"id": other_identity.job_id, "state": "claude_pending", "lease_digest": None},
+        ],
+        key=lambda row: row["id"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_matches", "uuid_matches", "error_code", "cleared"),
+    [
+        (False, True, "bridge_conflict", False),
+        (True, False, "bridge_conflict", False),
+        (True, True, "source_conflict", False),
+        (True, True, "bridge_conflict", True),
+    ],
+)
+def test_terminal_repair_lease_requires_exact_uncleared_bridge_conflict(
+    db: SessionDB,
+    job_matches: bool,
+    uuid_matches: bool,
+    error_code: str,
+    cleared: bool,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-repair-refusal")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    if cleared:
+        store.dismiss_claude_visibility_job(
+            job_id=identity.job_id, expected_error_code="bridge_conflict"
+        )
+
+    expected_error = (
+        "bridge_conflict"
+        if error_code != "bridge_conflict"
+        else "exact failed Claude visibility job"
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        store.claim_failed_claude_visibility_reconciliation(
+            100.0,
+            60,
+            expected_job_id=(identity.job_id if job_matches else f"{identity.job_id}-other"),
+            expected_reserved_claude_uuid=(
+                identity.claude_uuid
+                if uuid_matches
+                else "00000000-0000-4000-8000-000000000000"
+            ),
+            expected_error_code=error_code,
+        )
+
+    assert _rows(
+        db,
+        "SELECT state, error_code, lease_digest, operator_cleared_at "
+        "FROM session_claude_visibility_jobs",
+    ) == [
+        {
+            "state": "claude_failed",
+            "error_code": "bridge_conflict",
+            "lease_digest": None,
+            "operator_cleared_at": 100.0 if cleared else None,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("requested_code", "persisted_code"),
     [("source_conflict", "source_conflict"), ("invented_code", "unknown_error_code")],

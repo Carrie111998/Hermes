@@ -1031,7 +1031,11 @@ class ClaudeNativeRegistrar:
         self._poll_interval = poll_interval
 
     def process(
-        self, claim: ClaudeVisibilityClaim, *, stop: Any = None
+        self,
+        claim: ClaudeVisibilityClaim,
+        *,
+        stop: Any = None,
+        allow_absence: bool = True,
     ) -> ClaudeRegistrarOutcome:
         if not claim.claimed:
             return ClaudeRegistrarOutcome(
@@ -1057,7 +1061,13 @@ class ClaudeNativeRegistrar:
             return self._fail(claim, "bridge_conflict", "claim identity conflict")
 
         if claim.lease_kind == "reconciliation":
-            return self._reconcile(claim, candidate, identity, stop=stop)
+            return self._reconcile(
+                claim,
+                candidate,
+                identity,
+                stop=stop,
+                allow_absence=allow_absence,
+            )
         return self._launch(claim, candidate, identity, stop=stop)
 
     def resume_auth_recovery(
@@ -1332,6 +1342,7 @@ class ClaudeNativeRegistrar:
         identity: ClaudeVisibilityIdentity,
         *,
         stop: Any = None,
+        allow_absence: bool = True,
     ) -> ClaudeRegistrarOutcome:
         try:
             found = self._read_exact(identity.claude_uuid)
@@ -1352,6 +1363,14 @@ class ClaudeNativeRegistrar:
                 claim, "session_bridge_unavailable", "visibility cycle cancelled"
             )
         if found is None:
+            if not allow_absence:
+                return ClaudeRegistrarOutcome(
+                    "absent",
+                    claim.job_id,
+                    identity.claude_uuid,
+                    "native_transcript_not_indexed",
+                    "exact transcript absent; repair lease retained",
+                )
             evidence = hashlib.sha256(
                 f"absent:{identity.claude_uuid}:{claim.attempt_ordinal}".encode()
             ).hexdigest()
@@ -1774,6 +1793,8 @@ def _validate_projection(
     )
     if recovery_kind == "recovered":
         return
+    if _is_provider_limit_before_registration_prompt(messages, expected):
+        return
     prompt_indexes = [
         index
         for index, message in enumerate(messages)
@@ -1820,6 +1841,36 @@ def _validate_projection(
         return
     if not _is_exact_registered_text(aggregate):
         raise _TranscriptConflict("bridge_conflict")
+
+
+def _is_provider_limit_before_registration_prompt(
+    messages: list[ProjectedMessage], expected_prompt: str
+) -> bool:
+    if len(messages) != 2:
+        return False
+    response, prompt = messages
+    return (
+        response.role == "assistant"
+        and response.ordinal == 0
+        and not (
+            response.tool_calls
+            or response.tool_name
+            or response.tool_call_id
+            or response.reasoning
+        )
+        and isinstance(response.content, str)
+        and _is_exact_provider_limit_banner(response.content)
+        and response.native_event_id != prompt.native_event_id
+        and prompt.role == "user"
+        and prompt.content == expected_prompt
+        and prompt.ordinal == 0
+        and not (
+            prompt.tool_calls
+            or prompt.tool_name
+            or prompt.tool_call_id
+            or prompt.reasoning
+        )
+    )
 
 
 def _is_exact_registered_text(content: object) -> bool:
@@ -1910,6 +1961,23 @@ def _is_authentication_failure(output: str) -> bool:
             and ("401" in folded or "authentication_error" in folded)
             and ("authenticate" in folded or "authentication" in folded)
         )
+    )
+
+
+def _is_exact_provider_limit_banner(output: str) -> bool:
+    if not isinstance(output, str) or not (1 <= len(output) <= _MAX_RESPONSE_CHARS):
+        return False
+    folded = (
+        _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output))
+        .replace("\r", "")
+        .replace("Â·", "·")
+        .casefold()
+        .replace("’", "'")
+    )
+    nonempty_lines = [line.strip() for line in folded.splitlines() if line.strip()]
+    return (
+        len(nonempty_lines) == 1
+        and _CLAUDE_PROVIDER_LIMIT_BANNER_RE.fullmatch(nonempty_lines[0]) is not None
     )
 
 

@@ -474,6 +474,47 @@ class FakeBackend:
             "active_record_retired": True,
         }
 
+    def inspect_failed_claude_visibility_job(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        expected_error_code: str,
+    ):
+        self.calls.append((
+            "inspect_failed_claude_visibility_job",
+            job_id,
+            reserved_claude_uuid,
+            expected_error_code,
+        ))
+        return {
+            "status": "repairable",
+            "job_id": job_id,
+            "reserved_claude_uuid": reserved_claude_uuid,
+            "error_code": expected_error_code,
+            "attempts": 6,
+        }
+
+    def repair_failed_claude_visibility_job(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        expected_error_code: str,
+    ):
+        self.calls.append((
+            "repair_failed_claude_visibility_job",
+            job_id,
+            reserved_claude_uuid,
+            expected_error_code,
+        ))
+        return {
+            "status": "visible",
+            "job_id": job_id,
+            "reserved_claude_uuid": reserved_claude_uuid,
+            "error_code": None,
+        }
+
     def dismiss_claude_visibility_job(self, *, job_id: str, expected_error_code: str):
         self.calls.append(("dismiss_claude_visibility_job", job_id, expected_error_code))
         return {
@@ -5832,6 +5873,267 @@ def test_lineage_apply_syncs_completed_characterization_before_store_repair(
     assert events[1][0] == "reconcile"  # type: ignore[index]
 
 
+def test_terminal_visibility_repair_dry_run_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+
+    class Store:
+        def inspect_failed_claude_visibility_reconciliation(self, **kwargs):
+            assert kwargs == {
+                "expected_job_id": job_id,
+                "expected_reserved_claude_uuid": reserved_uuid,
+                "expected_error_code": "bridge_conflict",
+            }
+            return {
+                "status": "repairable",
+                "job_id": job_id,
+                "reserved_claude_uuid": reserved_uuid,
+                "error_code": "bridge_conflict",
+                "attempts": 6,
+            }
+
+        def claim_failed_claude_visibility_reconciliation(self, *args, **kwargs):
+            pytest.fail("dry-run must not acquire a lease")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: pytest.fail("dry-run must not construct registrar"),
+    )
+
+    result = backend.inspect_failed_claude_visibility_job(
+        job_id=job_id,
+        reserved_claude_uuid=reserved_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    assert result == {
+        "status": "repairable",
+        "job_id": job_id,
+        "reserved_claude_uuid": reserved_uuid,
+        "error_code": "bridge_conflict",
+        "attempts": 6,
+    }
+
+
+def test_terminal_visibility_repair_backend_claims_exact_job_and_never_launches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+    events: list[object] = []
+
+    class Claim:
+        claimed = True
+        lease_kind = "reconciliation"
+        launch_permitted = False
+        registration_reserved = False
+        requires_exact_id_reconciliation = True
+        error_code = None
+
+        def __init__(self) -> None:
+            self.job_id = job_id
+            self.reserved_claude_uuid = reserved_uuid
+
+    class Store:
+        def claim_failed_claude_visibility_reconciliation(self, *args, **kwargs):
+            events.append(("claim", args, kwargs))
+            return Claim()
+
+    class Registrar:
+        def process(self, claim, **kwargs):
+            events.append(("process", claim, kwargs))
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": "visible",
+                    "job_id": job_id,
+                    "reserved_claude_uuid": reserved_uuid,
+                    "error_code": None,
+                },
+            )()
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **kwargs: (
+            pytest.fail("terminal repair must disable native launch")
+            if kwargs.get("claude_command") != ()
+            else Registrar()
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda *_args, **_kwargs: pytest.fail("terminal repair must not resolve launcher"),
+    )
+
+    result = backend.repair_failed_claude_visibility_job(
+        job_id=job_id,
+        reserved_claude_uuid=reserved_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    assert result == {
+        "status": "visible",
+        "job_id": job_id,
+        "reserved_claude_uuid": reserved_uuid,
+        "error_code": None,
+    }
+    assert events[0][0] == "claim"  # type: ignore[index]
+    assert events[0][2] == {  # type: ignore[index]
+        "expected_job_id": job_id,
+        "expected_reserved_claude_uuid": reserved_uuid,
+        "expected_error_code": "bridge_conflict",
+    }
+    assert events[1][0] == "process"  # type: ignore[index]
+    assert events[1][2] == {"allow_absence": False}  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("claim_change", "expected_gate"),
+    [
+        ({"job_id": "claude-visibility-job:other"}, "visibility_repair_authority_mismatch"),
+        (
+            {"reserved_claude_uuid": "22222222-2222-4222-8222-222222222222"},
+            "visibility_repair_authority_mismatch",
+        ),
+        ({"launch_permitted": True}, "visibility_repair_authority_mismatch"),
+    ],
+)
+def test_terminal_visibility_repair_rejects_inexact_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    claim_change: dict[str, object],
+    expected_gate: str,
+) -> None:
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+
+    class Claim:
+        claimed = True
+        lease_kind = "reconciliation"
+        launch_permitted = False
+        registration_reserved = False
+        requires_exact_id_reconciliation = True
+
+    claim = Claim()
+    claim.job_id = job_id
+    claim.reserved_claude_uuid = reserved_uuid
+    for key, value in claim_change.items():
+        setattr(claim, key, value)
+
+    class Store:
+        def claim_failed_claude_visibility_reconciliation(self, *args, **kwargs):
+            return claim
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: pytest.fail("inexact authority must not reach registrar"),
+    )
+
+    with pytest.raises(RolloutGateBlocked, match=expected_gate):
+        backend.repair_failed_claude_visibility_job(
+            job_id=job_id,
+            reserved_claude_uuid=reserved_uuid,
+            expected_error_code="bridge_conflict",
+        )
+
+
+def test_terminal_visibility_repair_terminal_result_requires_an_ordinary_store_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+
+    class Claim:
+        claimed = True
+        lease_kind = "reconciliation"
+        launch_permitted = False
+        registration_reserved = False
+        requires_exact_id_reconciliation = True
+
+        def __init__(self) -> None:
+            self.job_id = job_id
+            self.reserved_claude_uuid = reserved_uuid
+
+    class Store:
+        def claim_failed_claude_visibility_reconciliation(self, *args, **kwargs):
+            return Claim()
+
+    class Registrar:
+        def process(self, claim, **kwargs):
+            assert kwargs == {"allow_absence": False}
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": "failed",
+                    "job_id": job_id,
+                    "reserved_claude_uuid": reserved_uuid,
+                    "error_code": "bridge_conflict",
+                },
+            )()
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar", lambda *_args, **_kwargs: Registrar()
+    )
+
+    with pytest.raises(
+        RolloutGateBlocked, match="visibility_repair_not_committed_visible"
+    ):
+        backend.repair_failed_claude_visibility_job(
+            job_id=job_id,
+            reserved_claude_uuid=reserved_uuid,
+            expected_error_code="bridge_conflict",
+        )
+
+
+def test_terminal_visibility_repair_rejects_nonvisible_result(capsys) -> None:
+    class Backend(FakeBackend):
+        def repair_failed_claude_visibility_job(self, **kwargs):
+            return {
+                "status": "failed",
+                "job_id": kwargs["job_id"],
+                "reserved_claude_uuid": kwargs["reserved_claude_uuid"],
+                "error_code": "duplicate_uuid",
+            }
+
+    backend = Backend()
+    result = _run(
+        [
+            "claude-visibility-repair-failed",
+            "--apply",
+            "--confirm-exact-terminal-repair",
+            "--job-id",
+            "claude-visibility-job:test",
+            "--reserved-claude-uuid",
+            "11111111-1111-4111-8111-111111111111",
+            "--error-code",
+            "bridge_conflict",
+        ],
+        backend,
+    )
+
+    assert result == 4
+    assert _json_output(capsys)["status"] == "failed"
+
+
 def test_visibility_dismiss_backend_reports_a_stale_row_as_a_gate_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5851,6 +6153,85 @@ def test_visibility_dismiss_backend_reports_a_stale_row_as_a_gate_refusal(
         )
 
     assert raised.value.gate == "visibility_dismiss_identity_mismatch"
+
+
+def test_terminal_visibility_repair_cli_requires_exact_confirmation(capsys) -> None:
+    backend = FakeBackend()
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+    base = [
+        "claude-visibility-repair-failed",
+        "--apply",
+        "--job-id",
+        job_id,
+        "--reserved-claude-uuid",
+        reserved_uuid,
+        "--error-code",
+        "bridge_conflict",
+    ]
+
+    assert _run(base, backend) == 4
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": "visibility_repair_confirmation_required",
+    }
+    assert not any(
+        call[0] == "repair_failed_claude_visibility_job" for call in backend.calls
+    )
+
+    assert _run([*base, "--confirm-exact-terminal-repair"], backend) == 0
+    assert _json_output(capsys) == {
+        "status": "visible",
+        "job_id": job_id,
+        "reserved_claude_uuid": reserved_uuid,
+    }
+    assert (
+        "repair_failed_claude_visibility_job",
+        job_id,
+        reserved_uuid,
+        "bridge_conflict",
+    ) in backend.calls
+
+
+def test_terminal_visibility_repair_cli_dry_run_does_not_require_confirmation(
+    capsys,
+) -> None:
+    backend = FakeBackend()
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+
+    assert (
+        _run(
+            [
+                "claude-visibility-repair-failed",
+                "--dry-run",
+                "--job-id",
+                job_id,
+                "--reserved-claude-uuid",
+                reserved_uuid,
+                "--error-code",
+                "bridge_conflict",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys) == {
+        "status": "repairable",
+        "job_id": job_id,
+        "reserved_claude_uuid": reserved_uuid,
+        "error_code": "bridge_conflict",
+        "attempts": 6,
+    }
+    assert (
+        "inspect_failed_claude_visibility_job",
+        job_id,
+        reserved_uuid,
+        "bridge_conflict",
+    ) in backend.calls
+    assert not any(
+        call[0] == "repair_failed_claude_visibility_job" for call in backend.calls
+    )
 
 
 def test_visibility_dismiss_cli_requires_explicit_confirmation(capsys) -> None:
