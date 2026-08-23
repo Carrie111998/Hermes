@@ -658,6 +658,32 @@ def _run_agent_tool_execution_middleware(
             if guardrail_decision.allows_execution:
                 guardrail_decision = None
 
+        # ── Config-driven execution budget boundary ─────────────────────
+        # Keep this check immediately before dispatch so it covers every
+        # sequential, concurrent, and segmented execution path without
+        # changing the model-facing prompt, tools, or message history.
+        if block_message is None and guardrail_decision is None:
+            try:
+                from agent.model_execution_budget import decide_tool_call
+
+                budget_decision = decide_tool_call(
+                    agent,
+                    function_name=function_name,
+                    final_args=final_args,
+                    tool_call_id=tool_call_id,
+                )
+                if budget_decision.get("action") == "block":
+                    block_message = (
+                        "Tool execution budget exhausted for this model in "
+                        "the current turn. Delegate bounded work or continue "
+                        "in a new turn."
+                    )
+                    block_error_type = "model_execution_budget"
+            except Exception:
+                # A budget check must never prevent the normal tool pipeline
+                # from handling an otherwise valid call.
+                logger.debug("Execution budget check failed", exc_info=True)
+
         if block_message is not None or guardrail_decision is not None:
             _advance_start_order()
             state["blocked"] = True

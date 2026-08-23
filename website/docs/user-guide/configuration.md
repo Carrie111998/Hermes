@@ -1015,6 +1015,19 @@ Plugin engines are **never auto-activated** — you must explicitly set `context
 
 See [Memory Providers](/user-guide/features/memory-providers) for the analogous single-select system for memory plugins.
 
+## Per-model Execution Budgets
+
+Execution budgets are optional. When configured, they cap non-delegation tool executions for a matching model during one agent turn; `delegate_task` remains available and does not consume the budget. An unset or empty map has no runtime effect.
+
+```yaml
+agent:
+  model_execution_budgets:
+    "provider/model-pattern": 20
+    "*worker*": 50
+```
+
+Keys use case-insensitive shell-style wildcards and match the full model identifier or its provider-free name. If patterns overlap, the most specific match wins. A value of `0` blocks every non-delegation execution for that model. The gate runs at the execution boundary and does not alter prompts, tool schemas, or cached conversation messages.
+
 ## Iteration Budget
 
 When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 500 turns). Hermes does **not** inject mid-task pressure warnings — earlier builds warned the model at 70%/90% budget, which caused models to abandon complex tasks prematurely and was removed in April 2026.
