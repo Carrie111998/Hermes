@@ -532,6 +532,49 @@ class TestReconnectClockCarriesAcrossFlaps:
         assert runner._recent_platform_recoveries == {}
         assert runner._reconnect_clock_start(Platform.TELEGRAM, now) == now
 
+    def test_zero_window_reports_no_hold_pending(self, monkeypatch):
+        """The return value is what the reconnect branch preserves the flag on.
+
+        At a zero window nothing is recorded, so nothing would ever release a
+        hold. Answering True here is how an escalated platform stayed
+        NEEDS_ATTENTION for the life of the process at the setting documented
+        as restoring the pre-#92178 behaviour.
+        """
+        import gateway.run as run_module
+
+        monkeypatch.setattr(run_module, "_RECONNECT_STABLE_AFTER_SECONDS", 0)
+        runner = _make_runner()
+        runner._recent_platform_recoveries = {}
+
+        held = runner._note_reconnect_recovery(
+            Platform.TELEGRAM,
+            {"queued_at": time.monotonic() - 9000, "attention_flagged": True},
+        )
+
+        assert held is False
+
+    def test_a_positive_window_reports_a_hold_for_an_escalated_episode(self):
+        runner = _make_runner()
+        runner._recent_platform_recoveries = {}
+
+        held = runner._note_reconnect_recovery(
+            Platform.TELEGRAM,
+            {"queued_at": time.monotonic() - 9000, "attention_flagged": True},
+        )
+
+        assert held is True
+
+    def test_a_positive_window_reports_no_hold_for_an_unflagged_episode(self):
+        """Nothing was ever set, so there is nothing to preserve."""
+        runner = _make_runner()
+        runner._recent_platform_recoveries = {}
+
+        held = runner._note_reconnect_recovery(
+            Platform.TELEGRAM, {"queued_at": time.monotonic() - 30}
+        )
+
+        assert held is False
+
     def test_a_requeue_after_a_flap_is_immediately_escalatable(self, monkeypatch):
         """End to end over the two calls the flap actually goes through.
 
@@ -985,6 +1028,42 @@ class TestOneEpisodeEscalatesOnce:
         assert connected, f"the reconnect must still be reported; got {writes!r}"
         assert connected[0]["needs_attention"] is False
         assert connected[0]["retrying_since"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_zero_window_clears_even_an_escalated_reconnect(self, monkeypatch):
+        """`0` is documented as restoring the pre-#92178 behaviour exactly.
+
+        The hold exists because `_expire_stable_recoveries` will later release
+        it. At a zero window that sweep returns immediately and no mark was
+        recorded, so a preserved flag is preserved forever: `hermes status`
+        reports a healthy, connected platform as NEEDS_ATTENTION with a stale
+        `retrying_since` until the process restarts.
+        """
+        import gateway.run as run_module
+
+        monkeypatch.setattr(run_module, "_RECONNECT_STABLE_AFTER_SECONDS", 0)
+        writes = self._capture_status(monkeypatch)
+        runner = self._reconnect_runner(monkeypatch)
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 40,
+            "next_retry": time.monotonic() - 1,
+            "queued_at": time.monotonic() - 9000,
+            "attention_flagged": True,
+        }
+
+        await self._run_one_watcher_pass(runner)
+
+        connected = [kw for kw in writes if kw.get("platform_state") == "connected"]
+        assert connected, f"the reconnect must still be reported; got {writes!r}"
+        assert connected[0].get("needs_attention") is False, (
+            "with no stability window there is no sweep to release a hold, so "
+            "holding the flag here strands it for the life of the process. "
+            f"got {connected[0]!r}"
+        )
+        assert connected[0].get("retrying_since") is None, (
+            f"the same applies to the timestamp beside it. got {connected[0]!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_the_watcher_sweeps_even_with_an_empty_queue(self, monkeypatch):

@@ -8435,27 +8435,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recoveries.pop(platform, None)
         return now
 
-    def _note_reconnect_recovery(self, platform: Platform, info, now: float = None) -> None:
+    def _note_reconnect_recovery(self, platform: Platform, info, now: float = None) -> bool:
         """Record that ``platform`` reconnected, and when its trouble began.
 
         Called just before the queue entry is dropped, because the entry is the
         only place the instability clock lives. If the platform fails again
         inside the stability window, ``_reconnect_clock_start`` hands that clock
         back rather than starting over.
+
+        Returns whether a HOLD is now pending: whether this recovery has an
+        escalation to carry AND something that will later retire it. The caller
+        preserves ``needs_attention``/``retrying_since`` on exactly that answer.
+
+        It is a return value rather than a second check at the call site because
+        the two must agree, and only this method knows every reason it might
+        decline to record a mark. The zero-window case is the one that proved
+        it: an independent ``info["attention_flagged"]`` test at the call site
+        preserved the flag while this method had already returned without
+        recording anything for ``_expire_stable_recoveries`` to find, so the
+        platform stayed NEEDS_ATTENTION for the life of the process at the
+        setting documented as restoring the old behaviour.
         """
         window = _RECONNECT_STABLE_AFTER_SECONDS
         if window <= 0:
-            return
+            # No stability window means every successful bind is a recovery, so
+            # there is nothing to hold and nothing that would ever release it.
+            return False
         if now is None:
             now = time.monotonic()
         recoveries = getattr(self, "_recent_platform_recoveries", None)
         if recoveries is None:
             recoveries = self._recent_platform_recoveries = {}
         entry = info or {}
+        escalated = bool(entry.get("attention_flagged"))
         recoveries[platform] = (
             entry.get("queued_at", now),
             now,
-            bool(entry.get("attention_flagged")),
+            escalated,
         )
         # Keep the map to platforms that could still be flapping. It is keyed
         # by Platform so it is tiny either way, but a stale mark would make a
@@ -8463,6 +8479,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # a mark can also clear a carried NEEDS_ATTENTION, so it lives in one
         # place rather than being open-coded here.
         self._expire_stable_recoveries(now)
+        return escalated
 
     def _carried_attention_flag(self, platform: Platform, now: float = None) -> bool:
         """Whether a platform re-entering the queue is already escalated.
@@ -14757,20 +14774,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self.delivery_router.adapters = self.adapters
                         # Before the entry (and with it the instability clock)
                         # is dropped: a reconnect is only a recovery if it
-                        # lasts. See _note_reconnect_recovery (#92178).
-                        self._note_reconnect_recovery(platform, info)
+                        # lasts. See _note_reconnect_recovery (#92178). Its
+                        # answer is whether a hold is pending, which is what
+                        # the status write below turns on.
+                        escalated = self._note_reconnect_recovery(platform, info)
                         del self._failed_platforms[platform]
                         # An escalated platform keeps its flag through the
-                        # bind. At this instant we cannot tell a recovery from
-                        # a flap, and clearing optimistically made `hermes
-                        # status` and fleet monitoring watch the platform blink
-                        # healthy on every bind, mid-episode. Omitting the
-                        # fields leaves the previous values in place;
-                        # _expire_stable_recoveries clears them once the
-                        # recovery outlives the stability window. An
-                        # un-escalated platform never had them set, so it takes
-                        # the original path and clears immediately.
-                        escalated = bool(info.get("attention_flagged"))
+                        # bind WHEN a hold is pending. At this instant we cannot
+                        # tell a recovery from a flap, and clearing
+                        # optimistically made `hermes status` and fleet
+                        # monitoring watch the platform blink healthy on every
+                        # bind, mid-episode. Omitting the fields leaves the
+                        # previous values in place; _expire_stable_recoveries
+                        # clears them once the recovery outlives the stability
+                        # window. An un-escalated platform never had them set,
+                        # and a zero window has nothing that would ever release
+                        # a hold, so both take the original path and clear
+                        # immediately.
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="connected",
