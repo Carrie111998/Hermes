@@ -86,6 +86,11 @@ def test_output_path_is_mp3_for_non_opus_platforms(platform):
     assert path.endswith(".mp3"), path
 
 
+def test_output_path_is_wav_for_bluebubbles_native_packaging():
+    path = build_auto_tts_output_path(Platform.BLUEBUBBLES)
+    assert path.endswith(".wav"), path
+
+
 # ---------------------------------------------------------------------------
 # Base-adapter auto-TTS block: explicit output_path, no contextvar reliance
 # ---------------------------------------------------------------------------
