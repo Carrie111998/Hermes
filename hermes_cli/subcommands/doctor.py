@@ -6,6 +6,7 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 
@@ -41,10 +42,9 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
             "doctor` first to see active advisories and their IDs."
         ),
     )
-    # ``hermes doctor logs <path>`` — one-shot rename-rotation of a foreign
-    # log (oMLX server.log, dashboard.error.log) so an operator or host-ops
-    # automation can rotate on demand instead of hand-truncating (t_57aac3e7
-    # fix 1). Reuses _rotate_error_log_if_needed via import.
+    # ``hermes doctor logs <path>`` rotates ordinary external logs. oMLX's
+    # app-managed server.log additionally requires an explicit reopen command
+    # and verifies that the replacement path has an active writer.
     doctor_sub = doctor_parser.add_subparsers(
         dest="doctor_command", metavar="{logs}"
     )
@@ -54,9 +54,9 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         description=(
             "One-shot rename-rotation of a single log file. Rotates "
             "<path> to <path>.1 (shifting .1 -> .2 -> ... up to --backups) "
-            "so the writer's open fd keeps pointing at the old inode while a "
-            "fresh file is created. Safe for foreign writers (oMLX, launchd "
-            "stderr) that hold the file open."
+            "so the writer's open fd keeps pointing at the old inode. For "
+            "oMLX Application Support/server.log, --reopen-command is required "
+            "and the new path must gain a writer before success is reported."
         ),
     )
     logs_parser.add_argument(
@@ -83,5 +83,17 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         "--force",
         action="store_true",
         help="Rotate even if the file is under the size cap (default).",
+    )
+    logs_parser.add_argument(
+        "--reopen-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the controlled oMLX restart/reopen (default 30).",
+    )
+    logs_parser.add_argument(
+        "--reopen-command",
+        nargs=argparse.REMAINDER,
+        default=None,
+        help="Required for oMLX server.log: explicit no-shell command that restarts or reopens its writer; must be last.",
     )
     doctor_parser.set_defaults(func=cmd_doctor)

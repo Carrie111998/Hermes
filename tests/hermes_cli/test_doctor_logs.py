@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import signal
+import subprocess
+import sys
+import textwrap
+import time
 
 import pytest
 
@@ -29,6 +34,14 @@ def test_doctor_logs_parser_wiring():
     assert ns.force is True
     assert ns.backups == 2
     assert ns.max_bytes == 100
+
+
+def test_doctor_logs_parser_accepts_reopen_command():
+    root = _build_doctor_parser()
+    ns = root.parse_args(
+        ["doctor", "logs", "/tmp/x.log", "--reopen-command", "/bin/kill", "-HUP", "123"]
+    )
+    assert ns.reopen_command == ["/bin/kill", "-HUP", "123"]
 
 
 def test_plain_doctor_has_no_logs_subcommand():
@@ -87,3 +100,58 @@ def test_run_doctor_logs_bad_args_exit_2(tmp_path):
     args = argparse.Namespace(path=str(log), max_bytes=None, backups=-1, force=True)
     rc = run_doctor_logs(args)
     assert rc == 2
+
+
+def test_omlx_log_refuses_rotation_without_reopen_command(tmp_path):
+    from hermes_cli.doctor_logs import run_doctor_logs
+
+    log = tmp_path / "Library" / "Application Support" / "oMLX" / "logs" / "server.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("before\n", encoding="utf-8")
+    rc = run_doctor_logs(
+        argparse.Namespace(path=str(log), max_bytes=None, backups=3, force=True)
+    )
+    assert rc == 3
+    assert log.exists()
+    assert not log.with_suffix(".log.1").exists()
+
+
+def test_omlx_log_rotation_requires_writer_handoff(tmp_path):
+    from hermes_cli.doctor_logs import run_doctor_logs
+
+    log = tmp_path / "Library" / "Application Support" / "oMLX" / "logs" / "server.log"
+    log.parent.mkdir(parents=True)
+    control = tmp_path / "reopen"
+    log.write_text("before\n", encoding="utf-8")
+    writer = textwrap.dedent(
+        """
+        import pathlib, signal, sys, time
+        path = pathlib.Path(sys.argv[1]); control = pathlib.Path(sys.argv[2])
+        handle = path.open('a', encoding='utf-8'); handle.write('writer before\\n'); handle.flush()
+        def reopen(*_):
+            global handle
+            handle.close(); handle = path.open('a', encoding='utf-8')
+            handle.write('writer after\\n'); handle.flush()
+        signal.signal(signal.SIGHUP, reopen)
+        while not control.exists(): time.sleep(.02)
+        handle.close()
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", writer, str(log), str(control)])
+    try:
+        deadline = time.monotonic() + 3
+        while "writer before" not in log.read_text(encoding="utf-8"):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        rc = run_doctor_logs(
+            argparse.Namespace(
+                path=str(log), max_bytes=None, backups=3, force=True,
+                reopen_command=["/bin/kill", "-HUP", str(proc.pid)], reopen_timeout=3,
+            )
+        )
+        assert rc == 0
+        assert "writer after" in log.read_text(encoding="utf-8")
+        assert "writer after" not in log.with_suffix(".log.1").read_text(encoding="utf-8")
+    finally:
+        control.touch()
+        proc.wait(timeout=3)
