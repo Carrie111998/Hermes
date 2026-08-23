@@ -65,3 +65,115 @@ def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeyp
     # Third arg is the fresh picker custom_providers snapshot (None here).
     assert captured["args"] == (result, True, None)
     assert "ran_inline" not in captured
+
+
+def test_empty_custom_endpoint_row_defers_setup_off_key_handler(monkeypatch):
+    """Selecting a bare custom row with no models starts endpoint setup.
+
+    The provider picker cannot descend into an empty model list: that leaves
+    only Back/Cancel and makes the highlighted custom row appear inert.  The
+    setup flow is interactive, so it must run off the prompt_toolkit key
+    handler just like expensive-model confirmation.
+    """
+    import cli as cli_mod
+
+    captured = {}
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon):
+            captured["target"] = target
+            captured["args"] = args
+            captured["daemon"] = daemon
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(cli_mod.threading, "Thread", _Thread)
+
+    provider = {
+        "slug": "custom",
+        "name": "Custom endpoint",
+        "models": [],
+        "is_user_defined": True,
+        "source": "model-config",
+    }
+    self_ = SimpleNamespace(
+        _app=object(),
+        _model_picker_state={
+            "stage": "provider",
+            "providers": [provider],
+            "selected": 0,
+            "custom_provs": [],
+        },
+        _restore_modal_input_snapshot=lambda: None,
+        _invalidate=lambda **_kwargs: None,
+    )
+    self_._close_model_picker = _bound(cli_mod.HermesCLI._close_model_picker, self_)
+    self_._configure_custom_endpoint_from_picker = lambda *_args: None
+
+    _bound(cli_mod.HermesCLI._handle_model_picker_selection, self_)()
+
+    assert self_._model_picker_state is None
+    assert captured["started"] is True
+    assert captured["daemon"] is True
+    assert captured["target"] is self_._configure_custom_endpoint_from_picker
+    assert captured["args"] == (provider, [])
+
+
+def test_custom_endpoint_picker_setup_applies_saved_route(monkeypatch):
+    import cli as cli_mod
+
+    configured = {
+        "model": {
+            "provider": "custom",
+            "default": "local-model",
+            "base_url": "http://truenas.local:11434/v1",
+            "api_key": "local-key",
+        },
+        "providers": {},
+    }
+    calls = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.main._model_flow_custom",
+        lambda config: calls.setdefault("setup_config", config),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: configured)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_compatible_custom_providers",
+        lambda _config: [{"name": "TrueNAS local"}],
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="local-model",
+        target_provider="custom",
+        base_url="http://truenas.local:11434/v1",
+    )
+
+    def _switch_model(**kwargs):
+        calls["switch"] = kwargs
+        return result
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch_model)
+
+    self_ = SimpleNamespace(
+        _app=None,
+        provider="openrouter",
+        model="old-model",
+        _confirm_and_apply_model_switch_result=lambda *args, **kwargs: calls.setdefault(
+            "apply", (args, kwargs)
+        ),
+        _invalidate=lambda **_kwargs: None,
+    )
+
+    _bound(cli_mod.HermesCLI._configure_custom_endpoint_from_picker, self_)(
+        {"slug": "custom"}, []
+    )
+
+    assert calls["setup_config"] is configured
+    assert calls["switch"]["explicit_provider"] == "custom"
+    assert calls["switch"]["raw_input"] == "local-model"
+    assert calls["switch"]["current_base_url"] == "http://truenas.local:11434/v1"
+    assert calls["switch"]["current_api_key"] == "local-key"
+    assert calls["apply"][0] == (result, True)
+    assert calls["apply"][1]["custom_providers"] == [{"name": "TrueNAS local"}]
