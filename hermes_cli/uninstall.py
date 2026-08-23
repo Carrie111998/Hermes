@@ -483,6 +483,10 @@ def remove_windows_bin_launchers(
         if _normalize_windows_path(Path(project_root).parent) != _normalize_windows_path(
             home
         ):
+            log_info(
+                "Skipping Windows launcher cleanup: this checkout does not own "
+                "the managed binary directory"
+            )
             return []
         bin_dir = home / "bin"
     except Exception as e:
@@ -914,7 +918,7 @@ def _perform_uninstall(
             for launcher in removed_launchers:
                 log_success(f"Removed {launcher}")
         else:
-            log_info("No Windows hermes launchers found")
+            log_info("No owned Windows hermes launchers removed")
 
     # 3b. Remove node/npm/npx symlinks the installer left in ~/.local/bin
     #     (only when they still point into this Hermes home's node dir, so we
