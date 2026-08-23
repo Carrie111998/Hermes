@@ -68,22 +68,27 @@ def test_sanitizer_rejects_malformed_shape():
     assert sanitize_reasoning_override({"enabled": False, "effort": "ultra"}) == {"enabled": False}
 
 @pytest.mark.asyncio
-async def test_command_persists_through_async_store():
+async def test_command_persists_through_async_store(store_factory):
+    """/reasoning writes through the unified durable-first primitive."""
     import gateway.run as gateway_run
+    store = store_factory()
+    entry = store.get_or_create_session(_source())
     runner = object.__new__(gateway_run.GatewayRunner)
-    runner._session_reasoning_overrides = {}; runner._reasoning_config = None
-    runner._show_reasoning = False; runner._running_agents = {}
-    runner.session_store = object()
-    runner._async_session_store = AsyncMock()
-    runner._async_session_store._store = runner.session_store
+    runner._sessions = {}; runner._session_options_locks = {}
+    runner._reasoning_config = None; runner._show_reasoning = False
+    runner.session_store = store
+    runner._async_session_store = gateway_run.AsyncSessionStore(store)
     runner._evict_cached_agent = lambda _key: None
     runner._save_gateway_config_key = lambda *_args: True
-    assert await runner._apply_reasoning_selection("agent:main:telegram:dm:u1", "telegram", "ultra")
-    runner._async_session_store.set_reasoning_override.assert_awaited_once_with("agent:main:telegram:dm:u1", {"enabled": True, "effort": "ultra"})
+    assert await runner._apply_reasoning_selection(entry.session_key, "telegram", "ultra")
+    assert store_factory().get_reasoning_override(entry.session_key) == {"enabled": True, "effort": "ultra"}
 
-def test_rehydrate_copies_durable_override():
+def test_rehydrate_copies_durable_override(store_factory):
     import gateway.run as gateway_run
-    runner = object.__new__(gateway_run.GatewayRunner); runner._session_reasoning_overrides = {}
-    entry = type("Entry", (), {"session_key": "agent:main:telegram:dm:u1", "reasoning_override": {"enabled": True, "effort": "max"}})()
-    runner._rehydrate_session_reasoning_override(entry)
+    store = store_factory()
+    entry = store.get_or_create_session(_source())
+    store.set_reasoning_override(entry.session_key, {"enabled": True, "effort": "max"})
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._sessions = {}; runner.session_store = store_factory()
+    runner._rehydrate_session_runtime_options(entry.session_key)
     assert runner._resolve_session_reasoning_config(session_key=entry.session_key) == {"enabled": True, "effort": "max"}

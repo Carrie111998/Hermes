@@ -3005,6 +3005,10 @@ from gateway.session_state import (
     legacy_dict_property,
     legacy_lease_token_property,
 )
+from gateway.session_options import (
+    session_admission_lock as _session_admission_lock,
+    session_admission_lock_held as _session_admission_lock_held,
+)
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -3102,7 +3106,10 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
-# between the guard check and actual agent creation.
+# between the guard check and actual agent creation.  The claim itself runs
+# under gateway.session_options.session_admission_lock, shared with the
+# runtime-options write-through, so an options commit cannot slip in between
+# a host observing "idle" and this sentinel being placed.
 _AGENT_PENDING_SENTINEL = object()
 
 # Conversation-scoped per-session state registry (legacy contract).
@@ -10181,32 +10188,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return _r_state.conversation.reasoning_override
         return self._load_reasoning_config(model)
 
-    def _set_session_reasoning_override(
+    async def _set_session_reasoning_override(
         self,
         session_key: str,
         reasoning_config: Optional[dict],
     ) -> None:
-        """Set or clear the session-scoped reasoning override."""
+        """Set or clear the session-scoped reasoning override (durable-first)."""
         if not session_key:
             return
-        self._rehydrate_session_runtime_options(session_key)
         # Per-session field write — the old lazy ``self._session_reasoning_overrides
         # = {}`` init replaced the WHOLE dict, racing concurrent sessions'
         # overrides; a SessionState field reset cannot cross sessions.
-        self._session_state(session_key).conversation.reasoning_override = (
-            None if reasoning_config is None else dict(reasoning_config)
+        await self._commit_session_runtime_options(
+            session_key,
+            reasoning_override=(
+                None if reasoning_config is None else dict(reasoning_config)
+            ),
         )
-        self._persist_session_runtime_options(session_key)
-
-    def _rehydrate_session_reasoning_override(self, session_entry) -> None:
-        """Copy a durable override from an already-loaded routing entry."""
-        session_key = str(getattr(session_entry, "session_key", "") or "")
-        persisted = getattr(session_entry, "reasoning_override", None)
-        if not session_key or persisted is None:
-            return
-        state = self._session_state(session_key)
-        if state.conversation.reasoning_override is None:
-            state.conversation.reasoning_override = dict(persisted)
 
     def _resolve_session_service_tier(
         self,
@@ -10237,28 +10235,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return _t_state.conversation.service_tier_override
         return self._load_service_tier()
 
-    def _set_session_service_tier_override(
+    async def _set_session_service_tier_override(
         self,
         session_key: str,
         service_tier,
         clear: bool = False,
     ) -> None:
-        """Set or clear the session-scoped /fast override.
+        """Set or clear the session-scoped /fast override (durable-first).
 
         ``service_tier`` is "priority" or None (explicit normal). Pass
         ``clear=True`` to remove the override entirely (fall back to config).
         """
         if not session_key:
             return
-        self._rehydrate_session_runtime_options(session_key)
         # Presence-sensitive: "priority" or None (explicit normal) both count
         # as an override; the sentinel means "no override".  Old code
         # wholesale-replaced the dict on lazy init (cross-session race) —
         # per-session field writes eliminate that class of bug.
-        self._session_state(session_key).conversation.service_tier_override = (
-            _SERVICE_TIER_UNSET if clear else service_tier
+        await self._commit_session_runtime_options(
+            session_key,
+            service_tier_override=_SERVICE_TIER_UNSET if clear else service_tier,
         )
-        self._persist_session_runtime_options(session_key)
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -13170,6 +13167,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
             if self._is_session_running(entry.session_key):
+                continue
+            # A runtime-options commit owns this session's admission lock
+            # (gateway/session_options.py). This pre-claim cannot await it, so
+            # leave the session resume_pending for this pass; the next real
+            # user message (whose claim does await the lock) resumes it.
+            if _session_admission_lock_held(self, entry.session_key):
                 continue
 
             source = entry.origin
@@ -19348,6 +19351,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             preset = moa_cfg["default_preset"]
             try:
                 event.text = moa_payload
+                # Rehydrate first so the post-turn restore puts back the
+                # persisted override, not a pre-rehydrate None.
+                self._rehydrate_session_runtime_options(_quick_key)
                 _moa_state = self._session_state(_quick_key)
                 event._moa_restore_override = _moa_state.conversation.model_override
                 _moa_state.conversation.model_override = {
@@ -19635,23 +19641,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(
-            _quick_key,
-            source,
-        )
-        if _limit_message is not None:
-            logger.info(
-                "Rejecting new active session %s: max_concurrent_sessions reached",
+        #
+        # The claim shares one per-session lock with the runtime-options
+        # write-through (gateway/session_options.py), so a host UI cannot
+        # observe "idle", yield, and commit new options under a turn admitted
+        # in between. Uncontended acquire never yields, so the discipline
+        # above still holds; the only wait is for an in-flight commit on this
+        # exact session, after which this turn resolves the committed values.
+        async with _session_admission_lock(self, _quick_key):
+            _active_session_lease, _limit_message = self._claim_active_session_slot(
                 _quick_key,
+                source,
             )
-            return _limit_message
-        _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.started_ts = time.time()
-        self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+            if _limit_message is not None:
+                logger.info(
+                    "Rejecting new active session %s: max_concurrent_sessions reached",
+                    _quick_key,
+                )
+                return _limit_message
+            _claim_state = self._session_state(_quick_key)
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.started_ts = time.time()
+            self._persist_active_agents()
+            _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
             try:
@@ -20540,7 +20554,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
-        self._rehydrate_session_reasoning_override(session_entry)
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(
                 session_entry,
@@ -20550,7 +20563,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
             session_key = session_entry.session_key
-            self._rehydrate_session_reasoning_override(session_entry)
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -28381,8 +28393,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state.persistent.runtime_options_rehydrated = True
         if not persisted:
             return
+        # Live state wins per field: a one-turn override already installed in
+        # this process (/model --once, /moa) must not be clobbered by the
+        # first rehydrate touch; only fields still at their default are filled.
         model_persisted = persisted.get("model_override")
-        if model_persisted:
+        if model_persisted and state.conversation.model_override is None:
             override: Dict[str, Any] = {
                 "model": model_persisted.get("model"),
                 "provider": model_persisted.get("provider"),
@@ -28412,53 +28427,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "(provider=%s); using credential-less override",
                     provider, exc_info=True,
                 )
-        self._session_state(session_key).conversation.model_override = override
-        logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
-        )
+            state.conversation.model_override = override
+            logger.info(
+                "Rehydrated persisted /model override for session=%s: "
+                "model=%s provider=%s",
+                session_key,
+                override.get("model"),
+                provider or "",
+            )
 
         reasoning = persisted.get("reasoning_override")
-        state.conversation.reasoning_override = (
-            dict(reasoning) if isinstance(reasoning, dict) else None
-        )
+        if state.conversation.reasoning_override is None and isinstance(reasoning, dict):
+            state.conversation.reasoning_override = dict(reasoning)
         tier = persisted.get("service_tier_override")
-        if tier == "priority":
-            state.conversation.service_tier_override = "priority"
-        elif tier == "normal":
-            state.conversation.service_tier_override = None
-        else:
-            state.conversation.service_tier_override = _SERVICE_TIER_UNSET
+        if state.conversation.service_tier_override is _SERVICE_TIER_UNSET:
+            if tier == "priority":
+                state.conversation.service_tier_override = "priority"
+            elif tier == "normal":
+                state.conversation.service_tier_override = None
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Compatibility alias for callers that predate structured options."""
         self._rehydrate_session_runtime_options(session_key)
 
-    def _persist_session_runtime_options(self, session_key: str) -> None:
-        """Keep durable host defaults aligned with later slash-command edits."""
-        store = getattr(self, "session_store", None)
-        state = self._peek_session_state(session_key)
-        if store is None or state is None:
-            return
-        tier = state.conversation.service_tier_override
-        durable_tier = (
-            None
-            if tier is _SERVICE_TIER_UNSET
-            else ("priority" if tier == "priority" else "normal")
-        )
-        try:
-            store.set_runtime_options(
-                session_key,
-                model_override=state.conversation.model_override,
-                reasoning_override=state.conversation.reasoning_override,
-                service_tier_override=durable_tier,
-            )
-        except Exception:
-            logger.debug(
-                "Failed to persist session runtime options for %s",
-                session_key,
-                exc_info=True,
-            )
+    async def _commit_session_runtime_options(self, session_key: str, **options) -> bool:
+        """Single durable-first write-through for per-session runtime options.
+
+        Shared by ``/model``, ``/reasoning``, ``/fast`` and the structured host
+        API: persist the complete snapshot first, then move live state; a
+        failed durable write raises with live state untouched. Runs under the
+        per-session admission lock. See
+        ``gateway.session_options.commit_session_runtime_options``.
+        """
+        from gateway.session_options import commit_session_runtime_options
+
+        return await commit_session_runtime_options(self, session_key, **options)
 
     def _apply_session_model_override(
         self, session_key: str, model: str, runtime_kwargs: dict
