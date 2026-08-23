@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from types import SimpleNamespace
 
 from hermes_cli.model_switch import ModelSwitchResult
@@ -177,3 +179,71 @@ def test_custom_endpoint_picker_setup_applies_saved_route(monkeypatch):
     assert calls["switch"]["current_api_key"] == "local-key"
     assert calls["apply"][0] == (result, True)
     assert calls["apply"][1]["custom_providers"] == [{"name": "TrueNAS local"}]
+
+
+def test_custom_endpoint_picker_setup_leaves_prompt_toolkit_loop(monkeypatch):
+    """The blocking setup flow must not run on prompt_toolkit's event loop."""
+    import cli as cli_mod
+
+    configured = {
+        "model": {
+            "provider": "custom",
+            "default": "local-model",
+            "base_url": "http://truenas.local:11434/v1",
+        }
+    }
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+    calls = {}
+
+    def _run_loop():
+        asyncio.set_event_loop(loop)
+        calls["loop_thread"] = threading.get_ident()
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=_run_loop)
+    loop_thread.start()
+    loop_ready.wait(timeout=2)
+
+    async def _run_in_terminal(func, *, in_executor=False):
+        calls["in_executor"] = in_executor
+        if in_executor:
+            return await asyncio.get_running_loop().run_in_executor(None, func)
+        return func()
+
+    def _setup(_config):
+        calls["setup_thread"] = threading.get_ident()
+
+    monkeypatch.setattr("prompt_toolkit.application.run_in_terminal", _run_in_terminal)
+    monkeypatch.setattr("hermes_cli.main._model_flow_custom", _setup)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: configured)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_compatible_custom_providers", lambda _config: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: ModelSwitchResult(
+            success=False, error_message="stop after setup"
+        ),
+    )
+
+    self_ = SimpleNamespace(
+        _app=SimpleNamespace(loop=loop),
+        provider="openrouter",
+        model="old-model",
+        _confirm_and_apply_model_switch_result=lambda *_args, **_kwargs: None,
+        _invalidate=lambda **_kwargs: None,
+    )
+
+    try:
+        _bound(cli_mod.HermesCLI._configure_custom_endpoint_from_picker, self_)(
+            {"slug": "custom"}, []
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=2)
+        loop.close()
+
+    assert calls["in_executor"] is True
+    assert calls["setup_thread"] != calls["loop_thread"]

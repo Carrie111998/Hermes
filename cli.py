@@ -11251,7 +11251,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 from prompt_toolkit.application import run_in_terminal
 
                 async def _run_setup() -> None:
-                    await run_in_terminal(_setup)
+                    await run_in_terminal(_setup, in_executor=True)
 
                 asyncio.run_coroutine_threadsafe(_run_setup(), app_loop).result()
             else:
