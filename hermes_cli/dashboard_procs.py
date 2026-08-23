@@ -296,6 +296,7 @@ def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
     *,
     restart_managed: bool = False,
+    already_restarted_units: "set[str] | None" = None,
 ) -> dict[str, list]:
     """Kill running ``hermes dashboard`` / ``hermes serve`` processes.
 
@@ -319,6 +320,14 @@ def _kill_stale_dashboard_processes(
     e.g. a remote backend's ``hermes-serve.service``) has its owning unit
     restarted after the kill, because systemd treats our SIGTERM as a clean
     stop and ``Restart=on-failure`` would never fire (#68934).
+
+    *already_restarted_units* names units (no ``.service`` suffix) the
+    caller already restarted directly — e.g. ``hermes update``'s systemd
+    fleet-restart loop, which restarts ``hermes-serve*`` units before this
+    function runs. Without excluding them, a Serve-only install's freshly
+    restarted process is found again here and restarted a second time for
+    no benefit (review on #83595). PIDs owned by one of these units are
+    left untouched.
     """
     if restart_managed and _m()._restart_managed_dashboard_service(reason):
         return {"matched": [], "killed": [], "failed": []}
@@ -347,9 +356,6 @@ def _kill_stale_dashboard_processes(
     if not pids:
         return {"matched": [], "killed": [], "failed": []}
 
-    print()
-    print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
-
     # Before killing, snapshot systemd cgroup info for each PID so we can
     # restart supervised services after the kill (the cgroup disappears
     # along with the process).  Only meaningful on Linux, and only when the
@@ -373,6 +379,22 @@ def _kill_stale_dashboard_processes(
                 if cmdline:
                     pid_cmdline[pid] = cmdline
                     pid_home[pid] = _hermes_home_for_pid(pid)
+
+        if already_restarted_units:
+            # Already handled directly by the caller (e.g. hermes update's
+            # systemd fleet-restart loop) — leave these alone instead of
+            # killing and re-restarting a process that's already fresh.
+            pids = [
+                pid
+                for pid in pids
+                if (pid_service.get(pid) or "").removesuffix(".service")
+                not in already_restarted_units
+            ]
+            if not pids:
+                return {"matched": [], "killed": [], "failed": []}
+
+    print()
+    print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
 
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
@@ -816,6 +838,20 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     return owned
 
 
+# Grace window before an orphaned-looking backend may be reaped. Covers the
+# gap between process start and the Desktop client writing backend.lock.json.
+_REAP_MIN_AGE_SECONDS = 180.0
+
+
+def _process_age_seconds(pid: int) -> float:
+    """Return a process age using psutil's cross-platform start timestamp."""
+    import time as _time
+
+    import psutil as _psutil
+
+    return max(0.0, _time.time() - _psutil.Process(pid).create_time())
+
+
 def _reap_orphaned_desktop_local_serves(
     *,
     reason: str = "orphaned desktop-local hermes serve",
@@ -823,6 +859,7 @@ def _reap_orphaned_desktop_local_serves(
     signal_kill=None,
     sleep_fn=None,
     lock_owned_pids_fn=None,
+    process_age_seconds_fn=None,
 ) -> dict[str, list]:
     """Kill leftover Desktop-local ``hermes serve`` backends with no parent.
 
@@ -845,6 +882,13 @@ def _reap_orphaned_desktop_local_serves(
       by another client/machine* which legitimately sit at ppid 1 after sshd
       exits. Killing those is a production incident, not cleanup.
     - never fixed-port remote serves (e.g. ``--port 9119``)
+    - never a candidate younger than ``_REAP_MIN_AGE_SECONDS`` (or whose age
+      cannot be determined). The Desktop client writes ``backend.lock.json``
+      only after the backend reports HERMES_BACKEND_READY, so during
+      concurrent multi-profile startup a live sibling is briefly unowned and
+      otherwise indistinguishable from a corpse; sparing young processes
+      closes that mutual-reap window. A genuine corpse merely waits for a
+      later scan.
     - best-effort; failures never raise to the caller
     """
     import signal as _signal
@@ -858,6 +902,8 @@ def _reap_orphaned_desktop_local_serves(
         sleep_fn = _time.sleep
     if lock_owned_pids_fn is None:
         lock_owned_pids_fn = _lock_owned_serve_pids
+    if process_age_seconds_fn is None:
+        process_age_seconds_fn = _process_age_seconds
 
     if sys.platform == "win32":
         # Windows desktop uses taskkill tree teardown; orphan scan here is POSIX.
@@ -903,6 +949,21 @@ def _reap_orphaned_desktop_local_serves(
             continue
         # Orphaned under init/launchd.
         if ppid not in (0, 1):
+            continue
+        # Spare backends that are still starting up. backend.lock.json is
+        # written by the *Desktop client* only after the backend reports
+        # HERMES_BACKEND_READY, so a sibling spawned seconds ago is not yet
+        # lock-owned and is invisible to the owned_now guard above. When
+        # Desktop opens several profiles at once (each its own SSH spawn),
+        # every new backend reaped its concurrently-starting siblings, whose
+        # clients then reconnected and reaped the next batch -- a mutual-reap
+        # storm. A genuine corpse from a previous Desktop session is always
+        # older than this grace window; anything younger is a live sibling.
+        try:
+            if process_age_seconds_fn(pid) < _REAP_MIN_AGE_SECONDS:
+                continue
+        except Exception:
+            # Never let a liveness probe failure widen the reap.
             continue
         targets.append((pid, cmd))
 
