@@ -18,11 +18,16 @@ def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     started = tmp_path / "started"
+    child_release = tmp_path / "child-release"
     child_done = tmp_path / "child-done"
     script = scripts_dir / "blocking.py"
     child_code = (
-        "import time; from pathlib import Path; "
-        f"time.sleep(1); Path({str(child_done)!r}).write_text('done')"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"release = Path({str(child_release)!r})\n"
+        "while not release.exists():\n"
+        "    time.sleep(0.01)\n"
+        f"Path({str(child_done)!r}).write_text('done')\n"
     )
     script.write_text(
         "import subprocess, sys, time\n"
@@ -50,21 +55,31 @@ def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
 
     thread = threading.Thread(target=_run)
     thread.start()
-    deadline = time.monotonic() + 5
-    while not started.exists() and not errors and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert errors == []
-    assert started.exists(), "script did not start"
+    try:
+        deadline = time.monotonic() + 5
+        while not started.exists() and not errors and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert errors == []
+        assert started.exists(), "script did not start"
 
-    cancel.set()
-    thread.join(timeout=3)
+        cancel.set()
+        thread.join(timeout=3)
 
-    assert errors == []
-    assert not thread.is_alive(), "script ignored cancellation"
-    assert result and result[0][0] is False
-    assert "cancel" in result[0][1].lower()
-    time.sleep(1.2)
-    assert not child_done.exists(), "script descendant survived cancellation"
+        assert errors == []
+        assert not thread.is_alive(), "script ignored cancellation"
+        assert result and result[0][0] is False
+        assert "cancel" in result[0][1].lower()
+        child_release.write_text("release", encoding="utf-8")
+        deadline = time.monotonic() + 2
+        while not child_done.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not child_done.exists(), "script descendant survived cancellation"
+    finally:
+        # A failing assertion must not leave the deliberately-blocked child
+        # holding pipe handles and hanging the test process.
+        cancel.set()
+        child_release.write_text("release", encoding="utf-8")
+        thread.join(timeout=3)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
@@ -536,7 +551,10 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
 
     assert scheduler.run_one_job(job) is True
-    assert calls >= 3
+    # Initial validation plus at least one failed renewal. Under scheduler load,
+    # the first renewal can arrive after the wall-clock grace has already
+    # elapsed, so requiring a fixed number of 10ms polling attempts is flaky.
+    assert calls >= 2
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):

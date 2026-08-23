@@ -42,9 +42,6 @@ except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None
 
 
-pytestmark = pytest.mark.skipif(fcntl is None, reason="flock semantics are POSIX-only")
-
-
 def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event):
     """Hold an exclusive flock on *path* from a separate fd until released.
 
@@ -64,6 +61,7 @@ def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event
         fd.close()
 
 
+@pytest.mark.skipif(fcntl is None, reason="flock semantics are POSIX-only")
 class TestBoundedJobsLock:
     def test_lock_acquisition_times_out_and_degrades(self, monkeypatch, caplog):
         """A foreign holder of .jobs.lock must NOT block _jobs_lock forever."""
