@@ -50,6 +50,24 @@ describe('Projects grouping contribution', () => {
     expect(resolveProjectsGrouping([project('a')])?.groups[0].id).toBe('valid')
   })
 
+  it.each([
+    { id: 42, label: 'Broken', projectIds: ['a'] },
+    { id: '   ', label: 'Broken', projectIds: ['a'] },
+    { id: 'broken', label: null, projectIds: ['a'] },
+    { id: 'broken', label: '   ', projectIds: ['a'] },
+    { id: 'broken', label: 'Broken', projectIds: 'a' },
+    { id: 'broken', label: 'Broken', projectIds: ['a', 42] }
+  ])('rejects a provider with malformed group descriptor %# and sanitizes the fallback', malformed => {
+    register({ getSnapshot: () => ({ groups: [malformed] }), subscribe: () => () => undefined }, 0)
+    register(provider([{ id: ' valid ', label: ' Valid ', projectIds: [' a '] }]), 10)
+
+    const resolved = resolveProjectsGrouping([project('a')])
+    const { result } = renderHook(() => useActiveProjectsGrouping())
+
+    expect(resolved?.groups).toEqual([{ collapsed: false, id: 'valid', label: 'Valid', projects: [project('a')] }])
+    expect(result.current?.snapshot.groups).toEqual([{ id: 'valid', label: 'Valid', projectIds: ['a'] }])
+  })
+
   it('keeps Home fixed and sends stale, duplicate and omitted ids to core Ungrouped', () => {
     register(
       provider([

@@ -43,6 +43,39 @@ export interface PresentedProjectsGrouping {
   readonly ungrouped: readonly SidebarProjectTree[]
 }
 
+function sanitizeSnapshot(value: unknown): ProjectsGroupingSnapshot | null {
+  if (!value || typeof value !== 'object' || !Array.isArray((value as Partial<ProjectsGroupingSnapshot>).groups)) {
+    return null
+  }
+
+  const groups: ProjectGroupDescriptor[] = []
+
+  for (const raw of (value as { groups: readonly unknown[] }).groups) {
+    if (!raw || typeof raw !== 'object') return null
+
+    const group = raw as Partial<ProjectGroupDescriptor>
+    if (
+      typeof group.id !== 'string' ||
+      !group.id.trim() ||
+      typeof group.label !== 'string' ||
+      !group.label.trim() ||
+      !Array.isArray(group.projectIds) ||
+      !group.projectIds.every(projectId => typeof projectId === 'string')
+    ) {
+      return null
+    }
+
+    groups.push({
+      id: group.id.trim(),
+      label: group.label.trim(),
+      projectIds: group.projectIds.map(projectId => projectId.trim()).filter(Boolean),
+      ...(group.collapsed === true && { collapsed: true })
+    })
+  }
+
+  return { groups }
+}
+
 function readValidProvider(): {
   contribution: ProjectsGroupingContribution
   snapshot: ProjectsGroupingSnapshot
@@ -52,8 +85,8 @@ function readValidProvider(): {
     if (typeof contribution?.getSnapshot !== 'function' || typeof contribution.subscribe !== 'function') continue
 
     try {
-      const snapshot = contribution.getSnapshot()
-      if (snapshot && Array.isArray(snapshot.groups)) {
+      const snapshot = sanitizeSnapshot(contribution.getSnapshot())
+      if (snapshot) {
         return { contribution: contribution as ProjectsGroupingContribution, snapshot }
       }
     } catch {
@@ -135,13 +168,20 @@ function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingS
   })
 }
 
-function createStoreAdapter(contribution: ProjectsGroupingContribution) {
-  let cachedSnapshot: ProjectsGroupingSnapshot | undefined
+function createStoreAdapter(contribution: ProjectsGroupingContribution, initialSnapshot: ProjectsGroupingSnapshot) {
+  let cachedSnapshot = initialSnapshot
 
   return {
     getSnapshot: () => {
-      const snapshot = contribution.getSnapshot()
-      if (cachedSnapshot && snapshotsEqual(cachedSnapshot, snapshot)) return cachedSnapshot
+      let snapshot: ProjectsGroupingSnapshot | null = null
+
+      try {
+        snapshot = sanitizeSnapshot(contribution.getSnapshot())
+      } catch {
+        // Keep the last safe value if an accepted provider later misbehaves.
+      }
+
+      if (!snapshot || snapshotsEqual(cachedSnapshot, snapshot)) return cachedSnapshot
       cachedSnapshot = snapshot
       return snapshot
     },
@@ -153,7 +193,10 @@ function useProjectsGroupingStore() {
   useContributions(PROJECTS_GROUPING_AREA)
   const active = readValidProvider()
   const contribution = active?.contribution ?? null
-  const store = useMemo(() => (contribution ? createStoreAdapter(contribution) : null), [contribution])
+  const store = useMemo(
+    () => (contribution && active ? createStoreAdapter(contribution, active.snapshot) : null),
+    [contribution]
+  )
   const snapshot = useSyncExternalStore(
     store?.subscribe ?? EMPTY_SUBSCRIBE,
     store?.getSnapshot ?? NULL_SNAPSHOT,

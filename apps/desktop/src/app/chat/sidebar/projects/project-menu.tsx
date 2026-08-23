@@ -29,6 +29,7 @@ import { notifyError } from '@/store/notifications'
 import {
   copyPath,
   deleteProject,
+  materializeAutoProject,
   openProjectAddFolder,
   openProjectRename,
   revealPath,
@@ -69,7 +70,10 @@ function useProjectActions({
     if (!grouping?.contribution.assignProject || groupPending || groupId === claimedGroupId) return
     setGroupPending(true)
     try {
-      await grouping.contribution.assignProject(project.id, groupId)
+      const adopted = project.isAuto ? await materializeAutoProject(project) : null
+      const projectId = project.isAuto ? adopted?.id : project.id
+      if (!projectId) return
+      await grouping.contribution.assignProject(projectId, groupId)
     } catch (error) {
       notifyError(error, p.groupUpdateFailed)
     } finally {

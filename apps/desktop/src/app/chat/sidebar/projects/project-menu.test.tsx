@@ -1,10 +1,19 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
+import { registry } from '@/contrib/registry'
+
+import { PROJECTS_GROUPING_AREA, type ProjectsGroupingContribution } from '../projects-presentation'
 import { ProjectMenu } from './project-menu'
 import type { SidebarProjectTree } from './workspace-groups'
 
-afterEach(cleanup)
+const disposers: Array<() => void> = []
+
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+  while (disposers.length) disposers.pop()?.()
+})
 
 // jsdom doesn't implement ResizeObserver; Radix's PopoverContent/Arrow use it
 // (via @radix-ui/react-use-size) to measure the arrow once the popover is
@@ -35,9 +44,11 @@ vi.mock('@/i18n', () => ({
           menuDelete: 'Delete',
           menuRename: 'Rename',
           menuSetActive: 'Set active',
+          moveToGroup: 'Move to group',
           noColor: 'No color',
           removeFromSidebar: 'Remove from sidebar',
-          reveal: 'Reveal in file manager'
+          reveal: 'Reveal in file manager',
+          ungrouped: 'Ungrouped'
         }
       }
     }
@@ -60,6 +71,7 @@ vi.mock('@/store/layout', () => ({
 vi.mock('@/store/projects', () => ({
   copyPath: vi.fn(),
   deleteProject: vi.fn(),
+  materializeAutoProject: vi.fn(),
   openProjectAddFolder: vi.fn(),
   openProjectRename: vi.fn(),
   revealPath: vi.fn(),
@@ -75,6 +87,10 @@ const project = {
   label: 'Test D',
   path: '/repo'
 } as unknown as SidebarProjectTree
+
+const projectsStore = await import('@/store/projects')
+const materializeAutoProject = vi.mocked(projectsStore.materializeAutoProject)
+const setProjectAppearance = vi.mocked(projectsStore.setProjectAppearance)
 
 const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"]')
 
@@ -114,5 +130,41 @@ describe('ProjectMenu', () => {
     // real button through the full Tip > PopoverAnchor > DropdownMenuTrigger
     // chain rather than getting silently dropped on an intermediate wrapper.
     expect(await screen.findByRole('button', { name: 'No color' })).toBeTruthy()
+  }, 15000)
+
+  it('adopts an auto Project before grouping so later appearance edits keep its membership', async () => {
+    const autoProject = { ...project, id: '/repo', isAuto: true }
+    const adoptedProject = { ...project, id: 'p_stable', isAuto: false }
+    let snapshot = { groups: [{ id: 'cue', label: 'CUE++', projectIds: [] as string[] }] }
+    const assignProject = vi.fn(async (projectId: string, groupId: string | null) => {
+      snapshot = {
+        groups: [{ ...snapshot.groups[0], projectIds: groupId === 'cue' ? [projectId] : [] }]
+      }
+    })
+    const contribution: ProjectsGroupingContribution = {
+      assignProject,
+      getSnapshot: () => snapshot,
+      subscribe: () => () => undefined
+    }
+    disposers.push(registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'groups' }))
+    materializeAutoProject.mockResolvedValue(adoptedProject as never)
+
+    const view = render(<ProjectMenu isActive={false} project={autoProject} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+    const moveToGroup = await screen.findByRole('menuitem', { name: 'Move to group' })
+    fireEvent.pointerMove(moveToGroup, { pointerType: 'mouse' })
+    fireEvent.pointerEnter(moveToGroup, { pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'CUE++' }))
+
+    await waitFor(() => expect(assignProject).toHaveBeenCalledWith('p_stable', 'cue'))
+    expect(materializeAutoProject).toHaveBeenCalledWith(autoProject)
+
+    view.rerender(<ProjectMenu isActive={false} project={adoptedProject} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Appearance' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'No color' }))
+
+    await waitFor(() => expect(setProjectAppearance).toHaveBeenCalledWith(adoptedProject, { color: null }))
+    expect(snapshot.groups[0].projectIds).toEqual(['p_stable'])
   }, 15000)
 })

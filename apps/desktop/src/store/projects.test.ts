@@ -22,6 +22,7 @@ import {
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
+  materializeAutoProject,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -31,6 +32,7 @@ import {
   refreshWorktrees,
   resolveNewSessionCwd,
   scanAndRecordRepos,
+  setProjectAppearance,
   startWorkInRepo,
   tombstoneSessions
 } from './projects'
@@ -437,6 +439,50 @@ describe('createProject', () => {
       'sidebar.projects.staleBackend'
     )
     expect($projectsRpcAvailable.get()).toBe(false)
+  })
+
+  it('keeps grouping on the stable id when an auto Project is materialized before appearance', async () => {
+    const created = {
+      archived: false,
+      board_slug: null,
+      color: null,
+      created_at: 1,
+      description: null,
+      folders: [{ added_at: 1, is_primary: true, label: null, path: '/repo' }],
+      icon: null,
+      id: 'p_stable',
+      name: 'repo',
+      primary_path: '/repo',
+      slug: 'repo'
+    }
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.create') return { project: created }
+      if (method === 'projects.tree') return { active_id: null, projects: [], scoped_session_ids: [] }
+      return { active_id: null, projects: [created], scoped_session_ids: [] }
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    $projects.set([])
+    $projectTree.set([])
+    const autoProject = {
+      color: null,
+      icon: null,
+      id: '/repo',
+      isAuto: true,
+      label: 'repo',
+      path: '/repo'
+    } as const
+    const membership: string[] = []
+
+    const adopted = await materializeAutoProject(autoProject)
+    if (adopted) membership.push(adopted.id)
+    await setProjectAppearance(autoProject, { color: '#123456' })
+
+    expect(membership).toEqual(['p_stable'])
+    expect(request.mock.calls.filter(([method]) => method === 'projects.create')).toHaveLength(1)
+    expect(request).toHaveBeenCalledWith(
+      'projects.update',
+      expect.objectContaining({ color: '#123456', id: 'p_stable' })
+    )
   })
 })
 

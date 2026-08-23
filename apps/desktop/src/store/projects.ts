@@ -1001,27 +1001,38 @@ export async function updateProject(
   )
 }
 
-// Appearance for an AUTO (inherited git-repo) project has no projects.db row to
-// write to — its id is just the repo path. So the first color/icon change ADOPTS
-// the repo as a real project (folder = repo root, name = its label) carrying the
-// chosen look; from then on it patches in place like any explicit project.
-// Returns true when an adoption happened, so an incremental picker can close
-// (the node's id changes on adopt, and a second stale write would double-create).
-export async function setProjectAppearance(
-  project: Pick<SidebarProjectTree, 'color' | 'icon' | 'id' | 'isAuto' | 'label' | 'path'>,
-  patch: { color?: null | string; icon?: null | string }
-): Promise<boolean> {
-  if (!project.isAuto) {
-    await updateProject(project.id, patch)
+type ProjectAppearancePatch = { color?: null | string; icon?: null | string }
+type AutoProjectIdentity = Pick<SidebarProjectTree, 'color' | 'icon' | 'id' | 'isAuto' | 'label' | 'path'>
 
-    return false
+const samePath = (left: string, right: string): boolean => isUnderPath(left, right) && isUnderPath(right, left)
+
+// Any durable per-Project metadata must be written against a projects.db id,
+// never an auto-discovered repo's transient path id. Materialize once and hand
+// callers the authoritative row returned by the backend.
+export async function materializeAutoProject(
+  project: AutoProjectIdentity,
+  patch: ProjectAppearancePatch = {}
+): Promise<ProjectInfo | null> {
+  if (!project.isAuto || !project.path) return null
+  const projectPath = project.path
+
+  const existing = $projects
+    .get()
+    .find(candidate =>
+      [candidate.primary_path, ...candidate.folders.map(folder => folder.path)].some(
+        path => path && samePath(path, projectPath)
+      )
+    )
+
+  if (existing) {
+    if (patch.color !== undefined || patch.icon !== undefined) {
+      await updateProject(existing.id, patch)
+    }
+
+    return existing
   }
 
-  if (!project.path) {
-    return false
-  }
-
-  await createProject({
+  return createProject({
     name: project.label,
     folders: [project.path],
     primaryPath: project.path,
@@ -1029,8 +1040,25 @@ export async function setProjectAppearance(
     color: (patch.color ?? project.color) || undefined,
     icon: (patch.icon ?? project.icon) || undefined
   })
+}
 
-  return true
+// Appearance for an AUTO (inherited git-repo) project has no projects.db row to
+// write to — its id is just the repo path. So the first color/icon change ADOPTS
+// the repo as a real project (folder = repo root, name = its label) carrying the
+// chosen look; from then on it patches in place like any explicit project.
+// Returns true when an adoption happened, so an incremental picker can close
+// (the node's id changes on adopt, and a second stale write would double-create).
+export async function setProjectAppearance(
+  project: AutoProjectIdentity,
+  patch: ProjectAppearancePatch
+): Promise<boolean> {
+  if (!project.isAuto) {
+    await updateProject(project.id, patch)
+
+    return false
+  }
+
+  return Boolean(await materializeAutoProject(project, patch))
 }
 
 export async function addProjectFolder(
