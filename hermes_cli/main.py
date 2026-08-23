@@ -5649,6 +5649,13 @@ def cmd_hooks(args):
 
 def cmd_doctor(args):
     """Check configuration and dependencies."""
+    # ``hermes doctor logs <path>`` — one-shot log rotation (t_57aac3e7 fix 1).
+    # Dispatched before run_doctor so the plain ``hermes doctor`` path is
+    # untouched when no subcommand is given.
+    if getattr(args, "doctor_command", None) == "logs":
+        from hermes_cli.doctor_logs import run_doctor_logs
+
+        sys.exit(run_doctor_logs(args))
     from hermes_cli.doctor import run_doctor
 
     run_doctor(args)
