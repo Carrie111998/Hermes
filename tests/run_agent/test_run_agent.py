@@ -2390,6 +2390,24 @@ class TestConcurrentToolExecution:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig(hard_stop_enabled=True)
         )
+        policy_calls = {"validated": 0, "dispatch": 0}
+        original_before_validated = agent._tool_guardrails.before_validated_call
+        original_before_call = agent._tool_guardrails.before_call
+
+        def count_before_validated(*args, **kwargs):
+            policy_calls["validated"] += 1
+            return original_before_validated(*args, **kwargs)
+
+        def count_before_call(*args, **kwargs):
+            policy_calls["dispatch"] += 1
+            return original_before_call(*args, **kwargs)
+
+        monkeypatch.setattr(
+            agent._tool_guardrails,
+            "before_validated_call",
+            count_before_validated,
+        )
+        monkeypatch.setattr(agent._tool_guardrails, "before_call", count_before_call)
         monkeypatch.setattr(
             "hermes_cli.middleware.apply_tool_request_middleware",
             lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
@@ -2457,6 +2475,9 @@ class TestConcurrentToolExecution:
             }
         ]
         assert corrected.result == '{"ok":true}'
+        # The managed executor owns guardrail transitions. The nested runtime
+        # and model-tools paths are skipped, so each call crosses one pipeline.
+        assert policy_calls == {"validated": 3, "dispatch": 1}
 
     @pytest.mark.parametrize(
         "original_args,hook_results",

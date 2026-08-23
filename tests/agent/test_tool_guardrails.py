@@ -102,9 +102,10 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert second.code == "repeated_exact_failure_warning"
 
     blocked = controller.before_call("web_search", args)
-    assert blocked.action == "block"
+    assert blocked.action == "halt"
     assert blocked.code == "repeated_exact_failure_block"
     assert blocked.count == 2
+    assert blocked.should_halt is True
 
 
 
@@ -259,9 +260,9 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     for i in range(3):
         assert controller.before_call("web_search", {"query": f"q{i}"}).action == "allow"
     decision = controller.before_call("web_search", {"query": "q4"})
-    assert decision.action == "block"
+    assert decision.action == "halt"
     assert decision.code == "loop_web_search_cap"
-    assert decision.should_halt is False
+    assert decision.should_halt is True
 
 
 def test_only_explicit_halt_decisions_terminate_the_turn():

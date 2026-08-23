@@ -51,11 +51,22 @@ def test_replace_allows_empty_new_string_deletion():
     handler.assert_called_once()
 
 
-def test_replace_rejects_identical_old_and_new_strings():
-    result = _failure(
-        {"mode": "replace", "path": "x.py", "old_string": "same", "new_string": "same"}
-    )
-    assert result["failure"]["code"] == "patch.replace.no_change"
+def test_replace_routes_identical_old_and_new_to_idempotency_handler():
+    args = {
+        "mode": "replace",
+        "path": "x.py",
+        "old_string": "same",
+        "new_string": "same",
+    }
+    with patch(
+        "tools.file_tools.patch_tool",
+        return_value='{"success":true,"no_change":true}',
+    ) as handler:
+        assert json.loads(_handle_patch(args)) == {
+            "success": True,
+            "no_change": True,
+        }
+    handler.assert_called_once()
 
 
 @pytest.mark.parametrize("patch_payload", ["diff", ""])

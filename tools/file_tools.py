@@ -2343,11 +2343,11 @@ def _validate_patch_contract(args: dict) -> str | None:
                 + ", ".join(invalid_fields),
                 f"patch.replace.{invalid_fields[0]}.invalid",
             )
-        if args["old_string"] == args["new_string"]:
-            return _patch_contract_error(
-                "patch mode='replace': old_string and new_string must differ.",
-                "patch.replace.no_change",
-            )
+        # Identical old/new strings are not a malformed contract. The handler
+        # deliberately reads the target and returns a replay-safe no-op success
+        # when that text is already present (or the normal not-found error when
+        # it is absent). Keep that idempotency path out of malformed-retry
+        # streaks.
         if "patch" in args:
             return _patch_contract_error(
                 "patch mode='replace' cannot include the patch payload.",

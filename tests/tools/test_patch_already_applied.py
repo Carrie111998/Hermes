@@ -56,15 +56,14 @@ def _patch_tool(**kwargs):
 
 
 class TestPatchReplaceAlreadyApplied:
-    def test_identical_old_new_is_rejected_as_malformed_noop(self, workdir):
+    def test_identical_old_new_present_is_success_noop(self, workdir):
         f = workdir / "a.py"
         original = "value = compute_total(items)\n"
         f.write_text(original)
         r = _patch_tool(path=str(f), old_string="value = compute_total(items)",
                         new_string="value = compute_total(items)", task_id="t-applied")
-        assert r["success"] is False
-        assert r["failure"]["kind"] == "malformed_input"
-        assert r["failure"]["code"] == "patch.replace.no_change"
+        assert r["success"] is True
+        assert r.get("no_change") is True
         assert f.read_text() == original
 
     def test_replay_of_landed_edit_is_success_noop(self, workdir):

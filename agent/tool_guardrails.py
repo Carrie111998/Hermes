@@ -472,7 +472,7 @@ class ToolCallGuardrailController:
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
             decision = ToolGuardrailDecision(
-                action="block",
+                action="halt",
                 code="repeated_exact_failure_block",
                 message=(
                     f"Blocked {tool_name}: the same tool call failed {exact_count} "
@@ -491,7 +491,7 @@ class ToolCallGuardrailController:
                 _result_hash, repeat_count = record
                 if repeat_count >= self.config.no_progress_block_after:
                     decision = ToolGuardrailDecision(
-                        action="block",
+                        action="halt",
                         code="idempotent_no_progress_block",
                         message=(
                             f"Blocked {tool_name}: this read-only call returned the same "
@@ -767,7 +767,7 @@ class ToolCallGuardrailController:
             cap = caps.max_web_searches
             if cap and self._turn_web_search_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="halt",
                     code="loop_web_search_cap",
                     message=(
                         f"Blocked web_search: this turn has already made {cap} "
@@ -795,7 +795,7 @@ class ToolCallGuardrailController:
                 return None
             if self._turn_subagent_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="halt",
                     code="loop_subagent_cap",
                     message=(
                         f"Blocked delegate_task: this turn has already spawned "

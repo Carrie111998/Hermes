@@ -723,7 +723,16 @@ def _run_agent_tool_execution_middleware(
                 error_type = block_error_type
                 error_message = block_message
             else:
-                raise AssertionError("blocked tool call has no terminal result")
+                # Validation normally always sets terminal_result. Degrade to a
+                # generic tool error if a plugin integration violates that
+                # invariant instead of raising from a worker thread.
+                logger.error(
+                    "blocked %s tool call had validation state but no terminal result",
+                    function_name,
+                )
+                error_message = "Tool call was blocked during final argument validation"
+                result = json.dumps({"error": error_message}, ensure_ascii=False)
+                error_type = "validation_block"
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
