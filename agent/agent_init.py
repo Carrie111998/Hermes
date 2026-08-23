@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -515,9 +516,11 @@ def _normalize_tool_loop_budget_warning(value):
         return False
     if value is True:
         return True
+    if isinstance(value, float) and not math.isfinite(value):  # NaN / inf / -inf
+        return False
     try:
         n = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     if isinstance(value, float) and value != value:  # NaN
         return False

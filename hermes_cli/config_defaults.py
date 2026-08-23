@@ -58,6 +58,10 @@ DEFAULT_CONFIG = {
         # exhausted. false/absent = off (zero behavior change). true = warn
         # once at >= 80% used. positive int N = warn once when remaining <= N.
         # Delivered like run_budget wrap-up (append to newest tool message).
+        # Tiny caps (max_iterations < 5, where 0.8*max rounds to the last
+        # iteration) may fire only as the budget runs out — a signpost cannot
+        # appear before the first tool message exists. max_iterations with an
+        # unlimited sentinel (>= sys.maxsize) never injects.
         "tool_loop_budget_warning": False,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
@@ -2923,6 +2927,16 @@ DEFAULT_CONFIG = {
         # code so the supervisor (systemd/launchd) revives the process instead
         # of leaving a wedged-but-alive zombie. Set to false to disable.
         "loop_watchdog": True,
+
+        # Loop-liveness watchdog tuning (defaults mirror
+        # gateway/shutdown_watchdog.py constants). probe_interval = seconds
+        # between liveness probes; probe_timeout = seconds a probe may go
+        # unprocessed before counting as a miss; max_strikes = consecutive
+        # misses before the watchdog hard-exits 75 for a service respawn
+        # (~90-120s of sustained loop block at the defaults).
+        "loop_watchdog_probe_interval_s": 30.0,
+        "loop_watchdog_probe_timeout_s": 10.0,
+        "loop_watchdog_max_strikes": 3,
 
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the

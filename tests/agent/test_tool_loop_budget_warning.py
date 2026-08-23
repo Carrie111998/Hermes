@@ -56,6 +56,9 @@ def _make_agent(tmp_path, monkeypatch, config_body: str = "", **overrides):
         ("abc", False),
         (3, 3),
         ("5", 5),
+        (float("inf"), False),
+        (float("-inf"), False),
+        (float("nan"), False),
     ],
 )
 def test_normalize_tool_loop_budget_warning(raw, expected):
@@ -161,6 +164,33 @@ def test_threshold_true_mode_injects_once_on_newest_tool():
     assert _maybe_inject_tool_loop_budget_wrapup(agent, messages) is False
     assert messages == snapshot
     assert messages[-1]["content"].count(TOOL_LOOP_BUDGET_WRAPUP_NOTICE) == 1
+
+
+def test_tiny_finite_cap_fires_only_as_budget_runs_out():
+    """Tiny finite caps (< 5) fire only near/at the wall — not before any
+    iteration has run, and (for max=1) only once the single budget is spent.
+    Documents the honest boundary rather than overclaiming an early signpost."""
+    from agent.conversation_loop import _maybe_inject_tool_loop_budget_wrapup
+
+    # max=1, nothing used yet: 0.8*1=0.8, used(0) < 0.8 => no injection.
+    agent = _StubAgent(warning=True, max_total=1, used=0)
+    messages = _tool_messages()
+    assert _maybe_inject_tool_loop_budget_wrapup(agent, messages) is False
+    assert agent._tool_loop_budget_wrapup_injected is False
+
+    # max=1, budget spent: fires (a signpost cannot precede the first call).
+    agent = _StubAgent(warning=True, max_total=1, used=1)
+    messages = _tool_messages()
+    assert _maybe_inject_tool_loop_budget_wrapup(agent, messages) is True
+    assert agent._tool_loop_budget_wrapup_injected is True
+
+    # max=4: 0.8*4=3.2 => fires only at used>=4 (last iteration).
+    agent = _StubAgent(warning=True, max_total=4, used=3)
+    messages = _tool_messages()
+    assert _maybe_inject_tool_loop_budget_wrapup(agent, messages) is False
+    agent = _StubAgent(warning=True, max_total=4, used=4)
+    messages = _tool_messages()
+    assert _maybe_inject_tool_loop_budget_wrapup(agent, messages) is True
 
 
 def test_threshold_true_mode_not_before_80_percent():
