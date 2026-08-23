@@ -20,14 +20,14 @@
  * Prerequisite: `npm run build` must have been run so that `dist/` exists.
  */
 
-import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
 import { _electron, type ElectronApplication, type Page } from '@playwright/test'
 
-import { startMockServer, type MockServerOptions } from './mock-server'
+import { findElectronBinary } from './electron-binary'
+import { type MockServerOptions, startMockServer } from './mock-server'
 import { installErrorBannerGuard } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
@@ -280,31 +280,34 @@ function assertDistBuilt(): void {
 }
 
 /**
+ * Candidate paths for the Electron dev binary, most-preferred first.
+ *
+ * Two real layouts exist (#92846): npm may hoist electron to the repo root
+ * (classic POSIX workspaces), or the desktop package may own its own copy
+ * under apps/desktop/node_modules (the normal layout on Windows). The binary
+ * itself is `electron.exe` on Windows and `electron` everywhere else.
+ */
+export function electronBinaryCandidates(
+  repoRoot: string,
+  desktopRoot: string,
+  platform: string = process.platform,
+): string[] {
+  const exe = platform === 'win32' ? 'electron.exe' : 'electron'
+
+  return [
+    path.join(repoRoot, 'node_modules', 'electron', 'dist', exe),
+    path.join(desktopRoot, 'node_modules', 'electron', 'dist', exe),
+  ]
+}
+
+/**
  * Find the Electron binary. In the nix devshell, `electron` is on PATH.
  * As a fallback, use the node_modules/.bin/electron from the desktop package.
+ *
+ * Delegates to ./electron-binary (kept hook-free so unit tests can import it).
  */
 export function findElectron(): string {
-  // In dev mode, we use the `electron` binary directly (not the packaged app).
-  // The dev:electron script in package.json does exactly this: `electron .`
-  // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
-
-  if (fs.existsSync(localElectron)) {
-    return localElectron
-  }
-
-  // Fall back to PATH
-  const result = spawnSync('which', ['electron'], {
-    encoding: 'utf8',
-  })
-
-  if (result.status === 0 && result.stdout.trim()) {
-    return result.stdout.trim()
-  }
-
-  throw new Error(
-    'Electron binary not found. Run "npm install" from the repo root to install devDependencies.',
-  )
+  return findElectronBinary(REPO_ROOT, DESKTOP_ROOT)
 }
 
 /**
@@ -632,6 +635,7 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
       // `position: fixed; inset: 0`. If the hit element or an ancestor
       // is a full-viewport fixed overlay, we're still covered.
       let node: Element | null = el
+
       while (node) {
         const cs = window.getComputedStyle(node)
 
