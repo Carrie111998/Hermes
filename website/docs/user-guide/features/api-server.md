@@ -622,6 +622,27 @@ to the routed profile**:
 - A named profile with no `API_SERVER_KEY` of its own fails closed — its
   prefix is unreachable until you set one.
 
+:::note Run status visibility
+`multiplex_profiles` isolates **execution** (secrets, files, session state)
+per routed profile. It does not make run polling a per-profile ownership
+check.
+
+`GET /p/<profile>/v1/runs/{run_id}` — and the matching `/events` and
+`/stop` routes — looks up the **process-level** run table for this
+gateway by `run_id`. The prefix only has to name a profile this listener
+already serves; an unknown profile still 404s.
+
+A client that already authenticates as another profile in that **same
+gateway's authorized profile set** (with that other profile's own
+`API_SERVER_KEY`) can therefore read a known `run_id` created under a
+different served prefix. On one multiplexed listener, profiles are
+routing handles, not a per-run authorization boundary. Callers outside
+that authorized set are out of scope.
+
+If tenants must not see each other's run status, give each tenant its
+own gateway process rather than multiplexing them on one API server.
+:::
+
 :::warning Breaking change (July 2026)
 Before this fix, a valid default-profile key was accepted on any
 `/p/<profile>/` prefix. If you relied on one shared key across profile
