@@ -75,8 +75,10 @@ def _diff_ansi() -> dict[str, str]:
         # (diff_added/diff_removed backgrounds + diff_*_word foregrounds —
         # the same keys the TUI uses), use them so diffs render in the skin's
         # intended low-saturation light green / light red. Otherwise fall back
-        # to a dark tinted background derived from ui_ok/ui_error + white text.
-        def _diff_line(bg_key: str, word_key: str, fallback_bg_rgb) -> str:
+        # to a dark tinted background derived from ui_error / ui_ok — exactly
+        # how diff colors were themed before the dedicated keys existed — so a
+        # skin that customized ui_error/ui_ok keeps its diff tinting.
+        def _diff_line(bg_key, word_key, src_key, src_fallback, r_div, g_div, b_div):
             bg_h = skin.get_color(bg_key, "")
             word_h = skin.get_color(word_key, "")
             if (
@@ -84,18 +86,37 @@ def _diff_ansi() -> dict[str, str]:
                 and len(bg_h) == 7 and bg_h[0] == "#"
                 and len(word_h) == 7 and word_h[0] == "#"
             ):
-                br = int(bg_h[1:3], 16)
-                bg2 = int(bg_h[3:5], 16)
-                bb = int(bg_h[5:7], 16)
-                fr = int(word_h[1:3], 16)
-                fg2 = int(word_h[3:5], 16)
-                fb = int(word_h[5:7], 16)
-                return f"\033[38;2;{fr};{fg2};{fb};48;2;{br};{bg2};{bb}m"
-            br, bg2_, bb_ = fallback_bg_rgb
-            return f"\033[38;2;255;255;255;48;2;{br};{bg2_};{bb_}m"
+                bg_r = int(bg_h[1:3], 16)
+                bg_g = int(bg_h[3:5], 16)
+                bg_b = int(bg_h[5:7], 16)
+                fg_r = int(word_h[1:3], 16)
+                fg_g = int(word_h[3:5], 16)
+                fg_b = int(word_h[5:7], 16)
+                return f"\033[38;2;{fg_r};{fg_g};{fg_b};48;2;{bg_r};{bg_g};{bg_b}m"
+            # Backward-compatible fallback: derive a dark tint from the skin's
+            # ui_error / ui_ok, exactly as diff colors were derived before the
+            # dedicated diff_* keys existed. The accent channel (the one
+            # halved) clamps to a floor of 20, the others to 10 — matching the
+            # previous ui_error/ui_ok derivation so skins that customized them
+            # keep their exact diff tinting.
+            src = skin.get_color(src_key, src_fallback)
+            if src and len(src) == 7 and src[0] == "#":
+                sr = int(src[1:3], 16)
+                sg = int(src[3:5], 16)
+                sb = int(src[5:7], 16)
+                min_r = 20 if r_div == 2 else 10
+                min_g = 20 if g_div == 2 else 10
+                min_b = 20 if b_div == 2 else 10
+                return (
+                    f"\033[38;2;255;255;255;48;2;"
+                    f"{max(sr // r_div, min_r)};{max(sg // g_div, min_g)};{max(sb // b_div, min_b)}m"
+                )
+            return "\033[38;2;255;255;255;48;2;20;20;20m"
 
-        minus = _diff_line("diff_removed", "diff_removed_word", (120, 20, 20))
-        plus = _diff_line("diff_added", "diff_added_word", (20, 90, 20))
+        # Removed lines: red tint from ui_error; Added lines: green tint from
+        # ui_ok. Divisors reproduce the previous ui_error/ui_ok derivation.
+        minus = _diff_line("diff_removed", "diff_removed_word", "ui_error", "#ef5350", 2, 4, 4)
+        plus = _diff_line("diff_added", "diff_added_word", "ui_ok", "#4caf50", 4, 2, 4)
     except Exception:
         pass
 
