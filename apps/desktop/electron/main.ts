@@ -3545,7 +3545,8 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       rememberLog('[updates] no staged updater; using repo hand-off script for CLI install')
     }
 
-    const handoffConflict = updateHandoffConflict(HERMES_HOME)
+    const updateRoot = resolveUpdateRoot()
+    const handoffConflict = updateHandoffConflict(HERMES_HOME, { installRoot: updateRoot })
 
     if (handoffConflict) {
       // A different updater already owns the marker — most often a previous
@@ -3566,7 +3567,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     })
     repairMacUpdaterHelper(updater)
 
-    const updateRoot = resolveUpdateRoot()
     const { branch: configuredBranch } = readDesktopUpdateConfig()
     const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     const updaterArgs = ['--update', '--branch', branch]
@@ -3800,7 +3800,8 @@ async function handOffWindowsBootstrapRecovery(reason) {
     return false
   }
 
-  const handoffConflict = updateHandoffConflict(HERMES_HOME)
+  const updateRoot = resolveUpdateRoot()
+  const handoffConflict = updateHandoffConflict(HERMES_HOME, { installRoot: updateRoot })
 
   if (handoffConflict) {
     // Same hazard as applyUpdates (#75778): a live foreign updater already
@@ -3818,7 +3819,6 @@ async function handOffWindowsBootstrapRecovery(reason) {
     return true
   }
 
-  const updateRoot = resolveUpdateRoot()
   const { branch: configuredBranch } = readDesktopUpdateConfig()
 
   const branch = directoryExists(path.join(updateRoot, '.git'))
@@ -4017,7 +4017,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
     return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
   }
 
-  const handoffConflict = updateHandoffConflict(HERMES_HOME)
+  const handoffConflict = updateHandoffConflict(HERMES_HOME, { installRoot: updateRoot })
 
   if (handoffConflict) {
     // Same hazard as the Windows path (#75778): a live foreign updater

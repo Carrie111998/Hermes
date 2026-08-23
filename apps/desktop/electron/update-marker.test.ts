@@ -20,6 +20,7 @@ import path from 'path'
 import { test } from 'vitest'
 
 import {
+  installLockPath,
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
@@ -46,6 +47,30 @@ const DEAD: typeof process.kill = () => {
   ;(err as any).code = 'ESRCH'
   throw err
 }
+
+test('installation lock path is the git metadata contract shared with Python and Rust', () => {
+  const home = tmpHome('install-lock-path')
+  const installRoot = path.join(home, 'hermes-agent')
+  fs.mkdirSync(path.join(installRoot, '.git'), { recursive: true })
+
+  assert.equal(installLockPath(installRoot), path.join(installRoot, '.git', 'hermes-update.lock'))
+})
+
+test('installation lock path resolves a gitfile metadata directory', () => {
+  const home = tmpHome('install-lock-gitfile')
+  const installRoot = path.join(home, 'worktree')
+  const metadata = path.join(home, 'repo.git', 'worktrees', 'worktree')
+  fs.mkdirSync(installRoot)
+  fs.mkdirSync(metadata, { recursive: true })
+  fs.writeFileSync(path.join(installRoot, '.git'), 'gitdir: ../repo.git/worktrees/worktree\n')
+
+  assert.equal(installLockPath(installRoot), path.join(metadata, 'hermes-update.lock'))
+})
+
+test('legacy handoff marker remains under HERMES_HOME', () => {
+  const home = tmpHome('legacy-marker-path')
+  assert.equal(markerPath(home), path.join(home, '.hermes-update-in-progress'))
+})
 
 test('absent marker => no live update', () => {
   const home = tmpHome('absent')
@@ -166,6 +191,19 @@ test('writeUpdateMarker + dead pid => self-heals on read', () => {
 test('no marker => hand-off is not blocked', () => {
   const home = tmpHome('conflict-none')
   assert.equal(updateHandoffConflict(home, { kill: ALIVE }), null)
+})
+
+test('atomic installation lock blocks hand-off even when another profile has no marker', () => {
+  const home = tmpHome('conflict-install-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(lock, { recursive: true })
+  fs.writeFileSync(path.join(lock, 'owner'), `4242\n${Math.floor(Date.now() / 1000)}\n`)
+
+  const conflict = updateHandoffConflict(home, { kill: ALIVE, installRoot })
+  assert.ok(conflict)
+  assert.equal(conflict.pid, 4242)
+  assert.match(conflict.message, /installation/)
 })
 
 test('a different live updater already owns the marker => hand-off is blocked', () => {

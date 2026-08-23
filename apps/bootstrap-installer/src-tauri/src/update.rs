@@ -98,6 +98,84 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve the private Git metadata directory used for the installation lock.
+/// This is deliberately outside the worktree: `git stash --include-untracked`
+/// never traverses Git metadata, so it cannot remove a held lock.
+fn install_lock_path(install_root: &Path) -> PathBuf {
+    let dot_git = install_root.join(".git");
+    let metadata = if dot_git.is_dir() {
+        dot_git
+    } else {
+        std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|raw| raw.lines().next().map(str::trim).map(str::to_owned))
+            .and_then(|line| {
+                line.strip_prefix("gitdir:")
+                    .or_else(|| line.strip_prefix("GITDIR:"))
+                    .map(str::trim)
+                    .map(PathBuf::from)
+            })
+            .map(|candidate| {
+                if candidate.is_absolute() {
+                    candidate
+                } else {
+                    install_root.join(candidate)
+                }
+            })
+            .and_then(|candidate| candidate.canonicalize().ok().or(Some(candidate)))
+            .unwrap_or(dot_git)
+    };
+    metadata.join("hermes-update.lock")
+}
+
+struct InstallLockGuard {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl InstallLockGuard {
+    fn acquire(install_root: &Path) -> std::io::Result<Self> {
+        let path = install_lock_path(install_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                let started_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if let Err(err) = std::fs::write(
+                    path.join("owner"),
+                    format!("{}\n{started_at}\n", std::process::id()),
+                ) {
+                    tracing::warn!(?path, %err, "could not write installation lock owner");
+                }
+                Ok(Self { path, owned: true })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn complete(&self) {
+        if !self.owned {
+            return;
+        }
+        let _ = std::fs::remove_file(self.path.join("owner"));
+        if let Err(err) = std::fs::remove_dir(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?self.path, %err, "could not remove installation lock");
+            }
+        }
+    }
+}
+
+impl Drop for InstallLockGuard {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
 /// RAII guard that owns the "update in progress" marker (see
 /// `paths::update_in_progress_marker`). Created at the top of `run_update`;
 /// its `Drop` removes the marker on EVERY exit path — success, early
@@ -252,6 +330,38 @@ impl Drop for UpdateMarkerGuard {
 async fn run_update(app: AppHandle) -> Result<()> {
     let hermes_home = crate::paths::hermes_home();
     let install_root = hermes_home.join("hermes-agent");
+
+    // Atomic installation-scoped single flight. The compatibility marker below
+    // remains under HERMES_HOME for Electron startup gating, but it is not an
+    // atomic lock and profiles have different homes. `create_dir` is the sole
+    // winner decision shared with Python's mkdir contract.
+    let _install_lock = match InstallLockGuard::acquire(&install_root) {
+        Ok(guard) => guard,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let msg = "Another Hermes update is already running for this installation. Wait for it to finish, then try again.";
+            emit(
+                &app,
+                BootstrapEvent::Failed {
+                    message: msg.to_string(),
+                    log_path: Some(crate::paths::log_path().to_string_lossy().into_owned()),
+                    exit_code: Some(UPDATE_EXIT_CONCURRENT),
+                },
+            );
+            return Err(anyhow!(msg));
+        }
+        Err(err) => {
+            let msg = format!("Could not acquire the installation update lock: {err}");
+            emit(
+                &app,
+                BootstrapEvent::Failed {
+                    message: msg.clone(),
+                    log_path: Some(crate::paths::log_path().to_string_lossy().into_owned()),
+                    exit_code: Some(UPDATE_EXIT_CONCURRENT),
+                },
+            );
+            return Err(anyhow!(msg));
+        }
+    };
 
     // Mutual exclusion (#50238): publish an "update in progress" marker for the
     // entire duration of this update. A desktop instance the user relaunches
@@ -598,6 +708,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // make a completed update look active — blocking desktop startup and
     // every other updater until the age ceiling expires.
     _update_marker.complete();
+    _install_lock.complete();
 
     if let Some(target_app) = launch_target {
         if let Err(err) = launch_macos_app_and_exit(&app, &target_app).await {
@@ -1302,6 +1413,39 @@ mod tests {
     }
 
     #[test]
+    fn install_lock_path_uses_git_metadata_contract() {
+        let dir = unique_tmp_dir("install-lock-path");
+        let root = dir.join("hermes-agent");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        assert_eq!(
+            install_lock_path(&root),
+            root.join(".git").join("hermes-update.lock")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_lock_path_resolves_gitfile_metadata() {
+        let dir = unique_tmp_dir("install-lock-gitfile");
+        let root = dir.join("worktree");
+        let metadata = dir.join("repo.git").join("worktrees").join("worktree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            "gitdir: ../repo.git/worktrees/worktree\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            install_lock_path(&root),
+            metadata.join("hermes-update.lock")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn update_marker_guard_drop_is_quiet_when_already_gone() {
         let dir = unique_tmp_dir("marker-guard-gone");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1368,7 +1512,10 @@ mod tests {
         assert_eq!(owner.pid, foreign_pid);
 
         // The refused guard must not delete the live owner's marker.
-        assert!(marker.exists(), "refused acquire must leave the marker intact");
+        assert!(
+            marker.exists(),
+            "refused acquire must leave the marker intact"
+        );
         let _ = foreign.kill();
         let _ = foreign.wait();
         let _ = std::fs::remove_dir_all(&dir);

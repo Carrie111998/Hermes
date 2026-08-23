@@ -4942,6 +4942,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_reload_updated_runtime_modules",
         "_resolve_pre_update_backup_mode",
         "_resolve_stash_selector",
+        "_resolve_systemd_manage_cmd",
         "_restart_phase_failure_is_incomplete",
         "_restore_active_tool_dependencies",
         "_restore_stashed_changes",

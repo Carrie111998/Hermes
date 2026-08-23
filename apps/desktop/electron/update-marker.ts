@@ -29,6 +29,31 @@ import path from 'path'
 // recycled the pid onto an unrelated process), so the gate self-heals.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 
+/**
+ * Installation-scoped single-flight lock. Keep byte-for-byte path semantics
+ * with hermes_cli.update_lock.install_lock_path and Rust install_lock_path.
+ * A linked worktree's .git file points at its private metadata directory.
+ */
+export function installLockPath(installRoot: string) {
+  const dotGit = path.join(installRoot, '.git')
+  let metadata = dotGit
+
+  try {
+    if (!fs.statSync(dotGit).isDirectory()) {
+      const firstLine = fs.readFileSync(dotGit, 'utf8').split(/\r?\n/, 1)[0] || ''
+      const match = /^gitdir:\s*(.+)$/i.exec(firstLine)
+
+      if (match) {
+        metadata = path.resolve(installRoot, match[1].trim())
+      }
+    }
+  } catch {
+    // ZIP/non-git installs use the conventional private metadata slot.
+  }
+
+  return path.join(metadata, 'hermes-update.lock')
+}
+
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
@@ -185,8 +210,33 @@ export function updateHandoffConflict(
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
+    installRoot?: string
   } = {}
 ) {
+  if (opts.installRoot) {
+    const lock = installLockPath(opts.installRoot)
+
+    if (fs.existsSync(lock)) {
+      let pid = 0
+
+      try {
+        const [pidLine] = fs.readFileSync(path.join(lock, 'owner'), 'utf8').split('\n')
+        pid = Number.parseInt((pidLine || '').trim(), 10)
+      } catch {
+        void 0
+      }
+
+      return {
+        pid,
+        ageMs: 0,
+        message:
+          pid > 0
+            ? `An update is already running for this installation (PID ${pid}). Wait for it to finish, then try again.`
+            : 'An update is already running for this installation. Wait for it to finish, then try again.'
+      }
+    }
+  }
+
   const owner = readLiveUpdateMarker(hermesHome, opts)
 
   if (!owner) {

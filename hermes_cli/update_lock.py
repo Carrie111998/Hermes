@@ -17,13 +17,16 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 ``git checkout`` could mutate the same checkout concurrently, rewriting source
 under a live interpreter and leaving the tree half-updated.
 
-This module makes that same marker the single lock for **all** update
-entrypoints instead of adding a fourth mechanism. The wire format remains
-byte-compatible with the Rust and Electron readers, while the location is
-installation-scoped so every profile using one checkout contends on the same
-lock:
+The marker remains byte-compatible and profile-scoped for the Rust updater /
+Electron backend-start handoff.  Mutual exclusion is a separate, atomic,
+installation-scoped directory under Git metadata:
 
-    <PROJECT_ROOT>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
+    $HERMES_HOME/.hermes-update-in-progress     body: "<pid>\\n<started_at_unix>"
+    <git-dir>/hermes-update.lock/owner           body: "<pid>\\n<started_at_unix>"
+
+Creating the lock directory is the single winner decision (``mkdir`` is atomic
+across processes).  Git never stashes its own metadata, so ``git stash
+--include-untracked`` cannot remove the held lock midway through an update.
 
 A marker only counts as a live update when its pid is alive AND it is younger
 than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
@@ -58,6 +61,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +74,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
+INSTALL_LOCK_NAME = "hermes-update.lock"
+INSTALL_LOCK_OWNER_NAME = "owner"
 
 # Set by an orchestrating updater (the Tauri `hermes-setup --update` flow) to
 # its own pid before spawning `hermes update` as a child stage. The parent
@@ -87,8 +94,33 @@ UPDATE_EXIT_CONCURRENT = 2
 
 
 def update_marker_path() -> Path:
-    """Path of the update marker shared by every profile in this install."""
-    return PROJECT_ROOT / MARKER_NAME
+    """Compatibility handoff marker consumed by Rust and Electron."""
+    return get_hermes_home() / MARKER_NAME
+
+
+def _git_metadata_dir(install_root: Path) -> Path:
+    """Resolve the checkout's private Git metadata directory without Git."""
+    dot_git = install_root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    try:
+        first_line = dot_git.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError):
+        # ZIP/non-git installs still need an install-private lock.  Keep it in
+        # the conventional metadata slot so it is outside normal source paths.
+        return dot_git
+    prefix = "gitdir:"
+    if not first_line.lower().startswith(prefix):
+        return dot_git
+    target = Path(first_line[len(prefix) :].strip())
+    if not target.is_absolute():
+        target = install_root / target
+    return target.resolve(strict=False)
+
+
+def install_lock_path(install_root: Path | None = None) -> Path:
+    """Atomic installation lock path shared by Python, Rust, and Electron."""
+    return _git_metadata_dir(install_root or PROJECT_ROOT) / INSTALL_LOCK_NAME
 
 
 def _pid_alive(pid: int) -> bool:
@@ -223,10 +255,68 @@ class UpdateLock:
     deleted out from under its new owner.
     """
 
-    def __init__(self, *, path: Path | None = None) -> None:
-        self.path = path or update_marker_path()
+    def __init__(
+        self,
+        *,
+        path: Path | None = None,
+        marker_path: Path | None = None,
+        install_root: Path | None = None,
+        lock_path: Path | None = None,
+    ) -> None:
+        if path is not None and marker_path is not None:
+            raise TypeError("pass path or marker_path, not both")
+        self.path = marker_path or path or update_marker_path()
+        if lock_path is not None:
+            self.install_path = lock_path
+        elif install_root is not None or (path is None and marker_path is None):
+            self.install_path = install_lock_path(install_root)
+        else:
+            # Explicit marker paths are the test/embedding API. Keep their
+            # lock hermetic unless the caller explicitly supplies install_root.
+            self.install_path = self.path.parent / ".git" / INSTALL_LOCK_NAME
+        self._install_owned = False
+        self._install_inherited = False
         self.acquired = False
         self.holder: UpdateHolder | None = None
+
+    def _read_install_holder(self) -> UpdateHolder | None:
+        try:
+            lines = (self.install_path / INSTALL_LOCK_OWNER_NAME).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            pid = int(lines[0].strip())
+            started_at = float(lines[1].strip())
+        except (OSError, IndexError, ValueError):
+            return None
+        if not _pid_alive(pid):
+            return None
+        return UpdateHolder(pid=pid, age_seconds=time.time() - started_at)
+
+    def _acquire_install_lock(self) -> bool:
+        self.install_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.install_path.mkdir()
+        except FileExistsError:
+            owner = self._read_install_holder()
+            if owner is not None and (
+                owner.pid == _handoff_pid() or _is_ancestor_pid(owner.pid)
+            ):
+                self._install_inherited = True
+                return True
+            self.holder = owner or UpdateHolder(pid=-1, age_seconds=0)
+            return False
+        except OSError as exc:
+            logger.warning("Could not acquire installation lock %s: %s", self.install_path, exc)
+            return False
+
+        self._install_owned = True
+        try:
+            (self.install_path / INSTALL_LOCK_OWNER_NAME).write_text(
+                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning("Could not write installation lock owner %s: %s", self.install_path, exc)
+        return True
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -238,11 +328,15 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
+        if not self._acquire_install_lock():
+            return False
+
         existing = read_live_update(path=self.path)
         if existing is not None:
             if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
                 return True
             self.holder = existing
+            self._release_install_lock()
             return False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,24 +352,34 @@ class UpdateLock:
         self.acquired = True
         return True
 
-    def release(self) -> None:
-        """Drop the marker if this process still owns it. Never raises."""
-        if not self.acquired:
+    def _release_install_lock(self) -> None:
+        if not self._install_owned:
             return
-        self.acquired = False
+        self._install_owned = False
         try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
-            return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
-            return
-        try:
-            self.path.unlink()
+            (self.install_path / INSTALL_LOCK_OWNER_NAME).unlink()
         except OSError:
             pass
+        try:
+            self.install_path.rmdir()
+        except OSError:
+            pass
+
+    def release(self) -> None:
+        """Drop the marker if this process still owns it. Never raises."""
+        if self.acquired:
+            self.acquired = False
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+                owner = int(raw.splitlines()[0].strip())
+            except (OSError, IndexError, ValueError):
+                owner = None
+            if owner == os.getpid():
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
+        self._release_install_lock()
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

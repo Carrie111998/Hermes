@@ -18,6 +18,7 @@ from hermes_cli.main import (
     _batch_systemd_gateway_restarts,
     _force_systemd_unit_restart,
     _for_each_systemd_gateway_unit,
+    _resolve_systemd_manage_cmd,
     _service_unit_supports_graceful_sigusr1_restart,
     _warn_incomplete_gateway_fleet_restart,
 )
@@ -92,6 +93,73 @@ def test_system_unit_without_root_uses_manual_fallback(monkeypatch, capsys):
     run.assert_not_called()
     assert failed == ["hermes-gateway-work"]
     assert "sudo systemctl restart hermes-gateway-work" in capsys.readouterr().out
+
+
+def test_production_manage_command_contract_user_root_sudo_and_manual(monkeypatch):
+    user = _resolve_systemd_manage_cmd(
+        "user", ["systemctl", "--user"], "hermes-gateway-work", cache={}
+    )
+    assert user == ["systemctl", "--user", "--no-ask-password"]
+
+    monkeypatch.setattr("hermes_cli.update_cmd.os.geteuid", lambda: 0)
+    root = _resolve_systemd_manage_cmd(
+        "system", ["systemctl"], "hermes-gateway-work", cache={}
+    )
+    assert root == ["systemctl", "--no-ask-password"]
+
+    monkeypatch.setattr("hermes_cli.update_cmd.os.geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd.subprocess.run",
+        lambda *args, **kwargs: Mock(returncode=0),
+    )
+    sudo = _resolve_systemd_manage_cmd(
+        "system", ["systemctl"], "hermes-gateway-work", cache={}
+    )
+    assert sudo == ["sudo", "-n", "systemctl", "--no-ask-password"]
+
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd.subprocess.run",
+        lambda *args, **kwargs: Mock(returncode=1),
+    )
+    manual = _resolve_systemd_manage_cmd(
+        "system", ["systemctl"], "hermes-gateway-work", cache={}
+    )
+    assert manual is None
+
+
+def test_production_batch_dedupes_and_isolates_finish_timeout_for_later_units():
+    entries = [
+        {"scope": "user", "svc_name": "hermes-gateway-a", "manage_cmd": ["systemctl", "--user"]},
+        {"scope": "user", "svc_name": "hermes-gateway-a", "manage_cmd": ["systemctl", "--user"]},
+        {"scope": "user", "svc_name": "hermes-gateway-b", "manage_cmd": ["systemctl", "--user"]},
+        {"scope": "user", "svc_name": "hermes-gateway-c", "manage_cmd": ["systemctl", "--user"]},
+    ]
+    events: list[str] = []
+    failed: list[str] = []
+
+    def finish(entry):
+        events.append(f"wait:{entry['svc_name']}")
+        if entry["svc_name"] == "hermes-gateway-b":
+            raise subprocess.TimeoutExpired(
+                ["systemctl", "restart", entry["svc_name"]], 15
+            )
+
+    _batch_systemd_gateway_restarts(
+        entries,
+        signal_unit=lambda entry: events.append(f"signal:{entry['svc_name']}"),
+        finish_unit=finish,
+        on_finish_timeout=lambda entry, exc: failed.append(entry["svc_name"]),
+    )
+
+    assert events == [
+        "signal:hermes-gateway-a",
+        "signal:hermes-gateway-b",
+        "signal:hermes-gateway-c",
+        "wait:hermes-gateway-a",
+        "wait:hermes-gateway-b",
+        "wait:hermes-gateway-c",
+    ]
+    assert failed == ["hermes-gateway-b"]
 
 
 class TestFleetRestartTimeoutIsolation:

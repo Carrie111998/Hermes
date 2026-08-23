@@ -17,6 +17,8 @@ disk.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -26,6 +28,7 @@ from hermes_cli.update_lock import (
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
     describe_holder,
+    install_lock_path,
     read_live_update,
     update_marker_path,
 )
@@ -41,6 +44,85 @@ def marker(tmp_path):
     return tmp_path / ".hermes-update-in-progress"
 
 
+def test_install_lock_lives_in_git_metadata_not_the_worktree(tmp_path):
+    install_root = tmp_path / "install"
+    git_dir = install_root / ".git"
+    git_dir.mkdir(parents=True)
+
+    assert install_lock_path(install_root) == git_dir / "hermes-update.lock"
+
+
+def test_gitfile_install_lock_resolves_the_git_metadata_directory(tmp_path):
+    install_root = tmp_path / "worktree"
+    metadata = tmp_path / "repo.git" / "worktrees" / "worktree"
+    install_root.mkdir()
+    metadata.mkdir(parents=True)
+    (install_root / ".git").write_text("gitdir: ../repo.git/worktrees/worktree\n", encoding="utf-8")
+
+    assert install_lock_path(install_root) == metadata / "hermes-update.lock"
+
+
+def test_simultaneous_processes_have_exactly_one_install_lock_winner(tmp_path):
+    """Real processes contend through atomic mkdir; no read-then-write race."""
+    install_root = tmp_path / "install"
+    (install_root / ".git").mkdir(parents=True)
+    gate = tmp_path / "go"
+    worker = """
+import pathlib, sys, time
+from hermes_cli.update_lock import UpdateLock
+root, gate = map(pathlib.Path, sys.argv[1:])
+while not gate.exists():
+    time.sleep(0.001)
+lock = UpdateLock(marker_path=root.parent / ('.marker-' + str(__import__('os').getpid())), install_root=root)
+won = lock.acquire()
+print('won' if won else 'lost', flush=True)
+if won:
+    time.sleep(0.4)
+lock.release()
+"""
+    # Each process gets a private compatibility marker: only the installation
+    # lock decides this race, exactly as two profiles sharing one checkout do.
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, str(install_root), str(gate)],
+            cwd=install_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    gate.touch()
+    results = [proc.communicate(timeout=10) for proc in procs]
+    assert [proc.returncode for proc in procs] == [0, 0], results
+    assert sorted(stdout.strip() for stdout, _ in results) == ["lost", "won"]
+
+
+def test_git_autostash_cannot_remove_a_held_install_lock(tmp_path):
+    install_root = tmp_path / "install"
+    subprocess.run(["git", "init", "-q", str(install_root)], check=True)
+    subprocess.run(["git", "-C", str(install_root), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(install_root), "config", "user.name", "Test"], check=True)
+    (install_root / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(install_root), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(install_root), "commit", "-qm", "base"], check=True)
+
+    lock = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
+    assert lock.acquire()
+    (install_root / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(install_root), "stash", "push", "--include-untracked", "-m", "test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert lock.install_path.is_dir(), "git stash never traverses the git metadata directory"
+    contender = UpdateLock(marker_path=tmp_path / "other-marker", install_root=install_root)
+    assert contender.acquire() is False
+    lock.release()
+
+
 def test_two_profile_homes_sharing_one_install_serialize(tmp_path, monkeypatch):
     """Profiles from one checkout must contend on one installation lock."""
     install_root = tmp_path / "install"
@@ -48,12 +130,14 @@ def test_two_profile_homes_sharing_one_install_serialize(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
     first = UpdateLock()
-    assert first.path == install_root / ".hermes-update-in-progress"
+    assert first.path == tmp_path / "profile-a" / ".hermes-update-in-progress"
+    assert first.install_path == install_root / ".git" / "hermes-update.lock"
     assert first.acquire() is True
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
     second = UpdateLock()
-    assert second.path == first.path
+    assert second.path == tmp_path / "profile-b" / ".hermes-update-in-progress"
+    assert second.install_path == first.install_path
     assert second.acquire() is False
 
     first.release()
@@ -179,7 +263,10 @@ def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
     An unwritable marker path is a worse reason to block an update than the
     race the lock prevents.
     """
-    lock = UpdateLock(path=tmp_path / "nonexistent-file" / "marker")
+    lock = UpdateLock(
+        path=tmp_path / "nonexistent-file" / "marker",
+        lock_path=tmp_path / ".git" / "hermes-update.lock",
+    )
     (tmp_path / "nonexistent-file").write_text("i am a file, not a dir", encoding="utf-8")
 
     assert lock.acquire() is True

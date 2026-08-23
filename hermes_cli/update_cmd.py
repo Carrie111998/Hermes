@@ -4987,12 +4987,14 @@ def _batch_systemd_gateway_restarts(
     *,
     signal_unit,
     finish_unit,
+    on_finish_timeout=None,
 ) -> None:
     """Signal the manageable systemd fleet before waiting on any one unit.
 
     An unprivileged system service must not be drained: without a usable
-    management command, systemd may not bring it back.  Its finish step emits
-    the existing manual/root fallback instead.
+    management command, systemd may not bring it back. Its finish step emits
+    the existing manual/root fallback instead. A timed-out finish can be
+    reported without preventing later units from completing.
     """
     unique_entries = []
     seen = set()
@@ -5007,7 +5009,12 @@ def _batch_systemd_gateway_restarts(
         if entry.get("manage_cmd") is not None:
             signal_unit(entry)
     for entry in unique_entries:
-        finish_unit(entry)
+        try:
+            finish_unit(entry)
+        except subprocess.TimeoutExpired as exc:
+            if on_finish_timeout is None:
+                raise
+            on_finish_timeout(entry, exc)
 
 
 def _force_systemd_unit_restart(
@@ -5076,6 +5083,41 @@ def _force_systemd_unit_restart(
         f"      {sudo_hint}systemctl {scope_flag}reset-failed {svc_name}\n"
         f"      {sudo_hint}systemctl {scope_flag}restart {svc_name}"
     )
+
+
+def _resolve_systemd_manage_cmd(
+    scope: str,
+    scope_cmd: list[str],
+    svc_name: str,
+    *,
+    cache: dict[str, list[str] | None],
+) -> list[str] | None:
+    """Return a non-interactive systemd management prefix for one scope."""
+    if scope in cache:
+        return cache[scope]
+
+    cmd: list[str] | None = scope_cmd + ["--no-ask-password"]
+    if scope == "system" and hasattr(os, "geteuid") and os.geteuid() != 0:
+        sudo_cmd = ["sudo", "-n"] + scope_cmd + ["--no-ask-password"]
+        sudo_ok = False
+        try:
+            probe = subprocess.run(
+                ["sudo", "-n", "true"], capture_output=True, timeout=5
+            )
+            sudo_ok = probe.returncode == 0
+            if not sudo_ok:
+                probe = subprocess.run(
+                    sudo_cmd + ["reset-failed", svc_name],
+                    capture_output=True,
+                    timeout=5,
+                )
+                sudo_ok = probe.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            sudo_ok = False
+        cmd = sudo_cmd if sudo_ok else None
+
+    cache[scope] = cmd
+    return cmd
 
 
 def _for_each_systemd_gateway_unit(
@@ -7538,65 +7580,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             break
                 return total if matched else default
 
-            _manage_cmd_cache: dict = {}
+            _manage_cmd_cache: dict[str, list[str] | None] = {}
 
             def _resolve_manage_cmd(scope_: str, scope_cmd_: list, svc_name_: str):
-                """Resolve the command prefix for manage-units operations.
-
-                Read-only systemctl calls (``is-active``, ``show``,
-                ``list-units``) work unprivileged, but manage-units verbs
-                (``reset-failed``, ``start``, ``restart``) on a *system*
-                service trigger a polkit ``org.freedesktop.systemd1.manage-units``
-                authentication prompt when run as a non-root user.  That
-                interactive prompt runs inside our captured subprocess with a
-                10-15s timeout — the user sees the prompt flash and "exit
-                directly" before they can answer, and the resulting
-                TimeoutExpired used to be swallowed silently.
-
-                Strategy: if root, plain systemctl.  If not root, try
-                non-interactive sudo (``sudo -n``) — first a blanket probe,
-                then a targeted ``systemctl reset-failed`` probe so a
-                least-privilege sudoers entry scoped to
-                ``systemctl ... hermes-gateway*`` also qualifies
-                (``reset-failed`` is an idempotent no-op we run before every
-                privileged restart anyway).  If neither works, return None —
-                the caller must SKIP the restart (without draining the
-                gateway first!) and tell the user how to restart manually.
-                ``--no-ask-password`` guarantees polkit can never hang a
-                captured subprocess on this path.
-                """
-                if scope_ in _manage_cmd_cache:
-                    return _manage_cmd_cache[scope_]
-                cmd = scope_cmd_ + ["--no-ask-password"]
-                if (
-                    scope_ == "system"
-                    and hasattr(os, "geteuid")
-                    and os.geteuid() != 0  # windows-footgun: ok — systemd path, Linux-only
-                ):
-                    sudo_cmd = ["sudo", "-n"] + scope_cmd_ + ["--no-ask-password"]
-                    sudo_ok = False
-                    try:
-                        _probe = subprocess.run(
-                            ["sudo", "-n", "true"],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        sudo_ok = _probe.returncode == 0
-                        if not sudo_ok:
-                            # Blanket sudo refused — a targeted sudoers entry
-                            # (NOPASSWD for systemctl ... hermes-gateway*)
-                            # may still allow the exact commands we need.
-                            _probe = subprocess.run(
-                                sudo_cmd + ["reset-failed", svc_name_],
-                                capture_output=True,
-                                timeout=5,
-                            )
-                            sudo_ok = _probe.returncode == 0
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        sudo_ok = False
-                    cmd = sudo_cmd if sudo_ok else None
-                _manage_cmd_cache[scope_] = cmd
-                return cmd
+                return _resolve_systemd_manage_cmd(
+                    scope_, scope_cmd_, svc_name_, cache=_manage_cmd_cache
+                )
 
             # Wait budget for graceful SIGUSR1 restarts.  In-band restart
             # may defer stop() until active turns finish
