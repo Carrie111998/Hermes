@@ -16,6 +16,18 @@ Moonshot wire shape that DeepSeek's OpenAI-compat endpoint expects:
 Non-thinking models (``deepseek-v3-*`` variants) are left as no-ops so we
 don't perturb the V3 wire format.
 
+The V4 models are reasoning models, and this profile deliberately omits
+``reasoning_effort`` when the user hasn't set one so DeepSeek applies its
+server default (currently *high*).  DeepSeek's OpenAI-compat endpoint in turn
+defaults to a low ``max_tokens`` when the field is omitted — so thinking
+tokens exhaust the completion budget and tool calls are truncated
+(``finish_reason="length"``), which the agent then refuses as an incomplete
+tool call.  ``default_max_tokens=65536`` gives an ample output budget so tool
+calls complete, matching the ``qwen-oauth`` profile's fix for the same
+reasoning-model failure mode (well within V4's 384k output limit and 1M
+context; the ephemeral "max_tokens too large given prompt" path still caps it
+safely against very large prompts).
+
 The legacy aliases ``deepseek-chat`` / ``deepseek-reasoner`` were retired on
 2026-07-24.  Use ``deepseek-v4-flash`` or ``deepseek-v4-pro``; Hermes remaps
 the retired IDs in ``hermes_cli.model_normalize``.
@@ -106,6 +118,10 @@ deepseek = DeepSeekProfile(
     ),
     base_url="https://api.deepseek.com/v1",
     default_aux_model="deepseek-v4-flash",
+    # V4 reasoning models truncate tool calls when max_tokens is omitted —
+    # thinking tokens exhaust DeepSeek's low default cap. Send an ample
+    # budget, mirroring the qwen-oauth profile. See module docstring.
+    default_max_tokens=65536,
 )
 
 register_provider(deepseek)

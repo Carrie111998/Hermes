@@ -219,5 +219,38 @@ class TestQwenProfile:
         assert "metadata" not in eb
 
 
+class TestDeepSeekProfile:
+    def test_registered(self):
+        p = get_provider_profile("deepseek")
+        assert p is not None
+        assert p.name == "deepseek"
+        assert "deepseek.com" in p.base_url
+
+    def test_default_max_tokens(self):
+        # V4 reasoning models truncate tool calls when max_tokens is omitted;
+        # the profile ships an ample default budget (mirrors qwen-oauth).
+        p = get_provider_profile("deepseek")
+        assert p.default_max_tokens == 65536
+        assert p.get_max_tokens("deepseek-v4-flash") == 65536
+
+    def test_v4_enables_thinking_wire_shape(self):
+        p = get_provider_profile("deepseek")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="deepseek-v4-flash",
+        )
+        assert eb["thinking"] == {"type": "enabled"}
+        assert tl["reasoning_effort"] == "high"
+
+    def test_v3_is_noop(self):
+        p = get_provider_profile("deepseek")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="deepseek-v3-0324",
+        )
+        assert eb == {}
+        assert tl == {}
+
+
 
 
