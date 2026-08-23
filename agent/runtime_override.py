@@ -24,6 +24,12 @@ Contract (mirrors the ``pre_failover_decision`` redirect contract):
   is re-resolved on every turn prologue, is never persisted to the session DB and
   is never injected into the user message / session history.
 * Unsupported keys are logged with a one-line warning and ignored (never crash).
+*
+* TRUST IMPLICATION: a plugin that returns ``runtime_override`` gains
+* prompt-routing authority — overriding ``base_url`` (plus optional
+* ``api_key``) redirects every subsequent LLM call, carrying the entire
+* session context, to an arbitrary endpoint.  Installing a plugin therefore
+* grants it this power; only install plugins you trust.
 """
 
 from __future__ import annotations
@@ -92,7 +98,7 @@ def validate_runtime_override(overrides: Any) -> Dict[str, str]:
                 ", ".join(sorted(KNOWN_API_MODES)),
             )
             continue
-        valid[key] = value
+        valid[key] = value.strip() if isinstance(value, str) else value
     return valid
 
 
@@ -117,6 +123,11 @@ class _RuntimeOverrideScope:
 
     def __enter__(self) -> "_RuntimeOverrideScope":
         agent = self.agent
+        # ── Snapshot phase ─────────────────────────────────────────────
+        # NOTE: agent._runtime_override is the canonical source.
+        # TurnContext.runtime_override is derived from it at construction
+        # time.  The call path in conversation_loop.py reads only the
+        # agent attribute; keep that as the single point of truth.
         for name in self._ATTRS:
             if name in self.overrides:
                 self._snapshot[name] = getattr(agent, name, self._MISSING)
@@ -138,6 +149,14 @@ class _RuntimeOverrideScope:
         ov = self.overrides
         for name in self._ATTRS:
             if name in ov:
+                # Normalize before storing: the emptiness check below strips,
+                # but the stored value must be stripped too or " gpt-5.6 "
+                # flows into agent.model and onto the wire.
+                val = str(ov[name]).strip()
+                if not val:
+                    logger.warning("runtime_override: empty value for %r ignored", name)
+                    continue
+                ov[name] = val
                 setattr(agent, name, ov[name])
         if "base_url" in ov:
             agent.base_url = str(ov["base_url"]).strip().rstrip("/")

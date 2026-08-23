@@ -2887,6 +2887,13 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
+                # Two-scope design (intentional — do not consolidate into
+                # one turn-long scope): Scope 1 wraps kwargs building so
+                # model/provider/base_url flow into the wire client's
+                # kwargs.  Scope 2 (inside _perform_api_call) wraps each
+                # wire attempt as a redundant safety net.  Between the two
+                # scopes the agent identity is un-overridden — correct,
+                # non-call code sees the real identity.
                 from agent.runtime_override import (
                     apply_runtime_override as _apply_runtime_override,
                 )
