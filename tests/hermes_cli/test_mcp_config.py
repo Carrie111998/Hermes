@@ -122,6 +122,39 @@ class TestMcpList:
         assert "myserver" in out
         assert "enabled" in out
 
+    def test_list_scalar_include_shows_one_selected(self, tmp_path, capsys):
+        """#93313: a scalar-string include is enforced at registration (a
+        one-tool filter) — the list display must not claim "all"."""
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "enabled": True,
+                "tools": {"include": "create_service"},
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list()
+        out = capsys.readouterr().out
+        assert "1 selected" in out
+        assert "all" not in out
+
+    def test_list_scalar_exclude_shows_one_excluded(self, tmp_path, capsys):
+        """Scalar exclude mirrors the same normalization shape (#93313)."""
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "enabled": True,
+                "tools": {"exclude": "debug_tool"},
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list()
+        out = capsys.readouterr().out
+        assert "-1 excluded" in out
+        assert "all" not in out
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_remove
