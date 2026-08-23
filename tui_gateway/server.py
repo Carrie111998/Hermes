@@ -11242,12 +11242,20 @@ def _run_prompt_submit(
                 # The iteration-summary fallback is useful assistant text, but
                 # it does not mean the requested work completed. Preserve it
                 # while exposing recoverable error semantics to clients.
-                _iteration_limit_incomplete = result.get("completed") is False and (
-                    result.get("turn_exit_kind") == "max_iterations"
-                    # Compatibility with result producers predating the
-                    # structured turn-exit kind.
-                    or str(result.get("turn_exit_reason") or "").startswith(
-                        "max_iterations_reached("
+                _turn_exit_kind = result.get("turn_exit_kind")
+                _iteration_limit_incomplete = (
+                    result.get("completed") is False
+                    and (
+                        _turn_exit_kind == "max_iterations"
+                        # Compatibility with result producers predating the
+                        # structured turn-exit kind. Once present, the kind is
+                        # authoritative over diagnostic text.
+                        or (
+                            _turn_exit_kind is None
+                            and str(result.get("turn_exit_reason") or "").startswith(
+                                "max_iterations_reached("
+                            )
+                        )
                     )
                 )
                 status = (
