@@ -163,7 +163,7 @@ async def test_picker_path_forwards_provider_scoped_exclusions(
     )
     monkeypatch.setattr(
         "gateway.run._load_gateway_config",
-        lambda: {
+        lambda **_kwargs: {
             "model": {
                 "provider": "openrouter",
                 "default": "deepseek/deepseek-v4",
