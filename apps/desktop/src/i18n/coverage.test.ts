@@ -28,6 +28,12 @@ const EXPECTED_UNUSED: Record<Locale, number> = {
   'zh-hant': 0
 }
 
+/** These arrays are random-choice copy pools; locale-specific cardinality is intentional. */
+const VARIABLE_LENGTH_ARRAY_KEYS = new Set([
+  'composer.newSessionPlaceholders',
+  'composer.followUpPlaceholders'
+])
+
 function leafKeys(value: unknown, prefix = '', out = new Set<string>()): Set<string> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     if (prefix) {
@@ -222,18 +228,15 @@ describe('desktop locale coverage', () => {
       }
 
       expect(unparsed, `${id} has function entries the structural guard could not parse`).toEqual([])
-      expect(
-        dropped,
-        `${id} drops caller data that the English source entry actually renders`
-      ).toEqual([])
+      expect(dropped, `${id} drops caller data that the English source entry actually renders`).toEqual([])
     })
 
-    it(`${id} keeps authored array-valued entries the same length as English`, () => {
+    it(`${id} keeps structural array-valued entries the same length as English`, () => {
       const authored = leafEntries(authoredEntries(id))
       const mismatched: string[] = []
 
       for (const [key, englishValue] of ENGLISH_ENTRIES) {
-        if (!Array.isArray(englishValue)) {
+        if (!Array.isArray(englishValue) || VARIABLE_LENGTH_ARRAY_KEYS.has(key)) {
           continue
         }
 
@@ -255,7 +258,7 @@ describe('desktop locale coverage', () => {
         }
       }
 
-      expect(mismatched, `${id} changes the shape of these array-valued translation entries`).toEqual([])
+      expect(mismatched, `${id} changes the shape of these structural array-valued translation entries`).toEqual([])
     })
   }
 })
