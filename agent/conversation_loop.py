@@ -8379,6 +8379,27 @@ def run_conversation(
                             agent, messages, final_response, original_user_message
                         )
                         if _ap_directive:
+                            # Optional session-recycle (opt-in via
+                            # autopilot.session_recycle.enabled). When a long run
+                            # crosses the context-utilization threshold, spin a
+                            # FRESH trimmed message list seeded from the durable
+                            # goal/ledger/ADR + a verbatim tail (or a CMX briefing)
+                            # INSTEAD of growing this conversation forever. The
+                            # seed is a role:user "resume" turn on the MESSAGE LIST
+                            # — never a system-prompt mutation (prompt-cache
+                            # invariant, #51312) — and the durable goal state is
+                            # preserved. Fail-open: returns None -> behave exactly
+                            # as today (grow the one conversation).
+                            try:
+                                _recycled = _autopilot_mod.maybe_recycle(agent, messages)
+                            except Exception as _rec_exc:  # noqa: BLE001
+                                logger.debug("autopilot recycle check failed: %s", _rec_exc)
+                                _recycled = None
+                            if _recycled:
+                                # Slice-assign to keep list identity for any
+                                # aliases; the continuation directive is then
+                                # appended to the fresh list below.
+                                messages[:] = _recycled
                             messages.append({
                                 "role": "user",
                                 "content": _ap_directive,

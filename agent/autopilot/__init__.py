@@ -5,6 +5,7 @@ Public surface used by the conversation loop and agent init:
     is_autopilot_active(agent)                  -> bool
     reset_turn_state(agent)                     -> None
     maybe_continue(agent, messages, final, msg) -> Optional[str]   (directive or None)
+    maybe_recycle(agent, messages)              -> Optional[list]  (fresh msgs or None)
     resolve_goal(agent, user_message)           -> str
 
 All policy (the goal-completion quality gate, the no-progress safety, the
@@ -24,12 +25,14 @@ from agent.autopilot.driver import (
     reset_turn_state,
     resolve_goal,
 )
+from agent.autopilot.recycle import maybe_recycle
 
 __all__ = [
     "is_autopilot_active",
     "keep_budget_ahead",
     "make_clarify_autoanswer",
     "maybe_continue",
+    "maybe_recycle",
     "reenter_after_abnormal_exit",
     "reset_turn_state",
     "resolve_goal",
