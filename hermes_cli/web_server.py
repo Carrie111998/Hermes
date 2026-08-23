@@ -271,16 +271,39 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     scheduler provider here (no live adapters; delivery falls back to the
     per-platform send path).
 
+    Bot Mode gives every named profile (Bot) its own cron store, but only the
+    resident desktop backend (bound to the default profile's HERMES_HOME)
+    runs continuously — a Bot's own backend is spawned transiently, only
+    while its chat is open. Without ticking every profile here, a Bot's
+    Routine only ever fires as a catch-up when its chat happens to be opened
+    (#92770). So, mirroring the gateway multiplexer's per-profile ticking
+    (#70646), tick every profile's store from this one resident process.
+
     Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
     the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    real gateway (or a Bot's own transient backend) on the same HERMES_HOME —
+    whichever process grabs the lock first wins the tick.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import (
+        InProcessCronScheduler,
+        resolve_cron_scheduler,
+        scheduler_for_profile_mode,
+    )
+    from hermes_cli.profiles import profiles_to_serve
 
+    profile_homes = profiles_to_serve(multiplex=True)
+    multiplex = len(profile_homes) > 1
     provider = resolve_cron_scheduler()
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    start_kwargs: dict = {"interval": interval}
+    if multiplex:
+        provider = scheduler_for_profile_mode(provider, multiplex_profiles=True)
+        if isinstance(provider, InProcessCronScheduler):
+            start_kwargs["profile_homes"] = profile_homes
+    _log.info(
+        "Desktop cron scheduler started (provider=%s, interval=%ds, profiles=%d)",
+        provider.name, interval, len(profile_homes),
+    )
+    provider.start(stop_event, **start_kwargs)
 
 
 def _warm_gateway_module() -> None:

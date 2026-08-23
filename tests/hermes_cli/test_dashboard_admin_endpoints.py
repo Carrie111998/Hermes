@@ -1040,6 +1040,44 @@ def test_desktop_lifespan_reaps_orphan_gateways_on_startup(
     assert called == [True]
 
 
+def test_desktop_cron_ticker_covers_every_bot_profile(monkeypatch, tmp_path):
+    """A Bot's Routine must fire on schedule even if its chat is never
+    opened (#92770).
+
+    The resident desktop backend is bound to the default profile's
+    HERMES_HOME; a non-default-profile Bot's own backend only exists
+    transiently, while its chat is open. Unless the resident ticker is told
+    about every Bot's profile home, a Bot's cron store is never ticked and
+    its Routine only ever fires as a catch-up on open.
+    """
+    import threading
+
+    import hermes_cli.web_server as ws
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    hermes_home = tmp_path / "hermes_home"
+    (hermes_home / "cron").mkdir(parents=True)
+    (hermes_home / "profiles" / "my-reader" / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    captured = {}
+
+    class _RecordingScheduler(InProcessCronScheduler):
+        def start(self, stop_event, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: _RecordingScheduler(),
+    )
+
+    ws._start_desktop_cron_ticker(threading.Event())
+
+    homes = captured.get("profile_homes")
+    assert homes is not None, "expected profile_homes when more than one profile exists"
+    assert {name for name, _home in homes} == {"default", "my-reader"}
+
+
 def test_desktop_lifespan_terminates_managed_gateway_restart(monkeypatch):
     """A Desktop-owned gateway child must not survive its serve backend."""
     import hermes_cli.web_server as ws
