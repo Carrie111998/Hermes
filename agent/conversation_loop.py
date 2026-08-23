@@ -63,6 +63,7 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
     serialized_messages_bytes,
+    strip_reasoning_details_for_non_openrouter,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
@@ -2381,6 +2382,21 @@ def run_conversation(
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
+
+        # Reconcile OpenRouter-only 'reasoning_details' against the active
+        # provider. OpenRouter emits it on reasoning turns and consumes it
+        # back for continuity (kept verbatim above, line ~2317); it is NOT
+        # standard Chat Completions schema, so strict proxies reject it. The
+        # observed failure is the Palantir Foundry LLM proxy 400-ing with
+        # 'unrecognizedProperty=reasoning_details' after a session mixes an
+        # OpenRouter reasoning turn into history and then routes to Palantir —
+        # the session then loops on the 400 until /new. Strip from the
+        # outgoing API copy for every non-OpenRouter provider (history keeps
+        # the field, so a switch back to OpenRouter still has it).
+        _is_or_provider = (agent.provider or "").strip().lower() == "openrouter" or (
+            agent._is_openrouter_url()
+        )
+        strip_reasoning_details_for_non_openrouter(api_messages, _is_or_provider)
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
