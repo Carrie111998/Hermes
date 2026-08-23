@@ -173,7 +173,7 @@ def run_bang_command(
         # command the human typed into their own composer, not model output.
         proc = subprocess.Popen(
             command,
-            shell=True,
+            shell=True,  # nosec B602 — human-typed command in composer, not model output
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

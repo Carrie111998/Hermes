@@ -3195,7 +3195,7 @@ class CLICommandsMixin:
             except Exception:
                 # Fall back to a bare invocation (editor value may not be a
                 # simple argv-splittable string on some platforms).
-                subprocess.call(f"{editor} {shlex.quote(path)}", shell=True)
+                subprocess.call(f"{editor} {shlex.quote(path)}", shell=True)  # nosec B602 — editor from config, path is shlex.quote'd
             with open(path, "r", encoding="utf-8") as fh:
                 raw = fh.read()
         finally:

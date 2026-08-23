@@ -2388,13 +2388,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
     # often shows a blank box. Pattern lifted from PR #14965.
     _INVISIBLE_RE = re.compile(
         "["
-        "​"          # Zero-Width Space
-        "‌"          # Zero-Width Non-Joiner
-        "‍"          # Zero-Width Joiner (ZWJ)
-        "‎‏"    # LTR / RTL marks
-        "⁠"          # Word Joiner
-        "﻿"          # BOM / Zero-Width No-Break Space
-        "︀-️"   # Variation Selectors 1-16 (VS1–VS16)
+        "\u200b"          # Zero-Width Space
+        "\u200c"          # Zero-Width Non-Joiner
+        "\u200d"          # Zero-Width Joiner (ZWJ)
+        "\u200e\u200f"    # LTR / RTL marks
+        "\u2060"          # Word Joiner
+        "\ufeff"          # BOM / Zero-Width No-Break Space
+        "\ufe00-\ufe0f"   # Variation Selectors 1-16 (VS1–VS16)
         "\U000e0100-\U000e01ef"  # Variation Selectors 17-256
         "]"
     )

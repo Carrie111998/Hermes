@@ -257,7 +257,7 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     def execute(command, **kwargs):
         completed = subprocess.run(
             command,
-            shell=True,
+            shell=True,  # nosec B602 — test helper executing fixture commands
             text=True,
             capture_output=True,
             input=kwargs.get("stdin_data"),

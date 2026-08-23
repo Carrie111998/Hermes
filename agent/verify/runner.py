@@ -111,7 +111,7 @@ def _run_phase_command(
     try:
         proc = subprocess.run(
             command,
-            shell=True,  # project-authored commands; see module docstring
+            shell=True,  # nosec B602 — project-authored commands; see module docstring
             cwd=str(root),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -211,7 +211,7 @@ def _run_start_phase(
     started = time.monotonic()
     proc = subprocess.Popen(
         recipe.start,
-        shell=True,  # project-authored command; see module docstring
+        shell=True,  # nosec B602 — project-authored command; see module docstring
         cwd=str(root),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -510,7 +510,7 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
     try:
         proc = subprocess.run(
             gate.command,
-            shell=True,
+            shell=True,  # nosec B602 — operator-configured gate command, not user/LLM input
             capture_output=True,
             text=True,
             # A gate runs whatever the operator configured, so its output is

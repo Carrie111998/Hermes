@@ -666,8 +666,8 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
             try:
                 tf.extractall(str(skills), filter="data")  # type: ignore[call-arg]
             except TypeError:
-                # Python < 3.12 — no filter kwarg
-                tf.extractall(str(skills))
+                # Python < 3.12 — no filter kwarg; members validated above
+                tf.extractall(str(skills))  # nosec B202 — members validated above (abs paths and .. rejected)
     except (OSError, tarfile.TarError) as e:
         # Best-effort recover. A partial extract can leave entries the
         # original tree never had, so drop those first, otherwise the
