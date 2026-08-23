@@ -871,6 +871,30 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
+            # Public contract: the disable sentinel, then efforts low→high.
+            # Keep this literal so an accidental reorder fails loudly.
+            from gateway.platforms.api_server import _request_reasoning_config
+
+            assert data["features"]["reasoning_efforts"] == [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+            ]
+            for level in data["features"]["reasoning_efforts"]:
+                if level == "none":
+                    assert _request_reasoning_config({"reasoning_effort": level}) == {
+                        "enabled": False
+                    }
+                else:
+                    assert _request_reasoning_config({"reasoning_effort": level}) == {
+                        "enabled": True,
+                        "effort": level,
+                    }
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
