@@ -56,11 +56,11 @@ mcp_servers:
 | `enabled` | bool | both | Skip the server entirely when false |
 | `timeout` | number | both | Tool call timeout in seconds (default: `300`) |
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
-| `protocol` | string | both | Protocol-era negotiation: `auto` (default — legacy `initialize` handshake first, falling back to the 2026-07-28 `server/discover` stateless probe when the server rejects the handshake as modern-only), `stateless` (probe `server/discover` first; one legacy retry), or `legacy` (handshake only, no fallback) |
+| `protocol` | string | both | Protocol authority: omitted/`auto` is modern-first; `stateless` and `2026-07-28` are strict-modern aliases; `legacy` is initialise-only. Unknown values fail before transport creation. See [Protocol authority](#protocol-authority). |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `transport` | string | HTTP | Set to `sse` to use the SSE transport instead of Streamable HTTP |
-| `keepalive_interval` | number | both | Liveness ping cadence in seconds (default: `180`, floored at 5s). Set below the server's session TTL for servers that GC idle sessions quickly |
+| `keepalive_interval` | number | both | Liveness-check cadence in seconds (default: `180`, floored at 5s). Modern stateless peers are checked with stateless discovery and do not depend on `Mcp-Session-Id` or a legacy session lease. Legacy peers use `ping`, with `tools/list` as the unsupported-ping fallback; only legacy sessionful peers need the interval set below a server session TTL. |
 | `idle_timeout_seconds` | number | stdio | Optional stdio server recycle after idle time (`0` disables). May also live under a `lifecycle:` mapping |
 | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
 | `tools` | mapping | both | Filtering and utility-tool policy |
@@ -68,6 +68,16 @@ mcp_servers:
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
+
+### Protocol authority
+
+| Configured value | First request | Legacy fallback |
+|---|---|---|
+| omitted or `auto` | `server/discover` | One same-generation `initialize` proof only after the exact canonical MCP 1.28.1 `-32602` `Invalid request parameters` discovery rejection; the peer is classified as legacy only if that proof succeeds |
+| `stateless` or `2026-07-28` | `server/discover` | None; this is strict modern mode and never sends `initialize` |
+| `legacy` | `initialize` | None; modern discovery is not attempted |
+
+Any other value is rejected before transport creation or network I/O.
 
 ## Environment variable references
 
