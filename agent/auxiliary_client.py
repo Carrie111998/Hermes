@@ -6652,6 +6652,13 @@ def resolve_provider_client(
                 custom_key = build_command_token_provider(
                     custom_key_cmd, custom_entry.get("name") or provider
                 ) or custom_key
+            # OpenAI's client constructor expects a concrete string and calls
+            # ``strip()`` on it. Main-agent clients support a callable
+            # credential, but auxiliary clients are created per task, so mint
+            # the command credential at this boundary instead of passing the
+            # CommandTokenSource object into the SDK.
+            if callable(custom_key) and not isinstance(custom_key, str):
+                custom_key = custom_key()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
