@@ -40,7 +40,7 @@ function load() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(`
-globalThis.__roster = { ROSTER_QUERY_RETRY };
+globalThis.__roster = { ROSTER_QUERY_RETRY, activeBotRoute };
 `)
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   return context.__roster
@@ -53,4 +53,11 @@ test('roster query retries are bounded so a stalled profiles.list cannot pin the
   assert.ok(ROSTER_QUERY_RETRY < Number.POSITIVE_INFINITY)
   assert.notEqual(ROSTER_QUERY_RETRY, true)
   assert.match(pluginSource, /retry:\s*ROSTER_QUERY_RETRY/)
+})
+
+test('activeBotRoute exists so useRoster does not crash the Bots pane', async () => {
+  const { activeBotRoute } = load()
+  assert.equal(typeof activeBotRoute, 'function')
+  // No host.profileRoutes → local/unscoped window, not an error.
+  assert.equal(await activeBotRoute(), null)
 })

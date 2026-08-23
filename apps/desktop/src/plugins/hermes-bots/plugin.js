@@ -4468,6 +4468,37 @@ function botBackendProfileScope(route, fallbackProfile = 'default') {
   return { connectionId: route.connectionId, profile: backendTargetProfile(route, fallbackProfile) }
 }
 
+/** Route of the window's currently active gateway/profile, or null.
+ *  useRoster and the hide-sweep call this before profiles.list. Missing it
+ *  is a ReferenceError that the Bots pane surfaces as "Roster unavailable".
+ *  Feature-detected: older hosts without profileRoutes stay on the unscoped
+ *  local door (null). */
+async function activeBotRoute() {
+  if (typeof host.profileRoutes !== 'function') {
+    return null
+  }
+
+  const profile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+  const connectionId = String(
+    host.state.connectionId?.get?.() ||
+    (typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : '') ||
+    'local'
+  ).trim() || 'local'
+  let routes
+  try {
+    routes = await host.profileRoutes()
+  } catch {
+    // Route inventory is a read. A miss must not take down the Bots pane —
+    // requestForBot falls through to the active gateway's profiles.list.
+    return null
+  }
+  const route = (Array.isArray(routes) ? routes : []).find(
+    candidate => candidate?.connectionId === connectionId && candidate?.profile === profile
+  )
+
+  return route || null
+}
+
 /** Gateway RPC on the bot's OWN source. Source-scoped rows always use the
  * explicit descriptor, including a registered local source. */
 async function requestForBot(bot, method, params = {}) {
