@@ -1197,6 +1197,39 @@ class TestWebServerEndpoints:
         assert status_data["pid"] is None
         assert any("docker pull nousresearch/hermes-agent:latest" in line for line in status_data["lines"])
 
+    def test_update_hermes_managed_runtime_returns_recommended_command(self, monkeypatch):
+        import hermes_cli.update_contract as update_contract
+        import hermes_cli.web_server as web_server
+
+        spawned = False
+
+        def fail_spawn(*_args, **_kwargs):
+            nonlocal spawned
+            spawned = True
+            raise AssertionError("managed runtime guard should not spawn hermes update")
+
+        # Marker-absent externally managed runtimes retain #78958's existing
+        # no-spawn seam, but the API must return real operator guidance rather
+        # than a status phrase that Desktop would render as shell input.
+        monkeypatch.setattr(update_contract, "perform_update", lambda **_kwargs: None)
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: True)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(web_server, "recommended_update_command", lambda: "hermes update")
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["name"] == "hermes-update"
+        assert data["pid"] is None
+        assert data["error"] == "dashboard_update_managed_externally"
+        assert data["update_command"] == "hermes update"
+        assert spawned is False
+
     def test_update_hermes_returns_apt_guidance_without_spawning(self, monkeypatch):
         import hermes_cli.web_server as web_server
 

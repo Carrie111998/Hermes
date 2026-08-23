@@ -25,7 +25,7 @@ def receipt_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(
-        "hermes_cli.config.get_hermes_home", lambda: home, raising=False
+        "hermes_constants.get_hermes_home", lambda: home
     )
     # ensure no receipt bleeds between tests
     ur._current = None

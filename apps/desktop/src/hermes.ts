@@ -122,6 +122,7 @@ export type {
   ToolsetInfo,
   ToolsetModel,
   ToolsetModelsResponse,
+  UpdateActionResponse,
   WebhookCreatePayload,
   WebhookCreateResponse,
   WebhookEnableResponse,

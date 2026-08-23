@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopUpdateStatus } from '@/global'
+import type { UpdateReceiptSummary } from '@/types/hermes'
 
 const storage = new Map<string, string>()
 
@@ -87,6 +88,17 @@ const status = (over: Partial<DesktopUpdateStatus> = {}): DesktopUpdateStatus =>
   behind: 3,
   targetSha: 'sha-a',
   fetchedAt: 0,
+  ...over
+})
+
+const updateReceipt = (over: Partial<UpdateReceiptSummary> = {}): UpdateReceiptSummary => ({
+  outcome: 'success',
+  started_at: new Date(Date.now()).toISOString(),
+  finished_at: new Date(Date.now()).toISOString(),
+  pre_sha: null,
+  post_sha: null,
+  post_version: null,
+  fleet_states: [],
   ...over
 })
 
@@ -798,6 +810,7 @@ describe('applyBackendUpdate recovery', () => {
     updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'update', pid: 1 })
     getActionStatusSpy
       .mockResolvedValueOnce({
+        action_id: actionId,
         exit_code: null,
         lines: ['Pulling updates...', 'Installing dependencies...'],
         name: 'update',
@@ -826,12 +839,195 @@ describe('applyBackendUpdate recovery', () => {
     await promise
   })
 
+  it('filters malformed action-log entries at the JSON boundary', async () => {
+    const actionId = 'e'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: null,
+        lines: [{ poisoned: true }, ['not', 'a', 'line'], 'safe progress'],
+        name: 'update',
+        pid: 1,
+        running: true
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: [],
+        name: 'update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    expect($backendUpdateApply.get().message).toBe('safe progress')
+    expect($backendUpdateApply.get().log.map(entry => entry.message)).toEqual(['safe progress'])
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await expect(promise).resolves.toMatchObject({ ok: true })
+  })
+
+  it('does not publish a stale generation before the matching action arrives', async () => {
+    const actionId = 'a'.repeat(32)
+    const staleActionId = 'b'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        action_id: staleActionId,
+        exit_code: 0,
+        lines: ['STALE-GENERATION-SECRET'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: ['matching generation complete'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    expect($backendUpdateApply.get().message).not.toContain('STALE-GENERATION-SECRET')
+    expect($backendUpdateApply.get().log).toEqual([])
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not publish or settle a status with a missing action id and no exact durable proof', async () => {
+    const actionId = 'a'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        exit_code: 0,
+        lines: ['UNATTRIBUTED-GENERATION-OUTPUT'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: ['matching generation complete'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    expect($backendUpdateApply.get().message).not.toContain('UNATTRIBUTED-GENERATION-OUTPUT')
+    expect($backendUpdateApply.get().log).toEqual([])
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await expect(promise).resolves.toMatchObject({ ok: true })
+  })
+
+  it('does not let a shared-tail completion marker override a known action-id mismatch', async () => {
+    const actionId = 'a'.repeat(32)
+    const staleActionId = 'b'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        action_id: staleActionId,
+        exit_code: 0,
+        lines: ['STALE-NEWER-ACTION', `=== hermes-update completed ${actionId} ===`],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: ['matching generation complete'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    expect($backendUpdateApply.get().message).not.toContain('STALE-NEWER-ACTION')
+    expect($backendUpdateApply.get().log).toEqual([])
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('accepts a missing status id only through an exactly correlated terminal receipt without publishing its tail', async () => {
+    const actionId = 'a'.repeat(32)
+    const observedMessages: string[] = []
+
+    const unsubscribe = $backendUpdateApply.subscribe(state => {
+      observedMessages.push(state.message, ...state.log.map(entry => entry.message))
+    })
+
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockResolvedValue({
+      exit_code: 1,
+      lines: ['SHARED-TAIL-OUTPUT'],
+      name: 'hermes-update',
+      pid: null,
+      running: false,
+      receipt: updateReceipt({ correlation_id: actionId, outcome: 'success' })
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    unsubscribe()
+    expect($backendUpdateApply.get().log).toEqual([])
+    expect($backendUpdateApply.get().message).not.toContain('SHARED-TAIL-OUTPUT')
+    expect(observedMessages).not.toContain('SHARED-TAIL-OUTPUT')
+  })
+
+  it('settles a missing status id by exact completion marker without publishing the shared tail', async () => {
+    const actionId = 'a'.repeat(32)
+    const observedMessages: string[] = []
+
+    const unsubscribe = $backendUpdateApply.subscribe(state => {
+      observedMessages.push(state.message, ...state.log.map(entry => entry.message))
+    })
+
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockResolvedValue({
+      exit_code: null,
+      lines: ['SHARED-MARKER-TAIL', `=== hermes-update completed ${actionId} ===`],
+      name: 'hermes-update',
+      pid: null,
+      running: false
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    unsubscribe()
+    expect($backendUpdateApply.get().log).toEqual([])
+    expect($backendUpdateApply.get().message).not.toContain('SHARED-MARKER-TAIL')
+    expect(observedMessages).not.toContain('SHARED-MARKER-TAIL')
+  })
+
   it('keeps waiting past the old 45-second cutoff while the update action is running', async () => {
     const actionId = 'f'.repeat(32)
     updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
 
     for (let attempt = 0; attempt < 31; attempt += 1) {
       getActionStatusSpy.mockResolvedValueOnce({
+        action_id: actionId,
         exit_code: null,
         lines: ['=== hermes-update started now ===', `step ${attempt}`],
         name: 'hermes-update',
@@ -951,6 +1147,413 @@ describe('applyBackendUpdate recovery', () => {
     expect(getActionStatusSpy).toHaveBeenCalledWith('hermes-update', 2000)
   })
 
+  it('turns its correlated refused receipt into manual image-update guidance', async () => {
+    const actionId = 'a'.repeat(32)
+    const message = 'This Hermes deployment is image-managed. Pull the desired image and recreate the service.'
+    const command = 'docker compose pull && docker compose up -d --force-recreate'
+
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockResolvedValue({
+      exit_code: 2,
+      lines: [],
+      name: 'hermes-update',
+      pid: null,
+      running: false,
+      receipt: updateReceipt({
+        correlation_id: actionId,
+        outcome: 'refused',
+        stop_reason: 'image_managed_update_refused',
+        refusal: {
+          code: 'image_managed_update_refused',
+          message,
+          update_command: command
+        }
+      })
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    await expect(promise).resolves.toEqual({
+      ok: false,
+      error: 'manual',
+      manual: true,
+      message,
+      command
+    })
+    expect($backendUpdateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'manual',
+      message,
+      command
+    })
+  })
+
+  it.each([
+    ['object/list', { poisoned: true }, ['not', 'a', 'command']],
+    ['list/object', ['not', 'a', 'message'], { poisoned: true }]
+  ])(
+    'rejects runtime-malformed %s refusal scalars at the JSON boundary',
+    async (_label, malformedMessage, malformedCommand) => {
+      const actionId = 'a'.repeat(32)
+      updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+      getActionStatusSpy.mockResolvedValue({
+        action_id: actionId,
+        exit_code: 2,
+        lines: [],
+        name: 'hermes-update',
+        pid: null,
+        running: false,
+        receipt: {
+          ...updateReceipt({ correlation_id: actionId, outcome: 'refused' }),
+          refusal: {
+            code: 'image_managed_update_refused',
+            message: malformedMessage,
+            update_command: malformedCommand
+          }
+        }
+      })
+
+      const promise = applyBackendUpdate()
+      await vi.advanceTimersByTimeAsync(1500)
+
+      await expect(promise).resolves.toEqual({
+        ok: false,
+        error: 'manual',
+        manual: true,
+        message: 'Update not available for this backend.'
+      })
+      expect($backendUpdateApply.get()).toMatchObject({
+        command: null,
+        message: 'Update not available for this backend.',
+        stage: 'manual'
+      })
+      expect(typeof $backendUpdateApply.get().message).toBe('string')
+    }
+  )
+
+  it('surfaces a direct image refusal without starting action polling', async () => {
+    const message = 'This Hermes deployment is image-managed. Pull the desired image and recreate the service.'
+    const command = 'docker compose pull && docker compose up -d --force-recreate'
+    updateHermesSpy.mockResolvedValue({
+      ok: false,
+      name: 'hermes-update',
+      pid: null,
+      error: 'image_managed_update_refused',
+      reason: 'image_managed_update_refused',
+      message,
+      update_command: command
+    })
+
+    await expect(applyBackendUpdate()).resolves.toEqual({
+      ok: false,
+      error: 'manual',
+      manual: true,
+      message,
+      command
+    })
+    expect($backendUpdateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'manual',
+      message,
+      command
+    })
+    expect(getActionStatusSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects malformed direct-refusal message and command scalars', async () => {
+    updateHermesSpy.mockResolvedValue({
+      ok: false,
+      name: 'hermes-update',
+      pid: null,
+      error: 'image_managed_update_refused',
+      message: { poisoned: true },
+      update_command: ['not', 'a', 'command']
+    })
+
+    await expect(applyBackendUpdate()).resolves.toEqual({
+      ok: false,
+      error: 'manual',
+      manual: true,
+      message: 'Update not available for this backend.'
+    })
+    expect($backendUpdateApply.get()).toMatchObject({
+      command: null,
+      message: 'Update not available for this backend.',
+      stage: 'manual'
+    })
+    expect(getActionStatusSpy).not.toHaveBeenCalled()
+  })
+
+  it('never invents a blocked in-place command when refusal guidance omits one', async () => {
+    const message = 'This image is managed outside Hermes. Consult your deployment operator.'
+    updateHermesSpy.mockResolvedValue({
+      ok: false,
+      name: 'hermes-update',
+      pid: null,
+      error: 'image_managed_update_refused',
+      message
+    })
+
+    await expect(applyBackendUpdate()).resolves.toEqual({
+      ok: false,
+      error: 'manual',
+      manual: true,
+      message
+    })
+    expect($backendUpdateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'manual',
+      message,
+      command: null
+    })
+    expect(getActionStatusSpy).not.toHaveBeenCalled()
+  })
+
+  it('keeps a correlated refusal receipt without remediation non-copyable', async () => {
+    const actionId = 'a'.repeat(32)
+    const message = 'This image is managed outside Hermes. Consult your deployment operator.'
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockResolvedValue({
+      action_id: actionId,
+      exit_code: 2,
+      lines: [],
+      name: 'hermes-update',
+      pid: null,
+      running: false,
+      receipt: updateReceipt({
+        correlation_id: actionId,
+        outcome: 'refused',
+        refusal: {
+          code: 'image_managed_update_refused',
+          message,
+          update_command: null
+        }
+      })
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    await expect(promise).resolves.toEqual({
+      ok: false,
+      error: 'manual',
+      manual: true,
+      message
+    })
+    expect($backendUpdateApply.get()).toMatchObject({ stage: 'manual', command: null })
+  })
+
+  it.each(
+    (['success', 'partial', 'failed', 'refused'] as const).flatMap(outcome =>
+      [0, 1, 2].map(exitCode => [outcome, exitCode] as const)
+    )
+  )('lets its correlated %s receipt outrank contradictory exit %i', async (outcome, exitCode) => {
+    const actionId = 'a'.repeat(32)
+    const command = 'docker compose pull && docker compose up -d --force-recreate'
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockResolvedValue({
+      action_id: actionId,
+      exit_code: exitCode,
+      lines: [],
+      name: 'hermes-update',
+      pid: null,
+      running: false,
+      receipt: updateReceipt({
+        correlation_id: actionId,
+        outcome,
+        refusal:
+          outcome === 'refused'
+            ? {
+                code: 'image_managed_update_refused',
+                message: 'Pull and recreate this image-managed deployment.',
+                update_command: command
+              }
+            : null
+      })
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+    const result = await promise
+
+    if (outcome === 'success') {
+      expect(result).toMatchObject({ ok: true })
+    } else if (outcome === 'refused') {
+      expect(result).toMatchObject({ ok: false, error: 'manual', manual: true, command })
+    } else {
+      expect(result).toMatchObject({ ok: false, error: 'apply-failed' })
+    }
+  })
+
+  it.each([0, 1, 2])('ignores terminal exit %i from a different action id', async staleExitCode => {
+    const actionId = 'a'.repeat(32)
+    const staleActionId = 'b'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        action_id: staleActionId,
+        exit_code: staleExitCode,
+        lines: ['terminal result from a previous update'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: ['terminal result from this update'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(3000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+    expect($backendUpdateApply.get().stage).toBe('idle')
+  })
+
+  it('ignores a fresh refused receipt correlated to another action', async () => {
+    const actionId = 'a'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        exit_code: null,
+        lines: [],
+        name: 'hermes-update',
+        pid: null,
+        running: false,
+        receipt: updateReceipt({ correlation_id: 'b'.repeat(32), outcome: 'refused' })
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: ['Update complete!'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(3000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+    expect($backendUpdateApply.get().stage).toBe('idle')
+  })
+
+  it('ignores an old uncorrelated refused receipt from a previous update', async () => {
+    updateHermesSpy.mockResolvedValue({ ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        exit_code: null,
+        lines: [],
+        name: 'hermes-update',
+        pid: null,
+        running: false,
+        receipt: updateReceipt({
+          outcome: 'refused',
+          started_at: new Date(Date.now() - 2 * 60_000).toISOString()
+        })
+      })
+      .mockResolvedValueOnce({
+        exit_code: 0,
+        lines: ['Update complete!'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(3000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('ignores a still-running receipt', async () => {
+    const actionId = 'a'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        exit_code: null,
+        lines: ['still running'],
+        name: 'hermes-update',
+        pid: 1,
+        running: false,
+        receipt: updateReceipt({
+          correlation_id: actionId,
+          finished_at: null,
+          outcome: 'running'
+        })
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: ['Update complete!'],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(3000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not use wall-clock proximity as proof for an uncorrelated receipt', async () => {
+    const actionId = 'a'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy
+      .mockResolvedValueOnce({
+        exit_code: 0,
+        lines: [],
+        name: 'hermes-update',
+        pid: null,
+        running: false,
+        receipt: updateReceipt({ outcome: 'refused' })
+      })
+      .mockResolvedValueOnce({
+        action_id: actionId,
+        exit_code: 0,
+        lines: [],
+        name: 'hermes-update',
+        pid: null,
+        running: false
+      })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(3000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledTimes(2)
+    expect($backendUpdateApply.get().stage).toBe('idle')
+  })
+
+  it.each(['partial', 'failed'] as const)('preserves the existing %s receipt failure behavior', async outcome => {
+    const actionId = 'a'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockResolvedValue({
+      exit_code: null,
+      lines: [],
+      name: 'hermes-update',
+      pid: null,
+      running: false,
+      receipt: updateReceipt({ correlation_id: actionId, outcome })
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(1500)
+
+    await expect(promise).resolves.toMatchObject({ error: 'apply-failed', ok: false })
+    expect($backendUpdateApply.get().stage).toBe('error')
+  })
+
   it('proves a pre-action-ID backend reached its requested commit after restart', async () => {
     $backendUpdateStatus.set({
       behind: 2,
@@ -1058,9 +1661,11 @@ describe('applyBackendUpdate recovery', () => {
   })
 
   it('restores the fixed action deadline after reconnecting', async () => {
-    updateHermesSpy.mockResolvedValue({ action_id: 'a'.repeat(32), ok: true, name: 'hermes-update', pid: 1 })
+    const actionId = 'a'.repeat(32)
+    updateHermesSpy.mockResolvedValue({ action_id: actionId, ok: true, name: 'hermes-update', pid: 1 })
 
     const running = {
+      action_id: actionId,
       exit_code: null,
       lines: ['still running'],
       name: 'hermes-update',

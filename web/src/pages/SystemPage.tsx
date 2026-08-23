@@ -951,6 +951,17 @@ export default function SystemPage() {
                 )}
               </div>
             )}
+            {!canUpdateHermes && updateInfo?.message && (
+              <div className="mt-4 grid gap-2 border-t border-border pt-4 text-xs text-muted-foreground">
+                <p className="whitespace-pre-line">{updateInfo.message}</p>
+                {updateInfo.update_command &&
+                  !updateInfo.message.includes(updateInfo.update_command) && (
+                    <code className="w-fit rounded bg-muted px-2 py-1 font-mono text-foreground">
+                      {updateInfo.update_command}
+                    </code>
+                  )}
+              </div>
+            )}
           </CardContent>
         </Card>
       </section>

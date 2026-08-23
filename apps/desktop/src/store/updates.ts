@@ -534,6 +534,29 @@ const BACKEND_ACTION_POLL_MS = 1500
 const BACKEND_ACTION_MAX_MS = 6 * 60 * 1000
 const BACKEND_RETURN_MAX_MS = 4 * 60 * 1000
 
+const TERMINAL_UPDATE_OUTCOMES = ['success', 'partial', 'failed', 'refused'] as const
+type TerminalUpdateOutcome = (typeof TERMINAL_UPDATE_OUTCOMES)[number]
+
+interface TerminalUpdateReceipt {
+  outcome: TerminalUpdateOutcome
+  refusal: {
+    message: string | null
+    updateCommand: string | null
+  } | null
+}
+
+function nonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  return value.trim() || null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
 function finishBackendApply(returned: boolean): DesktopUpdateApplyResult {
   if (returned) {
     $backendUpdateApply.set(IDLE)
@@ -561,9 +584,10 @@ function finishBackendApply(returned: boolean): DesktopUpdateApplyResult {
 
 function ingestBackendActionStatus(status: Awaited<ReturnType<typeof getActionStatus>>): void {
   const current = $backendUpdateApply.get()
+  const lines: unknown = status.lines
 
-  const log = status.lines
-    .filter(line => line.trim().length > 0)
+  const log = (Array.isArray(lines) ? lines : [])
+    .filter((line): line is string => typeof line === 'string' && line.trim().length > 0)
     .map(line => ({ at: Date.now(), message: line, stage: current.stage }))
     .slice(-50)
 
@@ -584,28 +608,64 @@ function completedAfterRestart(
   status: Awaited<ReturnType<typeof getActionStatus>>,
   actionId: string | undefined
 ): boolean {
-  return !!actionId && status.lines.some(line => line === `=== hermes-update completed ${actionId} ===`)
+  const lines: unknown = status.lines
+
+  return (
+    !!actionId && Array.isArray(lines) && lines.some(line => line === `=== hermes-update completed ${actionId} ===`)
+  )
 }
 
-/** Whether the durable update receipt attached to the status proves the
- *  outcome of THIS apply (#91277 bullet 3). Only a finished receipt whose
- *  run started at-or-after we kicked the update off counts — an older
- *  receipt describes a previous update, and a still-running one proves
- *  nothing yet. The 60s slack absorbs client/backend clock skew. */
-function receiptProvesOutcome(status: Awaited<ReturnType<typeof getActionStatus>>, applyStartedAtMs: number): boolean {
-  const receipt = status.receipt
+/** Return the terminal durable receipt for THIS apply (#91277 bullet 3).
+ *  A receipt is proof only when both sides name the exact same generation.
+ *  Pre-action-ID backends retain their existing exit-code/target-SHA recovery
+ *  below; wall-clock proximity is deliberately not treated as correlation. */
+function currentTerminalReceipt(
+  status: Awaited<ReturnType<typeof getActionStatus>>,
+  actionId: string | undefined
+): TerminalUpdateReceipt | null {
+  const receipt: unknown = status.receipt
 
-  if (!receipt || !receipt.finished_at || !receipt.started_at) {
-    return false
+  if (!actionId || !isRecord(receipt)) {
+    return null
   }
 
-  if (receipt.outcome !== 'success' && receipt.outcome !== 'partial' && receipt.outcome !== 'failed') {
-    return false
+  const outcome = receipt.outcome
+
+  if (
+    receipt.correlation_id !== actionId ||
+    !nonEmptyString(receipt.started_at) ||
+    !nonEmptyString(receipt.finished_at) ||
+    typeof outcome !== 'string' ||
+    !(TERMINAL_UPDATE_OUTCOMES as readonly string[]).includes(outcome)
+  ) {
+    return null
   }
 
-  const startedMs = Date.parse(receipt.started_at)
+  const rawRefusal = receipt.refusal
 
-  return Number.isFinite(startedMs) && startedMs >= applyStartedAtMs - 60_000
+  const refusal = isRecord(rawRefusal)
+    ? {
+        message: nonEmptyString(rawRefusal.message),
+        updateCommand: nonEmptyString(rawRefusal.update_command)
+      }
+    : null
+
+  return { outcome: outcome as TerminalUpdateOutcome, refusal }
+}
+
+function finishBackendRefusal(receipt: TerminalUpdateReceipt): DesktopUpdateApplyResult {
+  const message = receipt.refusal?.message || translateNow('updates.applyStatus.notAvailable')
+  const command = receipt.refusal?.updateCommand || null
+
+  $backendUpdateApply.set({ ...IDLE, applying: false, stage: 'manual', message, command })
+
+  return {
+    ok: false,
+    error: 'manual',
+    manual: true,
+    message,
+    ...(command ? { command } : {})
+  }
 }
 
 function legacyBackendReachedTarget(
@@ -644,14 +704,19 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
       : undefined
 
     const started = await updateHermes()
-    const applyStartedAtMs = Date.now()
 
     if (!started.ok) {
-      const message = (started as { message?: string }).message || translateNow('updates.applyStatus.notAvailable')
-      const command = (started as { update_command?: string }).update_command || 'hermes update'
+      const message = nonEmptyString(started.message) || translateNow('updates.applyStatus.notAvailable')
+      const command = nonEmptyString(started.update_command)
       $backendUpdateApply.set({ ...IDLE, applying: false, stage: 'manual', message, command })
 
-      return { ok: false, error: 'manual', manual: true, message, command }
+      return {
+        ok: false,
+        error: 'manual',
+        manual: true,
+        message,
+        ...(command ? { command } : {})
+      }
     }
 
     $backendUpdateApply.set({
@@ -673,7 +738,6 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
 
       try {
         last = await getActionStatus(started.name, 2000)
-        ingestBackendActionStatus(last)
       } catch {
         if (!reconnecting) {
           reconnecting = true
@@ -687,6 +751,24 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
         }
 
         continue
+      }
+
+      const receipt = currentTerminalReceipt(last, started.action_id)
+      const hasCorrelatedCompletion = completedAfterRestart(last, started.action_id)
+      const statusMatchesAction = !started.action_id || last.action_id === started.action_id
+
+      // Status is addressed by the stable action name, so a restarted backend
+      // can briefly return another generation. Identity gates presentation as
+      // well as settlement: never publish another run's logs/message while we
+      // wait for this action's exact status. Receipt/marker recovery may still
+      // settle this generation, but their shared tail is not safe to display
+      // unless the status object itself carries our action id.
+      if (!statusMatchesAction && !receipt && !hasCorrelatedCompletion) {
+        continue
+      }
+
+      if (statusMatchesAction) {
+        ingestBackendActionStatus(last)
       }
 
       if (last.running) {
@@ -704,16 +786,38 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
         continue
       }
 
-      if (last.exit_code === 0 || (last.exit_code === null && completedAfterRestart(last, started.action_id))) {
-        return finishBackendApply(true)
+      // The receipt represents structured terminal truth for this exact
+      // generation, including partial/refused states that a subprocess exit
+      // code cannot encode. It therefore outranks every contradictory exit
+      // code (0/1/2) returned by a server racing process reaping/restart.
+      if (receipt) {
+        if (receipt.outcome === 'refused') {
+          return finishBackendRefusal(receipt)
+        }
+
+        return finishBackendApply(receipt.outcome === 'success')
       }
 
-      // #91277 bullet 3: the backend now attaches the durable update
-      // receipt to the status. A receipt whose run STARTED after we kicked
-      // this update off is authoritative — read its outcome instead of
-      // inferring from log markers or timing out across the restart gap.
-      if (last.exit_code === null && receiptProvesOutcome(last, applyStartedAtMs)) {
-        return finishBackendApply(last.receipt!.outcome === 'success')
+      // A restarted dashboard can temporarily expose the terminal result of
+      // an older action while this apply is still running. Exact action
+      // identity outranks every exit code and log marker: a known mismatch is
+      // neither success nor failure for the update we started, so keep
+      // polling until its own status/receipt arrives. Backends predating
+      // action IDs retain the freshness compatibility path below.
+      if (started.action_id && last.action_id && last.action_id !== started.action_id) {
+        continue
+      }
+
+      // Once POST supplies an action id, a bare status without that same id is
+      // not allowed to settle the apply. The one compatibility exception is
+      // the exact completion marker written by that generation for backends
+      // that recovered the log but did not yet echo action_id in JSON.
+      if (started.action_id && last.action_id !== started.action_id && !hasCorrelatedCompletion) {
+        continue
+      }
+
+      if (last.exit_code === 0 || hasCorrelatedCompletion) {
+        return finishBackendApply(true)
       }
 
       if (!started.action_id && last.exit_code === null) {

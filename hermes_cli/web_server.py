@@ -48,7 +48,7 @@ import zipfile
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, cast
 
 import yaml
 
@@ -79,6 +79,7 @@ from hermes_cli.config import (
     detect_install_method,
     format_docker_update_message,
     is_nix_install_method,
+    recommended_update_command,
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
@@ -2340,6 +2341,20 @@ def _dashboard_local_update_managed_externally() -> bool:
     externally managed unless their apply path is proven safe inside the
     running container filesystem.
     """
+    # A baked image marker is the authoritative deployment fact.  It lives
+    # outside both HERMES_HOME and the checkout, so a bind-mounted .git tree
+    # must not make the dashboard advertise an in-place update button.
+    try:
+        from hermes_cli.image_provenance import read_image_provenance
+
+        if read_image_provenance() is not None:
+            return True
+    except Exception:
+        # The update admission kernel independently fails a present malformed
+        # marker closed.  Keep this capability probe best-effort so unrelated
+        # dashboard status requests remain available.
+        pass
+
     if _default_hermes_root_is_opt_data():
         return True
     try:
@@ -4420,6 +4435,60 @@ _LAST_GATEWAY_RESTART: Optional[Tuple[float, subprocess.Popen, Tuple[str, ...]]]
 _UPDATE_ACTION_COMPLETED_RE = re.compile(
     r"^=== hermes-update completed ([0-9a-f]{32}) ===$"
 )
+_UPDATE_ACTION_STARTED_RE = re.compile(
+    r"^=== hermes-update action ([0-9a-f]{32}) started ===$"
+)
+_UPDATE_TERMINAL_EXIT_CODES = {
+    "success": 0,
+    "partial": 1,
+    "failed": 1,
+    "refused": 2,
+}
+
+
+def _valid_update_action_id(value: object) -> Optional[str]:
+    """Return a bounded update action ID, or ``None`` for unsafe input."""
+
+    if not isinstance(value, str):
+        return None
+    if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
+        return None
+    return value
+
+
+def _validated_terminal_update_receipt(
+    summary: object,
+) -> Tuple[Optional[str], Optional[str], bool]:
+    """Return the exact identity/outcome of a schema-valid terminal receipt.
+
+    ``latest.json`` lives under the mutable Hermes home.  Modern receipts must
+    prove action identity, outcome, and non-empty start/finish timestamps.
+    Receipts with an actually absent identity are returned as legacy so the
+    caller can confine them to receipt-only recovery; a present malformed
+    identity is invalid.  Arbitrary JSON values must never reach dict
+    membership, become an ``action_id`` in the API response, or settle a newer
+    generation.
+    """
+
+    if not isinstance(summary, dict):
+        return None, None, False
+    typed_summary = cast(Dict[str, Any], summary)
+    has_correlation_id = "correlation_id" in typed_summary
+    action_id = _valid_update_action_id(typed_summary.get("correlation_id"))
+    outcome = typed_summary.get("outcome")
+    started_at = typed_summary.get("started_at")
+    finished_at = typed_summary.get("finished_at")
+    if has_correlation_id and action_id is None:
+        return None, None, False
+    if not isinstance(outcome, str):
+        return None, None, False
+    if not isinstance(started_at, str) or not started_at.strip():
+        return None, None, False
+    if not isinstance(finished_at, str) or not finished_at.strip():
+        return None, None, False
+    if outcome not in _UPDATE_TERMINAL_EXIT_CODES:
+        return None, None, False
+    return action_id, outcome, not has_correlation_id
 
 # ``name`` → completed synthetic action result for actions the server handled
 # without spawning a subprocess (for example, unsupported Docker updates).
@@ -4439,22 +4508,41 @@ def _terminate_desktop_managed_gateway() -> None:
         pass
 
 
-def _record_completed_action(name: str, message: str, exit_code: int = 1) -> None:
-    """Record a non-spawned action result and write it to the action log."""
-    log_file_name = _ACTION_LOG_FILES[name]
-    _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = _ACTION_LOG_DIR / log_file_name
-    with open(log_path, "ab", buffering=0) as log_file:
-        log_file.write(
-            f"\n=== {name} completed {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
-        )
-        log_file.write(message.encode("utf-8", errors="replace"))
-        if not message.endswith("\n"):
-            log_file.write(b"\n")
+def _record_completed_action(
+    name: str,
+    message: str,
+    exit_code: int = 1,
+    action_id: Optional[str] = None,
+) -> None:
+    """Record a non-spawned action result; action-log I/O is best-effort."""
+    valid_action_id = _valid_update_action_id(action_id)
+    try:
+        log_file_name = _ACTION_LOG_FILES[name]
+        _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = _ACTION_LOG_DIR / log_file_name
+        with open(log_path, "ab", buffering=0) as log_file:
+            # Preserve the legacy human-readable line byte-for-byte. A
+            # correlated terminal marker immediately after it lets a restarted
+            # dashboard arbitrate this synchronous refusal without wall clocks.
+            log_file.write(
+                f"\n=== {name} completed {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
+            )
+            if name == "hermes-update" and valid_action_id:
+                log_file.write(
+                    f"=== hermes-update completed {valid_action_id} ===\n".encode()
+                )
+            log_file.write(message.encode("utf-8", errors="replace"))
+            if not message.endswith("\n"):
+                log_file.write(b"\n")
+    except Exception as exc:
+        _log.warning("Could not write completed action log for %s: %s", name, exc)
     _ACTION_PROCS.pop(name, None)
     _ACTION_COMMANDS.pop(name, None)
     _ACTION_IDS.pop(name, None)
-    _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": None}
+    result: Dict[str, Any] = {"exit_code": exit_code, "pid": None}
+    if valid_action_id:
+        result["action_id"] = valid_action_id
+    _ACTION_RESULTS[name] = result
 
 
 def _dashboard_spawn_executable() -> str:
@@ -4485,9 +4573,19 @@ def _spawn_hermes_action(
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = _ACTION_LOG_DIR / log_file_name
     log_file = open(log_path, "ab", buffering=0)
-    log_file.write(
-        f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
+    raw_action_id = (env_overrides or {}).get("HERMES_ACTION_ID")
+    action_id = _valid_update_action_id(raw_action_id)
+
+    # Keep the legacy human-readable start line byte-for-byte, then append a
+    # machine-readable generation marker for update actions.  Write the pair
+    # together so a dashboard restart cannot durably observe the legacy line
+    # without the exact generation barrier that explains it.
+    start_record = (
+        f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
     )
+    if name == "hermes-update" and action_id:
+        start_record += f"=== hermes-update action {action_id} started ===\n"
+    log_file.write(start_record.encode())
 
     cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
 
@@ -4519,7 +4617,6 @@ def _spawn_hermes_action(
     _ACTION_RESULTS.pop(name, None)
     _ACTION_COMMANDS[name] = tuple(subcommand)
     _ACTION_PROCS[name] = proc
-    action_id = (env_overrides or {}).get("HERMES_ACTION_ID")
     if action_id:
         _ACTION_IDS[name] = action_id
     else:
@@ -4527,26 +4624,68 @@ def _spawn_hermes_action(
     return proc
 
 
+def _open_verified_action_log(
+    path: Path,
+) -> Tuple[Optional[int], Literal["ok", "absent", "invalid"]]:
+    """Open one regular, non-symlink action log without a path-swap race.
+
+    The returned descriptor is owned by the caller.  ``absent`` is reserved
+    for an initial ``lstat`` that proves no object exists; every present but
+    unsafe/unreadable object is ``invalid`` so durable arbitration fails closed.
+    """
+
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "invalid"
+    if not stat.S_ISREG(observed.st_mode):
+        return None, "invalid"
+
+    descriptor: Optional[int] = None
+    try:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != observed.st_dev
+            or opened.st_ino != observed.st_ino
+        ):
+            os.close(descriptor)
+            return None, "invalid"
+        return descriptor, "ok"
+    except OSError:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        return None, "invalid"
+
+
 def _tail_lines(path: Path, n: int) -> List[str]:
     """Return the last ``n`` lines of ``path`` without loading huge logs."""
-    if n <= 0 or not path.exists():
+    if n <= 0:
         return []
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return []
-    if size <= 0:
+    descriptor, _status = _open_verified_action_log(path)
+    if descriptor is None:
         return []
 
-    min_offset = max(0, size - _ACTION_LOG_TAIL_MAX_BYTES)
-    offset = size
-    chunk_size = _ACTION_LOG_TAIL_INITIAL_CHUNK_BYTES
-    newline_count = 0
-    chunks: List[bytes] = []
-    drop_partial_first_line = False
-
     try:
-        with path.open("rb") as handle:
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            size = os.fstat(handle.fileno()).st_size
+            if size <= 0:
+                return []
+            min_offset = max(0, size - _ACTION_LOG_TAIL_MAX_BYTES)
+            offset = size
+            chunk_size = _ACTION_LOG_TAIL_INITIAL_CHUNK_BYTES
+            newline_count = 0
+            chunks: List[bytes] = []
+            drop_partial_first_line = False
             while offset > min_offset and newline_count <= n:
                 read_size = min(chunk_size, offset - min_offset)
                 offset -= read_size
@@ -4563,6 +4702,10 @@ def _tail_lines(path: Path, n: int) -> List[str]:
                 drop_partial_first_line = handle.read(1) != b"\n"
     except OSError:
         return []
+    finally:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
     lines = (
         b"".join(reversed(chunks))
@@ -4600,6 +4743,99 @@ def _durable_completed_update_action_id(lines: List[str]) -> Optional[str]:
         return completed_action_id
 
     return None
+
+
+def _durable_correlated_update_action(
+    lines: Iterable[str],
+) -> Tuple[Optional[str], bool]:
+    """Return ``(latest_action_id, pending)`` from durable action markers.
+
+    A correlated start is appended to ``hermes-update.log`` before the update
+    child is spawned.  Its matching completion is emitted by the child (or by
+    a synchronous typed refusal).  Scanning in file order makes a newer start
+    supersede every older terminal marker without relying on wall clocks or
+    mtimes; a completion-only marker remains valid for legacy/synchronous
+    paths that never wrote a correlated start.
+    """
+
+    latest_action_id: Optional[str] = None
+    pending = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("=== hermes-update started "):
+            # Legacy human marker. A following correlated marker supplies the
+            # generation ID; on older logs this still acts as a conservative
+            # freshness barrier against a prior terminal receipt.
+            latest_action_id = None
+            pending = True
+            continue
+        started = _UPDATE_ACTION_STARTED_RE.fullmatch(stripped)
+        if started:
+            latest_action_id = started.group(1)
+            pending = True
+            continue
+        if stripped.startswith("=== hermes update started "):
+            # The child writes this after the dashboard spawn marker. Preserve
+            # an already-correlated pending generation; otherwise record an
+            # unknown legacy generation as pending.
+            if not pending:
+                latest_action_id = None
+                pending = True
+            continue
+        completed = _UPDATE_ACTION_COMPLETED_RE.fullmatch(stripped)
+        if completed:
+            completed_action_id = completed.group(1)
+            # A terminal marker may arrive late from an older child after a
+            # newer correlated start was already appended.  It settles a
+            # known pending generation only on exact identity; otherwise the
+            # newer start remains the freshness barrier.  Outside that known
+            # pending state, retain completion-only legacy/synchronous logs.
+            if (
+                pending
+                and latest_action_id is not None
+                and completed_action_id != latest_action_id
+            ):
+                continue
+            latest_action_id = completed_action_id
+            pending = False
+    return latest_action_id, pending
+
+
+def _read_durable_correlated_update_action(
+    path: Path,
+) -> Tuple[Optional[str], bool, bool]:
+    """Scan the complete action log for its latest durable generation.
+
+    The user-facing tail is intentionally capped, but a verbose in-progress
+    update can push its start marker beyond that cap before the dashboard
+    restarts.  Stream the log instead of materializing it so correlation stays
+    correct for arbitrarily long logs with bounded memory.
+    """
+
+    descriptor, status = _open_verified_action_log(path)
+    if status == "absent":
+        return None, False, False
+    if descriptor is None:
+        # An unsafe or unreadable durable log is not equivalent to an absent
+        # log. It may contain a newer start, so retain a freshness barrier
+        # instead of authorizing a stale receipt/completion fallback.
+        return None, True, True
+
+    try:
+        with os.fdopen(
+            descriptor,
+            encoding="utf-8",
+            errors="replace",
+        ) as log_file:
+            descriptor = None
+            action_id, pending = _durable_correlated_update_action(log_file)
+            return action_id, pending, False
+    except OSError:
+        return None, True, True
+    finally:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
 
 def _gateway_subcommand(profile: Optional[str], verb: str) -> List[str]:
@@ -4841,6 +5077,38 @@ async def gateway_drain(request: Request):
 @app.post("/api/hermes/update")
 async def update_hermes():
     """Kick off ``hermes update`` in the background."""
+    # The shared Phase 3 admission kernel is authoritative and runs before
+    # legacy container/install heuristics or process creation.  A refusal is
+    # terminal, typed, durable, and carries the same guidance as the CLI.
+    from hermes_cli.update_contract import UPDATE_REFUSED_EXIT, perform_update
+
+    refusal = perform_update(
+        surface="dashboard_api",
+        project_root=PROJECT_ROOT,
+    )
+    if refusal is not None:
+        _record_completed_action(
+            "hermes-update",
+            refusal.message,
+            exit_code=UPDATE_REFUSED_EXIT,
+            action_id=refusal.correlation_id,
+        )
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": refusal.code,
+            "reason": refusal.code,
+            "message": refusal.message,
+            "update_command": refusal.update_command,
+            "deployment_kind": refusal.deployment_kind,
+            "baked_identity": refusal.baked_identity,
+            "current_identity": refusal.current_identity,
+            "receipt_path": refusal.receipt_path,
+            "action_id": refusal.correlation_id,
+            "correlation_id": refusal.correlation_id,
+        }
+
     if _dashboard_local_update_managed_externally():
         message = (
             "Hermes updates are managed outside this dashboard in "
@@ -4854,7 +5122,7 @@ async def update_hermes():
             "name": "hermes-update",
             "error": "dashboard_update_managed_externally",
             "message": message,
-            "update_command": "managed outside dashboard",
+            "update_command": recommended_update_command(),
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
@@ -4995,6 +5263,32 @@ async def check_hermes_update(force: bool = False):
                  desktop's remote update overlay renders this as "what's
                  changed". Additive: existing consumers ignore it.
     """
+    # Refusal classification is local and read-only: it must win before the
+    # generic managed-runtime gate and before any cached/network update check.
+    from hermes_cli.update_contract import evaluate_update_admission
+
+    _plan, refusal = evaluate_update_admission(
+        surface="dashboard_check",
+        project_root=PROJECT_ROOT,
+    )
+    if refusal is not None:
+        return {
+            "install_method": refusal.install_method,
+            "deployment_kind": refusal.deployment_kind,
+            "current_version": (
+                refusal.current_identity.get("version") or __version__
+            ),
+            "behind": None,
+            "update_available": False,
+            "can_apply": False,
+            "update_command": refusal.update_command,
+            "message": refusal.message,
+            "error": refusal.code,
+            "reason": refusal.code,
+            "baked_identity": refusal.baked_identity,
+            "current_identity": refusal.current_identity,
+        }
+
     if _dashboard_local_update_managed_externally():
         return {
             "install_method": "managed-runtime",
@@ -5574,58 +5868,155 @@ async def get_action_status(name: str, lines: int = 200):
 
     log_path = _ACTION_LOG_DIR / log_file_name
     requested_lines = min(max(lines, 1), 2000)
-    tail = _tail_lines(log_path, requested_lines)
+    action_lines = _tail_lines(log_path, 2000)
+    tail = action_lines[-requested_lines:]
 
-    durable_update_action_id = None
-    update_receipt_summary = None
-    if name == "hermes-update":
-        durable_lines = _tail_lines(_ACTION_LOG_DIR / "update.log", 2000)
-        durable_update_action_id = _durable_completed_update_action_id(durable_lines)
-        if durable_update_action_id:
-            marker = f"=== hermes-update completed {durable_update_action_id} ==="
-            if marker not in tail:
-                tail = [*tail, marker][-requested_lines:]
-        # Phase-1 bullet 3 (#91277): the update receipt is the durable,
-        # structured truth about the last update — written by every run
-        # including refused/failed ones, and it survives the dashboard
-        # restarting itself mid-action. Surface its summary alongside the
-        # log-marker recovery so clients (Desktop, dashboard) READ the
-        # outcome instead of inferring it from liveness probes
-        # (#81193/#87359 class).
-        update_receipt_summary = _latest_update_receipt_summary()
-
+    # Reap first, while the in-memory action id is still available.  Keeping
+    # that id in the terminal result prevents a poll racing process exit from
+    # falling back to an older durable generation.
     proc = _ACTION_PROCS.get(name)
     if proc is None:
         result = _ACTION_RESULTS.get(name)
         running = False
         exit_code = result.get("exit_code") if result else None
         pid = result.get("pid") if result else None
-        if result is None and durable_update_action_id:
-            exit_code = 0
-        if (
-            result is None
-            and exit_code is None
-            and update_receipt_summary is not None
-            and update_receipt_summary.get("outcome") in ("success", "partial")
-        ):
-            # No in-memory result and no log marker (e.g. log rotated), but
-            # the receipt proves a completed run: report its outcome rather
-            # than a null that clients time out on. ``partial`` maps to
-            # exit 1 exactly like the CLI run itself did.
-            exit_code = 0 if update_receipt_summary["outcome"] == "success" else 1
+        result_action_id = result.get("action_id") if result else None
     else:
         exit_code = proc.poll()
         running = exit_code is None
         pid = proc.pid
+        result_action_id = _ACTION_IDS.get(name)
         if exit_code is not None:
             try:
                 proc.wait(timeout=1)
             except Exception:
                 pass
-            _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": pid}
+            completed_result: Dict[str, Any] = {
+                "exit_code": exit_code,
+                "pid": pid,
+            }
+            if result_action_id:
+                completed_result["action_id"] = result_action_id
+            _ACTION_RESULTS[name] = completed_result
             _ACTION_PROCS.pop(name, None)
             _ACTION_COMMANDS.pop(name, None)
             _ACTION_IDS.pop(name, None)
+
+    update_receipt_summary = None
+    receipt_visible = False
+    current_action_id = result_action_id
+    durable_terminal_action_id = None
+
+    if name == "hermes-update":
+        correlated_action_id, correlated_pending, correlation_scan_failed = (
+            _read_durable_correlated_update_action(log_path)
+        )
+        durable_lines = _tail_lines(_ACTION_LOG_DIR / "update.log", 2000)
+        legacy_completed_action_id = _durable_completed_update_action_id(
+            durable_lines
+        )
+
+        # In-memory identity is necessarily the action this server most
+        # recently admitted.  After restart, the correlated action-log marker
+        # is the durable generation barrier.  Only when no exact marker exists
+        # do we retain the old completion-only update.log recovery path.
+        if current_action_id is None:
+            if correlated_action_id is not None:
+                current_action_id = correlated_action_id
+                if not correlated_pending:
+                    durable_terminal_action_id = correlated_action_id
+            elif (
+                legacy_completed_action_id is not None
+                and not correlation_scan_failed
+            ):
+                current_action_id = legacy_completed_action_id
+                durable_terminal_action_id = legacy_completed_action_id
+        elif not running and correlated_action_id == current_action_id:
+            if not correlated_pending:
+                durable_terminal_action_id = correlated_action_id
+
+        # The updater mirrors its terminal marker to update.log as well as
+        # stdout.  After a restart or action-log rotation, that marker may be
+        # the only retained completion proof.  It settles a correlated start
+        # only on an exact id match; an older/mismatched completion remains
+        # subordinate to the newer start barrier.
+        if (
+            current_action_id is not None
+            and legacy_completed_action_id == current_action_id
+        ):
+            durable_terminal_action_id = current_action_id
+
+        # An uncorrelated in-memory action/result or a legacy start with no
+        # completion is still a freshness barrier.  It cannot prove which
+        # receipt is current, so fail closed instead of guessing from clocks.
+        has_unknown_generation = (
+            current_action_id is None
+            and (
+                correlated_pending
+                or proc is not None
+                or _ACTION_RESULTS.get(name) is not None
+            )
+        )
+
+        # Phase-1 bullet 3 (#91277): a terminal receipt is the structured
+        # outcome, but only for the exact generation established above.  This
+        # exact-id arbitration intentionally has no timestamp/mtime fallback.
+        update_receipt_summary = _latest_update_receipt_summary()
+        receipt_action_id, receipt_outcome, receipt_is_legacy = (
+            _validated_terminal_update_receipt(update_receipt_summary)
+        )
+        receipt_is_terminal = receipt_outcome is not None
+
+        if receipt_is_terminal:
+            if receipt_is_legacy:
+                # Phase-1 receipts predate correlation IDs.  Preserve their
+                # receipt-only restart behavior only when no current or
+                # unknown generation exists.  A present invalid/null ID is
+                # rejected by the validator and never enters this branch.
+                receipt_visible = (
+                    current_action_id is None and not has_unknown_generation
+                )
+            elif current_action_id is not None:
+                receipt_visible = receipt_action_id == current_action_id
+            elif not has_unknown_generation:
+                # Compatibility for a receipt-only restart/rotated-log state.
+                # It is safe only because no newer durable or in-memory
+                # generation exists to contradict it.
+                receipt_visible = True
+
+        receipt_is_authoritative = receipt_visible and receipt_is_terminal
+        if not running and receipt_is_authoritative:
+            # The correlated receipt records partial/refused outcomes that a
+            # subprocess exit code cannot represent.  For the same generation
+            # it therefore outranks every contradictory 0/1/2 exit code.
+            assert receipt_outcome is not None
+            exit_code = _UPDATE_TERMINAL_EXIT_CODES[receipt_outcome]
+            if current_action_id is None and receipt_action_id:
+                current_action_id = receipt_action_id
+        elif (
+            not running
+            and _ACTION_RESULTS.get(name) is None
+            and durable_terminal_action_id is not None
+            and legacy_completed_action_id == durable_terminal_action_id
+        ):
+            # The generic action-log completion marker carries identity but no
+            # outcome. Only the updater's matching update.log marker is exact
+            # success proof; a synchronous refusal whose receipt disappeared
+            # must remain unknown rather than being promoted to exit 0.
+            exit_code = 0
+
+        # Retain the legacy synthetic marker used by pre-receipt Desktop
+        # clients, but never synthesize success for a pending generation or a
+        # correlated receipt that says this same generation was non-success.
+        if durable_terminal_action_id and (
+            not receipt_is_authoritative or receipt_outcome == "success"
+        ):
+            marker = (
+                f"=== hermes-update completed "
+                f"{durable_terminal_action_id} ==="
+            )
+            if marker not in tail:
+                tail = [*tail, marker][-requested_lines:]
 
     response = {
         "name": name,
@@ -5634,11 +6025,17 @@ async def get_action_status(name: str, lines: int = 200):
         "pid": pid,
         "lines": tail,
     }
-    if durable_update_action_id:
-        response["action_id"] = durable_update_action_id
-    if update_receipt_summary is not None:
+    if current_action_id:
+        response["action_id"] = current_action_id
+    if receipt_visible and update_receipt_summary is not None:
         response["receipt"] = update_receipt_summary
     return response
+
+
+def _optional_receipt_string(value: object) -> Optional[str]:
+    """Return JSON string state unchanged; reject every other scalar shape."""
+
+    return value if isinstance(value, str) else None
 
 
 def _latest_update_receipt_summary() -> Optional[Dict[str, Any]]:
@@ -5658,18 +6055,51 @@ def _latest_update_receipt_summary() -> Optional[Dict[str, Any]]:
         receipt = read_latest_receipt()
         if not receipt:
             return None
-        fleet = receipt.get("fleet") or []
-        return {
-            "outcome": receipt.get("outcome"),
-            "started_at": receipt.get("started_at"),
-            "finished_at": receipt.get("finished_at"),
-            "pre_sha": (receipt.get("pre_update") or {}).get("sha"),
-            "post_sha": (receipt.get("post_update") or {}).get("sha"),
-            "post_version": (receipt.get("post_update") or {}).get("version"),
+        fleet_value = receipt.get("fleet")
+        fleet = fleet_value if isinstance(fleet_value, list) else []
+        refusal = receipt.get("refusal")
+        refusal_summary = None
+        if isinstance(refusal, dict) and refusal:
+            refusal_summary = {
+                "code": _optional_receipt_string(refusal.get("code")),
+                "message": _optional_receipt_string(refusal.get("message")),
+                "update_command": _optional_receipt_string(
+                    refusal.get("update_command")
+                ),
+            }
+        pre_update_value = receipt.get("pre_update")
+        pre_update = pre_update_value if isinstance(pre_update_value, dict) else {}
+        post_update_value = receipt.get("post_update")
+        post_update = (
+            post_update_value if isinstance(post_update_value, dict) else {}
+        )
+        summary = {
+            "outcome": _optional_receipt_string(receipt.get("outcome")),
+            "started_at": _optional_receipt_string(receipt.get("started_at")),
+            "finished_at": _optional_receipt_string(receipt.get("finished_at")),
+            "stop_reason": _optional_receipt_string(receipt.get("stop_reason")),
+            "refusal": refusal_summary,
+            "pre_sha": _optional_receipt_string(pre_update.get("sha")),
+            "post_sha": _optional_receipt_string(post_update.get("sha")),
+            "post_version": _optional_receipt_string(post_update.get("version")),
             "fleet_states": sorted(
-                {str(e.get("state")) for e in fleet if isinstance(e, dict)}
+                {
+                    state
+                    for entry in fleet
+                    if isinstance(entry, dict)
+                    for state in [entry.get("state")]
+                    if isinstance(state, str)
+                }
             ),
         }
+        # Key absence identifies legacy Phase-1 receipts.  Preserve that
+        # protocol distinction: an explicitly present null/invalid value must
+        # remain present as ``None`` so arbitration rejects it as malformed.
+        if "correlation_id" in receipt:
+            summary["correlation_id"] = _valid_update_action_id(
+                receipt.get("correlation_id")
+            )
+        return summary
     except Exception:
         return None
 
@@ -7170,7 +7600,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 
 
 def _dashboard_code_skew_guard() -> Optional[str]:
-    """Return a clear \"restart required\" message when the dashboard runs stale code.
+    """Return a clear "restart required" message when the dashboard runs stale code.
 
     The dashboard is a long-lived process; its ``sys.modules`` is frozen at
     boot.  When ``hermes update`` (or a manual ``git pull``) replaces the

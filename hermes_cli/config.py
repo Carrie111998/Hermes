@@ -65,6 +65,18 @@ def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
     followed/copied (mirrors the Gemini #21541 lstat guard) to avoid
     clobbering whatever a malicious/misconfigured symlink points at.
     """
+    # The immutable-image update boundary runs before the CLI can finish
+    # importing. Config itself eagerly discovers provider metadata, and that
+    # import graph can parse a malformed config. A marker-authoritative update
+    # must not turn its advertised read-only plan/check (or its pre-refusal
+    # bootstrap) into a durable config backup. Consult the already-loaded,
+    # stdlib-only bootstrap module without importing anything new; normal
+    # commands and marker-absent installs retain the existing backup policy.
+    bootstrap = sys.modules.get("hermes_cli._early_recovery")
+    if bootstrap is not None and bool(
+        getattr(bootstrap, "_IMAGE_MANAGED_UPDATE_BOOTSTRAP_OBSERVED", False)
+    ):
+        return None
     try:
         if config_path.is_symlink():
             return None

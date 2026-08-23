@@ -31,13 +31,18 @@ Supervisors (how a runtime is restarted after code changes):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+_PROVENANCE_UNSET = object()
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 @dataclass
@@ -62,6 +67,9 @@ class UpdatePlan:
     """The full pre-update picture: install shape + runtimes + actions."""
 
     install_method: str = "unknown"       # git | docker | nix | apt | ...
+    deployment_kind: str = "mutable"      # mutable | package | image
+    classification_reason: str = ""
+    image_provenance: Optional[dict[str, Any]] = None
     updatable_in_place: bool = True
     update_mechanism: str = "hermes update"
     expected_sha: Optional[str] = None    # current checkout HEAD (pre-pull)
@@ -125,7 +133,165 @@ def describe_restart_mechanism(mechanism: str, profile: str) -> str:
     return "hermes gateway restart"
 
 
-def collect_runtime_inventory() -> UpdatePlan:
+def _read_json_object(path: Path) -> Optional[dict[str, Any]]:
+    """Read one JSON object without cleanup, repair, or config imports."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_pid_value(path: Path) -> Optional[int]:
+    """Read legacy integer or JSON PID metadata without modifying it."""
+
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not raw:
+        return None
+    try:
+        payload: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = raw
+    try:
+        value = payload.get("pid") if isinstance(payload, dict) else payload
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_exists_read_only(pid: int) -> bool:
+    """Cross-platform liveness probe that never opens Hermes state for write."""
+
+    if pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        # psutil is a pinned core dependency and the project's canonical
+        # cross-platform PID authority.  An incomplete environment cannot
+        # prove liveness, so keep this read-only inventory probe fail-closed.
+        return False
+
+    try:
+        if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            return False
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:
+        pass
+    return bool(psutil.pid_exists(pid))
+
+
+def _declared_supervisor(pid: int, record: dict[str, Any]) -> str:
+    """Infer supervisor from persisted or process-owned read-only facts."""
+
+    declared = record.get("supervisor")
+    if isinstance(declared, str) and declared:
+        return declared
+    try:
+        import psutil  # type: ignore
+
+        env = psutil.Process(pid).environ()
+        if env.get("INVOCATION_ID"):
+            return "systemd"
+        if env.get("HERMES_DESKTOP_MANAGED"):
+            return "desktop"
+        if env.get("XPC_SERVICE_NAME", "").startswith("ai.hermes") or env.get(
+            "LAUNCHD_SOCKET"
+        ):
+            return "launchd"
+    except Exception:
+        pass
+    return "manual"
+
+
+def _collect_image_runtime_inventory(plan: UpdatePlan) -> None:
+    """Populate image ``--plan`` using read-only, import-light probes.
+
+    The normal fleet collector predates the immutable-image startup boundary
+    and imports ``hermes_cli.gateway``/``hermes_cli.config``. Those modules can
+    seed a first-run home merely by importing while resolving providers. An
+    image plan must still show the fleet, but it cannot create SOUL.md, caches,
+    logs, or profile directories in order to do so. Read existing status/PID
+    files and live process facts without cleaning stale metadata. Marker-absent
+    installs keep the original collector below.
+    """
+
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        default_home = get_default_hermes_root()
+    except Exception as exc:
+        logger.debug("Image profile-root probe failed: %s", exc)
+        return
+
+    profile_homes: list[tuple[str, Path]] = []
+    try:
+        if default_home.is_dir():
+            profile_homes.append(("default", default_home))
+        profiles_root = default_home / "profiles"
+        if profiles_root.is_dir():
+            for entry in sorted(profiles_root.iterdir()):
+                if (
+                    entry.is_dir()
+                    and entry.name != "default"
+                    and _PROFILE_ID_RE.fullmatch(entry.name)
+                ):
+                    profile_homes.append((entry.name, entry))
+    except OSError as exc:
+        logger.debug("Image profile enumeration failed: %s", exc)
+    plan.profiles = [name for name, _home in profile_homes]
+
+    seen_pids: set[int] = set()
+    for profile, home in profile_homes:
+        record = _read_json_object(home / "gateway_state.json") or {}
+        try:
+            status_pid = int(record.get("pid"))
+        except (TypeError, ValueError):
+            status_pid = 0
+        pid_file_pid = _read_pid_value(home / "gateway.pid") or 0
+        pid = next(
+            (
+                candidate
+                for candidate in (status_pid, pid_file_pid)
+                if candidate > 0
+                and candidate not in seen_pids
+                and _pid_exists_read_only(candidate)
+            ),
+            0,
+        )
+        if pid <= 0:
+            continue
+        seen_pids.add(pid)
+        supervisor = _declared_supervisor(pid, record)
+        code_sha = record.get("code_sha") if status_pid == pid else None
+        plan.runtimes.append(
+            RuntimeRecord(
+                kind="gateway",
+                profile=profile,
+                pid=pid,
+                supervisor=supervisor,
+                code_sha=str(code_sha) if code_sha else None,
+                code_version=(
+                    record.get("code_version") if status_pid == pid else None
+                ),
+                restart_via=_restart_mechanism(supervisor, profile),
+            )
+        )
+
+
+def collect_runtime_inventory(
+    project_root: Optional[Path] = None,
+    *,
+    provenance_path: Optional[Path] = None,
+    _known_image_provenance: Any = _PROVENANCE_UNSET,
+    include_runtimes: bool = True,
+) -> UpdatePlan:
     """Build the pre-update plan. Read-only; never raises.
 
     Every collector degrades independently — a probe failure yields fewer
@@ -135,32 +301,96 @@ def collect_runtime_inventory() -> UpdatePlan:
     plan = UpdatePlan()
 
     # --- install shape / deployment kind ---------------------------------
-    try:
-        from hermes_cli.config import (
-            detect_install_method,
-            get_managed_system,
-            recommended_update_command_for_method,
+    # The image-authored marker is outside both the checkout and HERMES_HOME.
+    # Read it before consulting mutable install hints so a bind-mounted .git,
+    # .install_method, environment variable, or config file cannot demote an
+    # official image to an in-place-updatable install.
+    if _known_image_provenance is _PROVENANCE_UNSET:
+        try:
+            from hermes_cli.image_provenance import read_image_provenance
+
+            provenance = read_image_provenance(provenance_path)
+        except Exception as exc:  # pragma: no cover - reader is fail-safe itself
+            logger.debug("Image-provenance probe failed: %s", exc)
+            provenance = None
+    else:
+        # The admission kernel already observed this marker. Reuse that exact
+        # immutable fact rather than reading twice and opening a
+        # present-then-absent race between classification and refusal.
+        provenance = _known_image_provenance
+
+    if provenance is not None:
+        plan.install_method = "docker"
+        plan.deployment_kind = "image"
+        plan.classification_reason = (
+            "baked_image_provenance"
+            if provenance.valid
+            else "invalid_baked_image_provenance"
         )
+        plan.image_provenance = provenance.to_dict()
+        plan.updatable_in_place = False
+        # The baked marker is the sole code-identity authority on an image
+        # path. Local image builds may intentionally carry a null revision,
+        # and operators may bind-mount a checkout containing .git. Falling
+        # through to build_info in either case would let mutable filesystem
+        # state trigger a subprocess before the immutable-image refusal.
+        plan.expected_sha = provenance.revision
+        plan.expected_version = provenance.version
+        # Keep marker-positive admission dependency-light. Importing config
+        # performs legacy first-run initialization, which would violate the
+        # read-only image plan/check boundary before it can print this static
+        # operator guidance.
+        plan.update_mechanism = "docker pull nousresearch/hermes-agent:latest"
+    else:
+        # Marker absence deliberately preserves the pre-Phase-3 detector and
+        # its legacy Docker/package behavior.
+        try:
+            from hermes_cli.config import (
+                detect_install_method,
+                get_managed_system,
+                recommended_update_command_for_method,
+            )
 
-        method = detect_install_method()
-        plan.install_method = method
-        managed = get_managed_system()
-        if managed:
-            plan.install_method = managed
-        plan.updatable_in_place = method in ("git", "unknown") and not managed
-        plan.update_mechanism = recommended_update_command_for_method(method)
-    except Exception as exc:
-        logger.debug("Install-method probe failed: %s", exc)
+            method = detect_install_method(project_root)
+            plan.install_method = method
+            managed = get_managed_system()
+            if managed:
+                plan.install_method = managed
+                plan.deployment_kind = "package"
+                plan.classification_reason = f"managed_system:{managed}"
+            elif method == "docker":
+                plan.deployment_kind = "image"
+                plan.classification_reason = "install_method:docker"
+            elif method in ("nix", "nixos", "home-manager", "apt"):
+                plan.deployment_kind = "package"
+                plan.classification_reason = f"install_method:{method}"
+            else:
+                plan.deployment_kind = "mutable"
+                plan.classification_reason = f"install_method:{method}"
+            plan.updatable_in_place = method in ("git", "unknown") and not managed
+            plan.update_mechanism = recommended_update_command_for_method(method)
+        except Exception as exc:
+            logger.debug("Install-method probe failed: %s", exc)
 
-    # --- expected code identity (pre-pull) --------------------------------
-    try:
-        from hermes_cli.build_info import get_code_identity
+        # --- expected code identity (pre-pull) -----------------------------
+        # Mutable/package installs retain the existing live identity probe.
+        # Marker-bearing images never reach it: baked identity is authoritative
+        # even when one of its optional values is absent.
+        try:
+            from hermes_cli.build_info import get_code_identity
 
-        identity = get_code_identity(refresh=True)
-        plan.expected_sha = identity.get("sha")
-        plan.expected_version = identity.get("version")
-    except Exception as exc:
-        logger.debug("Code-identity probe failed: %s", exc)
+            identity = get_code_identity(refresh=True)
+            plan.expected_sha = identity.get("sha")
+            plan.expected_version = identity.get("version")
+        except Exception as exc:
+            logger.debug("Code-identity probe failed: %s", exc)
+
+    if not include_runtimes:
+        return plan
+
+    if provenance is not None:
+        _collect_image_runtime_inventory(plan)
+        return plan
 
     # --- profiles ----------------------------------------------------------
     profile_homes: list[tuple[str, Path]] = []
@@ -305,6 +535,15 @@ def print_update_plan(plan: UpdatePlan) -> None:
             print(f" @ {plan.expected_sha[:8]}", end="")
         print(")", end="")
     print()
+    reason = (
+        f" ({plan.classification_reason})" if plan.classification_reason else ""
+    )
+    print(f"  Deployment: {plan.deployment_kind}{reason}")
+    if plan.image_provenance:
+        marker = plan.image_provenance.get("marker_path")
+        revision = plan.image_provenance.get("revision")
+        identity = f" @ {str(revision)[:12]}" if revision else ""
+        print(f"  Image provenance: {marker}{identity}")
     if not plan.updatable_in_place:
         print("  ⚠ This install is NOT updatable in place.")
         print(f"    Update via: {plan.update_mechanism}")

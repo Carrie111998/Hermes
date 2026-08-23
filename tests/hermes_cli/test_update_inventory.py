@@ -159,7 +159,7 @@ class TestReceiptIntegration:
 
         home = tmp_path / "receipt_home"
         home.mkdir()
-        monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: home, raising=False)
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
         ur._current = None
         ur.begin_update_receipt()
         plan = ui.collect_runtime_inventory()

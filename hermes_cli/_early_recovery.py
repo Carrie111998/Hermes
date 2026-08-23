@@ -31,6 +31,184 @@ import sys
 import time
 from pathlib import Path
 
+
+# This module must stay stdlib-only and importable even when a partial source
+# update has not installed the newer ``image_provenance`` helper yet. Observe
+# marker *presence* directly: absence is proved only by FileNotFoundError;
+# every other result is image-managed and fail-closed. ``main.py`` consumes the
+# sticky process-local fact so a present -> absent race between the two startup
+# layers cannot re-authorize checkout/package maintenance.
+_DEFAULT_IMAGE_PROVENANCE_PATH = Path("/etc/hermes/image-provenance.json")
+_IMAGE_MANAGED_RUNTIME_OBSERVED = False
+_IMAGE_MANAGED_UPDATE_BOOTSTRAP_OBSERVED = False
+
+_BOOTSTRAP_VALUE_FLAGS = frozenset(
+    {
+        "-z",
+        "--oneshot",
+        "-m",
+        "--model",
+        "--provider",
+        "--reasoning",
+        "-t",
+        "--toolsets",
+        "-r",
+        "--resume",
+        "-s",
+        "--skills",
+        "--usage-file",
+        "--in",
+        "-c",
+        "--continue",
+        "-p",
+        "--profile",
+    }
+)
+
+# ``argparse.ArgumentParser`` accepts unambiguous long-option prefixes by
+# default (for example ``--reas high`` for ``--reasoning high``).  The early
+# image-update recognizer runs before the canonical parser is importable, so it
+# must resolve the same prefixes or a valid update invocation can fall through
+# to import-time config/logging mutations before ``cmd_update`` refuses it.
+# Keep this set in behavioral lockstep with the top-level parser; ``--profile``
+# is deliberately absent because it is consumed by the exact-match pre-parser,
+# not argparse.
+_BOOTSTRAP_ARGPARSE_LONG_FLAGS = frozenset(
+    {
+        "--accept-hooks",
+        "--cli",
+        "--continue",
+        "--dev",
+        "--help",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--in",
+        "--model",
+        "--no-restore-cwd",
+        "--oneshot",
+        "--pass-session-id",
+        "--provider",
+        "--reasoning",
+        "--resume",
+        "--safe-mode",
+        "--skills",
+        "--toolsets",
+        "--tui",
+        "--usage-file",
+        "--version",
+        "--worktree",
+        "--yolo",
+    }
+)
+
+
+def _resolve_bootstrap_long_option(token: str) -> str | None:
+    """Resolve an exact or unambiguous argparse-style long option."""
+
+    option = token.partition("=")[0]
+    if not option.startswith("--"):
+        return None
+    if option in _BOOTSTRAP_ARGPARSE_LONG_FLAGS:
+        return option
+    matches = [
+        candidate
+        for candidate in _BOOTSTRAP_ARGPARSE_LONG_FLAGS
+        if candidate.startswith(option)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _image_provenance_marker_path() -> Path:
+    loaded = sys.modules.get("hermes_cli.image_provenance")
+    candidate = getattr(loaded, "IMAGE_PROVENANCE_PATH", None)
+    try:
+        return (
+            Path(candidate)
+            if candidate is not None
+            else _DEFAULT_IMAGE_PROVENANCE_PATH
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_IMAGE_PROVENANCE_PATH
+
+
+def _image_provenance_marker_present() -> bool:
+    """Return False only when ``lstat`` proves the baked marker is absent."""
+
+    try:
+        _image_provenance_marker_path().lstat()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _image_update_invocation(argv: list[str]) -> bool:
+    """Recognize a potential update without importing the full CLI parser."""
+
+    top_level_version = False
+    top_level_oneshot = False
+    top_level_help = False
+    unresolved_global_option = False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        long_option = _resolve_bootstrap_long_option(token)
+        recognized_token = long_option or token
+        if token == "--":
+            command = argv[index + 1] if index + 1 < len(argv) else None
+            return (
+                command == "update"
+                and not top_level_version
+                and not top_level_oneshot
+                and not top_level_help
+            )
+        if recognized_token in {"--version", "-V"}:
+            top_level_version = True
+            index += 1
+            continue
+        if recognized_token in {"--help", "-h"}:
+            top_level_help = True
+            index += 1
+            continue
+        if token.startswith("-"):
+            if (
+                recognized_token in {"-z", "--oneshot"}
+                or (token.startswith("-z") and token != "-z")
+            ):
+                top_level_oneshot = True
+            if "=" in token:
+                index += 1
+                continue
+            if (
+                recognized_token in _BOOTSTRAP_VALUE_FLAGS
+                and index + 1 < len(argv)
+            ):
+                index += 2
+                continue
+            if token.startswith("--") and long_option is None:
+                # An unknown or ambiguous split-value global can otherwise
+                # make its value look like the first positional and hide a
+                # later literal ``update``.  The canonical parser will reject
+                # the invocation, but marker-positive processes must render
+                # that error before unrelated import-time mutations.
+                unresolved_global_option = True
+            index += 1
+            continue
+        if (
+            unresolved_global_option
+            and "update" in argv[index + 1 :]
+            and not top_level_version
+            and not top_level_oneshot
+            and not top_level_help
+        ):
+            return True
+        return (
+            token == "update" and not top_level_version and not top_level_oneshot
+            and not top_level_help
+        )
+    return False
+
 # Core packages a failed lazy ``uv pip install`` is known to leave with intact
 # distribution metadata but wiped import files (#57828).  ``module`` is what we
 # probe via a real import; ``attr`` guards against an empty/stub module.
@@ -444,9 +622,33 @@ def recover_if_needed(
     Never raises: on any failure the import of main.py proceeds and surfaces
     the real error.
     """
+    global _IMAGE_MANAGED_RUNTIME_OBSERVED
+    global _IMAGE_MANAGED_UPDATE_BOOTSTRAP_OBSERVED
     global _UPDATE_RETRY_RECOVERED
 
     try:
+        # Published images are immutable deployment artifacts.  Their baked
+        # provenance marker lives outside both the checkout and HERMES_HOME,
+        # so no startup recovery path may repair packages, claim locks, or
+        # rewrite marker state in place.  This check runs before even probing
+        # the updater's recovery markers because ``main.py`` calls this
+        # function at import time, before the normal update command admission
+        # boundary can run. Keep this direct presence probe here instead of
+        # importing the newer reader module: interrupted source updates can
+        # have this recovery module without that sibling file, and this layer
+        # exists specifically to recover such partially-installed states.
+        _IMAGE_MANAGED_RUNTIME_OBSERVED = (
+            _IMAGE_MANAGED_RUNTIME_OBSERVED
+            or _image_provenance_marker_present()
+        )
+        if _IMAGE_MANAGED_RUNTIME_OBSERVED:
+            args = sys.argv[1:] if argv is None else argv
+            _IMAGE_MANAGED_UPDATE_BOOTSTRAP_OBSERVED = (
+                _IMAGE_MANAGED_UPDATE_BOOTSTRAP_OBSERVED
+                or _image_update_invocation(args)
+            )
+            return
+
         args = sys.argv[1:] if argv is None else argv
         root = _project_root() if project_root is None else project_root
         if _pytest_owns_live_checkout(root):

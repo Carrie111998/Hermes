@@ -6,19 +6,13 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 
-def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
-    """Attach the ``update`` subcommand to ``subparsers``."""
-    # =========================================================================
-    # update command
-    # =========================================================================
-    update_parser = subparsers.add_parser(
-        "update",
-        help="Update Hermes Agent to the latest version",
-        description="Pull the latest changes from git and reinstall dependencies",
-    )
+def _configure_update_arguments(update_parser: argparse.ArgumentParser) -> None:
+    """Define update arguments once for full and bootstrap parsing."""
+
     update_parser.add_argument(
         "--gateway",
         action="store_true",
@@ -111,4 +105,42 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+
+
+def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
+    """Attach the ``update`` subcommand to ``subparsers``."""
+
+    update_parser = subparsers.add_parser(
+        "update",
+        help="Update Hermes Agent to the latest version",
+        description="Pull the latest changes from git and reinstall dependencies",
+    )
+    _configure_update_arguments(update_parser)
     update_parser.set_defaults(func=cmd_update)
+
+
+def _build_update_bootstrap_parser() -> argparse.ArgumentParser:
+    """Build the canonical top-level + update-only bootstrap parser."""
+
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, subparsers, _chat_parser = build_top_level_parser()
+    build_update_parser(subparsers, cmd_update=lambda _args: None)
+    return parser
+
+
+def parse_update_bootstrap_command_or_exit(argv: list[str]) -> argparse.Namespace:
+    """Canonically parse an image update, rendering help/errors via argparse.
+
+    The immutable-image boundary calls this before importing unrelated
+    subcommands. Valid invocations return their namespace; help and invalid
+    syntax retain argparse's public stdout/stderr and exit codes.
+    """
+
+    parsed = _build_update_bootstrap_parser().parse_args(argv)
+    if parsed.command != "update":
+        # The stdlib pre-recognizer only routes potential update invocations
+        # here. Keep an explicit guard so detector/parser drift cannot dispatch
+        # a different command through the image-update kernel.
+        raise ValueError("bootstrap invocation did not parse as update")
+    return parsed

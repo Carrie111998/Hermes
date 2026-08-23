@@ -1224,10 +1224,47 @@ export interface ActionResponse {
   already_running?: boolean
 }
 
+/** POST /api/hermes/update has a typed terminal-refusal branch in addition to
+ * the normal spawned-action response. Keep it distinct from generic actions
+ * so callers cannot assume a PID exists or silently discard remediation. */
+export type UpdateActionResponse =
+  | {
+      name: string
+      ok: true
+      pid: number
+      action_id?: string
+      already_running?: boolean
+    }
+  | {
+      name: string
+      ok: false
+      pid: null
+      error: string
+      reason?: string
+      message: string
+      update_command?: string | null
+      deployment_kind?: string
+      baked_identity?: Record<string, unknown> | null
+      current_identity?: Record<string, unknown> | null
+      receipt_path?: string | null
+      action_id?: string
+      correlation_id?: string
+    }
+
 export interface UpdateReceiptSummary {
   outcome: 'running' | 'success' | 'partial' | 'failed' | 'refused' | string
   started_at: string | null
   finished_at: string | null
+  /** Stable identity shared with the dashboard action that launched this run. */
+  correlation_id?: string | null
+  /** Stable machine-readable reason for a terminal non-success outcome. */
+  stop_reason?: string | null
+  /** Image-managed refusal guidance persisted by the shared update kernel. */
+  refusal?: {
+    code?: string | null
+    message?: string | null
+    update_command?: string | null
+  } | null
   pre_sha: string | null
   post_sha: string | null
   post_version: string | null
@@ -1240,7 +1277,7 @@ export interface ActionStatusResponse {
   name: string
   pid: number | null
   running: boolean
-  /** hermes-update only: durable completion identity recovered from update.log. */
+  /** hermes-update only: exact durable generation recovered from action/update logs. */
   action_id?: string
   /** hermes-update only: summary of the durable update receipt (#91277 bullet 3) —
    *  the authoritative outcome record, present even when the dashboard

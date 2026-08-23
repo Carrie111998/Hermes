@@ -9,7 +9,8 @@ import type {
   ElevenLabsVoicesResponse,
   MemoryProviderConfig,
   MemoryProviderOAuthStatus,
-  MemoryStatusResponse
+  MemoryStatusResponse,
+  UpdateActionResponse
 } from '@/types/hermes'
 
 import { capabilityScoped, hermesApi, type ProfileScope, profileScoped } from './client'
@@ -142,8 +143,8 @@ export function restartGateway(): Promise<ActionResponse> {
   })
 }
 
-export function updateHermes(): Promise<ActionResponse> {
-  return hermesApi<ActionResponse>({
+export function updateHermes(): Promise<UpdateActionResponse> {
+  return hermesApi<UpdateActionResponse>({
     ...profileScoped(),
     path: '/api/hermes/update',
     method: 'POST'

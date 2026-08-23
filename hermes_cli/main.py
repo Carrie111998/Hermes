@@ -439,51 +439,10 @@ from typing import Optional
 
 import functools as _functools
 
-from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
-from hermes_cli.subcommands.cron import build_cron_parser
-from hermes_cli.subcommands.sync import build_sync_parser
-from hermes_cli.subcommands.gateway import build_gateway_parser
-from hermes_cli.subcommands.profile import build_profile_parser
-from hermes_cli.subcommands.model import build_model_parser
-from hermes_cli.subcommands.setup import build_setup_parser
-
-from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
-from hermes_cli.subcommands.slack import build_slack_parser
-from hermes_cli.subcommands.login import build_login_parser
-from hermes_cli.subcommands.logout import build_logout_parser
-from hermes_cli.subcommands.auth import build_auth_parser
-from hermes_cli.subcommands.status import build_status_parser
-from hermes_cli.subcommands.pause import build_pause_parser
-from hermes_cli.subcommands.webhook import build_webhook_parser
-from hermes_cli.subcommands.hooks import build_hooks_parser
-from hermes_cli.subcommands.doctor import build_doctor_parser
-from hermes_cli.subcommands.verify import build_verify_parser
-from hermes_cli.subcommands.security import build_security_parser
-from hermes_cli.subcommands.approvals import build_approvals_parser
-from hermes_cli.subcommands.dump import build_dump_parser
-from hermes_cli.subcommands.debug import build_debug_parser
-from hermes_cli.subcommands.backup import build_backup_parser
-from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
-from hermes_cli.subcommands.import_agent import build_import_agent_parser
-from hermes_cli.subcommands.config import build_config_parser
-from hermes_cli.subcommands.skin import build_skin_parser
-from hermes_cli.subcommands.console import build_console_parser
-from hermes_cli.subcommands.update import build_update_parser
-from hermes_cli.subcommands.uninstall import build_uninstall_parser
-from hermes_cli.subcommands.dashboard import build_dashboard_parser
-from hermes_cli.subcommands.gui import build_gui_parser
-from hermes_cli.subcommands.logs import build_logs_parser
-from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.memory import build_memory_parser
-from hermes_cli.subcommands.acp import build_acp_parser
-from hermes_cli.subcommands.tools import build_tools_parser
-from hermes_cli.subcommands.insights import build_insights_parser
-from hermes_cli.subcommands.monitoring import build_monitoring_parser
-from hermes_cli.subcommands.skills import build_skills_parser
-from hermes_cli.subcommands.pairing import build_pairing_parser
-from hermes_cli.subcommands.plugins import build_plugins_parser
-from hermes_cli.subcommands.mcp import build_mcp_parser
-from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.update import (
+    build_update_parser,
+    parse_update_bootstrap_command_or_exit,
+)
 
 
 def _require_tty(command_name: str) -> None:
@@ -576,6 +535,7 @@ def _apply_profile_override() -> None:
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -693,6 +653,216 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+
+_BOOTSTRAP_PROVENANCE_UNSET = object()
+
+
+class _FailClosedBootstrapImageProvenance:
+    """Minimal provenance used when the canonical reader cannot be trusted."""
+
+    schema = 1
+    deployment_kind = "image"
+    manager = "unknown"
+    image = None
+    version = None
+    revision = None
+    valid = False
+
+    def __init__(self, error: str) -> None:
+        self.marker_path = str(_early_recovery_mod._image_provenance_marker_path())
+        self.error = error
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": self.schema,
+            "deployment_kind": self.deployment_kind,
+            "manager": self.manager,
+            "image": self.image,
+            "version": self.version,
+            "revision": self.revision,
+            "marker_path": self.marker_path,
+            "valid": self.valid,
+            "error": self.error,
+        }
+
+
+def _read_bootstrap_image_provenance():
+    """Observe the immutable-image fact once for startup admission."""
+
+    earliest_positive = bool(
+        getattr(_early_recovery_mod, "_IMAGE_MANAGED_RUNTIME_OBSERVED", False)
+    )
+    try:
+        from hermes_cli.image_provenance import read_image_provenance
+
+        provenance = read_image_provenance()
+    except Exception as exc:
+        if (
+            earliest_positive
+            or _early_recovery_mod._image_provenance_marker_present()
+        ):
+            return _FailClosedBootstrapImageProvenance(
+                "bootstrap_provenance_reader_unavailable:"
+                f"{type(exc).__name__}"
+            )
+        # Partial source updates predating image_provenance must retain their
+        # legacy recovery path when the baked marker is genuinely absent.
+        return None
+
+    if provenance is None and earliest_positive:
+        return _FailClosedBootstrapImageProvenance(
+            "marker_disappeared_after_early_startup_probe"
+        )
+    return provenance
+
+
+def _run_image_managed_update_boundary(args, provenance) -> int:
+    """Execute one marker-authoritative update surface and return its exit code."""
+
+    from hermes_cli.update_inventory import (
+        collect_runtime_inventory,
+        print_update_plan,
+    )
+
+    if getattr(args, "plan", False):
+        print_update_plan(
+            collect_runtime_inventory(
+                project_root=PROJECT_ROOT,
+                _known_image_provenance=provenance,
+            )
+        )
+        return 0
+
+    from hermes_cli.update_contract import (
+        UPDATE_REFUSED_EXIT,
+        evaluate_update_admission,
+        perform_update,
+    )
+
+    admission_plan = collect_runtime_inventory(
+        project_root=PROJECT_ROOT,
+        _known_image_provenance=provenance,
+        include_runtimes=False,
+    )
+    surface = "gateway" if getattr(args, "gateway", False) else "cli"
+    if getattr(args, "check", False):
+        _, refusal = evaluate_update_admission(
+            surface=surface,
+            requested_target=getattr(args, "branch", None),
+            project_root=PROJECT_ROOT,
+            plan=admission_plan,
+        )
+    else:
+        refusal = perform_update(
+            surface=surface,
+            requested_target=getattr(args, "branch", None),
+            project_root=PROJECT_ROOT,
+            plan=admission_plan,
+        )
+    if refusal is not None:
+        print(refusal.message)
+        return UPDATE_REFUSED_EXIT
+
+    # A plan built from an observed marker must always be refused. Never
+    # authorize mutation if an internal contract regression violates that
+    # invariant.
+    print(
+        "image_managed_update_refused: image provenance was observed, "
+        "but update admission could not classify it; refusing closed."
+    )
+    return UPDATE_REFUSED_EXIT
+
+
+def _early_image_managed_update_gate(
+    argv: list[str] | None = None,
+    *,
+    _known_image_provenance=_BOOTSTRAP_PROVENANCE_UNSET,
+) -> bool:
+    """Terminally dispatch image updates before import-time side effects.
+
+    Marker absence performs no new work and preserves legacy startup. A
+    positive marker routes canonical help/errors, read-only plan/check, and
+    mutating refusal to terminal exit before unrelated subcommands import.
+    ``cmd_update`` repeats the same kernel for direct callers.
+    """
+
+    effective_argv = sys.argv[1:] if argv is None else argv
+    if not _early_recovery_mod._image_update_invocation(effective_argv):
+        return False
+
+    provenance = (
+        _read_bootstrap_image_provenance()
+        if _known_image_provenance is _BOOTSTRAP_PROVENANCE_UNSET
+        else _known_image_provenance
+    )
+    if provenance is None:
+        return False
+
+    parsed_update = parse_update_bootstrap_command_or_exit(effective_argv)
+    if parsed_update.version or parsed_update.oneshot is not None:
+        # Top-level version/one-shot dispatch precedes subcommand dispatch in
+        # ``main()``. An otherwise-present ``update`` token is not an update
+        # attempt in those invocations and must not create a refusal receipt.
+        return False
+    raise SystemExit(_run_image_managed_update_boundary(parsed_update, provenance))
+
+
+_IMAGE_PROVENANCE_BOOTSTRAP = _read_bootstrap_image_provenance()
+_IMAGE_MANAGED_RUNTIME_BOOTSTRAP = _IMAGE_PROVENANCE_BOOTSTRAP is not None
+_early_image_managed_update_gate(
+    sys.argv[1:],
+    _known_image_provenance=_IMAGE_PROVENANCE_BOOTSTRAP,
+)
+
+# Import the rest of the CLI only after immutable-image update admission. Many
+# subcommand modules import config/provider code with first-run filesystem side
+# effects; marker-positive update/help/check/plan invocations must terminally
+# exit above before that fan-out.
+from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
+from hermes_cli.subcommands.cron import build_cron_parser
+from hermes_cli.subcommands.sync import build_sync_parser
+from hermes_cli.subcommands.gateway import build_gateway_parser
+from hermes_cli.subcommands.profile import build_profile_parser
+from hermes_cli.subcommands.model import build_model_parser
+from hermes_cli.subcommands.setup import build_setup_parser
+
+from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
+from hermes_cli.subcommands.slack import build_slack_parser
+from hermes_cli.subcommands.login import build_login_parser
+from hermes_cli.subcommands.logout import build_logout_parser
+from hermes_cli.subcommands.auth import build_auth_parser
+from hermes_cli.subcommands.status import build_status_parser
+from hermes_cli.subcommands.pause import build_pause_parser
+from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.hooks import build_hooks_parser
+from hermes_cli.subcommands.doctor import build_doctor_parser
+from hermes_cli.subcommands.verify import build_verify_parser
+from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
+from hermes_cli.subcommands.dump import build_dump_parser
+from hermes_cli.subcommands.debug import build_debug_parser
+from hermes_cli.subcommands.backup import build_backup_parser
+from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
+from hermes_cli.subcommands.import_agent import build_import_agent_parser
+from hermes_cli.subcommands.config import build_config_parser
+from hermes_cli.subcommands.skin import build_skin_parser
+from hermes_cli.subcommands.console import build_console_parser
+from hermes_cli.subcommands.uninstall import build_uninstall_parser
+from hermes_cli.subcommands.dashboard import build_dashboard_parser
+from hermes_cli.subcommands.gui import build_gui_parser
+from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+from hermes_cli.subcommands.memory import build_memory_parser
+from hermes_cli.subcommands.acp import build_acp_parser
+from hermes_cli.subcommands.tools import build_tools_parser
+from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.monitoring import build_monitoring_parser
+from hermes_cli.subcommands.skills import build_skills_parser
+from hermes_cli.subcommands.pairing import build_pairing_parser
+from hermes_cli.subcommands.plugins import build_plugins_parser
+from hermes_cli.subcommands.mcp import build_mcp_parser
+from hermes_cli.subcommands.claw import build_claw_parser
+
 # Windows launcher self-heal — the ``hermes`` command users run is a COPY of
 # the venv console script, staged into the managed binary dir (the default
 # Hermes root's ``bin``, next to the managed uv) by install.ps1. That dir
@@ -710,7 +880,7 @@ _apply_profile_override()
 # profiles resolve. The launcher dir itself is per-machine (the helper
 # anchors on the DEFAULT root, not HERMES_HOME), so profile sessions heal
 # the same shared dir.
-if sys.platform == "win32":
+if sys.platform == "win32" and not _IMAGE_MANAGED_RUNTIME_BOOTSTRAP:
     try:
         from hermes_cli import _install_repair as _install_repair_mod
 
@@ -727,9 +897,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # the updater process before ``uv`` replaces the environment.  On Windows,
 # Bitwarden's cryptography import maps ``_rust.pyd`` and the parent updater then
 # prevents its own child installer from replacing that file (#73381).  Profile
-# flags have already been stripped above, so the first remaining argument is
-# the authoritative argparse subcommand.  Dotenv/managed config still loads;
-# only external secret fetches are unnecessary for installation maintenance.
+# flags have already been stripped above.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
     load_external_secrets=sys.argv[1:2] != ["update"],
@@ -746,22 +914,19 @@ load_hermes_dotenv(
 # `load_config()` was doing a full deep-merge for one boolean lookup).
 _FORCE_IPV4_EARLY = False
 try:
-    # Reuse read_raw_config()'s (mtime, size)-keyed cache instead of a bespoke
-    # yaml.load — the SAME parse then serves hermes_logging's
-    # _read_logging_config and any later raw reads in this process, collapsing
-    # 3-4 config.yaml parses per invocation into one.
+    # Reuse read_raw_config()'s (mtime, size)-keyed cache instead of a
+    # bespoke yaml.load — the SAME parse then serves hermes_logging's
+    # _read_logging_config and later raw reads in this process.
     from hermes_cli.config import read_raw_config as _read_raw_early
 
     _cfg_path = get_hermes_home() / "config.yaml"
     if _cfg_path.exists():
         _early_cfg_raw = _read_raw_early() or {}
         # Managed scope: overlay administrator-pinned values so a managed
-        # security.redact_secrets / network.force_ipv4 wins here too. This early
-        # bridge reads config.yaml directly (before load_config is usable), so
-        # without the overlay a managed redact_secrets toggle would be ignored.
-        # Fail-open via the shared helper.
+        # security.redact_secrets / network.force_ipv4 wins here too.
         try:
             from hermes_cli import managed_scope
+
             _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
         except Exception:
             pass
@@ -770,14 +935,16 @@ try:
             if isinstance(_early_sec_cfg, dict):
                 _early_redact = _early_sec_cfg.get("redact_secrets")
                 if _early_redact is not None:
-                    os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+                    os.environ["HERMES_REDACT_SECRETS"] = str(
+                        _early_redact
+                    ).lower()
         _early_net_cfg = _early_cfg_raw.get("network", {})
         if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
             _FORCE_IPV4_EARLY = True
         del _early_cfg_raw
     del _cfg_path
 except Exception:
-    pass  # best-effort — redaction stays at default (enabled) on config errors
+    pass  # best-effort — redaction stays at default on config errors
 
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
@@ -10293,13 +10460,40 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
-def cmd_update(args):
+def cmd_update(
+    args,
+    *,
+    _known_image_provenance=_BOOTSTRAP_PROVENANCE_UNSET,
+):
     """Update Hermes Agent to the latest version.
 
     Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
+    # Preserve the pre-Phase-3 managed-install refusal exactly when the baked
+    # marker is absent.  A positive (including invalid) image marker outranks
+    # that mutable profile hint and proceeds to the image-aware plan/refusal.
+    image_provenance = (
+        _read_bootstrap_image_provenance()
+        if _known_image_provenance is _BOOTSTRAP_PROVENANCE_UNSET
+        else _known_image_provenance
+    )
+
+    # Marker-positive callers share the exact bootstrap kernel. Observe the
+    # marker once above, then pin that fact through inventory and admission so
+    # a present -> absent race cannot re-authorize an in-place update. This
+    # branch also precedes importing config, whose first-run initialization is
+    # intentionally outside the immutable-image update boundary.
+    if image_provenance is not None:
+        exit_code = _run_image_managed_update_boundary(args, image_provenance)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
+    # Marker absence deliberately preserves the legacy managed/package/git
+    # order and behavior, including config initialization performed by those
+    # pre-Phase-3 paths.
     from hermes_cli.config import (
         detect_install_method,
         format_docker_update_message,
@@ -10313,10 +10507,10 @@ def cmd_update(args):
         managed_error("update Hermes Agent")
         return
 
-    # --plan is read-only and deployment-kind aware, so it runs BEFORE the
-    # docker/nix/apt refusal gates: on an image-managed or package-managed
-    # install the plan itself reports "not updatable in place" plus the
-    # right mechanism — strictly more useful than the bare refusal text.
+    # --plan is read-only and deployment-kind aware.  Marker-bearing images
+    # reach it before the legacy Docker/package refusal gates and receive the
+    # authoritative pull/recreate mechanism.  Marker absence keeps the prior
+    # managed-install behavior above.  The plan never creates a receipt.
     if getattr(args, "plan", False):
         # Read-only plan phase (#91277 Phase 2): inventory every running
         # Hermes runtime across profiles, its supervisor, and its running
@@ -11916,6 +12110,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -12650,6 +12845,11 @@ def _advertise_agent_env() -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    # The positive baked-image fact outranks checkout/profile/runtime hints.
+    # This runs before startup's recovery mutations; ``cmd_update`` repeats
+    # the same shared admission at its public boundary for direct callers.
+    _image_managed_runtime = _IMAGE_MANAGED_RUNTIME_BOOTSTRAP
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
@@ -12668,16 +12868,18 @@ def main():
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if not _image_managed_runtime:
+        try:
+            _cleanup_quarantined_exes()
+        except Exception:
+            pass
 
     # If the checkout changed since the last launch (hermes update, manual
     # git pull, old-updater update that predates newer clears), sweep stale
     # __pycache__ once so no process — this one's lazy imports included —
     # resolves fresh source against old bytecode. Never raises.
-    _sweep_stale_bytecode_if_checkout_changed()
+    if not _image_managed_runtime:
+        _sweep_stale_bytecode_if_checkout_changed()
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
@@ -12689,11 +12891,12 @@ def main():
     # ``hermes skills install update``) merely defers recovery one launch;
     # under-matching (missing ``hermes -p work update``) would race a recovery
     # install against the real one. Loose wins.
-    try:
-        if "update" not in sys.argv[1:]:
-            _recover_from_interrupted_install()
-    except Exception:
-        pass
+    if not _image_managed_runtime:
+        try:
+            if "update" not in sys.argv[1:]:
+                _recover_from_interrupted_install()
+        except Exception:
+            pass
 
     if _try_termux_fast_tui_launch():
         return

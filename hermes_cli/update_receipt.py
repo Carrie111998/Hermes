@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _RECEIPT_DIR_NAME = "update_receipts"
 _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
+_LIVE_CODE_IDENTITY = object()
 
 # Module-level current receipt. ``hermes update`` is a single-threaded CLI
 # command; a module singleton lets the 7k-line updater record steps from
@@ -53,17 +55,50 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _valid_correlation_id(value: object) -> Optional[str]:
+    """Return a safe action correlation ID, or None.
+
+    Dashboard update actions already use 128-bit lowercase hexadecimal IDs.
+    Restricting the carried value to that shape prevents arbitrary environment
+    content from being copied into a receipt.
+    """
+
+    if not isinstance(value, str):
+        return None
+    if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
+        return None
+    return value
+
+
+def _correlation_id(explicit: Optional[str] = None) -> str:
+    return (
+        _valid_correlation_id(explicit)
+        or _valid_correlation_id(os.environ.get("HERMES_ACTION_ID"))
+        or uuid.uuid4().hex
+    )
+
+
 class UpdateReceipt:
     """Collects the observable facts of one ``hermes update`` run."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        surface: str = "",
+        requested_target: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        code_identity: Any = _LIVE_CODE_IDENTITY,
+    ) -> None:
         self.data: dict[str, Any] = {
             "schema": 1,
+            "correlation_id": _correlation_id(correlation_id),
             "started_at": _utc_now_iso(),
             "finished_at": None,
             "argv": list(sys.argv),
             "pid": os.getpid(),
-            "outcome": "running",  # running | success | partial | failed
+            "surface": surface,
+            "requested_target": requested_target,
+            "refusal": {},
+            "outcome": "running",  # running | success | partial | failed | refused
             "pre_update": {},
             "post_update": {},
             "steps": [],
@@ -71,12 +106,16 @@ class UpdateReceipt:
             "gateway_restart": {},
             "fleet": [],
         }
-        try:
-            from hermes_cli.build_info import get_code_identity
+        self._authoritative_code_identity: Any = _LIVE_CODE_IDENTITY
+        if code_identity is _LIVE_CODE_IDENTITY:
+            try:
+                from hermes_cli.build_info import get_code_identity
 
-            self.data["pre_update"] = get_code_identity()
-        except Exception:
-            pass
+                self.data["pre_update"] = get_code_identity()
+            except Exception:
+                pass
+        else:
+            self.set_authoritative_code_identity(code_identity)
 
     # -- recording ---------------------------------------------------------
     def step(self, name: str, ok: bool, detail: str = "") -> None:
@@ -112,9 +151,27 @@ class UpdateReceipt:
             "phase_error": phase_error,
         }
 
-    def finalize(self, outcome: str) -> None:
+    def set_authoritative_code_identity(self, identity: Any) -> None:
+        """Pin pre/post identity to an already-authoritative observation.
+
+        Image-managed admission obtains identity from the immutable baked
+        marker.  Re-probing a bind-mounted checkout while persisting the
+        refusal would create a second authority and could make the receipt
+        contradict the refusal that it records.
+        """
+
+        normalized = dict(identity) if isinstance(identity, dict) else {}
+        self._authoritative_code_identity = normalized
+        self.data["pre_update"] = dict(normalized)
+
+    def finalize(self, outcome: str, code_identity: Any = _LIVE_CODE_IDENTITY) -> None:
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
+        if code_identity is not _LIVE_CODE_IDENTITY:
+            self.set_authoritative_code_identity(code_identity)
+        if self._authoritative_code_identity is not _LIVE_CODE_IDENTITY:
+            self.data["post_update"] = dict(self._authoritative_code_identity)
+            return
         try:
             from hermes_cli.build_info import get_code_identity
 
@@ -124,19 +181,62 @@ class UpdateReceipt:
 
 
 def _receipt_dir() -> Path:
-    from hermes_cli.config import get_hermes_home
+    # Receipt persistence is the sole permitted home-tree mutation for an
+    # image-managed apply refusal. Importing the legacy config module here
+    # eagerly seeds SOUL.md and runtime directories, so use the side-effect-
+    # free canonical home resolver directly.
+    from hermes_constants import get_hermes_home
 
     return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
 
 
-def begin_update_receipt() -> None:
-    """Start recording a new update receipt. Never raises."""
+def begin_update_receipt(
+    surface: str = "",
+    requested_target: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    code_identity: Any = _LIVE_CODE_IDENTITY,
+) -> Optional[str]:
+    """Start recording a receipt and return its correlation ID; never raises."""
     global _current
     try:
-        _current = UpdateReceipt()
+        _current = UpdateReceipt(
+            surface,
+            requested_target,
+            correlation_id,
+            code_identity,
+        )
+        return str(_current.data["correlation_id"])
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
         _current = None
+        return None
+
+
+def has_active_update_receipt() -> bool:
+    """Whether a receipt is currently collecting in this process."""
+
+    return _current is not None
+
+
+def active_update_correlation_id() -> Optional[str]:
+    """Return the active receipt's safe correlation ID, if any."""
+
+    try:
+        if _current is None:
+            return None
+        return _valid_correlation_id(_current.data.get("correlation_id"))
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def set_update_receipt_code_identity(identity: Any) -> None:
+    """Use one authoritative identity for both ends of the active receipt."""
+
+    try:
+        if _current is not None:
+            _current.set_authoritative_code_identity(identity)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not pin update receipt code identity: %s", exc)
 
 
 def record_step(name: str, ok: bool, detail: str = "") -> None:
@@ -157,6 +257,40 @@ def record_skip(name: str, reason: str) -> None:
         logger.debug("Could not record update skip %s: %s", name, exc)
 
 
+def record_refusal(payload: dict[str, Any]) -> None:
+    """Record a typed terminal refusal on the active receipt.
+
+    Only contract fields are retained.  This keeps arbitrary caller data (and
+    especially credentials) out of the durable receipt while preserving the
+    stable refusal reason, remediation, target, and baked/current identities.
+    """
+
+    try:
+        if _current is None:
+            return
+        allowed = {
+            "code",
+            "message",
+            "update_command",
+            "deployment_kind",
+            "install_method",
+            "surface",
+            "requested_target",
+            "classification_reason",
+            "baked_identity",
+            "current_identity",
+            "correlation_id",
+        }
+        clean = {key: payload[key] for key in allowed if key in payload}
+        _current.data["refusal"] = clean
+        if clean.get("surface"):
+            _current.data["surface"] = clean["surface"]
+        if "requested_target" in clean:
+            _current.data["requested_target"] = clean["requested_target"]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record update refusal: %s", exc)
+
+
 def record_gateway_restart(**kwargs: Any) -> None:
     """Record the gateway restart phase outcome (see UpdateReceipt)."""
     try:
@@ -167,7 +301,10 @@ def record_gateway_restart(**kwargs: Any) -> None:
 
 
 def finalize_update_receipt(
-    outcome: str, fleet: list | None = None, stop_reason: str = ""
+    outcome: str,
+    fleet: list | None = None,
+    stop_reason: str = "",
+    code_identity: Any = _LIVE_CODE_IDENTITY,
 ) -> Optional[Path]:
     """Finalize + persist the receipt. Returns the written path or None.
 
@@ -182,7 +319,7 @@ def finalize_update_receipt(
     if receipt is None:
         return None
     try:
-        receipt.finalize(outcome)
+        receipt.finalize(outcome, code_identity=code_identity)
         if stop_reason:
             receipt.data["stop_reason"] = stop_reason
         if fleet is not None:
@@ -190,7 +327,12 @@ def finalize_update_receipt(
         directory = _receipt_dir()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = directory / f"update_{stamp}_{os.getpid()}.json"
+        # A process can finalize more than one refusal within the same second
+        # (for example two dashboard POSTs).  Timestamp + PID alone silently
+        # overwrote the first durable result, so give every receipt its own
+        # collision-resistant filename. ``latest.json`` remains the stable
+        # pointer for consumers.
+        path = directory / f"update_{stamp}_{os.getpid()}_{uuid.uuid4().hex}.json"
         path.write_text(
             json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
         )

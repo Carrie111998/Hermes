@@ -2219,6 +2219,9 @@ export const ja = defineLocale({
     manualBody:
       'Hermes をコマンドラインからインストールしたため、更新もそこで実行されます。これをターミナルに貼り付けてください:',
     manualPickedUp: 'Hermes は次回起動時に新しいバージョンを読み込みます。',
+    manualBodyBackend:
+      'Hermes バックエンドはこのアプリの外部で管理されています。ホストするサーバーで次のコマンドを実行してください:',
+    manualPickedUpBackend: 'バックエンドは更新完了後に新しいバージョンを読み込みます。',
     guiSkewTitle: 'デスクトップアプリを更新してください',
     guiSkewBody:
       'バックエンドは更新されましたが、このデスクトップアプリのパッケージは変更されていません。一致させるために Hermes デスクトップアプリ（AppImage / .deb / .rpm）を更新または再インストールしてください。',

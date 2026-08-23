@@ -114,7 +114,12 @@ export function UpdatesOverlay() {
         {phase === 'applying' && <ApplyingView apply={apply} isBackend={isBackend} />}
 
         {phase === 'manual' && (
-          <ManualView command={apply.command ?? null} message={apply.message} onDone={() => handleClose(false)} />
+          <ManualView
+            command={apply.command ?? null}
+            isBackend={isBackend}
+            message={apply.message}
+            onDone={() => handleClose(false)}
+          />
         )}
 
         {phase === 'guiSkew' && <GuiSkewView message={apply.message} onDone={() => handleClose(false)} />}
@@ -280,10 +285,21 @@ function IdleView({
   )
 }
 
-function ManualView({ command, message, onDone }: { command: string | null; message?: string; onDone: () => void }) {
+function ManualView({
+  command,
+  isBackend,
+  message,
+  onDone
+}: {
+  command: string | null
+  isBackend: boolean
+  message?: string
+  onDone: () => void
+}) {
   const { t } = useI18n()
   const u = t.updates
   const [copied, setCopied] = useState(false)
+  const customGuidance = message?.trim() && message.trim() !== command?.trim() ? message : null
 
   const handleCopy = () => {
     if (!command) {
@@ -321,7 +337,9 @@ function ManualView({ command, message, onDone }: { command: string | null; mess
         <Terminal className="size-8 text-primary" />
 
         <DialogTitle className="text-center text-xl">{u.manualTitle}</DialogTitle>
-        <DialogDescription className="text-center text-sm">{u.manualBody}</DialogDescription>
+        <DialogDescription className="text-center text-sm">
+          {customGuidance || (isBackend ? u.manualBodyBackend : u.manualBody)}
+        </DialogDescription>
       </div>
 
       <button
@@ -347,7 +365,11 @@ function ManualView({ command, message, onDone }: { command: string | null; mess
         </span>
       </button>
 
-      <p className="text-center text-xs text-muted-foreground">{u.manualPickedUp}</p>
+      {!customGuidance && (
+        <p className="text-center text-xs text-muted-foreground">
+          {isBackend ? u.manualPickedUpBackend : u.manualPickedUp}
+        </p>
+      )}
 
       <Button className="font-semibold" onClick={onDone} size="lg" variant="secondary">
         {u.done}

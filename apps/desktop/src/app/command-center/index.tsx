@@ -8,7 +8,7 @@ import { SegmentedControl } from '@/components/ui/segmented-control'
 import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import { Tip } from '@/components/ui/tooltip'
 import { getActionStatus, getLogs, getStatus, getUsageAnalytics, restartGateway, updateHermes } from '@/hermes'
-import type { ActionStatusResponse, AnalyticsResponse, StatusResponse } from '@/hermes'
+import type { ActionResponse, ActionStatusResponse, AnalyticsResponse, StatusResponse } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { compactNumber } from '@/lib/format'
@@ -37,6 +37,7 @@ import { OverlayMain, OverlayNav, OverlaySplitLayout } from '../overlays/overlay
 import { OverlayView } from '../overlays/overlay-view'
 
 import { MaintenancePanel } from './maintenance'
+import { terminalUpdateRefusal } from './update-refusal'
 
 export type CommandCenterSection = 'maintenance' | 'sessions' | 'system' | 'usage'
 
@@ -75,6 +76,76 @@ function formatTimestamp(value?: number | null): string {
   }
 
   return fmtDateTime.format(date)
+}
+
+const TERMINAL_UPDATE_RECEIPT_EXIT_CODES = {
+  failed: 1,
+  partial: 1,
+  refused: 2,
+  success: 0
+} as const
+
+function recoveredUpdateExitCode(status: ActionStatusResponse, actionId: string): number | null {
+  const receipt: unknown = status.receipt
+
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+    return null
+  }
+
+  const fields = receipt as Record<string, unknown>
+  const outcome = fields.outcome
+
+  if (
+    fields.correlation_id !== actionId ||
+    typeof fields.started_at !== 'string' ||
+    fields.started_at.length === 0 ||
+    typeof fields.finished_at !== 'string' ||
+    fields.finished_at.length === 0 ||
+    typeof outcome !== 'string' ||
+    !Object.hasOwn(TERMINAL_UPDATE_RECEIPT_EXIT_CODES, outcome)
+  ) {
+    return null
+  }
+
+  return TERMINAL_UPDATE_RECEIPT_EXIT_CODES[outcome as keyof typeof TERMINAL_UPDATE_RECEIPT_EXIT_CODES]
+}
+
+/** Return only status that can safely be attributed to this POST generation.
+ * Receipt/marker recovery can prove terminal state after a backend restart,
+ * but the accompanying action-name log tail is shared across generations. In
+ * that case synthesize a terminal status instead of publishing unscoped text. */
+function statusForStartedAction(status: ActionStatusResponse, started: ActionResponse): ActionStatusResponse | null {
+  const actionId = started.action_id
+
+  if (!actionId) {
+    return status
+  }
+
+  // A status that names a generation is authoritative about which generation
+  // it describes. Never let a marker from the shared log tail override a known
+  // mismatch; those tails can contain several sequential actions.
+  if (status.action_id !== undefined) {
+    return status.action_id === actionId ? status : null
+  }
+
+  const recoveredExitCode = recoveredUpdateExitCode(status, actionId)
+  const lines: unknown = status.lines
+
+  const hasCompletionMarker =
+    Array.isArray(lines) && lines.some(line => line === `=== hermes-update completed ${actionId} ===`)
+
+  if (recoveredExitCode === null && !hasCompletionMarker) {
+    return null
+  }
+
+  return {
+    action_id: actionId,
+    exit_code: recoveredExitCode ?? 0,
+    lines: [],
+    name: started.name,
+    pid: null,
+    running: false
+  }
 }
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
@@ -264,19 +335,53 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
   const runSystemAction = useCallback(
     async (kind: 'restart' | 'update') => {
       setSystemError('')
+      let refreshAfterAction = true
 
       try {
-        const started = kind === 'restart' ? await restartGateway() : await updateHermes()
+        let started: ActionResponse
+
+        if (kind === 'restart') {
+          started = await restartGateway()
+        } else {
+          const updateStarted = await updateHermes()
+
+          if (!updateStarted.ok) {
+            const refusal = terminalUpdateRefusal(updateStarted)
+
+            setSystemAction(refusal.status)
+            upsertDesktopActionTask(refusal.status)
+            setSystemError(refusal.guidance)
+            // refreshSystem() clears systemError at entry. Keep this terminal
+            // server guidance visible instead of erasing it in finally.
+            refreshAfterAction = false
+
+            return
+          }
+
+          started = updateStarted
+        }
+
         let nextStatus: ActionStatusResponse | null = null
 
         for (let attempt = 0; attempt < 18; attempt += 1) {
           await new Promise(resolve => window.setTimeout(resolve, 1200))
           const polled = await getActionStatus(started.name, 180)
-          nextStatus = polled
-          setSystemAction(polled)
-          upsertDesktopActionTask(polled)
 
-          if (!polled.running) {
+          // The status endpoint is addressed by action name, so a restart or a
+          // newer caller can briefly expose another generation. Identity gates
+          // presentation as well as settlement: do not publish its logs/state
+          // as the action this Command Center started.
+          const correlatedStatus = statusForStartedAction(polled, started)
+
+          if (!correlatedStatus) {
+            continue
+          }
+
+          nextStatus = correlatedStatus
+          setSystemAction(correlatedStatus)
+          upsertDesktopActionTask(correlatedStatus)
+
+          if (!correlatedStatus.running) {
             break
           }
         }
@@ -296,7 +401,9 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
       } catch (error) {
         setSystemError(error instanceof Error ? error.message : String(error))
       } finally {
-        void refreshSystem()
+        if (refreshAfterAction) {
+          void refreshSystem()
+        }
       }
     },
     [cc, refreshSystem]
@@ -493,7 +600,7 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
                     />
                   </div>
                   {systemError && (
-                    <span className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive">
+                    <span className="inline-flex items-center gap-1 whitespace-pre-wrap text-[length:var(--conversation-caption-font-size)] text-destructive">
                       <AlertCircle className="size-3.5" />
                       {systemError}
                     </span>

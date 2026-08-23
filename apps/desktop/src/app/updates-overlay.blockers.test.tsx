@@ -5,6 +5,8 @@ import { Dialog, DialogContent } from '@/components/ui/dialog'
 import type { DesktopUpdateStatus } from '@/global'
 import { I18nProvider } from '@/i18n/context'
 import {
+  $backendUpdateApply,
+  $backendUpdateStatus,
   $updateApply,
   $updateOverlayOpen,
   $updateOverlayTarget,
@@ -79,6 +81,7 @@ describe('BlockerView', () => {
     $updateOverlayOpen.set(false)
     $updateOverlayTarget.set('client')
     $updateStatus.set(null)
+    $backendUpdateStatus.set(null)
     resetUpdateApplyState()
   })
 
@@ -115,6 +118,65 @@ describe('BlockerView', () => {
     expect(screen.getByText('Close other processes to update Hermes')).toBeTruthy()
     expect(screen.getByText('python.exe')).toBeTruthy()
     expect(screen.queryByText('Update didn’t finish')).toBeNull()
+  })
+
+  it('shows persisted image refusal guidance alongside its recreate command', async () => {
+    const message =
+      'image_managed_update_refused: This runtime is image-managed. Pull the desired image, then recreate it.'
+
+    $updateOverlayTarget.set('backend')
+    $updateOverlayOpen.set(true)
+    $backendUpdateStatus.set({
+      supported: true,
+      updateAvailable: false,
+      behind: 0,
+      commits: []
+    } as DesktopUpdateStatus)
+    $backendUpdateApply.set({
+      applying: false,
+      stage: 'manual',
+      message,
+      percent: null,
+      error: null,
+      command: 'docker compose pull && docker compose up -d',
+      log: []
+    })
+
+    await renderUpdatesOverlay()
+
+    expect(screen.getByText(message)).toBeTruthy()
+    expect(screen.getByText('docker compose pull && docker compose up -d')).toBeTruthy()
+    expect(screen.queryByText(/installed Hermes from the command line/i)).toBeNull()
+    expect(screen.queryByText(/next time you launch it/i)).toBeNull()
+  })
+
+  it('uses backend-specific manual guidance when the backend supplies only a command', async () => {
+    $updateOverlayTarget.set('backend')
+    $updateOverlayOpen.set(true)
+    $backendUpdateStatus.set({
+      supported: true,
+      updateAvailable: false,
+      behind: 0,
+      commits: []
+    } as DesktopUpdateStatus)
+    $backendUpdateApply.set({
+      applying: false,
+      stage: 'manual',
+      message: '',
+      percent: null,
+      error: null,
+      command: 'hermes update',
+      log: []
+    })
+
+    await renderUpdatesOverlay()
+
+    expect(
+      screen.getByText('The Hermes backend is managed outside this app. Run this on the server that hosts it:')
+    ).toBeTruthy()
+    expect(screen.getByText('The backend picks up the new version after the update completes.')).toBeTruthy()
+    expect(screen.getByText('hermes update')).toBeTruthy()
+    expect(screen.queryByText(/installed Hermes from the command line/i)).toBeNull()
   })
 
   it('identifies foreign blockers without offering automatic termination', async () => {
