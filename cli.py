@@ -4802,19 +4802,40 @@ def build_skill_invocation_message(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+# Set once the trigger-routing failure has been reported, so a persistent
+# breakage warns a single time per process instead of on every message.
+_trigger_routing_failed = False
+
+
 def match_skill_trigger(text: str):
     """Rewrite free text into a skill slash command via declared triggers.
 
     Returns None when nothing matches, which is the case for every install
     where no skill declares ``triggers:``.
     """
+    global _trigger_routing_failed
     try:
         from agent.skill_commands import match_skill_trigger as _impl
 
         return _impl(text, get_skill_commands())
     except Exception:
-        # Routing is an optimisation, never a gate: if the skill scan fails
-        # the input must still reach the model unchanged.
+        # Routing is an optimisation, never a gate: if the skill scan fails the
+        # input must still reach the model unchanged. It is not silent, though:
+        # an import error or schema drift would otherwise disable routing for
+        # the whole session with no signal, and from the call site "nothing
+        # matched" and "the scanner is broken" look identical.
+        #
+        # Warn once, then drop to debug. The failure is almost always sticky,
+        # and a warning on every submitted message would bury the session.
+        if not _trigger_routing_failed:
+            _trigger_routing_failed = True
+            logger.warning(
+                "Skill trigger routing failed; input left unchanged. "
+                "Further failures log at debug.",
+                exc_info=True,
+            )
+        else:
+            logger.debug("Skill trigger routing failed again", exc_info=True)
         return None
 
 

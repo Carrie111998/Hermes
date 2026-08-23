@@ -7,8 +7,14 @@ plausible answer from the wrong skill rather than an error.
 """
 
 import unittest
+from unittest import mock
 
-from agent.skill_commands import _normalize_triggers, match_skill_trigger
+from agent.skill_commands import (
+    _MAX_TRIGGER_LEN,
+    _MAX_TRIGGERS,
+    _normalize_triggers,
+    match_skill_trigger,
+)
 
 
 def _cmds(mapping):
@@ -145,6 +151,103 @@ class TestMatchSkillTrigger(unittest.TestCase):
     def test_malformed_command_entries_are_survivable(self):
         commands = {"/broken": {}, "/ok": {"triggers": ["brief"]}}
         self.assertEqual(match_skill_trigger("brief x", commands), "/ok brief x")
+
+
+class TestTriggerQuotas(unittest.TestCase):
+    """Frontmatter is untrusted, so a skill cannot declare unbounded triggers."""
+
+    def test_phrase_count_is_capped(self):
+        many = [f"trigger number {i}" for i in range(_MAX_TRIGGERS * 3)]
+        got = _normalize_triggers({"triggers": many})
+        self.assertEqual(len(got), _MAX_TRIGGERS)
+        # The cap keeps the declared order rather than an arbitrary subset.
+        self.assertEqual(got, [p.casefold() for p in many[:_MAX_TRIGGERS]])
+
+    def test_over_long_phrase_is_dropped_not_truncated(self):
+        long = "x" * (_MAX_TRIGGER_LEN + 1)
+        got = _normalize_triggers({"triggers": [long, "brief"]})
+        # Truncating would make the trigger match MORE than its author wrote.
+        self.assertEqual(got, ["brief"])
+
+    def test_phrase_at_the_limit_survives(self):
+        exact = "y" * _MAX_TRIGGER_LEN
+        self.assertEqual(_normalize_triggers({"triggers": [exact]}), [exact])
+
+    def test_over_quota_skill_still_loads(self):
+        # Malformed frontmatter degrades the feature; it must not raise.
+        got = _normalize_triggers({"triggers": ["z" * 500] * 500})
+        self.assertEqual(got, [])
+
+
+class TestCaseFolding(unittest.TestCase):
+    def test_non_ascii_trigger_matches_itself(self):
+        # .lower() is lossy for some scripts; both sides must use the same fold
+        # or a trigger stops matching the very phrase its author declared.
+        triggers = _normalize_triggers({"triggers": ["STRASSE"]})
+        commands = _cmds({"/street": triggers})
+        self.assertIsNotNone(match_skill_trigger("strasse now", commands))
+
+    def test_eszett_folds_consistently(self):
+        triggers = _normalize_triggers({"triggers": ["straße"]})
+        commands = _cmds({"/street": triggers})
+        self.assertEqual(
+            match_skill_trigger("STRASSE now", commands),
+            "/street STRASSE now",
+        )
+
+
+class TestCLIWrapper(unittest.TestCase):
+    """cli.match_skill_trigger() wires the matcher to the cached command scan.
+
+    The wrapper is the never-gate boundary: whatever goes wrong underneath, the
+    user's input has to reach the model unchanged.
+    """
+
+    def _cli(self):
+        import cli
+
+        return cli
+
+    def test_rewrite_is_returned_on_match(self):
+        cli = self._cli()
+        with mock.patch.object(
+            cli, "get_skill_commands", return_value=_cmds({"/trip-brief": ["brief"]})
+        ):
+            self.assertEqual(
+                cli.match_skill_trigger("brief me"), "/trip-brief brief me"
+            )
+
+    def test_no_match_returns_none(self):
+        cli = self._cli()
+        with mock.patch.object(
+            cli, "get_skill_commands", return_value=_cmds({"/trip-brief": ["brief"]})
+        ):
+            self.assertIsNone(cli.match_skill_trigger("what is the weather"))
+
+    def test_scan_failure_is_swallowed_but_logged(self):
+        cli = self._cli()
+        with mock.patch.object(cli, "_trigger_routing_failed", False):
+            with mock.patch.object(
+                cli, "get_skill_commands", side_effect=RuntimeError("schema drift")
+            ):
+                with self.assertLogs(cli.logger, level="WARNING") as caught:
+                    self.assertIsNone(cli.match_skill_trigger("brief me"))
+        # Silence here is the actual bug: a broken scan would disable routing
+        # everywhere and look exactly like "nothing matched".
+        self.assertTrue(any("trigger routing" in m for m in caught.output))
+
+    def test_repeat_failures_warn_only_once(self):
+        cli = self._cli()
+        with mock.patch.object(cli, "_trigger_routing_failed", False):
+            with mock.patch.object(
+                cli, "get_skill_commands", side_effect=RuntimeError("schema drift")
+            ):
+                with self.assertLogs(cli.logger, level="DEBUG") as caught:
+                    for _ in range(5):
+                        self.assertIsNone(cli.match_skill_trigger("brief me"))
+        # A sticky failure must not warn on every message the user sends.
+        warnings = [m for m in caught.output if m.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1)
 
 
 if __name__ == "__main__":

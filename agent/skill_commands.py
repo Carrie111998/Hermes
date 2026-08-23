@@ -38,6 +38,16 @@ _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 # a skill that declares one would quietly capture unrelated input.
 _MIN_TRIGGER_LEN = 3
 
+# Ceilings on what one skill may declare. Frontmatter is untrusted -- skills are
+# agent-authored (``skills.write_approval``) and hub-installed -- and every
+# declared phrase is scanned against every submitted input. The scan is over a
+# cached map and cheap per phrase, so these are not a hot path today; they are
+# here so a skill cannot make it one. Excess phrases are dropped, over-long
+# phrases are dropped whole rather than truncated (a truncated trigger would
+# match MORE than its author wrote, which is the wrong way to fail).
+_MAX_TRIGGERS = 32
+_MAX_TRIGGER_LEN = 64
+
 # What may follow a trigger for it to count as a match: end of input, or a
 # character that ends a word. Without this, the trigger "deploy" would also
 # capture "deployment guide, section 3".
@@ -51,6 +61,10 @@ def _normalize_triggers(frontmatter: Dict[str, Any]) -> "list[str]":
     Skills can be written by the agent itself (``skills.write_approval``) and
     installed from the hub, so a trigger string is untrusted input; treating it
     as a pattern would hand any skill author a ReDoS or a catch-all ``.*``.
+
+    At most ``_MAX_TRIGGERS`` phrases of at most ``_MAX_TRIGGER_LEN`` characters
+    survive; the rest are dropped with a debug line. Over-quota frontmatter is a
+    malformed skill, not a fatal error, so the skill still loads.
     """
     raw = frontmatter.get("triggers")
     if raw is None:
@@ -62,16 +76,37 @@ def _normalize_triggers(frontmatter: Dict[str, Any]) -> "list[str]":
 
     cleaned = []
     seen = set()
+    dropped_long = 0
     for item in raw:
         if not isinstance(item, str):
             continue
-        phrase = " ".join(item.split()).strip().lower()
+        # casefold(), not lower(): matching compares a casefolded haystack, so
+        # both sides must use the same fold or a non-ASCII trigger silently
+        # stops matching its own phrase.
+        phrase = " ".join(item.split()).strip().casefold()
         if len(phrase) < _MIN_TRIGGER_LEN:
+            continue
+        if len(phrase) > _MAX_TRIGGER_LEN:
+            dropped_long += 1
             continue
         if phrase in seen:
             continue
         seen.add(phrase)
         cleaned.append(phrase)
+        if len(cleaned) >= _MAX_TRIGGERS:
+            break
+
+    if dropped_long:
+        logger.debug(
+            "skill triggers: dropped %d phrase(s) over %d characters",
+            dropped_long,
+            _MAX_TRIGGER_LEN,
+        )
+    if len(cleaned) >= _MAX_TRIGGERS:
+        logger.debug(
+            "skill triggers: capped at %d phrases; later entries ignored",
+            _MAX_TRIGGERS,
+        )
     return cleaned
 
 
@@ -104,7 +139,7 @@ def match_skill_trigger(text: str, commands: Optional[Dict[str, Any]] = None):
     if commands is None:
         commands = scan_skill_commands()
 
-    haystack = " ".join(stripped.split()).lower()
+    haystack = " ".join(stripped.split()).casefold()
     best_len = -1
     best_cmd = None
     for cmd_key, info in (commands or {}).items():

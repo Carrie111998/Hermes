@@ -513,10 +513,17 @@ Rules worth knowing before you add them:
   deploy this` does not. A trigger anywhere in a sentence would capture ordinary
   prose that merely mentions the word.
 - **Whole words only.** The trigger `deploy` does not match `deployment guide`.
+  A word ends at whitespace or punctuation, so `deploy` *does* match
+  `deploy-to-staging` — a hyphen separates words. An underscore does not, so
+  `deploy_staging` is treated as one word and does not match.
 - **Literal phrases, never regex.** Skills can be agent-authored or installed
   from the hub, so trigger strings are untrusted input. They are matched
   literally — a skill cannot declare `.*` and capture everything.
 - **Minimum three characters.** Shorter fragments match too much prose.
+- **At most 32 phrases, 64 characters each.** Frontmatter is untrusted — skills
+  can be agent-authored or hub-installed — and every phrase is checked against
+  every message you send. Anything past the limit is dropped and the skill
+  still loads.
 - **Longest match wins** when skills overlap, so `deploy staging` beats
   `deploy`. Equal-length ties resolve by slug, so the winner does not depend on
   filesystem scan order.
