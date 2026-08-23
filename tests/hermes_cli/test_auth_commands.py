@@ -228,6 +228,65 @@ def test_auth_add_nous_oauth_honors_custom_label(tmp_path, monkeypatch):
     assert payload["providers"]["nous"]["label"] == "my-nous"
 
 
+def test_auth_add_minimax_oauth_reuses_canonical_seeded_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    states = iter(
+        [
+            {
+                "provider": "minimax-oauth",
+                "access_token": "first-access-token",
+                "refresh_token": "first-refresh-token",
+                "inference_base_url": "https://api.minimax.io/anthropic",
+            },
+            {
+                "provider": "minimax-oauth",
+                "access_token": "second-access-token",
+                "refresh_token": "second-refresh-token",
+                "inference_base_url": "https://api.minimax.io/anthropic",
+            },
+        ]
+    )
+
+    def _fake_login(*, label=None, **_kwargs):
+        from hermes_cli.auth import _minimax_save_auth_state
+
+        state = next(states)
+        if label:
+            state["label"] = label
+        _minimax_save_auth_state(state)
+        return state
+
+    monkeypatch.setattr("hermes_cli.auth._minimax_oauth_login", _fake_login)
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "minimax-oauth"
+        auth_type = "oauth"
+        api_key = None
+        label = "primary-minimax"
+        no_browser = False
+        timeout = None
+
+    auth_add_command(_Args())
+    first_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    first_entry = first_payload["credential_pool"]["minimax-oauth"][0]
+
+    auth_add_command(_Args())
+    final_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = final_payload["credential_pool"]["minimax-oauth"]
+
+    assert len(entries) == 1
+    assert entries[0]["source"] == "oauth"
+    assert entries[0]["id"] == first_entry["id"]
+    assert entries[0]["priority"] == first_entry["priority"] == 0
+    assert entries[0]["access_token"] == "second-access-token"
+    assert entries[0]["refresh_token"] == "second-refresh-token"
+    assert entries[0]["label"] == "primary-minimax"
+    assert not any(item["source"] == "manual:minimax_oauth" for item in entries)
+
+
 def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch):
     """Two ``hermes auth add openai-codex`` runs for different ChatGPT
     accounts must produce two independent pool entries with distinct tokens.
