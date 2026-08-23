@@ -510,6 +510,20 @@ def build_top_level_parser():
         help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.",
     )
     chat_parser.add_argument(
+        "--session-id-file",
+        dest="session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the live session id to PATH atomically (temp file + rename) "
+            "the moment it exists — at startup for new AND resumed sessions, on "
+            "/new rotation, and when a continuation session takes over. Path must "
+            "be unique per run; concurrent runs each bind only their own session. "
+            "For programmatic supervisors (Mission Control) that need the binding "
+            "before exit, including under -Q."
+        ),
+    )
+    chat_parser.add_argument(
         "--source",
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",

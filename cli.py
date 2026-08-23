@@ -5478,7 +5478,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
-        
+        self._bind_session_id_file()
+
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttle UI repaints
@@ -9836,6 +9837,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
+    def _bind_session_id_file(self):
+        """Write the live session id to the --session-id-file binding path.
+
+        No-op unless HERMES_SESSION_ID_FILE is set (via ``chat
+        --session-id-file``). Best-effort; see hermes_cli/session_binding.py.
+        """
+        try:
+            from hermes_cli.session_binding import (
+                resolve_session_id_file,
+                write_session_id_file,
+            )
+
+            write_session_id_file(
+                resolve_session_id_file(), getattr(self, "session_id", None)
+            )
+        except Exception:
+            pass
+
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         old_session_id = self.session_id
@@ -9881,6 +9900,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         short_uuid = uuid.uuid4().hex[:6]
         self.session_id = f"{timestamp_str}_{short_uuid}"
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
+        self._bind_session_id_file()
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
@@ -21392,6 +21412,7 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
+                            cli._bind_session_id_file()
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the

@@ -3209,6 +3209,13 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    # --session-id-file: deterministic native-session binding path for
+    # programmatic supervisors (Mission Control). The runtime (cli.py) reads
+    # HERMES_SESSION_ID_FILE and writes the live session id there at startup
+    # and whenever the session id changes.
+    if getattr(args, "session_id_file", None):
+        os.environ["HERMES_SESSION_ID_FILE"] = args.session_id_file
+
     _pin_kanban_board_env()
     _confirm_startup_expensive_model_override(args)
 
