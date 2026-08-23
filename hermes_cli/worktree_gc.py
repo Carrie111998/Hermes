@@ -314,8 +314,22 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
     """
     import cli as _cli
 
-    if _cli._repo_is_shallow(repo_root):
-        _cli._deepen_shallow_repo(repo_root)
+    # `_deepen_shallow_repo` returns whether the repo is actually non-shallow
+    # afterwards, and its contract is explicit that "on failure (offline, no
+    # remote) callers keep today's preserve-everything behavior". Branch
+    # reclaim has no second line of defence: unlike the tree path, which is
+    # backed by `_worktree_has_unpushed_commits` answering conservatively
+    # True on unverifiable history, every verdict below (`--merged`,
+    # `rev-list --count`, `git cherry`) is read as fact. `cli.py` says as
+    # much: "check `_repo_is_shallow` before presenting this verdict as
+    # fact". Offer nothing rather than delete refs on a truncated graph.
+    if _cli._repo_is_shallow(repo_root) and not _cli._deepen_shallow_repo(repo_root):
+        logger.info(
+            "Skipping branch reclaim in %s: repository is still shallow, so "
+            "merged/unique verdicts are not trustworthy",
+            repo_root,
+        )
+        return []
 
     upstream = None
     for candidate in ("origin/HEAD", "origin/main", "origin/master"):
