@@ -614,6 +614,37 @@ def credential_pool_matches_provider(
     return False
 
 
+def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -> str:
+    """Resolve the credential-pool key for a runtime provider identity.
+
+    Named custom runtimes retain their configured alias while their pool is
+    stored under ``custom:<name>``. Return that scoped key only when the
+    canonical provider/endpoint boundary accepts it; otherwise preserve the
+    normalized runtime identity so callers fail closed.
+    """
+    provider_norm = str(provider or "").strip().lower()
+    if not provider_norm:
+        return ""
+
+    try:
+        if provider_norm.startswith(CUSTOM_POOL_PREFIX):
+            candidate = provider_norm
+        else:
+            candidate = get_custom_provider_pool_key(
+                base_url,
+                provider_name=None if provider_norm == "custom" else provider_norm,
+            )
+        if candidate and credential_pool_matches_provider(
+            candidate,
+            provider_norm,
+            base_url=base_url,
+        ):
+            return str(candidate).strip().lower()
+    except Exception:
+        pass
+    return provider_norm
+
+
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
