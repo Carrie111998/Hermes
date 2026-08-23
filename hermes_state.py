@@ -1566,6 +1566,32 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
+def _stat_file_identity(path) -> "tuple[int, int] | None":
+    """Return ``(st_dev, st_ino)`` for *path*, or ``None`` when unknowable.
+
+    This is the identity of the FILE, not of its contents: it changes when
+    something replaces the path with a different file (``cp`` onto the live
+    path, a restore script, a ``mv`` of a new inode over it) and does not
+    change when the same file is written to.
+
+    ``None`` is the fail-open answer and callers must treat it as "no
+    opinion", never as "changed". A missing file, a stat error, or a
+    filesystem that reports ``st_ino == 0`` (some network and FUSE mounts, and
+    Windows volumes where the file index is unavailable) must not be able to
+    make a healthy database look replaced -- a guard that fires on absent
+    evidence would turn a working store into an outage, which is the failure
+    it exists to prevent.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    dev, ino = getattr(st, "st_dev", 0), getattr(st, "st_ino", 0)
+    if not ino:
+        return None
+    return (dev, ino)
+
+
 # Markers that mean the host filesystem cannot accept another write. Kept as
 # plain substrings so OSError, sqlite3.OperationalError, and wrapped RPC
 # error strings all match the same helper.
@@ -3779,6 +3805,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        # File identity (st_dev, st_ino) of the database this connection was
+        # opened against, recorded by _connect_and_init. None means "could not
+        # be determined" and disables the guard rather than arming it -- see
+        # _stat_file_identity and _backing_file_was_replaced.
+        self._file_identity: "tuple[int, int] | None" = None
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
@@ -3915,6 +3946,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                self._file_identity = _stat_file_identity(self.db_path)
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -4557,6 +4589,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                # Identity check BEFORE either repair rung. A file swapped at
+                # the same path surfaces as this same corruption class, and
+                # the reporter's incident (#89332) shows what happens when it
+                # is misrouted into the FTS ladder: repair attempts that
+                # cannot succeed, the last of which mutates the database, and
+                # every append_message failing for 17 minutes with nothing in
+                # the log naming the actual cause. Upstream already decided
+                # this class fails closed rather than self-healing (50bbcbf2b4,
+                # "one connection cannot safely heal a shared DB identity
+                # change"); this says the same thing about the FTS rungs, and
+                # says WHICH failure it is while doing so.
+                if self._refuse_repair_on_replaced_file(exc):
+                    raise
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
                 # while the canonical messages table is intact. Recover here,
@@ -4605,6 +4650,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._WRITE_RETRY_MAX_S,
             )
         time.sleep(min(jitter, max(deadline - now, 0.001)))
+        return True
+
+    def _backing_file_was_replaced(self) -> bool:
+        """True when state.db is a DIFFERENT file than the one we opened.
+
+        Fail-open: unknown identity at open time, unknown identity now, or a
+        path that cannot be stat'ed all answer False. The guard only fires on
+        two identities that are both known and differ.
+        """
+        if self._file_identity is None:
+            return False
+        current = _stat_file_identity(self.db_path)
+        if current is None:
+            return False
+        return current != self._file_identity
+
+    def _refuse_repair_on_replaced_file(self, exc: sqlite3.DatabaseError) -> bool:
+        """Log and refuse in-file repair when the database was swapped out.
+
+        Returns True when the caller must NOT run its recovery ladder.
+
+        Every rung of that ladder assumes the damage is inside the file we
+        opened: reopen-and-retry, an in-place FTS rebuild, and finally
+        detaching the FTS indexes. None of them can fix a file that was
+        replaced underneath the process, and the last one is not inert -- it
+        drops the sync triggers, so canonical rows written afterwards create
+        an index gap of unknown extent. Running damage-repair against a file
+        whose damage is not in it can only add damage.
+
+        The write still fails; it fails immediately and by name instead of
+        after futile recovery attempts. That is the whole difference
+        between the 17-minute silent outage reported in #89332 and a
+        30-second diagnosis.
+        """
+        if not self._backing_file_was_replaced():
+            return False
+        logger.error(
+            "state.db at %s was REPLACED underneath this process (opened %s, "
+            "now %s at the same path). In-file repair cannot help and will "
+            "not be attempted; the original error was: %s. A new SessionDB "
+            "will pick up the current file -- restart the process that owns "
+            "this connection.",
+            self.db_path,
+            self._file_identity,
+            _stat_file_identity(self.db_path),
+            exc,
+        )
         return True
 
     @staticmethod
