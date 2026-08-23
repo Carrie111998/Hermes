@@ -254,3 +254,131 @@ def test_migrate_heartbeat_to_session():
 def test_migrate_noop_without_source():
     assert migrate_heartbeat_to_session("hb-none-a", "hb-none-b") is False
     assert migrate_heartbeat_to_session("same", "same") is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# claim timeout — a claimed tick that produces no turn must not hang
+# silently (#92837 expectation #3)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_claim_timeout_in_due_prompt_abandons_and_reclaims(caplog, monkeypatch):
+    import hermes_cli.heartbeat as hb
+
+    # Anchor "this process" far enough in the past that a 30s-old claim
+    # reads as a live-process claim, not a stale previous-process one.
+    monkeypatch.setattr(hb, "_PROCESS_START_TS", time.time() - 1000)
+
+    mgr = HeartbeatManager(session_id="hb-timeout-sid", claim_timeout_seconds=10)
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+    assert mgr.due_prompt() is not None  # claims the due tick
+    assert mgr.state.claimed_at is not None
+
+    # A live-process claim that produced no turn within the timeout
+    # window must be abandoned loudly, counted missed, and the still-due
+    # tick re-claimed on the same call instead of stalling silently.
+    mgr.state.claimed_at = time.time() - 30
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
+        prompt = mgr.due_prompt()
+
+    assert prompt is not None  # re-claimed: the tick stayed due
+    assert mgr.state.missed_count == 1
+    assert mgr.state.fire_count == 0
+    assert mgr.state.claimed_at is not None  # fresh claim
+    assert "no turn" in caplog.text
+
+
+def test_fresh_claim_within_timeout_stays_in_flight():
+    mgr = HeartbeatManager(session_id="hb-timeout-fresh-sid", claim_timeout_seconds=60)
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+    assert mgr.due_prompt() is not None
+    # The claim is only seconds old: overlapping polls must not touch it.
+    assert mgr.due_prompt() is None
+    assert mgr.state.missed_count == 0
+    assert mgr.state.claimed_at is not None
+
+
+def test_claim_timeout_resolves_from_config_defaults(monkeypatch):
+    import hermes_cli.config as cfg_mod
+    import hermes_cli.heartbeat as hb
+
+    monkeypatch.setattr(
+        cfg_mod, "load_config_readonly",
+        lambda: {"heartbeat": {"claim_timeout_seconds": 42}},
+    )
+    mgr = HeartbeatManager(session_id="hb-cfg-sid")
+    assert mgr.claim_timeout_seconds == 42.0
+
+    # Without the config key (or with unreadable config) the documented
+    # fallback applies — never a crash.
+    monkeypatch.setattr(cfg_mod, "load_config_readonly", lambda: {})
+    mgr2 = HeartbeatManager(session_id="hb-cfg-sid-2")
+    assert mgr2.claim_timeout_seconds == hb._CLAIM_TIMEOUT_FALLBACK_SECONDS
+
+
+# ──────────────────────────────────────────────────────────────────────
+# CLI watchdog tick — confirm failures must never wedge the claim
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cli_watchdog_tick_confirms_after_queueing():
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)  # bypass __init__ (no full app needed)
+    cli.session_id = "hb-cli-ok-sid"
+    cli._heartbeat_manager = None
+    cli._agent_running = False
+    cli._voice_recording = False
+    cli._voice_processing = False
+    import queue
+
+    cli._pending_input = queue.Queue()
+
+    mgr = HeartbeatManager(session_id="hb-cli-ok-sid")
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+    cli._heartbeat_manager = mgr
+
+    cli._heartbeat_watchdog_tick()
+
+    assert cli._pending_input.qsize() == 1  # prompt queued for the REPL
+    assert mgr.state.fire_count == 1
+    assert mgr.state.missed_count == 0
+    assert mgr.state.claimed_at is None
+
+
+def test_cli_confirm_delivery_failure_abandons_claim_instead_of_wedging():
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "hb-cli-boom-sid"
+    cli._heartbeat_manager = None
+    cli._agent_running = False
+    cli._voice_recording = False
+    cli._voice_processing = False
+    import queue
+
+    cli._pending_input = queue.Queue()
+
+    mgr = HeartbeatManager(session_id="hb-cli-boom-sid")
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+    cli._heartbeat_manager = mgr
+
+    def _boom():
+        raise RuntimeError("persisted write failed")
+
+    mgr.confirm_delivery = _boom  # type: ignore[method-assign]
+
+    cli._heartbeat_watchdog_tick()
+
+    # The prompt was queued but confirmation blew up: the claim must be
+    # abandoned (not left in flight forever), so the next tick re-claims
+    # the still-due interval.
+    assert cli._pending_input.qsize() == 1
+    assert mgr.state.fire_count == 0
+    assert mgr.state.missed_count == 1
+    assert mgr.state.claimed_at is None
+

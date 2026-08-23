@@ -44,6 +44,37 @@ MIN_INTERVAL_SECONDS = 60
 # How often drivers poll for due heartbeats. Not user-facing.
 POLL_SECONDS = 5.0
 
+# Claim-timeout fallback (seconds): how long a claimed-but-unconfirmed tick
+# may stay in flight before it is abandoned with a warning, counted in
+# missed_count, and left due for retry (issue #92837 expectation #3: a
+# claimed tick that produces no turn must be loud, never silent). The
+# authoritative default lives in the config defaults
+# (hermes_cli.config_defaults.DEFAULT_CONFIG["heartbeat"][
+# "claim_timeout_seconds"]); this constant only covers the degraded case
+# where the config can't be read. Drivers can also pin a value per manager
+# via HeartbeatManager(claim_timeout_seconds=...).
+_CLAIM_TIMEOUT_FALLBACK_SECONDS = 300.0
+
+
+def _default_claim_timeout_seconds() -> float:
+    """Resolve the heartbeat claim timeout from config (best-effort).
+
+    Reads ``heartbeat.claim_timeout_seconds`` from the user config; on any
+    failure (unreadable config, missing key, bad value) falls back to
+    :data:`_CLAIM_TIMEOUT_FALLBACK_SECONDS`. Never raises.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        hb_cfg = (load_config_readonly() or {}).get("heartbeat") or {}
+        val = hb_cfg.get("claim_timeout_seconds")
+        if val is not None:
+            return float(val)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("HeartbeatManager: claim-timeout config read failed: %s", exc)
+    return _CLAIM_TIMEOUT_FALLBACK_SECONDS
+
+
 # Import time of this module — a proxy for "this process started". A
 # persisted claim older than this timestamp was made by a previous process
 # that died between claiming a tick and confirming/abandoning it, so the
@@ -247,8 +278,20 @@ class HeartbeatManager:
     double-claiming the same tick, so no backlog can pile up.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(
+        self,
+        session_id: str,
+        claim_timeout_seconds: Optional[float] = None,
+    ):
         self.session_id = session_id
+        # How long a claimed tick may wait for a turn before it is
+        # abandoned with a warning, counted missed, and re-claimed. None
+        # resolves the config default (heartbeat.claim_timeout_seconds).
+        self.claim_timeout_seconds = (
+            float(claim_timeout_seconds)
+            if claim_timeout_seconds is not None
+            else _default_claim_timeout_seconds()
+        )
         self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
 
     @property
@@ -338,10 +381,16 @@ class HeartbeatManager:
         While a claim is in flight (claimed but unconfirmed), further polls
         return None so overlapping polls can never double-claim the same
         tick, and missed intervals coalesce into one delivery instead of a
-        backlog. A claim left behind by a previous process (crash between
-        claim and handoff) is resolved here: it is logged as a missed
-        delivery and cleared, so the tick can be re-claimed on the next
-        poll instead of stalling forever.
+        backlog. Two in-flight hazards are resolved here instead of
+        stalling silently (issue #92837):
+
+        - A claim left behind by a previous process (crash between claim
+          and handoff) is logged as a missed delivery and cleared.
+        - A claim from a LIVE process that produced no turn within
+          ``claim_timeout_seconds`` (staged prompt stuck with no consumer:
+          idle-evicted session, vanished drain, wedged input queue) is
+          abandoned with a warning, counted in ``missed_count``, and the
+          still-due tick is re-claimed in the same call.
         """
         s = self._state
         if s is None or not s.is_due(now):
@@ -363,9 +412,23 @@ class HeartbeatManager:
                 s.missed_count += 1
                 s.claimed_at = None
                 save_heartbeat(self.session_id, s)
-            # In-flight claim from this process: the driver has not resolved
-            # it yet — never claim the same tick twice.
-            return None
+                # The tick is still due: leave it for the next poll to
+                # re-claim (mirrors the pre-claim-timeout contract).
+                return None
+            elif now - s.claimed_at >= self.claim_timeout_seconds:
+                # Live-process claim that never became a turn within the
+                # claim window. Abandon loudly (warning + missed_count)
+                # and fall through: the tick is still due and gets a
+                # fresh claim below, so the heartbeat keeps trying
+                # instead of hanging forever with no signal.
+                self.abandon_claim(
+                    f"no turn consumed the claimed tick within "
+                    f"{self.claim_timeout_seconds:.0f}s"
+                )
+            else:
+                # In-flight claim from this process: the driver has not
+                # resolved it yet — never claim the same tick twice.
+                return None
         s.claimed_at = now
         save_heartbeat(self.session_id, s)
         return s.render_prompt()

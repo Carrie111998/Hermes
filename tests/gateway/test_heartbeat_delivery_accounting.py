@@ -2,12 +2,15 @@
 
 A heartbeat tick is only "fired" once its staged prompt actually becomes
 a turn. Claims that vanish without any turn must be counted as missed
-(with a warning), and a session without a live adapter must never be
-claimed in the first place. Regression coverage for #92837.
+(with a warning), a session without a live adapter must never be claimed
+in the first place, and a claim that hangs forever (staged event stuck
+in the pending slot, no turn starts) must be abandoned loudly after the
+claim timeout and re-claimed. Regression coverage for #92837.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Dict, Optional
 
@@ -69,6 +72,12 @@ def _make_runner(monkeypatch, session_id: str = "session-1"):
     runner._agent_cache = {}
     runner._adapter_for_source = lambda _source: adapter
     runner._peek_session_state = lambda _key: None
+    runner._session_key_for_source = lambda _source: key
+    # Deterministic claim timeout (real config is not consulted in tests);
+    # individual tests re-patch to a tiny value for timeout scenarios.
+    from hermes_cli import heartbeat as hb_module
+
+    monkeypatch.setattr(hb_module, "_default_claim_timeout_seconds", lambda: 300.0)
     return runner, adapter, key, source
 
 
@@ -77,7 +86,7 @@ async def test_due_tick_stages_without_counting_fired(monkeypatch):
     runner, adapter, key, _source = _make_runner(monkeypatch)
     _due_heartbeat("session-1", 700)
 
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
 
     staged = adapter._pending_messages.get(key)
     assert staged is not None and staged._hermes_heartbeat_tick is True
@@ -92,14 +101,15 @@ async def test_due_tick_stages_without_counting_fired(monkeypatch):
 async def test_turn_consuming_staged_tick_confirms_the_fire(monkeypatch):
     runner, adapter, key, _source = _make_runner(monkeypatch)
     _due_heartbeat("session-1", 700)
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
 
-    # Simulate a real turn: the adapter drained the pending slot and the
-    # session's agent recorded activity after the tick was staged.
-    adapter._pending_messages.pop(key, None)
-    agent = type("Agent", (), {"_last_activity_ts": time.time()})()
-    runner._agent_cache[key] = (agent,)
-    await runner._poll_heartbeat_watches_once()
+    # Simulate the drain consuming the staged tick: the pending slot is
+    # emptied and the tagged event enters the live message pipeline —
+    # the ONLY evidence that confirms a delivery.
+    staged = adapter._pending_messages.pop(key, None)
+    assert staged is not None and staged._hermes_heartbeat_tick is True
+    runner._confirm_heartbeat_delivery_for_event(staged)
+    await runner._poll_heartbeat_delivery_accounting_once()
 
     mgr = HeartbeatManager(session_id="session-1")
     assert mgr.state.fire_count == 1
@@ -115,13 +125,13 @@ async def test_staged_tick_vanishing_without_turn_counts_missed(monkeypatch, cap
 
     runner, adapter, key, _source = _make_runner(monkeypatch)
     _due_heartbeat("session-1", 700)
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
 
     # Session reset / stale-lock heal / eviction discards the staged event
     # without any turn ever running.
     adapter._pending_messages.pop(key, None)
     with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
-        await runner._poll_heartbeat_watches_once()
+        await runner._poll_heartbeat_delivery_accounting_once()
 
     mgr = HeartbeatManager(session_id="session-1")
     assert mgr.state.fire_count == 0
@@ -131,8 +141,129 @@ async def test_staged_tick_vanishing_without_turn_counts_missed(monkeypatch, cap
 
     # The tick was never delivered: it stays due and is re-claimed on the
     # following poll instead of being silently dropped.
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
     assert adapter._pending_messages.get(key) is not None
+
+
+@pytest.mark.asyncio
+async def test_vanished_tick_with_unrelated_activity_counts_missed(monkeypatch, caplog):
+    """Unrelated session activity is NOT delivery evidence (#92837).
+
+    A turn that ran without consuming the tagged tick (or any other
+    activity-timestamp refresh) must never confirm the delivery. Only the
+    tagged event entering the live message pipeline confirms; a vanished
+    staged event without that evidence counts as missed.
+    """
+    import logging
+
+    runner, adapter, key, _source = _make_runner(monkeypatch)
+    _due_heartbeat("session-1", 700)
+    await runner._poll_heartbeat_delivery_accounting_once()
+
+    # The staged event disappears without ever entering the message
+    # pipeline, but the session shows unrelated activity afterwards.
+    adapter._pending_messages.pop(key, None)
+    agent = type("Agent", (), {"_last_activity_ts": time.time()})()
+    runner._agent_cache[key] = (agent,)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
+        await runner._poll_heartbeat_delivery_accounting_once()
+
+    mgr = HeartbeatManager(session_id="session-1")
+    assert mgr.state.fire_count == 0
+    assert mgr.state.missed_count == 1
+    assert mgr.state.claimed_at is None
+
+
+@pytest.mark.asyncio
+async def test_claim_timeout_abandons_stuck_staged_tick_and_reclaims(monkeypatch, caplog):
+    """The main #92837 failure mode: the staged tick sits in the pending
+    slot forever and no turn ever starts. After the claim timeout the
+    claim must be abandoned loudly, counted missed, and the still-due
+    tick re-claimed and re-staged instead of hanging silently.
+    """
+    import logging
+
+    from hermes_cli import heartbeat as hb_module
+
+    runner, adapter, key, _source = _make_runner(monkeypatch)
+    monkeypatch.setattr(hb_module, "_default_claim_timeout_seconds", lambda: 0.05)
+    _due_heartbeat("session-1", 700)
+    await runner._poll_heartbeat_delivery_accounting_once()
+    assert key in runner._heartbeat_inflight
+    staged_old = adapter._pending_messages.get(key)
+
+    # The staged event never leaves the pending slot and no turn starts.
+    await asyncio.sleep(0.2)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
+        await runner._poll_heartbeat_delivery_accounting_once()
+
+    mgr = HeartbeatManager(session_id="session-1")
+    assert mgr.state.fire_count == 0
+    assert mgr.state.missed_count == 1
+    assert "no turn" in caplog.text
+    # The claim is resolved and the stale staged tick discarded — the
+    # tick stays due instead of hanging silently.
+    assert mgr.state.claimed_at is None
+    assert adapter._pending_messages.get(key) is None
+    assert key not in runner._heartbeat_inflight
+
+    # The following poll re-claims the still-due tick and re-stages a
+    # fresh delivery attempt.
+    await runner._poll_heartbeat_delivery_accounting_once()
+    mgr2 = HeartbeatManager(session_id="session-1")
+    assert mgr2.state.claimed_at is not None
+    staged_new = adapter._pending_messages.get(key)
+    assert staged_new is not None and staged_new is not staged_old
+    assert key in runner._heartbeat_inflight
+
+
+@pytest.mark.asyncio
+async def test_watch_reregistration_clears_orphan_claim(monkeypatch, caplog):
+    """Re-registering a watch clears a persisted claim whose in-process
+    staging context was lost — otherwise the heartbeat stalls forever.
+    """
+    import logging
+
+    runner, adapter, key, source = _make_runner(monkeypatch)
+    _due_heartbeat("session-1", 700)
+    await runner._poll_heartbeat_delivery_accounting_once()
+    mgr0 = HeartbeatManager(session_id="session-1")
+    assert mgr0.state.claimed_at is not None  # claimed by THIS process
+
+    # The in-memory staging context is lost while the persisted claim
+    # survives (watch + inflight rebuilt under the live process).
+    runner._heartbeat_watch.pop(key, None)
+    runner._heartbeat_inflight.pop(key, None)
+
+    runner._start_heartbeat_poller = lambda: None  # avoid a stray task
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
+        runner._register_heartbeat_watch(key, source, "session-1")
+
+    mgr = HeartbeatManager(session_id="session-1")
+    assert mgr.state.claimed_at is None
+    assert mgr.state.missed_count == 1
+    assert key in runner._heartbeat_watch
+
+
+@pytest.mark.asyncio
+async def test_unregister_watch_abandons_dangling_claim(monkeypatch, caplog):
+    """Unregistering a watch (e.g. /heartbeat clear) resolves any
+    in-flight claim so the persisted state keeps no dangling claim.
+    """
+    import logging
+
+    runner, adapter, key, _source = _make_runner(monkeypatch)
+    _due_heartbeat("session-1", 700)
+    await runner._poll_heartbeat_delivery_accounting_once()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
+        runner._unregister_heartbeat_watch(key)
+
+    mgr = HeartbeatManager(session_id="session-1")
+    assert mgr.state.claimed_at is None
+    assert mgr.state.missed_count == 1
+    assert runner._heartbeat_watch == {}
+    assert runner._heartbeat_inflight == {}
 
 
 @pytest.mark.asyncio
@@ -141,7 +272,7 @@ async def test_missing_adapter_never_claims_the_tick(monkeypatch):
     _due_heartbeat("session-1", 700)
     runner._adapter_for_source = lambda _source: None
 
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
 
     mgr = HeartbeatManager(session_id="session-1")
     assert mgr.state.fire_count == 0
@@ -153,11 +284,11 @@ async def test_missing_adapter_never_claims_the_tick(monkeypatch):
 async def test_busy_session_leaves_staged_tick_in_flight(monkeypatch):
     runner, adapter, key, _source = _make_runner(monkeypatch)
     _due_heartbeat("session-1", 700)
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
 
     # A turn starts (session busy) but has not drained the slot yet.
     runner._running_agents[key] = object()
-    await runner._poll_heartbeat_watches_once()
+    await runner._poll_heartbeat_delivery_accounting_once()
 
     mgr = HeartbeatManager(session_id="session-1")
     assert mgr.state.fire_count == 0
