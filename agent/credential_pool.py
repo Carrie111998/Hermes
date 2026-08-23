@@ -559,10 +559,11 @@ def credential_pool_matches_provider(
 ) -> bool:
     """Return whether a pool belongs to the requested runtime provider.
 
-    Named custom endpoints intentionally use two identities: the live agent is
-    ``custom`` while its pool is keyed ``custom:<name>``. Accept that pair only
-    when the runtime base URL resolves to the exact same custom pool key.
-    Empty string identities fail closed. Legacy pool adapters without a
+    Named custom endpoints may use three identities: the live agent can retain
+    the configured name/provider key, newer runtime paths normalize it to
+    ``custom``, and the pool is keyed ``custom:<name>``. Accept those aliases
+    only when the runtime endpoint belongs to the same configured custom
+    provider. Empty identities fail closed. Legacy pool adapters without a
     ``provider`` attribute remain compatible; production pools are scoped.
     """
     raw_pool_provider = getattr(pool_or_provider, "provider", None)
@@ -580,13 +581,35 @@ def credential_pool_matches_provider(
         return False
     if pool_provider == provider_norm:
         return True
-    if provider_norm != "custom" or not pool_provider.startswith(CUSTOM_POOL_PREFIX):
+    if not pool_provider.startswith(CUSTOM_POOL_PREFIX):
+        return False
+    if provider_norm == "custom":
+        try:
+            matched_pool = get_custom_provider_pool_key(base_url or "")
+        except Exception:
+            return False
+        return str(matched_pool or "").strip().lower() == pool_provider
+
+    runtime_url = str(base_url or "").strip().rstrip("/")
+    if not runtime_url:
         return False
     try:
-        matched_pool = get_custom_provider_pool_key(base_url or "")
+        for normalized_name, entry in _iter_custom_providers():
+            if f"{CUSTOM_POOL_PREFIX}{normalized_name}" != pool_provider:
+                continue
+            aliases = {normalized_name}
+            for value in (entry.get("name"), entry.get("provider_key")):
+                alias = _normalize_custom_pool_name(str(value or ""))
+                if alias:
+                    aliases.add(alias)
+                    if alias.startswith(CUSTOM_POOL_PREFIX):
+                        aliases.add(alias[len(CUSTOM_POOL_PREFIX):])
+            configured_url = str(entry.get("base_url") or "").strip().rstrip("/")
+            named_identity = _normalize_custom_pool_name(provider_norm)
+            return named_identity in aliases and runtime_url == configured_url
     except Exception:
         return False
-    return str(matched_pool or "").strip().lower() == pool_provider
+    return False
 
 
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1

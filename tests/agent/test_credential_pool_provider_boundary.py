@@ -26,6 +26,35 @@ def test_custom_pool_match_is_scoped_by_endpoint():
         )
 
 
+def test_named_custom_pool_match_requires_configured_identity_and_endpoint():
+    configured = [
+        (
+            "gemini-no-filter",
+            {
+                "name": "Gemini No Filter",
+                "provider_key": "gemini-no-filter",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/",
+            },
+        )
+    ]
+    with patch("agent.credential_pool._iter_custom_providers", return_value=configured):
+        assert credential_pool_matches_provider(
+            "custom:gemini-no-filter",
+            "gemini-no-filter",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        assert not credential_pool_matches_provider(
+            "custom:gemini-no-filter",
+            "gemini-no-filter",
+            base_url="https://fallback.example/v1",
+        )
+        assert not credential_pool_matches_provider(
+            "custom:gemini-no-filter",
+            "other-provider",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+
+
 def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
     entry = SimpleNamespace(
         provider="openai-codex",
