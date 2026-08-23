@@ -27,7 +27,7 @@ import { setSessionPinnedRemote } from '@/hermes'
 import { onConnectionScopeChange } from '@/lib/connection-scoped'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
+import { $cronSessions, $messagingSessions, $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 // pin ids we've successfully PATCHed pinned=true this session.
@@ -70,41 +70,77 @@ function publishUnconfirmed(): void {
   $unconfirmedPinWrites.set(new Set(unconfirmed.keys()))
 }
 
-function profileFor(pinId: string): null | string | undefined {
-  return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
+function loadedRows(): SessionInfo[] {
+  return [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()]
 }
 
-/**
- * One authoritative row per durable pin id. Session ids are only unique inside
- * a profile, so the cross-profile list can legitimately hold two rows with the
- * same `sessionPinId` but different `pinned` flags (copied/imported profile
- * databases). Iterating both would pin then unpin the same id in one pass and
- * re-fire `reconcile` forever — the runaway that overflows nanostores'
- * listenerQueue. Collapse to a single row per id, preferring the active
- * gateway's profile (the same tie-break `resolveLoadedRow` uses), so the pull
- * is deterministic and never oscillates.
+/** Resolve a stored id across every sidebar slice, preferring the active
+ * gateway when two profiles legitimately share the same session id. */
+function resolveLoadedRow(storedId: string, rows: readonly SessionInfo[] = loadedRows()): SessionInfo | undefined {
+  const matches = rows.filter(row => sessionMatchesStoredId(row, storedId))
+
+  if (matches.length < 2) {
+    return matches[0]
+  }
+
+  const gateway = normalizeProfileKey($activeGatewayProfile.get())
+
+  return matches.find(row => normalizeProfileKey(row.profile) === gateway) ?? matches[0]
+}
+
+function profileFor(pinId: string, rows: readonly SessionInfo[]): null | string | undefined {
+  return resolveLoadedRow(pinId, rows)?.profile
+}
+
+interface PinSyncConversation {
+  conflicted: boolean
+  pinId: string
+  representative: SessionInfo
+  rows: SessionInfo[]
+}
+
+/** One reconciliation group per durable pin id across every sidebar slice.
+ *
+ * Session ids are only unique inside a profile, so first choose the active
+ * gateway's rows (or the first-seen profile when none are active). Within that
+ * profile an explicit backend pin opinion outranks an older row that omits the
+ * flag. Conflicting explicit opinions are left unresolved until a later slice
+ * refresh converges; choosing either stale page would synthesize authority.
  */
-function rowsByPinId(rows: readonly SessionInfo[]): Map<string, SessionInfo> {
-  const byId = new Map<string, SessionInfo>()
+function pinSyncConversations(rows: readonly SessionInfo[]): PinSyncConversation[] {
+  const grouped = new Map<string, SessionInfo[]>()
   const gateway = normalizeProfileKey($activeGatewayProfile.get())
 
   for (const row of rows) {
     const pinId = sessionPinId(row)
-    const existing = byId.get(pinId)
+    const existing = grouped.get(pinId)
 
-    if (!existing) {
-      byId.set(pinId, row)
-
-      continue
-    }
-
-    // Prefer the active gateway's profile; otherwise keep the first seen.
-    if (normalizeProfileKey(row.profile) === gateway && normalizeProfileKey(existing.profile) !== gateway) {
-      byId.set(pinId, row)
+    if (existing) {
+      existing.push(row)
+    } else {
+      grouped.set(pinId, [row])
     }
   }
 
-  return byId
+  return [...grouped].map(([pinId, members]) => {
+    const active = members.filter(row => normalizeProfileKey(row.profile) === gateway)
+
+    const profile = active.length
+      ? active
+      : members.filter(row => normalizeProfileKey(row.profile) === normalizeProfileKey(members[0]?.profile))
+
+    const explicit = profile.filter(row => typeof row.pinned === 'boolean')
+    const opinions = new Set(explicit.map(row => row.pinned))
+
+    const representative =
+      (opinions.size === 1 ? explicit[0] : undefined) ?? profile.find(row => row.id === pinId) ?? profile[0]
+
+    if (!representative) {
+      throw new Error(`Pin group ${pinId} has no representative`)
+    }
+
+    return { conflicted: opinions.size > 1, pinId, representative, rows: members }
+  })
 }
 
 /** PATCH the flag, guarding reads against pages that predate the write. */
@@ -137,10 +173,14 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
  * (#74570). Remote pins adopted here are marked mirrored before the local set
  * changes, so the re-entrant reconcile doesn't echo them back as a PATCH.
  */
-function pullRemotePins(): void {
+function pullRemotePins(conversations: readonly PinSyncConversation[]): void {
   const local = new Set($pinnedSessionIds.get())
 
-  for (const row of rowsByPinId($sessions.get()).values()) {
+  for (const { conflicted, pinId, representative: row, rows } of conversations) {
+    if (conflicted) {
+      continue
+    }
+
     // A backend without the flag has no opinion; never act on `undefined`.
     if (typeof row.pinned !== 'boolean') {
       continue
@@ -148,15 +188,15 @@ function pullRemotePins(): void {
 
     // Pins are keyed on the durable lineage root so they survive compression
     // tip rotation; the row may surface under either identity.
-    const pinId = sessionPinId(row)
-    const heldLocally = local.has(pinId) || local.has(row.id)
+    const heldId = local.has(pinId) ? pinId : rows.find(entry => local.has(entry.id))?.id
+    const heldLocally = heldId !== undefined
 
     // A write of ours this page may predate. Confirmed (page agrees) → release
     // the guard, the server has caught up. Contradicted but still inside the
     // cooldown → the page was almost certainly issued before our PATCH, so our
     // write is newer: skip the row. Contradicted past the cooldown → no page
     // ever confirmed us, so stop fencing and let the server win.
-    const guardKey = unconfirmed.has(pinId) ? pinId : unconfirmed.has(row.id) ? row.id : null
+    const guardKey = [pinId, ...rows.map(entry => entry.id)].find(id => unconfirmed.has(id)) ?? null
     const guard = guardKey ? unconfirmed.get(guardKey) : undefined
 
     if (guard && guardKey) {
@@ -171,7 +211,7 @@ function pullRemotePins(): void {
 
     // Local intent still waiting on its PATCH (row unresolved when the push
     // pass ran) is also newer than the page — never revert it.
-    if (pending.has(pinId) || pending.has(row.id)) {
+    if (pending.has(pinId) || rows.some(entry => pending.has(entry.id))) {
       continue
     }
 
@@ -180,17 +220,21 @@ function pullRemotePins(): void {
       // and the nested reconcile must not see this as a new pin to PATCH.
       mirrored.add(pinId)
       pinSession(pinId)
-    } else if (!row.pinned && heldLocally) {
+    } else if (!row.pinned && heldId !== undefined) {
       // Same discipline on the way down: forget the mirror before the nested
       // reconcile runs, or it re-PATCHes pinned=false the server already has.
       mirrored.delete(pinId)
-      mirrored.delete(row.id)
-      unpinSession(local.has(pinId) ? pinId : row.id)
+
+      for (const entry of rows) {
+        mirrored.delete(entry.id)
+      }
+
+      unpinSession(heldId)
     }
   }
 }
 
-// Re-entrancy guard: reconcile() is subscribed to BOTH $sessions and
+// Re-entrancy guard: reconcile() is subscribed to the session-list stores and
 // $pinnedSessionIds, and pullRemotePins() mutates $pinnedSessionIds (via
 // pinSession/unpinSession), which fires reconcile() again synchronously.
 // Without this guard, a session whose pin state oscillates — two rows with the
@@ -229,13 +273,15 @@ function reconcileInner(): void {
   // writePin) — only then may the pull read the page, where those fences stop
   // the still-stale row from silently reverting the user's action (#74570).
   const current = new Set($pinnedSessionIds.get())
+  const rows = loadedRows()
+  const conversations = pinSyncConversations(rows)
 
   // Unpinned: anything we were tracking that's no longer in the set.
   for (const id of [...mirrored, ...pending]) {
     if (!current.has(id)) {
       mirrored.delete(id)
       pending.delete(id)
-      void writePin(id, false, profileFor(id)).catch(() => {})
+      void writePin(id, false, profileFor(id, rows)).catch(() => {})
     }
   }
 
@@ -247,9 +293,9 @@ function reconcileInner(): void {
   }
 
   // Flush whatever we can resolve now; unresolved ids (row not loaded yet)
-  // retry on the next $sessions change.
+  // retry on the next loaded-session-list change.
   for (const id of [...pending]) {
-    const row = $sessions.get().find(entry => sessionMatchesStoredId(entry, id))
+    const row = resolveLoadedRow(id, rows)
 
     if (!row) {
       continue
@@ -264,7 +310,7 @@ function reconcileInner(): void {
     })
   }
 
-  pullRemotePins()
+  pullRemotePins(conversations)
 }
 
 // Sync once, then re-sync on pin-set and session-list changes. Call once per app.
@@ -276,6 +322,8 @@ export function watchSessionPins(): void {
   reconcile()
   $pinnedSessionIds.listen(reconcile)
   $sessions.listen(reconcile)
+  $cronSessions.listen(reconcile)
+  $messagingSessions.listen(reconcile)
 }
 
 /**

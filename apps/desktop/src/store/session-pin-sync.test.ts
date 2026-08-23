@@ -15,7 +15,7 @@ vi.mock('@/hermes', () => ({
 
 import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $sessions } from '@/store/session'
+import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
 
 import { $unconfirmedPinWrites, resetSessionPinMirror, watchSessionPins } from './session-pin-sync'
 
@@ -33,6 +33,8 @@ beforeAll(() => {
 
 beforeEach(() => {
   $sessions.set([])
+  $cronSessions.set([])
+  $messagingSessions.set([])
   $pinnedSessionIds.set([])
   // The mirror/pending/unconfirmed maps are module-global, so one test's
   // bookkeeping would otherwise suppress the next test's PATCH (or fence out
@@ -43,6 +45,8 @@ beforeEach(() => {
 
 afterEach(() => {
   $sessions.set([])
+  $cronSessions.set([])
+  $messagingSessions.set([])
   $pinnedSessionIds.set([])
 })
 
@@ -79,6 +83,27 @@ describe('watchSessionPins', () => {
     expect(patch).toHaveBeenCalledWith('c', true, 'p2')
   })
 
+  it('flushes a deferred messaging pin when its row appears', async () => {
+    $pinnedSessionIds.set(['message-pin'])
+    await flush()
+    expect(patch).not.toHaveBeenCalled()
+
+    $messagingSessions.set([row('message-pin', { profile: 'chat', source: 'photon' })])
+    await flush()
+
+    expect(patch).toHaveBeenCalledWith('message-pin', true, 'chat')
+  })
+
+  it('writes once when multiple slices represent the same durable conversation', async () => {
+    $sessions.set([row('local-tip', { _lineage_root_id: 'shared-pin' })])
+    $messagingSessions.set([row('message-tip', { _lineage_root_id: 'shared-pin', source: 'photon' })])
+    $pinnedSessionIds.set(['shared-pin'])
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(1)
+    expect(patch).toHaveBeenCalledWith('shared-pin', true, undefined)
+  })
+
   it('matches a pin id against the lineage root', async () => {
     // pin id is the lineage root; the live row carries it as _lineage_root_id.
     $sessions.set([row('tip', { _lineage_root_id: 'root' })])
@@ -103,6 +128,75 @@ describe('watchSessionPins', () => {
 })
 
 describe('watchSessionPins remote pull', () => {
+  it('adopts and can unpin a backend-only messaging pin', async () => {
+    $messagingSessions.set([row('photon', { pinned: true, profile: 'default', source: 'photon' })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual(['photon'])
+    patch.mockClear()
+
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect(patch).toHaveBeenCalledWith('photon', false, 'default')
+  })
+
+  it('keeps the only explicit pin opinion in a split lineage', async () => {
+    $sessions.set([row('shared-root')])
+    $messagingSessions.set([row('shared-tip', { _lineage_root_id: 'shared-root', pinned: true, source: 'photon' })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual(['shared-root'])
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it('defers same-profile conflicts until the slices converge', async () => {
+    $messagingSessions.set([row('conflict-root', { pinned: false, source: 'photon' })])
+    $sessions.set([row('conflict-tip', { _lineage_root_id: 'conflict-root', pinned: true })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual([])
+    expect(patch).not.toHaveBeenCalled()
+
+    $messagingSessions.set([row('conflict-root', { pinned: true, source: 'photon' })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual(['conflict-root'])
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it('adopts and can unpin a backend-only cron pin', async () => {
+    $cronSessions.set([row('cron-run', { pinned: true, profile: 'default', source: 'cron' })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual(['cron-run'])
+    patch.mockClear()
+
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect(patch).toHaveBeenCalledWith('cron-run', false, 'default')
+  })
+
+  it('routes a cross-slice unpin to the active profile', async () => {
+    $activeGatewayProfile.set('work')
+
+    try {
+      $sessions.set([row('shared', { pinned: true, profile: 'default' })])
+      $messagingSessions.set([row('shared', { pinned: true, profile: 'work', source: 'photon' })])
+      await flush()
+      expect($pinnedSessionIds.get()).toEqual(['shared'])
+      patch.mockClear()
+
+      $pinnedSessionIds.set([])
+      await flush()
+
+      expect(patch).toHaveBeenCalledWith('shared', false, 'work')
+    } finally {
+      $activeGatewayProfile.set('default')
+    }
+  })
+
   it('adopts a pin another app made', async () => {
     $sessions.set([row('remote', { pinned: true })])
     await flush()
