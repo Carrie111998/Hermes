@@ -34,13 +34,23 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 #: Keys a plugin may override.  Anything else is logged and ignored.
+#: ``system_prompt`` is intentionally NOT supported: it is the prompt-cache
+#: prefix (byte-stable for the life of a conversation), so overriding it would
+#: invalidate the cache and drop the core instructions. Model/provider routing
+#: does not need it; persona switching needs a separate cache-safe design.
 RUNTIME_OVERRIDE_KEYS = frozenset(
-    {"model", "provider", "base_url", "api_key", "api_mode", "system_prompt"}
+    {"model", "provider", "base_url", "api_key", "api_mode"}
 )
 
 #: All supported keys are plain non-empty strings.
 _STRING_KEYS = frozenset(
-    {"model", "provider", "base_url", "api_key", "api_mode", "system_prompt"}
+    {"model", "provider", "base_url", "api_key", "api_mode"}
+)
+
+#: Known wire protocols.  Unknown api_mode values are rejected (logged+ignored)
+#: instead of being forwarded into the call path.
+KNOWN_API_MODES = frozenset(
+    {"chat_completions", "anthropic_messages", "codex_responses", "bedrock_converse"}
 )
 
 
@@ -72,6 +82,14 @@ def validate_runtime_override(overrides: Any) -> Dict[str, str]:
                 "pre_llm_call runtime_override: key %r must be a non-empty "
                 "string, ignored",
                 key,
+            )
+            continue
+        if key == "api_mode" and value not in KNOWN_API_MODES:
+            logger.warning(
+                "pre_llm_call runtime_override: unsupported api_mode %r "
+                "(known: %s), ignored",
+                value,
+                ", ".join(sorted(KNOWN_API_MODES)),
             )
             continue
         valid[key] = value
@@ -122,7 +140,7 @@ class _RuntimeOverrideScope:
             if name in ov:
                 setattr(agent, name, ov[name])
         if "base_url" in ov:
-            agent.base_url = ov["base_url"]
+            agent.base_url = str(ov["base_url"]).strip().rstrip("/")
         if "api_key" in ov and isinstance(ck, dict):
             ck["api_key"] = ov["api_key"]
         if "base_url" in ov and isinstance(ck, dict):

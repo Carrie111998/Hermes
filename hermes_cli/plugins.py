@@ -5135,14 +5135,16 @@ class PluginManager:
                  "base_url": "https://api.openai.com/v1",
                  "api_key": "sk-...",
                  "api_mode": "chat_completions",
-                 "system_prompt": "You are ...",
              }}
 
         The override is applied before API kwargs/client resolution (proactive,
         unlike the error-driven failover redirect), is ephemeral and turn-
         scoped, and is never written into session history.  Unsupported keys
-        are logged and ignored.  ``system_prompt`` affects only the API-call
-        copy of the messages, never the cached session prompt.
+        are logged and ignored.  ``system_prompt`` is intentionally NOT
+        supported: it is the prompt-cache prefix (byte-stable for the life of
+        a conversation), so overriding it would invalidate the cache and drop
+        the core instructions.  ``api_mode`` is validated against the known
+        wire protocols.
         """
         # Most legacy observer hooks carry the shared telemetry marker. Gateway
         # platform events define event-local additive envelopes instead: injecting

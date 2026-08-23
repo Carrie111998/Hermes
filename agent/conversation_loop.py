@@ -1503,14 +1503,6 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     ``active_system_prompt`` for subsequent call-block rebuilds.
     """
     sp = getattr(agent, "_cached_system_prompt", None)
-    # pre_llm_call runtime_override: keep the overridden system prompt stable
-    # across a mid-turn failover instead of reverting to the cached prompt.
-    _ro_system_prompt = (getattr(agent, "_runtime_override", None) or {}).get("system_prompt")
-    if _ro_system_prompt:
-        if api_messages and api_messages[0].get("role") == "system":
-            if not _rewrite_system_content_blocks(api_messages[0], str(_ro_system_prompt)):
-                api_messages[0]["content"] = str(_ro_system_prompt)
-        return str(_ro_system_prompt)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
@@ -2321,16 +2313,9 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         _runtime_ov = getattr(agent, "_runtime_override", None) or {}
-        _ro_system_prompt = _runtime_ov.get("system_prompt")
-        if _ro_system_prompt:
-            # pre_llm_call runtime_override: replace the system prompt for
-            # THIS call only.  Applied to the ephemeral api_messages copy —
-            # the cached session prompt and persisted history are untouched.
-            effective_system = str(_ro_system_prompt)
-        else:
-            effective_system = active_system_prompt or ""
-            if agent.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective_system = active_system_prompt or ""
+        if agent.ephemeral_system_prompt:
+            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

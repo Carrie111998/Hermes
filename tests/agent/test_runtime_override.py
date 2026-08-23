@@ -23,7 +23,6 @@ class TestValidate:
             "base_url": "https://api.openai.com/v1",
             "api_key": "sk-test",
             "api_mode": "chat_completions",
-            "system_prompt": "You are a test.",
         })
         assert ro == {
             "model": "gpt-5.6",
@@ -31,8 +30,24 @@ class TestValidate:
             "base_url": "https://api.openai.com/v1",
             "api_key": "sk-test",
             "api_mode": "chat_completions",
-            "system_prompt": "You are a test.",
         }
+
+    def test_system_prompt_rejected(self):
+        # system_prompt is intentionally NOT supported (cache-prefix sacred):
+        # it must be dropped, not applied.
+        ro = validate_runtime_override({
+            "model": "gpt-5.6",
+            "system_prompt": "You are a test.",
+        })
+        assert ro == {"model": "gpt-5.6"}
+
+    def test_unknown_api_mode_rejected(self):
+        ro = validate_runtime_override({"api_mode": "invalid_wire"})
+        assert ro == {}
+
+    def test_known_api_mode_accepted(self):
+        for mode in ("chat_completions", "anthropic_messages", "codex_responses", "bedrock_converse"):
+            assert validate_runtime_override({"api_mode": mode}) == {"api_mode": mode}
 
     def test_empty_dict(self):
         assert validate_runtime_override({}) == {}
@@ -55,7 +70,7 @@ class TestValidate:
 
     def test_whitelist_matches_spec(self):
         assert RUNTIME_OVERRIDE_KEYS == frozenset({
-            "model", "provider", "base_url", "api_key", "api_mode", "system_prompt",
+            "model", "provider", "base_url", "api_key", "api_mode",
         })
 
 
