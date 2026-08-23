@@ -71,12 +71,13 @@ def read_image_provenance(
     This function never raises.
     """
 
-    path = Path(marker_path) if marker_path is not None else IMAGE_PROVENANCE_PATH
+    path = IMAGE_PROVENANCE_PATH
     try:
+        path = Path(marker_path) if marker_path is not None else path
         marker_stat = path.lstat()
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except BaseException as exc:
         # Permission errors and other lookup failures do not prove absence.
         return _invalid(path, f"marker_presence_unreadable:{type(exc).__name__}")
 

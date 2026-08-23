@@ -29,6 +29,24 @@ def test_absent_marker_preserves_non_image_install(tmp_path):
     assert read_image_provenance(tmp_path / "missing.json") is None
 
 
+def test_embedded_nul_marker_path_returns_invalid_value_error():
+    marker = Path("image\x00.json")
+
+    provenance = read_image_provenance(marker)
+
+    assert provenance is not None
+    assert provenance.valid is False
+    assert provenance.error == "marker_presence_unreadable:ValueError"
+
+
+def test_invalid_marker_path_argument_returns_invalid_type_error():
+    provenance = read_image_provenance(object())
+
+    assert provenance is not None
+    assert provenance.valid is False
+    assert provenance.error == "marker_presence_unreadable:TypeError"
+
+
 def test_valid_marker_exposes_baked_identity(tmp_path):
     marker = _write_marker(tmp_path / "image.json")
 
