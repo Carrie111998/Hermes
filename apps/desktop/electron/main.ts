@@ -212,6 +212,7 @@ import {
   parentWatchdogEnv
 } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
+import { dirToRemember, nextPickerDefaultPath, readLastPickerDir, writeLastPickerDir } from './picker-state'
 import {
   buildRegistryProfileRoutes,
   localRouteFallbackProfiles,
@@ -355,7 +356,6 @@ import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
-import { dirToRemember, nextPickerDefaultPath, readLastPickerDir, writeLastPickerDir } from './picker-state'
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
