@@ -18,6 +18,7 @@ import functools
 import inspect
 import json
 import logging
+import os
 import re
 import subprocess  # noqa: F401
 import sys  # noqa: F401
@@ -593,7 +594,7 @@ def _merge_profile_tree(
             session["profile"] = profile
             session["is_default_profile"] = profile == "default"
 
-        key = project.get("path") or project["id"]
+        key = os.path.normcase(project.get("path") or project["id"])
         existing = merged.get(key)
         if existing is None:
             merged[key] = project
