@@ -88,15 +88,24 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        kb.block_task(conn, child, reason="wait", kind="dependency")
-        assert kb.get_task(conn, child).status == "todo"
+        run_id = kb.get_task(conn, child).current_run_id
+        assert run_id is not None
+        assert kb.contain_task(
+            conn,
+            child,
+            reason="wait",
+            author="operator",
+            expected_run_id=run_id,
+            parent_id=parent,
+            signal_fn=lambda *_args, **_kwargs: None,
+        )
+        assert kb.get_task(conn, child).status == "blocked"
         # Finish the parent, then let recompute_ready run.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         kb.claim_task(conn, parent, claimer="worker")
         kb.complete_task(conn, parent, result="done")
-        kb.recompute_ready(conn)
+        assert kb.release_dispatch_hold(conn, child, author="operator")
         assert kb.get_task(conn, child).status == "ready"
 
 

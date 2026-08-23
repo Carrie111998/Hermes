@@ -838,6 +838,8 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    hold_children_reason: Optional[str] = None
+    hold_author: Optional[str] = None
     # Per-task model/provider override (the board's model dropdown).
     # ``model_override=""`` clears both. ``clear_model_override=True`` is
     # the explicit clear signal — needed because Optional[str]=None means
@@ -902,6 +904,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    hold_children_reason=payload.hold_children_reason,
+                    hold_author=payload.hold_author or "dashboard",
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -1234,6 +1238,61 @@ def _set_status_direct(
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+
+
+class ContainBody(BaseModel):
+    reason: str
+    expected_run_id: int
+    parent_id: Optional[str] = None
+    author: Optional[str] = "dashboard"
+
+
+class ReleaseHoldBody(BaseModel):
+    author: Optional[str] = "dashboard"
+
+
+@router.post("/tasks/{task_id}/contain")
+def contain_task(
+    task_id: str, payload: ContainBody, board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            ok = kanban_db.contain_task(
+                conn,
+                task_id,
+                reason=payload.reason,
+                author=payload.author or "dashboard",
+                expected_run_id=payload.expected_run_id,
+                parent_id=payload.parent_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail="run ownership changed or task is not running",
+            )
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/dispatch-hold/release")
+def release_dispatch_hold(
+    task_id: str, payload: ReleaseHoldBody, board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if not kanban_db.release_dispatch_hold(
+            conn, task_id, author=payload.author or "dashboard",
+        ):
+            raise HTTPException(status_code=409, detail="task has no dispatch hold")
+        return {"ok": True}
+    finally:
+        conn.close()
 
 
 @router.post("/tasks/{task_id}/comments")

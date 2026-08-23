@@ -771,6 +771,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    hold_children_reason=args.get("hold_children_reason"),
+                    hold_author=os.getenv("HERMES_PROFILE") or "worker",
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1848,6 +1850,14 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "hold_children_reason": {
+                "type": "string",
+                "description": (
+                    "Optional durable dispatch-hold reason applied to every direct "
+                    "child inside the completion transaction, before dependency "
+                    "promotion. Omit for the backward-compatible default."
                 ),
             },
             "board": _board_schema_prop(),

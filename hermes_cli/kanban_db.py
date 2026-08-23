@@ -1141,6 +1141,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Durable operator/dispatcher fence. Held tasks remain non-dispatchable
+    # regardless of their workflow status until an audited release.
+    dispatch_hold_reason: Optional[str] = None
+    dispatch_hold_at: Optional[int] = None
+    dispatch_hold_by: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1239,15 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            dispatch_hold_reason=(
+                row["dispatch_hold_reason"] if "dispatch_hold_reason" in keys else None
+            ),
+            dispatch_hold_at=(
+                row["dispatch_hold_at"] if "dispatch_hold_at" in keys else None
+            ),
+            dispatch_hold_by=(
+                row["dispatch_hold_by"] if "dispatch_hold_by" in keys else None
             ),
         )
 
@@ -1422,7 +1436,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable fail-closed dispatch fence. Clearing it requires the audited
+    -- release_dispatch_hold domain operation.
+    dispatch_hold_reason TEXT,
+    dispatch_hold_at     INTEGER,
+    dispatch_hold_by     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2698,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "dispatch_hold_reason" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dispatch_hold_reason", "dispatch_hold_reason TEXT"
+        )
+    if "dispatch_hold_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dispatch_hold_at", "dispatch_hold_at INTEGER"
+        )
+    if "dispatch_hold_by" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dispatch_hold_by", "dispatch_hold_by TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3826,6 +3858,204 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
+def set_dispatch_hold(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    author: Optional[str] = None,
+) -> bool:
+    """Durably fence a task from promotion and claim."""
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("dispatch hold reason is required")
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET dispatch_hold_reason = ?, dispatch_hold_at = ?, "
+            "dispatch_hold_by = ? WHERE id = ? AND status != 'archived'",
+            (reason, now, author, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_held",
+            {"reason": reason, "author": author, "source": "explicit"},
+        )
+    return True
+
+
+def release_dispatch_hold(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: Optional[str] = None,
+) -> bool:
+    """Explicitly clear a durable dispatch fence and re-evaluate readiness."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT dispatch_hold_reason, dispatch_hold_at, dispatch_hold_by "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["dispatch_hold_reason"] is None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET dispatch_hold_reason = NULL, dispatch_hold_at = NULL, "
+            "dispatch_hold_by = NULL WHERE id = ? AND dispatch_hold_reason IS NOT NULL",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_hold_released",
+            {
+                "author": author,
+                "prior_reason": row["dispatch_hold_reason"],
+                "prior_held_at": row["dispatch_hold_at"],
+                "prior_held_by": row["dispatch_hold_by"],
+            },
+        )
+    recompute_ready(conn)
+    return True
+
+
+def contain_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    author: str,
+    expected_run_id: int,
+    parent_id: Optional[str] = None,
+    signal_fn=None,
+) -> bool:
+    """Atomically contain one owned run and optionally gate it on a parent.
+
+    Worker termination is attempted from a fenced run snapshot before the
+    single write transaction. Competing readers therefore see either the old
+    live claim or the complete containment record; never a reclaim/ready gap.
+    If termination reports that the worker survived, ownership is retained and
+    only the durable hold, comment, optional link, and audit event are added.
+    """
+    reason = str(reason or "").strip()
+    author = str(author or "").strip()
+    if not reason:
+        raise ValueError("containment reason is required")
+    if not author:
+        raise ValueError("containment author is required")
+    expected_run_id = int(expected_run_id)
+    snapshot = conn.execute(
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        not snapshot
+        or snapshot["status"] != "running"
+        or snapshot["current_run_id"] != expected_run_id
+    ):
+        return False
+    if parent_id:
+        missing = _find_missing_parents(conn, [parent_id, task_id])
+        if missing:
+            raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        if parent_id == task_id or _would_cycle(conn, parent_id, task_id):
+            raise ValueError(
+                f"linking {parent_id} -> {task_id} would create a cycle"
+            )
+    termination = _terminate_reclaimed_worker(
+        snapshot["worker_pid"], snapshot["claim_lock"], signal_fn=signal_fn,
+    )
+    # Containment is stricter than ordinary stale-claim recovery: if a worker
+    # PID exists and we cannot prove termination (including a remote claim we
+    # cannot signal), retain ownership. Uncertainty must never expose ready.
+    survived = bool(
+        _worker_survived_termination(termination)
+        or (snapshot["worker_pid"] and not termination.get("terminated"))
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            not current
+            or current["status"] != "running"
+            or current["current_run_id"] != expected_run_id
+            or current["claim_lock"] != snapshot["claim_lock"]
+        ):
+            return False
+        if parent_id:
+            if _would_cycle(conn, parent_id, task_id):
+                raise ValueError(
+                    f"linking {parent_id} -> {task_id} would create a cycle"
+                )
+            linked = conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (parent_id, task_id),
+            )
+            if linked.rowcount:
+                _append_event(
+                    conn,
+                    task_id,
+                    "linked",
+                    {"parent": parent_id, "child": task_id, "source": "containment"},
+                )
+            _inherit_notify_subs(conn, task_id, (parent_id,))
+        if survived:
+            new_expires = now + _resolve_claim_ttl_seconds()
+            conn.execute(
+                "UPDATE tasks SET dispatch_hold_reason = ?, dispatch_hold_at = ?, "
+                "dispatch_hold_by = ?, claim_expires = ? WHERE id = ?",
+                (reason, now, author, new_expires, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                (new_expires, expected_run_id),
+            )
+            run_id = expected_run_id
+            landing = "running"
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', dispatch_hold_reason = ?, "
+                "dispatch_hold_at = ?, dispatch_hold_by = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, block_kind = 'capability' "
+                "WHERE id = ?",
+                (reason, now, author, task_id),
+            )
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="blocked",
+                status="blocked",
+                summary=reason,
+                metadata=termination,
+            )
+            landing = "blocked"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author, reason, now),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "contained",
+            {
+                "reason": reason,
+                "author": author,
+                "parent": parent_id,
+                "landing": landing,
+                "worker_survived": survived,
+                "termination": termination,
+            },
+            run_id=run_id,
+        )
+    return True
+
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
@@ -3836,6 +4066,18 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
+            )
+        states = conn.execute(
+            "SELECT id, status FROM tasks WHERE id IN (?, ?)",
+            (parent_id, child_id),
+        ).fetchall()
+        statuses = {row["id"]: row["status"] for row in states}
+        if statuses[child_id] == "running" and statuses[parent_id] not in (
+            "done", "archived",
+        ):
+            raise ValueError(
+                f"cannot link unfinished parent {parent_id} behind running child "
+                f"{child_id}; use contain_task for atomic containment"
             )
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -4545,7 +4787,8 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND dispatch_hold_reason IS NULL"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4630,6 +4873,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        held = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND dispatch_hold_reason IS NOT NULL",
+            (task_id,),
+        ).fetchone()
+        if held:
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4685,6 +4934,7 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND dispatch_hold_reason IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4785,6 +5035,7 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND dispatch_hold_reason IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -5359,6 +5610,8 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    hold_children_reason: Optional[str] = None,
+    hold_author: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5476,6 +5729,31 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if hold_children_reason:
+            hold_children_reason = str(hold_children_reason).strip()
+            children = conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (task_id,),
+            ).fetchall()
+            for child in children:
+                child_id = child["child_id"]
+                held = conn.execute(
+                    "UPDATE tasks SET dispatch_hold_reason = ?, dispatch_hold_at = ?, "
+                    "dispatch_hold_by = ? WHERE id = ? AND status != 'archived'",
+                    (hold_children_reason, now, hold_author, child_id),
+                )
+                if held.rowcount:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "dispatch_held",
+                        {
+                            "reason": hold_children_reason,
+                            "author": hold_author,
+                            "source": "parent_completion",
+                            "parent": task_id,
+                        },
+                    )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -9554,7 +9832,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND dispatch_hold_reason IS NULL"
     ).fetchall()
     if not rows:
         return False
@@ -9580,7 +9858,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND dispatch_hold_reason IS NULL"
     ).fetchall()
     if not rows:
         return False
@@ -10036,6 +10314,7 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND dispatch_hold_reason IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -10045,6 +10324,7 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
+            "AND dispatch_hold_reason IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs

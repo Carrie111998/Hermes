@@ -81,6 +81,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "dispatch_hold_reason": t.dispatch_hold_reason,
+        "dispatch_hold_at": t.dispatch_hold_at,
+        "dispatch_hold_by": t.dispatch_hold_by,
     }
 
 
@@ -553,6 +556,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
+    p_contain = sub.add_parser(
+        "contain", help="Atomically terminate, hold, block, comment, and optionally link a run"
+    )
+    p_contain.add_argument("task_id")
+    p_contain.add_argument("reason")
+    p_contain.add_argument("--expected-run-id", type=int, required=True)
+    p_contain.add_argument("--parent", default=None)
+    p_contain.add_argument("--author", default=None)
+    p_release_hold = sub.add_parser(
+        "release-hold", help="Explicitly release a task's durable dispatch hold"
+    )
+    p_release_hold.add_argument("task_id")
+    p_release_hold.add_argument("--author", default=None)
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -600,6 +616,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--hold-children",
+        default=None,
+        metavar="REASON",
+        help="Atomically hold direct children before dependency promotion",
+    )
+    p_complete.add_argument("--hold-author", default=None)
 
     p_edit = sub.add_parser(
         "edit",
@@ -1120,6 +1143,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
+            "contain":  _cmd_contain,
+            "release-hold": _cmd_release_hold,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "attach":   _cmd_attach,
@@ -1189,6 +1214,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "reassign",
     "link",
     "unlink",
+    "contain",
+    "release-hold",
     "claim",
     "comment",
     "attach",
@@ -2073,6 +2100,38 @@ def _cmd_link(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_contain(args: argparse.Namespace) -> int:
+    author = args.author or os.getenv("HERMES_PROFILE") or "user"
+    with kb.connect_closing() as conn:
+        ok = kb.contain_task(
+            conn,
+            args.task_id,
+            reason=args.reason,
+            author=author,
+            expected_run_id=args.expected_run_id,
+            parent_id=args.parent,
+        )
+    if not ok:
+        print(
+            f"cannot contain {args.task_id}: run ownership changed or task is not running",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Contained {args.task_id} with durable dispatch hold")
+    return 0
+
+
+def _cmd_release_hold(args: argparse.Namespace) -> int:
+    author = args.author or os.getenv("HERMES_PROFILE") or "user"
+    with kb.connect_closing() as conn:
+        ok = kb.release_dispatch_hold(conn, args.task_id, author=author)
+    if not ok:
+        print(f"no active dispatch hold on {args.task_id}", file=sys.stderr)
+        return 1
+    print(f"Released dispatch hold on {args.task_id}")
+    return 0
+
+
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
@@ -2298,6 +2357,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                hold_children_reason=getattr(args, "hold_children", None),
+                hold_author=(
+                    getattr(args, "hold_author", None)
+                    or os.getenv("HERMES_PROFILE")
+                    or "user"
+                ),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
