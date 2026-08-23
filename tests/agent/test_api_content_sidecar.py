@@ -42,6 +42,22 @@ class TestComposeUserApiContent:
     def test_none_when_nothing_to_inject(self):
         assert compose_user_api_content("hello", "", "") is None
 
+    def test_concise_evidence_adds_api_only_style_sidecar(self):
+        out = compose_user_api_content(
+            "hello",
+            "",
+            "",
+            output_policy="concise_evidence",
+        )
+        assert out == (
+            "hello\n\n[RESPONSE STYLE]\n"
+            "Conclusion first. No restatement or ceremony. Preserve paths, IDs, "
+            "numbers, verification evidence, and unresolved boundaries."
+        )
+
+    def test_standard_and_full_evidence_do_not_add_style_sidecar(self):
+        assert compose_user_api_content("hello", "", "", output_policy="standard") is None
+        assert compose_user_api_content("hello", "", "", output_policy="full_evidence") is None
 
     def test_composes_memory_block_and_plugin_context(self):
         out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")

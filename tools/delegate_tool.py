@@ -3605,6 +3605,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    route_candidates: Optional[List[Dict[str, str]]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3700,7 +3701,12 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        if route_candidates:
+            creds = _resolve_route_delegation_credentials(
+                route_candidates, parent_agent
+            )
+        else:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -4412,6 +4418,45 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+def _resolve_route_delegation_credentials(
+    candidates: List[Dict[str, str]], parent_agent
+) -> dict:
+    """Resolve the first active role candidate supplied by the route bridge."""
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    failures = []
+    for candidate in candidates:
+        provider = str(candidate.get("provider") or "").strip()
+        model = str(candidate.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        try:
+            runtime = resolve_runtime_provider(
+                requested=provider,
+                target_model=model,
+            )
+            return {
+                "model": model,
+                "provider": runtime.get("provider") or provider,
+                "base_url": runtime.get("base_url"),
+                # A same-provider child can inherit the parent's key. A
+                # provider-specific runtime key wins when one is available.
+                "api_key": runtime.get("api_key") or None,
+                "api_mode": runtime.get("api_mode"),
+                "request_overrides": dict(runtime.get("request_overrides") or {}),
+                "max_output_tokens": runtime.get("max_output_tokens"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+            }
+        except Exception as exc:
+            failures.append(f"{provider}/{model}: {type(exc).__name__}")
+    raise ValueError(
+        "Routed delegation has no usable role candidate: "
+        + (", ".join(failures) or "empty candidate list")
+    )
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:

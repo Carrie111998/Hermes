@@ -581,6 +581,26 @@ def _run_agent_tool_execution_middleware(
     )
 
     trace = middleware_trace if middleware_trace is not None else []
+    if (
+        getattr(agent, "_direct_execution_guard", False)
+        and getattr(agent, "_delegate_depth", 0) == 0
+        and function_name in getattr(agent, "_direct_execution_guard_tools", set())
+    ):
+        logger.warning(
+            "Top-level coordinated workflow attempted direct tool %s; delegation required",
+            function_name,
+        )
+        return _ManagedToolResult(
+            result=(
+                "Execution blocked: this task is in a coordinated workflow. "
+                "Delegate the step to worker or worker-pro using delegate_task, "
+                "then synthesize and verify the returned evidence."
+            ),
+            args=function_args,
+            middleware_trace=trace,
+            blocked=True,
+            dispatched=False,
+        )
     state = {
         "args": function_args,
         "middleware_trace": trace,
@@ -1339,6 +1359,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
+                    if (
+                        getattr(agent, "_direct_execution_guard", False)
+                        and getattr(agent, "_delegate_depth", 0) == 0
+                        and function_name in getattr(agent, "_direct_execution_guard_tools", set())
+                    ):
+                        logger.warning(
+                            "Top-level coordinated workflow attempted direct tool %s; delegation required",
+                            function_name,
+                        )
+                        return (
+                            "Execution blocked: this task is in a coordinated workflow. "
+                            "Do not execute project operations from the top-level responder. "
+                            "Delegate the step to worker or worker-pro using delegate_task, "
+                            "then synthesize and verify the returned evidence."
+                        )
                     return agent._invoke_tool(
                         function_name,
                         next_args,

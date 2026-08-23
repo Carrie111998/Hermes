@@ -31,6 +31,11 @@ DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
 # in config.yaml.
 DEFAULT_MCP_RESULT_SIZE_CHARS: int = 50_000
 
+# Semantic compression is opt-in. These values govern only the reversible
+# compression candidate path; normal spillover thresholds remain unchanged.
+DEFAULT_SEMANTIC_COMPRESS_THRESHOLD_CHARS: int = 20_000
+DEFAULT_SEMANTIC_COMPRESS_MIN_REDUCTION_CHARS: int = 500
+
 # Tool-name prefix that identifies MCP-served tools (same prefix the
 # untrusted-content wrapper keys on in agent/tool_dispatch_helpers.py).
 MCP_TOOL_PREFIX: str = "mcp_"
@@ -63,6 +68,54 @@ def _configured_mcp_result_size() -> int:
     return DEFAULT_MCP_RESULT_SIZE_CHARS
 
 
+def _configured_semantic_compression() -> tuple[bool, int, int]:
+    """Read opt-in semantic-compression settings from config safely.
+
+    Accepts the setting under EITHER of the two recognised key paths so
+    downstream behaviour follows the user's intent whichever block they
+    landed it in:
+
+    * ``tool_budget.semantic_compress`` -- the canonical home (matches the
+      wider ``tool_budget:`` configurable-caps section).
+    * ``tool_output.semantic_compress`` -- a sibling block used by the
+      tool-output limits reader; keys here took shape before the budget
+      section did, and end users have set the flag here.
+
+    Either side enabling it flips the runtime flag on (logical OR).
+    Threshold/min-reduction knobs are read from ``tool_budget`` only -- a
+    single home keeps the override pattern simple. Fail-open: any
+    exception, missing key, or non-True value lands on the defaults
+    (compression OFF, default threshold/minimum).
+    """
+    enabled = False
+    threshold = DEFAULT_SEMANTIC_COMPRESS_THRESHOLD_CHARS
+    minimum = DEFAULT_SEMANTIC_COMPRESS_MIN_REDUCTION_CHARS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly()
+        if isinstance(data, dict):
+            tool_budget = data.get("tool_budget")
+            tool_output = data.get("tool_output")
+            if isinstance(tool_budget, dict):
+                if tool_budget.get("semantic_compress") is True:
+                    enabled = True
+                raw_threshold = tool_budget.get("semantic_compress_threshold_chars")
+                raw_minimum = tool_budget.get("semantic_compress_min_reduction_chars")
+                if raw_threshold is not None and int(raw_threshold) > 0:
+                    threshold = int(raw_threshold)
+                if raw_minimum is not None and int(raw_minimum) >= 0:
+                    minimum = int(raw_minimum)
+            if not enabled and isinstance(tool_output, dict):
+                # Mirror the same strict-truthiness check used above so a
+                # noisy `false`/`0`/absent value does NOT flip the flag on.
+                if tool_output.get("semantic_compress") is True:
+                    enabled = True
+    except Exception:
+        pass
+    return enabled, threshold, minimum
+
+
 @dataclass(frozen=True)
 class BudgetConfig:
     """Immutable budget constants for the 3-layer tool result persistence system.
@@ -71,6 +124,8 @@ class BudgetConfig:
     Layer 3 (per-turn):   turn_budget -> aggregate char budget across all tool
                           results in a single assistant turn.
     Preview:              preview_size -> inline snippet size after persistence.
+    Semantic compression: opt-in reversible JSON/log reduction before
+                          per-result persistence.
     """
 
     default_result_size: int = DEFAULT_RESULT_SIZE_CHARS
@@ -78,6 +133,9 @@ class BudgetConfig:
     preview_size: int = DEFAULT_PREVIEW_SIZE_CHARS
     mcp_result_size: int = DEFAULT_MCP_RESULT_SIZE_CHARS
     tool_overrides: Dict[str, int] = field(default_factory=dict)
+    semantic_compress: bool = False
+    semantic_compress_threshold: int = DEFAULT_SEMANTIC_COMPRESS_THRESHOLD_CHARS
+    semantic_compress_min_reduction: int = DEFAULT_SEMANTIC_COMPRESS_MIN_REDUCTION_CHARS
 
     def resolve_threshold(self, tool_name: str) -> int | float:
         """Resolve the persistence threshold for a tool.
@@ -151,11 +209,17 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     always survives.
     """
     mcp_result_size = _configured_mcp_result_size()
+    semantic_compress, semantic_threshold, semantic_minimum = _configured_semantic_compression()
 
     if not context_length or context_length <= 0:
-        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS:
+        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS and not semantic_compress:
             return DEFAULT_BUDGET
-        return BudgetConfig(mcp_result_size=mcp_result_size)
+        return BudgetConfig(
+            mcp_result_size=mcp_result_size,
+            semantic_compress=semantic_compress,
+            semantic_compress_threshold=semantic_threshold,
+            semantic_compress_min_reduction=semantic_minimum,
+        )
 
     window_chars = context_length * _CHARS_PER_TOKEN
     per_result = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
@@ -171,4 +235,7 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+        semantic_compress=semantic_compress,
+        semantic_compress_threshold=semantic_threshold,
+        semantic_compress_min_reduction=semantic_minimum,
     )

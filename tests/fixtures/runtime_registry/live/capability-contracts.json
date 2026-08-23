@@ -1,0 +1,96 @@
+{
+  "schema_version": "1.0",
+  "description": "Capability contracts declare what a task needs (quality floor, context, tools, modality, reasoning intent) without naming any model or vendor.",
+  "contracts": {
+    "fast-economy": {
+      "quality": "economy",
+      "modality": [
+        "text"
+      ],
+      "tools": "basic",
+      "context_class": "standard",
+      "reasoning_intent": "low",
+      "output_policy": "concise_evidence"
+    },
+    "standard-reasoning": {
+      "quality": "standard",
+      "modality": [
+        "text"
+      ],
+      "tools": "basic",
+      "context_class": "standard",
+      "reasoning_intent": "high",
+      "output_policy": "standard"
+    },
+    "complex-execution": {
+      "quality": "complex",
+      "modality": [
+        "text"
+      ],
+      "tools": "full",
+      "context_class": "standard",
+      "reasoning_intent": "deep",
+      "output_policy": "full_evidence"
+    },
+    "multimodal-extraction": {
+      "quality": "visual",
+      "modality": [
+        "image"
+      ],
+      "tools": "none",
+      "context_class": "standard",
+      "reasoning_intent": "off"
+    },
+    "high-stakes-decision": {
+      "quality": "expert",
+      "modality": [
+        "text"
+      ],
+      "tools": "full",
+      "context_class": "standard",
+      "reasoning_intent": "deep",
+      "output_policy": "full_evidence"
+    },
+    "independent-review": {
+      "quality": "review",
+      "modality": [
+        "text"
+      ],
+      "tools": "read",
+      "context_class": "standard",
+      "reasoning_intent": "deep",
+      "output_policy": "full_evidence"
+    },
+    "publishing": {
+      "quality": "publish",
+      "modality": [
+        "text"
+      ],
+      "tools": "full",
+      "context_class": "standard",
+      "reasoning_intent": "medium",
+      "output_policy": "full_evidence"
+    },
+    "routing-classifier": {
+      "quality": "classifier",
+      "modality": [
+        "text"
+      ],
+      "tools": "none",
+      "context_class": "short",
+      "reasoning_intent": "low",
+      "max_tokens": 512,
+      "timeout_ms": 6000,
+      "output_policy": "concise_evidence"
+    },
+    "image-generation": {
+      "quality": "image-generation",
+      "modality": [
+        "text"
+      ],
+      "tools": "none",
+      "context_class": "short",
+      "reasoning_intent": "off"
+    }
+  }
+}

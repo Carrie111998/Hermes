@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "hermes-workflow-registry/1.0",
+  "registryVersion": "2026-08-22.18",
+  "owner": "hermes-production",
+  "sourceRuntime": "migrated-design",
+  "sourceDescription": "Hermes-native workflow control: route levels are independent from execution roles; L3 workflows choose worker or worker-pro per step; top-level responder is blocked from direct project execution on coordinated workflows.",
+  "importedAt": "2026-08-20",
+  "automaticSync": false,
+  "promotionState": "READY_FOR_REVIEW",
+  "promotionStates": [
+    "DRAFT",
+    "READY_FOR_REVIEW",
+    "APPROVED",
+    "PUBLISHED"
+  ],
+  "portableContract": "../goose-migration/PORTABLE_CONTRACT.md",
+  "files": [
+    {
+      "path": "capability-contracts.json",
+      "sha256": "52318beba2fe6fbfb2c9a7fe40dff10ea676a0e2f44ba9fecb61694680d93691"
+    },
+    {
+      "path": "execution-roles.json",
+      "sha256": "7831c2178d992bd4942081f08532975c9c8942d5deeeabbe90a70dab0c0535f2"
+    },
+    {
+      "path": "model-policies.json",
+      "sha256": "81d842a21bc2806867b2a0c03e98cbe7157f86b45ac4b8a7a37738513545a801"
+    },
+    {
+      "path": "model-profiles.json",
+      "sha256": "a1992a754a78a94d145672db1d8c712f453141e2d05b777d17917742141c0d5f"
+    },
+    {
+      "path": "route-policy.json",
+      "sha256": "8129574878f88c508fdd05a7b9e7cd900e0411678127b547695ffbea2475c230"
+    },
+    {
+      "path": "semantic-router-prompt.md",
+      "sha256": "8fc6f46034b5891526b8573d4484cab9e0472d7701ced9bbc3e9274a0b08262a"
+    },
+    {
+      "path": "workflow-templates.json",
+      "sha256": "6308817c85276343fcda2e6fe049ae9a8cfb26f4c1e7ae8584e39fcd3cd28f0d"
+    }
+  ],
+  "governance": {
+    "changeRequires": [
+      "new registryVersion",
+      "manifest hash update",
+      "baseline benchmark comparison",
+      "review decision"
+    ],
+    "secretsIncluded": false,
+    "providerAuthSource": "Hermes provider configuration and environment, never this registry"
+  },
+  "publishedAt": "2026-08-20"
+}
