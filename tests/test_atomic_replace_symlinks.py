@@ -233,10 +233,17 @@ def test_atomic_replace_copy_fallback_preserves_symlink(
     link.symlink_to(real)
     tmp = _write_tmp(tmp_path, "new\n")
 
-    def fail_replace(src: str, dst: str) -> None:
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+    genuine_replace = os.replace
+    replace_calls = 0
 
-    monkeypatch.setattr("utils.os.replace", fail_replace)
+    def exdev_once(src: str, dst: str) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+        genuine_replace(src, dst)
+
+    monkeypatch.setattr("utils.os.replace", exdev_once)
 
     assert Path(atomic_replace(tmp, link)) == real
     assert link.is_symlink()
@@ -394,30 +401,37 @@ def test_atomic_replace_cross_device_uses_rename_not_inplace_copy(
 
 
 @pytest.mark.require_symlinks
-def test_atomic_replace_busy_target_falls_back_to_plain_copy(
+def test_atomic_replace_busy_staged_rename_preserves_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A busy inode cannot be renamed onto, so the plain copy must remain.
-
-    Behaviour-preservation guard: green before and after the staging change.
-    It pins the residual last-resort path and catches a staged temp leaking
-    when the staged rename fails.
-    """
+    """A failed staged rename must leave the resolved target untouched."""
     real = tmp_path / "config.yaml"
     link = tmp_path / "link.yaml"
-    real.write_text("old\n", encoding="utf-8")
+    original = "provider: openrouter\napi_key: keep-me\n"
+    real.write_text(original, encoding="utf-8")
     link.symlink_to(real)
-    tmp = _write_tmp(tmp_path, "new\n")
+    tmp = _write_tmp(tmp_path, "provider: replacement\n")
 
-    def always_busy(src: str, dst: str) -> None:
+    replace_calls: list[tuple[str, str]] = []
+
+    def exdev_then_busy(src: str, dst: str) -> None:
+        replace_calls.append((str(src), str(dst)))
+        if len(replace_calls) == 1:
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
         raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), src, None, dst)
 
-    monkeypatch.setattr("utils.os.replace", always_busy)
+    monkeypatch.setattr("utils.os.replace", exdev_then_busy)
 
-    assert Path(atomic_replace(tmp, link)) == real
-    assert link.is_symlink()
-    assert real.read_text(encoding="utf-8") == "new\n"
-    assert not tmp.exists()
+    with pytest.raises(OSError) as excinfo:
+        atomic_replace(tmp, link)
+
+    assert excinfo.value.errno == errno.EBUSY
+    assert replace_calls[0] == (str(tmp), str(real))
+    assert replace_calls[1][0] != str(tmp), "the second replace must use staging"
+    assert replace_calls[1][1] == str(real)
+    assert link.is_symlink(), "failed replacement must not detach the symlink"
+    assert real.read_text(encoding="utf-8") == original
+    assert tmp.exists(), "the pending write must survive for the caller"
     assert not list(tmp_path.glob(".tmp_xdev_*")), "staged temp leaked on EBUSY"
 
 

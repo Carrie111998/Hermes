@@ -212,11 +212,10 @@ def _copy_fallback(tmp_str: str, real_path: str) -> None:
     means there is no window in which the name could resolve to a different
     inode.
 
-    The plain copy survives only as the residual case: the target's directory
-    refuses a staging temp, or ``os.replace(staged, target)`` fails (a busy or
-    bind-mounted inode is the motivating case, but a permission/ACL,
-    read-only-filesystem or symlink-loop failure lands there too).  That
-    residual remains non-atomic.
+    The plain copy survives only when the target's directory refuses a staging
+    temp. Once staging succeeds, a failed ``os.replace(staged, target)`` is
+    cleaned up and propagated: falling back to an in-place copy then would
+    truncate the target the staging path was meant to protect.
     """
     try:
         staged_fd, staged = tempfile.mkstemp(
@@ -250,6 +249,7 @@ def _copy_fallback(tmp_str: str, real_path: str) -> None:
             os.replace(staged, real_path)
         except OSError:
             _unlink_quietly(staged)
+            raise
         else:
             os.unlink(tmp_str)
             return
