@@ -28,6 +28,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MATERIALIZER = REPO_ROOT / ".github" / "materialize-process-edge-authority.py"
+ARCHIVE_PATH = REPO_ROOT / "phase-g-product.tar.gz"
 CHUNK_CHARS = 3000
 
 
@@ -180,8 +181,10 @@ def _archive_product(root: Path, paths: set[str], receipt: dict) -> bytes:
 
 
 def _emit_archive(archive: bytes, receipt: dict) -> None:
+    ARCHIVE_PATH.write_bytes(archive)
     encoded = base64.b64encode(archive).decode("ascii")
     print("PHASE_G_MATERIALIZED_ARCHIVE_BEGIN")
+    print(f"archive_path={ARCHIVE_PATH}")
     print(f"archive_sha256={_sha256(archive)}")
     print(f"archive_bytes={len(archive)}")
     print(f"encoded_chars={len(encoded)}")
