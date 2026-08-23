@@ -1166,3 +1166,127 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._redeliver_claimed_obligations.assert_awaited_once()
 
 
+# ---------------------------------------------------------------------------
+# Heartbeat watch restore after gateway restart (#92584)
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreHeartbeatWatches:
+    """``_heartbeat_watch`` is process-local and empty on a fresh gateway,
+    while the heartbeat STATE it drives lives in ``state_meta`` and
+    survives restart. ``_restore_heartbeat_watches`` closes that gap the
+    same way ``_schedule_resume_pending_sessions`` already does for
+    interrupted turns: read the persisted routing off ``SessionEntry.origin``
+    and rebuild the in-memory registry from it.
+    """
+
+    def _entry(self, session_key, session_id, chat_id):
+        now = datetime.now()
+        return SessionEntry(
+            session_key=session_key,
+            session_id=session_id,
+            created_at=now,
+            updated_at=now,
+            origin=make_restart_source(chat_id=chat_id),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+
+    @pytest.mark.asyncio
+    async def test_restores_active_heartbeat_and_starts_poller(self):
+        runner, _adapter = make_restart_runner()
+        entry = self._entry("agent:main:telegram:dm:hb-1", "sid-hb-1", "hb-1")
+        runner.session_store._entries = {entry.session_key: entry}
+
+        active_state = MagicMock(status="active")
+        with patch(
+            "hermes_cli.heartbeat.load_heartbeat", return_value=active_state
+        ):
+            restored = runner._restore_heartbeat_watches()
+
+        assert restored == 1
+        watch = runner._heartbeat_watch
+        assert entry.session_key in watch
+        source, session_id = watch[entry.session_key]
+        assert source == entry.origin
+        assert session_id == "sid-hb-1"
+        task = runner._heartbeat_poll_task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    def test_paused_and_missing_heartbeats_are_not_registered(self):
+        runner, _adapter = make_restart_runner()
+        paused_entry = self._entry(
+            "agent:main:telegram:dm:hb-paused", "sid-paused", "hb-paused"
+        )
+        missing_entry = self._entry(
+            "agent:main:telegram:dm:hb-missing", "sid-missing", "hb-missing"
+        )
+        runner.session_store._entries = {
+            paused_entry.session_key: paused_entry,
+            missing_entry.session_key: missing_entry,
+        }
+
+        def _fake_load(session_id):
+            if session_id == "sid-paused":
+                return MagicMock(status="paused")
+            return None
+
+        with patch("hermes_cli.heartbeat.load_heartbeat", side_effect=_fake_load):
+            restored = runner._restore_heartbeat_watches()
+
+        assert restored == 0
+        assert not getattr(runner, "_heartbeat_watch", None)
+
+    @pytest.mark.asyncio
+    async def test_restore_is_platform_scoped(self):
+        runner, _adapter = make_restart_runner()
+        tg_entry = self._entry("agent:main:telegram:dm:hb-tg", "sid-tg", "hb-tg")
+        dc_source = SessionSource(
+            platform=Platform.DISCORD, chat_id="hb-dc", chat_type="dm", user_id="u1"
+        )
+        dc_entry = SessionEntry(
+            session_key="agent:main:discord:dm:hb-dc",
+            session_id="sid-dc",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=dc_source,
+            platform=Platform.DISCORD,
+            chat_type="dm",
+        )
+        runner.session_store._entries = {
+            tg_entry.session_key: tg_entry,
+            dc_entry.session_key: dc_entry,
+        }
+
+        active_state = MagicMock(status="active")
+        with patch(
+            "hermes_cli.heartbeat.load_heartbeat", return_value=active_state
+        ):
+            restored = runner._restore_heartbeat_watches(platform=Platform.TELEGRAM)
+
+        assert restored == 1
+        assert tg_entry.session_key in runner._heartbeat_watch
+        assert dc_entry.session_key not in runner._heartbeat_watch
+        task = runner._heartbeat_poll_task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    def test_no_adapter_defers_restore_to_reconnect(self):
+        runner, _adapter = make_restart_runner()
+        runner.adapters = {}
+        entry = self._entry("agent:main:telegram:dm:hb-cold", "sid-cold", "hb-cold")
+        runner.session_store._entries = {entry.session_key: entry}
+
+        active_state = MagicMock(status="active")
+        with patch(
+            "hermes_cli.heartbeat.load_heartbeat", return_value=active_state
+        ):
+            restored = runner._restore_heartbeat_watches()
+
+        assert restored == 0
+        assert not getattr(runner, "_heartbeat_watch", None)
+
+
