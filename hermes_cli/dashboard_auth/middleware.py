@@ -321,7 +321,7 @@ def _verify_bearer(request: Request, *, access_token: str):
     return None
 
 
-def _verify_request_auth(request) -> Optional[Session]:
+def _verify_request_auth(request: Request) -> Optional[Session]:
     """Trusted-request auth: try every ``supports_request_auth`` provider.
 
     Request-scoped analog of ``_verify_bearer``. Called when a protected
