@@ -39,6 +39,13 @@ def test_filter_model_ids_matches_exact_and_glob_case_insensitively():
     ]
 
 
+    assert filter_model_ids(
+        "ai-gateway",
+        ["anthropic/claude-opus-4.8", "deepseek/deepseek-v4"],
+        {"vercel": ["anthropic/*"]},
+    ) == ["deepseek/deepseek-v4"]
+
+
 def test_filter_model_ids_is_scoped_to_provider():
     rules = {"openrouter": ["anthropic/*", "openai/*"]}
 
@@ -116,10 +123,6 @@ def test_terminal_model_picker_hides_excluded_models(monkeypatch):
         "hermes_cli.curses_ui.curses_radiolist",
         _choose_first,
     )
-    monkeypatch.setattr(
-        "hermes_cli.auth._confirm_expensive_model_selection",
-        lambda *args, **kwargs: True,
-    )
 
     selected = _prompt_model_selection(
         [
@@ -145,10 +148,6 @@ def test_terminal_model_picker_still_accepts_explicit_model_id(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.curses_ui.curses_radiolist",
         _choose_custom,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.auth._confirm_expensive_model_selection",
-        lambda *args, **kwargs: True,
     )
     monkeypatch.setattr(
         "builtins.input",

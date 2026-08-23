@@ -5,6 +5,8 @@ from __future__ import annotations
 from fnmatch import fnmatchcase
 from typing import Iterable, Mapping
 
+from hermes_cli.providers import normalize_provider
+
 
 def _patterns_for_provider(
     provider: str,
@@ -17,9 +19,20 @@ def _patterns_for_provider(
     if not provider_key:
         return ()
 
+    # Picker rows and setup flows do not always use the same spelling. For
+    # example, the Vercel AI Gateway flow uses ``ai-gateway`` while the shared
+    # catalog row is canonicalized to ``vercel``. Compare canonical aliases so
+    # one provider-scoped rule applies consistently across both surfaces.
+    canonical_provider = normalize_provider(provider_key)
+
     raw_patterns: object = None
     for key, value in excluded_models.items():
-        if str(key or "").strip().lower() == provider_key:
+        rule_provider = str(key or "").strip().lower()
+        canonical_rule_provider = normalize_provider(rule_provider)
+        if (
+            rule_provider == provider_key
+            or canonical_rule_provider == canonical_provider
+        ):
             raw_patterns = value
             break
 

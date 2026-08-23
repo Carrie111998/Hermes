@@ -122,7 +122,10 @@ model_catalog:
 In this example, OpenRouter's Anthropic models and its exact
 `openai/gpt-5.6-sol` route are omitted from picker inventories. Native
 Anthropic, OpenAI Codex, and custom providers remain unchanged because rules
-are matched only against the provider slug that contains them.
+are matched only against the provider scope that contains them. Provider keys
+are case-insensitive and resolve the same aliases as Hermes' provider catalog,
+so `ai-gateway`, `vercel-ai-gateway`, and canonical `vercel` target the same
+Vercel AI Gateway scope.
 
 The patterns use shell-style globs: `*` matches any sequence, `?` matches one
 character, and bracket expressions such as `[ab]` match one listed character.
