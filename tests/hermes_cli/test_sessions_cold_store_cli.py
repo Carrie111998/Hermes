@@ -496,6 +496,41 @@ def test_cold_archive_yes_runs_store_verify_purge_serially_and_keeps_snapshot(
     assert _message_rows() == [("unrelated", "keep this row")]
 
 
+def test_cold_archive_resolution_database_error_fails_closed(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "cold-root"
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+
+    def fail_resolution(_db: SessionDB, _session_id: str) -> str:
+        raise sqlite3.DatabaseError("forced damaged-page lookup")
+
+    monkeypatch.setattr(SessionDB, "resolve_session_id", fail_resolution)
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--dry-run",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "Error: could not resolve cold-archive session" in out
+    assert "forced damaged-page lookup" in out
+    assert not archive_root.exists()
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+
+
 @pytest.mark.parametrize(
     ("failed_stage", "expected_calls", "snapshot_retained"),
     [

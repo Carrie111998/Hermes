@@ -909,7 +909,12 @@ def cmd_sessions(args, sessions_parser=None):
             return 1
 
     elif action == "cold-archive":
-        resolved_session_id = db.resolve_session_id(args.session_id)
+        try:
+            resolved_session_id = db.resolve_session_id(args.session_id)
+        except sqlite3.DatabaseError as exc:
+            print(f"Error: could not resolve cold-archive session: {exc}")
+            db.close()
+            return 1
         if not resolved_session_id:
             print(
                 f"Session '{args.session_id}' was not found or is ambiguous."
