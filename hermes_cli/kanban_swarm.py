@@ -22,6 +22,10 @@ import sqlite3
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_policy import (
+    current_profile_principal,
+    require_creation_allowed,
+)
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -143,6 +147,9 @@ def create_swarm(
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    require_creation_allowed(
+        current_profile_principal(), operation="kanban swarm"
+    )
     activation_summary = (
         "Swarm topology planned; root remains the shared blackboard."
     )
