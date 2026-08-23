@@ -318,6 +318,7 @@ def _is_allowed_bridge_path(url: str) -> bool:
     # constants) so this validator follows the active profile override; under a
     # profile override the inbound bridge writes media into that profile's
     # cache, which the frozen constants would not match.
+    from hermes_constants import get_hermes_home
     from gateway.platforms.base import (
         get_audio_cache_dir,
         get_document_cache_dir,
@@ -325,14 +326,36 @@ def _is_allowed_bridge_path(url: str) -> bool:
         get_video_cache_dir,
     )
 
-    for root in (
-        get_image_cache_dir(),
-        get_audio_cache_dir(),
-        get_video_cache_dir(),
-        get_document_cache_dir(),
+    roots = {
+        Path(root).resolve()
+        for root in (
+            get_image_cache_dir(),
+            get_audio_cache_dir(),
+            get_video_cache_dir(),
+            get_document_cache_dir(),
+        )
+    }
+    # A long-lived bridge process may predate a mid-session layout flip:
+    # get_hermes_dir() resolves ONE layout per kind (legacy ``<kind>_cache``
+    # once it has content, else consolidated ``cache/<kind>``), but the bridge
+    # was launched with env vars pointing at whichever layout was active at
+    # startup and keeps writing there (#92685). Accept both layouts under the
+    # same Hermes home — they are all Hermes-owned media cache directories.
+    home = Path(get_hermes_home()).resolve()
+    for kind_new, kind_old in (
+        ("cache/images", "image_cache"),
+        ("cache/audio", "audio_cache"),
+        ("cache/videos", "video_cache"),
+        ("cache/documents", "document_cache"),
     ):
+        for sub in (kind_new, kind_old):
+            candidate = home / sub
+            if candidate not in roots:
+                roots.add(candidate.resolve())
+
+    for root in roots:
         try:
-            if resolved.is_relative_to(Path(root).resolve()):
+            if resolved.is_relative_to(root):
                 return True
         except (OSError, ValueError):
             continue
