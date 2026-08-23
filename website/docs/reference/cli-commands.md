@@ -39,6 +39,7 @@ hermes [global-options] <command> [subcommand/options]
 | Command | Purpose |
 |---------|---------|
 | `hermes chat` | Interactive or one-shot chat with the agent. |
+| `hermes chat-z` | Submit a prompt through the running Desktop app and return after Desktop accepts it. |
 | `hermes model` | Interactively choose the default provider and model. |
 | `hermes moa` | Configure named Mixture of Agents presets selectable from the model picker. |
 | `hermes fallback` | Manage fallback providers tried when the primary model errors. |
@@ -145,6 +146,30 @@ hermes chat --worktree -q "Review this repo and open a PR"
 hermes chat --ignore-user-config --ignore-rules -q "Repro without my personal setup"
 hermes chat --safe-mode -q "Is this bug mine or Hermes'?"
 ```
+
+### `hermes chat-z` — submit through the running Desktop
+
+`chat-z` reuses the Desktop renderer's normal submit path, so the target session has the same running state and status indicator as a prompt entered in the app. The command returns as soon as Desktop accepts the prompt; it does not wait for the agent's answer.
+
+Send to an existing session by its durable ID (preferred):
+
+```bash
+hermes chat-z --session-id "20260823_221854_82325e" -q "Run the next task"
+```
+
+An exact visible title is also accepted:
+
+```bash
+hermes chat-z -c "Knowledge receiver" -q "Run the next task"
+```
+
+Create a Desktop session in a specific project directory and give it a stable title:
+
+```bash
+hermes chat-z --new --cwd "/path/to/project" --title "Knowledge receiver" -q "Wait for work"
+```
+
+Creation prints the stored session ID. Prefer that ID for later sends because titles can be renamed and must otherwise match exactly. Desktop must already be running, and the target must belong to its active profile.
 
 ### `hermes -z <prompt>` — scripted one-shot
 

@@ -760,7 +760,7 @@ export function useSessionActions({
           await closeCreated.catch(() => undefined)
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
 
-          return
+          return null
         }
 
         createdThisRun.add(stored)
@@ -795,8 +795,12 @@ export function useSessionActions({
         if (listed) {
           broadcastSessionsChanged()
         }
+
+        return { runtimeSessionId: created.session_id, storedSessionId: stored }
       } catch (error) {
         notifyError(error, copy.createSessionFailed)
+
+        return null
       }
     },
     [copy, requestGateway, updateSessionState]
