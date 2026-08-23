@@ -903,7 +903,6 @@ class SessionEntry:
     # conversation fields on GatewayRunner, these survive a gateway restart.
     # ``service_tier_override`` uses "priority" / "normal" so explicit normal
     # remains distinguishable from an omitted (inherit-profile) value.
-    reasoning_override: Optional[Dict[str, Any]] = None
     service_tier_override: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -2832,7 +2831,7 @@ class SessionStore:
 
     def _heal_compression_tip_locked(
         self,
-        entry: SessionEntry,
+        entry: "SessionEntry",
         original_session_id: Optional[str],
         canonical_session_id: Optional[str],
     ) -> bool:

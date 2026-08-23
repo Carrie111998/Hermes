@@ -278,43 +278,6 @@ async def test_inbound_turn_parks_behind_in_flight_commit_then_runs_once():
 
 
 # ---------------------------------------------------------------------------
-# Boot-resume pre-claim skip: the skipped session is resumed by the next pass
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_boot_resume_skipped_session_resumes_once_lock_is_free():
-    runner, adapter = make_restart_runner()
-    runner._is_user_authorized = lambda _source: True
-    runner._restart_loop_guard_config = lambda: (0, 0, 0)
-    runner._run_startup_resume_event = AsyncMock()
-    adapter.handle_message = AsyncMock()
-    source = make_restart_source(chat_id="held-chat")
-    key = runner._session_key_for_source(source)
-    entry = SessionEntry(
-        session_key=key,
-        session_id="sid",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        origin=source,
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        resume_pending=True,
-        resume_reason="restart_timeout",
-        last_resume_marked_at=datetime.now(),
-    )
-    runner.session_store._entries = {key: entry}
-
-    async with session_admission_lock(runner, key):
-        assert runner._schedule_resume_pending_sessions() == 0
-        assert entry.resume_pending is True  # left for the next pass
-        assert runner._is_session_running(key) is False
-
-    assert runner._schedule_resume_pending_sessions() == 1
-    assert runner._is_session_running(key) is True
-
-
-# ---------------------------------------------------------------------------
 # Rehydrate never clobbers a live one-shot override
 # ---------------------------------------------------------------------------
 

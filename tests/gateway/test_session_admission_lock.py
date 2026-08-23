@@ -129,6 +129,7 @@ async def test_boot_resume_pre_claim_skips_session_under_options_transaction():
 
     async with session_admission_lock(runner, key):
         assert runner._schedule_resume_pending_sessions() == 0
+        assert entry.resume_pending is True  # left for the next pass
         assert runner._is_session_running(key) is False
 
     assert runner._schedule_resume_pending_sessions() == 1

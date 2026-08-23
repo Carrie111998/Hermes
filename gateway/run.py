@@ -7496,7 +7496,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
-        # Serializes structured host-UI option changes per messaging session.
+        # Per-session admission lock: shared by the runtime-options write-through
+        # (gateway/session_options.py) and _handle_message's idle->running claim.
         # Locks are process-local; accepted values are persisted by SessionStore.
         self._session_options_locks: Dict[str, asyncio.Lock] = {}
         self.delivery_router = DeliveryRouter(self.config)
