@@ -11005,22 +11005,9 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
     Mirrors what auth_commands.add_command does so the dashboard flow leaves
     the system in the same state as ``hermes auth add anthropic``.
     """
-    from agent.anthropic_adapter import _get_hermes_oauth_file
-    oauth_file = _get_hermes_oauth_file()
-    payload = {
-        "accessToken": access_token,
-        "refreshToken": refresh_token,
-        "expiresAt": expires_at_ms,
-    }
-    # atomic_json_write creates the temp with mode 0o600 (via mkstemp) *before*
-    # any content is written, then fsyncs and atomically replaces the target.
-    # The previous os.replace + post-hoc chmod left a TOCTOU window in which the
-    # OAuth token file was world-readable at the default umask (0o644 on most
-    # hosts) between the rename and the chmod. atomic_json_write also preserves
-    # the existing file's owner and cleans up its temp on failure.
-    from utils import atomic_json_write
+    from agent.anthropic_adapter import _write_hermes_oauth_credentials
 
-    atomic_json_write(oauth_file, payload, indent=2, mode=0o600)
+    _write_hermes_oauth_credentials(access_token, refresh_token, expires_at_ms)
     # Best-effort credential-pool insert. Failure here doesn't invalidate
     # the file write — pool registration only matters for the rotation
     # strategy, not for runtime credential resolution.
@@ -11029,12 +11016,18 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
             PooledCredential,
             load_pool,
             AUTH_TYPE_OAUTH,
-            SOURCE_MANUAL,
         )
         import uuid
         pool = load_pool("anthropic")
-        # Avoid duplicate entries: delete any prior dashboard-issued OAuth entry
-        existing = [e for e in pool.entries() if getattr(e, "source", "").startswith(f"{SOURCE_MANUAL}:dashboard_pkce")]
+        # The dashboard and singleton seeder both represent the one grant in
+        # .anthropic_oauth.json. Replace every legacy mirror with one canonical
+        # source so a rotating refresh token can only be consumed by one row.
+        existing = [
+            e
+            for e in pool.entries()
+            if getattr(e, "source", "")
+            in {"hermes_pkce", "manual:dashboard_pkce"}
+        ]
         for e in existing:
             try:
                 pool.remove_entry(getattr(e, "id", ""))
@@ -11046,7 +11039,7 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
             label="dashboard PKCE",
             auth_type=AUTH_TYPE_OAUTH,
             priority=0,
-            source=f"{SOURCE_MANUAL}:dashboard_pkce",
+            source="hermes_pkce",
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at_ms=expires_at_ms,

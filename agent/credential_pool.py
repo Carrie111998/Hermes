@@ -1392,6 +1392,19 @@ class CredentialPool:
                         )
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
+                elif entry.source == "hermes_pkce":
+                    try:
+                        from agent.anthropic_adapter import _write_hermes_oauth_credentials
+
+                        _write_hermes_oauth_credentials(
+                            refreshed["access_token"],
+                            refreshed["refresh_token"],
+                            refreshed["expires_at_ms"],
+                        )
+                    except Exception as wexc:
+                        logger.debug(
+                            "Failed to write refreshed Hermes PKCE token: %s", wexc
+                        )
             elif self.provider == "openai-codex":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another Hermes
@@ -2427,13 +2440,39 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
+    incoming_expires_at_ms = payload.get("expires_at_ms")
+    preserve_fresher_pkce_tokens = False
+    if (
+        provider == "anthropic"
+        and source == "hermes_pkce"
+        and existing.auth_type == AUTH_TYPE_OAUTH
+        and existing.expires_at_ms is not None
+        and incoming_expires_at_ms is not None
+    ):
+        try:
+            preserve_fresher_pkce_tokens = (
+                int(incoming_expires_at_ms) <= int(existing.expires_at_ms)
+                and (
+                    payload.get("access_token") != existing.access_token
+                    or payload.get("refresh_token") != existing.refresh_token
+                )
+            )
+        except (TypeError, ValueError):
+            preserve_fresher_pkce_tokens = False
     token_changed = (
-        "access_token" in payload
+        not preserve_fresher_pkce_tokens
+        and "access_token" in payload
         and payload["access_token"] is not None
         and payload["access_token"] != existing.access_token
     )
     for key, value in payload.items():
         if key in {"id", "priority"} or value is None:
+            continue
+        if preserve_fresher_pkce_tokens and key in {
+            "access_token",
+            "refresh_token",
+            "expires_at_ms",
+        }:
             continue
         if key == "label" and existing.label:
             continue
@@ -2565,10 +2604,15 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 changed = True
             return changed, active_sources
 
-        from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
+        from agent.anthropic_adapter import (
+            _write_hermes_oauth_credentials,
+            read_claude_code_credentials,
+            read_hermes_oauth_credentials,
+        )
 
+        hermes_oauth_creds = read_hermes_oauth_credentials()
         for source_name, creds in (
-            ("hermes_pkce", read_hermes_oauth_credentials()),
+            ("hermes_pkce", hermes_oauth_creds),
             ("claude_code", read_claude_code_credentials()),
         ):
             if creds and creds.get("accessToken"):
@@ -2588,6 +2632,63 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                         "label": label_from_token(creds.get("accessToken", ""), source_name),
                     },
                 )
+
+        # Older dashboard logins mirrored the one file-backed PKCE grant into
+        # a second manual:dashboard_pkce row. Anthropic refresh tokens rotate
+        # on use, so two rows must never retain the same underlying grant.
+        # Collapse that legacy pair while preserving whichever pool row has
+        # the latest expiry; on a tie prefer the dashboard row because the
+        # file-backed row may just have been re-seeded from stale disk state.
+        if hermes_oauth_creds and "hermes_pkce" in active_sources:
+            shared_sources = {"hermes_pkce", "manual:dashboard_pkce"}
+            candidates = [
+                entry for entry in entries if entry.source in shared_sources
+            ]
+            if len(candidates) > 1:
+
+                def _pkce_freshness(item: PooledCredential) -> Tuple[int, int]:
+                    try:
+                        expires = int(item.expires_at_ms or 0)
+                    except (TypeError, ValueError):
+                        expires = 0
+                    return expires, int(item.source == "manual:dashboard_pkce")
+
+                winner = max(candidates, key=_pkce_freshness)
+                canonical = next(
+                    item for item in candidates if item.source == "hermes_pkce"
+                )
+                merged = replace(
+                    winner,
+                    id=canonical.id,
+                    source="hermes_pkce",
+                    priority=canonical.priority,
+                )
+                collapsed = []
+                inserted = False
+                for item in entries:
+                    if item.source not in shared_sources:
+                        collapsed.append(item)
+                    elif not inserted:
+                        collapsed.append(merged)
+                        inserted = True
+                entries[:] = collapsed
+                changed = True
+
+                if (
+                    winner.access_token != hermes_oauth_creds.get("accessToken")
+                    or winner.refresh_token != hermes_oauth_creds.get("refreshToken")
+                    or winner.expires_at_ms != hermes_oauth_creds.get("expiresAt")
+                ):
+                    try:
+                        _write_hermes_oauth_credentials(
+                            winner.access_token,
+                            winner.refresh_token or "",
+                            int(winner.expires_at_ms or 0),
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to repair stale Hermes PKCE singleton: %s", exc
+                        )
 
     elif provider == "nous":
         state = _load_provider_state(auth_store, "nous")

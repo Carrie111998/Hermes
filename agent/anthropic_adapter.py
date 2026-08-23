@@ -1556,6 +1556,24 @@ def _get_hermes_oauth_file() -> Path:
     return get_hermes_home() / ".anthropic_oauth.json"
 
 
+def _write_hermes_oauth_credentials(
+    access_token: str, refresh_token: str, expires_at_ms: int
+) -> None:
+    """Atomically persist the rotating Hermes-managed PKCE grant."""
+    from utils import atomic_json_write
+
+    atomic_json_write(
+        _get_hermes_oauth_file(),
+        {
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "expiresAt": expires_at_ms,
+        },
+        indent=2,
+        mode=0o600,
+    )
+
+
 def _generate_pkce() -> tuple:
     """Generate PKCE code_verifier and code_challenge (S256)."""
     import base64

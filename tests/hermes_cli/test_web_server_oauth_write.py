@@ -6,13 +6,20 @@ from hermes_cli.web_server import _save_anthropic_oauth_creds
 
 
 class _DummyPool:
-    def entries(self):
-        return []
+    def __init__(self, entries=None):
+        self._entries = list(entries or [])
+        self.removed = []
+        self.added = []
 
-    def remove_entry(self, _id):
+    def entries(self):
+        return list(self._entries)
+
+    def remove_entry(self, entry_id):
+        self.removed.append(entry_id)
         return None
 
-    def add_entry(self, _entry):
+    def add_entry(self, entry):
+        self.added.append(entry)
         return None
 
 
@@ -56,3 +63,23 @@ def test_dashboard_oauth_write_uses_atomic_json_write_with_owner_only_mode(oauth
     assert calls.get('mode') == 0o600, \
         'OAuth creds must be written 0o600 atomically (no chmod-after-replace window)'
     assert oauth_file.exists()
+
+
+def test_dashboard_oauth_write_reuses_file_seeded_pool_identity(
+    oauth_file, monkeypatch
+):
+    from types import SimpleNamespace
+
+    canonical = SimpleNamespace(id="canonical", source="hermes_pkce")
+    duplicate = SimpleNamespace(id="duplicate", source="manual:dashboard_pkce")
+    pool = _DummyPool([canonical, duplicate])
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool", lambda _provider: pool
+    )
+
+    _save_anthropic_oauth_creds("access-token", "refresh-token", 123456)
+
+    assert pool.removed == ["canonical", "duplicate"]
+    assert len(pool.added) == 1
+    assert pool.added[0].source == "hermes_pkce"
+    assert pool.added[0].refresh_token == "refresh-token"
