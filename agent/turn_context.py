@@ -1224,6 +1224,7 @@ def build_turn_context(
                 _routed_provider = str(r.get("provider") or "").strip() or ""
                 break
         if _routed_model and _routed_model != getattr(agent, "model", ""):
+            _was_model = getattr(agent, "model", "?") or "?"
             _cur_provider = getattr(agent, "provider", "") or ""
             _provider_changed = bool(_routed_provider) and (
                 _routed_provider.strip().lower() != _cur_provider.strip().lower()
@@ -1265,7 +1266,7 @@ def build_turn_context(
                             "pre_llm_call routed answerer to model=%s provider=%s (was %s; provider change)",
                             _res.new_model or _routed_model,
                             _res.target_provider or _routed_provider,
-                            getattr(agent, "model", "?"),
+                            _was_model,
                         )
                 else:
                     agent.switch_model(
@@ -1278,7 +1279,7 @@ def build_turn_context(
                     logger.info(
                         "pre_llm_call routed answerer to model=%s provider=%s (was %s; same provider)",
                         _routed_model, _routed_provider or _cur_provider,
-                        getattr(agent, "model", "?"),
+                        _was_model,
                     )
             except Exception as _route_exc:
                 logger.warning("pre_llm_call model route failed: %s", _route_exc)
