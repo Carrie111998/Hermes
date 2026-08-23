@@ -9241,18 +9241,18 @@ def _messaging_platform_payload(
         "error_code": error_code,
         "error_message": error_message,
         "updated_at": (
-                    runtime_platform.get("updated_at")
-                    if isinstance(runtime_platform, dict)
-                    else None
-                ),
-                "live_health": (
-                    runtime_platform.get("live_health")
-                    if isinstance(runtime_platform, dict)
-                    else None
-                ),
-                "home_channel": home_channel,
-                "env_vars": env_vars,
-            }
+            runtime_platform.get("updated_at")
+            if isinstance(runtime_platform, dict)
+            else None
+        ),
+        "live_health": (
+            runtime_platform.get("live_health")
+            if isinstance(runtime_platform, dict)
+            else None
+        ),
+        "home_channel": home_channel,
+        "env_vars": env_vars,
+    }
     if whatsapp_setup is not None:
         payload["whatsapp_setup"] = whatsapp_setup
     return payload

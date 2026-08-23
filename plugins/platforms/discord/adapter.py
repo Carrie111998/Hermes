@@ -155,6 +155,8 @@ from gateway.platforms.helpers import (
     convert_table_to_bullets,
 )
 from utils import atomic_json_write, env_float, env_int
+from gateway.status import write_platform_live_health
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -1996,8 +1998,6 @@ class DiscordAdapter(BasePlatformAdapter):
             # Persist live health data so gateway_state.json reflects the
             # most recent probe outcome for external monitoring.
             try:
-                from gateway.status import write_platform_live_health
-
                 health_record: dict = {
                     "websocket_state": reason,
                     "healthy": healthy,
@@ -2009,7 +2009,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     health_record["ack_age"] = details["ack_age"]
                 write_platform_live_health("discord", health_record)
             except Exception:
-                logger.debug(
+                logger.warning(
                     "[%s] Failed to persist liveness health record",
                     self.name,
                     exc_info=True,
@@ -2189,6 +2189,20 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        # Write a terminal health record so monitoring sees the adapter
+        # as disconnected rather than stale-healthy.
+        try:
+            write_platform_live_health("discord", {
+                "websocket_state": "disconnected",
+                "healthy": False,
+                "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            })
+        except Exception:
+            logger.warning(
+                "[%s] Failed to write terminal health record on disconnect",
+                self.name,
+                exc_info=True,
+            )
         # Clean up all active voice connections *before* cancelling the bot task.
         # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
         # VoiceClient.disconnect() sends a voice state update over the main
@@ -2201,7 +2215,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
-
         # Cancel the bot task before closing the client.  If connect() timed out
         # and returned False, the background client.start() task may still be
         # running; calling client.close() alone is not enough to stop it because
