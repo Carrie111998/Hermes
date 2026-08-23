@@ -148,7 +148,10 @@ describe('PluginsSettings', () => {
       { ...legacyRow, name: 'deepinfra', key: 'image_gen/deepinfra', source: 'bundled' },
       { ...legacyRow, name: 'discord', key: 'platforms/discord', source: 'bundled' },
       { ...legacyRow, name: 'fal-video', key: 'video_gen/fal', source: 'bundled' },
-      { ...legacyRow, name: 'exa', key: 'web/exa', source: 'bundled' }
+      { ...legacyRow, name: 'exa', key: 'web/exa', source: 'bundled' },
+      { ...legacyRow, name: 'spotify', key: 'spotify', source: 'bundled' },
+      { ...legacyRow, name: 'google-meet', key: 'google_meet', source: 'bundled' },
+      { ...legacyRow, name: 'langfuse', key: 'observability/langfuse', source: 'bundled' }
     ])
 
     renderSettings()
@@ -163,6 +166,9 @@ describe('PluginsSettings', () => {
     expect(screen.queryByText('discord')).toBeNull()
     expect(screen.queryByText('fal-video')).toBeNull()
     expect(screen.queryByText('exa')).toBeNull()
+    expect(screen.queryByText('spotify')).toBeNull()
+    expect(screen.queryByText('google-meet')).toBeNull()
+    expect(screen.queryByText('langfuse')).toBeNull()
     // Count pill reflects the filtered list, not the raw RPC row count.
     expect(screen.getByText('3 installed', { exact: false })).toBeTruthy()
   })

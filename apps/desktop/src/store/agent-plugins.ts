@@ -39,12 +39,15 @@ export const $agentPluginsError = atom<string | null>(null)
 /** Best available address of the row whose toggle RPC is in flight. */
 export const $agentPluginBusy = atom<string | null>(null)
 
-// Rows the Plugins page actually lists (and search should surface): user
-// plugins plus general bundled plugins such as disk-cleanup and
-// security-guidance. Category plugins stay on the settings surfaces that own
-// their configuration. Key-prefix ownership works for keyed rows regardless
-// of source. Keyless legacy rows remain visible and read-only because their
-// owning surface cannot be inferred — same stance as desktop-slash-commands.
+// Rows the Plugins page actually lists (and search should surface). Bundled
+// plugins fail closed: only explicitly curated lifecycle plugins belong here;
+// tool-owned and dedicated-surface bundles stay hidden even when their keys do
+// not use a known category prefix. Non-bundled keyed rows retain the prefix
+// fallback for older backends. Keyless legacy rows remain visible and read-only
+// because their owning surface cannot be inferred — same stance as
+// desktop-slash-commands.
+const DESKTOP_BUNDLED_PLUGIN_KEYS = new Set(['disk-cleanup', 'security-guidance'])
+
 const HIDDEN_KEY_PREFIXES = [
   'browser/',
   'cron_providers/',
@@ -58,6 +61,10 @@ const HIDDEN_KEY_PREFIXES = [
 
 export const isDesktopRelevantPlugin = (row: AgentPluginRow): boolean => {
   const key = row.key
+
+  if (row.source === 'bundled') {
+    return Boolean(key && DESKTOP_BUNDLED_PLUGIN_KEYS.has(key))
+  }
 
   return !key || !HIDDEN_KEY_PREFIXES.some(prefix => key.startsWith(prefix))
 }
