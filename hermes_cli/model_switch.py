@@ -3031,6 +3031,23 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Anthropic external creds check failed: %s", exc)
+        # Azure Foundry can be configured for keyless Microsoft Entra ID
+        # authentication.  Its runtime credential is a callable, so neither
+        # the API-key env check nor the credential-pool checks above can see
+        # it.  Use the provider's structural status helper here: it verifies
+        # the active Foundry/Entra configuration and SDK availability without
+        # minting or serializing a bearer token.
+        if not has_creds and hermes_slug == "azure-foundry":
+            try:
+                from hermes_cli.auth import _get_azure_foundry_auth_status
+
+                azure_auth = _get_azure_foundry_auth_status()
+                has_creds = bool(
+                    azure_auth.get("logged_in")
+                    and azure_auth.get("auth_mode") == "entra_id"
+                )
+            except Exception as exc:
+                logger.debug("Azure Foundry Entra eligibility check failed: %s", exc)
         if not has_creds:
             continue
 

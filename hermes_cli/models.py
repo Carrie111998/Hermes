@@ -4066,11 +4066,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     # honours BOTH API-key and keyless Microsoft Entra ID auth and always
     # targets the same resource inference will hit. For ``auth_mode:
     # entra_id`` the resolver returns a callable token provider (not a
-    # string), which the probe accepts via ``token_provider=``. Any failure
-    # (missing credentials, azure-identity not installed, network error,
-    # empty list) falls through silently to the static ``[]`` — no behaviour
-    # change when Azure Foundry is not configured.
+    # string), which the probe accepts via ``token_provider=``. A configured
+    # default deployment remains selectable when the advisory /models probe
+    # is empty or unavailable: discovery must never erase a working route.
     if normalized == "azure-foundry":
+        model_cfg = _get_model_config_dict()
+        configured_default = ""
+        if str(model_cfg.get("provider") or "").strip().lower() == "azure-foundry":
+            configured_default = str(model_cfg.get("default") or "").strip()
         try:
             from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
             from hermes_cli.azure_detect import _probe_openai_models
@@ -4078,7 +4081,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
             runtime = _resolve_azure_foundry_runtime(
                 requested_provider="azure-foundry",
-                model_cfg=_get_model_config_dict(),
+                model_cfg=model_cfg,
             )
             base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
             credential = runtime.get("api_key")
@@ -4090,9 +4093,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 else:
                     ok, ids = _probe_openai_models(base_url, str(credential))
                 if ok and ids:
-                    return ids
+                    return list(dict.fromkeys([*ids, *([configured_default] if configured_default else [])]))
+            if configured_default:
+                return [configured_default]
         except Exception:
-            pass
+            # Discovery is advisory. A valid configured deployment is enough to
+            # keep the provider selectable while the endpoint is unavailable.
+            if configured_default:
+                return [configured_default]
     # Bedrock uses live discovery keyed by the resolved AWS region so that
     # EU/AP users see eu.*/ap.* model IDs instead of the static us.* list.
     # Note: early return intentionally skips _MODELS_DEV_PREFERRED merge
