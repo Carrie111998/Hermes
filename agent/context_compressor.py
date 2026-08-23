@@ -2805,8 +2805,16 @@ class ContextCompressor(ContextEngine):
         self._apply_threshold_tokens_cap()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
-        self.tail_token_budget = target_tokens
+        # Lean mode derives its clamped [10K, 25K] band from context_length
+        # inside the tail_token_budget property — reset the cache so it
+        # re-derives for the new window instead of being clobbered by the
+        # ratio-based formula below (which would silently revert lean to a
+        # legacy-sized tail on every model switch/fallback). (#compaction-v2)
+        if getattr(self, "tail_mode", "legacy") == "lean":
+            self._tail_token_budget = None
+        else:
+            target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+            self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
