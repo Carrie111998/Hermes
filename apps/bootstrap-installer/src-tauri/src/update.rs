@@ -408,22 +408,6 @@ fn strict_marker_state(path: &Path) -> StrictMarkerState {
     }
 }
 
-/// Compatibility observation returning a live owner, if any. Mutation paths
-/// use `strict_marker_state` so unreadable/malformed state cannot look absent.
-///
-/// Self-PID is returned so `acquire` can adopt the desktop's pre-written claim
-/// without refreshing its acquisition time (#74761). A foreign live pid (e.g.
-/// a dashboard-spawned `hermes update`) still blocks.
-fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
-    // The owner refreshes this lease every 30s. A confirmed-live PID remains
-    // authoritative after suspend, clock jumps, or heartbeat trouble: safety
-    // beats the rare liveness cost of a recycled PID retaining the marker.
-    match strict_marker_state(path) {
-        StrictMarkerState::Live(owner) => Some(owner),
-        _ => None,
-    }
-}
-
 /// True when a process with `pid` currently exists.
 #[cfg(windows)]
 fn pid_is_alive(pid: u32) -> bool {

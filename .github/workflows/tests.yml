@@ -126,6 +126,11 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e:
+    # The E2E suite includes a systemd witness that runs checked-out code via
+    # sudo. Do not run that root-gated path for fork pull requests; same-repo
+    # pull requests and non-PR triggers remain trusted. The native Linux test
+    # job above is intentionally unaffected.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

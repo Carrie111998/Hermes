@@ -70,7 +70,14 @@ jobs:
             apps/bootstrap-installer/src-tauri/target
           key: cargo-${{ runner.os }}-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml') }}
 
-      # --lib only: the integration/bin targets would need a built frontend
-      # (vite dist) that this lane deliberately does not produce.
+      # Keep integration tests out: they need a built frontend (vite dist) that
+      # this lane deliberately does not produce. Include --bins so the
+      # [[bin]] Hermes-Setup target is compiled and its test harness is covered
+      # alongside the library target.
+      #
+      # The Rust tests cover the marker wire format and ownership fencing used
+      # by Python/Electron. A live cross-language mutex-interoperability test is
+      # not part of this lane yet; keep that gap explicit rather than implying
+      # that the Rust-only run proves the full protocol.
       - name: cargo test
-        run: cargo test --lib
+        run: cargo test --lib --bins

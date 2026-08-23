@@ -16,6 +16,7 @@
 //! writes to one place and the installer reads from another, breaking
 //! the bootstrap-complete check.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -92,14 +93,12 @@ pub fn update_in_progress_marker() -> PathBuf {
 
 /// Named profile homes share one checkout under the containing Hermes root.
 /// Keep their update marker install-wide so Rust, Python, and Electron cannot
-/// acquire independent claims while mutating that same tree. Windows path
-/// components are case-insensitive, so accept any ASCII casing of `profiles`
-/// here as well; otherwise Rust can disagree with Electron about marker scope.
+/// acquire independent claims while mutating that same tree.
 fn install_hermes_root(home: &Path) -> PathBuf {
     if home
         .parent()
         .and_then(Path::file_name)
-        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("profiles"))
+        .is_some_and(is_profiles_dir)
     {
         return home
             .parent()
@@ -108,6 +107,16 @@ fn install_hermes_root(home: &Path) -> PathBuf {
             .to_path_buf();
     }
     home.to_path_buf()
+}
+
+#[cfg(target_os = "windows")]
+fn is_profiles_dir(name: &OsStr) -> bool {
+    name.to_string_lossy().eq_ignore_ascii_case("profiles")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_profiles_dir(name: &OsStr) -> bool {
+    name == OsStr::new("profiles")
 }
 
 /// Copy the currently-running installer binary to `installer_dest()` so it's
@@ -241,20 +250,26 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn named_profiles_share_the_install_hermes_root_across_path_casing() {
+    fn named_profiles_share_the_install_hermes_root() {
         let root = Path::new("root");
-        for profiles_dir in ["profiles", "Profiles", "PROFILES"] {
-            assert_eq!(
-                install_hermes_root(&root.join(profiles_dir).join("alpha")),
-                root,
-                "profile root should be install-wide for {profiles_dir}"
-            );
-            assert_eq!(
-                install_hermes_root(&root.join(profiles_dir).join("beta")),
-                root,
-                "profile root should be install-wide for {profiles_dir}"
-            );
-        }
+        assert_eq!(
+            install_hermes_root(&root.join("profiles").join("alpha")),
+            root
+        );
+        assert_eq!(
+            install_hermes_root(&root.join("profiles").join("beta")),
+            root
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn named_profiles_share_the_install_hermes_root_case_insensitively_on_windows() {
+        let root = Path::new("root");
+        assert_eq!(
+            install_hermes_root(&root.join("Profiles").join("alpha")),
+            root
+        );
     }
 
     #[test]
