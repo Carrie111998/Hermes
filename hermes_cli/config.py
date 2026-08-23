@@ -4064,11 +4064,17 @@ def invalidate_env_cache() -> None:
 
 
 def _sanitize_env_lines(lines: list) -> list:
-    """Normalize .env line endings without changing assignment semantics.
+    """Normalize .env line endings; drop masked-secret placeholder lines.
 
     Content after the first ``=`` is opaque value data. A known variable name
     embedded in that value must never be reinterpreted as another assignment;
     concatenated assignments are ambiguous and therefore remain on one line.
+
+    One deliberate exception: an assignment whose *complete* value is the
+    ``***`` mask (optionally quoted) is a placeholder echoed by masked
+    secret displays, not a credential. Copy-pasting such a display block
+    into .env must not install ``"***"`` as a live value, so those lines
+    are dropped entirely. Values merely containing the mask pass through.
     """
     sanitized: list[str] = []
     for line in lines:
@@ -4079,6 +4085,11 @@ def _sanitize_env_lines(lines: list) -> list:
         if not stripped or stripped.startswith("#"):
             sanitized.append(raw + "\n")
             continue
+
+        if "=" in stripped:
+            _, _, value = stripped.partition("=")
+            if value.strip().strip("\"'") == "***":
+                continue
 
         sanitized.append(stripped + "\n")
 

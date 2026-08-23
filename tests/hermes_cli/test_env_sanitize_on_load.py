@@ -84,3 +84,79 @@ def test_env_loader_does_not_split_concatenated_text():
         assert parsed_token == f"{token}ANTHROPIC_API_KEY=sk-ant-test"
     finally:
         env_path.unlink(missing_ok=True)
+
+
+def test_load_env_drops_lone_mask_placeholder_line():
+    """A KEY=*** line is a pasted masked display, not a credential.
+
+    Masked secret output echoes ``***``; copying that block into .env must
+    not install the literal mask as a live value.
+    """
+    import os
+
+    from hermes_cli.config import load_env
+
+    content = "ANTHROPIC_API_KEY=***\nOPENAI_API_KEY=sk-real\n"
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".env", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(content)
+        env_path = Path(f.name)
+
+    try:
+        with patch("hermes_cli.config.get_env_path", return_value=env_path):
+            result = load_env()
+        assert "ANTHROPIC_API_KEY" not in result
+        assert result["OPENAI_API_KEY"] == "sk-real"
+    finally:
+        env_path.unlink(missing_ok=True)
+        os.environ.pop("OPENAI_API_KEY", None)
+
+
+def test_load_env_drops_quoted_mask_placeholder():
+    """Quoted variants of the mask (KEY=\"***\") are placeholders too."""
+    from hermes_cli.config import load_env
+
+    content = 'TELEGRAM_BOT_TOKEN="***"\n'
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".env", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(content)
+        env_path = Path(f.name)
+
+    try:
+        with patch("hermes_cli.config.get_env_path", return_value=env_path):
+            result = load_env()
+        assert "TELEGRAM_BOT_TOKEN" not in result
+    finally:
+        env_path.unlink(missing_ok=True)
+
+
+def test_sanitize_keeps_values_merely_containing_mask():
+    """Only a *complete* *** value is a placeholder — substrings stay."""
+    from hermes_cli.config import _sanitize_env_lines
+
+    lines = [
+        "SECRET_KEY=abc***def\n",
+        "MASKED_IN_MIDDLE=x***y=z\n",
+        "# note: *** in comment stays\n",
+        "\n",
+        "REAL_KEY=value\n",
+    ]
+    out = _sanitize_env_lines(lines)
+    assert out == lines
+
+
+def test_sanitize_drops_only_placeholder_entries():
+    """partition('=') semantics: empty values and suffixed keys survive."""
+    from hermes_cli.config import _sanitize_env_lines
+
+    lines = [
+        "EMPTY_KEY=\n",
+        "KNOWN=value=***\n",
+        "GONE=***\n",
+    ]
+    out = _sanitize_env_lines(lines)
+    assert out == ["EMPTY_KEY=\n", "KNOWN=value=***\n"]
