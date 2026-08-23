@@ -21,6 +21,13 @@ function connectionCacheKey(connection: HermesConnection | null) {
     return 'local:'
   }
 
+  // A profile belongs to a registry connection, not the whole Desktop. Prefer
+  // the stable registry id so two backends exposing the same profile/path never
+  // share filesystem/gitignore cache entries during a connection switch.
+  if (connection.connectionId) {
+    return `connection:${connection.connectionId}:${connection.profile || ''}`
+  }
+
   const target =
     connection.remoteKind === 'ssh'
       ? connection.remoteIdentity || connection.remoteHost || ''
@@ -58,9 +65,16 @@ function bridge() {
 }
 
 function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  return bridge().api<T>(
-    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
-  )
+  const connectionId = $connection.get()?.connectionId
+
+  const request = {
+    ...(body ? { body, method: 'POST' as const } : {}),
+    ...(connectionId ? { connectionId } : {}),
+    path,
+    profile: desktopFsProfile()
+  }
+
+  return bridge().api<T>(request)
 }
 
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {
