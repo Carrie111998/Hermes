@@ -25,11 +25,17 @@ class _FakeAgent:
         self.calls = []
         self.model = "old/model"
         self.provider = "openrouter"
+        self.reasoning_config = {"enabled": True, "effort": "medium"}
+        self._primary_runtime = {
+            "reasoning_config": {"enabled": True, "effort": "medium"}
+        }
 
     def switch_model(self, **kwargs):
         self.calls.append(kwargs)
         self.model = kwargs["new_model"]
         self.provider = kwargs["new_provider"]
+        self.reasoning_config = {"enabled": False}
+        self._primary_runtime["reasoning_config"] = dict(self.reasoning_config)
 
 
 class _StubCLI:
@@ -46,6 +52,7 @@ class _StubCLI:
     _pending_model_switch_note = None
     _pending_one_turn_model_restore = None
     _app = None
+    reasoning_config = {"enabled": True, "effort": "medium"}
 
     def _confirm_expensive_model_switch(self, result):
         return True
@@ -132,6 +139,7 @@ def test_confirm_runs_off_main_thread_when_tui_present(monkeypatch):
     assert stub.model == "claude-sonnet-4.6"
     assert stub.provider == "anthropic"
     assert stub.agent.calls[-1]["new_model"] == "claude-sonnet-4.6"
+    assert stub.reasoning_config == {"enabled": False}
 
 
 def test_confirm_stays_synchronous_without_app(monkeypatch):
@@ -159,3 +167,27 @@ def test_confirm_stays_synchronous_without_app(monkeypatch):
     assert called_on.get("is_main") is True
     assert stub.model == "claude-sonnet-4.6"
     assert stub.provider == "anthropic"
+    assert stub.reasoning_config == {"enabled": False}
+
+
+def test_switch_before_agent_init_resolves_target_model_override(monkeypatch):
+    """A /model command can be the first interaction in a CLI session."""
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.agent = None
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"qwen3-coder:30b": "none"},
+            }
+        },
+    )
+
+    cli_mod.HermesCLI._sync_reasoning_config_after_model_switch(
+        stub, "qwen3-coder:30b"
+    )
+
+    assert stub.reasoning_config == {"enabled": False}
