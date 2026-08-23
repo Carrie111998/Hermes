@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import os
 from pathlib import Path
 import signal
+import sqlite3
 
 import pytest
 
@@ -130,6 +131,98 @@ def test_purge_flushes_pending_token_accounting_before_final_recheck(
         assert row is not None
         assert row["source"] == "cli"
         assert row["input_tokens"] == 7
+    finally:
+        db.close()
+
+
+def test_purge_tombstone_blocks_cross_instance_session_resurrection(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    archive_root = tmp_path / "archive"
+    purge_db = SessionDB(db_path)
+    late_writer = SessionDB(db_path)
+    try:
+        purge_db.create_session("root", source="cli")
+        purge_db.append_message("root", role="user", content="first")
+        purge_db.end_session("root", "compression")
+        purge_db.create_session(
+            "terminal", source="cli", parent_session_id="root"
+        )
+        purge_db.append_message("terminal", role="user", content="stored")
+        purge_db.end_session("terminal", "completed")
+        assert purge_db.set_session_archived("terminal", True)
+        store_archived_lineage(purge_db, "terminal", archive_root)
+
+        purged = purge_archived_lineage(purge_db, "terminal", archive_root)
+        assert purge_db.get_session("root") is None
+        assert purge_db.get_session("terminal") is None
+        assert late_writer._conn is not None
+        tombstones = late_writer._conn.execute(
+            "SELECT session_id, terminal_id, source_fingerprint "
+            "FROM cold_archive_tombstones ORDER BY session_id"
+        ).fetchall()
+        assert [tuple(row) for row in tombstones] == [
+            ("root", "terminal", purged.source_fingerprint),
+            ("terminal", "terminal", purged.source_fingerprint),
+        ]
+
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            late_writer.update_token_counts(
+                "terminal",
+                input_tokens=7,
+                model="late-model",
+                billing_provider="late-provider",
+                api_call_count=1,
+            )
+        assert late_writer.get_session("terminal") is None
+
+        def _direct_insert(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                ("root", "gateway", 1.0),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            late_writer._execute_write(_direct_insert)
+        assert late_writer.get_session("root") is None
+    finally:
+        late_writer.close()
+        purge_db.close()
+
+
+def test_purge_rolls_back_tombstone_when_source_delete_fails(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="stored")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        assert db._conn is not None
+        db._conn.executescript(
+            """
+            CREATE TRIGGER force_cold_purge_delete_failure
+            BEFORE DELETE ON sessions
+            WHEN OLD.id = 'terminal'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced cold purge delete failure');
+            END;
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced cold purge"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert db.get_messages("terminal")[0]["content"] == "stored"
+        assert db._conn.execute(
+            "SELECT 1 FROM cold_archive_tombstones WHERE session_id = ?",
+            ("terminal",),
+        ).fetchone() is None
     finally:
         db.close()
 
@@ -836,6 +929,16 @@ def test_store_keeps_purged_snapshot_when_same_id_is_reused_in_new_generation(
         db._conn.commit()
         first = store_archived_lineage(db, "reused", archive_root)
         purge_archived_lineage(db, "reused", archive_root)
+
+        # Cold Purge deliberately fences this ID from implicit resurrection.
+        # Simulate a future explicit restore/new-generation authorization; v1
+        # exposes no public untombstone operation.
+        untombstoned = db._conn.execute(
+            "DELETE FROM cold_archive_tombstones WHERE session_id = ?",
+            ("reused",),
+        )
+        assert untombstoned.rowcount == 1
+        db._conn.commit()
 
         db.create_session("reused", source="cli")
         db.append_message("reused", role="user", content="second generation")

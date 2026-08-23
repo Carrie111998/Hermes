@@ -1057,6 +1057,17 @@ def purge_archived_lineage(
             conn, terminal_id, archive_root
         )
 
+        deleted_at = datetime.now(UTC).timestamp()
+        conn.executemany(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                (physical_id, plan.terminal_id, plan.source_fingerprint, deleted_at)
+                for physical_id in plan.physical_ids
+            ),
+        )
+
         prompt_hashes = tuple(
             sorted(
                 {
