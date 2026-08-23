@@ -20,8 +20,10 @@ from agent.tool_guardrails import (
     IDENTICAL_RESULT_STUB_MIN_CHARS,
     STALL_GUARD_IDENTICAL_CALL_THRESHOLD,
     STALL_GUARD_REPEATABLE_TOOLS,
+    UNIQUE_OUTPUT_TOOL_NAMES,
     ToolCallGuardrailController,
     is_stall_guard_repeatable,
+    is_unique_output_tool,
 )
 
 
@@ -104,6 +106,10 @@ def test_allowlist_membership_contract():
     assert is_stall_guard_repeatable("acme_get_result")
     assert not is_stall_guard_repeatable("web_search")
     assert not is_stall_guard_repeatable("terminal")
+    assert not is_stall_guard_repeatable("text_to_speech")
+    for tool in UNIQUE_OUTPUT_TOOL_NAMES:
+        assert is_unique_output_tool(tool)
+        assert not is_stall_guard_repeatable(tool)
 
 
 def test_resets_per_turn():
@@ -394,3 +400,36 @@ def test_ignores_conversational_future_offers():
     assert not trailing_continue_intent(
         "If you want, I will happily review the PR once CI is green. Just say so!"
     )
+
+
+def test_tts_notice_fires_when_only_the_generated_path_changes():
+    c = ToolCallGuardrailController()
+    args = {"text": "hi"}
+    notices = [
+        c.observe_identical_call("text_to_speech", args, f"/cache/tts_{i}.ogg")
+        for i in range(STALL_GUARD_IDENTICAL_CALL_THRESHOLD)
+    ]
+    assert notices[0] is None
+    assert notices[1] is None
+    assert notices[2] is not None
+    assert "text_to_speech" in notices[2]
+    assert "identical arguments" in notices[2]
+    assert "same result" not in notices[2]
+
+
+def test_unique_output_notice_resets_when_args_change():
+    c = ToolCallGuardrailController()
+    for i in range(5):
+        notice = c.observe_identical_call(
+            "text_to_speech", {"text": f"line {i}"}, f"/cache/tts_{i}.ogg"
+        )
+        assert notice is None
+
+
+def test_terminal_poll_with_changing_results_still_does_not_notice():
+    c = ToolCallGuardrailController()
+    for i in range(5):
+        notice = c.observe_identical_call(
+            "terminal", {"command": "poll-status"}, f"output {i}"
+        )
+        assert notice is None
