@@ -1502,6 +1502,41 @@ def _validate_audio_file_size(audio_path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _remux_with_ffmpeg(file_path: str) -> Optional[str]:
+    """Best-effort recovery of a truncated audio container via ffmpeg.
+
+    Returns a path to a remuxed 16 kHz mono WAV on success, else None.
+    Uses shutil.which so any ffmpeg on PATH works (no hard dependency).
+    """
+    import shutil as _shutil
+    ffmpeg = _shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="hermes-audio-recover-", suffix=".wav", delete=False
+    )
+    tmp.close()
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-err_detect", "ignore_err",
+                "-i", file_path, "-vn", "-ar", "16000", "-ac", "1", tmp.name,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        os.unlink(tmp.name)
+        return None
+    if proc.returncode == 0 and os.path.getsize(tmp.name) > 44:
+        return tmp.name
+    try:
+        os.unlink(tmp.name)
+    except OSError:
+        pass
+    return None
+
+
 def _validate_audio_source_file(
     file_path: str,
     *,
@@ -1977,8 +2012,30 @@ def _transcribe_local(
             transcribe_kwargs["initial_prompt"] = prompt
 
         try:
-            segments, info = model.transcribe(file_path, **transcribe_kwargs)
-            transcript = _join_confident_segments(segments, local_config)
+            try:
+                segments, info = model.transcribe(file_path, **transcribe_kwargs)
+                transcript = _join_confident_segments(segments, local_config)
+            except (EOFError, OSError, ValueError) as exc:
+                # Truncated/empty recordings (e.g. the desktop voice recorder
+                # stopped before flushing the WebM container) surface here as
+                # ``av.error.EOFError [Errno 541478725] End of file`` or
+                # ``OSError(5, 'I/O error')``. Try an ffmpeg remux first; if
+                # even ffmpeg cannot read it, treat as silence so live voice
+                # loops re-listen instead of showing a failure toast.
+                recovered = _remux_with_ffmpeg(file_path)
+                if not recovered:
+                    logger.warning(
+                        "Audio %s is truncated/unreadable (%s) — treating as silence.",
+                        Path(file_path).name, exc,
+                    )
+                    return {
+                        "success": True,
+                        "transcript": "",
+                        "no_speech": True,
+                    }
+                logger.info("Retrying transcription via ffmpeg remux after decode error: %s", exc)
+                segments, info = model.transcribe(recovered, **transcribe_kwargs)
+                transcript = _join_confident_segments(segments, local_config)
         except Exception as exc:
             # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
             # AFTER the model loaded successfully.  Evict the broken cached
