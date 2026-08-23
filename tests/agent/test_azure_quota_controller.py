@@ -18,7 +18,7 @@ class Clock:
 
 
 def controller(tmp_path, clock, **kw):
-    return AzureQuotaController(tmp_path / "quota.db", hard_cap=1_000_000,
+    return AzureQuotaController(tmp_path / "quota.db", hard_cap=200_000,
                                 clock=clock.time, sleeper=clock.sleep, **kw)
 
 
@@ -41,32 +41,34 @@ def test_final_native_send_owner_clamps_chat_and_responses_payloads():
 
 
 def test_header_ceiling_reduces_and_malformed_is_ignored():
-    assert ceiling_from_headers({"X-RateLimit-Limit-Tokens": "1000000"}, 900_000) == 800_000
-    assert ceiling_from_headers({"x-ratelimit-limit-tokens": "500000"}, 900_000) == 400_000
-    assert ceiling_from_headers({"x-ratelimit-limit-tokens": "nope"}, 900_000) is None
+    assert ceiling_from_headers({"X-RateLimit-Limit-Tokens": "200000"}, 180_000) == 160_000
+    assert ceiling_from_headers({"x-ratelimit-limit-tokens": "100000"}, 180_000) == 80_000
+    assert ceiling_from_headers({"x-ratelimit-limit-tokens": "nope"}, 180_000) is None
 
 
-def test_terra_luna_are_distinct_and_bucket_uses_deployment():
-    terra, tq = quota_identity("https://example.services.ai.azure.com", "terra-prod")
-    luna, lq = quota_identity("https://example.services.ai.azure.com", "luna-prod")
-    assert tq == "terra" and lq == "luna" and terra != luna
-    assert "example" not in terra and "prod" not in luna
+def test_distinct_deployments_have_distinct_private_buckets_and_queues():
+    first_bucket, first_queue = quota_identity("https://example.services.ai.azure.com", "deployment-a")
+    second_bucket, second_queue = quota_identity("https://example.services.ai.azure.com", "deployment-b")
+    assert first_bucket == first_queue
+    assert second_bucket == second_queue
+    assert first_bucket != second_bucket
+    assert "example" not in first_bucket and "deployment" not in second_bucket
 
 
 def test_atomic_admission_generation_replay_reconcile_and_privacy(tmp_path):
     clock = Clock(); ctl = controller(tmp_path, clock)
     payload = {"messages": [{"role": "user", "content": "private prompt"}], "tools": [{"secret": "key"}]}
-    a = ctl.admit(base_url="https://private.services.ai.azure.com", deployment="terra-one",
+    a = ctl.admit(base_url="https://private.services.ai.azure.com", deployment="deployment-a",
                   request_class="title", requested_output=100, payload=payload, request_identity="same")
     assert a.generation == 1 and a.reserved_tokens >= 100
     with pytest.raises(AzureQuotaError, match="replay_refused"):
-        ctl.admit(base_url="https://private.services.ai.azure.com", deployment="terra-one",
+        ctl.admit(base_url="https://private.services.ai.azure.com", deployment="deployment-a",
                   request_class="title", payload=payload, request_identity="same")
-    ctl.reconcile(a, usage_tokens=42, headers={"x-ratelimit-limit-tokens": "500000"})
+    ctl.reconcile(a, usage_tokens=42, headers={"x-ratelimit-limit-tokens": "100000"})
     with ctl._connect() as db:
         receipt = db.execute("select body from receipts").fetchone()[0]
         ceiling = db.execute("select ceiling from buckets").fetchone()[0]
-    assert ceiling == 400_000
+    assert ceiling == 80_000
     assert "private prompt" not in receipt and "secret" not in receipt and "private.services" not in receipt
     assert json.loads(receipt)["no_fallback"] is True
 
@@ -74,16 +76,16 @@ def test_atomic_admission_generation_replay_reconcile_and_privacy(tmp_path):
 def test_queue_wait_cancellation_and_stale_recovery(tmp_path):
     clock = Clock(); ctl = AzureQuotaController(tmp_path / "q.db", hard_cap=300,
         max_wait=1, stale_after=.2, clock=clock.time, sleeper=clock.sleep)
-    first = ctl.admit(base_url="https://x.azure.com", deployment="terra", request_class="title",
+    first = ctl.admit(base_url="https://x.azure.com", deployment="deployment-a", request_class="title",
                       requested_output=256, payload={}, request_identity="one")
     calls = 0
     def cancelled():
         nonlocal calls; calls += 1; return calls > 2
     with pytest.raises(AzureQuotaError, match="cancelled_pre_send"):
-        ctl.admit(base_url="https://x.azure.com", deployment="terra", request_class="title",
+        ctl.admit(base_url="https://x.azure.com", deployment="deployment-a", request_class="title",
                   requested_output=256, payload={}, request_identity="two", cancelled=cancelled)
     clock.now += 61
-    second = ctl.admit(base_url="https://x.azure.com", deployment="terra", request_class="title",
+    second = ctl.admit(base_url="https://x.azure.com", deployment="deployment-a", request_class="title",
                        requested_output=256, payload={}, request_identity="three")
     assert second.generation > first.generation
     ctl.reconcile(second, usage_tokens=None, cancelled=True)
@@ -104,7 +106,7 @@ def test_retry_precedence_and_five_attempt_lifecycle():
 def test_mutation_guards_fail_if_comparisons_are_weakened(tmp_path):
     clock = Clock(); ctl = controller(tmp_path, clock)
     with pytest.raises(AzureQuotaError, match="reservation_exceeds_hard_cap"):
-        ctl.admit(base_url="https://x.azure.com", deployment="terra", request_class="primary",
-                  payload={"blob": "x" * 2_000_000})
+        ctl.admit(base_url="https://x.azure.com", deployment="deployment-a", request_class="primary",
+                  payload={"blob": "x" * 500_000})
     with pytest.raises(AzureQuotaError, match="invalid_output_ceiling"):
         trusted_output_ceiling("title", True)
