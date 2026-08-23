@@ -237,6 +237,84 @@ def test_creates_ccd_registry_record_for_visible_mirror(db, tmp_path) -> None:
     assert record["permissionMode"] == "default"
 
 
+def test_recently_active_mirror_registers_unarchived(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    worker = ClaudeMirrorFloatWorker(
+        store,
+        min_interval_seconds=900.0,
+        registry_root=registry,
+        wall_clock=lambda: 6_000.0,
+    )
+
+    result = worker.run_once()
+
+    assert result["registered"] == 1
+    record = _registry_records(registry)[0]
+    # A source active within the recency window surfaces directly in the
+    # sidebar; only historical backfill lands archived.
+    assert record["isArchived"] is False
+
+
+def test_stale_mirror_registers_archived(db, tmp_path) -> None:
+    from session_bridge.mirror_float import _RECENT_UNARCHIVED_SECONDS
+
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    worker = ClaudeMirrorFloatWorker(
+        store,
+        min_interval_seconds=900.0,
+        registry_root=registry,
+        wall_clock=lambda: 5_000.0 + _RECENT_UNARCHIVED_SECONDS + 1.0,
+    )
+
+    result = worker.run_once()
+
+    assert result["registered"] == 1
+    assert _registry_records(registry)[0]["isArchived"] is True
+
+
+def test_float_update_preserves_manual_unarchive(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    identity, _ = _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    record_path = registry / f"local_{identity.claude_uuid}.json"
+    record_path.write_text(
+        json.dumps(
+            {
+                "sessionId": f"local_{identity.claude_uuid}",
+                "cliSessionId": identity.claude_uuid,
+                "lastActivityAt": 1_000,
+                "isArchived": False,
+                "title": "kept",
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    )
+
+    worker.run_once()
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    # The float path only advances lastActivityAt; an operator's (or the
+    # recency rule's) unarchived state must survive subsequent cycles.
+    assert record["lastActivityAt"] == 5_000_000
+    assert record["isArchived"] is False
+
+
 def test_registry_record_title_falls_back_to_cwd_not_uuid(db, tmp_path) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     identity, _ = _seed_visible_mirror(db, store, tmp_path)

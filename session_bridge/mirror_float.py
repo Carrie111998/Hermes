@@ -16,6 +16,11 @@ _BACKUP_MARKERS = (".junction-backup", ".real-", "recovery-backup")
 _REPLACE_ATTEMPTS = 3
 _REPLACE_RETRY_SECONDS = 0.05
 _CLI_SESSION_ID_PATTERN = re.compile(r'"cliSessionId"\s*:\s*"([^"]+)"')
+# Sources active within this window register UNARCHIVED so live cross-harness
+# work surfaces directly in the desktop sidebar; anything older is historical
+# backfill and lands archived (an unarchived default once buried the user's
+# real sidebar under thousands of visible imports).
+_RECENT_UNARCHIVED_SECONDS = 3 * 86_400
 
 
 def default_ccd_sessions_base() -> Path | None:
@@ -154,6 +159,7 @@ class ClaudeMirrorFloatWorker:
         id_factory: Callable[[], str] | None = None,
         run_min_interval_seconds: float = 300.0,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         interval = float(min_interval_seconds)
         if not math.isfinite(interval) or interval <= 0:
@@ -177,6 +183,7 @@ class ClaudeMirrorFloatWorker:
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self._run_min_interval_seconds = run_interval
         self._monotonic = monotonic
+        self._wall_clock = wall_clock
         self._last_run_at: float | None = None
 
     def run_once(self) -> dict[str, int]:
@@ -295,10 +302,11 @@ class ClaudeMirrorFloatWorker:
                     "createdAt": created_ms,
                     "lastActivityAt": activity_ms,
                     "model": session_row.get("model") or "claude-fable-5",
-                    # Mirrors land archived: they are imported automation
-                    # traffic, and an unarchived default once buried the user's
-                    # real sidebar under thousands of visible imports.
-                    "isArchived": True,
+                    # Recently active sources surface unarchived; historical
+                    # backfill lands archived (see _RECENT_UNARCHIVED_SECONDS).
+                    "isArchived": (
+                        self._wall_clock() - activity > _RECENT_UNARCHIVED_SECONDS
+                    ),
                     "title": title,
                     "permissionMode": "default",
                     "alwaysAllowedReasons": [],
