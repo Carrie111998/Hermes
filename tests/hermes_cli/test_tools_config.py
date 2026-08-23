@@ -18,6 +18,7 @@ from hermes_cli.tools_config import (
     _configure_provider,
     _reconfigure_provider,
     _get_platform_tools,
+    _pip_install,
     _platform_toolset_summary,
     _reconfigure_tool,
     _run_post_setup,
@@ -1219,3 +1220,62 @@ def test_explicit_plugin_toolset_admitted_against_real_a2a_plugin(monkeypatch):
         f"plugin-provided 'a2a' toolset dropped by _get_platform_tools "
         f"(Layer 2 of #81163); enabled={sorted(enabled)}"
     )
+
+
+class TestPipInstallUvEnvIsolation:
+    """Regression: _pip_install's uv tier must build its env via
+    managed_python_env(), the same third-party UV_PYTHON /
+    UV_PYTHON_INSTALL_DIR isolation the update path uses (sibling of the
+    uv-env-hijack class fixed in hermes_cli/update_cmd.py). Before the fix,
+    _pip_install built its uv env as a bare ``{**os.environ, "VIRTUAL_ENV":
+    ...}``, so a third-party UV_PYTHON / UV_PYTHON_INSTALL_DIR on the host
+    could steer a post-setup install (faster-whisper, piper-tts, ddgs,
+    langfuse) into an unintended interpreter.
+    """
+
+    def test_uv_install_env_drops_third_party_uv_python_vars(self, monkeypatch, tmp_path):
+        """A poisoned UV_PYTHON / UV_PYTHON_INSTALL_DIR on os.environ must not
+        reach the uv subprocess env; VIRTUAL_ENV must point at this venv."""
+        import os
+        import sys
+        from pathlib import Path
+
+        poisoned_dir = str(tmp_path / "hijacker" / "python")
+        poisoned_python = str(tmp_path / "hijacker" / "python" / "python.exe")
+        monkeypatch.setenv("UV_PYTHON_INSTALL_DIR", poisoned_dir)
+        monkeypatch.setenv("UV_PYTHON", poisoned_python)
+        monkeypatch.setenv("UV_SYSTEM_PYTHON", "1")
+
+        captured = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("hermes_cli.managed_uv.ensure_uv", return_value="/fake/bin/uv"), \
+             patch("subprocess.run", side_effect=_fake_run):
+            _pip_install(["some-package"])
+
+        assert captured["cmd"][0] == "/fake/bin/uv"
+        env = captured["env"]
+        assert env is not None, "uv tier must pass an explicit env=, not inherit os.environ implicitly"
+
+        # The poisoned values must not survive into the uv subprocess env.
+        assert env.get("UV_PYTHON_INSTALL_DIR") != poisoned_dir
+        assert "hijacker" not in (env.get("UV_PYTHON_INSTALL_DIR") or "")
+        assert env.get("UV_PYTHON") is None
+        assert env.get("UV_SYSTEM_PYTHON") is None
+
+        # Managed-env pins are set (same contract as managed_python_env()).
+        assert env.get("UV_MANAGED_PYTHON") == "1"
+        assert env.get("UV_NO_CONFIG") == "1"
+
+        # VIRTUAL_ENV still points at this install's venv (sys.executable's
+        # parent.parent), unlike the third-party VIRTUAL_ENV in os.environ.
+        expected_venv_root = str(Path(sys.executable).parent.parent)
+        assert env.get("VIRTUAL_ENV") == expected_venv_root
+
+        # Sanity: the poisoned values really were on os.environ (guards the
+        # test itself against a no-op monkeypatch).
+        assert os.environ.get("UV_PYTHON_INSTALL_DIR") == poisoned_dir
