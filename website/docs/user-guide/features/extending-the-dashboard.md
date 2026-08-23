@@ -747,6 +747,17 @@ Routes are mounted under `/api/plugins/<name>/`, so the above becomes:
 - `GET  /api/plugins/my-plugin/data`
 - `POST /api/plugins/my-plugin/action`
 
+:::info One route has a fixed contract — `/steer`
+Backend routes that implement a **steer** endpoint (`POST /steer` — deliver an
+operator instruction to a kanban task via the task-comment bridge) MUST follow
+the [Steer Delivery Contract](https://github.com/NousResearch/hermes-agent/blob/main/docs/steer-delivery-contract.md):
+the status→response table (live for `running`, `deferred: true` for queued
+non-terminal tasks, 409 only for `done`/`archived`), durable comment writes,
+and no fake deliveries. This is THE contract every steer surface implements;
+core guarantees delivery. See the contract for the full semantics and the
+reference implementation (crew-mandala).
+:::
+
 Plugin API routes sit behind the dashboard's normal auth gate — unauthenticated requests get a `401` before the plugin route runs, and requests to a disabled plugin's routes are rejected at request time. Still, **don't expose the dashboard on a public interface with `--host 0.0.0.0` if you run untrusted plugins** — an authenticated session can reach their routes too.
 
 #### Accessing Hermes internals
