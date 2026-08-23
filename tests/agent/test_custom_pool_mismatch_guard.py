@@ -35,6 +35,19 @@ def _agent(provider, base_url, pool_provider):
 
 class TestCustomPoolMismatchGuard:
 
+    @staticmethod
+    def _gemini_config():
+        return [
+            (
+                "gemini-no-filter",
+                {
+                    "name": "Gemini No Filter",
+                    "provider_key": "gemini-no-filter",
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                },
+            )
+        ]
+
     def test_named_custom_provider_rotates_its_matching_pool(self):
         agent, pool = _agent(
             "gemini-no-filter",
@@ -48,20 +61,61 @@ class TestCustomPoolMismatchGuard:
         pool.current.return_value = None
         next_entry = SimpleNamespace(id="key-b", runtime_api_key="key-b")
         pool.mark_exhausted_and_rotate.return_value = next_entry
-        configured = [
-            (
-                "gemini-no-filter",
-                {
-                    "name": "Gemini No Filter",
-                    "provider_key": "gemini-no-filter",
-                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
-                },
+        with patch(
+            "agent.credential_pool._iter_custom_providers",
+            return_value=self._gemini_config(),
+        ):
+            recovered, retried = recover_with_credential_pool(
+                agent,
+                status_code=429,
+                has_retried_429=True,
+                classified_reason=FailoverReason.rate_limit,
             )
-        ]
+
+        assert recovered is True
+        assert retried is False
+        pool.mark_exhausted_and_rotate.assert_called_once()
+        agent._swap_credential.assert_called_once_with(next_entry)
+
+    def test_exact_custom_identity_requires_matching_endpoint(self):
+        agent, pool = _agent(
+            "custom:gemini-no-filter",
+            "https://fallback.example/v1",
+            "custom:gemini-no-filter",
+        )
 
         with patch(
             "agent.credential_pool._iter_custom_providers",
-            return_value=configured,
+            return_value=self._gemini_config(),
+        ):
+            recovered, retried = recover_with_credential_pool(
+                agent,
+                status_code=429,
+                has_retried_429=True,
+                classified_reason=FailoverReason.rate_limit,
+            )
+
+        assert recovered is False
+        assert retried is True
+        assert not pool.method_calls
+
+    def test_exact_custom_identity_rotates_at_matching_endpoint(self):
+        agent, pool = _agent(
+            "custom:gemini-no-filter",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "custom:gemini-no-filter",
+        )
+        agent.api_key = "key-a"
+        agent._credential_pool_entry_id = None
+        agent._swap_credential = MagicMock()
+        pool.entries.return_value = []
+        pool.current.return_value = None
+        next_entry = SimpleNamespace(id="key-b", runtime_api_key="key-b")
+        pool.mark_exhausted_and_rotate.return_value = next_entry
+
+        with patch(
+            "agent.credential_pool._iter_custom_providers",
+            return_value=self._gemini_config(),
         ):
             recovered, retried = recover_with_credential_pool(
                 agent,

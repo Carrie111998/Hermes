@@ -43,9 +43,19 @@ def test_named_custom_pool_match_requires_configured_identity_and_endpoint():
             "gemini-no-filter",
             base_url="https://generativelanguage.googleapis.com/v1beta",
         )
+        assert credential_pool_matches_provider(
+            "custom:gemini-no-filter",
+            "custom:gemini-no-filter",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
         assert not credential_pool_matches_provider(
             "custom:gemini-no-filter",
             "gemini-no-filter",
+            base_url="https://fallback.example/v1",
+        )
+        assert not credential_pool_matches_provider(
+            "custom:gemini-no-filter",
+            "custom:gemini-no-filter",
             base_url="https://fallback.example/v1",
         )
         assert not credential_pool_matches_provider(

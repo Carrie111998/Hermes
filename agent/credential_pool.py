@@ -579,10 +579,8 @@ def credential_pool_matches_provider(
     provider_norm = str(provider or "").strip().lower()
     if not pool_provider or not provider_norm:
         return False
-    if pool_provider == provider_norm:
-        return True
     if not pool_provider.startswith(CUSTOM_POOL_PREFIX):
-        return False
+        return pool_provider == provider_norm
     if provider_norm == "custom":
         try:
             matched_pool = get_custom_provider_pool_key(base_url or "")
@@ -606,7 +604,11 @@ def credential_pool_matches_provider(
                         aliases.add(alias[len(CUSTOM_POOL_PREFIX):])
             configured_url = str(entry.get("base_url") or "").strip().rstrip("/")
             named_identity = _normalize_custom_pool_name(provider_norm)
-            return named_identity in aliases and runtime_url == configured_url
+            pool_identity = f"{CUSTOM_POOL_PREFIX}{normalized_name}"
+            return (
+                (named_identity in aliases or provider_norm == pool_identity)
+                and runtime_url == configured_url
+            )
     except Exception:
         return False
     return False

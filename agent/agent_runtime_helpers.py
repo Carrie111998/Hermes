@@ -989,10 +989,10 @@ def recover_with_credential_pool(
     # because swapping the pool's credentials would set base_url/api_key
     # without fixing the empty provider field, leaving the agent in a
     # corrupted state (provider="" model="").
-    if pool_provider and current_provider != pool_provider:
+    if pool_provider:
         # Use the same fail-closed boundary predicate as runtime binding. This
-        # recognizes configured named-custom aliases without weakening the
-        # fallback-provider isolation that protects the primary pool.
+        # recognizes configured named-custom aliases, validates endpoints even
+        # for exact custom:* identities, and preserves fallback isolation.
         if not credential_pool_matches_provider(
             pool,
             current_provider,
