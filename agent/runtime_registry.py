@@ -905,6 +905,13 @@ def _validate_payload_files(
 
     for child in root.rglob("*"):
         relative = child.relative_to(root).as_posix()
+        top_level = relative.split("/", 1)[0]
+        if (
+            top_level.startswith(".backup_")
+            and (root / top_level).is_dir()
+            and not (root / top_level).is_symlink()
+        ):
+            continue
         if relative == "manifest.json" or relative in EXEMPT_FILES:
             continue
         if child.is_file() or child.is_symlink():

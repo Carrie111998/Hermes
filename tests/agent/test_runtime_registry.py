@@ -276,6 +276,17 @@ def test_unlisted_nested_behavior_file_is_rejected(tmp_path: Path) -> None:
         load_registry(tmp_path)
 
 
+def test_root_backup_tree_is_ignored_by_live_registry_validation(tmp_path: Path) -> None:
+    _write_registry(tmp_path)
+    backup_payload = tmp_path / ".backup_20260823_142543" / "route-policy.json"
+    backup_payload.parent.mkdir()
+    backup_payload.write_text("archived registry payload", encoding="utf-8")
+
+    snapshot = load_registry(tmp_path)
+
+    assert snapshot.registry_version == "2026-08-21.1"
+
+
 def test_invalid_manifest_schema_version_is_rejected(tmp_path: Path) -> None:
     _write_registry(tmp_path)
     _rewrite_manifest(tmp_path, schemaVersion="hermes-workflow-registry/999.0")
