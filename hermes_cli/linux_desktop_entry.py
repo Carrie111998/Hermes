@@ -9,7 +9,11 @@ Two values must be absolute for the entry to work:
 
   - ``Exec`` — the launcher runs without shell ``PATH`` customizations, so
     a bare ``hermes desktop`` fails when hermes lives in ``~/.local/bin``
-    or a venv. Resolve the real binary and write its full path.
+    or a venv. Resolve the real binary and write its full path. When an
+    interpreter is written (``sys.executable``), keep it VERBATIM: on
+    POSIX a venv's ``bin/python`` is a symlink to the base interpreter,
+    and resolving it would point ``Exec`` at an interpreter with none of
+    Hermes' dependencies (#92882).
   - ``Icon`` — an unqualified icon name needs an indexed icon theme. The
     spec allows an absolute path instead, so point at the app icon in the
     checkout. Do not copy the icon: ``Exec`` already depends on that tree.
@@ -63,6 +67,13 @@ def resolve_exec_command() -> str:
     Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
     runs as a module with no launcher installed, use the current
     interpreter, also absolute.
+
+    The interpreter is written as ``sys.executable`` VERBATIM — never
+    ``resolve()``-d. On POSIX a venv's ``bin/python`` is a symlink to the
+    base interpreter, so resolving it walks straight out of the venv and
+    pins ``Exec=`` to an interpreter with none of Hermes' dependencies
+    (#92882). Keeping the symlink path lets CPython detect the venv via
+    the ``pyvenv.cfg`` next to it, so the venv's deps stay active.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
@@ -77,12 +88,12 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly — verbatim, per the docstring.
+            argv = [sys.executable, str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [sys.executable, "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 

@@ -4,8 +4,59 @@ Hermes Agent CLI launcher.
 
 This wrapper should behave like the installed `hermes` command, including
 subcommands such as `gateway`, `cron`, and `doctor`.
+
+When the interpreter running this script has none of Hermes' dependencies
+installed — a bare uv-managed CPython, or a generated .desktop ``Exec=``
+whose interpreter escaped the install venv — it fails with an actionable
+diagnostic instead of a bare ``ModuleNotFoundError`` (#92882, #90292,
+#91504, #80439).
 """
 
+import sys
+from pathlib import Path
+
+
+def _find_install_venv_python(checkout: Path) -> str | None:
+    """The install venv's interpreter next to this checkout, if it exists."""
+    windows = sys.platform == "win32"
+    python_name = "python.exe" if windows else "python"
+    for name in ("venv", ".venv"):
+        venv_dir = checkout / name
+        if not (venv_dir / "pyvenv.cfg").is_file():
+            continue
+        python = venv_dir / ("Scripts" if windows else "bin") / python_name
+        if python.is_file():
+            return str(python)
+    return None
+
+
+def _report_launcher_failure(missing: str) -> None:
+    """Print which interpreter ran, which module is missing, and the fix."""
+    script = Path(__file__).resolve()
+    lines = [
+        "hermes: cannot start under this Python interpreter.",
+        f"  running interpreter: {sys.executable}",
+        f"  missing dependency:  {missing}",
+        "  Hermes' dependencies live in the install venv, which this "
+        "interpreter does not use.",
+    ]
+    expected = _find_install_venv_python(script.parent)
+    if expected:
+        lines.append(f"  expected interpreter: {expected}")
+        lines.append(f"  fix: {expected} {script} " + " ".join(sys.argv[1:]))
+    else:
+        lines.append(
+            "  fix: run this script with the venv Python Hermes was installed "
+            "into (e.g. <checkout>/venv/bin/python), or reinstall Hermes' "
+            "dependencies into this interpreter."
+        )
+    sys.stderr.write("\n".join(lines) + "\n")
+
+
 if __name__ == "__main__":
-    from hermes_cli.main import main
+    try:
+        from hermes_cli.main import main
+    except ModuleNotFoundError as exc:
+        _report_launcher_failure(getattr(exc, "name", "") or str(exc))
+        sys.exit(1)
     main()

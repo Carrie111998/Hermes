@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import stat
 from pathlib import Path
 
@@ -93,6 +94,9 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # interpreter when the DE spawns the .desktop entry → ModuleNotFoundError,
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
 # resolved bin that is a python script escaping the running venv.
+# #92882: the prefixed interpreter must be sys.executable VERBATIM — never
+# resolve()-d — because on POSIX a venv's bin/python is a symlink to the base
+# interpreter and resolve() would walk Exec= straight out of the venv.
 def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
     import sys
 
@@ -107,10 +111,72 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
-    assert str(hermes_bin) in exec_line
-    assert exec_line.endswith("desktop")
+    # shlex parses the spec quoting (backslash-escapes inside double quotes),
+    # so the comparison is correct on hosts whose paths need quoting too.
+    tokens = shlex.split(exec_line)
+    assert tokens[0] == sys.executable
+    assert tokens[1] == str(Path(hermes_bin).resolve())
+    assert tokens[-1] == "desktop"
+
+
+def _make_venv_symlink(tmp_path: Path) -> tuple[Path, Path]:
+    """A POSIX-venv ``bin/python`` symlink and its (bare) base interpreter."""
+    base_python = tmp_path / "base" / "python3.11"
+    base_python.parent.mkdir()
+    base_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    return venv_python, base_python
+
+
+# #92882: on POSIX a venv's bin/python is a symlink to the base interpreter.
+# resolve() follows it out of the venv, so an Exec= built from
+# Path(sys.executable).resolve() pins the entry to an interpreter with none
+# of Hermes' deps — the exact ModuleNotFoundError from the issue. Exec must
+# keep the symlink path verbatim: the kernel follows it to the base binary,
+# but CPython detects the venv via the pyvenv.cfg next to the symlink, so
+# the venv's dependencies stay active.
+@pytest.mark.require_symlinks
+def test_exec_fallback_keeps_venv_interpreter_symlink_verbatim(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    venv_python, base_python = _make_venv_symlink(tmp_path)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    first = shlex.split(exec_line)[0]
+    assert first == str(venv_python)
+    assert str(base_python) not in exec_line
+    assert exec_line.endswith("-m hermes_cli.main desktop")
+
+
+@pytest.mark.require_symlinks
+def test_exec_prefix_keeps_venv_interpreter_symlink_verbatim(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    venv_python, base_python = _make_venv_symlink(tmp_path)
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    tokens = shlex.split(exec_line)
+    assert tokens[0] == str(venv_python)
+    assert str(base_python) not in exec_line
+    assert tokens[1] == str(Path(hermes_bin).resolve())
+    assert tokens[-1] == "desktop"
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
