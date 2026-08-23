@@ -297,6 +297,7 @@ describe('PreviewPane console state', () => {
     const closeButtons = rendered.getAllByRole('button', { name: 'Close' })
 
     expect(closeButtons).toHaveLength(2)
+    expect(closeButtons[1]!.className).toContain('pointer-events-auto')
     fireEvent.click(closeButtons[1]!)
     expect(onClose).toHaveBeenCalledOnce()
   })
@@ -396,8 +397,9 @@ describe('PreviewPane console state', () => {
     }
 
     let rendered!: ReturnType<typeof render>
+    const onClose = vi.fn()
     await act(async () => {
-      rendered = render(<PreviewPane target={target} />)
+      rendered = render(<PreviewPane onClose={onClose} target={target} />)
     })
 
     const iframe = rendered.container.querySelector('iframe')
@@ -408,6 +410,12 @@ describe('PreviewPane console state', () => {
     expect(iframe?.getAttribute('srcdoc')).toContain(`default-src 'none'`)
     expect(iframe?.getAttribute('srcdoc')).toContain('<h1>remote</h1>')
     expect(rendered.container.textContent).not.toContain(dataUrl)
+
+    const closeButton = rendered.getByRole('button', { name: 'Close' })
+
+    expect(closeButton).toBeTruthy()
+    fireEvent.click(closeButton)
+    expect(onClose).toHaveBeenCalledOnce()
 
     await act(async () => {
       rendered.rerender(

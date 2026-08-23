@@ -184,7 +184,7 @@ function PreviewLoadError({
           {onClose && (
             <button
               aria-label={t.common.close}
-              className="mt-3 rounded-full border border-border bg-background px-3.5 py-1.5 text-xs font-medium text-foreground shadow-xs transition-colors hover:bg-accent"
+              className="pointer-events-auto mt-3 rounded-full border border-border bg-background px-3.5 py-1.5 text-xs font-medium text-foreground shadow-xs transition-colors hover:bg-accent"
               onClick={onClose}
               type="button"
             >
@@ -249,6 +249,9 @@ export function PreviewPane({
     target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
 
   const isRemoteHtml = isRemoteHtmlTarget && target.renderMode !== 'source' && Boolean(target.dataUrl)
+  // The browser bar is absent for sandboxed remote HTML, so that branch still
+  // needs the pane-body close affordance.
+  const showBrowserBar = isWebPreview && !isRemoteHtml
 
   const remoteHtmlDocument = useMemo(
     () => (isRemoteHtml ? remoteHtmlPreviewDocument(target.dataUrl!) : null),
@@ -942,7 +945,7 @@ export function PreviewPane({
           goForward()
         }
       }}
-      {...(isWebPreview && !isRemoteHtml && tabId ? { [PREVIEW_BROWSER_ATTR]: tabId } : {})}
+      {...(showBrowserBar && tabId ? { [PREVIEW_BROWSER_ATTR]: tabId } : {})}
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {!embedded && (
@@ -968,7 +971,7 @@ export function PreviewPane({
           </div>
         )}
 
-        {isWebPreview && !isRemoteHtml && (
+        {showBrowserBar && (
           <PreviewBrowserBar
             canGoBack={history.back}
             canGoForward={history.forward}
@@ -1028,7 +1031,7 @@ export function PreviewPane({
               restarting={restartingServer}
             />
           )}
-          {onClose && !isWebPreview && (
+          {onClose && !showBrowserBar && (
             <button
               aria-label={t.common.close}
               className="absolute right-2 top-2 z-60 rounded-full border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground shadow-sm transition-colors hover:bg-accent"
