@@ -68,6 +68,17 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   receives a v1.0 `StreamResponse` (`statusUpdate`) payload, HMAC-SHA256
   signed (`X-A2A-Signature`, secret `A2A_PUSH_SECRET` falling back to the
   bearer token), with SSRF-guarded callback URLs.
+- **Forwarded-profile output must be UTF-8.** When a bot agent forwards a task
+  to another profile, the child process is spawned with `PYTHONUTF8=1` and its
+  stdout is decoded as UTF-8 with `errors="replace"`. A child that emits text
+  in a legacy code page (GBK, CP1253, …) will surface U+FFFD replacement
+  characters rather than raising. Decoding with the host ANSI code page instead
+  is what produced empty-but-`COMPLETED` tasks on non-UTF-8 Windows hosts.
+- **Child stderr is never returned to a peer.** A failing forwarded profile
+  yields a generic `[profile exited N; …]` reply; the stderr tail goes to the
+  gateway log. `security.redact_outbound` scrubs credential *shapes* only —
+  filesystem paths, usernames and hostnames are not credential-shaped and
+  would otherwise cross the trust boundary verbatim.
 
 ## v1.0 wire format notes
 - Task states / roles are SCREAMING_SNAKE_CASE (TASK_STATE_*, ROLE_*).

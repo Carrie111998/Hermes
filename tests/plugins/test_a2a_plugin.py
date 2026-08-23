@@ -1430,7 +1430,11 @@ class TestMultiAgentRouting:
         agent = adapter._agents["dev"]
 
         def fake_run(cmd, **kwargs):
-            return SimpleNamespace(returncode=0, stdout="   \n", stderr="boom")
+            return SimpleNamespace(
+                returncode=0,
+                stdout="   \n",
+                stderr=r'File "C:\dev\hermes\venv\lib\app.py" USER=220697 HOST=IGRATHIN2001',
+            )
 
         monkeypatch.setattr(_sp, "run", fake_run)
         monkeypatch.setattr(adapter, "_latest_a2a_session", lambda *a, **k: None)
@@ -1439,7 +1443,41 @@ class TestMultiAgentRouting:
 
         assert state == protocol.STATE_FAILED
         assert "no output" in reply
-        assert "boom" in reply
+        # The peer must learn THAT it failed, never the child's stderr: paths,
+        # usernames and hostnames are not credential-shaped, so redact_outbound
+        # does not remove them. Details go to the gateway log instead.
+        assert "C:\\dev" not in reply
+        assert "220697" not in reply
+        assert "IGRATHIN2001" not in reply
+
+    def test_forward_nonzero_exit_does_not_leak_stderr_to_peer(self, monkeypatch):
+        """A crashing child must not echo its traceback to a remote peer."""
+        import subprocess as _sp
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
+        }))
+        agent = adapter._agents["dev"]
+
+        def fake_run(cmd, **kwargs):
+            return SimpleNamespace(
+                returncode=2,
+                stdout="",
+                stderr=r'Traceback: File "C:\Users\220697\app.py" on IGRATHIN2001',
+            )
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+        monkeypatch.setattr(adapter, "_latest_a2a_session", lambda *a, **k: None)
+
+        reply, state = adapter._forward_to_profile(agent, "peer-x", "ctx-1", "hi")
+
+        assert state == protocol.STATE_FAILED
+        assert "exited 2" in reply
+        assert "Traceback" not in reply
+        assert "C:\\Users" not in reply
+        assert "IGRATHIN2001" not in reply
 
 
 class TestClientTenantAndDiscovery:

@@ -886,7 +886,13 @@ class A2AAdapter(BasePlatformAdapter):
                 return security.redact_outbound(f"Profile dispatch failed: {e}"), protocol.STATE_FAILED
             if proc.returncode != 0:
                 msg = (proc.stderr or proc.stdout or f"profile exited {proc.returncode}").strip()
-                return security.redact_outbound(msg[-2000:]), protocol.STATE_FAILED
+                logger.error(
+                    "a2a: profile %r exited %d; stderr tail: %s",
+                    profile, proc.returncode, msg[-2000:],
+                )
+                return security.redact_outbound(
+                    f"[profile exited {proc.returncode}; see gateway logs for details]"
+                ), protocol.STATE_FAILED
             if not session_id:
                 session_id = self._latest_a2a_session(profile, start)
                 if session_id:
@@ -895,9 +901,13 @@ class A2AAdapter(BasePlatformAdapter):
             _out = (proc.stdout or "").strip()
             if not _out:
                 _err = (proc.stderr or "").strip()
-                _detail = f" stderr: {_err[-400:]}" if _err else ""
+                if _err:
+                    logger.error(
+                        "a2a: profile %r produced no stdout (rc=%d); stderr tail: %s",
+                        profile, proc.returncode, _err[-2000:],
+                    )
                 return security.redact_outbound(
-                    f"[profile produced no output (rc={proc.returncode}){_detail}]"
+                    f"[profile produced no output (rc={proc.returncode})]"
                 ), protocol.STATE_FAILED
             return security.redact_outbound(_out), protocol.STATE_COMPLETED
 
