@@ -2117,10 +2117,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_exec_approval failed")
             if result.success:
+                # Record the chat type so click callbacks can gate under the
+                # chat's own admission rules (DM peer vs group policy).
+                chat_info = await self.get_chat_info(chat_id)
                 self._approval_state[approval_id] = {
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "chat_type": str(chat_info.get("type") or "").strip().lower(),
                 }
             return result
         except Exception as exc:
@@ -2185,10 +2189,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_update_prompt failed")
             if result.success:
+                chat_info = await self.get_chat_info(chat_id)
                 self._update_prompt_state[prompt_id] = {
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "chat_type": str(chat_info.get("type") or "").strip().lower(),
                 }
             return result
         except Exception as exc:
@@ -2768,15 +2774,46 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
-    def _is_interactive_operator_authorized(self, open_id: str) -> bool:
-        """Return whether this card-action operator may answer gated prompts."""
-        normalized = str(open_id or "").strip()
-        if not normalized:
-            return False
-        allowed_ids = set(self._admins) | set(self._allowed_group_users)
-        if not allowed_ids:
+    def _dm_sender_authorized(self, sender_ids: Any) -> bool:
+        """The DM branch of ``_admit``, shared with interactive-card clicks.
+
+        Platform/gateway allow-all flags first, then the empty-allowlist
+        pairing-mode default, then ``FEISHU_ALLOWED_USERS`` membership. Cards
+        answer under the same rules that admitted the conversation, so a DM
+        peer who can trigger an approval can always answer it.
+        """
+        if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
             return True
-        return "*" in allowed_ids or normalized in allowed_ids
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            return True
+        # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
+        # forward DMs to gateway intake so the pairing handshake can run.
+        # Gateway auth fail-closes agent access until approval.
+        if not self._allowed_group_users:
+            return True
+        return bool(sender_ids and (sender_ids & self._allowed_group_users))
+
+    def _is_card_operator_authorized(
+        self, state: Dict[str, Any], open_id: str, user_id: str = ""
+    ) -> bool:
+        """May this operator answer an interactive card sent to ``state``'s chat?
+
+        The gate mirrors the admission rules of the chat the card was sent
+        to, not the group policy unconditionally: a DM card is visible only
+        to the DM peer, so it answers under ``_dm_sender_authorized`` (plus
+        the bot admins); a group card keeps the group policy gate. Chat type
+        comes from the state (recorded at send time), then the chat-info
+        cache, and fails closed to the group gate when unknown.
+        """
+        chat_type = str(state.get("chat_type") or "").strip().lower()
+        if not chat_type:
+            cached = self._chat_info_cache.get(str(state.get("chat_id") or "")) or {}
+            chat_type = str(cached.get("type") or "").strip().lower()
+        ids = {v for v in (open_id, user_id) if v}
+        if chat_type in {"dm", "p2p"}:
+            return bool(ids & self._admins) or self._dm_sender_authorized(ids)
+        sender = SimpleNamespace(open_id=open_id, user_id=user_id)
+        return self._allow_group_message(sender, str(state.get("chat_id") or ""), is_bot=False)
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -2792,8 +2829,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        operator_user_id = str(getattr(operator, "user_id", "") or "")
+        if not self._is_card_operator_authorized(state, open_id, operator_user_id):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2852,8 +2889,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        operator_user_id = str(getattr(operator, "user_id", "") or "")
+        if not self._is_card_operator_authorized(state, open_id, operator_user_id):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2905,7 +2942,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
+        if open_id and not self._is_card_operator_authorized(state, open_id):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
@@ -2959,11 +2996,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        if open_id:
-            sender_id = SimpleNamespace(open_id=open_id, user_id="")
-            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
-                logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
-                return
+        if open_id and not self._is_card_operator_authorized(state, open_id):
+            logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
+            return
         expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
             logger.warning(
@@ -4371,16 +4406,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
-            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-                return None
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-                return None
-            # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
-            # forward DMs to gateway intake so the pairing handshake can run.
-            # Gateway auth fail-closes agent access until approval.
-            if not self._allowed_group_users:
-                return None
-            if not (sender_ids and (sender_ids & self._allowed_group_users)):
+            if not self._dm_sender_authorized(sender_ids):
                 return "dm_policy_rejected"
             return None
 
