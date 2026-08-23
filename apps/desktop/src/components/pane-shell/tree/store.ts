@@ -53,19 +53,69 @@ writeKey('hermes.desktop.layoutTree.v1', null)
 
 let defaultTree: LayoutNode | null = null
 
+/**
+ * Panes that must never reach the persisted tree. Preview tiles are transient
+ * by design: their pane set is re-derived from `$previewTabs` on every boot
+ * (artifact and other non-restorable tabs are dropped outright at decode), so
+ * a tree saved with `preview-tile:` panes bakes splits/weights around tabs the
+ * next session may not have — and the user's hand-built arrangement re-assembles
+ * differently on every restart. The LIVE tree keeps them for the session; only
+ * the STORED copy is scrubbed, and boot adoption re-docks surviving preview
+ * tabs at their remembered share (see `rememberPaneShare`).
+ */
+const EPHEMERAL_PANE_PREFIXES = ['preview-tile:'] as const
+
+const isEphemeralPane = (paneId: string): boolean => EPHEMERAL_PANE_PREFIXES.some(prefix => paneId.startsWith(prefix))
+
+/** Remove every ephemeral tile pane from a tree COPY (`removePane` rebuilds;
+ *  the input is never mutated). Returns the same reference when nothing matches
+ *  — `persist` runs on every commit and must not churn allocations — and null
+ *  only for a tree that was nothing but ephemeral panes. */
+function scrubEphemeralPanes(tree: LayoutNode | null): LayoutNode | null {
+  if (!tree) {
+    return null
+  }
+
+  let next: LayoutNode | null = tree
+
+  for (const paneId of allPaneIds(tree)) {
+    if (isEphemeralPane(paneId)) {
+      next = next === null ? null : removePane(next, paneId)
+    }
+  }
+
+  return next
+}
+
 function loadPersisted(): LayoutNode | null {
   const parsed = readJson<unknown>(STORAGE_KEY)
 
   // Canonicalize on load: bring attributes onto the current schema (see
   // migratePersistedTree — the retired `headerHidden` is dropped here) and
-  // re-flatten the structure.
-  return isLayoutNode(parsed) ? normalize(migratePersistedTree(parsed)) : null
+  // re-flatten the structure. Ephemeral tile panes are scrubbed here too, so
+  // trees persisted by older builds (before persist() scrubbed them) heal on
+  // their next boot instead of re-arranging around ghost preview tiles.
+  return isLayoutNode(parsed) ? scrubEphemeralPanes(normalize(migratePersistedTree(parsed))) : null
 }
 
 function persist(tree: LayoutNode | null) {
   // A secondary window (single-chat pop-out) shares the origin's localStorage;
   // writing its stripped-down DEFAULT tree back would wipe the primary's layout.
   if (isSecondaryWindow()) {
+    return
+  }
+
+  if (tree) {
+    const stored = scrubEphemeralPanes(tree)
+
+    // A tree that was nothing but ephemeral panes has no layout worth keeping;
+    // skip the write so the last good persisted tree survives.
+    if (!stored) {
+      return
+    }
+
+    writeJson(STORAGE_KEY, stored)
+
     return
   }
 
