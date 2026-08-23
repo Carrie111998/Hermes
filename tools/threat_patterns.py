@@ -61,16 +61,18 @@ _FILLER = r"(?:\w+\s+){0,8}"
 # Phrases that mark an upcoming attack phrase as a *description* of the
 # attack rather than the attack itself — e.g. a SOUL.md security doctrine
 # saying "when you encounter instructions telling you to ignore previous
-# instructions ... STOP".  Checked in a bounded window before a match of a
-# pattern in ``_DESCRIPTIVE_FRAMING_GUARDED`` so the whole file isn't
-# blocked for teaching the agent to recognize the attack it defends
-# against.  An attacker cannot use this to slip an active directive past
-# the scanner: the marker must be the text immediately preceding the
-# match, so "when you encounter X, do Y" still blocks on Y elsewhere in
-# the content.
+# instructions ... STOP".  Checked immediately before a match of a pattern
+# in ``_DESCRIPTIVE_FRAMING_GUARDED`` so the whole file isn't blocked for
+# teaching the agent to recognize the attack it defends against.  The
+# marker must be the last thing before the match — separated only by
+# whitespace/punctuation, never by filler words — so an attacker can't
+# plant a marker earlier in the sentence and bury a real directive after
+# it (e.g. "such as <filler filler> ignore all instructions").
+_DESCRIPTIVE_FRAMING_SEPARATOR = r'[\s,;:\'"\-–—]{0,10}'
 _DESCRIPTIVE_FRAMING = re.compile(
-    r'(when\s+you\s+encounter|describ\w*|defend\w*\s+against|examples?\s+of|'
-    r'attack\s+patterns?\s+like|told\s+to|telling\s+you\s+to|such\s+as)',
+    r'(?:when\s+you\s+encounter|describ\w*|defend\w*\s+against|examples?\s+of|'
+    r'attack\s+patterns?\s+like|told\s+to|telling\s+you\s+to|such\s+as)'
+    + _DESCRIPTIVE_FRAMING_SEPARATOR + r'$',
     re.IGNORECASE,
 )
 _DESCRIPTIVE_FRAMING_WINDOW = 60
