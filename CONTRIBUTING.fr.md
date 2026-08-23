@@ -131,7 +131,7 @@ cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
 # Ajoutez les extras dev/test par-dessus l'installation standard.
 uv pip install -e ".[all,dev]"
 
-# Optionnel : outils navigateur / dépendances du site de docs.
+# Optionnel : dépendances du site de docs + de l'espace de travail.
 npm install
 ```
 
@@ -169,7 +169,7 @@ export PATH="$VIRTUAL_ENV/bin:$PATH"
 # Installez avec tous les extras (messagerie, cron, menus CLI, outils de dev)
 uv pip install -e ".[all,dev]"
 
-# Optionnel : outils navigateur
+# Optionnel : dépendances de l'espace de travail / des docs
 npm install
 ```
 
@@ -732,21 +732,7 @@ emprunter votre chemin de code.
    PowerShell est le remplaçant moderne de `wmic process`. Voir
    `hermes_cli/gateway.py::_scan_gateway_pids` pour le motif à suivre.
 
-3. **`termios` et `fcntl` sont réservés à Unix.** Attrapez toujours à la fois
-   `ImportError` et `NotImplementedError` :
-   ```python
-   try:
-       from simple_term_menu import TerminalMenu
-       menu = TerminalMenu(options)
-       idx = menu.show()
-   except (ImportError, NotImplementedError):
-       # Repli : menu numéroté pour Windows
-       for i, opt in enumerate(options):
-           print(f"  {i+1}. {opt}")
-       idx = int(input("Choice: ")) - 1
-   ```
-
-4. **Encodage des fichiers.** Windows peut enregistrer les fichiers `.env` en
+3. **Encodage des fichiers.** Windows peut enregistrer les fichiers `.env` en
    `cp1252`. Gérez toujours les erreurs d'encodage :
    ```python
    try:
@@ -759,7 +745,7 @@ emprunter votre chemin de code.
    `encoding="utf-8-sig"` pour lire les fichiers qui ont pu être touchés par un
    éditeur graphique Windows.
 
-5. **Gestion des processus.** `os.setsid()`, `os.killpg()`, `os.fork()`,
+4. **Gestion des processus.** `os.setsid()`, `os.killpg()`, `os.fork()`,
    `os.getuid()` et la gestion des signaux POSIX diffèrent sous Windows. Protégez
    avec `platform.system()`, `sys.platform` ou `hasattr(os, "setsid")` :
    ```python
@@ -784,31 +770,31 @@ emprunter votre chemin de code.
        pass
    ```
 
-6. **Signaux inexistants sous Windows : `SIGALRM`, `SIGCHLD`, `SIGHUP`,
+5. **Signaux inexistants sous Windows : `SIGALRM`, `SIGCHLD`, `SIGHUP`,
    `SIGUSR1`, `SIGUSR2`, `SIGPIPE`, `SIGQUIT`, `SIGKILL`.** Le module `signal` de
    Python lève `AttributeError` à l'import si vous les référencez sous Windows.
    Utilisez `getattr(signal, "SIGKILL", signal.SIGTERM)` ou placez tout le bloc
    derrière une vérification de plateforme. `loop.add_signal_handler` lève
    `NotImplementedError` sous Windows — attrapez-la toujours.
 
-7. **Séparateurs de chemins.** Utilisez `pathlib.Path` plutôt que la concaténation
+6. **Séparateurs de chemins.** Utilisez `pathlib.Path` plutôt que la concaténation
    de chaînes avec `/`. Les slashs fonctionnent presque partout sous Windows, mais
    `subprocess.run(["cmd.exe", "/c", ...])` et d'autres contextes shell peuvent
    exiger des antislashs — convertissez avec `str(path)` à la frontière du
    subprocess, pas au cœur de la logique Python.
 
-8. **Les liens symboliques exigent des privilèges élevés sous Windows** (sauf si
+7. **Les liens symboliques exigent des privilèges élevés sous Windows** (sauf si
    le mode développeur est activé). Les tests qui créent des liens symboliques ont
    besoin de `@pytest.mark.skipif(sys.platform ==
    "win32", reason="Symlinks require elevated privileges on Windows")`.
 
-9. **Les modes de fichiers POSIX (0o600, 0o644, etc.) ne sont PAS appliqués sur
+8. **Les modes de fichiers POSIX (0o600, 0o644, etc.) ne sont PAS appliqués sur
    NTFS** par défaut. Les tests qui font des assertions sur
    `stat().st_mode & 0o777` doivent être ignorés sous Windows — le concept ne se
    transpose pas. Utilisez des ACL (`icacls`, `pywin32`) pour protéger les
    fichiers de secrets sous Windows si nécessaire.
 
-10. **Les démons d'arrière-plan détachés sous Windows exigent `pythonw.exe`, PAS
+9. **Les démons d'arrière-plan détachés sous Windows exigent `pythonw.exe`, PAS
     `python.exe`.** `python.exe` alloue toujours une console ou s'y attache, ce
     qui le rend vulnérable aux diffusions de `CTRL_C_EVENT` depuis n'importe quel
     processus frère. `pythonw.exe` est la variante sans console. Combinez avec
@@ -817,7 +803,7 @@ emprunter votre chemin de code.
     Voir `hermes_cli/gateway_windows.py::_spawn_detached` pour l'implémentation
     de référence.
 
-11. **`subprocess.Popen` avec des shims `.cmd` ou `.bat` a besoin de
+10. **`subprocess.Popen` avec des shims `.cmd` ou `.bat` a besoin de
     `shutil.which` pour la résolution.** Passer `"agent-browser"` à `Popen` sous
     Windows trouve le shim shebang POSIX sans extension dans
     `node_modules/.bin/`, que `CreateProcessW` ne peut pas exécuter — vous
@@ -825,32 +811,32 @@ emprunter votre chemin de code.
     `shutil.which("agent-browser", path=local_bin)`, qui honore PATHEXT et
     choisit la variante `.CMD` sous Windows.
 
-12. **N'utilisez pas les shebangs shell pour lancer du Python.** `#!/usr/bin/env
+11. **N'utilisez pas les shebangs shell pour lancer du Python.** `#!/usr/bin/env
     python` ne fonctionne que lorsque le fichier est exécuté à travers un shell
     Unix. `subprocess.run(["./myscript.py"])` échoue sous Windows même si le
     fichier a une ligne shebang. Invoquez toujours Python explicitement :
     `[sys.executable, "myscript.py"]`.
 
-13. **Commandes shell dans les installeurs.** Si vous modifiez
+12. **Commandes shell dans les installeurs.** Si vous modifiez
     `scripts/install.sh`, faites la modification équivalente dans
     `scripts/install.ps1`. Ces deux scripts sont l'exemple canonique de
     « fonctionne sous Linux ne veut pas dire fonctionne sous Windows » et ont
     divergé plusieurs fois — gardez-les synchronisés.
 
-14. **Chemins connus redirigés vers OneDrive sous Windows :** Desktop,
+13. **Chemins connus redirigés vers OneDrive sous Windows :** Desktop,
     Documents, Pictures, Videos. Le « vrai » chemin quand OneDrive Backup est
     activé est `%USERPROFILE%\OneDrive\Desktop` (etc.), et NON
     `%USERPROFILE%\Desktop` (qui existe en coquille vide). Résolvez
     l'emplacement réel via `ctypes` + `SHGetKnownFolderPath` ou en lisant la clé
     de registre `Shell Folders` — ne supposez jamais `~/Desktop`.
 
-15. **CRLF vs LF dans les scripts générés.** `cmd.exe` et `schtasks` sous Windows
+14. **CRLF vs LF dans les scripts générés.** `cmd.exe` et `schtasks` sous Windows
     parsent ligne par ligne ; des fins de ligne mixtes ou uniquement LF peuvent
     casser des fichiers `.cmd` / `.bat` multilignes. Utilisez `open(path, "w",
     encoding="utf-8", newline="\r\n")` — ou `open(path, "wb")` + octets
     explicites — pour générer des scripts que Windows exécutera.
 
-16. **Deux schémas de quoting différents sur une même ligne de commande.**
+15. **Deux schémas de quoting différents sur une même ligne de commande.**
     `subprocess.run(["schtasks", "/TR", some_cmd])` → schtasks parse lui-même
     `/TR`, ET la chaîne `some_cmd` est re-parsée par `cmd.exe` quand la tâche se
     déclenche. Parseurs différents, règles d'échappement différentes. Utilisez
@@ -860,18 +846,16 @@ emprunter votre chemin de code.
 
 ### Tester le multiplateforme
 
-Les tests qui utilisent des appels système exclusivement POSIX ont besoin d'un marqueur de skip. Les cas courants :
-- Liens symboliques → `@pytest.mark.skipif(sys.platform == "win32", ...)`
-- Modes de fichiers `0o600` → `@pytest.mark.skipif(sys.platform.startswith("win"), ...)`
-- `signal.SIGALRM` → Unix uniquement (les délais par test ne l'utilisent plus directement ; voir le shim de délai win32 dans `tests/conftest.py::pytest_configure`)
-- `os.setsid` / `os.fork` → Unix uniquement
-- Tests de régression Winsock réels / propres à Windows →
-  `@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific regression")`
+Les tests qui exercent un comportement propre à certaines plateformes doivent s'exécuter sur leurs plateformes cibles.
 
-Si vous monkeypatchez `sys.platform` pour des tests multiplateformes, patchez aussi
-`platform.system()` / `platform.release()` / `platform.mac_ver()` — chacun relit
-indépendamment le véritable OS, si bien que des tests à moitié patchés empruntent
-quand même la mauvaise branche sur un runner Windows.
+```python
+@pytest.mark.linux_only
+@pytest.mark.macos_only
+@pytest.mark.windows_only
+```
+
+Évitez de monkeypatcher `sys.platform` sauf nécessité absolue ; si vous le faites, patchez aussi `platform.system()` / `platform.release()` / `platform.mac_ver()`.
+Les liens symboliques, les permissions 0o600, SIGALRM et os.setsid/fork sont tous propres à Unix.
 
 ---
 
@@ -1003,7 +987,7 @@ test(tools): add unit tests for file_operations
 ## Signaler un problème
 
 - Utilisez les [GitHub Issues](https://github.com/NousResearch/hermes-agent/issues)
-- Incluez : OS, version de Python, version d'Hermes (`hermes version`), traceback d'erreur complet
+- Incluez : OS, version de Python, version d'Hermes (`hermes --version`), traceback d'erreur complet
 - Incluez les étapes de reproduction
 - Vérifiez les issues existantes avant de créer des doublons
 - Pour les vulnérabilités de sécurité, merci de les signaler en privé
