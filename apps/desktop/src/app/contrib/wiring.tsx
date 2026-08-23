@@ -319,7 +319,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       const paramsSessionId = typeof params?.session_id === 'string' ? params.session_id.trim() : ''
       const targetStoredSessionId = paramsSessionId ? storedSessionIdForRuntimeId(paramsSessionId) : null
 
-      const routingSessionId = targetStoredSessionId ?? $focusedStoredSessionId.get() ?? selectedStoredSessionIdRef.current
+      const routingSessionId =
+        targetStoredSessionId ?? $focusedStoredSessionId.get() ?? selectedStoredSessionIdRef.current
 
       const owner =
         (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
