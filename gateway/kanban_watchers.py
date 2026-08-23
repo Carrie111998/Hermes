@@ -250,6 +250,39 @@ class GatewayKanbanWatchersMixin:
             or bool(getattr(self, "_kanban_dispatch_claim_inflight", False))
         )
 
+    def _kanban_auto_decompose_inflight_count(self) -> int:
+        """Return the number of auto-decompose worker threads still running."""
+        lock = getattr(self, "_kanban_auto_decompose_counter_lock", None)
+        if lock is None:
+            return int(bool(getattr(self, "_kanban_auto_decompose_inflight", 0)))
+        with lock:
+            return max(0, int(getattr(self, "_kanban_auto_decompose_inflight", 0)))
+
+    def _kanban_auto_decompose_started(self) -> None:
+        lock = getattr(self, "_kanban_auto_decompose_counter_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._kanban_auto_decompose_counter_lock = lock
+        with lock:
+            self._kanban_auto_decompose_inflight = (
+                int(getattr(self, "_kanban_auto_decompose_inflight", 0)) + 1
+            )
+
+    def _kanban_auto_decompose_finished(self) -> None:
+        lock = getattr(self, "_kanban_auto_decompose_counter_lock", None)
+        if lock is None:
+            self._kanban_auto_decompose_inflight = 0
+            return
+        with lock:
+            self._kanban_auto_decompose_inflight = max(
+                0, int(getattr(self, "_kanban_auto_decompose_inflight", 0)) - 1
+            )
+
+    def _wait_for_kanban_dispatch_gate(self) -> None:
+        """Join an already-admitted dispatch before external drain proceeds."""
+        with self._kanban_dispatch_gate():
+            return
+
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -1796,7 +1829,11 @@ class GatewayKanbanWatchersMixin:
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
-                        await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
+                        self._kanban_auto_decompose_started()
+                        try:
+                            await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
+                        finally:
+                            self._kanban_auto_decompose_finished()
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):

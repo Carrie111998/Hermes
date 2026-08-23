@@ -140,6 +140,7 @@ def test_update_prompt_view_accepts_role_allowlist():
 async def test_update_prompt_response_is_correlation_bound_and_replay_inert(tmp_path):
     pending = {
         "correlation_id": "corr-1",
+        "user_id": "1",
         "session_key": "session-1",
         "origin_profile": "work",
         "profile_home": "/profiles/work",

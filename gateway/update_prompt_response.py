@@ -36,6 +36,7 @@ def write_update_confirmation_response(
     prompt_id: str,
     correlation_id: str,
     session_key: str,
+    actor_id: str,
     answer: str,
 ) -> bool:
     """Atomically answer exactly one current ``update_confirmation`` prompt.
@@ -55,7 +56,12 @@ def write_update_confirmation_response(
     else:
         return False
 
-    if not str(prompt_id) or not str(correlation_id) or not str(session_key):
+    if (
+        not str(prompt_id)
+        or not str(correlation_id)
+        or not str(session_key)
+        or not str(actor_id).strip()
+    ):
         return False
 
     if not prompt or not pending or prompt.get("kind") != "update_confirmation":
@@ -67,6 +73,12 @@ def write_update_confirmation_response(
     if str(pending.get("correlation_id") or "") != str(correlation_id):
         return False
     if str(pending.get("session_key") or "") != str(session_key):
+        return False
+    # The session key is not an authorization boundary: two actors can share
+    # one chat/session, while an actor can also move between sessions.  Bind
+    # the callback to the identity captured when /update created the prompt.
+    expected_actor = pending.get("user_id")
+    if expected_actor is None or str(expected_actor) != str(actor_id):
         return False
 
     context = prompt.get("context")

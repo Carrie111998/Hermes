@@ -9131,6 +9131,7 @@ def _define_discord_view_classes() -> None:
                     prompt_id=self.prompt_id,
                     correlation_id=self.correlation_id,
                     session_key=self.session_key,
+                    actor_id=str(interaction.user.id),
                     answer=answer,
                 )
             except Exception as exc:

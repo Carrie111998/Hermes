@@ -8651,6 +8651,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_kanban_worker_count()
+            + self._kanban_dispatch_claim_inflight_count()
+            + self._kanban_auto_decompose_inflight_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -9239,18 +9241,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._set_kanban_dispatch_quiesced(True)
         self._external_drain_active = True
         kanban_workers = self._active_kanban_worker_count(fail_closed=True)
+        dispatch_inflight = self._kanban_dispatch_claim_inflight_count()
+        auto_decompose_inflight = self._kanban_auto_decompose_inflight_count()
         active_work = (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + kanban_workers
+            + dispatch_inflight
+            + auto_decompose_inflight
         )
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns and Kanban claims; %d in-flight work unit(s), including "
-            "%d Kanban worker(s), will finish. Process stays up.",
+            "%d Kanban worker(s), %d dispatch claim(s), and %d auto-decompose "
+            "thread(s), will finish. Process stays up.",
             active_work,
             kanban_workers,
+            dispatch_inflight,
+            auto_decompose_inflight,
         )
         # Flip the persisted lifecycle state so /api/status.gateway_busy /
         # gateway_drainable track the drain. Preserve active_agents (the
@@ -9302,6 +9311,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if drain_requested():
                     self._enter_external_drain()
+                    # Admission is closed, but a claim that already owns the
+                    # gate may still publish a worker. Join it before the
+                    # external poll surface can report drain completion.
+                    await asyncio.to_thread(self._wait_for_kanban_dispatch_gate)
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
                     # external caller polls this reversible drain state.
@@ -10726,20 +10739,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             timeout if cron_timeout is None else cron_timeout
         )
         snapshot = self._snapshot_running_agents()
-        last_counts: Optional[tuple[int, int, int, int, int]] = None
+        last_counts: Optional[tuple[int, int, int, int, int, int]] = None
         last_status_at = 0.0
 
-        def _counts() -> tuple[int, int, int, int, int]:
+        def _counts() -> tuple[int, int, int, int, int, int]:
             return (
                 self._running_agent_count(),
                 self._active_cron_job_count(),
                 self._active_api_run_count(),
                 self._active_kanban_worker_count(fail_closed=True),
                 self._kanban_dispatch_claim_inflight_count(),
+                self._kanban_auto_decompose_inflight_count(),
             )
 
         def _maybe_update_status(
-            counts: tuple[int, int, int, int, int], force: bool = False
+            counts: tuple[int, int, int, int, int, int], force: bool = False
         ) -> None:
             nonlocal last_counts, last_status_at
             now = loop.time()
@@ -10752,6 +10766,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug(
                     "Gateway drain progress: agents=%d cron=%d api=%d "
                     "kanban_workers=%d kanban_dispatch_inflight=%d "
+                    "kanban_auto_decompose_inflight=%d "
                     "kanban_probe_failed=%s",
                     *counts,
                     bool(getattr(self, "_kanban_worker_probe_failed", False)),
@@ -10784,12 +10799,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``timed_out=True`` after 0.00s with a cron job in flight and kill
         # it — the drain never even entered this loop (#82161).
         def _still_draining(
-            current: tuple[int, int, int, int, int], now: float
+            current: tuple[int, int, int, int, int, int], now: float
         ) -> bool:
-            active_count, cron_count, api_count, kanban_count, dispatch_count = current
+            (
+                active_count,
+                cron_count,
+                api_count,
+                kanban_count,
+                dispatch_count,
+                auto_decompose_count,
+            ) = current
             if (active_count or api_count) and now < deadline:
                 return True
-            return bool(cron_count or kanban_count or dispatch_count) and (
+            return bool(
+                cron_count or kanban_count or dispatch_count or auto_decompose_count
+            ) and (
                 now < background_deadline
             )
 
@@ -10824,6 +10848,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+
+    async def _terminate_active_kanban_workers(self, reason: str) -> int:
+        """Terminate detached Kanban workers before a timed-out replacement.
+
+        The drain probe observes worker PIDs, but those processes are outside
+        ``_running_agents`` and cannot receive ``request_hard_interrupt``. A
+        timed-out shutdown must therefore kill them explicitly; otherwise an
+        environment replacement leaves old workers executing against the old
+        checkout. Their durable running claims remain for the next dispatcher
+        tick to reclaim, which is the handoff boundary for a fresh gateway.
+        """
+        try:
+            from hermes_cli import kanban_db
+            from gateway.status import terminate_pid
+
+            pids = list(kanban_db.active_worker_pids_all_boards())
+        except Exception as exc:
+            logger.warning(
+                "Unable to enumerate Kanban workers during %s; refusing to "
+                "claim a clean replacement: %s",
+                reason,
+                exc,
+            )
+            return 0
+
+        for pid in pids:
+            try:
+                await asyncio.to_thread(terminate_pid, int(pid), force=False)
+            except (ProcessLookupError, OSError, ValueError) as exc:
+                logger.debug("Kanban worker %s already exited or resisted SIGTERM: %s", pid, exc)
+
+        loop = asyncio.get_running_loop()
+        grace_deadline = loop.time() + 2.0
+        remaining = pids
+        while remaining and loop.time() < grace_deadline:
+            await asyncio.sleep(0.1)
+            try:
+                live = set(kanban_db.active_worker_pids_all_boards())
+            except Exception:
+                live = set(remaining)
+            remaining = [pid for pid in remaining if pid in live]
+
+        for pid in remaining:
+            try:
+                await asyncio.to_thread(terminate_pid, int(pid), force=True)
+            except (ProcessLookupError, OSError, ValueError) as exc:
+                logger.debug("Kanban worker %s force termination failed: %s", pid, exc)
+
+        try:
+            remaining = list(kanban_db.active_worker_pids_all_boards())
+        except Exception:
+            remaining = list(remaining)
+        if remaining:
+            logger.error(
+                "Kanban worker termination incomplete during %s; live PIDs=%s",
+                reason,
+                remaining,
+            )
+        else:
+            logger.info("Terminated %d detached Kanban worker(s) during %s", len(pids), reason)
+        return len(remaining)
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died.
@@ -15198,6 +15283,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
+                await self._terminate_active_kanban_workers(
+                    "gateway restart" if self._restart_requested else "gateway shutdown"
+                )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 # Wait on API-server work too. The interrupt is cooperative:
                 # without this the settle window closes the instant
@@ -17179,6 +17267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             prompt_id=str(prompt_data.get("id") or ""),
                             correlation_id=str(prompt_data.get("correlation_id") or ""),
                             session_key=_quick_key,
+                            actor_id=str(event.source.user_id or ""),
                             answer=response_text,
                         )
                         if not written:
@@ -17210,13 +17299,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             write_update_confirmation_response,
                         )
 
-                        write_update_confirmation_response(
+                        written = write_update_confirmation_response(
                             _hermes_home,
                             prompt_id=str(prompt_data.get("id") or ""),
                             correlation_id=str(prompt_data.get("correlation_id") or ""),
                             session_key=_quick_key,
+                            actor_id=str(event.source.user_id or ""),
                             answer="no",
                         )
+                        if not written:
+                            logger.warning(
+                                "Rejected cancellation for pending update prompt for %s; "
+                                "leaving prompt pending",
+                                _quick_key,
+                            )
+                            return (
+                                "⚠️ Pending update confirmation remains active; "
+                                "the command was not dispatched."
+                            )
                     else:
                         tmp = response_path.with_suffix(".tmp")
                         tmp.write_text("", encoding="utf-8")

@@ -52,6 +52,8 @@ export interface FleetUpdateRow {
 export interface FleetUpdateResult {
   command?: string | null
   connectionId: string
+  /** Profile scope is part of a restart's terminal identity. */
+  gatewayProfile?: string | null
   installId: string | null
   message?: string | null
   outcome: 'current' | 'failed' | 'managed' | 'manual' | 'partial' | 'restarted' | 'success'
@@ -590,6 +592,7 @@ function resultFromRow(row: FleetUpdateRow): FleetUpdateResult {
   return {
     command: row.updateCommand,
     connectionId: row.connectionId,
+    gatewayProfile: row.action === 'restart' ? row.gatewayProfile?.trim() || 'default' : null,
     installId: row.installId,
     message: row.message,
     outcome
@@ -614,7 +617,13 @@ async function runGatewayRestart(
       const message = started.message?.trim() || fleetMessage('restartRefused')
       updateRestartRows({ action: 'restart', error: message, message, outcome: 'failed' })
 
-      return { connectionId: connection.id, installId: row.installId, message, outcome: 'failed' }
+      return {
+        connectionId: connection.id,
+        gatewayProfile: profile?.trim() || 'default',
+        installId: row.installId,
+        message,
+        outcome: 'failed'
+      }
     }
 
     const expectedId = started.correlation_id?.trim() || started.action_id?.trim() || undefined
@@ -638,7 +647,13 @@ async function runGatewayRestart(
           const message = status.lines.at(-1) || fleetMessage('restartFailed')
           updateRestartRows({ action: 'restart', error: message, message, outcome: 'failed' })
 
-          return { connectionId: connection.id, installId: row.installId, message, outcome: 'failed' }
+          return {
+            connectionId: connection.id,
+            gatewayProfile: profile?.trim() || 'default',
+            installId: row.installId,
+            message,
+            outcome: 'failed'
+          }
         }
 
         const refreshed = await probeConnection(connection, true, profile)
@@ -650,7 +665,12 @@ async function runGatewayRestart(
         const settled = { ...refreshed, action: refreshed.action, outcome: 'restarted' as const }
         updateRestartRows(settled)
 
-        return { connectionId: connection.id, installId: row.installId, outcome: 'restarted' }
+        return {
+          connectionId: connection.id,
+          gatewayProfile: profile?.trim() || 'default',
+          installId: row.installId,
+          outcome: 'restarted'
+        }
       } catch {
         // A profile-scoped gateway is expected to disappear briefly while its
         // supervisor replaces it. Keep polling its explicitly pinned route.
@@ -660,13 +680,25 @@ async function runGatewayRestart(
     const message = errorMessage(error)
     updateRestartRows({ action: 'restart', error: message, message, outcome: 'failed' })
 
-    return { connectionId: connection.id, installId: row.installId, message, outcome: 'failed' }
+    return {
+      connectionId: connection.id,
+      gatewayProfile: profile?.trim() || 'default',
+      installId: row.installId,
+      message,
+      outcome: 'failed'
+    }
   }
 
   const message = fleetMessage('restartNoReturn')
   updateRestartRows({ action: 'restart', error: message, message, outcome: 'failed' })
 
-  return { connectionId: connection.id, installId: row.installId, message, outcome: 'failed' }
+  return {
+    connectionId: connection.id,
+    gatewayProfile: profile?.trim() || 'default',
+    installId: row.installId,
+    message,
+    outcome: 'failed'
+  }
 }
 
 async function runFleetMutation(
@@ -1012,11 +1044,14 @@ export async function applyFleetUpdates(): Promise<FleetUpdateResult[]> {
 
   for (const result of settled) {
     const row = $fleetUpdates.get()[result.connectionId]
-    const key = row
-      ? mutationKey({ ...row, installId: result.installId ?? row.installId })
-      : result.installId
-        ? `install:${result.installId}`
-        : `connection:${result.connectionId}`
+    const gatewayProfile = result.gatewayProfile?.trim() || null
+    const key = gatewayProfile
+      ? `restart:${result.installId ?? row?.installId ?? result.connectionId}:${gatewayProfile}`
+      : row
+        ? mutationKey({ ...row, installId: result.installId ?? row.installId })
+        : result.installId
+          ? `install:${result.installId}`
+          : `connection:${result.connectionId}`
 
     if (seen.has(key)) {
       continue

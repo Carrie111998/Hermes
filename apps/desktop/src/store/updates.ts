@@ -384,10 +384,11 @@ function activeBackendAuthority(): BackendAuthority | null {
   }
 
   const connectionId = connection.connectionId?.trim()
+  const baseUrl = connection.baseUrl?.trim() || ''
   const profile = connection.profile?.trim()
 
   return {
-    key: `${connectionId || connection.baseUrl}::${profile || 'default'}`,
+    key: `${baseUrl}::${connectionId || ''}::${profile || 'default'}`,
     scope: connectionId ? { connectionId, ...(profile ? { profile } : {}) } : undefined
   }
 }

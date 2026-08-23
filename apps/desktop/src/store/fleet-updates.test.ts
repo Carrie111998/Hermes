@@ -794,9 +794,10 @@ describe('applyFleetUpdate', () => {
       const results = Promise.all([applyFleetUpdate('default-alias'), applyFleetUpdate('research-alias')])
       await vi.advanceTimersByTimeAsync(1_500)
       await expect(results).resolves.toEqual([
-        { connectionId: 'default-alias', installId: 'shared-install', outcome: 'restarted' },
+        { connectionId: 'default-alias', gatewayProfile: 'default', installId: 'shared-install', outcome: 'restarted' },
         {
           connectionId: 'research-alias',
+          gatewayProfile: 'research',
           installId: 'shared-install',
           message: 'research restart failed',
           outcome: 'failed'

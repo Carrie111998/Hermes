@@ -7646,6 +7646,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 prompt_id=prompt_id,
                 correlation_id=str(prompt_state.get("correlation_id") or ""),
                 session_key=str(prompt_state.get("session_key") or ""),
+                actor_id=caller_id,
                 answer=answer,
             )
         except Exception as exc:

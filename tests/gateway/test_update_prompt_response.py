@@ -7,6 +7,7 @@ def _markers(home, *, prompt_id="prompt-new", correlation_id="corr-new"):
     (home / ".update_pending.json").write_text(
         json.dumps({
             "correlation_id": correlation_id,
+            "user_id": "user-new",
             "session_key": "session-new",
             "origin_profile": "work",
             "profile_home": "/profiles/work",
@@ -39,6 +40,7 @@ def test_stale_prompt_and_cross_session_callbacks_are_inert(tmp_path):
         prompt_id="prompt-old",
         correlation_id="corr-old",
         session_key="session-new",
+        actor_id="user-new",
         answer="yes",
     )
     assert not write_update_confirmation_response(
@@ -46,6 +48,7 @@ def test_stale_prompt_and_cross_session_callbacks_are_inert(tmp_path):
         prompt_id="prompt-new",
         correlation_id="corr-new",
         session_key="session-other",
+        actor_id="user-new",
         answer="yes",
     )
     assert not (tmp_path / ".update_response").exists()
@@ -63,6 +66,7 @@ def test_missing_origin_identity_fails_closed(tmp_path):
         prompt_id="prompt-new",
         correlation_id="corr-new",
         session_key="session-new",
+        actor_id="user-new",
         answer="yes",
     )
     assert not (tmp_path / ".update_response").exists()
@@ -76,6 +80,7 @@ def test_duplicate_callback_cannot_overwrite_first_answer(tmp_path):
         prompt_id="prompt-new",
         correlation_id="corr-new",
         session_key="session-new",
+        actor_id="user-new",
         answer="yes",
     )
     assert not write_update_confirmation_response(
@@ -83,6 +88,21 @@ def test_duplicate_callback_cannot_overwrite_first_answer(tmp_path):
         prompt_id="prompt-new",
         correlation_id="corr-new",
         session_key="session-new",
+        actor_id="user-new",
         answer="no",
     )
     assert json.loads((tmp_path / ".update_response").read_text())["answer"] == "yes"
+
+
+def test_cross_actor_callback_cannot_answer_current_prompt(tmp_path):
+    _markers(tmp_path)
+
+    assert not write_update_confirmation_response(
+        tmp_path,
+        prompt_id="prompt-new",
+        correlation_id="corr-new",
+        session_key="session-new",
+        actor_id="user-other",
+        answer="yes",
+    )
+    assert not (tmp_path / ".update_response").exists()
