@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-08-21T20:49:36Z",
+  "updated_at": "2026-08-23T21:41:06Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -155,6 +155,14 @@
         },
         {
           "id": "stealth/ox-alpha",
+          "description": "free"
+        },
+        {
+          "id": "thinkingmachines/inkling:free",
+          "description": "free"
+        },
+        {
+          "id": "thinkingmachines/inkling-small:free",
           "description": "free"
         },
         {

@@ -134,6 +134,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
     ("stealth/ox-alpha",                       "free"),  # "Ox Alpha" stealth reasoning model — 1M ctx
+    ("thinkingmachines/inkling:free",          "free"),
+    ("thinkingmachines/inkling-small:free",    "free"),
     ("openrouter/elephant-alpha",              "free"),
     ("z-ai/glm-5.2:free",                      "free"),
     ("poolside/laguna-s-2.1:free",             "free"),
