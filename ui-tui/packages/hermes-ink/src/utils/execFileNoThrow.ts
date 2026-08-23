@@ -69,12 +69,12 @@ export function execFileNoThrow(
           timedOut = true
           child.kill('SIGTERM')
 
-          // When resolving on exit, SIGTERM-ing a child that has already
-          // exited is a no-op and `'exit'` won't fire again — settle here
-          // so the promise doesn't leak. Safe under settled-guard.
-          if (options.resolveOnExit) {
-            settle(124)
-          }
+          // Settle in both modes. In resolveOnExit mode the child may already
+          // be gone, so SIGTERM is a no-op and 'exit' will not fire again. In
+          // the default mode a grandchild that inherited the stdio pipes can
+          // keep 'close' from firing forever. The settled guard makes this
+          // safe when a later process event also arrives.
+          settle(124)
         }, options.timeout)
       : null
 

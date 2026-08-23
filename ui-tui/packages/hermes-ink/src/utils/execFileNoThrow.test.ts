@@ -65,19 +65,16 @@ afterEach(() => {
 })
 
 describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
-  // Skipped because the bug it documents is a forever-hang. Without
-  // resolveOnExit, the 'close' event doesn't fire when the immediate
-  // child has exited but a forked daemon still holds stdio open. Even
-  // SIGTERM at the timeout doesn't help — the daemon survives it. To
-  // verify by hand: remove `it.skip` and watch the test timeout. This
-  // test is here so a reviewer reading the resolveOnExit option knows
-  // *why* every clipboard-tool spawn in osc.ts wires it on.
-  it.skip('(documented hang) without resolveOnExit, await never resolves when daemon inherits stdio', async () => {
-    const pidFile = join(scriptDir, 'sleeper-skip.pid')
+  // Regression guard: a daemon that inherits stdio must not make the
+  // default close-based mode ignore its declared timeout.
+  it('settles on timeout when a daemon inherits stdio without resolveOnExit', async () => {
+    const pidFile = join(scriptDir, 'sleeper-default.pid')
+    const start = Date.now()
     const result = await execFileNoThrow(daemonScript, [pidFile], { timeout: 300 })
     trackSleeperPid(pidFile)
 
     expect(result.code).toBe(124)
+    expect(Date.now() - start).toBeLessThan(1500)
   })
 
   it("settles immediately on 'exit' when resolveOnExit is true, regardless of daemon stdio", async () => {
