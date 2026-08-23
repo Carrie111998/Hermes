@@ -10,6 +10,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from tools.mcp_tool import _MCP_LIST_MAX_PAGES, _paginate_full_list
 
 
@@ -153,6 +155,97 @@ class TestPaginateFullList:
             "protocol_era": "legacy",
             "metadata_complete": False,
         }
+
+    def test_real_legacy_result_without_ttl_hint_remains_hintless(self):
+        mcp_types = pytest.importorskip("mcp.types")
+        result = mcp_types.ListToolsResult.model_validate(
+            {"tools": [], "cacheScope": "private"}
+        )
+        metadata = {}
+
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(return_value=result),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="legacy",
+            )
+        )
+
+        assert "ttl_ms" not in metadata
+        assert metadata["cache_scope"] == "private"
+
+    def test_real_modern_result_without_ttl_hint_fails_closed(self):
+        mcp_types = pytest.importorskip("mcp.types")
+        result = mcp_types.ListToolsResult.model_validate(
+            {"tools": [], "cacheScope": "private"}
+        )
+        metadata = {}
+
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(return_value=result),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="modern",
+            )
+        )
+
+        assert metadata["ttl_ms"] == 0.0
+        assert metadata["cache_scope"] == "private"
+        assert metadata["metadata_complete"] is False
+
+    def test_real_legacy_result_preserves_explicit_zero_ttl(self):
+        mcp_types = pytest.importorskip("mcp.types")
+        result = mcp_types.ListToolsResult.model_validate(
+            {"tools": [], "ttlMs": 0}
+        )
+        metadata = {}
+
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(return_value=result),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="legacy",
+            )
+        )
+
+        assert metadata["ttl_ms"] == 0.0
+
+    def test_real_legacy_page_without_ttl_keeps_aggregate_hintless(self):
+        mcp_types = pytest.importorskip("mcp.types")
+        pages = [
+            mcp_types.ListToolsResult.model_validate(
+                {
+                    "tools": [],
+                    "nextCursor": "next",
+                    "ttlMs": 500,
+                    "cacheScope": "private",
+                }
+            ),
+            mcp_types.ListToolsResult.model_validate(
+                {"tools": [], "cacheScope": "private"}
+            ),
+        ]
+        metadata = {}
+
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(side_effect=pages),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="legacy",
+            )
+        )
+
+        assert "ttl_ms" not in metadata
+        assert metadata["cache_scope"] == "private"
+        assert metadata["metadata_complete"] is False
 
 
 class TestDiscoveryUsesPagination:

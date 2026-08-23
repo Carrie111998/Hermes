@@ -90,6 +90,7 @@ jobs:
             tests/tools/test_mcp_mrtr.py \
             tests/tools/test_mcp_subscriptions.py \
             tests/tools/test_mcp_schema_cache.py \
+            tests/tools/test_mcp_list_pagination.py \
             tests/tools/test_mcp_lifecycle.py \
             tests/tools/test_mcp_oauth_issuer.py \
             tests/tools/test_mcp_stateless_liveness.py \

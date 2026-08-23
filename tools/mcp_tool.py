@@ -898,6 +898,13 @@ def _coerce_cache_ttl(value: Any) -> Optional[float]:
     return number
 
 
+def _ttl_hint_was_sent(result: Any) -> bool:
+    fields_set = getattr(result, "model_fields_set", None)
+    if fields_set is None:
+        return True
+    return "ttl_ms" in fields_set or "ttlMs" in fields_set
+
+
 async def _paginate_full_list(list_method, items_attr: str, server_name: str,
                               cache_meta_out: Optional[dict] = None,
                               protocol_era: Optional[str] = None):
@@ -930,6 +937,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
     cursor = None
     era = protocol_era or "legacy"
     missing_ttl = False
+    explicit_zero_ttl = False
     missing_scope = False
     if cache_meta_out is not None:
         cache_meta_out["protocol_era"] = era
@@ -950,19 +958,32 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
             except TypeError:
                 result = await list_method(cursor=cursor)
         if cache_meta_out is not None:
-            ttl = _coerce_cache_ttl(mcp_field(result, "ttl_ms", "ttlMs"))
+            ttl = (
+                _coerce_cache_ttl(mcp_field(result, "ttl_ms", "ttlMs"))
+                if _ttl_hint_was_sent(result)
+                else None
+            )
             scope = mcp_field(result, "cache_scope", "cacheScope")
             if ttl is None:
                 missing_ttl = True
                 cache_meta_out["metadata_complete"] = False
-                if era == "modern" or "ttl_ms" in cache_meta_out:
+                if era == "modern":
                     cache_meta_out["ttl_ms"] = 0.0
+                elif not explicit_zero_ttl:
+                    cache_meta_out.pop("ttl_ms", None)
+            elif ttl == 0.0:
+                explicit_zero_ttl = True
+                cache_meta_out["ttl_ms"] = 0.0
+            elif explicit_zero_ttl:
+                cache_meta_out["ttl_ms"] = 0.0
+            elif missing_ttl and era == "legacy":
+                cache_meta_out.pop("ttl_ms", None)
             else:
                 previous_ttl = cache_meta_out.get("ttl_ms")
                 cache_meta_out["ttl_ms"] = (
                     ttl if previous_ttl is None else min(float(previous_ttl), ttl)
                 )
-                if missing_ttl:
+                if missing_ttl and era == "modern":
                     cache_meta_out["ttl_ms"] = 0.0
             if scope not in {"public", "private"}:
                 missing_scope = True
