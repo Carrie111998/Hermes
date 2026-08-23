@@ -5564,25 +5564,16 @@ class AIAgent:
             self._request_anthropic_client_cache = cache
         return cache
 
-    def _build_anthropic_client(
-        self,
-        api_key: Any,
-        base_url: Optional[str] = None,
-        timeout: Optional[float] = None,
-        *,
-        drop_context_1m_beta: bool = False,
-    ) -> Any:
-        """Build an Anthropic client bound to this Hermes conversation."""
-        from agent.anthropic_adapter import build_anthropic_client
-
-        session_affinity = False
+    @staticmethod
+    def _resolve_anthropic_session_affinity(base_url: Optional[str]) -> bool:
+        """Resolve the privacy-gated custom-provider affinity opt-in."""
         try:
             from hermes_cli.config import (
                 get_custom_provider_session_affinity,
                 load_config_readonly,
             )
 
-            session_affinity = get_custom_provider_session_affinity(
+            return get_custom_provider_session_affinity(
                 base_url,
                 config=load_config_readonly(),
             )
@@ -5591,6 +5582,22 @@ class AIAgent:
                 "custom-provider session affinity resolution skipped",
                 exc_info=True,
             )
+            return False
+
+    def _build_anthropic_client(
+        self,
+        api_key: Any,
+        base_url: Optional[str] = None,
+        timeout: Optional[float] = None,
+        *,
+        drop_context_1m_beta: bool = False,
+        session_affinity: Optional[bool] = None,
+    ) -> Any:
+        """Build an Anthropic client bound to this Hermes conversation."""
+        from agent.anthropic_adapter import build_anthropic_client
+
+        if session_affinity is None:
+            session_affinity = self._resolve_anthropic_session_affinity(base_url)
 
         return build_anthropic_client(
             api_key,
@@ -5602,18 +5609,20 @@ class AIAgent:
         )
 
     def _request_anthropic_client_key(self) -> tuple:
-        """Cache key covering everything that forces a fresh client: credential
-        rotation, base URL / region changes, timeout changes (model switch),
-        and the 1M-context beta flag."""
+        """Cache key covering everything that forces a fresh request client."""
         if getattr(self, "provider", None) == "bedrock":
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
             return ("bedrock", region)
+        base_url = getattr(self, "_anthropic_base_url", None)
+        session_affinity = self._resolve_anthropic_session_affinity(base_url)
         return (
             "direct",
             self._anthropic_api_key,
-            getattr(self, "_anthropic_base_url", None),
+            base_url,
             get_provider_request_timeout(self.provider, self.model),
             bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+            session_affinity,
+            getattr(self, "session_id", None) if session_affinity else None,
         )
 
     def _create_request_anthropic_client(self, *, reason: str) -> Any:
@@ -5633,7 +5642,8 @@ class AIAgent:
         (``_create_request_openai_client``): building ``anthropic.Anthropic``
         means a fresh httpx pool and TCP+TLS handshake per call, so the client
         is kept warm across sequential calls whose cache key (credentials,
-        base URL/region, timeout, 1M-beta flag) hasn't changed. ``in_use``
+        base URL/region, timeout, 1M-beta flag, and effective session affinity)
+        hasn't changed. ``in_use``
         keeps a second concurrent call from sharing one pool's close/abort
         lifecycle — it gets a fresh untracked client instead.
 
@@ -5678,6 +5688,7 @@ class AIAgent:
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
                 drop_context_1m_beta=key[4],
+                session_affinity=key[5],
             )
         logger.debug(
             "Anthropic request client created (%s, shared=False) provider=%s model=%s",

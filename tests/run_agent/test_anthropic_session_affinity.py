@@ -190,3 +190,57 @@ def test_delegated_child_uses_its_own_session_affinity(tmp_path, monkeypatch):
         parent.session_id.encode("utf-8")
     ).hexdigest()
     assert child_headers["x-session-affinity"] != parent_headers["x-session-affinity"]
+
+
+def test_request_client_rebuilds_when_session_id_changes(tmp_path, monkeypatch):
+    """A cached proxy client must not retain a previous conversation's affinity."""
+    from hermes_cli import config as config_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "\n".join([
+            "privacy:",
+            "  allow_third_party_identifiers: true",
+            "providers:",
+            "  test-anthropic-proxy:",
+            f"    api: {PROXY_BASE_URL}",
+            "    transport: anthropic_messages",
+            "    session_affinity: true",
+        ]),
+        encoding="utf-8",
+    )
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._RAW_CONFIG_CACHE.clear()
+
+    with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        mock_sdk.Anthropic.side_effect = [MagicMock(), MagicMock(), MagicMock()]
+        agent = AIAgent(
+            api_key="proxy-key",
+            base_url=PROXY_BASE_URL,
+            provider="custom-proxy",
+            api_mode="anthropic_messages",
+            model="claude-test",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        first_id = agent.session_id
+        first_client = agent._create_request_anthropic_client(reason="first")
+        first_headers = mock_sdk.Anthropic.call_args.kwargs["default_headers"]
+        agent._close_request_anthropic_client(
+            first_client,
+            reason="request_complete",
+        )
+
+        agent.session_id = "continued-session"
+        second_client = agent._create_request_anthropic_client(reason="continued")
+        second_headers = mock_sdk.Anthropic.call_args.kwargs["default_headers"]
+
+    assert second_client is not first_client
+    assert first_headers["x-session-affinity"] == hashlib.sha256(
+        first_id.encode("utf-8")
+    ).hexdigest()
+    assert second_headers["x-session-affinity"] == hashlib.sha256(
+        agent.session_id.encode("utf-8")
+    ).hexdigest()
+    assert second_headers["x-session-affinity"] != first_headers["x-session-affinity"]
