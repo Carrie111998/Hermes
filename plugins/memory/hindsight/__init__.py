@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.secret_scope import (
     build_profile_secret_scope,
     get_secret,
+    is_multiplex_active,
     reset_secret_scope,
     set_secret_scope,
 )
@@ -57,6 +58,7 @@ from agent.secret_scope import (
 from agent.memory_provider import MemoryProvider, RecallStatus
 from hermes_constants import (
     get_hermes_home,
+    get_hermes_home_override,
     reset_hermes_home_override,
     set_hermes_home_override,
 )
@@ -755,8 +757,23 @@ class HindsightMemoryProvider(MemoryProvider):
         self._api_key = None
         # Captured at construction time: under multiplexing the constructor
         # runs inside the adapter's per-profile context, while the background
-        # threads spawned later do not (see _profile_scope).
+        # threads spawned later do not (see _profile_scope). The scope mapping
+        # is built once here and reused by every background body — building it
+        # per job would re-parse the profile .env on each retain/recall for no
+        # benefit (the snapshot tracks this provider instance's lifecycle).
         self._profile_home = Path(get_hermes_home())
+        self._profile_secret_scope = build_profile_secret_scope(self._profile_home)
+        if is_multiplex_active() and get_hermes_home_override() is None:
+            # Constructed with no profile override active while multiplexing:
+            # _profile_home likely baked in the process-default home, and every
+            # background secret read will resolve against that profile. Almost
+            # certainly a misconstruction — make it diagnosable in debug logs.
+            logger.debug(
+                "HindsightMemoryProvider constructed under multiplexing without "
+                "a HERMES_HOME override; captured home %s is likely the "
+                "process default rather than a profile home",
+                self._profile_home,
+            )
         self._api_url = _DEFAULT_API_URL
         self._bank_id = "hermes"
         self._budget = "mid"
@@ -1493,9 +1510,16 @@ class HindsightMemoryProvider(MemoryProvider):
         #76574/#86402), so every background body re-installs the scope this
         instance captured at construction — mirroring the gateway's thread
         wrapping (gateway/run.py).
+
+        The scope mapping is built ONCE at construction and reused: retain
+        jobs and recalls are network-bound, so re-parsing the profile .env per
+        job would only add filesystem IO. Mid-session .env edits are picked up
+        when the provider instance is recreated (gateway session lifecycle);
+        the daemon-restart path reads config changes separately via
+        _build/_materialize_embedded_profile_env.
         """
         home_token = set_hermes_home_override(str(self._profile_home))
-        secret_token = set_secret_scope(build_profile_secret_scope(self._profile_home))
+        secret_token = set_secret_scope(self._profile_secret_scope)
         try:
             yield
         finally:
@@ -1811,51 +1835,54 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._mode = "disabled"
                 return
 
-            def _start_daemon():
-                with self._profile_scope():
-                    _start_daemon_scoped()
-
-            def _start_daemon_scoped():
-                import traceback
-                log_dir = get_hermes_home() / "logs"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_path = log_dir / "hindsight-embed.log"
-                try:
-                    # Redirect the daemon manager's Rich console to our log file
-                    # instead of stderr. This avoids global fd redirects that
-                    # would capture output from other threads.
-                    import hindsight_embed.daemon_embed_manager as dem
-                    from rich.console import Console
-                    dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
-
-                    client = self._get_client()
-                    profile = self._config.get("profile", "hermes")
-
-                    # Update the profile .env to match our current config so
-                    # the daemon always starts with the right settings.
-                    # If the config changed and the daemon is running, stop it.
-                    profile_env = _embedded_profile_env_path(self._config)
-                    expected_env = _build_embedded_profile_env(self._config)
-                    saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
-
-                    if config_changed:
-                        profile_env = _materialize_embedded_profile_env(self._config)
-                        if client._manager.is_running(profile):
-                            with open(log_path, "a", encoding="utf-8") as f:
-                                f.write("\n=== Config changed, restarting daemon ===\n")
-                            client._manager.stop(profile)
-
-                    client._ensure_started()
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write("\n=== Daemon started successfully ===\n")
-                except Exception as e:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"\n=== Daemon startup failed: {e} ===\n")
-                        traceback.print_exc(file=f)
-
-            t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
+            t = threading.Thread(
+                target=self._spawn_embedded_daemon, daemon=True, name="hindsight-daemon-start"
+            )
             t.start()
+
+    def _spawn_embedded_daemon(self):
+        """Run the embedded daemon startup under this profile's secret scope."""
+        with self._profile_scope():
+            self._daemon_start_body()
+
+    def _daemon_start_body(self):
+        import traceback
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "hindsight-embed.log"
+        try:
+            # Redirect the daemon manager's Rich console to our log file
+            # instead of stderr. This avoids global fd redirects that
+            # would capture output from other threads.
+            import hindsight_embed.daemon_embed_manager as dem
+            from rich.console import Console
+            dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
+
+            client = self._get_client()
+            profile = self._config.get("profile", "hermes")
+
+            # Update the profile .env to match our current config so
+            # the daemon always starts with the right settings.
+            # If the config changed and the daemon is running, stop it.
+            profile_env = _embedded_profile_env_path(self._config)
+            expected_env = _build_embedded_profile_env(self._config)
+            saved = _load_simple_env(profile_env)
+            config_changed = saved != expected_env
+
+            if config_changed:
+                profile_env = _materialize_embedded_profile_env(self._config)
+                if client._manager.is_running(profile):
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write("\n=== Config changed, restarting daemon ===\n")
+                    client._manager.stop(profile)
+
+            client._ensure_started()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n=== Daemon started successfully ===\n")
+        except Exception as e:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== Daemon startup failed: {e} ===\n")
+                traceback.print_exc(file=f)
 
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
@@ -1995,25 +2022,27 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_disabled():
             return
 
-        def _run():
-            # Ensure the just-completed turn's retain is recall-visible on the
-            # server before we recall, so the warmed context for the next turn
-            # includes it. This waits for the local writer queue to drain AND
-            # for the server-side async retain op(s) to complete (an explicit
-            # read-after-write signal), because async retain returns on
-            # acceptance rather than durability. Runs on the background prefetch
-            # thread, never the reply path, so it adds no response latency.
-            with self._profile_scope():
-                if self._prefetch_waits_for_retain:
-                    self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-                recalled = self._do_recall(query)
-                if recalled.text:
-                    with self._prefetch_lock:
-                        self._prefetch_result = recalled.text
-                        self._prefetch_count = recalled.count
-
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_background, args=(query,), daemon=True, name="hindsight-prefetch"
+        )
         self._prefetch_thread.start()
+
+    def _prefetch_background(self, query: str) -> None:
+        # Ensure the just-completed turn's retain is recall-visible on the
+        # server before we recall, so the warmed context for the next turn
+        # includes it. This waits for the local writer queue to drain AND
+        # for the server-side async retain op(s) to complete (an explicit
+        # read-after-write signal), because async retain returns on
+        # acceptance rather than durability. Runs on the background prefetch
+        # thread, never the reply path, so it adds no response latency.
+        with self._profile_scope():
+            if self._prefetch_waits_for_retain:
+                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+            recalled = self._do_recall(query)
+            if recalled.text:
+                with self._prefetch_lock:
+                    self._prefetch_result = recalled.text
+                    self._prefetch_count = recalled.count
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()

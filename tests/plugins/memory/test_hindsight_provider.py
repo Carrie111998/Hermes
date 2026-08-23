@@ -6,10 +6,12 @@ turn counting, tags), and schema completeness.
 """
 
 import json
+import queue
 import os
 import re
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+from agent.secret_scope import build_profile_secret_scope
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -1569,29 +1572,61 @@ class TestBackgroundSecretScope:
     Under multiplexing, get_secret fails closed on unscoped reads rather
     than risk leaking another profile's credential. The writer/daemon/
     prefetch threads are spawned raw (no contextvars propagation), so each
-    body wraps itself in _profile_scope using the home captured at
-    construction — same contract as gateway/run.py's thread wrapping.
+    body wraps itself in _profile_scope using the home + scope mapping
+    captured at construction — same contract as gateway/run.py's thread
+    wrapping.
     """
 
     @staticmethod
-    def _bare_provider(home):
+    def _bare_provider(home, **attrs):
         provider = HindsightMemoryProvider.__new__(HindsightMemoryProvider)
         provider._profile_home = home
-        provider._retain_queue = __import__("queue").Queue()
-        provider._shutting_down = __import__("threading").Event()
+        provider._profile_secret_scope = build_profile_secret_scope(home)
+        provider._retain_queue = queue.Queue()
+        provider._shutting_down = threading.Event()
+        for name, value in attrs.items():
+            setattr(provider, name, value)
         return provider
 
-    def test_writer_job_reads_profile_secret_and_resets_scope(self, tmp_path):
-        import queue as _queue
-        import threading as _threading
+    @pytest.fixture
+    def multiplex_on(self):
+        """Activate multiplex mode via the public hook, restoring after."""
+        from agent import secret_scope as secret_scope_module
 
+        secret_scope_module.set_multiplex_active(True)
+        yield
+        secret_scope_module.set_multiplex_active(False)
+
+    @pytest.fixture
+    def sync_threads(self, monkeypatch):
+        """Make hindsight's Thread(...) spawns synchronous and capturable."""
+        started = []
+
+        class _SyncThread:
+            def __init__(self, target=None, args=(), daemon=False, name=None):
+                self._target = target
+                self._args = args
+                self.name = name
+                started.append(self)
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.threading.Thread", _SyncThread
+        )
+        return started
+
+    def test_writer_job_reads_profile_secret_and_resets_scope(self, tmp_path):
         from agent.secret_scope import current_secret_scope
         from plugins.memory.hindsight import (
             _WRITER_SENTINEL,
             get_secret as plugin_get_secret,
         )
 
-        (tmp_path / ".env").write_text("HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8")
+        (tmp_path / ".env").write_text(
+            "HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8"
+        )
         observed = {}
 
         def job():
@@ -1599,8 +1634,6 @@ class TestBackgroundSecretScope:
             observed["key"] = plugin_get_secret("HINDSIGHT_LLM_API_KEY", "MISSING")
 
         provider = self._bare_provider(tmp_path)
-        provider._retain_queue = _queue.Queue()
-        provider._shutting_down = _threading.Event()
         provider._retain_queue.put(job)
         provider._retain_queue.put(_WRITER_SENTINEL)
         provider._writer_loop()
@@ -1611,9 +1644,6 @@ class TestBackgroundSecretScope:
         assert current_secret_scope() is None
 
     def test_writer_job_sees_captured_hermes_home(self, tmp_path, monkeypatch):
-        import queue as _queue
-        import threading as _threading
-
         from hermes_constants import get_hermes_home as real_get_hermes_home
         from plugins.memory.hindsight import _WRITER_SENTINEL
 
@@ -1624,47 +1654,134 @@ class TestBackgroundSecretScope:
         def job():
             observed["home"] = real_get_hermes_home()
 
-        provider = HindsightMemoryProvider.__new__(HindsightMemoryProvider)
-        provider._profile_home = tmp_path
-        provider._retain_queue = _queue.Queue()
-        provider._shutting_down = _threading.Event()
+        provider = self._bare_provider(tmp_path)
         provider._retain_queue.put(job)
         provider._retain_queue.put(_WRITER_SENTINEL)
         provider._writer_loop()
 
         assert observed["home"] == tmp_path
 
-    def test_unscoped_read_fails_closed_under_multiplex(self, monkeypatch):
-        from agent import secret_scope as secret_scope_module
+    def test_unscoped_read_fails_closed_under_multiplex(self, multiplex_on):
+        from agent.secret_scope import (
+            get_secret as scope_get_secret,
+            UnscopedSecretError,
+        )
 
-        monkeypatch.setattr(secret_scope_module, "_MULTIPLEX_ACTIVE", True)
-        with pytest.raises(secret_scope_module.UnscopedSecretError):
-            secret_scope_module.get_secret("HINDSIGHT_LLM_API_KEY", "")
+        with pytest.raises(UnscopedSecretError):
+            scope_get_secret("HINDSIGHT_LLM_API_KEY", "")
 
-    def test_writer_job_survives_fail_closed_multiplex_guard(self, tmp_path, monkeypatch):
+    def test_writer_job_survives_fail_closed_multiplex_guard(
+        self, tmp_path, multiplex_on
+    ):
         """The reported crash shape: multiplex on, key only in profile .env,
         read from the raw writer thread — must succeed inside the scope."""
-        import queue as _queue
-        import threading as _threading
-
-        from agent import secret_scope as secret_scope_module
+        from agent.secret_scope import get_secret as scope_get_secret
         from plugins.memory.hindsight import _WRITER_SENTINEL
 
-        monkeypatch.setattr(secret_scope_module, "_MULTIPLEX_ACTIVE", True)
-        (tmp_path / ".env").write_text("HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8")
+        (tmp_path / ".env").write_text(
+            "HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8"
+        )
         observed = {}
 
         def job():
-            observed["key"] = secret_scope_module.get_secret(
-                "HINDSIGHT_LLM_API_KEY", "MISSING"
-            )
+            observed["key"] = scope_get_secret("HINDSIGHT_LLM_API_KEY", "MISSING")
 
-        provider = HindsightMemoryProvider.__new__(HindsightMemoryProvider)
-        provider._profile_home = tmp_path
-        provider._retain_queue = _queue.Queue()
-        provider._shutting_down = _threading.Event()
+        provider = self._bare_provider(tmp_path)
         provider._retain_queue.put(job)
         provider._retain_queue.put(_WRITER_SENTINEL)
-        provider._writer_loop()  # must not raise UnscopedSecretError
+        provider._writer_loop()
 
         assert observed["key"] == "scope-key"
+
+    def test_prefetch_body_runs_inside_captured_profile_scope(self, tmp_path, sync_threads):
+        from agent.secret_scope import current_secret_scope
+        from hermes_constants import get_hermes_home as real_get_hermes_home
+
+        (tmp_path / ".env").write_text(
+            "HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8"
+        )
+        observed = {}
+
+        def fake_recall(query, *, session_id=""):
+            observed["scope"] = current_secret_scope()
+            observed["home"] = real_get_hermes_home()
+            return SimpleNamespace(text="hit", count=1)
+
+        provider = self._bare_provider(
+            tmp_path,
+            _recall_sync=False,
+            _memory_mode="hybrid",
+            _auto_recall=True,
+            _prefetch_waits_for_retain=False,
+            _prefetch_retain_drain_timeout=1.0,
+            _prefetch_lock=threading.Lock(),
+            _prefetch_result=None,
+            _prefetch_count=0,
+            _do_recall=fake_recall,
+        )
+        provider.queue_prefetch("query", session_id="s")
+        assert len(sync_threads) == 1
+        sync_threads[0]._target(*sync_threads[0]._args)
+
+        assert observed["scope"] is not None
+        assert observed["home"] == tmp_path
+        assert current_secret_scope() is None
+
+    def test_daemon_start_body_runs_inside_captured_profile_scope(
+        self, tmp_path, multiplex_on, sync_threads, monkeypatch
+    ):
+        import types
+
+        from agent.secret_scope import (
+            current_secret_scope,
+            get_secret as scope_get_secret,
+        )
+        from hermes_constants import get_hermes_home as real_get_hermes_home
+
+        (tmp_path / ".env").write_text(
+            "HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8"
+        )
+
+        # Stub hindsight_embed + rich so the scoped body can run end-to-end
+        # without the real packages installed.
+        dem_mod = types.ModuleType("hindsight_embed.daemon_embed_manager")
+        dem_mod.console = None
+        he_pkg = types.ModuleType("hindsight_embed")
+        he_pkg.daemon_embed_manager = dem_mod
+        rich_console_mod = types.ModuleType("rich.console")
+        rich_console_mod.Console = lambda **kwargs: object()
+        rich_pkg = types.ModuleType("rich")
+        rich_pkg.console = rich_console_mod
+        monkeypatch.setitem(sys.modules, "hindsight_embed", he_pkg)
+        monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", dem_mod)
+        monkeypatch.setitem(sys.modules, "rich", rich_pkg)
+        monkeypatch.setitem(sys.modules, "rich.console", rich_console_mod)
+
+        observed = {}
+
+        def fake_get_client():
+            observed["scope"] = current_secret_scope()
+            observed["home"] = real_get_hermes_home()
+            observed["key"] = scope_get_secret("HINDSIGHT_LLM_API_KEY", "MISSING")
+            return SimpleNamespace(
+                _manager=SimpleNamespace(is_running=lambda profile: False),
+                _ensure_started=lambda: None,
+            )
+
+        provider = self._bare_provider(
+            tmp_path,
+            _config={
+                "profile": "p",
+                "llm_provider": "openai_compatible",
+                "llm_base_url": "http://127.0.0.1:9002/v1",
+                "llm_model": "m",
+            },
+            _get_client=fake_get_client,
+        )
+        provider._spawn_embedded_daemon()
+
+        assert observed["scope"] is not None
+        assert observed["key"] == "scope-key"
+        assert observed["home"] == tmp_path
+        # Scope must reset even though the body left log/env artifacts.
+        assert current_secret_scope() is None
