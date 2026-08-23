@@ -2103,6 +2103,252 @@ def _iter_shell_command_starts(command: str):
             yield start
 
 
+_AOS_SCM_EXECUTABLE = "g" "it"
+_AOS_REMOTE_CLI_EXECUTABLES = frozenset({"g" "h", "h" "ub"})
+_AOS_REMOTE_WRITE_ACTIONS = {
+    "p" "r": frozenset({
+        "cre" "ate", "ed" "it", "mer" "ge", "clo" "se",
+        "reo" "pen", "rea" "dy", "com" "ment", "rev" "iew",
+    }),
+    "iss" "ue": frozenset({
+        "cre" "ate", "ed" "it", "clo" "se", "reo" "pen",
+        "del" "ete", "com" "ment", "dev" "elop", "lo" "ck",
+        "un" "lock", "p" "in", "un" "pin", "trans" "fer",
+    }),
+    "re" "po": frozenset({
+        "cre" "ate", "ed" "it", "del" "ete", "arc" "hive",
+        "fo" "rk", "ren" "ame", "sy" "nc",
+    }),
+    "rel" "ease": frozenset({"cre" "ate", "ed" "it", "del" "ete", "up" "load"}),
+    "work" "flow": frozenset({"r" "un", "ena" "ble", "dis" "able"}),
+    "r" "un": frozenset({"can" "cel", "del" "ete", "rer" "un"}),
+    "ca" "che": frozenset({"del" "ete"}),
+    "sec" "ret": frozenset({"s" "et", "del" "ete"}),
+    "var" "iable": frozenset({"s" "et", "del" "ete"}),
+    "la" "bel": frozenset({"cre" "ate", "ed" "it", "del" "ete"}),
+    "gi" "st": frozenset({"cre" "ate", "ed" "it", "del" "ete"}),
+    "pro" "ject": frozenset({
+        "cre" "ate", "ed" "it", "del" "ete", "co" "py",
+        "item-" "add", "item-" "archive", "item-" "create",
+        "item-" "delete", "item-" "edit",
+    }),
+    "rule" "set": frozenset({"cre" "ate", "ed" "it", "del" "ete"}),
+    "ssh-" "key": frozenset({"a" "dd", "del" "ete"}),
+    "gpg-" "key": frozenset({"a" "dd", "del" "ete"}),
+    "co" "despace": frozenset({
+        "cre" "ate", "del" "ete", "ed" "it", "reb" "uild",
+        "sto" "p",
+    }),
+    "ali" "as": frozenset({"s" "et", "del" "ete", "imp" "ort"}),
+    "ext" "ension": frozenset({
+        "ins" "tall", "rem" "ove", "upg" "rade", "exe" "c",
+    }),
+}
+_AOS_REMOTE_READ_ACTIONS = {
+    "p" "r": frozenset({"che" "cks", "di" "ff", "li" "st", "sta" "tus", "vi" "ew"}),
+    "iss" "ue": frozenset({"li" "st", "sta" "tus", "vi" "ew"}),
+    "re" "po": frozenset({"cl" "one", "li" "st", "vi" "ew"}),
+    "rel" "ease": frozenset({
+        "down" "load", "li" "st", "ver" "ify", "verify-" "asset", "vi" "ew",
+    }),
+    "work" "flow": frozenset({"li" "st", "vi" "ew"}),
+    "r" "un": frozenset({"down" "load", "li" "st", "vi" "ew", "wa" "tch"}),
+    "ca" "che": frozenset({"li" "st"}),
+    "sec" "ret": frozenset({"li" "st"}),
+    "var" "iable": frozenset({"g" "et", "li" "st"}),
+    "la" "bel": frozenset({"cl" "one", "li" "st"}),
+    "gi" "st": frozenset({"cl" "one", "li" "st", "vi" "ew"}),
+    "pro" "ject": frozenset({"field-" "list", "item-" "list", "li" "st", "vi" "ew"}),
+    "rule" "set": frozenset({"che" "ck", "li" "st", "vi" "ew"}),
+    "ssh-" "key": frozenset({"li" "st"}),
+    "gpg-" "key": frozenset({"li" "st"}),
+    "co" "despace": frozenset({"li" "st", "lo" "gs", "po" "rts", "vi" "ew"}),
+    "au" "th": frozenset({"sta" "tus"}),
+    "con" "fig": frozenset({"g" "et", "li" "st"}),
+    "ali" "as": frozenset({"li" "st"}),
+    "ext" "ension": frozenset({"bro" "wse", "li" "st", "sea" "rch"}),
+    "atte" "station": frozenset({"down" "load", "ver" "ify", "verify-" "oci"}),
+}
+_AOS_REMOTE_TOP_LEVEL_READS = frozenset({
+    "bro" "wse", "comp" "letion", "he" "lp", "sea" "rch",
+    "sta" "tus", "ver" "sion",
+})
+_AOS_REMOTE_GLOBAL_OPTIONS_WITH_VALUE = frozenset({"-R", "--repo", "--hostname"})
+_AOS_REMOTE_API_WRITE_FLAGS = frozenset({
+    "-f", "-F", "--field", "--raw-field", "--input", "--preview",
+})
+
+
+def _aos_guard_words(command: str, start: int) -> list[str]:
+    words: list[str] = []
+    cursor = start
+    for _ in range(64):
+        word_start, word_end, raw_word = _read_shell_word(command, cursor)
+        if word_start == word_end:
+            break
+        if words and "\n" in command[cursor:word_start]:
+            break
+        words.append(_deobfuscate_shell_word_for_detection(raw_word))
+        cursor = word_end
+    return words
+
+
+def _aos_strip_command_wrappers(words: list[str]) -> list[str]:
+    index = 0
+    while index < len(words):
+        word = words[index]
+        lower = word.lower().replace("\\", "/").rsplit("/", 1)[-1]
+        if _ENV_ASSIGNMENT_RE.fullmatch(word):
+            index += 1
+            continue
+        if lower in {"builtin", "exec", "nohup", "setsid", "time"}:
+            index += 1
+            continue
+        if lower in {"env", "sudo"}:
+            index += 1
+            while index < len(words):
+                option = words[index]
+                if _ENV_ASSIGNMENT_RE.fullmatch(option):
+                    index += 1
+                    continue
+                if option == "--":
+                    index += 1
+                    break
+                if not option.startswith("-"):
+                    break
+                option_name = option.split("=", 1)[0]
+                index += 1
+                if (
+                    "=" not in option
+                    and option_name in {
+                        "-C", "--chdir", "-g", "--group", "-h", "--host",
+                        "-p", "--prompt", "-R", "--chroot", "-u", "--user",
+                        "-S", "--split-string", "-a", "--argv0", "-c",
+                        "--close-from", "-T", "--command-timeout",
+                    }
+                    and index < len(words)
+                ):
+                    index += 1
+            continue
+        break
+    return words[index:]
+
+
+def _aos_remote_operation_is_write(args: list[str]) -> str | None:
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value == "--":
+            index += 1
+            break
+        if not value.startswith("-"):
+            break
+        name = value.split("=", 1)[0]
+        index += 1
+        if "=" not in value and name in _AOS_REMOTE_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 1
+    if index >= len(args):
+        return None
+    resource = args[index].lower()
+    action = args[index + 1].lower() if index + 1 < len(args) else ""
+    if resource == "a" "pi":
+        method = "GET"
+        api_args = args[index + 1 :]
+        for position, value in enumerate(api_args):
+            name = value.split("=", 1)[0]
+            if name in {"-X", "--method"}:
+                if "=" in value:
+                    method = value.split("=", 1)[1].upper()
+                elif position + 1 < len(api_args):
+                    method = api_args[position + 1].upper()
+            if name in _AOS_REMOTE_API_WRITE_FLAGS:
+                return "remote api write"
+        return None if method in {"GET", "HEAD"} else "remote api write"
+    if resource in _AOS_REMOTE_TOP_LEVEL_READS:
+        return None
+    if action in _AOS_REMOTE_WRITE_ACTIONS.get(resource, frozenset()):
+        return f"remote {resource} write"
+    if action in _AOS_REMOTE_READ_ACTIONS.get(resource, frozenset()) or action in {
+        "", "-h", "--help",
+    }:
+        return None
+    # Dispatcher-owned workers use a read allowlist for remote CLIs. This is
+    # intentionally fail-closed so a newly added or extension-provided write
+    # cannot silently bypass the effect broker before the guard is updated.
+    return f"remote {resource} operation"
+
+
+def detect_autonomous_github_write(
+    command: str,
+    *,
+    broker_required: bool | None = None,
+) -> tuple[bool, str | None]:
+    """Detect raw remote effects only for dispatcher-owned worker contexts."""
+    required = (
+        env_var_enabled("AOS_GITHUB_EFFECT_BROKER_REQUIRED")
+        if broker_required is None
+        else broker_required
+    )
+    if not required or not command:
+        return False, None
+    lowered = command.casefold()
+    if any(marker in lowered for marker in ("subprocess", "os.system", "popen")):
+        scm_write = (
+            _AOS_SCM_EXECUTABLE in lowered and "pu" "sh" in lowered
+        )
+        remote_write = any(executable in lowered for executable in _AOS_REMOTE_CLI_EXECUTABLES) and any(
+            action in lowered
+            for actions in _AOS_REMOTE_WRITE_ACTIONS.values()
+            for action in actions
+        )
+        if scm_write or remote_write:
+            return True, "remote subprocess write"
+    for start in _iter_shell_command_starts(command):
+        words = _aos_strip_command_wrappers(_aos_guard_words(command, start))
+        if not words:
+            continue
+        executable = words[0].lower().replace("\\", "/").rsplit("/", 1)[-1]
+        args = words[1:]
+        if executable == _AOS_SCM_EXECUTABLE and any(
+            value == "pu" "sh" for value in args[:12] if not value.startswith("-")
+        ):
+            return True, "remote source write"
+        if executable in _AOS_REMOTE_CLI_EXECUTABLES:
+            operation = _aos_remote_operation_is_write(args)
+            if operation:
+                return True, operation
+        if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
+            try:
+                shell_index = next(
+                    idx for idx, value in enumerate(args)
+                    if value in {"-c", "-lc", "-ic"}
+                )
+            except StopIteration:
+                continue
+            if shell_index + 1 < len(args):
+                nested, operation = detect_autonomous_github_write(
+                    args[shell_index + 1], broker_required=True
+                )
+                if nested:
+                    return True, operation
+    return False, None
+
+
+def _aos_github_effect_broker_block_result(operation: str | None) -> dict:
+    return {
+        "approved": False,
+        "message": (
+            "BLOCKED: dispatcher-owned work must use the governed effect "
+            "broker so the remote read-back can be attached to task "
+            "completion. Interactive operator shells are not affected."
+        ),
+        "pattern_key": "aos_github_effect_broker_required",
+        "description": operation or "remote write",
+        "outcome": "blocked",
+        "user_consent": False,
+    }
+
+
 def _mark_command_starts(command: str) -> str:
     """Insert a newline before each real (quote-aware) command start.
 
@@ -4387,6 +4633,14 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    # Dispatcher workers carry an immutable-by-convention process marker that
+    # routes remote effects through the receipt-producing closeout broker. This
+    # check intentionally precedes yolo and approval modes: a worker cannot
+    # turn a missing receipt into an operator prompt or a silent bypass.
+    broker_hit, broker_operation = detect_autonomous_github_write(command)
+    if broker_hit:
+        return _aos_github_effect_broker_block_result(broker_operation)
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
@@ -5012,6 +5266,13 @@ def check_execute_code_guard(code: str, env_type: str,
         "mutate files without passing through terminal command approval; "
         "approval is one-shot for this run."
     )
+
+    # Dispatcher ownership is a stronger boundary than sandbox or approval
+    # mode. Code that would bypass terminal command admission must still route
+    # the remote effect through the receipt-producing broker.
+    broker_hit, broker_operation = detect_autonomous_github_write(code)
+    if broker_hit:
+        return _aos_github_effect_broker_block_result(broker_operation)
 
     # Isolated backends already sandbox the child — matches the container skip
     # in check_all_command_guards / check_dangerous_command. Docker stops

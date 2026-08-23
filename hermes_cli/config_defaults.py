@@ -2611,6 +2611,17 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Optional per-board concurrency cap retained for compatibility with
+        # the standalone dispatcher. The host-wide cap below still wins.
+        "max_spawn": None,
+        # Evidence-gated autonomous admission. When enabled, each tick must
+        # read a fresh (at most five minute) aos.dispatch_admission.v1 receipt
+        # before it may reconcile or claim cards.
+        "require_admission_receipt": False,
+        "admission_receipt_path": "",
+        # Immutable broker receipts are retained here for exact read-back and
+        # idempotent receipt_pending reconciliation.
+        "github_receipt_dir": "~/.local/state/aos/github-action-receipts",
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
@@ -3199,6 +3210,12 @@ DEFAULT_CONFIG = {
     "telemetry": {
         "shared_metrics": {
             "enabled": False,
+        },
+        # High-cardinality request attribution is local and opt-in. Values
+        # flow only to LiteLLM spend-log metadata, never to prompt content.
+        "request_attribution": {
+            "enabled": False,
+            "litellm_endpoints": ["http://127.0.0.1:4001"],
         },
     },
 

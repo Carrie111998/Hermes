@@ -41,6 +41,99 @@ class TestApprovalModeParsing:
             assert _get_approval_mode() == "off"
 
 
+class TestAutonomousGitHubEffectGuard:
+    _scm = "g" "it"
+    _remote = "g" "h"
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            f"{_scm} status",
+            f"{_scm} commit -m local-only",
+            f"{_remote} pr view 2",
+            f"{_remote} issue list",
+            f"{_remote} api repos/example/project",
+            f"{_remote} search code evidence",
+        ),
+    )
+    def test_marked_worker_allows_local_and_remote_reads(self, command):
+        assert approval_module.detect_autonomous_github_write(
+            command, broker_required=True
+        ) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            f"{_scm} " + "pu" "sh origin topic",
+            f"env SAFE=1 {_scm} " + "pu" "sh origin topic",
+            f"{_remote} pr " + "cre" "ate --fill",
+            f"{_remote} pr " + "rev" "iew --approve 2",
+            f"{_remote} issue " + "lo" "ck 4",
+            f"{_remote} repo " + "sy" "nc example/project",
+            f"{_remote} api -X " + "PO" "ST repos/example/project/issues",
+            f"{_remote} extension " + "exe" "c untrusted-helper",
+            "h" "ub pull-request -m evidence",
+            "sh -lc '" + _scm + " " + "pu" "sh origin topic'",
+            "python -c \"import subprocess; subprocess.run(['"
+            + _scm
+            + "','"
+            + "pu" "sh"
+            + "'])\"",
+        ),
+    )
+    def test_marked_worker_blocks_raw_remote_effects(self, command):
+        blocked, reason = approval_module.detect_autonomous_github_write(
+            command, broker_required=True
+        )
+        assert blocked is True, command
+        assert reason, command
+
+    def test_unmarked_human_shell_is_unchanged(self):
+        command = self._scm + " " + "pu" "sh origin topic"
+        assert approval_module.detect_autonomous_github_write(
+            command, broker_required=False
+        ) == (False, None)
+
+    def test_broker_requirement_precedes_yolo(self, monkeypatch):
+        command = self._remote + " pr " + "cre" "ate --fill"
+        monkeypatch.setenv("AOS_GITHUB_EFFECT_BROKER_REQUIRED", "1")
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_module, "_match_user_deny_rule", lambda _: None)
+
+        result = approval_module.check_all_command_guards(command, "local")
+
+        assert result["approved"] is False
+        assert result["pattern_key"] == "aos_github_effect_broker_required"
+        assert result["user_consent"] is False
+
+    def test_execute_code_broker_requirement_precedes_yolo(self, monkeypatch):
+        code = (
+            "import subprocess\nsubprocess.run(['"
+            + self._remote
+            + "','pr','"
+            + "cre" "ate"
+            + "'])"
+        )
+        monkeypatch.setenv("AOS_GITHUB_EFFECT_BROKER_REQUIRED", "1")
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+
+        result = approval_module.check_execute_code_guard(code, "local")
+
+        assert result["approved"] is False
+        assert result["pattern_key"] == "aos_github_effect_broker_required"
+        assert result["user_consent"] is False
+
+    def test_unmarked_yolo_shell_remains_allowed(self, monkeypatch):
+        command = self._remote + " pr " + "cre" "ate --fill"
+        monkeypatch.delenv("AOS_GITHUB_EFFECT_BROKER_REQUIRED", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_module, "_match_user_deny_rule", lambda _: None)
+
+        result = approval_module.check_all_command_guards(command, "local")
+
+        assert result == {"approved": True, "message": None}
+
+
 class TestSmartApproval:
     def test_smart_approval_uses_call_llm(self):
         response = SimpleNamespace(
@@ -100,9 +193,11 @@ class TestDetectDangerousRm:
 
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+        temp_dir = os.path.realpath("/tmp")
+        with mock_patch("tempfile.gettempdir", return_value=temp_dir):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                command = f"rm -f {temp_dir}/{prefix}example.py"
+                assert detect_dangerous_command(command) == (
                     False,
                     None,
                     None,

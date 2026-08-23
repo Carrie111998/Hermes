@@ -48,7 +48,9 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Larger runners are organization-scoped. The personal evidence
+            # fork runs the identical marked set on the standard Windows host.
+            runner: ${{ github.repository == 'lightcloud00/hermes-agent-upstream-fork' && 'windows-latest' || 'windows-latest-32-core' }}
             marker: windows_only
     steps:
       - name: Checkout code

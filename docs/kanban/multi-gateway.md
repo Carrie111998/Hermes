@@ -38,3 +38,6 @@ Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
 Non-dispatch gateways still deliver messages for their own platform adapters
 (Telegram, Discord, etc.). They do not dispatch tasks, and they skip boards
 that have no subscriptions owned by their profiles.
+
+For autonomous claim and source-completion gates on the dispatch owner, see
+[Evidence-gated autonomous dispatch](evidence-gated-dispatch.md).

@@ -503,6 +503,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "admission_class": task.admission_class,
+        "completion_contract": task.completion_contract,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +551,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "admission_class": t.admission_class,
+                    "completion_contract": t.completion_contract,
                 }
 
             def _run_dict(r):
@@ -667,6 +671,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    github_receipt = args.get("github_action_receipt")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -741,6 +746,11 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if github_receipt is not None:
+        if not isinstance(github_receipt, dict):
+            return tool_error("github_action_receipt must be an object/dict")
+        metadata = dict(metadata or {})
+        metadata["github_action_receipt"] = github_receipt
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -798,6 +808,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.GitHubReceiptPendingError as receipt_err:
+                return tool_error(
+                    f"kanban_complete parked {tid} as blocked/receipt_pending: "
+                    f"{receipt_err.reason}. The proposed completion and workspace "
+                    f"were retained. Supply a fresh broker read-back receipt and "
+                    f"call kanban_complete again; the task will complete exactly once."
                 )
             if not ok:
                 return tool_error(
@@ -1397,6 +1414,8 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    admission_class = args.get("admission_class") or "hold"
+    completion_contract = args.get("completion_contract") or "standard"
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1461,6 +1480,8 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                admission_class=str(admission_class),
+                completion_contract=str(completion_contract),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1848,6 +1869,14 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "github_action_receipt": {
+                "type": "object",
+                "description": (
+                    "Verified aos.github_action_receipt.v1 from the GitHub "
+                    "effect broker. Required when this card uses the "
+                    "github_effect_v1 completion contract."
                 ),
             },
             "board": _board_schema_prop(),
@@ -2245,6 +2274,22 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "admission_class": {
+                "type": "string",
+                "enum": ["hold", "cloud_priority", "local_only"],
+                "description": (
+                    "Autonomous admission lane. Defaults to hold so work is "
+                    "never claimed without explicit classification."
+                ),
+            },
+            "completion_contract": {
+                "type": "string",
+                "enum": ["standard", "github_effect_v1"],
+                "description": (
+                    "Evidence gate applied before done. Use github_effect_v1 "
+                    "for source delivery or GitHub mutations."
                 ),
             },
             "skills": {

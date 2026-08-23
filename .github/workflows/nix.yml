@@ -54,8 +54,10 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    # Preserve the upstream larger runner but keep the personal evidence fork
+    # runnable, where organization-level larger-runner groups are unavailable.
+    runs-on: ${{ github.repository == 'lightcloud00/hermes-agent-upstream-fork' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: ${{ github.repository == 'lightcloud00/hermes-agent-upstream-fork' && 90 || 60 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
