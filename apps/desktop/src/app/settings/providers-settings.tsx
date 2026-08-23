@@ -348,6 +348,11 @@ export function ProvidersSettings({
   // authoritative empty catalog — a failed or in-flight fetch must never be
   // mistaken for "no accounts", or the pane silently misrepresents itself.
   const [oauthStatus, setOauthStatus] = useState<'error' | 'loading' | 'ready'>('loading')
+  // Bumped by the Retry button to re-run the load effect below — routing
+  // retries through the same effect (rather than calling loadOAuthProviders
+  // directly) means the effect's cleanup cancels the superseded request, so
+  // a slow, now-stale response can never land after a newer one.
+  const [reloadNonce, setReloadNonce] = useState(0)
   const [openProvider, setOpenProvider] = useState<null | string>(null)
   const [disconnecting, setDisconnecting] = useState<null | string>(null)
   // Free-text filter for the API-keys view (provider name / env-var key / desc).
@@ -396,7 +401,7 @@ export function ProvidersSettings({
     }
 
     return loadOAuthProviders()
-  }, [loadOAuthProviders, onboardingActive])
+  }, [loadOAuthProviders, onboardingActive, reloadNonce])
 
   // External (CLI-managed) providers can't be cleared via the API by design —
   // Hermes never deletes creds another tool owns behind a silent API call.
@@ -531,7 +536,7 @@ export function ProvidersSettings({
     return (
       <SettingsContent>
         <ErrorState title={t.settings.providers.accountsLoadFailed}>
-          <Button onClick={() => loadOAuthProviders()} type="button" variant="secondary">
+          <Button onClick={() => setReloadNonce(n => n + 1)} type="button" variant="secondary">
             {t.common.retry}
           </Button>
         </ErrorState>

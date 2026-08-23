@@ -246,6 +246,51 @@ describe('ProvidersSettings', () => {
     expect(await screen.findByText('Nous Portal')).toBeTruthy()
   })
 
+  it('does not let a stale retry response overwrite a newer load', async () => {
+    // Regression: the Retry button used to call the loader directly and
+    // discard its cleanup, so a slow retry response could still land after a
+    // newer, effect-driven reload had already resolved and overwrite it.
+    listOAuthProviders.mockRejectedValueOnce(new Error('network down'))
+
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('Could not load accounts.')).toBeTruthy()
+
+    let resolveStaleRetry: ((value: { providers: OAuthProvider[] }) => void) | undefined
+    let resolveNewerLoad: ((value: { providers: OAuthProvider[] }) => void) | undefined
+
+    listOAuthProviders
+      .mockImplementationOnce(() => new Promise(resolve => (resolveStaleRetry = resolve)))
+      .mockImplementationOnce(() => new Promise(resolve => (resolveNewerLoad = resolve)))
+
+    // Fire the retry — its request is left in flight.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    })
+
+    // A second, independent reload (e.g. the onboarding overlay opening and
+    // closing) starts a newer request while the retry is still pending.
+    await act(async () => {
+      onboarding.set({ manual: true })
+    })
+    await act(async () => {
+      onboarding.set({ manual: false })
+    })
+
+    // The newer request resolves first with the correct data.
+    await act(async () => {
+      resolveNewerLoad!({ providers: [provider('nous', true)] })
+    })
+    expect(await screen.findByText('Nous Portal')).toBeTruthy()
+
+    // The superseded retry response arrives late — it must not win.
+    await act(async () => {
+      resolveStaleRetry!({ providers: [provider('minimax-oauth', false)] })
+    })
+    expect(screen.getByText('Nous Portal')).toBeTruthy()
+    expect(screen.queryByText('MiniMax')).toBeNull()
+  })
+
   it('keeps the keys catalog on view="keys" even with a non-empty OAuth list', async () => {
     getEnvVars.mockResolvedValue({
       ACME_API_KEY: keyVar({ provider: 'acme', provider_label: 'Acme' })
