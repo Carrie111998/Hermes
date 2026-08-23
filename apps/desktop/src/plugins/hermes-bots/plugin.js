@@ -4467,6 +4467,31 @@ function botBackendProfileScope(route, fallbackProfile = 'default') {
 
 /** Gateway RPC on the bot's OWN source. Source-scoped rows always use the
  * explicit descriptor, including a registered local source. */
+/** Resolve the (connectionId, profile) route descriptor of the bot whose
+ *  gateway the renderer currently foregrounds — the routing key every
+ *  roster/sweep request needs. Definition restored from commit 9b7ab9d65a
+ *  after merge 0404020f7b dropped it (Bots pane eternal loading spinner). */
+async function activeBotRoute() {
+  if (typeof host.profileRoutes !== 'function') {
+    return null
+  }
+
+  const profile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+  const connectionId = String(
+    host.state.connectionId?.get?.() ||
+    (typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : '') ||
+    'local'
+  ).trim() || 'local'
+  const routes = await host.profileRoutes()
+  const route = routes.find(candidate => candidate?.connectionId === connectionId && candidate?.profile === profile)
+
+  if (!route && typeof host.agents === 'function') {
+    throw new Error(`No route for active bot ${connectionId}::${profile}`)
+  }
+
+  return route || null
+}
+
 async function requestForBot(bot, method, params = {}) {
   const route = botConnectionRoute(bot)
 
