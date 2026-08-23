@@ -22,6 +22,8 @@ import {
   buildCronJobPayload,
   cronJobHasExecutionContent,
   cronJobFormFromJob,
+  cronJobSummaryPresentation,
+  loadCronJobDetailForEditor,
   type CronJobFormState,
 } from "@/lib/cron-job";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
@@ -65,10 +67,6 @@ function truncateText(value: string, maxLength: number): string {
   return value.length > maxLength
     ? value.slice(0, maxLength) + "..."
     : value;
-}
-
-function getJobPrompt(job: CronJob): string {
-  return asText(job.prompt);
 }
 
 function NameCheckboxPicker({
@@ -439,21 +437,8 @@ function CronJobFormFields({
   );
 }
 
-function getJobName(job: CronJob): string {
-  return asText(job.name).trim();
-}
-
 function getJobTitle(job: CronJob): string {
-  const name = getJobName(job);
-  if (name) return name;
-
-  const prompt = getJobPrompt(job);
-  if (prompt) return truncateText(prompt, 60);
-
-  const script = asText(job.script);
-  if (script) return truncateText(script, 60);
-
-  return job.id || "Cron job";
+  return cronJobSummaryPresentation(job).title;
 }
 
 function getJobScheduleDisplay(
@@ -467,7 +452,7 @@ function getJobScheduleDisplay(
   // then the structured ``display`` field, then the raw ``expr``) so
   // legacy job rows still render *something* meaningful.
   return describeSchedule(
-    job.schedule,
+    job.schedule ?? undefined,
     asText(job.schedule_display) || asText(job.schedule?.display),
     strings,
   );
@@ -485,30 +470,15 @@ function getRepeatDisplay(job: CronJob): string {
 }
 
 function getJobMode(job: CronJob): string {
-  if (job.no_agent) return "no_agent";
-  if (job.script) return "script+agent";
-  return "agent";
+  return cronJobSummaryPresentation(job).mode;
 }
 
 function getModelDisplay(job: CronJob): string {
-  const provider = asText(job.provider);
-  const model = asText(job.model);
-  if (provider && model) return `${provider}/${model}`;
-  return model || provider;
-}
-
-function getJobProfile(job: CronJob): string {
-  return asText(job.profile) || asText(job.profile_name) || "default";
+  return cronJobSummaryPresentation(job).modelLabel;
 }
 
 function getJobKey(job: CronJob): string {
-  return `${getJobProfile(job)}:${job.id}`;
-}
-
-function splitJobKey(key: string): { profile: string; id: string } {
-  const idx = key.indexOf(":");
-  if (idx === -1) return { profile: "default", id: key };
-  return { profile: key.slice(0, idx) || "default", id: key.slice(idx + 1) };
+  return job.id;
 }
 
 function profileLabel(profile: string): string {
@@ -605,12 +575,25 @@ export default function CronPage() {
   const [availableToolsets, setAvailableToolsets] = useState<ToolsetInfo[]>([]);
   const [modelOptions, setModelOptions] = useState<ModelOptionsResponse | null>(null);
 
-  const resourceProfile = editJob ? getJobProfile(editJob) : createProfile;
+  const resourceProfile = editJob ? selectedProfile : createProfile;
 
-  const openEditModal = useCallback((job: CronJob) => {
-    setEditJob(job);
-    setEditForm(editorFormFromJob(job));
-  }, []);
+  const openEditModal = useCallback(async (job: CronJob) => {
+    try {
+      const detail = await loadCronJobDetailForEditor(
+        api.getCronJobDetail,
+        job,
+        selectedProfile,
+      );
+      setEditJob(detail);
+      setEditForm(editorFormFromJob(detail));
+    } catch (error) {
+      const message =
+        selectedProfile === "all"
+          ? "Select one profile before editing a cron job"
+          : `${t.common.loading}: ${error}`;
+      showToast(message, "error");
+    }
+  }, [selectedProfile, showToast, t.common.loading]);
 
   const selectedProfileRef = useRef(selectedProfile);
   const jobsRequestGenerationRef = useRef(0);
@@ -723,7 +706,7 @@ export default function CronPage() {
   };
 
   const handleEdit = async () => {
-    if (!editJob) return;
+    if (!editJob || selectedProfile === "all") return;
     const payload = buildCronJobPayloadFromEditor(editForm);
     if (
       !payload.schedule ||
@@ -741,7 +724,7 @@ export default function CronPage() {
       await api.updateCronJob(
         editJob.id,
         payload,
-        getJobProfile(editJob),
+        selectedProfile,
       );
       showToast("Saved changes ✓", "success");
       setEditJob(null);
@@ -754,17 +737,20 @@ export default function CronPage() {
   };
 
   const handlePauseResume = async (job: CronJob) => {
+    if (selectedProfile === "all") {
+      showToast("Select one profile before changing a cron job", "error");
+      return;
+    }
     try {
       const isPaused = getJobState(job) === "paused";
-      const profile = getJobProfile(job);
       if (isPaused) {
-        await api.resumeCronJob(job.id, profile);
+        await api.resumeCronJob(job.id, selectedProfile);
         showToast(
           `${t.cron.resume}: "${truncateText(getJobTitle(job), 30)}"`,
           "success",
         );
       } else {
-        await api.pauseCronJob(job.id, profile);
+        await api.pauseCronJob(job.id, selectedProfile);
         showToast(
           `${t.cron.pause}: "${truncateText(getJobTitle(job), 30)}"`,
           "success",
@@ -777,6 +763,10 @@ export default function CronPage() {
   };
 
   const handleTrigger = async (job: CronJob) => {
+    if (selectedProfile === "all") {
+      showToast("Select one profile before triggering a cron job", "error");
+      return;
+    }
     const jobKey = getJobKey(job);
     const label = `${t.cron.triggerNow}: "${truncateText(getJobTitle(job), 30)}"`;
     const viewProfile = selectedProfile;
@@ -791,7 +781,7 @@ export default function CronPage() {
       // the request has not produced yet. Terminal feedback only.
       const result = await controller.run(
         jobKey,
-        () => api.triggerCronJob(job.id, getJobProfile(job)),
+        () => api.triggerCronJob(job.id, selectedProfile),
       );
 
       if (
@@ -814,11 +804,13 @@ export default function CronPage() {
 
   const jobDelete = useConfirmDelete({
     onDelete: useCallback(
-      async (key: string) => {
-        const { profile, id } = splitJobKey(key);
-        const job = jobs.find((j) => getJobKey(j) === key);
+      async (id: string) => {
+        if (selectedProfile === "all") {
+          throw new Error("cron_detail_profile_required");
+        }
+        const job = jobs.find((j) => getJobKey(j) === id);
         try {
-          await api.deleteCronJob(id, profile);
+          await api.deleteCronJob(id, selectedProfile);
           showToast(
             `${t.common.delete}: "${job ? truncateText(getJobTitle(job), 30) : id}"`,
             "success",
@@ -1089,17 +1081,14 @@ export default function CronPage() {
 
         {jobs.map((job) => {
           const state = getJobState(job);
-          const promptText = getJobPrompt(job);
           const title = getJobTitle(job);
-          const hasName = Boolean(getJobName(job));
-          const deliver = asText(job.deliver);
-          const profile = getJobProfile(job);
+          const deliver = asText(job.delivery_kind);
           const jobKey = getJobKey(job);
           const mode = getJobMode(job);
           const modelDisplay = getModelDisplay(job);
-          const toolsets = Array.isArray(job.enabled_toolsets)
-            ? job.enabled_toolsets.filter(Boolean)
-            : [];
+          const skillCount = job.skill_count ?? 0;
+          const toolsetCount = job.toolset_count ?? 0;
+          const canManage = selectedProfile !== "all";
 
           return (
             <Card key={jobKey}>
@@ -1112,15 +1101,15 @@ export default function CronPage() {
                     <Badge tone={STATUS_TONE[state] ?? "secondary"}>
                       {state}
                     </Badge>
-                    <Badge tone="outline">{profileLabel(profile)}</Badge>
+                    {selectedProfile !== "all" && (
+                      <Badge tone="outline">{profileLabel(selectedProfile)}</Badge>
+                    )}
                     {deliver && deliver !== "local" && (
                       <Badge tone="outline">{deliver}</Badge>
                     )}
-                    {Array.isArray(job.skills) && job.skills.length > 0 && (
-                      <Badge tone="outline" title={job.skills.join(", ")}>
-                        {job.skills.length === 1
-                          ? job.skills[0]
-                          : `${job.skills.length} skills`}
+                    {skillCount > 0 && (
+                      <Badge tone="outline">
+                        {skillCount === 1 ? "1 skill" : `${skillCount} skills`}
                       </Badge>
                     )}
                     {mode !== "agent" && (
@@ -1131,17 +1120,12 @@ export default function CronPage() {
                         model
                       </Badge>
                     )}
-                    {toolsets.length > 0 && (
-                      <Badge tone="outline" title={toolsets.join(", ")}>
-                        {toolsets.length} toolsets
+                    {toolsetCount > 0 && (
+                      <Badge tone="outline">
+                        {toolsetCount} toolsets
                       </Badge>
                     )}
                   </div>
-                  {hasName && promptText && (
-                    <p className="text-xs text-muted-foreground truncate mb-1">
-                      {truncateText(promptText, 100)}
-                    </p>
-                  )}
                   <div className="flex items-center gap-4 text-xs text-muted-foreground">
                     <span className="font-mono-ui">
                       {getJobScheduleDisplay(job, scheduleDescribeStrings)}
@@ -1156,18 +1140,17 @@ export default function CronPage() {
                   </div>
                   {job.last_delivery_error && (
                     <p className="text-xs text-destructive mt-1">
-                      delivery: {job.last_delivery_error}
+                      delivery: failed
                     </p>
                   )}
-                  {job.last_fire_error?.detail && (
+                  {job.last_fire_error?.error_kind === "fire_forward_failed" && (
                     <p className="text-xs text-destructive mt-1">
-                      missed scheduled fire ({formatTime(job.last_fire_error.at ?? null)}):{" "}
-                      {job.last_fire_error.detail}
+                      missed scheduled fire ({formatTime(job.last_fire_error.at ?? null)})
                     </p>
                   )}
                   {job.last_error && (
                     <p className="text-xs text-destructive mt-1">
-                      {job.last_error}
+                      run failed
                     </p>
                   )}
                 </div>
@@ -1176,6 +1159,7 @@ export default function CronPage() {
                   <Button
                     ghost
                     size="icon"
+                    disabled={!canManage}
                     title={state === "paused" ? t.cron.resume : t.cron.pause}
                     aria-label={
                       state === "paused" ? t.cron.resume : t.cron.pause
@@ -1191,7 +1175,7 @@ export default function CronPage() {
                   <Button
                     ghost
                     size="icon"
-                    disabled={triggeringJobKeys.has(jobKey)}
+                    disabled={!canManage || triggeringJobKeys.has(jobKey)}
                     title={t.cron.triggerNow}
                     aria-label={t.cron.triggerNow}
                     onClick={() => handleTrigger(job)}
@@ -1202,6 +1186,7 @@ export default function CronPage() {
                   <Button
                     ghost
                     size="icon"
+                    disabled={!canManage}
                     title="Edit job"
                     aria-label="Edit job"
                     onClick={() => openEditModal(job)}
@@ -1213,6 +1198,7 @@ export default function CronPage() {
                     ghost
                     destructive
                     size="icon"
+                    disabled={!canManage}
                     title={t.common.delete}
                     aria-label={t.common.delete}
                     onClick={() => jobDelete.requestDelete(jobKey)}
