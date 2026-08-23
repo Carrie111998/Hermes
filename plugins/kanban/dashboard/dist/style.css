@@ -184,15 +184,16 @@
     text-align: right;
   }
   .hermes-kanban-columns {
-    overscroll-behavior-x: contain;
-    scroll-snap-type: x mandatory;
+    overflow-x: hidden;
   }
   .hermes-kanban-column {
+    display: none;
     flex-basis: calc(100vw - 2rem);
     min-width: calc(100vw - 2rem);
     max-width: calc(100vw - 2rem);
-    scroll-snap-align: start;
-    scroll-snap-stop: always;
+  }
+  .hermes-kanban-column--active {
+    display: flex;
   }
 }
 

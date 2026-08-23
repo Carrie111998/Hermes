@@ -2720,6 +2720,7 @@
       const column = rail.querySelector(`[data-kanban-column="${columnName}"]`);
       if (!column) return;
       setActiveColumn(columnName);
+      if (window.matchMedia && window.matchMedia("(max-width: 767px)").matches) return;
       const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       rail.scrollTo({ left: column.offsetLeft, behavior: reduceMotion ? "auto" : "smooth" });
       column.focus({ preventScroll: true });
@@ -2864,6 +2865,7 @@
         return h(Column, {
           key: col.name,
           column: col,
+          active: col.name === activeColumn,
           boardMeta: props.boardMeta,
           laneByProfile: props.laneByProfile,
           selectedIds: props.selectedIds,
@@ -2951,6 +2953,7 @@
       "data-kanban-column": props.column.name,
       className: cn(
         "hermes-kanban-column",
+        props.active ? "hermes-kanban-column--active" : "",
         dragOver ? "hermes-kanban-column--drop" : "",
       ),
       onDragOver: handleDragOver,

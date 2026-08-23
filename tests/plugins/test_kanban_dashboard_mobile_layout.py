@@ -148,6 +148,7 @@ def _run_browser(
   }
   const context = await browser.newContext({
     viewport:{width:Number(process.argv[4]),height:900},
+    hasTouch:true,
     reducedMotion:process.argv[6] === 'reduce' ? 'reduce' : 'no-preference'
   });
   await context.addInitScript(() => {
@@ -168,14 +169,19 @@ def _run_browser(
   console.error('step: mounted');
   const labels = await page.locator('.hermes-kanban-column-nav-item').allTextContents();
   const visits = [];
-  for (const button of await page.locator('.hermes-kanban-column-nav-item').all()) {
-    await button.focus(); await page.keyboard.press('Enter'); await page.waitForTimeout(600);
-    const controls = await button.getAttribute('aria-controls');
-    visits.push({controls, current: await button.getAttribute('aria-current'),
-      visible: await page.locator('#' + controls).evaluate((el) => {
-        const lane = el.getBoundingClientRect(); const rail = el.parentElement.getBoundingClientRect();
-        return lane.left >= rail.left && lane.right <= rail.right + 1;
-      })});
+  if (Number(process.argv[4]) <= 767) {
+    for (const button of await page.locator('.hermes-kanban-column-nav-item').all()) {
+      await button.tap(); await page.waitForTimeout(50);
+      const controls = await button.getAttribute('aria-controls');
+      visits.push({controls, current: await button.getAttribute('aria-current'),
+        visibleCount: await page.locator('.hermes-kanban-column:visible').count(),
+        visible: await page.locator('#' + controls).evaluate((el) => {
+          const lane = el.getBoundingClientRect(); const rail = el.parentElement.getBoundingClientRect();
+          return lane.left >= rail.left && lane.right <= rail.right + 1;
+        })});
+    }
+    await page.locator('.hermes-kanban-column-nav-item').first().tap();
+    await page.waitForTimeout(50);
   }
   console.error('step: lanes');
   const empty = await page.evaluate(() => document.querySelector('[data-kanban-column="todo"] .hermes-kanban-empty')?.textContent || null);
@@ -216,7 +222,7 @@ def _run_browser(
   });
   const navTargets = await page.locator('.hermes-kanban-column-nav-item').evaluateAll(rects);
   const toolbarTargets = await page.locator('.hermes-kanban-toolbar input:not([type="checkbox"]), .hermes-kanban-toolbar select, .hermes-kanban-toolbar button, .hermes-kanban-toolbar-toggle').evaluateAll(rects);
-  const addTargets = await page.locator('.hermes-kanban-column-add').evaluateAll(rects);
+  const addTargets = await page.locator('.hermes-kanban-column-add:visible').evaluateAll(rects);
   const triageBody = page.locator('[data-kanban-column="triage"] .hermes-kanban-column-body');
   const verticalScroll = await triageBody.evaluate(el => {
     const before = el.scrollTop; el.scrollTop = el.scrollHeight;
@@ -267,7 +273,10 @@ def test_real_app_exposes_and_activates_every_mobile_lane(app_fixture: Path, wid
     screenshot = Path(screenshot_dir) / f"kanban-mobile-{width}.png" if screenshot_dir else None
     measured = _run_browser(app_fixture, width, screenshot)
     assert measured["labels"] == ["Triage20", "Todo0", "Ready1", "In Progress2", "Blocked1", "Review1", "Done1", "scheduled1"]
-    assert all(visit["current"] == "true" and visit["visible"] for visit in measured["visits"]), measured["visits"]
+    assert all(
+        visit["current"] == "true" and visit["visible"] and visit["visibleCount"] == 1
+        for visit in measured["visits"]
+    ), measured["visits"]
     assert measured["empty"] == "— no tasks —"
     assert measured["filteredCounts"] == ["0", "0", "0", "1", "0", "0", "0", "0"]
     assert measured["tenantFilteredCounts"] == ["0", "0", "0", "0", "0", "1", "0", "0"]
@@ -302,5 +311,5 @@ def test_real_app_preserves_desktop_lane_geometry(app_fixture: Path):
 def test_real_app_honors_reduced_motion_for_lane_activation(app_fixture: Path):
     normal = _run_browser(app_fixture, 390)
     reduced = _run_browser(app_fixture, 390, reduced_motion=True)
-    assert normal["scrollBehaviors"] and set(normal["scrollBehaviors"]) == {"smooth"}
-    assert reduced["scrollBehaviors"] and set(reduced["scrollBehaviors"]) == {"auto"}
+    assert normal["scrollBehaviors"] == []
+    assert reduced["scrollBehaviors"] == []
