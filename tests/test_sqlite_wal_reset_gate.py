@@ -104,6 +104,86 @@ class TestApplyWalWalResetGate:
         finally:
             conn.close()
 
+    def test_malformed_schema_probe_is_indeterminate_without_downgrade(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+        path = tmp_path / "malformed.db"
+        seed = sqlite3.connect(str(path))
+        seed.execute("CREATE TABLE messages_fts(x)")
+        seed.execute("PRAGMA writable_schema=ON")
+        seed.execute(
+            """
+            INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+            SELECT type, name, tbl_name, rootpage, sql
+            FROM sqlite_master
+            WHERE name = 'messages_fts'
+            """
+        )
+        seed.commit()
+        seed.close()
+
+        class _TrackDeleteConnection(sqlite3.Connection):
+            delete_attempts = 0
+
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if "journal_mode=delete" in sql.lower().replace(" ", ""):
+                    self.delete_attempts += 1
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(str(path), factory=_TrackDeleteConnection)
+        try:
+            assert apply_wal_with_fallback(conn, db_label="malformed.db") == "wal"
+            assert conn.delete_attempts == 0
+        finally:
+            conn.close()
+
+    def test_automatic_delete_database_error_is_best_effort(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+
+        class _DeleteDatabaseErrorConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if "journal_mode=delete" in sql.lower().replace(" ", ""):
+                    raise sqlite3.DatabaseError("malformed database schema")
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "automatic.db"), factory=_DeleteDatabaseErrorConnection
+        )
+        try:
+            assert apply_wal_with_fallback(conn, db_label="automatic.db") == "delete"
+        finally:
+            conn.close()
+
+    def test_configured_delete_database_error_still_raises(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+        monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "delete")
+
+        class _DeleteDatabaseErrorConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if "journal_mode=delete" in sql.lower().replace(" ", ""):
+                    raise sqlite3.DatabaseError("malformed database schema")
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "configured.db"), factory=_DeleteDatabaseErrorConnection
+        )
+        try:
+            with pytest.raises(sqlite3.DatabaseError, match="malformed database schema"):
+                apply_wal_with_fallback(conn, db_label="configured.db")
+        finally:
+            conn.close()
+
 
 
     def test_warning_deduped_per_label(self, tmp_path, monkeypatch, caplog):

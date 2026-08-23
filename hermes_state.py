@@ -875,7 +875,7 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     for _ in range(4):
         try:
             row = conn.execute("PRAGMA journal_mode").fetchone()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             last_exc = exc
             if "disk i/o error" not in str(exc).lower():
                 return None
@@ -1334,7 +1334,7 @@ def _apply_delete_for_wal_reset_bug(
     actual = ""
     try:
         actual = _set_journal_mode_no_wait(conn, "DELETE")
-    except sqlite3.OperationalError as exc:
+    except sqlite3.DatabaseError as exc:
         if require_delete:
             raise
         lowered = str(exc).lower()
