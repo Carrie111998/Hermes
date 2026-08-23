@@ -2181,7 +2181,7 @@ class GatewaySlashCommandsMixin:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
                 providers = await asyncio.to_thread(
-                    list_authenticated_providers,
+                    list_picker_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
