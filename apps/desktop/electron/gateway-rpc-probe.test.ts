@@ -159,6 +159,27 @@ test('probe fails on the reply timeout when the upgrade is accepted but no reply
   assert.match(result.reason, /Timed out after 20ms waiting for a JSON-RPC reply/)
 })
 
+test('probe disarms the connect timer on open: a reply arriving after the connect timeout has elapsed still counts', async () => {
+  const { FakeWs, instances } = makeFakeWs()
+
+  const promise = probeGatewayRpc('ws://host/api/ws?token=t', {
+    WebSocketImpl: FakeWs,
+    requestId: 'probe-1',
+    connectTimeoutMs: 20,
+    replyTimeoutMs: 1_000
+  })
+
+  instances[0].emit('open')
+  // The socket opened well before the connect timeout; the reply is just
+  // slow (startup import storm). The connect timer must be disarmed at
+  // open — otherwise a healthy reply is misreported as "Timed out waiting
+  // for the WebSocket to open" even though the upgrade was accepted.
+  await new Promise(resolve => setTimeout(resolve, 40))
+  instances[0].emit('message', replyWithId('probe-1', { result: { sessions: [] } }))
+  const result = await promise
+  assert.deepEqual(result, { ok: true })
+})
+
 test('probe times out when the socket never opens', async () => {
   const { FakeWs } = makeFakeWs()
 

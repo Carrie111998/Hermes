@@ -144,6 +144,13 @@ function probeGatewayRpc(wsUrl: string, options: GatewayRpcProbeOptions = {}): P
       }
 
       opened = true
+      // The socket opened: the connect deadline has done its job. Disarm it
+      // so a slow reply (or a grace window longer than connectTimeoutMs)
+      // can't be misreported as a connect timeout on an open connection.
+      if (connectTimer !== null) {
+        clearTimeout(connectTimer)
+        connectTimer = null
+      }
       sendRequest()
     }
 
