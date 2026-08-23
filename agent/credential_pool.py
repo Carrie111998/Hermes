@@ -458,20 +458,17 @@ def _normalize_custom_pool_name(name: str) -> str:
 
 
 def _iter_custom_providers(config: Optional[dict] = None):
-    """Yield (normalized_name, entry_dict) for each valid custom_providers entry."""
+    """Yield normalized entries from the merged custom-provider config view."""
     if config is None:
         config = _load_config_safe()
     if config is None:
         return
-    custom_providers = config.get("custom_providers")
-    if not isinstance(custom_providers, list):
-        # Fall back to the v12+ providers dict via the compatibility layer
-        try:
-            from hermes_cli.config import get_compatible_custom_providers
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
 
-            custom_providers = get_compatible_custom_providers(config)
-        except Exception:
-            return
+        custom_providers = get_compatible_custom_providers(config)
+    except Exception:
+        return
     if not custom_providers:
         return
     for entry in custom_providers:

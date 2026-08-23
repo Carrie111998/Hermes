@@ -396,17 +396,23 @@ class TestRestorePrimaryRuntime:
         agent._fallback_activated = True
         agent._credential_pool = fallback_pool
         agent._swap_credential = MagicMock()
-        configured = [(
-            "gemini-display",
-            {
-                "name": "Gemini Display",
-                "provider_key": "gemini-no-filter",
-                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        config = {
+            "custom_providers": [
+                {
+                    "name": "Legacy Provider",
+                    "base_url": "https://legacy.example/v1",
+                }
+            ],
+            "providers": {
+                "gemini-no-filter": {
+                    "name": "Gemini Display",
+                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                }
             },
-        )]
+        }
 
         with (
-            patch("agent.credential_pool._iter_custom_providers", return_value=configured),
+            patch("agent.credential_pool._load_config_safe", return_value=config),
             patch("agent.credential_pool.load_pool", return_value=primary_pool) as load_pool,
             patch("run_agent.OpenAI", return_value=MagicMock()),
         ):

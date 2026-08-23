@@ -107,6 +107,41 @@ def test_runtime_pool_key_resolves_all_custom_runtime_identities():
         )
 
 
+def test_runtime_pool_key_resolves_modern_provider_in_mixed_config():
+    endpoint = "https://generativelanguage.googleapis.com/v1beta"
+    config = {
+        "custom_providers": [
+            {
+                "name": "Legacy Provider",
+                "base_url": "https://legacy.example/v1",
+            }
+        ],
+        "providers": {
+            "gemini-no-filter": {
+                "name": "Gemini Display",
+                "api": endpoint,
+            }
+        },
+    }
+
+    with patch("agent.credential_pool._load_config_safe", return_value=config):
+        assert (
+            resolve_runtime_pool_key("gemini-no-filter", endpoint)
+            == "custom:gemini-display"
+        )
+        assert (
+            resolve_runtime_pool_key("custom:gemini-no-filter", endpoint)
+            == "custom:gemini-display"
+        )
+        assert (
+            resolve_runtime_pool_key(
+                "custom:gemini-no-filter",
+                "https://fallback.example/v1",
+            )
+            == "custom:gemini-no-filter"
+        )
+
+
 def test_runtime_pool_key_preserves_non_custom_identity():
     with patch("agent.credential_pool._iter_custom_providers", return_value=[]):
         assert (
