@@ -156,6 +156,40 @@ def _load_web_config() -> dict:
         return {}
 
 
+def _raw_backend_name(cfg: dict, key: str = "backend") -> str:
+    """Return the raw stored name for a web backend config key.
+
+    Lowercased + stripped; empty string when unset/blank. Callers that treat
+    the literal value ``"auto"`` as "pick for me" should route through
+    :func:`_configured_backend_name`, which additionally normalizes it away —
+    keeping that rule in one place so future read sites cannot forget it.
+    """
+    return str(cfg.get(key) or "").strip().lower()
+
+
+def _is_auto_sentinel(raw_name: str) -> bool:
+    """True when a raw stored backend name is exactly the hand-edit ``auto``.
+
+    ``"auto"`` is never written by ``hermes tools``, but it is a common hand
+    edit meaning "pick for me" (other Hermes sections use it as their default
+    sentinel). Centralized here so every read site agrees on what counts.
+    """
+    return raw_name == "auto"
+
+
+def _configured_backend_name(cfg: dict, key: str = "backend") -> str:
+    """Normalized stored backend name with ``"auto"`` treated as unset.
+
+    The single normalization point for backend-name reads: every site that
+    decides routing from a stored name must use this so hand-edited
+    ``"auto"`` values behave exactly like an empty key everywhere.
+    """
+    raw = _raw_backend_name(cfg, key)
+    if _is_auto_sentinel(raw):
+        return ""
+    return raw
+
+
 # The built-in web backends whose availability is driven by hardcoded
 # env-var / package / OAuth probes below. Any name NOT in this set is a
 # candidate plugin-registered provider and must be resolved through the
@@ -232,9 +266,9 @@ def _get_backend() -> str:
     the picker) counts as *no* stored name and selects the ladder too,
     matching how the registry resolver already treats unknown names.
     """
-    configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured == "auto":
-        configured = ""
+    cfg = _load_web_config()
+    raw_shared = _raw_backend_name(cfg)
+    configured = _configured_backend_name(cfg)
     if configured:
         # Strict: the stored selection is final, known name or not — an
         # unknown/typoed name surfaces as the vendor path's honest error
@@ -261,7 +295,7 @@ def _get_backend() -> str:
         # asked for autodetection — run the full ladder instead of
         # pinning firecrawl. Per-capability-only selections keep the
         # firecrawl sentinel.
-        if str(_load_web_config().get("backend") or "").strip().lower() != "auto":
+        if not _is_auto_sentinel(raw_shared):
             return "firecrawl"
 
     # Never-configured install — pick the highest-priority available
@@ -366,12 +400,7 @@ def _get_capability_backend(capability: str) -> str:
     per-capability override is stored.
     """
     cfg = _load_web_config()
-    specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
-    if specific == "auto":
-        # Hand-edited "pick for me" — same meaning as unset (never written
-        # by the picker); fall through to the shared selection instead of
-        # surfacing a "no registered provider 'auto'" error.
-        specific = ""
+    specific = _configured_backend_name(cfg, f"{capability}_backend")
     if specific:
         return specific
     return _get_backend()
@@ -1431,13 +1460,9 @@ def check_web_api_key() -> bool:
     registry.
     """
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
-    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
-    configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured == "auto":
-        # Mirror _get_backend: "auto" is a hand-edited alias for "pick for
-        # me", not a provider name — treat it as unset so the readiness OR
-        # below reflects the backends the user actually has credentials for.
-        configured = ""
+    # ``None.lower()`` would raise. Mirrors _get_backend, including the
+    # "auto"-means-autodetect normalization.
+    configured = _configured_backend_name(_load_web_config())
     if configured and _is_backend_available(configured):
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so
