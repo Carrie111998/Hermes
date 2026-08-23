@@ -1000,3 +1000,31 @@ class TestNotFoundCache:
         assert _check_not_found_cache("read", "/tmp/never-exists-notify", tid) is None, (
             "notify_other_tool_call must clear cached misses"
         )
+
+
+def test_ssh_config_write_gate_routes_single_query_deny(tmp_path, monkeypatch):
+    """#93201: the SSH-config write guard must route through the approval
+    gate's single-query deny path — before the fix its call site missed the
+    required single_query_deny_message kwarg and raised TypeError instead of
+    returning the deny message."""
+    from tools import approval as _approval
+    from tools import file_tools
+
+    monkeypatch.setattr(
+        "agent.file_safety.is_write_approval_required",
+        lambda p: str(p).endswith(".ssh/config"),
+    )
+    monkeypatch.setattr(
+        _approval, "_is_single_query_approval_context", lambda: True
+    )
+    monkeypatch.setattr(
+        _approval, "_get_single_query_approval_mode", lambda: "deny"
+    )
+
+    blocked = file_tools._check_approval_required_write(
+        [str(tmp_path / ".ssh" / "config")]
+    )
+
+    assert blocked is not None
+    assert "single-query" in blocked
+    assert "ssh config" in blocked.lower()
