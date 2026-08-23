@@ -45,6 +45,11 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.kanban_policy import (
+    KanbanCreationDenied,
+    current_profile_principal,
+    require_creation_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +389,13 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
         )
+
+    try:
+        require_creation_allowed(
+            current_profile_principal(), operation="kanban decompose fan-out"
+        )
+    except KanbanCreationDenied as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
 
     # Rewrite invalid assignees to the default fallback. Never leave a
     # task with assignee=None — the user explicitly does not want that.
