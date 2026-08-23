@@ -278,4 +278,19 @@ describe('host.state busy vs gateway', () => {
     expect(host.state.busyBySession.get()['runtime-a']).toBeUndefined()
     expect(host.state.gateway.get()).toBe('open')
   })
+
+  // A roster row knows its bot's STORED session ids, never the runtime ids
+  // busyBySession is keyed by — so per-row "is this working" needs this.
+  it('exposes mid-turn chats by stored id, across every open session', () => {
+    publishSessionState('runtime-a', { ...createClientSessionState('stored-a'), busy: true })
+    publishSessionState('runtime-b', { ...createClientSessionState('stored-b'), busy: false })
+
+    expect([...host.state.workingStoredSessionIds.get()]).toEqual(['stored-a'])
+
+    publishSessionState('runtime-b', { ...createClientSessionState('stored-b'), busy: true })
+    expect([...host.state.workingStoredSessionIds.get()].sort()).toEqual(['stored-a', 'stored-b'])
+
+    dropSessionState('runtime-a')
+    expect([...host.state.workingStoredSessionIds.get()]).toEqual(['stored-b'])
+  })
 })

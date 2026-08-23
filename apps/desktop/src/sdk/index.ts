@@ -18,6 +18,11 @@
  *  - `ui.*` — the design language, so plugin UI looks native by default.
  */
 
+// Nothing animates without it, and it costs the stylesheet and nothing else
+// when no blobatar sets `animate`. Imported once here so every consumer of the
+// SDK's `Blobatar` gets motion for free.
+import 'blobatar/motion.css'
+
 import { atom, computed, type ReadableAtom } from 'nanostores'
 import type { ReactNode } from 'react'
 
@@ -87,7 +92,8 @@ import {
   $focusedSessionState,
   $focusedStoredSessionId,
   $sessionStates,
-  $sessionTiles
+  $sessionTiles,
+  $workingSessionIds
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { UsageStats } from '@/types/hermes'
@@ -551,7 +557,14 @@ export const host = {
     /** Profile the live gateway is routed to. */
     profile: readonlyAtom<string>($activeGatewayProfile),
     /** Window geometry ({ width, height, narrow }). */
-    viewport: readonlyAtom<ViewportRect>($viewport)
+    viewport: readonlyAtom<ViewportRect>($viewport),
+    /**
+     * STORED session ids that are mid-turn right now, across every open chat.
+     * Lineage aliases are already resolved, so these match session-list rows
+     * directly. Prefer this over `busy` (one bit, focused chat only) or
+     * `busyBySession` (runtime ids) for any per-row "is this working" readout.
+     */
+    workingStoredSessionIds: readonlyAtom<readonly string[]>($workingSessionIds)
   },
 
   /** Toast into the app's notification stack. */
@@ -1345,7 +1358,11 @@ export { useStore as useValue } from '@nanostores/react'
  *  invalidate exactly like core screens — no hand-rolled atoms or polls. */
 export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 /** Deterministic soft-body avatars from any string (name → face). String
- *  renderer for rasterization; React component for live rendering. */
+ *  renderer for rasterization; React component for live rendering (the only
+ *  one that animates — the string renderer ignores `animate` by design).
+ *  `motion.css` is imported here rather than by each consumer: nothing
+ *  animates without it, and it costs the stylesheet and nothing else on the
+ *  static path (imported at the top of this file). */
 export { blobatar as blobatarSvg } from 'blobatar/blob'
 export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll
