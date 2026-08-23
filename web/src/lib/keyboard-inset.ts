@@ -63,7 +63,8 @@ export const CHROME_INSET_MAX_PX = 79;
  * ~500ms at the shell's 500ms sampling cadence — long enough that a
  * collapsing/reshowing bar (whose value wobbles every sample) never
  * qualifies, short enough that a parked bar is compensated in half a
- * second.
+ * second. The window assumes that cadence: if the sampling interval
+ * changes, revisit whether 2 samples still separates wobble from parked.
  */
 export const CHROME_INSET_STABLE_SAMPLES = 2;
 
@@ -124,6 +125,10 @@ export function computeViewportChromeInset(
       CHROME_INSET_MAX_PX,
     ),
   );
+  // The Math.max(…, 0) is the lower guard — a negative raw (visual viewport
+  // taller than the layout, seen in some iOS zoom states) yields 0 there and
+  // never reaches the band check. The band check below is the effective
+  // lower bound for real (non-negative) readings.
   if (raw < CHROME_INSET_MIN_PX) return 0;
   if (!Number.isFinite(stableSamples) || stableSamples < CHROME_INSET_STABLE_SAMPLES) {
     return 0;
