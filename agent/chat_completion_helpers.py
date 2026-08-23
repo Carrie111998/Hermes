@@ -923,6 +923,34 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def _repair_blank_model(agent, api_kwargs: dict) -> None:
+    """Restore a blank ``model`` wire field from the agent's live model.
+
+    A mid-session provider switch (``switch_model``) can leave stale
+    request-construction state behind: the turn context still resolves the
+    correct model (logs show ``model=ox-alpha-free``), but the api_kwargs
+    reaching the wire carry an empty model string. Relays reject that with
+    a misleading auth-shaped error — e.g. OpenCode Go returns
+    ``HTTP 401 Model  is not supported`` (note the double space, empty
+    model interpolated). Reproduced byte-for-byte 2026-08-23.
+
+    The agent object remains authoritative for the *identity* of the
+    selected model, so when the wire kwargs have lost it we write the
+    agent's live value back in place of sending a request the relay must
+    fail. Only repairs genuinely blank values — never rewrites a non-empty
+    model the caller deliberately set.
+    """
+    if api_kwargs.get("model"):
+        return
+    live = str(getattr(agent, "model", "") or "").strip()
+    if not live:
+        return
+    from hermes_cli.models import normalize_opencode_model_id
+
+    normalized = normalize_opencode_model_id(getattr(agent, "provider", None), live)
+    api_kwargs["model"] = normalized or live
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -940,6 +968,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     this helper only issues the request.
     """
     if agent.api_mode == "codex_responses":
+        _repair_blank_model(agent, api_kwargs)
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
             api_kwargs,
@@ -995,6 +1024,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
+    _repair_blank_model(agent, api_kwargs)
     request_client = make_client("chat_completion_request")
     return request_client.chat.completions.create(**api_kwargs)
 
@@ -3905,6 +3935,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_stream_response = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            _repair_blank_model(agent, next_api_kwargs)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -4504,6 +4535,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+            _repair_blank_model(agent, next_api_kwargs)
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,
