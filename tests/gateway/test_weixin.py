@@ -828,3 +828,91 @@ class TestWeixinVoiceGatewayHandoff:
             "the wrong transcript instead of re-transcribing (#27300)."
         )
 
+
+class TestWeixinUploadContextToken:
+    """getUploadUrl must receive the per-chat context_token (#64704 / #80166)."""
+
+    def test_get_upload_url_includes_context_token_in_payload(self):
+        api_post = AsyncMock(return_value={"upload_full_url": "https://u.example/x"})
+        with patch.object(weixin, "_api_post", api_post):
+            asyncio.run(
+                weixin._get_upload_url(
+                    object(),
+                    base_url="https://ilink.example",
+                    token="tok",
+                    to_user_id="wxid_peer",
+                    media_type=1,
+                    filekey="fk",
+                    rawsize=10,
+                    rawfilemd5="md5",
+                    filesize=16,
+                    aeskey_hex="aa",
+                    context_token="ctx-live",
+                )
+            )
+        payload = api_post.await_args.kwargs["payload"]
+        assert payload["context_token"] == "ctx-live"
+        assert payload["to_user_id"] == "wxid_peer"
+        assert payload["filekey"] == "fk"
+
+    def test_get_upload_url_omits_empty_context_token(self):
+        api_post = AsyncMock(return_value={"ret": -2})
+        with patch.object(weixin, "_api_post", api_post):
+            asyncio.run(
+                weixin._get_upload_url(
+                    object(),
+                    base_url="https://ilink.example",
+                    token="tok",
+                    to_user_id="wxid_peer",
+                    media_type=1,
+                    filekey="fk",
+                    rawsize=10,
+                    rawfilemd5="md5",
+                    filesize=16,
+                    aeskey_hex="aa",
+                    context_token="",
+                )
+            )
+        payload = api_post.await_args.kwargs["payload"]
+        assert "context_token" not in payload
+
+    def test_send_file_forwards_stored_token_to_get_upload_url(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._cdn_base_url = "https://cdn.example.com/c2c"
+        adapter._token_store.get = lambda account_id, chat_id: "stored-ctx"
+        image = tmp_path / "demo.png"
+        image.write_bytes(b"fake-png-bytes")
+        get_upload = AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})
+        with patch.object(weixin, "_get_upload_url", get_upload), patch.object(
+            weixin, "_upload_ciphertext", AsyncMock(return_value="enc")
+        ), patch.object(weixin, "_api_post", AsyncMock(return_value={})):
+            asyncio.run(adapter._send_file("wxid_peer", str(image), ""))
+        assert get_upload.await_args.kwargs["context_token"] == "stored-ctx"
+        assert get_upload.await_args.kwargs["to_user_id"] == "wxid_peer"
+
+    def test_send_file_raises_on_getuploadurl_ret_negative(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: "stored-ctx"
+        image = tmp_path / "demo.png"
+        image.write_bytes(b"fake-png-bytes")
+        with patch.object(
+            weixin,
+            "_get_upload_url",
+            AsyncMock(return_value={"ret": -2, "errmsg": "prepare failed", "errcode": -14}),
+        ):
+            try:
+                asyncio.run(adapter._send_file("wxid_peer", str(image), ""))
+            except RuntimeError as exc:
+                assert "ret=-2" in str(exc)
+                assert "prepare failed" in str(exc)
+            else:
+                raise AssertionError("expected RuntimeError for getUploadUrl ret=-2")
+

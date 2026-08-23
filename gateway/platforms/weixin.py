@@ -560,6 +560,8 @@ async def _get_upload_url(
     aeskey_hex: str,
     context_token: Optional[str] = None,
 ) -> Dict[str, Any]:
+    # iLink getUploadUrl authorizes the CDN grant with the per-chat token.
+    # Omitting it returns ret:-2 / errcode -14 while text send still works.
     payload: Dict[str, Any] = {
         "filekey": filekey,
         "media_type": media_type,
@@ -2190,6 +2192,12 @@ class WeixinAdapter(BasePlatformAdapter):
         rawsize = len(plaintext)
         rawfilemd5 = hashlib.md5(plaintext).hexdigest()
         context_token = self._token_store.get(self._account_id, chat_id)
+        if not context_token:
+            logger.warning(
+                "[%s] getUploadUrl has no context_token for %s; iLink may reject media (ret:-2 / errcode -14)",
+                self.name,
+                _safe_id(chat_id),
+            )
         upload_response = await _get_upload_url(
             self._send_session,
             base_url=self._base_url,
@@ -2203,6 +2211,12 @@ class WeixinAdapter(BasePlatformAdapter):
             aeskey_hex=aes_key.hex(),
             context_token=context_token,
         )
+        ret = upload_response.get("ret")
+        if isinstance(ret, int) and ret < 0:
+            raise RuntimeError(
+                "getUploadUrl failed ret=%s errmsg=%r errcode=%r"
+                % (ret, upload_response.get("errmsg"), upload_response.get("errcode"))
+            )
         upload_param = str(upload_response.get("upload_param") or "")
         upload_full_url = str(upload_response.get("upload_full_url") or "")
         ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
