@@ -48,10 +48,11 @@ describe('selectTranscriptWindow', () => {
 
   it('keeps far MORE messages when they are light than when they are heavy', () => {
     // The contract is weight, not count: a message-count cap would treat these
-    // two identically. 500 tiny messages are cheaper than 500 tool results, so
-    // many more of them survive the same budget.
-    const light = selectTranscriptWindow(transcript(500, 20))
-    const heavy = selectTranscriptWindow(transcript(500, RENDER_WEIGHT_CHARS * 40))
+    // two identically. Tiny messages are cheaper than tool results, so many
+    // more of them survive the same budget. The fixture exceeds the enlarged
+    // local history budget in both shapes.
+    const light = selectTranscriptWindow(transcript(2_000, 20))
+    const heavy = selectTranscriptWindow(transcript(2_000, RENDER_WEIGHT_CHARS * 40))
 
     expect(light.messages.length).toBeGreaterThan(heavy.messages.length * 10)
   })

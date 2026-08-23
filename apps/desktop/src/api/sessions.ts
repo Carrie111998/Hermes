@@ -370,13 +370,12 @@ export function getSessionMessages(
 }
 
 /**
- * The initial hydration page: enough tail to fill the transcript window a few
- * times over, small enough that opening a long session doesn't ship (and
- * convert) hundreds of rows nobody has scrolled to. Older rows load on demand
+ * The initial hydration page: enough tail to fill the larger local transcript
+ * window a few times over while remaining bounded. Older rows load on demand
  * via `getOlderSessionMessages` when "Show earlier" exhausts the in-memory
  * store (see app/chat/transcript-backfill).
  */
-export const LATEST_SESSION_MESSAGES_LIMIT = 120
+export const LATEST_SESSION_MESSAGES_LIMIT = 360
 
 export function getLatestSessionMessages(id: string, profile?: ProfileScope): Promise<SessionMessagesResponse> {
   // includeCompacted: durable display history must include rows preserved by
