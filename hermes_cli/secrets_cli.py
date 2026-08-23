@@ -598,6 +598,7 @@ def _yn(b: bool) -> str:
 
 
 def _bws_version(binary: Path) -> str:
+    bw = _load_bw()
     verified = bw.verify_bws_for_use(binary)
     if verified is None:
         return "version unknown"
@@ -653,6 +654,7 @@ def _list_projects(
     binary: Path, token: str, console: Console, *, server_url: str = ""
 ) -> Optional[List[dict]]:
     """Call ``bws project list`` and return the parsed list, or None on failure."""
+    bw = _load_bw()
     verified = bw.verify_bws_for_use(binary)
     if verified is None:
         console.print("  [red]Refusing unverified bws binary.[/red]")
