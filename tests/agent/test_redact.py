@@ -273,6 +273,20 @@ class TestControlCharSplitTokens:
         result = redact_sensitive_text(text, force=True)
         assert "NOT_TOKEN_TEXT" in result
 
+    def test_mixed_csi_and_bare_control_split_masked(self):
+        # Follow-up review finding on #81012: one complete CSI sequence PLUS
+        # one bare/zero-width split inside the SAME credential must still
+        # mask — mixing supported control encodings is not evidence of
+        # unrelated prose. Only an orphan ESC coexisting with a formed CSI
+        # (mangled/truncated terminal output) refuses the join.
+        for sep, tail_ch in (("\u200b", "c"), ("\x00", "d")):
+            text = "sk-" + "a" * 5 + "\x1b[31m" + "b" * 5 + sep + tail_ch * 10
+            result = redact_sensitive_text(text, force=True)
+            assert result != text
+            assert "a" * 5 not in result
+            assert "b" * 5 not in result
+            assert tail_ch * 10 not in result
+
 
 class TestEnvLookupPreserved:
     """Programmatic env var lookups must not be corrupted (issue #2852)."""

@@ -553,25 +553,34 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
                     body = body[:clips - body_start]
                     if not body:
                         continue
-        # Live chars must be token-body chars, AND stripped regions must be
-        # KIND-UNIFORM: all bare controls, or all complete-CSI bytes. An
-        # orphan ESC followed by a later color sequence leaves live text
-        # between two stripped regions that is not provably part of one
-        # smuggled token — bridging across it deletes arbitrary bytes
-        # (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
-        # NOT_TOKEN_TEXT; review finding on #81012). Kind-uniform spans keep
-        # both smuggling shapes covered: bare-control splits (#77484) bridge
-        # only their own kind, color-glued fragments (#81012) only theirs.
-        kinds = 0  # bit set from keep values: 1 = bare control · 2 = CSI byte
+        # Live chars must be token-body chars, and a candidate whose stripped
+        # regions contain BOTH an orphan ESC (a bare \x1b that began no CSI)
+        # and a complete CSI sequence is refused: that combination marks
+        # mangled/truncated terminal output, where the live text sitting
+        # between the two regions is not provably part of one smuggled token,
+        # and the greedy shadow match bridges across it deleting arbitrary
+        # bytes (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
+        # NOT_TOKEN_TEXT; review finding on #81012). Each splitter alone stays
+        # bridgeable — bare-control splits are #77484's canonical shape,
+        # complete sequences #81012's — and MIXING non-ESC encodings (one CSI
+        # plus one zero-width/control split) remains fail-closed-masked:
+        # diversity of supported splitting encodings is not evidence that a
+        # candidate is unrelated prose.
+        has_orphan_esc = False
+        has_csi = False
         clean_join = True
         for k, c in enumerate(span):
             kd = keep[start_orig + k]
-            if kd:
-                kinds |= kd
+            if kd == 2:
+                has_csi = True
+            elif kd:
+                if c == "\x1b":
+                    has_orphan_esc = True
             elif c not in _TOKEN_BODY_CHARS:
                 clean_join = False
                 break
-        if (clean_join and kinds != 3
+        if (clean_join
+                and not (has_orphan_esc and has_csi)
                 and (end_orig >= n or text[end_orig] != "=")):
             matches.append((start_orig, end_orig, mask_fn(body)))
     for start_orig, end_orig, replacement in reversed(matches):
@@ -590,8 +599,8 @@ def _strip_shadow(text: str):
       1 = bare control char (stripped individually), 2 = byte belonging to a
       complete ANSI CSI sequence (stripped as a unit). Any truthy value means
       strippable noise, preserving the historical contract; the KIND
-      distinction lets the join pass refuse candidate spans whose stripped
-      regions MIX kinds (see the gate in _mask_control_split_tokens).
+      distinction lets the join pass refuse candidates that mix an ORPHAN ESC
+      with a formed CSI sequence (see the gate in _mask_control_split_tokens).
     - ``orig_idx`` maps each shadow index back to its index in ``text``.
 
     Stripping complete CSI sequences — not just the bare ``\\x1b`` byte — is
