@@ -303,6 +303,30 @@ def test_always_approve_covers_foreground():
         cu.set_approval_callback(None)
 
 
+def test_yolo_bypasses_foreground_computer_use_approval(monkeypatch):
+    from tools.computer_use import tool as cu
+
+    calls = []
+
+    def cb(action, args, summary):
+        calls.append(action)
+        return "timeout"
+
+    cu.set_approval_callback(cb)
+    monkeypatch.setattr(
+        "tools.approval.is_approval_bypass_active_for_session",
+        lambda session: True,
+    )
+    try:
+        assert cu._request_approval(
+            "type", {"delivery_mode": "foreground"}, "yolo-run"
+        ) is None
+        assert calls == []
+    finally:
+        cu.set_approval_callback(None)
+
+
+
 def test_foreground_summary_warns_about_focus_change():
     from tools.computer_use.tool import _summarize_action
     s = _summarize_action("click", {"element": 3, "delivery_mode": "foreground"})

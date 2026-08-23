@@ -638,6 +638,20 @@ def _request_approval(action: str, args: Dict[str, Any],
             return None
         if scope_key in _always_allow.get(session_id, set()):
             return None
+    try:
+        from tools.approval import (
+            get_current_session_key,
+            is_approval_bypass_active_for_session,
+        )
+
+        if is_approval_bypass_active_for_session(session_id):
+            return None
+        current_key = get_current_session_key(default="")
+        if current_key and is_approval_bypass_active_for_session(current_key):
+            return None
+    except Exception:
+        # Approval resolution fails closed; the normal callback remains required.
+        pass
     cb = _approval_callback
     if cb is None:
         # No CLI approval wired — default allow. Gateway approval is handled
