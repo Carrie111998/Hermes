@@ -1,6 +1,7 @@
 """End-to-end routing invariants for webhook session handoff processing."""
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,14 @@ from gateway.session import (
     build_session_key,
 )
 from hermes_state import AsyncSessionDB, SessionDB
+
+
+def _successful_handle_message(response):
+    async def _handle(event):
+        event.agent_run_failed = False
+        return response
+
+    return AsyncMock(side_effect=_handle)
 
 
 def _discord_config(
@@ -71,7 +80,9 @@ def _runner_with_store(config, store, db):
     runner.adapters = {Platform.DISCORD: adapter}
     runner._evict_cached_agent = MagicMock()
     runner._release_running_agent_state = MagicMock()
-    runner._handle_message = AsyncMock(return_value="Ready in the handoff thread.")
+    runner._handle_message = _successful_handle_message(
+        "Ready in the handoff thread."
+    )
     return runner, adapter
 
 
@@ -431,8 +442,8 @@ async def test_relay_handoff_reuses_persisted_scope_for_profile_routing(
     runner.adapters = {Platform.RELAY: relay}
     runner._evict_cached_agent = MagicMock()
     runner._release_running_agent_state = MagicMock()
-    runner._handle_message = AsyncMock(
-        return_value="Ready in the relay handoff thread."
+    runner._handle_message = _successful_handle_message(
+        "Ready in the relay handoff thread."
     )
     row = db.get_session(entry.session_id)
     row.update(
@@ -671,6 +682,7 @@ async def test_post_move_send_failure_cleans_compressed_destination(
             compressed_session_id,
         )
         assert advanced is not None
+        event.agent_run_failed = False
         return "Compressed, but delivery will fail."
 
     runner._handle_message = AsyncMock(side_effect=_compress_during_synthetic_turn)
@@ -807,8 +819,157 @@ async def test_claim_cancellation_reconciles_running_webhook_handoff(
 
 
 @pytest.mark.asyncio
-async def test_synthetic_agent_failure_cleans_moved_destination(
+@pytest.mark.parametrize(
+    "claim_behavior",
+    ["return", "raise-before-commit"],
+)
+async def test_real_state_db_offloaded_claim_cancellation_is_reconciled(
+    tmp_path, monkeypatch, claim_behavior
+):
+    """Cancellation reconciles a real offloaded claim result or late error."""
+    config = _discord_config(tmp_path)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:cancel-real-offloaded-claim",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    entry = store.get_or_create_session(source)
+    assert db.request_handoff_once(entry.session_id, "discord") is True
+    runner, adapter = _runner_with_store(config, store, db)
+    runner._running = True
+
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+    real_claim = db.claim_handoff
+    event_loop_thread_id = threading.get_ident()
+    claim_thread_ids = []
+
+    def _blocked_real_claim(session_id):
+        claim_thread_ids.append(threading.get_ident())
+        claim_started.set()
+        if not release_claim.wait(timeout=5):
+            raise TimeoutError("test did not release the real SQLite claim")
+        if claim_behavior == "raise-before-commit":
+            runner._running = False
+            raise RuntimeError("simulated pre-commit claim failure")
+        return real_claim(session_id)
+
+    monkeypatch.setattr(db, "claim_handoff", _blocked_real_claim)
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _no_sleep)
+    watcher_task = asyncio.create_task(
+        GatewayRunner._handoff_watcher(runner, interval=0)
+    )
+    assert await asyncio.to_thread(claim_started.wait, 5)
+    watcher_task.cancel()
+    release_claim.set()
+    with pytest.raises(asyncio.CancelledError):
+        await watcher_task
+
+    durable = db.get_session(entry.session_id)
+    if claim_behavior == "raise-before-commit":
+        assert store.lookup_by_session_key(entry.session_key) is not None
+        assert durable["handoff_state"] == "pending"
+        assert durable["handoff_error"] is None
+        assert durable["ended_at"] is None
+        assert durable["end_reason"] is None
+    else:
+        assert store.lookup_by_session_key(entry.session_key) is None
+        assert durable["handoff_state"] == "failed"
+        assert durable["handoff_error"] == "handoff claim was cancelled"
+        assert durable["ended_at"] is not None
+        assert durable["end_reason"] == "webhook_handoff_failed"
+    assert claim_thread_ids
+    assert all(thread_id != event_loop_thread_id for thread_id in claim_thread_ids)
+    adapter.create_handoff_thread.assert_not_awaited()
+    runner._handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_real_route_move_error_after_cancellation_cleans_source(
     tmp_path, monkeypatch
+):
+    """A real offloaded move error cannot replace cancellation or leak source."""
+    config = _discord_config(tmp_path)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:cancel-real-offloaded-move",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    entry = store.get_or_create_session(source)
+    assert db.request_handoff_once(entry.session_id, "discord") is True
+    runner, adapter = _runner_with_store(config, store, db)
+    runner._running = True
+
+    move_started = threading.Event()
+    release_move = threading.Event()
+    event_loop_thread_id = threading.get_ident()
+    move_thread_ids = []
+    destination_keys = []
+
+    def _blocked_real_move(*args, **kwargs):
+        move_thread_ids.append(threading.get_ident())
+        destination_keys.append(args[1])
+        move_started.set()
+        if not release_move.wait(timeout=5):
+            raise TimeoutError("test did not release the real route move")
+        runner._running = False
+        raise RuntimeError("simulated route move failure")
+
+    monkeypatch.setattr(store, "move_session_route", _blocked_real_move)
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _no_sleep)
+    watcher_task = asyncio.create_task(
+        GatewayRunner._handoff_watcher(runner, interval=0)
+    )
+    assert await asyncio.to_thread(move_started.wait, 5)
+    watcher_task.cancel()
+    release_move.set()
+    with pytest.raises(asyncio.CancelledError):
+        await watcher_task
+
+    assert destination_keys
+    destination_key = destination_keys[0]
+    assert store.lookup_by_session_key(entry.session_key) is None
+    assert store.lookup_by_session_key(destination_key) is None
+    durable = db.get_session(entry.session_id)
+    assert durable["handoff_state"] == "failed"
+    assert durable["handoff_error"] == "handoff processing was cancelled"
+    assert durable["ended_at"] is not None
+    assert durable["end_reason"] == "webhook_handoff_failed"
+    assert move_thread_ids
+    assert all(thread_id != event_loop_thread_id for thread_id in move_thread_ids)
+    runner._handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+    db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_run_failed", [True, None], ids=["failed", "missing"])
+async def test_synthetic_agent_failure_cleans_moved_destination(
+    tmp_path, monkeypatch, agent_run_failed
 ):
     """A normalized agent error response cannot complete a webhook handoff."""
     config = _discord_config(tmp_path)
@@ -829,7 +990,7 @@ async def test_synthetic_agent_failure_cleans_moved_destination(
     runner, adapter = _runner_with_store(config, store, db)
 
     async def _failed_synthetic_turn(event):
-        event._agent_run_failed = True
+        event.agent_run_failed = agent_run_failed
         return "Sorry, I encountered an unexpected error."
 
     runner._handle_message = AsyncMock(side_effect=_failed_synthetic_turn)
@@ -870,6 +1031,7 @@ async def test_pending_handoff_recovers_after_restart_and_missing_home_fails_cle
     """A persisted request is claimed after restart; pre-move failure leaves no ghost."""
     config = GatewayConfig(
         sessions_dir=tmp_path / "sessions",
+        write_sessions_json=False,
         platforms={
             Platform.DISCORD: PlatformConfig(
                 enabled=True,
@@ -891,11 +1053,19 @@ async def test_pending_handoff_recovers_after_restart_and_missing_home_fails_cle
     entry = original_store.get_or_create_session(source)
     assert db.request_handoff_once(entry.session_id, "discord") is True
 
-    # New store instance models a gateway restart loading the durable routing
-    # index and pending handoff from state.db.
-    restarted_store = SessionStore(sessions_dir=config.sessions_dir, config=config)
-    restarted_store._db = db
-    runner, adapter = _runner_with_store(config, restarted_store, db)
+    # Close every original handle, then load both routing ownership and the
+    # pending handoff through a freshly opened state.db connection.
+    original_store.close_all_db_handles()
+    db.close()
+    restarted_db = SessionDB(db_path=tmp_path / "state.db")
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        restarted_store = SessionStore(
+            sessions_dir=config.sessions_dir,
+            config=config,
+        )
+    restarted_store._db = restarted_db
+    restarted_store._ensure_loaded()
+    runner, adapter = _runner_with_store(config, restarted_store, restarted_db)
     states = iter([True, False])
 
     class _Running:
@@ -914,11 +1084,84 @@ async def test_pending_handoff_recovers_after_restart_and_missing_home_fails_cle
     await GatewayRunner._handoff_watcher(runner, interval=0)
 
     assert restarted_store.lookup_by_session_key(entry.session_key) is None
-    durable = db.get_session(entry.session_id)
+    durable = restarted_db.get_session(entry.session_id)
     assert durable["handoff_state"] == "failed"
     assert "no home channel configured" in durable["handoff_error"]
     assert durable["ended_at"] is not None
     assert durable["end_reason"] == "webhook_handoff_failed"
     adapter.create_handoff_thread.assert_not_awaited()
     adapter.send.assert_not_awaited()
-    db.close()
+    restarted_store.close_all_db_handles()
+    restarted_db.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_handoff_recovers_after_real_db_restart_and_creates_one_thread(
+    tmp_path, monkeypatch
+):
+    """A restarted watcher moves one persisted request exactly once."""
+    config = _discord_config(tmp_path)
+    config.write_sessions_json = False
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        original_store = SessionStore(
+            sessions_dir=config.sessions_dir,
+            config=config,
+        )
+    db_path = tmp_path / "state.db"
+    original_db = SessionDB(db_path=db_path)
+    original_store._db = original_db
+    original_store._loaded = True
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:pending-success-before-restart",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    entry = original_store.get_or_create_session(source)
+    assert original_db.request_handoff_once(entry.session_id, "discord") is True
+    original_store.close_all_db_handles()
+    original_db.close()
+
+    restarted_db = SessionDB(db_path=db_path)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        restarted_store = SessionStore(
+            sessions_dir=config.sessions_dir,
+            config=config,
+        )
+    restarted_store._db = restarted_db
+    restarted_store._ensure_loaded()
+    runner, adapter = _runner_with_store(config, restarted_store, restarted_db)
+
+    class _RunningOnce:
+        def __init__(self):
+            self._states = iter([True, False])
+
+        def __bool__(self):
+            return next(self._states, False)
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _no_sleep)
+    runner._running = _RunningOnce()
+    await GatewayRunner._handoff_watcher(runner, interval=0)
+    # A second scan of the same durable store must find no pending work.
+    runner._running = _RunningOnce()
+    await GatewayRunner._handoff_watcher(runner, interval=0)
+
+    synthetic_event = runner._handle_message.await_args.args[0]
+    destination_key = runner._session_key_for_source(synthetic_event.source)
+    moved = restarted_store.lookup_by_session_key(destination_key)
+    assert restarted_store.lookup_by_session_key(entry.session_key) is None
+    assert moved is not None
+    assert moved.session_id == entry.session_id
+    assert restarted_db.get_handoff_state(entry.session_id) == {
+        "state": "completed",
+        "platform": "discord",
+        "error": None,
+    }
+    adapter.create_handoff_thread.assert_awaited_once()
+    runner._handle_message.assert_awaited_once()
+    adapter.send.assert_awaited_once()
+    restarted_store.close_all_db_handles()
+    restarted_db.close()

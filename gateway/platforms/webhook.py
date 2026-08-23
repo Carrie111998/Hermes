@@ -140,6 +140,20 @@ _HANDOFF_DELIVERY_STATE_PREFIX = "webhook_handoff_delivery:"
 _EVENT_HANDOFF_TARGET_KEY = "_webhook_handoff_to"
 _EVENT_HANDOFF_MARKER_KEY = "_webhook_handoff_delivery"
 _EVENT_HANDOFF_REQUESTED_KEY = "_webhook_handoff_requested"
+
+
+class _HandoffDeliveryTargetConflict(RuntimeError):
+    """A provider delivery ID is already owned by another target."""
+
+    def __init__(self, state: Dict[str, Any], expected_target: str):
+        self.state = state
+        self.stored_target = str(state.get("platform") or "")
+        super().__init__(
+            "durable webhook delivery belongs to target "
+            f"{self.stored_target!r}, not {expected_target!r}"
+        )
+
+
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -969,6 +983,44 @@ class WebhookAdapter(BasePlatformAdapter):
                         await self._recover_unrequested_handoff(
                             str(bound_session_id), handoff_to
                         )
+                except _HandoffDeliveryTargetConflict as exc:
+                    bound_session_id = exc.state.get("session_id")
+                    if (
+                        bound_session_id
+                        and exc.stored_target in _SUPPORTED_HANDOFF_TARGETS
+                    ):
+                        try:
+                            await self._recover_unrequested_handoff(
+                                str(bound_session_id), exc.stored_target
+                            )
+                        except Exception as recovery_exc:
+                            logger.error(
+                                "[webhook] Durable original-target recovery "
+                                "failed for %s: %s",
+                                delivery_id,
+                                recovery_exc,
+                            )
+                            return web.json_response(
+                                {"error": "Webhook handoff state unavailable"},
+                                status=503,
+                            )
+                    logger.warning(
+                        "[webhook] Durable duplicate target conflict for %s: %s",
+                        delivery_id,
+                        exc,
+                    )
+                    return web.json_response(
+                        {
+                            "message": (
+                                "Delivery ID already claimed for a different "
+                                "handoff target"
+                            ),
+                            "status": "conflict",
+                            "reason": "handoff_target_changed",
+                            "delivery_id": delivery_id,
+                        },
+                        status=200,
+                    )
                 except Exception as exc:
                     logger.error(
                         "[webhook] Durable duplicate recovery failed for %s: %s",
@@ -1167,8 +1219,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # no more webhook-adapter delivery can occur for this run.
         self._active_handoff_sessions.discard(event.source.chat_id)
 
-        agent_run_failure_marker = getattr(event, "_agent_run_failed", None)
-        agent_run_succeeded = agent_run_failure_marker is False
+        agent_run_succeeded = event.agent_run_failed is False
         # Base derives ProcessingOutcome from text-delivery accounting. A
         # successful agent turn whose truthy response contains only media can
         # therefore arrive as FAILURE because attachment sends do not call
@@ -1257,13 +1308,20 @@ class WebhookAdapter(BasePlatformAdapter):
             raise RuntimeError("invalid durable webhook delivery state") from exc
         if not isinstance(state, dict):
             raise RuntimeError("durable webhook delivery state is missing")
-        if state.get("marker") != marker or state.get("platform") != handoff_to:
+        if state.get("marker") != marker:
             raise RuntimeError(
-                "durable webhook delivery belongs to a different route or platform"
+                "durable webhook delivery belongs to a different route"
+            )
+        stored_target = state.get("platform")
+        if not isinstance(stored_target, str) or not stored_target:
+            raise RuntimeError(
+                "durable webhook delivery has an invalid handoff target"
             )
         session_id = state.get("session_id")
         if session_id is not None and not isinstance(session_id, str):
             raise RuntimeError("durable webhook delivery has an invalid session id")
+        if stored_target != handoff_to:
+            raise _HandoffDeliveryTargetConflict(state, handoff_to)
         return state
 
     async def _session_store_call(

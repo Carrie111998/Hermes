@@ -13305,7 +13305,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         try:
                             claimed = await asyncio.shield(claim_task)
                         except asyncio.CancelledError:
-                            claimed = await claim_task
+                            try:
+                                claimed = await claim_task
+                            except Exception as claim_exc:
+                                # A failed task provides no proof that this
+                                # gateway won the pending-to-running CAS. Another
+                                # gateway may claim the row immediately after
+                                # this transaction rolls back, so a bare
+                                # ``state == running`` reread cannot safely
+                                # authorize cleanup here.
+                                logger.error(
+                                    "Cancelled webhook handoff claim failed for "
+                                    "%s: %s",
+                                    session_id,
+                                    claim_exc,
+                                    exc_info=True,
+                                )
+                                claimed = False
                             if claimed:
                                 try:
                                     cleanup_task = asyncio.create_task(
@@ -13681,20 +13697,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # cancellation; if cancellation arrives at this boundary, wait for
             # the transaction result so cleanup targets the key that actually
             # owns the session.
-            move_task = asyncio.create_task(
-                self.async_session_store.move_session_route(
+            async def _move_session_route():
+                return await self.async_session_store.move_session_route(
                     move_source_key,
                     session_key,
                     handoff_session_id,
                     dest_source,
                 )
-            )
+
+            move_task = asyncio.create_task(_move_session_route())
             try:
                 switched = await asyncio.shield(move_task)
             except asyncio.CancelledError:
-                switched = await move_task
-                if switched is not None:
-                    row["_handoff_active_session_key"] = session_key
+                try:
+                    switched = await move_task
+                except Exception as move_exc:
+                    # move_session_route publishes no live state until its
+                    # primary CAS commits and contains no raising operation
+                    # after that commit. A task error therefore leaves the
+                    # source key authoritative for outer cancellation cleanup.
+                    logger.error(
+                        "Cancelled webhook handoff route move failed for %s: %s",
+                        handoff_session_id,
+                        move_exc,
+                        exc_info=True,
+                    )
+                else:
+                    if switched is not None:
+                        row["_handoff_active_session_key"] = session_key
                 raise
             if switched is not None:
                 row["_handoff_active_session_key"] = session_key
@@ -13745,9 +13775,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
         response_text = await self._handle_message(synthetic_event)
-        if move_source_key and getattr(
-            synthetic_event, "_agent_run_failed", False
-        ):
+        if move_source_key and synthetic_event.agent_run_failed is not False:
             raise RuntimeError("synthetic destination agent run failed")
         if not response_text:
             # Streaming may have already delivered the response inline.
@@ -16726,8 +16754,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
+                        # Adapters retain this exact event object for their
+                        # processing-complete lifecycle callback. Preserve
+                        # that identity so the agent outcome stamped below is
+                        # visible to the adapter after a plugin rewrite.
+                        event.text = _new_text
                     break
                 if _action == "allow":
                     break
@@ -20310,9 +20341,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # response was delivered. Some autonomous adapters need to know
             # whether the agent itself completed successfully: failed/partial
             # results are normalized into helpful text below and can therefore
-            # look like successful transport delivery. Keep this internal and
+            # look like successful transport delivery. This typed field stays
             # per-event; it is not serialized or accepted from inbound data.
-            event._agent_run_failed = bool(
+            event.agent_run_failed = bool(
                 agent_result.get("failed")
                 or agent_result.get("partial")
                 or agent_result.get("interrupted")
@@ -20342,7 +20373,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
             if not self._is_session_run_current(_quick_key, run_generation):
-                event._agent_run_failed = True
+                event.agent_run_failed = True
                 logger.info(
                     "Discarding stale agent result for %s — generation %d is no longer current",
                     _quick_key or "?",
@@ -20942,8 +20973,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             return response
             
+        except asyncio.CancelledError:
+            event.agent_run_failed = True
+            raise
         except Exception as e:
-            event._agent_run_failed = True
+            event.agent_run_failed = True
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:

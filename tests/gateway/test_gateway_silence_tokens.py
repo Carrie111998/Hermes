@@ -1,5 +1,7 @@
 """Gateway intentional-silence token behavior."""
 
+import asyncio
+
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -195,3 +197,20 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
     )
     assert end_context["model"] == "gpt-5.6-terra"
     assert end_context["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_agent_run_stamps_event_failure(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(side_effect=asyncio.CancelledError())
+    event = _event()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._handle_message_with_agent(
+            event,
+            _source(),
+            "agent:main:telegram:group:-1001:12345",
+            1,
+        )
+
+    assert event.agent_run_failed is True

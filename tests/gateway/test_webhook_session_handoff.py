@@ -1,6 +1,7 @@
 """Webhook-side contracts for durable messaging session handoff."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,9 +9,11 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+import gateway.platforms.webhook as webhook_module
 from gateway.config import PlatformConfig
 from gateway.platforms.base import ProcessingOutcome, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+from hermes_state import AsyncSessionDB, SessionDB
 
 
 def _make_adapter(routes) -> WebhookAdapter:
@@ -314,7 +317,7 @@ async def test_success_binds_claim_and_requests_exact_session_once():
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, marker = _make_event(adapter)
-    event._agent_run_failed = False
+    event.agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     # A duplicate lifecycle callback in the same process must be a no-op.
@@ -350,7 +353,7 @@ async def test_existing_matching_bound_request_is_idempotent():
         },
     )
     event, _ = _make_event(adapter)
-    event._agent_run_failed = False
+    event.agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -366,7 +369,7 @@ async def test_media_only_success_requests_handoff_despite_delivery_failure_outc
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, marker = _make_event(adapter)
-    event._agent_run_failed = False
+    event.agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
@@ -395,7 +398,7 @@ async def test_media_only_success_requests_handoff_through_real_adapter_lifecycl
     adapter._active_handoff_sessions.add(event.source.chat_id)
 
     async def _media_only_handler(current_event):
-        current_event._agent_run_failed = False
+        current_event.agent_run_failed = False
         return "![generated result](https://example.com/result.png)"
 
     adapter._message_handler = _media_only_handler
@@ -440,7 +443,7 @@ async def test_failure_with_explicit_agent_failure_still_finalizes():
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, _ = _make_event(adapter)
-    event._agent_run_failed = True
+    event.agent_run_failed = True
 
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
@@ -457,7 +460,7 @@ async def test_cancellation_with_explicit_agent_success_still_finalizes():
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, _ = _make_event(adapter)
-    event._agent_run_failed = False
+    event.agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
 
@@ -475,7 +478,7 @@ async def test_agent_failure_marker_overrides_delivery_success():
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, _ = _make_event(adapter)
-    event._agent_run_failed = True
+    event.agent_run_failed = True
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -512,7 +515,7 @@ async def test_request_failure_removes_source_and_finalizes():
         request_error=RuntimeError("database unavailable"),
     )
     event, _ = _make_event(adapter)
-    event._agent_run_failed = False
+    event.agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -528,7 +531,7 @@ async def test_cancellation_during_shielded_request_leaves_pending_for_watcher()
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, _ = _make_event(adapter)
-    event._agent_run_failed = False
+    event.agent_run_failed = False
     request_started = asyncio.Event()
     release_request = asyncio.Event()
     durable = {"state": None}
@@ -607,6 +610,106 @@ async def test_durable_duplicate_after_restart_skips_second_agent_run():
     db.get_meta.assert_awaited_once_with(state_key)
     db.get_session.assert_awaited_once_with("original-session")
     db.request_handoff_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_real_state_db_duplicate_replay_survives_adapter_restart(tmp_path):
+    """A completed durable claim remains exact-once after reopening SQLite."""
+    original_adapter = _make_adapter(_handoff_routes())
+    delivery_id = "real-db-restart-duplicate"
+    marker, state_key, bound_state = _delivery_state(
+        original_adapter,
+        delivery_id,
+        session_id="original-session",
+    )
+    db_path = tmp_path / "state.db"
+    original_db = SessionDB(db_path=db_path)
+    original_db.create_session("original-session", "webhook")
+    original_db.set_meta(state_key, bound_state)
+    assert original_db.request_handoff_once("original-session", "discord")
+    assert original_db.claim_handoff("original-session")
+    assert original_db.complete_running_handoff("original-session")
+    original_db.close()
+
+    restarted_db = SessionDB(db_path=db_path)
+    restarted_adapter = _make_adapter(_handoff_routes())
+    restarted_adapter.gateway_runner = SimpleNamespace(
+        _session_db=AsyncSessionDB(restarted_db)
+    )
+    restarted_adapter.handle_message = AsyncMock()
+    try:
+        async with TestClient(TestServer(_create_app(restarted_adapter))) as client:
+            response = await client.post(
+                "/webhooks/alerts",
+                json={"message": "provider replay after restart"},
+                headers={"X-GitHub-Delivery": delivery_id},
+            )
+            body = await response.json()
+
+        assert response.status == 200
+        assert body["status"] == "duplicate"
+        assert restarted_db.get_meta(state_key) == bound_state
+        assert restarted_db.get_handoff_state("original-session") == {
+            "state": "completed",
+            "platform": "discord",
+            "error": None,
+        }
+        restarted_adapter.handle_message.assert_not_awaited()
+    finally:
+        restarted_db.close()
+
+
+@pytest.mark.asyncio
+async def test_real_state_db_bound_claim_recovers_after_adapter_restart(tmp_path):
+    """A bound pre-request crash recovers without another agent execution."""
+    original_adapter = _make_adapter(_handoff_routes())
+    delivery_id = "real-db-bound-before-request"
+    _, state_key, bound_state = _delivery_state(
+        original_adapter,
+        delivery_id,
+        session_id="bound-session",
+    )
+    db_path = tmp_path / "state.db"
+    original_db = SessionDB(db_path=db_path)
+    original_db.create_session("bound-session", "webhook")
+    original_db.set_meta(state_key, bound_state)
+    original_db.close()
+
+    restarted_db = SessionDB(db_path=db_path)
+    restarted_adapter = _make_adapter(_handoff_routes())
+    restarted_adapter.gateway_runner = SimpleNamespace(
+        _session_db=AsyncSessionDB(restarted_db)
+    )
+    restarted_adapter.handle_message = AsyncMock()
+    try:
+        async with TestClient(TestServer(_create_app(restarted_adapter))) as client:
+            first, second = await asyncio.gather(
+                client.post(
+                    "/webhooks/alerts",
+                    json={"message": "retry bound delivery"},
+                    headers={"X-GitHub-Delivery": delivery_id},
+                ),
+                client.post(
+                    "/webhooks/alerts",
+                    json={"message": "same retry again"},
+                    headers={"X-GitHub-Delivery": delivery_id},
+                ),
+            )
+            first_body, second_body = await asyncio.gather(
+                first.json(), second.json()
+            )
+
+        assert first.status == second.status == 200
+        assert first_body["status"] == second_body["status"] == "duplicate"
+        assert restarted_db.get_meta(state_key) == bound_state
+        assert restarted_db.get_handoff_state("bound-session") == {
+            "state": "pending",
+            "platform": "discord",
+            "error": None,
+        }
+        restarted_adapter.handle_message.assert_not_awaited()
+    finally:
+        restarted_db.close()
 
 
 @pytest.mark.asyncio
@@ -715,7 +818,7 @@ async def test_duplicate_recovers_crash_between_binding_and_request():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_with_mismatched_durable_target_fails_closed():
+async def test_duplicate_with_mismatched_durable_target_is_terminal_conflict():
     adapter = _make_adapter(_handoff_routes())
     _, _, conflicting_state = _delivery_state(
         adapter,
@@ -733,15 +836,139 @@ async def test_duplicate_with_mismatched_durable_target_fails_closed():
     adapter.handle_message = AsyncMock()
 
     async with TestClient(TestServer(_create_app(adapter))) as client:
+        first, second = await asyncio.gather(
+            client.post(
+                "/webhooks/alerts",
+                json={"message": "conflict"},
+                headers={"X-GitHub-Delivery": "mismatched-target"},
+            ),
+            client.post(
+                "/webhooks/alerts",
+                json={"message": "conflict replay"},
+                headers={"X-GitHub-Delivery": "mismatched-target"},
+            ),
+        )
+        first_body, second_body = await asyncio.gather(
+            first.json(), second.json()
+        )
+
+    assert first.status == second.status == 200
+    assert first_body == second_body == {
+        "message": "Delivery ID already claimed for a different handoff target",
+        "status": "conflict",
+        "reason": "handoff_target_changed",
+        "delivery_id": "mismatched-target",
+    }
+    assert db.set_meta_if_absent.await_count == 2
+    assert db.get_meta.await_count == 2
+    db.get_session.assert_not_awaited()
+    db.request_handoff_once.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retargeted_duplicate_recovers_only_first_claimed_target(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        webhook_module,
+        "_SUPPORTED_HANDOFF_TARGETS",
+        frozenset({"discord", "telegram"}),
+    )
+    adapter = _make_adapter(_handoff_routes(handoff_to="telegram"))
+    _, _, first_target_state = _delivery_state(
+        adapter,
+        "retargeted-bound-delivery",
+        session_id="bound-session",
+        platform="discord",
+    )
+    db = SimpleNamespace(
+        set_meta_if_absent=AsyncMock(return_value=False),
+        get_meta=AsyncMock(return_value=first_target_state),
+        get_session=AsyncMock(
+            return_value={"id": "bound-session", "ended_at": None}
+        ),
+        get_handoff_state=AsyncMock(
+            return_value={"state": None, "platform": None, "error": None}
+        ),
+        request_handoff_once=AsyncMock(return_value=True),
+    )
+    adapter.gateway_runner = SimpleNamespace(_session_db=db)
+    adapter.handle_message = AsyncMock()
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
         response = await client.post(
             "/webhooks/alerts",
-            json={"message": "conflict"},
-            headers={"X-GitHub-Delivery": "mismatched-target"},
+            json={"message": "replay after retarget"},
+            headers={"X-GitHub-Delivery": "retargeted-bound-delivery"},
+        )
+        body = await response.json()
+
+    assert response.status == 200
+    assert body["status"] == "conflict"
+    assert body["reason"] == "handoff_target_changed"
+    db.request_handoff_once.assert_awaited_once_with(
+        "bound-session", "discord"
+    )
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_target", [None, "", 7])
+async def test_malformed_durable_target_remains_retryable_failure(stored_target):
+    adapter = _make_adapter(_handoff_routes())
+    marker, _, _ = _delivery_state(adapter, "malformed-target")
+    malformed_state = json.dumps(
+        {
+            "marker": marker,
+            "platform": stored_target,
+            "session_id": "bound-session",
+        }
+    )
+    db = SimpleNamespace(
+        set_meta_if_absent=AsyncMock(return_value=False),
+        get_meta=AsyncMock(return_value=malformed_state),
+    )
+    adapter.gateway_runner = SimpleNamespace(_session_db=db)
+    adapter.handle_message = AsyncMock()
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        response = await client.post(
+            "/webhooks/alerts",
+            json={"message": "malformed tombstone"},
+            headers={"X-GitHub-Delivery": "malformed-target"},
         )
 
     assert response.status == 503
-    db.get_session.assert_not_awaited()
-    db.request_handoff_once.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mismatched_target_with_malformed_session_id_remains_retryable_failure():
+    adapter = _make_adapter(_handoff_routes())
+    marker, _, _ = _delivery_state(adapter, "malformed-retarget-session")
+    malformed_state = json.dumps(
+        {
+            "marker": marker,
+            "platform": "telegram",
+            "session_id": 7,
+        }
+    )
+    db = SimpleNamespace(
+        set_meta_if_absent=AsyncMock(return_value=False),
+        get_meta=AsyncMock(return_value=malformed_state),
+    )
+    adapter.gateway_runner = SimpleNamespace(_session_db=db)
+    adapter.handle_message = AsyncMock()
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        response = await client.post(
+            "/webhooks/alerts",
+            json={"message": "malformed retarget tombstone"},
+            headers={"X-GitHub-Delivery": "malformed-retarget-session"},
+        )
+
+    assert response.status == 503
     adapter.handle_message.assert_not_awaited()
 
 
