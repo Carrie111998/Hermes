@@ -2395,7 +2395,7 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=current_model,
-            filter_provider="custom",
+            filter_provider="custom:bedrock-mantle",
             confirm_provider="custom",
             confirm_base_url=mantle_base_url,
             confirm_api_key=existing_key,
