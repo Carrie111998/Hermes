@@ -152,16 +152,18 @@ _MACHINE_PREFIXES = (
 # model's guess, not after what the user actually asked.
 #
 # Matching strategy — structural, not verbatim:
-#   - Look for a leading ``[`` block whose first line signals an image
-#     attachment (``attached an image``). We key on the semantic marker
-#     rather than hardcoding one phrase, because two call sites already
-#     use slightly different wording and a third variant would silently
-#     reintroduce the bug (#82339 review follow-up):
-#       tui_gateway/server.py:  "[The user attached an image:\n<desc>]\n[hint]"
+#   - Look for a leading ``[`` envelope whose opener names the *user* as
+#     the image attacher — ``The user attached an image`` (both call sites)
+#     or ``User attached an image`` (a leaner third variant). Keying on the
+#     shared ``user attached an image`` marker (rather than the divergent
+#     tails) catches wording drift while still excluding first-person
+#     quotes like ``[I attached an image ...]``, which are a user's own text
+#     and must survive:
+#       tui_gateway/server.py:  "[The user attached an image:\n<desc>]"
 #       cli.py:                 "[The user attached an image. Here's what it
-#                                contains:\n<desc>]\n[hint]"
+#                                contains:\n<desc>]"
 #   - Failure variants ("...but analysis failed.") are matched by the same
-#     rule — they still start with the image-attachment signal.
+#     rule — they still begin with the image-attachment marker.
 #   - The description body may itself contain brackets (the vision model
 #     echoes code like ``array[0] = 1``), so the body is matched as a mix
 #     of non-bracket chars and ``[xxx]`` atomic blocks — the closing ``]``
@@ -169,9 +171,10 @@ _MACHINE_PREFIXES = (
 #     (2026-08-10 #82339 follow-up from triage review).
 #   - An optional trailing ``[hint]`` line (vision_analyze pointer) is
 #     consumed along with each envelope block.
+#   - Case-insensitive: the wording is machine-authored, but a user pasting
+#     a re-capitalized export must not have their text stripped.
 _IMAGE_ENVELOPE_RE = re.compile(
-    r"\[\s*[^\n]*attached an image[^\n]*\n?"
-    r"(?:[^\[\]]|\[[^\]\n]*\])*\]"
+    r"\[\s*(?:the\s+)?user attached an image(?:[^\[\]]|\[[^\]\n]*\])*\]"
     r"(?:\s*\[[^\]\n]*\])?",
     re.IGNORECASE | re.DOTALL,
 )
@@ -305,7 +308,15 @@ def _summarize_user_message(user_message: str) -> str:
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
     text = described if described is not None else user_message
-    return strip_control_wrappers(_strip_image_envelope(text))
+    stripped = strip_control_wrappers(_strip_image_envelope(text))
+    # If stripping consumed nothing (no real envelope) or everything (the
+    # input was itself an envelope-shaped quote with no user request), there
+    # is no user intent to title. Returning "" makes derive_title skip — the
+    # cost of a slightly conservative untitled session is lower than naming
+    # it after the machine's vision guess.
+    if not stripped.strip() or (_IMAGE_ENVELOPE_RE.match(stripped.lstrip())):
+        return ""
+    return stripped
 
 
 def is_titleable_user_message(user_message: str) -> bool:

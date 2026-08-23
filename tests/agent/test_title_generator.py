@@ -521,6 +521,40 @@ class TestImageEnvelopeStripping:
         )
         assert _strip_image_envelope(msg) == msg
 
+    def test_bare_envelope_produces_no_title(self):
+        # A message that is *only* an envelope-shaped quote (pasted export,
+        # bug report) must not be titled after the machine's own wording —
+        # deriving a title from it would name the session "[The user
+        # attached an image:" instead of leaving it untitled. Stripping
+        # leaves nothing, and the fallback (returning the original) would
+        # still title off the envelope's first line, so _summarize_user_message
+        # must collapse it to "" and derive_title to None (#82356, Enough1122
+        # point 1).
+        from agent.title_generator import derive_title, _summarize_user_message
+
+        msg = (
+            "[The user attached an image:\n"
+            "A screenshot of the login form.\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]"
+        )
+        assert _strip_image_envelope(msg) == msg
+        assert _summarize_user_message(msg) == ""
+        assert derive_title(msg) is None
+
+    def test_keeps_first_person_attached_image_quote(self):
+        # A user who opens their message with a first-person "I attached an
+        # image ..." quote (not a machine envelope — the envelope always says
+        # "the user attached an image") must keep the full message. The looser
+        # "attached an image" match would swallow this and drop the subject
+        # (#82356 symmetric edge: fixing "leading envelope eaten" must not
+        # also eat a genuine first-person statement).
+        msg = "[I attached an image to the report] please review the numbers"
+        assert _strip_image_envelope(msg) == msg  # not swallowed
+        from agent.title_generator import derive_title
+
+        assert derive_title(msg).startswith("[I attached an image")
+
     def test_strips_envelope_even_with_short_user_request(self):
         # A short user request like "Fix it" after an envelope is a real
         # enrichment scenario — we strip normally. The guard only fires
