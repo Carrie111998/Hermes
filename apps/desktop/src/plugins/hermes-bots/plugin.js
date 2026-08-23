@@ -7855,6 +7855,75 @@ function botRowOwnsWorkspace(
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
+/**
+ * Bot-row context-menu copy (#91667) — the menu was hardcoded English while
+ * the rest of the app follows `display.language`. Registered under the plugin
+ * id via `ctx.i18n.register` (same channel as kanban); resolution follows the
+ * app's active locale with an English fallback, so locales this bundle
+ * doesn't ship keep today's strings.
+ */
+const BOT_ROW_MENU_LOCALES = {
+  en: {
+    pinTop: 'Pin to top',
+    unpin: 'Unpin',
+    hideBot: 'Hide',
+    unhideBot: 'Unhide',
+    editProfile: 'Edit Profile',
+    manageGroups: 'Manage groups…',
+    groups: names => `Groups: ${names.join(', ')}…`,
+    duplicate: 'Duplicate',
+    newChat: 'New chat with this agent',
+    delete: 'Delete'
+  },
+  ja: {
+    pinTop: 'ピン留め',
+    unpin: 'ピン留めを解除',
+    hideBot: 'ボットを非表示',
+    unhideBot: 'ボットを再表示',
+    editProfile: 'プロフィールを編集',
+    manageGroups: 'グループを管理…',
+    groups: names => `グループ：${names.join('、')}…`,
+    duplicate: '複製',
+    newChat: '新しいチャット',
+    delete: '削除'
+  },
+  zh: {
+    pinTop: '置顶',
+    unpin: '取消置顶',
+    hideBot: '隐藏机器人',
+    unhideBot: '取消隐藏机器人',
+    editProfile: '编辑资料',
+    manageGroups: '管理群组…',
+    groups: names => `群组：${names.join('、')}…`,
+    duplicate: '复制',
+    newChat: '新建对话',
+    delete: '删除'
+  },
+  'zh-hant': {
+    pinTop: '釘選',
+    unpin: '取消釘選',
+    hideBot: '隱藏機器人',
+    unhideBot: '取消隱藏機器人',
+    editProfile: '編輯資料',
+    manageGroups: '管理群組…',
+    groups: names => `群組：${names.join('、')}…`,
+    duplicate: '複製',
+    newChat: '新建對話',
+    delete: '刪除'
+  }
+}
+
+const botRowMenuEn = (key, ...args) => {
+  const value = BOT_ROW_MENU_LOCALES.en[key] ?? key
+  return typeof value === 'function' ? value(...args) : value
+}
+
+/** Reactive menu translator: plugin i18n when the SDK ships it, English
+ *  literals on older SDK builds (keeps today's behavior). A module constant,
+ *  so BotRow's call below stays an unconditional hook call. */
+const useBotRowMenuT =
+  typeof sdk === 'undefined' || typeof sdk.usePluginI18n !== 'function' ? () => botRowMenuEn : sdk.usePluginI18n
+
 function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   const activeProfile = useValue(host.state.profile)
   const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
@@ -7868,6 +7937,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   const pinned = isBotPinned(bot, allMeta)
   const sourceStatus = botSourceStatus(bot)
   const groups = botGroups(meta)
+  const t = useBotRowMenuT(ID)
   const last = bot.last_session
   // Highlight follows the chat on screen (focused session's owner), not the
   // gateway socket's home — a focused tab doesn't swap the socket, and on the
@@ -8098,7 +8168,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 })
               }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
-            children: pinned ? 'Unpin' : 'Pin to top'
+            children: pinned ? t('unpin') : t('pinTop')
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
@@ -8118,16 +8188,16 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 })
               }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
-            children: hidden ? 'Unhide' : 'Hide'
+            children: hidden ? t('unhideBot') : t('hideBot')
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onEdit(bot)).catch(error => host.notifyError?.(error, 'Could not load bot')),
-            children: 'Edit Profile'
+            children: t('editProfile')
           }),
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onGroup(bot)).catch(error => host.notifyError?.(error, 'Could not load bot groups')),
-            children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
+            children: groups.length ? t('groups', groups) : t('manageGroups')
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
@@ -8139,7 +8209,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 })
                 .catch(err => host.notifyError(err, 'Duplicate failed'))
             },
-            children: 'Duplicate'
+            children: t('duplicate')
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
@@ -8148,7 +8218,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
               setBotsWorkspaceOwner(botWorkspaceOwnerKey(bot), bot)
               newBotChat(bot)
             },
-            children: 'New chat with this agent'
+            children: t('newChat')
           }),
           isDefaultBot(bot) ? null : jsx(ContextMenuSeparator, {}),
           isDefaultBot(bot)
@@ -8156,7 +8226,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
             : jsx(ContextMenuItem, {
                 onSelect: () => onDelete(bot),
                 variant: 'destructive',
-                children: 'Delete'
+                children: t('delete')
               })
         ]
       })
@@ -14405,6 +14475,13 @@ export default {
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
       ctx.onDispose(stopBotRelay)
+    }
+
+    // Bot-row context-menu copy (#91667): ship the strings with the plugin
+    // under its own id — same channel as kanban, no core en.ts edits. The
+    // guard keeps older hosts without the plugin-i18n surface on English.
+    if (ctx.i18n && typeof ctx.i18n.register === 'function') {
+      ctx.i18n.register(BOT_ROW_MENU_LOCALES)
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the

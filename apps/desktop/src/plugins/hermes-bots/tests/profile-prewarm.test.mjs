@@ -50,6 +50,10 @@ function renderBotRow(input = 'alpha') {
     Codicon: 'Codicon',
     Tip: 'Tip',
     ROSTER_KEY: ['hermes-bots', 'roster'],
+    ID: 'hermes-bots',
+    // The plugin's real hook resolves menu copy via the i18n registry; the
+    // sliced BotRow only exercises structure/behavior, so translate to keys.
+    useBotRowMenuT: () => key => key,
     $botMeta: atom({}),
     $botUnread: atom({}),
     $botAttention: atom({}),
@@ -249,6 +253,8 @@ test('behavior: remote default never opens the same-name local chat', async () =
     Codicon: 'Codicon',
     Tip: 'Tip',
     ROSTER_KEY: ['hermes-bots', 'roster'],
+    ID: 'hermes-bots',
+    useBotRowMenuT: () => key => key,
     $botMeta: atom({ default: { chat: 'this-device-chat' } }),
     $botUnread: atom({}),
     $botAttention: atom({}),
