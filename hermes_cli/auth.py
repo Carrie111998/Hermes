@@ -1223,7 +1223,12 @@ def _file_lock(
     # On Windows, msvcrt.locking needs the file to have content and the
     # file pointer at position 0. Ensure the lock file has at least 1 byte.
     if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-        lock_path.write_text(" ", encoding="utf-8")
+        try:
+            lock_path.write_text(" ", encoding="utf-8")
+        except (OSError, PermissionError):
+            # Another process may already hold the byte-range lock. The
+            # acquisition loop below owns contention handling.
+            pass
 
     with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
