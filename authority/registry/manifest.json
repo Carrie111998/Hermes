@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hermes-workflow-registry/1.0",
-  "registryVersion": "2026-08-22.17",
+  "registryVersion": "2026-08-22.18",
   "owner": "hermes-production",
   "sourceRuntime": "migrated-design",
   "sourceDescription": "Hermes-native workflow control: route levels are independent from execution roles; L3 workflows choose worker or worker-pro per step; top-level responder is blocked from direct project execution on coordinated workflows.",
@@ -25,7 +25,7 @@
     },
     {
       "path": "model-policies.json",
-      "sha256": "0d9a3a94b80f3c5372dc6d27f32a93c494949e93d69938e939b5c0b860106913"
+      "sha256": "81d842a21bc2806867b2a0c03e98cbe7157f86b45ac4b8a7a37738513545a801"
     },
     {
       "path": "model-profiles.json",

@@ -1,6 +1,6 @@
 {
   "schema_version": "1.2",
-  "description": "Role-specific model policies. MiniMax remains the frequent primary for routing, fast-economy, and bounded simple execution; GPT-5.6 Luna high is the resident primary for standard reasoning; GPT-first roles do not route through MiniMax/other primary suppliers. DeepSeek official models are hard-fallback only and never resident primary tasks. Multimodal is the sole Gemini → MiniMax → GPT exception.",
+  "description": "Role-specific model policies. MiniMax remains the frequent primary for routing, fast-economy, and bounded simple execution; GPT-5.6 Luna high is the resident primary for standard reasoning and complex execution. Teamo-router is the soft_failover tail for MiniMax-primary roles only (routing-classifier, fast-economy, standard-reasoning); pure GPT-first roles do NOT route through Teamo. DeepSeek official models are hard-fallback only and never resident primary tasks. Multimodal is the sole Gemini -> MiniMax -> GPT exception.",
   "policies": {
     "routing-classifier": {
       "primary_pool": [
@@ -40,9 +40,8 @@
       ]
     },
     "complex-execution": {
-      "primary": "minimax-cn/MiniMax-M3",
+      "primary": "openai-codex/gpt-5.6-luna",
       "soft_failover": [
-        "openai-codex/gpt-5.6-luna",
         "openai-codex/gpt-5.6-terra"
       ],
       "hard_failover": [
@@ -57,7 +56,7 @@
         "openai-codex/gpt-5.6-sol"
       ],
       "hard_failover": [],
-      "note": "Only exception to the normal primary→GPT soft→DeepSeek hard chain. Gemini → MiniMax M3 → GPT; DeepSeek is not a raw-image fallback."
+      "note": "Only exception to the normal primary->GPT soft->DeepSeek hard chain. Gemini -> MiniMax M3 -> GPT; DeepSeek is not a raw-image fallback."
     },
     "high-stakes-decision": {
       "primary": "openai-codex/gpt-5.6-sol",

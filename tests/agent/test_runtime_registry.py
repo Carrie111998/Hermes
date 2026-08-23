@@ -688,7 +688,7 @@ def test_current_live_registry_fixture_loads_in_explicit_preview() -> None:
 
     snapshot = RegistryLoader(root).load(mode="preview")
 
-    assert snapshot.registry_version == "2026-08-22.17"
+    assert snapshot.registry_version == "2026-08-22.18"
     assert snapshot.promotion_state == "READY_FOR_REVIEW"
     assert snapshot.is_candidate is True
     assert snapshot.source == "preview"
