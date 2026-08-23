@@ -113,6 +113,19 @@ def test_atomic_promotion_and_claim_guards_reject_held_task(kanban_home: Path) -
         assert _event_count(conn, tid, "claimed") == 2  # only the pre-hold runs
 
 
+def test_recompute_ready_cannot_resurrect_held_task(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _held_triage_task(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "todo"
+        assert kb.claim_task(conn, tid, claimer="worker") is None
+        assert _event_count(conn, tid, "claimed") == 2
+
+
 def test_explicit_specify_recovers_hold_exactly_once(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _held_triage_task(conn)
