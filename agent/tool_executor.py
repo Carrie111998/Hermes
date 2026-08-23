@@ -642,6 +642,8 @@ def _run_agent_tool_execution_middleware(
                         state["args"] = modified_args
                     return block_msg
                 except Exception:
+                    if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+                        return "Sensitive execution policy failed closed"
                     return None
 
             block_message = (

@@ -500,6 +500,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "candidate_sha": task.candidate_sha,
         "clean_workspace_policy": task.clean_workspace_policy,
         "dispatchable": task.dispatchable,
+        "sensitive_execution": task.sensitive_execution,
+        "sensitive_runner_id": task.sensitive_runner_id,
+        "protected_resource_ids": list(task.protected_resource_ids),
         "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -554,6 +557,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "sensitive_execution": t.sensitive_execution,
+                    "sensitive_runner_id": t.sensitive_runner_id,
+                    "protected_resource_ids": list(t.protected_resource_ids),
                 }
 
             def _run_dict(r):

@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -3106,7 +3107,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             if modified_args is not None:
                 function_args = modified_args
         except Exception:
-            block_message = None
+            if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+                block_message = "Sensitive execution policy failed closed"
+            else:
+                block_message = None
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:

@@ -2643,6 +2643,12 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Operator-owned fixed runners for sensitive tasks. Task rows persist
+        # only opaque ids; executable argv and exact protected paths stay here.
+        "sensitive_execution": {
+            "runners": {},
+            "resources": {},
+        },
         # Profile assigned to the root/orchestration task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the

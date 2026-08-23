@@ -134,6 +134,40 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_sensitive_worker_spawn_uses_output_redaction_wrapper(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="elias")
+    task.sensitive_execution = True
+    task.sensitive_runner_id = "fixed-v1"
+
+    assert kb._default_spawn(task, str(workspace)) == 4245
+    assert captured["env"]["HERMES_KANBAN_SENSITIVE"] == "1"
+    assert captured["cmd"][1:4] == [
+        "-m", "hermes_cli.kanban_sensitive_worker", "--"
+    ]
+    assert "hermes" in captured["cmd"]
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

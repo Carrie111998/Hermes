@@ -1,0 +1,6 @@
+name: kanban-sensitive
+version: "1.0.0"
+description: "Fail-closed credential containment for sensitive Kanban workers."
+author: "Hermes Agent"
+hooks:
+  - pre_tool_call

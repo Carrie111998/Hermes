@@ -88,6 +88,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "candidate_sha": t.candidate_sha,
         "clean_workspace_policy": t.clean_workspace_policy,
         "dispatchable": t.dispatchable,
+        "sensitive_execution": t.sensitive_execution,
+        "sensitive_runner_id": t.sensitive_runner_id,
+        "protected_resource_ids": list(t.protected_resource_ids),
     }
 
 
@@ -360,6 +363,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="store_true",
         help="Explicit human/control-plane lane; dispatcher never spawns it",
     )
+    p_create.add_argument(
+        "--sensitive-execution", action="store_true",
+        help="Enable fixed sensitive-runner policy for this task",
+    )
+    p_create.add_argument(
+        "--sensitive-runner-id", default=None,
+        help="Opaque runner id from kanban.sensitive_execution.runners",
+    )
+    p_create.add_argument(
+        "--protected-resource-id", action="append", default=[],
+        help="Opaque protected resource id (repeatable)",
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -422,6 +437,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # No model/user arguments by design. Authority comes only from pinned
+    # worker env, the task row, and operator-owned config.
+    sub.add_parser("sensitive-run", help="Run this task's fixed sensitive runner")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -1150,6 +1169,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "sensitive-run": _cmd_sensitive_run,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1641,6 +1661,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            sensitive_execution=bool(getattr(args, "sensitive_execution", False)),
+            sensitive_runner_id=getattr(args, "sensitive_runner_id", None),
+            protected_resource_ids=getattr(args, "protected_resource_id", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1660,6 +1683,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
     return 0
+
+
+def _cmd_sensitive_run(args: argparse.Namespace) -> int:
+    if getattr(args, "board", None):
+        raise ValueError("sensitive-run accepts no board or model/user arguments")
+    from hermes_cli.kanban_sensitive import run_sensitive_runner
+
+    return run_sensitive_runner()
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:

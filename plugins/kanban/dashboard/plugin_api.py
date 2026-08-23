@@ -608,6 +608,9 @@ class CreateTaskBody(BaseModel):
     candidate_sha: Optional[str] = None
     clean_workspace_policy: str = "allow_dirty"
     dispatchable: bool = True
+    sensitive_execution: bool = False
+    sensitive_runner_id: Optional[str] = None
+    protected_resource_ids: list[str] = Field(default_factory=list)
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -643,6 +646,9 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             candidate_sha=payload.candidate_sha,
             clean_workspace_policy=payload.clean_workspace_policy,
             dispatchable=payload.dispatchable,
+            sensitive_execution=payload.sensitive_execution,
+            sensitive_runner_id=payload.sensitive_runner_id,
+            protected_resource_ids=payload.protected_resource_ids,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,

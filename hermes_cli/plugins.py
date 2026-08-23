@@ -5138,6 +5138,18 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                if (
+                    hook_name == "pre_tool_call"
+                    and os.environ.get("HERMES_KANBAN_SENSITIVE") == "1"
+                ):
+                    # Credential-bearing callback failures must neither leak
+                    # their exception text nor be mistaken for a successful
+                    # policy pass. The dispatcher converts this to the fixed
+                    # fail-closed message at the pre-tool boundary.
+                    logger.warning(
+                        "Sensitive pre_tool_call callback failed; policy will fail closed"
+                    )
+                    raise
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
@@ -5984,6 +5996,7 @@ class _PreToolCallDirective:
     message: Optional[str] = None
     rule_key: Optional[str] = None
     modified_args: Optional[Dict[str, Any]] = None
+    validators: Tuple[Tuple[str, Callable[..., Optional[str]]], ...] = ()
 
 
 def set_thread_tool_whitelist(
@@ -6044,20 +6057,29 @@ def _get_pre_tool_call_directive_details(
 
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
 
-    hook_results = invoke_lifecycle_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
-        task_id=task_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        middleware_trace=list(middleware_trace or []),
-    )
+    sensitive_mode = os.environ.get("HERMES_KANBAN_SENSITIVE") == "1"
+    try:
+        hook_results = invoke_lifecycle_hook(
+            "pre_tool_call",
+            tool_name=tool_name,
+            args=args if isinstance(args, dict) else {},
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            middleware_trace=list(middleware_trace or []),
+        )
+    except Exception:
+        if sensitive_mode:
+            return _PreToolCallDirective(
+                action="block", message="Sensitive execution policy failed closed"
+            )
+        raise
 
     block_msg: Optional[str] = None
     modified_args: Optional[Dict[str, Any]] = None
+    validators: list[Tuple[str, Callable[..., Optional[str]]]] = []
 
     for result in hook_results:
         if not isinstance(result, dict):
@@ -6074,6 +6096,12 @@ def _get_pre_tool_call_directive_details(
                     modified_args = dict(args) if isinstance(args, dict) else {}
                 modified_args.update(partial)
             continue
+        if result.get("action") == "validate":
+            validator = result.get("validator")
+            policy = str(result.get("policy") or "").strip()
+            if callable(validator):
+                validators.append((policy, validator))
+            continue
         action = result.get("action")
         if action not in ("block", "approve"):
             continue
@@ -6089,10 +6117,20 @@ def _get_pre_tool_call_directive_details(
             rule_key = None
         return _PreToolCallDirective(
             action=action, message=message, rule_key=rule_key,
-            modified_args=modified_args,
+            modified_args=modified_args, validators=tuple(validators),
         )
 
-    return _PreToolCallDirective(modified_args=modified_args)
+    if sensitive_mode and not any(
+        policy == "kanban_sensitive" for policy, _validator in validators
+    ):
+        return _PreToolCallDirective(
+            action="block",
+            message="Sensitive execution policy failed closed",
+            modified_args=modified_args,
+        )
+    return _PreToolCallDirective(
+        modified_args=modified_args, validators=tuple(validators)
+    )
 
 
 def get_pre_tool_call_directive(
@@ -6277,6 +6315,29 @@ def _dispatch_pre_tool_call_hooks(
         details, tool_name,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
     )
+    final_args = details.modified_args if details.modified_args is not None else (
+        args if isinstance(args, dict) else {}
+    )
+    if block_msg is None:
+        for _policy, validator in details.validators:
+            try:
+                block_msg = validator(
+                    tool_name=tool_name,
+                    args=final_args,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    middleware_trace=list(middleware_trace or []),
+                )
+            except Exception:
+                if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+                    block_msg = "Sensitive execution policy failed closed"
+                else:
+                    continue
+            if block_msg:
+                break
     return (block_msg, details.modified_args)
 
 

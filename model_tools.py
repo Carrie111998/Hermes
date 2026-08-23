@@ -1398,7 +1398,13 @@ def handle_function_call(
                 if modified_args is not None:
                     function_args = modified_args
             except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
+                if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+                    block_message = "Sensitive execution policy failed closed"
+                    logger.warning(
+                        "Sensitive pre_tool_call dispatch failed; policy failed closed"
+                    )
+                else:
+                    logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
                 result = tool_error(block_message)

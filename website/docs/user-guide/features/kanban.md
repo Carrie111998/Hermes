@@ -245,6 +245,40 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Sensitive execution with fixed runners
+
+Sensitive tasks can invoke one operator-approved command without exposing
+credentials or protected paths to the model. Define fixed argv and exact
+resource paths in the assigned profile's `config.yaml`:
+
+```yaml
+kanban:
+  sensitive_execution:
+    runners:
+      deploy-v1:
+        argv: [/usr/local/bin/deploy-approved, production]
+    resources:
+      deploy-config: /srv/secrets/deploy.json
+```
+
+Then create the card from the operator CLI or dashboard:
+
+```bash
+hermes kanban create "Deploy approved release" \
+  --assignee ops \
+  --sensitive-execution \
+  --sensitive-runner-id deploy-v1 \
+  --protected-resource-id deploy-config
+```
+
+The worker may run only `hermes kanban sensitive-run` with no arguments. The
+dispatcher resolves the opaque ids from the task and config, executes the fixed
+argv without a shell, and passes the declared resource mapping only to that
+trusted child. Ordinary file and terminal reads of credential stores remain
+blocked. Tool arguments, worker output, comments, review/completion handoffs,
+and artifacts are checked or redacted at durable boundaries; sensitive binary
+artifacts are rejected because they cannot be audited safely.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

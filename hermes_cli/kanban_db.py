@@ -135,6 +135,30 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_CLEAN_WORKSPACE_POLICIES = {"allow_dirty", "require_clean"}
 _FULL_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_OPAQUE_SENSITIVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _parse_string_list(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in value if item] if isinstance(value, list) else []
+
+
+def _normalize_opaque_sensitive_ids(values: Iterable[str], field_name: str) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = str(raw).strip()
+        if not _OPAQUE_SENSITIVE_ID_RE.fullmatch(value):
+            raise ValueError(f"{field_name} entries must be opaque identifiers")
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1153,6 +1177,9 @@ class Task:
     candidate_sha: Optional[str] = None
     clean_workspace_policy: str = "allow_dirty"
     dispatchable: bool = True
+    sensitive_execution: bool = False
+    sensitive_runner_id: Optional[str] = None
+    protected_resource_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1271,6 +1298,20 @@ class Task:
                 bool(row["dispatchable"])
                 if "dispatchable" in keys and row["dispatchable"] is not None
                 else True
+            ),
+            sensitive_execution=(
+                bool(row["sensitive_execution"])
+                if "sensitive_execution" in keys and row["sensitive_execution"] is not None
+                else False
+            ),
+            sensitive_runner_id=(
+                row["sensitive_runner_id"]
+                if "sensitive_runner_id" in keys and row["sensitive_runner_id"]
+                else None
+            ),
+            protected_resource_ids=(
+                _parse_string_list(row["protected_resource_ids"])
+                if "protected_resource_ids" in keys else []
             ),
         )
 
@@ -1468,7 +1509,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     expected_base_sha    TEXT,
     candidate_sha        TEXT,
     clean_workspace_policy TEXT NOT NULL DEFAULT 'allow_dirty',
-    dispatchable         INTEGER NOT NULL DEFAULT 1
+    dispatchable         INTEGER NOT NULL DEFAULT 1,
+    sensitive_execution  INTEGER NOT NULL DEFAULT 0,
+    sensitive_runner_id  TEXT,
+    protected_resource_ids TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2754,6 +2798,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "dispatchable", "dispatchable INTEGER NOT NULL DEFAULT 1"
         )
+    if "sensitive_execution" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "sensitive_execution", "sensitive_execution INTEGER NOT NULL DEFAULT 0"
+        )
+    if "sensitive_runner_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "sensitive_runner_id", "sensitive_runner_id TEXT")
+    if "protected_resource_ids" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "protected_resource_ids", "protected_resource_ids TEXT"
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3263,6 +3317,9 @@ def create_task(
     candidate_sha: Optional[str] = None,
     clean_workspace_policy: str = "allow_dirty",
     dispatchable: bool = True,
+    sensitive_execution: bool = False,
+    sensitive_runner_id: Optional[str] = None,
+    protected_resource_ids: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3339,6 +3396,23 @@ def create_task(
             "clean_workspace_policy must be one of "
             f"{sorted(VALID_CLEAN_WORKSPACE_POLICIES)}"
         )
+    sensitive_execution = bool(sensitive_execution)
+    sensitive_runner_id = (
+        str(sensitive_runner_id).strip() if sensitive_runner_id is not None else ""
+    ) or None
+    protected_resource_ids = list(protected_resource_ids or [])
+    if not sensitive_execution and (sensitive_runner_id or protected_resource_ids):
+        raise ValueError(
+            "sensitive_runner_id/protected_resource_ids require sensitive_execution"
+        )
+    if sensitive_execution and (
+        sensitive_runner_id is None
+        or not _OPAQUE_SENSITIVE_ID_RE.fullmatch(sensitive_runner_id)
+    ):
+        raise ValueError("sensitive_runner_id must be an opaque identifier")
+    protected_resource_ids = _normalize_opaque_sensitive_ids(
+        protected_resource_ids, "protected_resource_ids"
+    )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3594,8 +3668,9 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         expected_base_sha, candidate_sha,
-                        clean_workspace_policy, dispatchable
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        clean_workspace_policy, dispatchable,
+                        sensitive_execution, sensitive_runner_id, protected_resource_ids
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3625,6 +3700,9 @@ def create_task(
                         candidate_sha,
                         clean_workspace_policy,
                         1 if dispatchable else 0,
+                        1 if sensitive_execution else 0,
+                        sensitive_runner_id,
+                        json.dumps(protected_resource_ids),
                     ),
                 )
                 for pid in parents:
@@ -3657,6 +3735,9 @@ def create_task(
                         "candidate_sha": candidate_sha,
                         "clean_workspace_policy": clean_workspace_policy,
                         "dispatchable": bool(dispatchable),
+                        "sensitive_execution": bool(sensitive_execution),
+                        "sensitive_runner_id": sensitive_runner_id,
+                        "protected_resource_ids": protected_resource_ids,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4294,6 +4375,28 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+def _redact_sensitive_task_value(conn: sqlite3.Connection, task_id: str, value: Any) -> Any:
+    row = conn.execute(
+        "SELECT sensitive_execution FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or not bool(row["sensitive_execution"]):
+        return value
+    from hermes_cli.kanban_sensitive import redact_exact_secrets
+
+    if isinstance(value, str):
+        return redact_exact_secrets(value)
+    if isinstance(value, dict):
+        return {
+            _redact_sensitive_task_value(conn, task_id, key):
+            _redact_sensitive_task_value(conn, task_id, item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_task_value(conn, task_id, item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive_task_value(conn, task_id, item) for item in value)
+    return value
+
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
 ) -> int:
@@ -4301,6 +4404,7 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    body = _redact_sensitive_task_value(conn, task_id, body)
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -4452,6 +4556,13 @@ def store_attachment_bytes(
         raise AttachmentTooLarge(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
+    task_row = conn.execute(
+        "SELECT sensitive_execution FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task_row and bool(task_row["sensitive_execution"]):
+        from hermes_cli.kanban_sensitive import scan_sensitive_artifact_bytes
+
+        scan_sensitive_artifact_bytes(data)
     safe_name = _safe_attachment_name(filename)
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -4627,6 +4738,7 @@ def _append_event(
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
     """
+    payload = _redact_sensitive_task_value(conn, task_id, payload)
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
@@ -4655,6 +4767,9 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
+    summary = _redact_sensitive_task_value(conn, task_id, summary)
+    error = _redact_sensitive_task_value(conn, task_id, error)
+    metadata = _redact_sensitive_task_value(conn, task_id, metadata)
     now = int(time.time())
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -5758,6 +5873,13 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    result = _redact_sensitive_task_value(conn, task_id, result)
+    summary = _redact_sensitive_task_value(conn, task_id, summary)
+    metadata = _redact_sensitive_task_value(conn, task_id, metadata)
+    hold_children_reason = _redact_sensitive_task_value(
+        conn, task_id, hold_children_reason
+    )
+    hold_author = _redact_sensitive_task_value(conn, task_id, hold_author)
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -6046,16 +6168,22 @@ def _persist_scratch_completion_artifacts(
         return
 
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path, sensitive_execution "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+    if not row or not row["workspace_path"]:
+        return
+    sensitive = bool(row["sensitive_execution"])
+    if row["workspace_kind"] != "scratch" and not sensitive:
         return
 
     workspace = Path(row["workspace_path"]).expanduser()
     is_managed, board = _managed_scratch_path_info(workspace)
     if not is_managed:
-        return
+        if not sensitive:
+            return
+        board = get_current_board()
 
     try:
         workspace_root = workspace.resolve()
@@ -6111,15 +6239,26 @@ def _persist_scratch_completion_artifacts(
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
+            if sensitive:
+                from hermes_cli.kanban_sensitive import read_and_scan_sensitive_artifact
+
+                artifact_bytes = read_and_scan_sensitive_artifact(resolved_src)
+                if len(artifact_bytes) > KANBAN_ATTACHMENT_MAX_BYTES:
+                    raise ArtifactPreservationError(
+                        f"declared artifact exceeds the size limit: {artifact}"
+                    )
+                with dest.open("xb") as destination_file:
+                    destination_file.write(artifact_bytes)
+            else:
+                with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
+                    copied = 0
+                    while chunk := source_file.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                            raise ArtifactPreservationError(
+                                f"declared scratch artifact grew beyond the size limit: {artifact}"
+                            )
+                        destination_file.write(chunk)
         except Exception as exc:
             if dest is not None:
                 try:
@@ -6669,6 +6808,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    reason = _redact_sensitive_task_value(conn, task_id, reason)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -6914,6 +7054,9 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    summary = _redact_sensitive_task_value(conn, task_id, summary)
+    metadata = _redact_sensitive_task_value(conn, task_id, metadata)
+    reviewer = _redact_sensitive_task_value(conn, task_id, reviewer)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -11522,6 +11665,8 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.sensitive_execution:
+        env["HERMES_KANBAN_SENSITIVE"] = "1"
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -11615,6 +11760,10 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    if task.sensitive_execution:
+        # The wrapper holds raw child output only in memory and emits the
+        # exact-value + pattern-redacted form to the durable worker log.
+        cmd = [sys.executable, "-m", "hermes_cli.kanban_sensitive_worker", "--", *cmd]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
