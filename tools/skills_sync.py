@@ -1132,8 +1132,40 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
                 "synced": None,
             }
 
+        previous_manifest = dict(manifest)
         manifest[name] = bundled_hash
         _write_manifest(manifest)
+        if _read_manifest() != manifest:
+            rollback_errors = []
+            if dest.exists():
+                try:
+                    _rmtree_writable(dest)
+                except (OSError, IOError) as e:
+                    rollback_errors.append(f"could not remove restored copy: {e}")
+            if moved_user_copy and backup.exists() and not dest.exists():
+                try:
+                    shutil.move(str(backup), str(dest))
+                except (OSError, IOError) as e:
+                    rollback_errors.append(f"could not restore prior copy: {e}")
+
+            if _read_manifest() != previous_manifest:
+                _write_manifest(previous_manifest)
+                if _read_manifest() != previous_manifest:
+                    rollback_errors.append("could not restore prior manifest")
+
+            rollback_detail = ""
+            if rollback_errors:
+                rollback_detail = f" Rollback incomplete: {'; '.join(rollback_errors)}."
+            return {
+                "ok": False,
+                "action": "not_reset",
+                "message": (
+                    f"Could not restore '{name}' from bundled source because the "
+                    f"bundled manifest was not persisted.{rollback_detail} The profile "
+                    "remains opted out of bundled-skill seeding."
+                ),
+                "synced": None,
+            }
         if backup.exists():
             try:
                 _rmtree_writable(backup)

@@ -653,6 +653,59 @@ class TestResetBundledSkill:
         assert manifest_file.read_text() == "google-workspace:STALEHASH\n"
         assert marker.exists()
 
+    def test_opted_out_targeted_restore_rolls_back_when_manifest_write_fails(self, tmp_path):
+        """A failed manifest write must roll back the targeted restore."""
+        bundled = self._setup_bundled(tmp_path)
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        user_copy = dest / "SKILL.md"
+        user_copy.write_text("# user version\n")
+        manifest_file.write_text("google-workspace:STALEHASH\n")
+        marker = hermes_home / ".no-bundled-skills"
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ), patch(
+            "tools.skills_sync.atomic_write_text", side_effect=OSError("disk full")
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+        assert result["ok"] is False
+        assert result["action"] == "not_reset"
+        assert "manifest" in result["message"]
+        assert user_copy.read_text() == "# user version\n"
+        assert manifest_file.read_text() == "google-workspace:STALEHASH\n"
+        assert not dest.with_suffix(".reset.bak").exists()
+        assert marker.exists()
+
+    def test_opted_out_targeted_restore_remains_absent_when_manifest_write_fails(self, tmp_path):
+        """A failed first manifest write must remove the untracked restored copy."""
+        bundled = self._setup_bundled(tmp_path)
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        marker = hermes_home / ".no-bundled-skills"
+        hermes_home.mkdir()
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ), patch(
+            "tools.skills_sync.atomic_write_text", side_effect=OSError("disk full")
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+        dest = skills_dir / "productivity" / "google-workspace"
+        assert result["ok"] is False
+        assert result["action"] == "not_reset"
+        assert not dest.exists()
+        assert not manifest_file.exists()
+        assert marker.exists()
+
     def test_opted_out_restore_reports_removed_bundled_source(self, tmp_path):
         """Opt-out handling must preserve the normal missing-source error."""
         bundled = self._setup_bundled(tmp_path)
