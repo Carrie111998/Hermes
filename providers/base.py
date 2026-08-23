@@ -101,6 +101,21 @@ class ProviderProfile:
 
     # ── Hooks (override in subclass for complex providers) ───
 
+    def resolve_api_mode(
+        self,
+        model: str | None,
+        base_url: str | None = None,
+    ) -> str:
+        """Return the wire protocol for *model*.
+
+        The default preserves the provider-wide :attr:`api_mode`. Multi-wire
+        provider plugins can override this hook to choose a supported mode per
+        concrete model without requiring a provider-name branch in core.
+        ``base_url`` is supplied for providers whose route policy also depends
+        on the configured endpoint.
+        """
+        return self.api_mode
+
     def resolve_aux_model(self, *, vision: bool = False) -> str:
         """Return a LIVE cheap-model id for auxiliary tasks, or "".
 

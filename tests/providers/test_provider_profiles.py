@@ -4,6 +4,33 @@ from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
 
+def test_provider_profile_resolve_api_mode_defaults_to_static_mode():
+    profile = ProviderProfile(name="static", api_mode="anthropic_messages")
+
+    assert profile.resolve_api_mode("any-model", "https://relay.test/v1") == (
+        "anthropic_messages"
+    )
+
+
+def test_provider_profile_resolve_api_mode_can_be_overridden_per_model():
+    class DynamicProfile(ProviderProfile):
+        def resolve_api_mode(self, model, base_url=None):
+            return (
+                "codex_responses"
+                if str(model or "").startswith("gpt-")
+                else "chat_completions"
+            )
+
+    profile = DynamicProfile(name="dynamic", api_mode="chat_completions")
+
+    assert profile.resolve_api_mode("gpt-7", "https://relay.test/v1") == (
+        "codex_responses"
+    )
+    assert profile.resolve_api_mode("kimi-k4", "https://relay.test/v1") == (
+        "chat_completions"
+    )
+
+
 class TestRegistry:
     def test_discovery_populates_registry(self):
         p = get_provider_profile("nvidia")
