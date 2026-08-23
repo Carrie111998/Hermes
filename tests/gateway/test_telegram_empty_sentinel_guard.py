@@ -56,3 +56,32 @@ def test_send_still_delivers_real_content():
     result = asyncio.run(adapter.send(chat_id="123", content="real answer"))
     assert result.success is True
     assert bot.send_message.await_count >= 1
+
+
+def test_sentinel_guard_follows_canonical_constant(monkeypatch):
+    """The adapter must not hardcode the sentinel literal.
+
+    The guard reads ``agent.anthropic_adapter._EMPTY_TEXT_PLACEHOLDER`` at
+    call time — the same single source the gateway's classifier imports. If
+    someone re-hardcodes ``"(empty)"`` in the adapter, this test fails
+    because the re-hardcoded guard would send ``(nil)`` to the Bot API
+    instead of skipping it (#92924 review: single-source the sentinel).
+    """
+    import agent.anthropic_adapter as anthropic_adapter
+
+    monkeypatch.setattr(anthropic_adapter, "_EMPTY_TEXT_PLACEHOLDER", "(nil)")
+    adapter, bot = _make_adapter()
+    result = asyncio.run(adapter.send(chat_id="123", content="(nil)"))
+    assert result.success is True
+    assert result.message_id is None
+    assert bot.send_message.await_count == 0
+
+
+def test_sentinel_guard_matches_gateway_classifier():
+    """Adapter guard and gateway classifier must agree on the sentinel value."""
+    from gateway.run import _is_empty_agent_sentinel
+    from plugins.platforms.telegram.adapter import _empty_agent_sentinel_text
+
+    sentinel = _empty_agent_sentinel_text()
+    assert sentinel
+    assert _is_empty_agent_sentinel(sentinel)

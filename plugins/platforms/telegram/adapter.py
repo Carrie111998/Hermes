@@ -38,6 +38,23 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _empty_agent_sentinel_text() -> str:
+    """The agent's terminal ``"(empty)"`` sentinel, from its single source.
+
+    The canonical constant is ``agent.anthropic_adapter._EMPTY_TEXT_PLACEHOLDER``
+    — the same source the gateway's ``_is_empty_agent_sentinel`` classifier
+    imports — so the adapter guard can never drift from the gateway's
+    comparison (#92924). Imported lazily, matching the adapter's other
+    ``agent.*`` imports and the gateway's lazy import; the literal is only a
+    defensive fallback for standalone/test use.
+    """
+    try:
+        from agent.anthropic_adapter import _EMPTY_TEXT_PLACEHOLDER
+        return _EMPTY_TEXT_PLACEHOLDER
+    except Exception:
+        return "(empty)"
+
+
 def _scoped_gate_env(name: str, default: str = "") -> str:
     """Read a TELEGRAM_*/GATEWAY_* authorization gate env var per-profile.
 
@@ -5222,9 +5239,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Also skip the agent's "(empty)" terminal sentinel (#92924): the
         # gateway converts it to a friendly fallback on the normal delivery
         # path, but direct callers (status bubbles, pushes, queued sends) can
-        # still hand us the raw placeholder — never render it to a user.
+        # still hand us the raw placeholder. The sentinel value comes from the
+        # same canonical constant the gateway compares against, so this guard
+        # and the gateway's classifier cannot drift apart.
         if not content or not content.strip() or (
-            isinstance(content, str) and content.strip() == "(empty)"
+            isinstance(content, str) and content.strip() == _empty_agent_sentinel_text()
         ):
             return SendResult(success=True, message_id=None)
         
