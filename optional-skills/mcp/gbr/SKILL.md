@@ -1,95 +1,111 @@
 ---
 name: gbr
-description: >
-  Pair a phone running Build Remote Agent to Hermes. Requires gbr-agent run on
-  the host. Attach via Bot API 127.0.0.1:8788 or hermes mcp add gbr (stdio gbr-mcp).
-  Use when the user wants a mobile spectator / inject into this Hermes session.
+description: Pair a phone spectator to this Hermes host session.
 version: 1.0.0
-author: community
+author: David Rad (LinespottingPrivate), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
-compatibility: Requires gbr-agent ≥ 0.6.0 on the host. Loopback only. No mailbox keys in this file.
 metadata:
   hermes:
-    tags: [MCP, Mobile, Pairing, Tools]
+    tags: [MCP, Mobile, Pairing]
+    related_skills: [hermes-agent]
     homepage: https://grokbuildremote.com/
-    product: "Build Remote Agent"
-  version: "0.6.1"
 prerequisites:
-  commands: [node, gbr-agent]
+  commands: [gbr-agent]
 ---
 
-# Build Remote Agent — pairing device
+# GBR Skill
 
-One adapter. Protocol `gbr/1`. No fourth pair protocol.
+Pair a phone running Build Remote Agent as a spectator (and veto) on this Hermes host session. Protocol is `gbr/1` only: phone app, `gbr-agent pair` (QR and printed 8-char code), then `gbr-agent run`. This skill does not make the phone the orchestrator, does not treat Hermes chat channels as the pair path, and does not require Hermes to run on a GBR host — MCP add stays on the Hermes box.
 
 Independent product by Linespotting AB. Not affiliated with xAI or SpaceX.
 
-Hermes messaging channels (Telegram, WhatsApp, …) are not `gbr/1`. The phone
-app spectates the **desktop** Hermes session through the host Bot API / MCP.
+## When to Use
 
-This skill is optional (not bundled). Install with `hermes skills install` from
-this path, or copy to `~/.hermes/skills/`.
+- The user wants a phone to spectate or veto this Hermes host session.
+- The user asks to pair Build Remote Agent / `gbr-agent` with Hermes.
 
-## Pair (unchanged)
+Do not use for:
 
-1. Phone: [Build Remote Agent](https://grokbuildremote.com/) → Connect.
-2. PC: `gbr-agent pair` — browser QR **and** printed 8-char code.
-3. Phone scans QR **or** types the 8-char code.
-4. PC: `gbr-agent run` (keep it running).
+- Making the phone the orchestrator
+- Pairing through Hermes messaging (Telegram, WhatsApp, Discord, …)
+- Any fourth pair protocol beyond phone app + `gbr-agent pair` + `gbr-agent run`
 
-```bash
-curl -fsSL https://grokbuildremote.com/install.sh | bash   # Windows: irm https://grokbuildremote.com/install.ps1 | iex
-gbr-agent version    # need v0.6.0+
-gbr-agent pair && gbr-agent run
+## Prerequisites
+
+- `gbr-agent` v0.6.0 or newer on PATH. Prefer a pinned GitHub Release binary from https://github.com/LinespottingOrg/GrokBuildRemote-Agents/releases/tag/v0.6.0 (assets `gbr-agent-<os>-<arch>`). The website `install.sh` is mutable; do not treat it as a pin.
+- Phone app: [Build Remote Agent](https://grokbuildremote.com/) → Connect.
+- Attach is only `http://127.0.0.1:8788` (after `gbr-agent run` on this same host) or stdio `gbr-mcp`.
+- MCP setup is on the Hermes box, not on a remote GBR host. HTTP loopback works only when `gbr-agent run` is local to Hermes. Stdio `gbr-mcp` needs Node on the Hermes box.
+
+Register MCP through `terminal` after the binary or `gbr-mcp` is present:
+
+```
+terminal(command="hermes mcp add gbr -- http://127.0.0.1:8788")
 ```
 
-Unpair on the phone before a new mailbox. Force-close is not enough.
+or stdio:
 
-## Attach (only these)
-
-| How | Where |
-|-----|--------|
-| Bot API | `http://127.0.0.1:8788` after `gbr-agent run` |
-| MCP | `gbr-mcp` stdio (same JSON as Bot API) |
-
-Phone is spectator + veto, not orchestrator.
-
-```bash
-curl -sS http://127.0.0.1:8788/health
-curl -sS http://127.0.0.1:8788/v1/sessions
-curl -sS -X POST http://127.0.0.1:8788/v1/inject \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":"SESSION","text":"hello","submit":true}'
+```
+terminal(command="hermes mcp add gbr -- stdio -- node ./bin/gbr-mcp.js")
 ```
 
-## Hermes MCP
-
-```bash
-git clone https://github.com/LinespottingOrg/GrokBuildRemote-Agents.git
-cd GrokBuildRemote-Agents/mcp/gbr-mcp && npm install
-node bin/gbr-mcp.js --diagnose
-
-# stdio (works even if you only have gbr-mcp on this box)
-hermes mcp add gbr -- stdio -- node ./bin/gbr-mcp.js
-
-# HTTP only if gbr-agent run is already on this same host:
-# hermes mcp add gbr -- http://127.0.0.1:8788
-```
-
-Equivalent `~/.hermes/config.yaml` (never put mailbox keys here):
+Equivalent `~/.hermes/config.yaml` (HTTP, same host):
 
 ```yaml
 mcp_servers:
   gbr:
-    command: "node"
-    args: ["/absolute/path/to/GrokBuildRemote-Agents/mcp/gbr-mcp/bin/gbr-mcp.js"]
+    url: "http://127.0.0.1:8788"
 ```
 
-Remote bots: phone **Settings → Bot API** copies relay URL + mailbox id + key. Never commit the key.
+## How to Run
 
-## Loop
+Invoke host commands through the `terminal` tool. Do not substitute a fourth pair path.
 
-diagnose → open/attach → lock → inject → wait idle → harvest excerpt → iterate or close
+```
+terminal(command="gbr-agent version")
+terminal(command="gbr-agent pair", pty=true, timeout=180)
+terminal(command="gbr-agent run", background=true)
+```
 
-Docs: https://github.com/LinespottingOrg/GrokBuildRemote-Agents/blob/main/docs/BOT-API.md
+`gbr-agent pair` prints an 8-char code and opens a browser QR. The phone scans the QR or types that code. Then keep `gbr-agent run` running.
+
+## Quick Reference
+
+| Command | Purpose |
+|---------|---------|
+| `gbr-agent version` | Confirm v0.6.0+ |
+| `gbr-agent pair` | QR **and** printed 8-char code |
+| `gbr-agent run` | Serve loopback `http://127.0.0.1:8788` |
+| `gbr-agent doctor` | Prove install and pair health |
+| `gbr-agent status` | List local session |
+| `hermes mcp add gbr -- http://127.0.0.1:8788` | HTTP attach (same host) |
+| `hermes mcp add gbr -- stdio -- node ./bin/gbr-mcp.js` | Stdio `gbr-mcp` on the Hermes box |
+
+## Procedure
+
+1. Confirm `gbr-agent version` reports v0.6.0 or newer via `terminal`. Done when stdout includes `v0.6` or higher.
+2. On the phone, open Build Remote Agent → Connect.
+3. On the host, invoke `gbr-agent pair` through `terminal` (`pty=true`). Done when a QR page is open **and** an 8-char code is printed.
+4. Phone scans the QR **or** types the 8-char code. Done when the phone shows this host as paired.
+5. Invoke `gbr-agent run` through `terminal` (`background=true`). Done when the process stays up and loopback `http://127.0.0.1:8788` is the attach URL (or stdio `gbr-mcp` is registered on the Hermes box).
+6. Phone spectates and may veto; it does not drive the Hermes tool loop.
+
+## Pitfalls
+
+- Unpair on the phone before pairing a new host. Force-close is not enough.
+- Website `install.sh` / `install.ps1` can change without a tag; pin GitHub Release v0.6.0+.
+- `http://127.0.0.1:8788` is loopback. It is not reachable if Hermes is on another machine — use stdio `gbr-mcp` on the Hermes box instead.
+- Hermes messaging channels are not `gbr/1`.
+- Do not invent a fourth pair protocol.
+- Phone is spectator + veto, not orchestrator.
+
+## Verification
+
+One command, through `terminal`:
+
+```
+terminal(command="gbr-agent doctor")
+```
+
+Done when `gbr-agent doctor` exits 0.
