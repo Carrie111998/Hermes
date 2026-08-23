@@ -19,7 +19,10 @@ import pytest
 
 from hermes_state import SessionDB
 
-from session_bridge.claude_adapter import claude_project_directory_name
+from session_bridge.claude_adapter import (
+    ClaudeSourceAdapter,
+    claude_project_directory_name,
+)
 from session_bridge.characterize import build_characterization_auth_recovery_prompt
 from session_bridge.claude_registrar import (
     ClaudeNativeRegistrar,
@@ -731,18 +734,36 @@ def test_launch_keeps_unterminated_auto_submitted_response_ambiguous() -> None:
     assert "/exit\r" not in process.writes
 
 
-def test_launch_never_discards_malformed_auto_submitted_response() -> None:
+def test_launch_untrusted_auto_submitted_wording_yields_to_exact_transcript() -> None:
     item = claim()
     process = FakePty(
         prompt_input_output="NOT REGISTERED\r\n",
         output="REGISTERED\r\n",
     )
+    store = FakeStore()
     source = FakeSource([None, projection_for(item)])
 
-    result = registrar(source, FakeFactory(process)).process(item)
+    result = registrar(source, FakeFactory(process), store).process(item)
+
+    assert result.status == "visible"
+    assert [call[0] for call in store.calls] == ["commit"]
+    assert "\r" not in process.writes
+    assert "/exit\r" not in process.writes
+
+
+def test_launch_malformed_auto_submitted_response_without_transcript_stays_ambiguous() -> None:
+    item = claim()
+    process = FakePty(
+        prompt_input_output="NOT REGISTERED\r\n",
+        output="REGISTERED\r\n",
+    )
+    store = FakeStore()
+
+    result = registrar(FakeSource([None]), FakeFactory(process), store).process(item)
 
     assert result.status == "retry"
     assert result.error_code == "creation_ambiguous"
+    assert [call[0] for call in store.calls] == ["retry"]
     assert "\r" not in process.writes
     assert "/exit\r" not in process.writes
 
@@ -1828,6 +1849,139 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     assert result.status == "visible"
     assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
     assert len(factory.spawns) == 1
+
+
+class _TranscriptCreatingLimitPty(FakePty):
+    """Persist a strict provider-limit transcript during PTY interaction."""
+
+    def __init__(self, projects_root: Path, item: ClaudeVisibilityClaim) -> None:
+        super().__init__()
+        self._projects_root = projects_root
+        self._item = item
+
+    def read_until_ready(
+        self, timeout: float, *, accept_workspace_trust: bool = False
+    ) -> str:
+        self.write_exact_transcript()
+        return super().read_until_ready(timeout, accept_workspace_trust=True)
+
+    def write_exact_transcript(self) -> None:
+        value = candidate()
+        identity = derive_claude_visibility_identity(value, SECRET)
+        prompt = build_claude_registration_prompt(value, identity, SECRET)
+        project = claude_project_directory_name(self._item.source_cwd or "")
+        directory = self._projects_root / project
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{self._item.reserved_claude_uuid}.jsonl"
+        limited = (
+            "You've hit your weekly limit · resets Aug 24, 4am (America/New_York)"
+        )
+        records = [
+            {
+                "type": "custom-title",
+                "sessionId": self._item.reserved_claude_uuid,
+                "customTitle": self._item.native_name,
+            },
+            {
+                "type": "assistant",
+                "sessionId": self._item.reserved_claude_uuid,
+                "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "timestamp": "2026-08-22T00:00:00Z",
+                "cwd": self._item.source_cwd,
+                "gitBranch": self._item.git_branch,
+                "isSidechain": False,
+                "entrypoint": "cli",
+                "message": {"role": "assistant", "content": limited},
+            },
+            {
+                "type": "user",
+                "sessionId": self._item.reserved_claude_uuid,
+                "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "timestamp": "2026-08-22T00:00:01Z",
+                "cwd": self._item.source_cwd,
+                "gitBranch": self._item.git_branch,
+                "isSidechain": False,
+                "entrypoint": "cli",
+                "message": {"role": "user", "content": prompt},
+            },
+        ]
+        path.write_bytes(
+            b"".join(
+                json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+                for record in records
+            )
+        )
+
+
+def test_launch_provider_limit_freshly_discovers_exact_transcript_after_cached_empty_lookup(
+    tmp_path: Path,
+) -> None:
+    item = claim()
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    store = FakeStore()
+    process = _TranscriptCreatingLimitPty(tmp_path, item)
+    factory = FakeFactory(process)
+
+    result = registrar(adapter, factory, store).process(item)
+
+    assert result.status == "visible"
+    assert result.error_code is None
+    assert len(factory.spawns) == 1
+    assert process.terminated is False
+    assert process.closed is True
+    expected = (
+        tmp_path
+        / claude_project_directory_name(item.source_cwd or "")
+        / f"{item.reserved_claude_uuid}.jsonl"
+    )
+    assert expected.exists()
+    assert [call[0] for call in store.calls] == ["commit"]
+
+
+class _AmbiguousTranscriptPty(_TranscriptCreatingLimitPty):
+    """Persist a valid transcript but end the PTY observation ambiguously."""
+
+    def read_until_ready(
+        self, timeout: float, *, accept_workspace_trust: bool = False
+    ) -> str:
+        self.write_exact_transcript()
+        return super().read_until_ready(timeout, accept_workspace_trust=True)
+
+    def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
+        raise TimeoutError("registration observation ended ambiguously")
+
+
+def test_launch_ambiguous_response_still_reconciles_exact_transcript_after_verified_cleanup(
+    tmp_path: Path,
+) -> None:
+    item = claim()
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    store = FakeStore()
+    process = _AmbiguousTranscriptPty(tmp_path, item)
+    factory = FakeFactory(process)
+
+    result = registrar(adapter, factory, store).process(item)
+
+    assert result.status == "visible"
+    assert len(factory.spawns) == 1
+    assert process.terminated is True
+    assert process.closed is True
+    assert [call[0] for call in store.calls] == ["commit"]
+
+
+def test_ambiguous_polling_without_transcript_keeps_original_creation_ambiguity(
+    tmp_path: Path,
+) -> None:
+    item = claim()
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    store = FakeStore()
+    process = FakePty(prompt_input_error=_PtyResponseTimeout("blocked"))
+
+    result = registrar(adapter, factory=FakeFactory(process), store=store).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert [call[0] for call in store.calls] == ["retry"]
 
 
 @pytest.mark.parametrize(

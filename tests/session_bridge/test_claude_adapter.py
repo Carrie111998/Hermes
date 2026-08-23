@@ -124,6 +124,99 @@ def test_discover_recurses_and_is_deterministic(tmp_path):
     assert adapter.discover() == sorted([first, second], key=lambda path: str(path))
 
 
+def test_fresh_exact_stem_lookup_observes_warm_absence_without_recursive_walk(
+    tmp_path: Path, monkeypatch
+) -> None:
+    unrelated = tmp_path / "C--unrelated" / "unrelated.jsonl"
+    unrelated.parent.mkdir()
+    unrelated.write_text("{}\n", encoding="utf-8")
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    assert adapter.discover() == [unrelated]
+
+    expected = tmp_path / "C--target" / f"{BASIC_SESSION_ID}.jsonl"
+    expected.parent.mkdir()
+    expected.write_text("{}\n", encoding="utf-8")
+
+    def forbidden_rglob(_self: Path, _pattern: str):
+        raise AssertionError("fresh exact lookup recursively walked transcript inventory")
+
+    monkeypatch.setattr(Path, "rglob", forbidden_rglob)
+
+    assert adapter.find_native_sessions_by_stem_fresh(BASIC_SESSION_ID) == [expected]
+    assert adapter.discover() == sorted([unrelated, expected], key=lambda path: str(path))
+
+
+def test_fresh_exact_stem_lookup_returns_every_new_duplicate_deterministically(
+    tmp_path: Path,
+) -> None:
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    assert adapter.discover() == []
+    first = tmp_path / "C--first" / f"{BASIC_SESSION_ID}.jsonl"
+    second = tmp_path / "D--second" / f"{BASIC_SESSION_ID}.jsonl"
+    for path in (second, first):
+        path.parent.mkdir()
+        path.write_text("{}\n", encoding="utf-8")
+
+    assert adapter.find_native_sessions_by_stem_fresh(BASIC_SESSION_ID) == [
+        first,
+        second,
+    ]
+
+
+def test_fresh_exact_stem_lookup_drops_removed_cached_match_only(
+    tmp_path: Path,
+) -> None:
+    exact = tmp_path / "C--first" / f"{BASIC_SESSION_ID}.jsonl"
+    unrelated = tmp_path / "D--second" / "unrelated.jsonl"
+    for path in (exact, unrelated):
+        path.parent.mkdir()
+        path.write_text("{}\n", encoding="utf-8")
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    assert adapter.discover() == [exact, unrelated]
+    exact.unlink()
+
+    assert adapter.find_native_sessions_by_stem_fresh(BASIC_SESSION_ID) == []
+    assert adapter.discover() == [unrelated]
+
+
+def test_fresh_exact_stem_lookup_treats_missing_root_as_absent(tmp_path: Path) -> None:
+    adapter = ClaudeSourceAdapter(tmp_path / "absent", marker_secret=SECRET)
+
+    assert adapter.find_native_sessions_by_stem_fresh(BASIC_SESSION_ID) == []
+
+
+def test_fresh_exact_stem_lookup_treats_file_root_as_absent(tmp_path: Path) -> None:
+    root_file = tmp_path / "not-a-directory"
+    root_file.write_text("not a directory", encoding="utf-8")
+    adapter = ClaudeSourceAdapter(root_file, marker_secret=SECRET)
+
+    assert adapter.find_native_sessions_by_stem_fresh(BASIC_SESSION_ID) == []
+
+
+def test_fresh_exact_stem_lookup_does_not_extend_inventory_ttl(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(claude_adapter_module.time, "monotonic", lambda: now[0])
+    initial = tmp_path / "C--first" / "initial.jsonl"
+    initial.parent.mkdir()
+    initial.write_text("{}\n", encoding="utf-8")
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    assert adapter.discover() == [initial]
+
+    now[0] = 59.0
+    exact = tmp_path / "D--second" / f"{BASIC_SESSION_ID}.jsonl"
+    exact.parent.mkdir()
+    exact.write_text("{}\n", encoding="utf-8")
+    assert adapter.find_native_sessions_by_stem_fresh(BASIC_SESSION_ID) == [exact]
+
+    newcomer = tmp_path / "E--third" / "newcomer.jsonl"
+    newcomer.parent.mkdir()
+    newcomer.write_text("{}\n", encoding="utf-8")
+    now[0] = 60.0
+    assert adapter.discover() == [initial, exact, newcomer]
+
+
 def test_parse_returns_canonical_metadata_and_native_activity(tmp_path):
     path = _copy_fixture(tmp_path, "basic.jsonl")
 

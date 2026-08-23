@@ -89,6 +89,8 @@ class ClaudeReadableSource(Protocol):
 
     def find_native_sessions_by_stem(self, native_id: str) -> list[Path]: ...
 
+    def find_native_sessions_by_stem_fresh(self, native_id: str) -> list[Path]: ...
+
     def parse(self, path: Path) -> ClaudeParseResult: ...
 
 
@@ -400,12 +402,43 @@ class ClaudeSourceAdapter:
         return matches
 
     def find_native_sessions_by_stem(self, native_id: str) -> list[Path]:
-        """Return authoritative Claude transcript filenames without record probes."""
+        """Return cached Claude transcript filenames without record probes."""
 
         if not isinstance(native_id, str) or not native_id.strip():
             return []
         wanted = native_id.strip()
         return [path for path in self.discover() if path.stem == wanted]
+
+    def find_native_sessions_by_stem_fresh(self, native_id: str) -> list[Path]:
+        """Return live exact-filename matches without refreshing the full inventory."""
+
+        if not isinstance(native_id, str) or not native_id.strip():
+            return []
+        wanted = native_id.strip()
+        if wanted in {".", ".."} or Path(wanted).name != wanted:
+            return []
+        filename = f"{wanted}.jsonl"
+        try:
+            directories = list(self._projects_root.iterdir())
+        except OSError:
+            # A missing or non-directory projects root behaves like an empty
+            # inventory, matching the recursive scan it replaced.
+            return []
+        matches = sorted(
+            (
+                directory / filename
+                for directory in directories
+                if directory.is_dir() and (directory / filename).is_file()
+            ),
+            key=lambda path: str(path),
+        )
+        cached = self._discover_cache
+        if cached is not None:
+            self._discover_cache = sorted(
+                [path for path in cached if path.stem != wanted] + matches,
+                key=lambda path: str(path),
+            )
+        return matches
 
     def projection_has_exact_marker(
         self, projection: SessionProjection, marker: str

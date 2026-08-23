@@ -1444,6 +1444,7 @@ class ClaudeNativeRegistrar:
         clean_exit = False
         provider_limit_observed = False
         pending: tuple[str, str, str] | None = None
+        lifecycle_verified = False
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
@@ -1590,11 +1591,13 @@ class ClaudeNativeRegistrar:
             pending = ("retry", code, "interactive registration unavailable")
         finally:
             if process is not None:
+                lifecycle_verified = clean_exit
                 if not clean_exit:
                     try:
                         terminated = process.terminate(self._exit_timeout)
                     except Exception:
                         terminated = False
+                    lifecycle_verified = terminated
                     if not terminated:
                         provider_limit_observed = False
                         detail = (
@@ -1612,6 +1615,7 @@ class ClaudeNativeRegistrar:
                 except Exception:
                     cleanup = PtyCleanupResult(False, False, False, None)
                 if not cleanup.succeeded:
+                    lifecycle_verified = False
                     provider_limit_observed = False
                     detail = (
                         pending[2]
@@ -1624,7 +1628,14 @@ class ClaudeNativeRegistrar:
                         detail,
                     )
 
-        if pending is not None and not provider_limit_observed:
+        ambiguous_reconciliation = (
+            lifecycle_verified
+            and (pending is None or pending[:2] == ("retry", "creation_ambiguous"))
+        )
+
+        if pending is not None and not (
+            provider_limit_observed or ambiguous_reconciliation
+        ):
             transition, code, detail = pending
             if transition == "fail":
                 return self._fail(claim, code, detail)
@@ -1655,6 +1666,8 @@ class ClaudeNativeRegistrar:
                         "creation_ambiguous",
                         "Claude provider limit interrupted registration",
                     )
+                if pending is not None:
+                    return self._retry(claim, pending[1], pending[2])
                 return self._retry(
                     claim,
                     "native_transcript_not_indexed",
@@ -1668,14 +1681,19 @@ class ClaudeNativeRegistrar:
                 )
 
     def _read_exact(self, native_id: str) -> _ExactTranscript | None:
+        fresh = getattr(self._source, "find_native_sessions_by_stem_fresh", None)
         finder = getattr(self._source, "find_native_sessions_by_stem", None)
-        if not callable(finder):
-            finder = getattr(self._source, "find_native_sessions", None)
-        if callable(finder):
+        if callable(fresh):
+            paths = list(fresh(native_id))
+        elif callable(finder):
             paths = list(finder(native_id))
         else:
-            found = self._source.find_native_session(native_id)
-            paths = [] if found is None else [found]
+            finder = getattr(self._source, "find_native_sessions", None)
+            if callable(finder):
+                paths = list(finder(native_id))
+            else:
+                found = self._source.find_native_session(native_id)
+                paths = [] if found is None else [found]
         if len(paths) > 1:
             raise _TranscriptConflict("duplicate_uuid")
         if not paths:
