@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -47,8 +48,25 @@ def _tool_call_name(tc: Any) -> str:
     return str(getattr(tc, "name", "") or "")
 
 
+def _tool_result_succeeded(content: Any) -> bool:
+    """Return whether a terminal tool result represents a state transition.
+
+    Recoverable validation failures are structured tool errors. They must not
+    count as terminal, or the worker may exit before retrying its handoff.
+    """
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return True
+        return not (isinstance(payload, dict) and payload.get("error"))
+    if isinstance(content, dict):
+        return not content.get("error")
+    return True
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True if this conversation successfully invoked a terminal kanban tool."""
     if not messages:
         return False
     for msg in messages:
@@ -56,12 +74,12 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
             continue
         role = msg.get("role")
         if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
-                    return True
+            # The matching tool result below is authoritative; a rejected
+            # call must leave the worker eligible for a retry.
+            continue
         elif role == "tool":
             name = str(msg.get("name") or "")
-            if name in _TERMINAL_KANBAN_TOOLS:
+            if name in _TERMINAL_KANBAN_TOOLS and _tool_result_succeeded(msg.get("content")):
                 return True
     return False
 

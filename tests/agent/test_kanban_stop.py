@@ -74,6 +74,27 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_rejected_terminal_tool_keeps_worker_retryable(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_recover")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "kanban_complete", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "call-1",
+            "content": '{"error":"publication proof rejected: working tree is not clean"}',
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
 
 
 

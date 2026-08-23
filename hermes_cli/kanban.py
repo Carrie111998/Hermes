@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "publication_required": t.publication_required,
     }
 
 
@@ -346,6 +347,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
+    p_create.add_argument("--publication-required", action=argparse.BooleanOptionalAction,
+                          default=None, help="Require Forge publication proof (default depends on assignee)")
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
@@ -1585,6 +1588,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            publication_required=getattr(args, "publication_required", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
