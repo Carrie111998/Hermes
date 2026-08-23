@@ -191,3 +191,33 @@ async def test_unstamped_source_is_routed_and_refused_when_route_targets_unserve
     assert (result["status"], result["code"]) == ("rejected", "invalid_session")
     assert source.profile_route_rejected is True
     assert store.list_sessions() == []
+
+
+# --- durable write failure: structured rejection, live state untouched ------
+
+
+@pytest.mark.asyncio
+async def test_durable_write_failure_is_a_rejection_not_an_exception(
+    store, monkeypatch
+):
+    runner = _make_runner(store)
+    source = _make_source()
+    key = runner._session_key_for_source(runner._normalize_source_for_session_key(source))
+    # Routing entry exists and is healthy; only the later options write fails.
+    store.get_or_create_session(source)
+
+    def _fail(_data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(store, "_save_sessions_json", _fail)
+
+    result = await runner.apply_session_options(source, {"reasoning_effort": "high"})
+
+    assert (result["status"], result["code"]) == ("rejected", "durable_write_failed")
+    assert runner._session_state(key).conversation.reasoning_override is None
+    assert (store.get_runtime_options(key) or {}).get("reasoning_override") is None
+    # Nothing is stuck: once the disk is healthy again the same patch lands.
+    monkeypatch.undo()
+    retry = await runner.apply_session_options(source, {"reasoning_effort": "high"})
+    assert retry["status"] == "accepted"
+    assert retry["applied"] == ["reasoning_effort"]

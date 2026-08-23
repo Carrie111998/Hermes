@@ -145,7 +145,14 @@ service tier — and share two primitives:
   instead of replying "set" while disk disagrees. Persisted: model override
   (credentials stripped — the API key is re-resolved from live config on
   rehydrate), reasoning override, service tier. Never persisted: `/model --once`
-  and the `/moa` one-shot (live-only by contract).
+  and the `/moa` one-shot (live-only by contract; both park the prior override in
+  `conversation.one_turn_restore`, so a durable commit landing while either is
+  live persists that snapshot, never the one-turn model or the virtual `moa`
+  provider). An I/O failure on the durable write reaches `apply_session_options()`
+  callers as `rejected`/`durable_write_failed`; slash commands surface it as the
+  adapter's error reply. Persist and live assignment run as one shielded unit
+  under the lock: a caller cancelled mid-commit still observes live state equal
+  to disk (a second cancellation during that wait is the one case not covered).
 - **`session_admission_lock(runner, key)`** — one `asyncio.Lock` per session key.
   `_handle_message` holds it across its synchronous idle→running claim (uncontended
   acquire never yields, so the "claim before any await" rule still holds); every

@@ -50,6 +50,14 @@ def _rejected(code: str, error: str) -> dict[str, Any]:
     return {"status": "rejected", "code": code, "error": error}
 
 
+def _durable_write_failed(exc: BaseException) -> dict[str, Any]:
+    logger.warning("session runtime options durable write failed: %s", exc)
+    return _rejected(
+        "durable_write_failed",
+        f"could not persist session runtime options: {exc}",
+    )
+
+
 def _busy_result() -> dict[str, Any]:
     return _rejected(
         "session_busy",
@@ -203,9 +211,22 @@ async def _commit_session_runtime_options_locked(
             else None
         )
 
-    persisted = True
+    def _assign_live() -> None:
+        conversation.model_override = new_model
+        conversation.reasoning_override = new_reasoning
+        conversation.service_tier_override = new_tier
+        if durable and model_override is not UNSET:
+            # A durable model commit supersedes any pending one-turn restore;
+            # the old snapshot would otherwise revert this model after the
+            # next turn.
+            conversation.one_turn_restore = None
+
     store = getattr(runner, "session_store", None)
-    if durable and callable(getattr(store, "set_runtime_options", None)):
+    if not (durable and callable(getattr(store, "set_runtime_options", None))):
+        _assign_live()
+        return True
+
+    async def _persist_then_assign() -> bool:
         # Off-loop via the async facade. Raises on a failed save (the store
         # rolls its own entry back); False when no routing entry exists yet.
         persisted = bool(
@@ -218,15 +239,23 @@ async def _commit_session_runtime_options_locked(
         )
         if not persisted and require_routing_entry:
             return False
+        _assign_live()
+        return persisted
 
-    conversation.model_override = new_model
-    conversation.reasoning_override = new_reasoning
-    conversation.service_tier_override = new_tier
-    if durable and model_override is not UNSET:
-        # A durable model commit supersedes any pending one-turn restore; the
-        # old snapshot would otherwise revert this model after the next turn.
-        conversation.one_turn_restore = None
-    return persisted
+    # Persist + live assignment are one unit: the worker-thread write cannot
+    # be un-done by cancelling the awaiting task, so a cancelled caller must
+    # still see live state follow whatever landed on disk. The unit runs
+    # shielded and, on cancellation, is awaited to completion under the lock
+    # before the cancellation propagates. Known residual: a second
+    # cancellation delivered during that wait still exits the lock with the
+    # unit in flight -- that one case is not covered.
+    unit = asyncio.ensure_future(_persist_then_assign())
+    try:
+        return await asyncio.shield(unit)
+    except asyncio.CancelledError:
+        if not unit.done():
+            await asyncio.wait({unit})
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +488,10 @@ async def _apply_scoped(
             return _busy_result()
         # Create/resolve the routing entry only after every requested value
         # has passed validation.
-        entry = await runner.async_session_store.get_or_create_session(source)
+        try:
+            entry = await runner.async_session_store.get_or_create_session(source)
+        except OSError as exc:
+            return _durable_write_failed(exc)
         conversation = state.conversation
         if getattr(entry, "was_auto_reset", False):
             # The session crossed an idle/daily boundary: consume the flag so
@@ -528,12 +560,20 @@ async def _apply_scoped(
                 [], new["reasoning_override"], new["service_tier_override"]
             )
 
-        persisted = await _commit_session_runtime_options_locked(
-            runner,
-            session_key,
-            require_routing_entry=True,
-            **{name: new[name] for name in changed},
-        )
+        try:
+            persisted = await _commit_session_runtime_options_locked(
+                runner,
+                session_key,
+                require_routing_entry=True,
+                **{name: new[name] for name in changed},
+            )
+        except OSError as exc:
+            # The store rolled its entry back and live state never moved
+            # (durable-first). The host API contract is a structured result,
+            # not an exception, so map the I/O failure to a rejection code;
+            # the slash paths keep raising (the adapter's generic handler
+            # turns that into a visible "Sorry, I encountered an error").
+            return _durable_write_failed(exc)
         if not persisted:
             return _rejected(
                 "session_missing",

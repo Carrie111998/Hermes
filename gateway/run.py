@@ -28396,6 +28396,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Messaging adapters and host UIs should use this public boundary instead
         of injecting visible slash-command turns. Values are validated before
         any state is created or changed, then persisted atomically per session.
+        Returns a structured result; an I/O failure on the durable write is
+        ``rejected``/``durable_write_failed``. Persist and live assignment are
+        one unit under the session lock, completed even if the caller is
+        cancelled.
         """
         from gateway.session_options import apply_gateway_session_options
 
