@@ -192,6 +192,12 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+# Kanban wake turns (gateway/kanban_watchers.py, via gateway.wake.deliver_wake)
+# are injected as role="user" rows to resume a session on task completion.
+# The "[kanban] " tag is emitted verbatim by every locale catalog (see
+# locales/*.yaml gateway.kanban.wake.message) so it is a stable marker even
+# though the rest of the message is translated.
+_KANBAN_WAKE_NOTIFICATION_PREFIX = "[kanban] "
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -5239,6 +5245,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith(
             _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
+        ) or text.startswith(
+            _KANBAN_WAKE_NOTIFICATION_PREFIX
         ) or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         ) or text.startswith(
