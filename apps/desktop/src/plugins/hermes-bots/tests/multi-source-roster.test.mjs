@@ -32,7 +32,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;\nglobalThis.__activeBotRoute = activeBotRoute;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -660,4 +660,19 @@ test('resolveRosterMentions: @hermes in this chat is not a handoff to yourself',
 
   assert.equal(hits.length, 1)
   assert.equal(hits[0].connectionId, 'mac-mini')
+})
+
+
+test('#92830 activeBotRoute: defined, and null when no roster cache exists', async () => {
+  const { __activeBotRoute } = runtime()
+
+  assert.equal(typeof __activeBotRoute, 'function')
+
+  // No cached union roster in this harness (queryClient is undefined in the
+  // VM context, which cachedUnionRoster tolerates): the route must resolve
+  // to null so callers fall back to the unscoped local path — NOT throw the
+  // ReferenceError that blanked the Bots pane.
+  const route = await __activeBotRoute()
+
+  assert.equal(route, null)
 })

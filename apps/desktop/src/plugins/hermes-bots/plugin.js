@@ -4593,6 +4593,33 @@ function persistBotMetaSnapshot(value, scoped = false) {
 
 /** Immutable owner descriptor for every source-scoped row. The active
  *  gateway is presentation state and is never consulted here. */
+/** The ACTIVE window's bot route, or null when the window rides the
+ *  unscoped local backend. Resolved from the freshest cached union roster:
+ *  the row whose name matches the live profile carries its route. Callers
+ *  fall back to the unscoped local path on null (#92830: useRoster and the
+ *  Bot Mode sweep called this without a definition, so every roster attempt
+ *  died on ReferenceError and `retry: true` spun the Bots pane forever).
+ *  Best-effort: any cache hiccup degrades to null (unscoped local), which
+ *  is the pre-#90006 behavior. */
+async function activeBotRoute() {
+  const profile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+
+  try {
+    const cached = cachedUnionRoster()
+    const profiles = Array.isArray(cached?.profiles) ? cached.profiles : []
+    const row = profiles.find(row => row?.name === profile)
+
+    if (row?.route) {
+      return { ...row.route }
+    }
+  } catch {
+    /* cache hiccup — fall through to unscoped local */
+  }
+
+  return null
+}
+
+
 function botConnectionRoute(bot) {
   if (!bot?.sourceScoped && !bot?.remoteSource) {
     return null
