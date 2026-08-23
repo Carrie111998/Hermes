@@ -82,6 +82,7 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["api_mode"] == agent.api_mode
         assert "client_kwargs" in rt
         assert "compressor_context_length" in rt
+        assert rt["config_context_length"] == agent._config_context_length
 
     def test_snapshot_includes_compressor_state(self):
         agent = _make_agent()
@@ -196,6 +197,39 @@ class TestRestorePrimaryRuntime:
 
         assert agent.context_compressor.context_length == original_ctx_len
         assert agent.context_compressor.threshold_tokens == original_threshold
+
+    def test_restores_primary_context_override_after_fallback(self):
+        fallback = {
+            "provider": "custom",
+            "model": "fallback-model",
+            "base_url": "https://fallback.example/v1",
+            "context_length": 65_536,
+        }
+        agent = _make_agent(fallback_model=[fallback])
+        agent._config_context_length = 200_000
+        agent._primary_runtime["config_context_length"] = 200_000
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_resolve(
+                        base_url="https://fallback.example/v1",
+                        api_key="fallback-key-1234",
+                    ),
+                    "fallback-model",
+                ),
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=65_536),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._config_context_length == 65_536
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent._config_context_length == 200_000
 
     def test_restores_prompt_caching_flag(self):
         agent = _make_agent()

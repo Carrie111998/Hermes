@@ -1891,24 +1891,30 @@ def get_fallback_provider_context_length(
     if not active_provider or not active_model:
         return None
 
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        entry_provider = str(entry.get("provider") or "").strip().lower()
-        entry_model = str(entry.get("model") or "").strip()
-        if entry_provider != active_provider or entry_model != active_model:
-            continue
-        entry_url = normalize_route_base_url(entry.get("base_url"))
-        if entry_url and entry_url != active_url:
-            continue
-        raw_ctx = entry.get("context_length")
-        try:
-            context_length = int(raw_ctx)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(raw_ctx, bool) or context_length <= 0:
-            continue
-        return context_length
+    # Prefer an entry pinned to the active route over an otherwise identical
+    # provider/model entry.  Config order remains the tiebreaker within each
+    # specificity tier.
+    for require_route in (True, False):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_provider = str(entry.get("provider") or "").strip().lower()
+            entry_model = str(entry.get("model") or "").strip()
+            if entry_provider != active_provider or entry_model != active_model:
+                continue
+            entry_url = normalize_route_base_url(entry.get("base_url"))
+            if bool(entry_url) != require_route:
+                continue
+            if entry_url and entry_url != active_url:
+                continue
+            raw_ctx = entry.get("context_length")
+            try:
+                context_length = int(raw_ctx)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(raw_ctx, bool) or context_length <= 0:
+                continue
+            return context_length
     return None
 
 

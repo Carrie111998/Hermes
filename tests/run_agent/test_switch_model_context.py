@@ -283,4 +283,5 @@ def test_lmstudio_switch_uses_destination_context_and_verified_runtime(monkeypat
     call_kwargs = mock_ctx_len.call_args.kwargs
     assert call_kwargs.get("config_context_length") == 100_000
     assert agent._config_context_length == 120_000
+    assert agent._primary_runtime["config_context_length"] == 120_000
     assert agent.context_compressor.context_length == 100_000

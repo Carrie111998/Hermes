@@ -2631,6 +2631,10 @@ def init_agent(
                 fallback_model,
             )
         except Exception:
+            logger.debug(
+                "Could not resolve the active fallback context override",
+                exc_info=True,
+            )
             _config_context_length = None
 
     # Persist for reuse on switch_model / fallback activation. Must come
@@ -3062,6 +3066,7 @@ def init_agent(
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "config_context_length": agent._config_context_length,
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).

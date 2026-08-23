@@ -1350,6 +1350,7 @@ def try_recover_primary_transport(
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
+        agent._config_context_length = rt.get("config_context_length")
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1581,6 +1582,7 @@ def restore_primary_runtime(agent) -> bool:
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
+        agent._config_context_length = rt.get("config_context_length")
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
@@ -2991,6 +2993,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "config_context_length": agent._config_context_length,
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",

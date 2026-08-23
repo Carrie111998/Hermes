@@ -121,6 +121,50 @@ class TestGetFallbackProviderContextLength:
             is None
         )
 
+    def test_route_pinned_match_outranks_earlier_unpinned_match(self):
+        fallbacks = [
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "context_length": 32_768,
+            },
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "base_url": "https://exact.invalid/v1",
+                "context_length": 65_536,
+            },
+        ]
+
+        assert get_fallback_provider_context_length(
+            "shared-model",
+            "custom",
+            "https://exact.invalid/v1/",
+            fallbacks,
+        ) == 65_536
+
+    def test_unpinned_match_applies_when_pinned_route_does_not_match(self):
+        fallbacks = [
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "base_url": "https://other.invalid/v1",
+                "context_length": 65_536,
+            },
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "context_length": 32_768,
+            },
+        ]
+
+        assert get_fallback_provider_context_length(
+            "shared-model",
+            "custom",
+            "https://active.invalid/v1",
+            fallbacks,
+        ) == 32_768
+
 
 class TestGetCustomProviderModelCapability:
     def test_matches_exact_model_on_normalized_route(self):
