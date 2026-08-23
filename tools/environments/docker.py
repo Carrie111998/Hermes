@@ -980,7 +980,13 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
+            # Issue #92414: task ids like "session:agent:main:telegram:dm:<id>"
+            # contain colons, and Docker's short `-v host:container[:mode]`
+            # syntax splits on ':'. A raw id in the host path makes the mount
+            # spec unparseable (exit 125, "invalid mode: /root"). Sanitize the
+            # path component the same way container labels are sanitized so
+            # both derive from one safe form.
+            sandbox = get_sandbox_dir() / "docker" / _sanitize_label_value(task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args.extend([
