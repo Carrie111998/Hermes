@@ -103,9 +103,20 @@ class _ProviderEntry:
 # ---------------------------------------------------------------------------
 
 
-# Sent on SDK-built OAuth discovery/registration requests that would
-# otherwise carry no User-Agent (see _ensure_auth_request_user_agent).
-DEFAULT_AUTH_REQUEST_USER_AGENT = "Hermes-Agent"
+def _default_auth_request_user_agent() -> str:
+    """``Hermes-Agent/<version>`` for SDK-built OAuth discovery/registration
+    requests that would otherwise carry no User-Agent at all (see
+    ``_ensure_auth_request_user_agent``). Versioned so server operators
+    debugging a WAF block can tell which client they are looking at — same
+    shape as ``tools.xai_http.hermes_xai_user_agent``."""
+    try:
+        from hermes_cli import __version__
+    except Exception:  # pragma: no cover — defensive
+        __version__ = "unknown"
+    return f"Hermes-Agent/{__version__}"
+
+
+DEFAULT_AUTH_REQUEST_USER_AGENT = _default_auth_request_user_agent()
 
 
 def _make_hermes_provider_class() -> Optional[type]:
