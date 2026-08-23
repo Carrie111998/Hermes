@@ -353,7 +353,7 @@ def save_stash(stash: PromptStash, path: Path | None = None) -> None:
     try:
         data = stash.to_dict()
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
         tmp.chmod(0o600)
         tmp.rename(path)
     except Exception:
@@ -374,7 +374,7 @@ def load_stash(path: Path | None = None) -> PromptStash:
         path = Path(get_hermes_home()) / "stash.json"
 
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding='utf-8'))
         return PromptStash.from_dict(data)
     except Exception:
         return PromptStash()
