@@ -31,6 +31,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -2548,6 +2549,23 @@ if _config_path.exists():
             _trust_recent_seconds = _gateway_cfg.get("trust_recent_files_seconds")
             if _trust_recent_seconds is not None:
                 os.environ["HERMES_MEDIA_TRUST_RECENT_SECONDS"] = str(_trust_recent_seconds)
+            # Bridge gateway.followup_grace_seconds (+ per-platform overrides) to
+            # the internal env vars _followup_grace_seconds() reads. config.yaml
+            # is the user-facing surface; the env names are the mechanism, plus
+            # back-compat for the pre-existing Telegram variable. An explicitly
+            # set env var wins, so the documented escape hatch keeps working.
+            _followup_grace = _gateway_cfg.get("followup_grace_seconds")
+            if (
+                _followup_grace is not None
+                and "HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS" not in os.environ
+            ):
+                os.environ["HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS"] = str(_followup_grace)
+            _followup_by_platform = _gateway_cfg.get("followup_grace_seconds_by_platform")
+            if isinstance(_followup_by_platform, dict):
+                for _plat, _secs in _followup_by_platform.items():
+                    _name = f"HERMES_{str(_plat).upper()}_FOLLOWUP_GRACE_SECONDS"
+                    if _secs is not None and _name not in os.environ:
+                        os.environ[_name] = str(_secs)
             # Bridge gateway.platform_connect_timeout → the internal env var the
             # connect path + Discord adapter ready-wait both read (#19776).
             # Unlike the agent.*/display.* bridges above (config-authoritative),
@@ -9731,11 +9749,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not raw:
                 continue
             try:
-                return float(raw)
+                parsed = float(raw)
             except (TypeError, ValueError):
                 logger.warning(
                     "Ignoring %s=%r — not a number; falling back.", name, raw
                 )
+                continue
+            # float() accepts "nan"/"inf". NaN fails every comparison, silently
+            # disabling the window; inf makes it unbounded. Neither is a value a
+            # user can have meant, and both fail quietly, so reject them here.
+            if not math.isfinite(parsed):
+                logger.warning(
+                    "Ignoring %s=%r — not a finite number; falling back.", name, raw
+                )
+                continue
+            return parsed
         return 3.0
 
     @staticmethod

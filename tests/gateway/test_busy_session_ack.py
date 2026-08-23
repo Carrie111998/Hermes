@@ -210,6 +210,82 @@ class TestBusySessionAck:
         assert sk in adapter._pending_messages
 
     @pytest.mark.asyncio
+    async def test_control_command_is_not_swallowed_by_the_grace_window(self, monkeypatch):
+        """`/stop` inside the grace window must still reach command handling.
+
+        The window exists to absorb the trailing half of a split send. A control
+        command is never that — it is the user deliberately intervening, and it is
+        exactly the moment they most need to be heard. If `/stop` lands in the
+        pending slot instead, the fix trades "user interrupted themselves" for
+        "user cannot stop a runaway run", which is a strictly worse bug.
+        """
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS", "3.0")
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        adapter = _make_adapter()
+
+        source = SessionSource(
+            platform=Platform.BLUEBUBBLES,
+            chat_id="any;-;+15550001111",
+            chat_type="dm",
+            user_id="+15550001111",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()   # run started just now
+
+        stop_event = MessageEvent(
+            text="/stop",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="stop-1",
+        )
+        assert stop_event.is_command(), "precondition: /stop must parse as a command"
+
+        await GatewayRunner._handle_message(runner, stop_event)
+
+        # The command must NOT have been parked in the pending slot.
+        parked = adapter._pending_messages.get(sk)
+        assert parked is None or parked.text != "/stop", (
+            "/stop was swallowed by the follow-up grace window"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "banana"])
+    async def test_non_finite_grace_values_fall_back(self, monkeypatch, bad):
+        """`float()` accepts nan/inf; neither is a window a user could have meant.
+
+        NaN fails every comparison and silently disables the feature; inf makes the
+        window unbounded so nothing ever interrupts. Both fail QUIETLY, which is the
+        worst way for a misconfiguration to behave — hence an explicit guard.
+        """
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS", bad)
+        monkeypatch.delenv("HERMES_BLUEBUBBLES_FOLLOWUP_GRACE_SECONDS", raising=False)
+
+        assert GatewayRunner._followup_grace_seconds(Platform.BLUEBUBBLES) == 3.0
+
+    @pytest.mark.asyncio
+    async def test_per_platform_override_beats_the_gateway_wide_value(self, monkeypatch):
+        """Per-platform wins; other platforms still read the gateway-wide value."""
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS", "1.0")
+        monkeypatch.setenv("HERMES_BLUEBUBBLES_FOLLOWUP_GRACE_SECONDS", "5.0")
+
+        assert GatewayRunner._followup_grace_seconds(Platform.BLUEBUBBLES) == 5.0
+        assert GatewayRunner._followup_grace_seconds(Platform.MATRIX) == 1.0
+
+    @pytest.mark.asyncio
     async def test_telegram_env_var_still_honoured_after_generalisation(self, monkeypatch):
         """The platform-specific env var must keep working — it is documented and in use."""
         from gateway.run import GatewayRunner
