@@ -2,6 +2,7 @@ import type { ReadableAtom } from 'nanostores'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
+import type * as sessionStore from '@/store/session'
 
 // Workspace-identity gate on the foreground publish (#92888): a background
 // Kanban worker's session.info carries ITS PR-worktree cwd/branch. The cwd
@@ -17,7 +18,7 @@ const { current } = vi.hoisted(() => ({
 }))
 
 vi.mock('@/store/session', async importOriginal => {
-  const actual = await importOriginal<typeof import('@/store/session')>()
+  const actual = await importOriginal<typeof sessionStore>()
 
   return {
     ...actual,
