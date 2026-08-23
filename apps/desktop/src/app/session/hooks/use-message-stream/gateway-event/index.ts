@@ -206,7 +206,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         eventRuntimeSessionId: sessionId,
         eventStoredSessionId,
         fromActiveSource: fromActiveSource(),
-        selectedStoredSessionId: deps.selectedStoredSessionIdRef.current
+        selectedStoredSessionId: deps.selectedStoredSessionIdRef.current,
+        storedIdsShareLineage: deps.storedIdsShareLineage
       })
 
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
@@ -258,6 +259,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       deps.appendReasoningDelta,
       deps.activeSessionIdRef,
       deps.selectedStoredSessionIdRef,
+      deps.storedIdsShareLineage,
       deps.activeGatewayProfile,
       deps.compactedTurnRef,
       deps.completeAssistantMessage,

@@ -225,6 +225,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const messagingSessions = useStore($messagingSessions)
   const sessions = useStore($sessions)
+  const storedIdsShareLineage = useCallback(
+    (leftStoredId: string, rightStoredId: string) =>
+      leftStoredId === rightStoredId ||
+      sessions.some(
+        session => sessionMatchesStoredId(session, leftStoredId) && sessionMatchesStoredId(session, rightStoredId)
+      ),
+    [sessions]
+  )
   const activeConnectionId = useStore($activeConnectionId)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
@@ -453,6 +461,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeGatewayProfile,
     activeSessionIdRef,
     selectedStoredSessionIdRef,
+    storedIdsShareLineage,
     hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,

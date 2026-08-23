@@ -39,6 +39,7 @@ interface MessageStreamOptions {
   activeGatewayProfile?: string
   activeSessionIdRef: MutableRefObject<string | null>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
+  storedIdsShareLineage: (leftStoredId: string, rightStoredId: string) => boolean
   hydrateFromStoredSession: (
     attempts?: number,
     storedSessionId?: string | null,
@@ -72,6 +73,7 @@ export function useMessageStream({
   activeGatewayProfile = 'default',
   activeSessionIdRef,
   selectedStoredSessionIdRef,
+  storedIdsShareLineage,
   hydrateFromStoredSession,
   queryClient,
   refreshHermesConfig,
@@ -848,6 +850,7 @@ export function useMessageStream({
     appendReasoningDelta,
     activeSessionIdRef,
     selectedStoredSessionIdRef,
+    storedIdsShareLineage,
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,

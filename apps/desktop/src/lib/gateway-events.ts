@@ -86,6 +86,7 @@ interface GatewayEventActiveInput {
   eventStoredSessionId: null | string
   fromActiveSource: boolean
   selectedStoredSessionId: null | string
+  storedIdsShareLineage: (leftStoredId: string, rightStoredId: string) => boolean
 }
 
 /** Runtime ids can be replaced while resuming/reclaiming a conversation. The
@@ -97,13 +98,16 @@ export function gatewayEventIsActive({
   eventRuntimeSessionId,
   eventStoredSessionId,
   fromActiveSource,
-  selectedStoredSessionId
+  selectedStoredSessionId,
+  storedIdsShareLineage
 }: GatewayEventActiveInput): boolean {
   return Boolean(
     fromActiveSource &&
       eventRuntimeSessionId &&
       (eventRuntimeSessionId === activeRuntimeSessionId ||
-        (eventStoredSessionId && eventStoredSessionId === selectedStoredSessionId))
+        (eventStoredSessionId &&
+          selectedStoredSessionId &&
+          storedIdsShareLineage(eventStoredSessionId, selectedStoredSessionId)))
   )
 }
 
