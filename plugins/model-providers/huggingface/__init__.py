@@ -13,6 +13,7 @@ huggingface = ProviderProfile(
     fallback_models=(
         "Qwen/Qwen3.5-72B-Instruct",
         "deepseek-ai/DeepSeek-V3.2",
+        "zai-org/GLM-4.7-Flash",
     ),
     base_url="https://router.huggingface.co/v1",
 )

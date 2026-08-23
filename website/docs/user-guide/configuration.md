@@ -1442,6 +1442,28 @@ auxiliary:
 
 The shape mirrors what OpenRouter accepts in the chat completions request body. Hermes forwards the entire `extra_body` verbatim, so any other OpenRouter request-body field documented at [openrouter.ai/docs](https://openrouter.ai/docs) works the same way.
 
+For the [Auto Beta router](/integrations/providers#openrouter-auto-beta-router) (`openrouter/auto-beta`), use the `auto-beta-router` plugin id instead:
+
+```yaml
+auxiliary:
+  compression:
+    provider: openrouter
+    model: openrouter/auto-beta
+    extra_body:
+      plugins:
+        - id: auto-beta-router
+          cost_tier: medium   # low | medium | high | xhigh | max
+```
+
+For the [Free Models router](/integrations/providers#openrouter-free-models-router) (`openrouter/free`), set the model slug only — no plugin block:
+
+```yaml
+auxiliary:
+  compression:
+    provider: openrouter
+    model: openrouter/free
+```
+
 ### Changing the Vision Model
 
 To use GPT-4o instead of Gemini Flash for image analysis:

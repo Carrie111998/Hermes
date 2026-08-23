@@ -95,7 +95,7 @@ This resolver is the main reason Hermes can share auth/runtime logic between:
 
 ## AI Gateway
 
-Set `AI_GATEWAY_API_KEY` in `~/.hermes/.env` and run with `--provider ai-gateway`. Hermes fetches available models from the gateway's `/models` endpoint, filtering to language models with tool-use support.
+Set `AI_GATEWAY_API_KEY` in `~/.hermes/.env` and run with `--provider ai-gateway`. Hermes fetches available models from the gateway's `/models` endpoint, filtering to language models with tool-use support. The curated picker also keeps $0 models that Vercel's live catalog sometimes omits — for example `meta/llama-3.3-70b`, `meta/llama-4-scout`, `meta/llama-4-maverick`, and `poolside/laguna-s-2.1-free`.
 
 ## OpenRouter, AI Gateway, and custom OpenAI-compatible base URLs
 

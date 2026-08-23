@@ -978,6 +978,28 @@ auxiliary:
 
 形状与 OpenRouter 在聊天补全请求体中接受的内容一致。Hermes 原样转发整个 `extra_body`，因此 [openrouter.ai/docs](https://openrouter.ai/docs) 中记录的任何其他 OpenRouter 请求体字段都以相同方式工作。
 
+[Auto Beta 路由器](/integrations/providers#openrouter-auto-beta-路由器)（`openrouter/auto-beta`）请改用 `auto-beta-router` 插件 id：
+
+```yaml
+auxiliary:
+  compression:
+    provider: openrouter
+    model: openrouter/auto-beta
+    extra_body:
+      plugins:
+        - id: auto-beta-router
+          cost_tier: medium   # low | medium | high | xhigh | max
+```
+
+[免费模型路由器](/integrations/providers#openrouter-免费模型路由器)（`openrouter/free`）只需设置 model slug，无需 plugins 块：
+
+```yaml
+auxiliary:
+  compression:
+    provider: openrouter
+    model: openrouter/free
+```
+
 ### 更改视觉模型
 
 使用 GPT-4o 而非 Gemini Flash 进行图像分析：

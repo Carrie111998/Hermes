@@ -255,6 +255,8 @@ hermes chat --provider novita --model moonshotai/kimi-k2.5
 
 # z.ai / ZhipuAI GLM
 hermes chat --provider zai --model glm-5
+# Free-tier flash models (omitted from Z.AI's live /models — curated in Hermes):
+# hermes chat --provider zai --model glm-4.7-flash
 # Requires: GLM_API_KEY in ~/.hermes/.env
 
 # Kimi / Moonshot AI (international: api.moonshot.ai)
@@ -281,8 +283,9 @@ hermes chat --provider alibaba --model qwen3.5-plus
 hermes chat --provider xiaomi --model mimo-v2-pro
 # Requires: XIAOMI_API_KEY in ~/.hermes/.env
 
-# Tencent TokenHub (Hy3 Preview)
+# Tencent TokenHub (Hy3 / Hy3 Preview)
 hermes chat --provider tencent-tokenhub --model hy3-preview
+# GA successor: hermes chat --provider tencent-tokenhub --model hy3
 # Requires: TOKENHUB_API_KEY in ~/.hermes/.env
 
 # Arcee AI (Trinity models)
@@ -316,6 +319,10 @@ Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_U
 
 :::note Z.AI Endpoint Auto-Detection
 When using the Z.AI / GLM provider, Hermes automatically probes multiple endpoints (global, China, coding variants) to find one that accepts your API key. You don't need to set `GLM_BASE_URL` manually — the working endpoint is detected and cached automatically.
+:::
+
+:::note Z.AI free flash models
+Z.AI's `/models` listing omits some free flash slugs (`glm-4.7-flash`, `glm-4.5-flash`, `glm-4.6v-flash`). Hermes keeps them in the curated `/model` picker so you can select them directly when your API key tier includes them.
 :::
 
 ### xAI (Grok) — Responses API + Prompt Caching
@@ -539,6 +546,8 @@ For on-prem deployments (DGX Spark, local GPU), set `NVIDIA_BASE_URL=http://loca
 
 Hermes automatically attaches the NIM billing-origin header on every request to `build.nvidia.com` — no configuration needed. This routes consumption against the correct origin in NVIDIA's billing dashboard.
 
+The curated `/model` picker also surfaces hosted third-party and free-tier chat models on NIM (for example `openai/gpt-oss-20b`, `google/gemma-4-31b-it`, `meta/llama-3.3-70b-instruct`, and `poolside/laguna-xs-2.1`) alongside Nemotron flagship slugs. Live `/v1/models` may omit some entries — Hermes merges the static curated list so they stay selectable.
+
 ### GMI Cloud
 
 Open and reasoning models via [GMI Cloud](https://www.gmicloud.ai/) — OpenAI-compatible API, API key authentication.
@@ -617,6 +626,9 @@ hermes chat --provider huggingface --model Qwen/Qwen3.5-397B-A17B
 
 # Short alias
 hermes chat --provider hf --model deepseek-ai/DeepSeek-V3.2
+
+# Free on HF Inference Providers (curated in Hermes when live /models omits it)
+hermes chat --provider hf --model zai-org/GLM-4.7-Flash
 ```
 
 Or set it permanently in `config.yaml`:
@@ -1560,6 +1572,53 @@ Notes:
 - Selection is deterministic per score on a given day, but the actual model chosen can shift as the Pareto frontier moves (new models, benchmark updates).
 - See OpenRouter's [Pareto Router docs](https://openrouter.ai/docs/guides/routing/routers/pareto-router) for the full router behavior.
 - To use the Pareto Code router for a specific **auxiliary task** (compression, vision, etc.) instead of the main agent, set `extra_body.plugins` under that task — see [Auxiliary Models → OpenRouter routing & Pareto Code for auxiliary tasks](/user-guide/configuration#openrouter-routing--pareto-code-for-auxiliary-tasks).
+
+## OpenRouter Auto Beta Router
+
+OpenRouter ships an early-access general-purpose router at `openrouter/auto-beta` that picks the best model for each prompt from live market spend (trailing 7-day task mix on OpenRouter). Use it when the right model varies by request — mixed chat, reasoning, and completion workloads — instead of pinning one slug yourself:
+
+```yaml
+model:
+  provider: openrouter
+  model: openrouter/auto-beta
+```
+
+Optional per-request tuning uses the `auto-beta-router` plugin (via `extra_body.plugins` on auxiliary tasks, or any path that forwards OpenRouter request bodies):
+
+```yaml
+extra_body:
+  plugins:
+    - id: auto-beta-router
+      cost_tier: medium   # low | medium | high | xhigh | max
+      # allowed_models: ["anthropic/*"]   # optional wildcard allowlist
+      # excluded_models: ["deepseek/*"]    # optional wildcard blocklist
+```
+
+Notes:
+
+- There is **no Hermes-specific config knob** for Auto Beta (unlike `openrouter.min_coding_score` for Pareto Code). Settings go through OpenRouter's `auto-beta-router` plugin or your OpenRouter workspace Routing defaults.
+- The response `model` field names the model that actually ran; you pay that model's standard rate — no router surcharge.
+- `openrouter/auto` is the stable Auto Router slug; `openrouter/auto-beta` is the early-access track where new routing behavior lands first. Plugin settings must use the matching plugin id (`auto-beta-router` vs `auto-router`).
+- See OpenRouter's [Auto Router docs](https://openrouter.ai/docs/guides/routing/routers/auto-router) for cost tiers, allowlists, and account defaults.
+- For a **coding-only** router with a Hermes config knob, use [Pareto Code](#openrouter-pareto-code-router) instead.
+
+## OpenRouter Free Models Router
+
+OpenRouter's `openrouter/free` router picks a **free** model for each request from the current `:free` catalog. It filters for capabilities your request needs (tool calling, vision, structured outputs, etc.) so zero-cost experimentation does not land on a model that cannot run the turn:
+
+```yaml
+model:
+  provider: openrouter
+  model: openrouter/free
+```
+
+Notes:
+
+- No plugin block is required — set `model: openrouter/free` and send the request.
+- The response `model` field names the free model that actually ran; there is no router surcharge.
+- Rate limits and availability vary by the underlying free model OpenRouter selects.
+- For a specific free slug instead of random routing, use `:free` variants directly (e.g. `z-ai/glm-5.2:free`) or pick from the `:free` entries in the `/model` picker.
+- See OpenRouter's [Free Models Router](https://openrouter.ai/openrouter/free) page and [free variant docs](https://openrouter.ai/docs/guides/routing/model-variants/free).
 
 ## Fallback Providers
 

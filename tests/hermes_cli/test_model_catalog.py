@@ -38,6 +38,18 @@ def _valid_manifest() -> dict:
                 "models": [
                     {"id": "anthropic/claude-opus-4.7", "description": "recommended"},
                     {"id": "openai/gpt-5.4", "description": ""},
+                    {
+                        "id": "openrouter/pareto-code",
+                        "description": "auto-routes to cheapest coder meeting openrouter.min_coding_score",
+                    },
+                    {
+                        "id": "openrouter/auto-beta",
+                        "description": "auto-routes to best model for each request",
+                    },
+                    {
+                        "id": "openrouter/free",
+                        "description": "auto-routes to a free model for each request",
+                    },
                     {"id": "openrouter/elephant-alpha", "description": "free"},
                 ],
             },
@@ -204,6 +216,18 @@ class TestCuratedAccessors:
         assert result == [
             ("anthropic/claude-opus-4.7", "recommended"),
             ("openai/gpt-5.4", ""),
+            (
+                "openrouter/pareto-code",
+                "auto-routes to cheapest coder meeting openrouter.min_coding_score",
+            ),
+            (
+                "openrouter/auto-beta",
+                "auto-routes to best model for each request",
+            ),
+            (
+                "openrouter/free",
+                "auto-routes to a free model for each request",
+            ),
             ("openrouter/elephant-alpha", "free"),
         ]
 

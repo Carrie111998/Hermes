@@ -132,7 +132,11 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("sakana/fugu-ultra",                      ""),
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
-    # Free tier
+    ("openrouter/auto-beta",                   "auto-routes to best model for each request"),
+    ("openrouter/free",                        "auto-routes to a free model for each request"),
+    # Free tier — keep in sync with live OpenRouter free+tools catalog.
+    # Stale :free ids that OpenRouter retired are dropped so the picker
+    # does not advertise models that fail at request time.
     ("stealth/ox-alpha",                       "free"),  # "Ox Alpha" stealth reasoning model — 1M ctx
     ("openrouter/elephant-alpha",              "free"),
     ("z-ai/glm-5.2:free",                      "free"),
@@ -166,6 +170,11 @@ VERCEL_AI_GATEWAY_MODELS: list[tuple[str, str]] = [
     ("google/gemini-3-flash",                ""),
     ("google/gemini-3.1-flash-lite-preview", ""),
     ("xai/grok-4.20-reasoning",              ""),
+    # Free (models.dev $0) — Gateway omits some of these from live /models
+    ("meta/llama-3.3-70b",                   "free"),
+    ("meta/llama-4-scout",                   "free"),
+    ("meta/llama-4-maverick",                "free"),
+    ("poolside/laguna-s-2.1-free",           "free"),
 ]
 
 _ai_gateway_catalog_cache: list[tuple[str, str]] | None = None
@@ -380,8 +389,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "glm-5v-turbo",
         "glm-5-turbo",
         "glm-4.7",
+        # Free API models — Z.AI's /models listing omits these, so they must
+        # stay in the curated list or the /model picker never shows them.
+        "glm-4.7-flash",
         "glm-4.5",
         "glm-4.5-flash",
+        "glm-4.6v-flash",
+        "glm-4-9b",
     ],
     "xai": _xai_curated_models(),
     "nvidia": [
@@ -390,12 +404,24 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nvidia/nemotron-3-super-120b-a12b",
         "nvidia/nemotron-3.5-lightning-30b-a3b",
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        "nvidia/nemotron-3-nano-30b-a3b",
+        "nvidia/nvidia-nemotron-nano-9b-v2",
+        "nvidia/nemotron-nano-12b-v2-vl",
+        "nvidia/llama-3.1-nemotron-70b-instruct",
+        "nvidia/llama-3.3-70b-instruct",
         # Third-party agentic models hosted on build.nvidia.com
         # (map to OpenRouter defaults — users get familiar picks on NIM)
         "z-ai/glm-5.3",
         "z-ai/glm-5.2",
         "moonshotai/kimi-k2.6",
         "minimaxai/minimax-m3",
+        # Free-tier / $0 (models.dev) agentic chat models commonly used
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "google/gemma-4-31b-it",
+        "meta/llama-3.3-70b-instruct",
+        "stepfun-ai/step-3.7-flash",
+        "poolside/laguna-xs-2.1",
     ],
     "kimi-coding": [
         "kimi-k3",
@@ -476,6 +502,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "tencent-tokenhub": [
         "hy3-preview",
+        "hy3",
     ],
     "arcee": [
         "trinity-large-thinking",
@@ -652,12 +679,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     # Curated HF model list — only agentic models that map to OpenRouter defaults.
     "huggingface": [
+        "Qwen/Qwen3.5-72B-Instruct",
         "moonshotai/Kimi-K2.5",
         "Qwen/Qwen3.5-397B-A17B",
         "Qwen/Qwen3.5-35B-A3B",
         "deepseek-ai/DeepSeek-V3.2",
         "MiniMaxAI/MiniMax-M2.5",
         "zai-org/GLM-5",
+        "zai-org/GLM-4.7-Flash",  # free on HF Inference Providers
         "XiaomiMiMo/MiMo-V2-Flash",
         "moonshotai/Kimi-K2-Thinking",
         "moonshotai/Kimi-K2.6",

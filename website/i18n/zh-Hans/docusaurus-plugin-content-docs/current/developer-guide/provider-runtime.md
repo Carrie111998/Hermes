@@ -95,7 +95,7 @@ Hermes 拥有一个共享的 provider 运行时解析器，用于以下场景：
 
 ## AI Gateway
 
-在 `~/.hermes/.env` 中设置 `AI_GATEWAY_API_KEY`，并使用 `--provider ai-gateway` 运行。Hermes 从 gateway 的 `/models` 端点获取可用模型，筛选出支持工具调用的语言模型。
+在 `~/.hermes/.env` 中设置 `AI_GATEWAY_API_KEY`，并使用 `--provider ai-gateway` 运行。Hermes 从 gateway 的 `/models` 端点获取可用模型，筛选出支持工具调用的语言模型。精选选择器还保留 Vercel 实时目录有时遗漏的 $0 模型——例如 `meta/llama-3.3-70b`、`meta/llama-4-scout`、`meta/llama-4-maverick`、`poolside/laguna-s-2.1-free`。
 
 ## OpenRouter、AI Gateway 与自定义 OpenAI 兼容 base URL
 

@@ -155,6 +155,9 @@ zai = ZaiProfile(
     fallback_models=(
         "glm-5.2",
         "glm-5",
+        "glm-4.7-flash",
+        "glm-4.5-flash",
+        "glm-4.6v-flash",
         "glm-4-9b",
     ),
     base_url="https://api.z.ai/api/paas/v4",

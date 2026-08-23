@@ -208,6 +208,8 @@ hermes chat --provider novita --model moonshotai/kimi-k2.5
 
 # z.ai / ZhipuAI GLM
 hermes chat --provider zai --model glm-5
+# 免费 flash 模型（Z.AI 实时 /models 可能不列出 — Hermes 已纳入精选列表）：
+# hermes chat --provider zai --model glm-4.7-flash
 # 需要：~/.hermes/.env 中的 GLM_API_KEY
 
 # Kimi / Moonshot AI（国际版：api.moonshot.ai）
@@ -234,8 +236,9 @@ hermes chat --provider alibaba --model qwen3.5-plus
 hermes chat --provider xiaomi --model mimo-v2-pro
 # 需要：~/.hermes/.env 中的 XIAOMI_API_KEY
 
-# 腾讯 TokenHub（Hy3 Preview）
+# 腾讯 TokenHub（Hy3 / Hy3 Preview）
 hermes chat --provider tencent-tokenhub --model hy3-preview
+# GA 版本：hermes chat --provider tencent-tokenhub --model hy3
 # 需要：~/.hermes/.env 中的 TOKENHUB_API_KEY
 
 # Arcee AI（Trinity 模型）
@@ -259,6 +262,10 @@ model:
 
 :::note Z.AI 端点自动检测
 使用 Z.AI / GLM 提供商时，Hermes 会自动探测多个端点（全球版、中国版、编程版）以找到接受你 API key 的端点。无需手动设置 `GLM_BASE_URL`——可用端点会被自动检测并缓存。
+:::
+
+:::note Z.AI 免费 flash 模型
+Z.AI 的 `/models` 列表会遗漏部分免费 flash slug（`glm-4.7-flash`、`glm-4.5-flash`、`glm-4.6v-flash`）。Hermes 在精选 `/model` 选择器中保留它们，以便在 API key 套餐包含时可直接选用。
 :::
 
 ### xAI（Grok）— Responses API + Prompt 缓存
@@ -448,6 +455,8 @@ model:
 
 Hermes 会在每次向 `build.nvidia.com` 发送请求时自动附加 NIM 计费来源请求头——无需任何配置。这会在 NVIDIA 计费仪表板中将消耗路由到正确的来源。
 
+精选 `/model` 选择器还会展示 NIM 上托管的第三方与免费层对话模型（例如 `openai/gpt-oss-20b`、`google/gemma-4-31b-it`、`meta/llama-3.3-70b-instruct`、`poolside/laguna-xs-2.1`），与 Nemotron 旗舰 slug 并列。实时 `/v1/models` 可能遗漏部分条目——Hermes 合并静态精选列表以保持可选。
+
 ### GMI Cloud
 
 通过 [GMI Cloud](https://www.gmicloud.ai/) 使用开源和推理模型——OpenAI 兼容 API，API key 认证。
@@ -497,6 +506,9 @@ hermes chat --provider huggingface --model Qwen/Qwen3-235B-A22B-Thinking-2507
 
 # 短别名
 hermes chat --provider hf --model deepseek-ai/DeepSeek-V3.2
+
+# HF Inference Providers 免费模型（实时 /models 未列出时由 Hermes 精选保留）
+hermes chat --provider hf --model zai-org/GLM-4.7-Flash
 ```
 
 或在 `config.yaml` 中永久设置：
@@ -1379,6 +1391,53 @@ openrouter:
 - 在给定日期内，按分数选择是确定性的，但随着 Pareto 前沿移动（新模型、基准更新），实际选择的模型可能变化。
 - 参见 OpenRouter 的 [Pareto Router 文档](https://openrouter.ai/docs/guides/routing/routers/pareto-router) 了解完整路由器行为。
 - 要将 Pareto Code 路由器用于特定**辅助任务**（压缩、视觉等）而非主智能体，在该任务下设置 `extra_body.plugins`——参见[辅助模型 → OpenRouter 路由与辅助任务的 Pareto Code](/user-guide/configuration#openrouter-routing--pareto-code-for-auxiliary-tasks)。
+
+## OpenRouter Auto Beta 路由器
+
+OpenRouter 提供早期访问的通用路由器 `openrouter/auto-beta`，根据 OpenRouter 上的实时市场支出（过去 7 天的任务分布）为每个提示选择最佳模型。当不同请求需要不同模型——混合对话、推理与补全工作负载——而非固定单一 slug 时使用：
+
+```yaml
+model:
+  provider: openrouter
+  model: openrouter/auto-beta
+```
+
+可选的按请求调优通过 `auto-beta-router` 插件（辅助任务的 `extra_body.plugins`，或任何转发 OpenRouter 请求体的路径）：
+
+```yaml
+extra_body:
+  plugins:
+    - id: auto-beta-router
+      cost_tier: medium   # low | medium | high | xhigh | max
+      # allowed_models: ["anthropic/*"]   # 可选通配符允许列表
+      # excluded_models: ["deepseek/*"]    # 可选通配符排除列表
+```
+
+说明：
+
+- Auto Beta **没有** Hermes 专用配置项（不同于 Pareto Code 的 `openrouter.min_coding_score`）。设置通过 OpenRouter 的 `auto-beta-router` 插件或工作区 Routing 默认值完成。
+- 响应中的 `model` 字段标明实际运行的模型；按该模型的标准费率计费——无路由器附加费。
+- `openrouter/auto` 是稳定版 Auto Router slug；`openrouter/auto-beta` 是早期访问轨道，新路由行为会先在此落地。插件设置须使用匹配的插件 id（`auto-beta-router` 与 `auto-router`）。
+- 参见 OpenRouter 的 [Auto Router 文档](https://openrouter.ai/docs/guides/routing/routers/auto-router) 了解 cost tier、允许列表与账户默认值。
+- 若需要**仅编程**且带 Hermes 配置项的路由器，请改用 [Pareto Code](#openrouter-pareto-code-路由器)。
+
+## OpenRouter 免费模型路由器
+
+OpenRouter 的 `openrouter/free` 路由器从当前 `:free` 目录中为每个请求选择**免费**模型，并按请求所需能力（工具调用、视觉、结构化输出等）过滤，避免零成本试用落到无法完成该轮次的模型：
+
+```yaml
+model:
+  provider: openrouter
+  model: openrouter/free
+```
+
+说明：
+
+- 无需 plugins 块——设置 `model: openrouter/free` 即可。
+- 响应中的 `model` 字段标明实际运行的免费模型；无路由器附加费。
+- 速率限制与可用性取决于 OpenRouter 选中的底层免费模型。
+- 若要固定某个免费 slug 而非随机路由，请直接使用 `:free` 变体（如 `z-ai/glm-5.2:free`），或在 `/model` 选择器中选择 `:free` 条目。
+- 参见 OpenRouter [Free Models Router](https://openrouter.ai/openrouter/free) 与[免费变体文档](https://openrouter.ai/docs/guides/routing/model-variants/free)。
 
 ## 故障转移提供商
 

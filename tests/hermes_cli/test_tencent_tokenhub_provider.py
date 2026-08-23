@@ -117,7 +117,10 @@ class TestTencentTokenhubModelCatalog:
     def test_static_model_list_exists(self):
         from hermes_cli.models import _PROVIDER_MODELS
         assert "tencent-tokenhub" in _PROVIDER_MODELS
-        assert len(_PROVIDER_MODELS["tencent-tokenhub"]) >= 1
+        models = _PROVIDER_MODELS["tencent-tokenhub"]
+        assert len(models) >= 1
+        assert "hy3-preview" in models
+        assert "hy3" in models
 
 
     def test_default_model(self):

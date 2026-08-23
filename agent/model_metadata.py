@@ -584,6 +584,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "elephant": 262144,
     # Hugging Face Inference Providers — model IDs use org/name format
     "Qwen/Qwen3.5-397B-A17B": 131072,
+    "Qwen/Qwen3.5-72B-Instruct": 131072,
     "Qwen/Qwen3.5-35B-A3B": 131072,
     "deepseek-ai/DeepSeek-V3.2": 65536,
     "moonshotai/Kimi-K2.5": 262144,
@@ -597,6 +598,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     "mimo-v2-omni": 262144,
     "mimo-v2-flash": 262144,
     "zai-org/GLM-5": 202752,
+    "zai-org/glm-4.7-flash": 202752,  # GLM-4.7 Flash on HF Inference Providers
+    "glm-4.7-flash": 202752,
+    "glm-4.6v-flash": 202752,
 }
 
 # xAI Grok models that ACCEPT the `reasoning.effort` parameter on
