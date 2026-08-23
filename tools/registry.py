@@ -23,7 +23,18 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NoReturn,
+    Optional,
+    Self,
+    Set,
+    SupportsIndex,
+)
 
 from hermes_constants import hermes_home_key
 
@@ -231,6 +242,135 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+
+
+class _ToolsetSnapshotState:
+    """Host-owned state for one plugin context's dynamic toolset."""
+
+    __slots__ = ("source_revision", "signature", "entries")
+
+    def __init__(
+        self,
+        source_revision: str,
+        signature: tuple,
+        entries: Dict[str, ToolEntry],
+    ) -> None:
+        self.source_revision = source_revision
+        self.signature = signature
+        self.entries = entries
+
+
+_RESERVED_PROGRESSIVE_DISCLOSURE_NAMES = frozenset(
+    {"tool_search", "tool_describe", "tool_call"}
+)
+
+
+def _immutable_json(value: Any) -> Any:
+    """Recursively freeze a detached JSON value while preserving JSON shapes."""
+    if isinstance(value, dict):
+        return _ImmutableJsonDict(
+            {key: _immutable_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return _ImmutableJsonList(_immutable_json(item) for item in value)
+    return value
+
+
+def _mutable_json(value: Any) -> Any:
+    """Return ordinary detached containers for schema normalization callers."""
+    if isinstance(value, dict):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mutable_json(item) for item in value]
+    return value
+
+
+class _ImmutableJsonDict(dict[str, Any]):
+    """A JSON-serializable dictionary that rejects post-publication mutation."""
+
+    @staticmethod
+    def _reject() -> NoReturn:
+        raise TypeError("published snapshot schemas are immutable")
+
+    def __setitem__(self, _key: str, _value: Any) -> None:
+        self._reject()
+
+    def __delitem__(self, _key: str) -> None:
+        self._reject()
+
+    def clear(self) -> None:
+        self._reject()
+
+    def pop(self, _key: str, _default: Any = None) -> Any:
+        self._reject()
+
+    def popitem(self) -> tuple[str, Any]:
+        self._reject()
+
+    def setdefault(self, _key: str, _default: Any = None) -> Any:
+        self._reject()
+
+    def update(self, *_args: Any, **_kwargs: Any) -> None:
+        self._reject()
+
+    def __ior__(self, _value: Any):
+        self._reject()
+
+    def __copy__(self):
+        return _mutable_json(self)
+
+    def __deepcopy__(self, _memo):
+        return _mutable_json(self)
+
+
+class _ImmutableJsonList(list[Any]):
+    """A JSON-serializable list that rejects post-publication mutation."""
+
+    @staticmethod
+    def _reject() -> NoReturn:
+        raise TypeError("published snapshot schemas are immutable")
+
+    def __setitem__(self, _index: Any, _value: Any) -> None:
+        self._reject()
+
+    def __delitem__(self, _index: Any) -> None:
+        self._reject()
+
+    def __iadd__(self, _value: Any):
+        self._reject()
+
+    def __imul__(self, _value: SupportsIndex) -> Self:
+        self._reject()
+
+    def append(self, _value: Any) -> None:
+        self._reject()
+
+    def clear(self) -> None:
+        self._reject()
+
+    def extend(self, _values: Any) -> None:
+        self._reject()
+
+    def insert(self, _index: SupportsIndex, _value: Any) -> None:
+        self._reject()
+
+    def pop(self, _index: SupportsIndex = -1) -> Any:
+        self._reject()
+
+    def remove(self, _value: Any) -> None:
+        self._reject()
+
+    def reverse(self) -> None:
+        self._reject()
+
+    def sort(self, *args: Any, **kwargs: Any) -> None:
+        self._reject()
+
+    def __copy__(self):
+        return _mutable_json(self)
+
+    def __deepcopy__(self, _memo):
+        return _mutable_json(self)
 
 
 class _PluginOverridePolicy:
@@ -469,6 +609,13 @@ class ToolRegistry:
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        # Dynamic plugin snapshots are keyed by immutable context ownership,
+        # profile scope, and toolset. Entries remain private registry state;
+        # plugins mutate them only through PluginContext.
+        self._plugin_toolset_snapshots: Dict[
+            tuple[str, str, object], _ToolsetSnapshotState
+        ] = {}
+        self._plugin_snapshot_name_owners: Dict[tuple[str, str], object] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -484,6 +631,24 @@ class ToolRegistry:
     def current_scope_key() -> str:
         """Return the active profile's canonical registry scope."""
         return hermes_home_key()
+
+    @property
+    def generation(self) -> int:
+        """Return the current registry generation through a public accessor."""
+        with self._lock:
+            return self._generation
+
+    def has_dynamic_snapshot_availability(self, scope: Optional[str] = None) -> bool:
+        """Return whether the active scope has snapshot callbacks to re-probe."""
+        active_scope = scope or self.current_scope_key()
+        with self._lock:
+            return any(
+                entry.check_fn is not None
+                for (snapshot_scope, _toolset, _owner), state
+                in self._plugin_toolset_snapshots.items()
+                if snapshot_scope == active_scope
+                for entry in state.entries.values()
+            )
 
     def _merged_tools(self, scope: Optional[str] = None) -> Dict[str, ToolEntry]:
         """Return global tools overlaid with one profile's plugin tools."""
@@ -594,6 +759,226 @@ class ToolRegistry:
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
+
+    def _replace_plugin_toolset_snapshot(
+        self,
+        *,
+        owner: object,
+        owner_is_live: Callable[[], bool],
+        scope: str,
+        toolset: str,
+        source_revision: str,
+        entries: List[Mapping[str, Any]],
+    ) -> dict:
+        """Atomically publish one context-owned, profile-scoped toolset."""
+        if not isinstance(toolset, str) or not toolset.strip():
+            raise ValueError("toolset must be a non-empty string")
+        if not isinstance(source_revision, str) or not source_revision.strip():
+            raise ValueError("source_revision must be a non-empty string")
+
+        prepared: Dict[str, ToolEntry] = {}
+        signatures = []
+        allowed_fields = {
+            "name",
+            "schema",
+            "handler",
+            "check_fn",
+            "requires_env",
+            "is_async",
+            "description",
+            "emoji",
+        }
+        for candidate in entries:
+            if not isinstance(candidate, Mapping):
+                raise TypeError("snapshot entries must be mappings")
+            unsupported = set(candidate) - allowed_fields
+            if unsupported:
+                raise ValueError(
+                    "unsupported snapshot entry fields: "
+                    + ", ".join(sorted(str(field) for field in unsupported))
+                )
+            name = candidate.get("name")
+            schema = candidate.get("schema")
+            handler = candidate.get("handler")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("snapshot entry name must be a non-empty string")
+            if name in _RESERVED_PROGRESSIVE_DISCLOSURE_NAMES:
+                raise ValueError(f"snapshot tool name is reserved by Hermes: {name}")
+            if name in prepared:
+                raise ValueError(f"duplicate snapshot tool name: {name}")
+            if not isinstance(schema, dict):
+                raise TypeError(f"snapshot schema for {name!r} must be a dictionary")
+            if not callable(handler):
+                raise TypeError(f"snapshot handler for {name!r} must be callable")
+            check_fn = candidate.get("check_fn")
+            if check_fn is not None and not callable(check_fn):
+                raise TypeError(f"snapshot check_fn for {name!r} must be callable")
+            requires_env_value = candidate.get("requires_env", [])
+            if (
+                not isinstance(requires_env_value, list)
+                or not all(isinstance(value, str) for value in requires_env_value)
+            ):
+                raise TypeError(
+                    f"snapshot requires_env for {name!r} must be a list of strings"
+                )
+            requires_env = list(requires_env_value)
+            is_async = candidate.get("is_async", False)
+            if not isinstance(is_async, bool):
+                raise TypeError(f"snapshot is_async for {name!r} must be a boolean")
+            description = candidate.get("description", schema.get("description", ""))
+            if not isinstance(description, str):
+                raise TypeError(f"snapshot description for {name!r} must be a string")
+            emoji = candidate.get("emoji", "")
+            if not isinstance(emoji, str):
+                raise TypeError(f"snapshot emoji for {name!r} must be a string")
+            try:
+                schema_signature = json.dumps(
+                    {**schema, "name": name},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"snapshot schema for {name!r} must be JSON-serializable"
+                ) from exc
+            # Round-trip through JSON so nested caller-owned dictionaries and
+            # lists cannot mutate a live schema without a generation bump.
+            schema_with_name = _immutable_json(json.loads(schema_signature))
+            prepared[name] = ToolEntry(
+                name=name,
+                toolset=toolset,
+                schema=schema_with_name,
+                handler=handler,
+                check_fn=check_fn,
+                requires_env=requires_env,
+                is_async=is_async,
+                description=description,
+                emoji=emoji,
+            )
+            signatures.append(
+                (
+                    name,
+                    schema_signature,
+                    id(handler),
+                    id(check_fn),
+                    tuple(requires_env),
+                    is_async,
+                    description,
+                    emoji,
+                )
+            )
+        signature = tuple(sorted(signatures))
+
+        key = (scope, toolset, owner)
+        with self._lock:
+            if not owner_is_live():
+                raise RuntimeError("plugin snapshot context has been unloaded")
+            previous = self._plugin_toolset_snapshots.get(key)
+            if previous is None and not prepared:
+                self._plugin_toolset_snapshots[key] = _ToolsetSnapshotState(
+                    source_revision, signature, prepared
+                )
+                return {
+                    "changed": False,
+                    "generation": self._generation,
+                    "added": (),
+                    "removed": (),
+                }
+            if previous is not None and previous.source_revision == source_revision:
+                if previous.signature != signature:
+                    raise ValueError(
+                        "source_revision already identifies a different toolset snapshot"
+                    )
+                return {
+                    "changed": False,
+                    "generation": self._generation,
+                    "added": (),
+                    "removed": (),
+                }
+            if previous is not None and previous.signature == signature:
+                self._plugin_toolset_snapshots[key] = _ToolsetSnapshotState(
+                    source_revision, signature, previous.entries
+                )
+                return {
+                    "changed": False,
+                    "generation": self._generation,
+                    "added": (),
+                    "removed": (),
+                }
+            previous_entries = previous.entries if previous is not None else {}
+            previous_names = set(previous_entries)
+            target = dict(self._scoped_tools.get(scope, {}))
+
+            for name, old_entry in previous_entries.items():
+                if target.get(name) is not old_entry:
+                    raise RuntimeError(
+                        f"snapshot tool {name!r} changed outside its owner context"
+                    )
+                target.pop(name)
+
+            for name in prepared:
+                name_owner = self._plugin_snapshot_name_owners.get((scope, name))
+                if name_owner is not None and name_owner is not owner:
+                    raise ValueError(
+                        f"snapshot tool name is owned by another context: {name}"
+                    )
+                if name in target or name in self._tools:
+                    raise ValueError(f"snapshot tool name is already registered: {name}")
+
+            target.update(prepared)
+            if target:
+                self._scoped_tools[scope] = target
+            else:
+                self._scoped_tools.pop(scope, None)
+            self._plugin_toolset_snapshots[key] = _ToolsetSnapshotState(
+                source_revision, signature, prepared
+            )
+            for name in previous_names - set(prepared):
+                if self._plugin_snapshot_name_owners.get((scope, name)) is owner:
+                    self._plugin_snapshot_name_owners.pop((scope, name), None)
+            for name in prepared:
+                self._plugin_snapshot_name_owners[(scope, name)] = owner
+            self._generation += 1
+            return {
+                "changed": True,
+                "generation": self._generation,
+                "added": tuple(sorted(set(prepared) - previous_names)),
+                "removed": tuple(sorted(previous_names - set(prepared))),
+            }
+
+    def _remove_plugin_toolset_snapshot(
+        self,
+        *,
+        owner: object,
+        scope: str,
+        toolset: str,
+    ) -> tuple[str, ...]:
+        """Remove a context-owned snapshot during plugin unload."""
+        key = (scope, toolset, owner)
+        with self._lock:
+            state = self._plugin_toolset_snapshots.get(key)
+            if state is None:
+                return ()
+            target = dict(self._scoped_tools.get(scope, {}))
+            for name, entry in state.entries.items():
+                if target.get(name) is not entry:
+                    raise RuntimeError(
+                        f"snapshot tool {name!r} changed outside its owner context"
+                    )
+            for name in state.entries:
+                target.pop(name, None)
+            if target:
+                self._scoped_tools[scope] = target
+            else:
+                self._scoped_tools.pop(scope, None)
+            self._plugin_toolset_snapshots.pop(key, None)
+            for name in state.entries:
+                if self._plugin_snapshot_name_owners.get((scope, name)) is owner:
+                    self._plugin_snapshot_name_owners.pop((scope, name), None)
+            if state.entries:
+                self._generation += 1
+            return tuple(sorted(state.entries))
 
     def register_plugin_override_policy(
         self,
@@ -790,6 +1175,16 @@ class ToolRegistry:
         if scope is None and owner is not None:
             scope = self._plugin_scope_of(owner)
         with self._lock:
+            if (
+                scope is not None
+                and (scope, name) in self._plugin_snapshot_name_owners
+            ):
+                logger.error(
+                    "Tool registration REJECTED: %r is owned by an atomic "
+                    "plugin toolset snapshot",
+                    name,
+                )
+                return
             target = (
                 self._tools
                 if scope is None
@@ -910,6 +1305,13 @@ class ToolRegistry:
                 if caller_scope is not None
                 else self._tools
             )
+            if (
+                caller_scope is not None
+                and (caller_scope, name) in self._plugin_snapshot_name_owners
+            ):
+                raise PermissionError(
+                    f"Tool {name!r} is owned by an atomic plugin toolset snapshot"
+                )
             entry = target.get(name)
             if entry is None and caller_scope is not None:
                 if name in self._tools:
@@ -1145,6 +1547,13 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            active_scope = scope or self.current_scope_key()
+            with self._lock:
+                snapshot_owned = (
+                    active_scope, name
+                ) in self._plugin_snapshot_name_owners
+            if snapshot_owned and entry.check_fn and not _check_fn_cached(entry.check_fn):
+                return tool_error(f"Tool unavailable: {name}")
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))

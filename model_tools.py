@@ -362,7 +362,10 @@ def get_tool_definitions(
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
-        if profile_scope != CHECK_FN_CACHE_BYPASS:
+        if (
+            profile_scope != CHECK_FN_CACHE_BYPASS
+            and not registry.has_dynamic_snapshot_availability()
+        ):
             cache_key = (
                 registry.current_scope_key(),
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,

@@ -102,6 +102,17 @@ class PluginToolOverrideError(PermissionError):
     """
 
 
+@dataclass(frozen=True)
+class SnapshotReplacement:
+    """Result of one public plugin toolset-snapshot publication."""
+
+    changed: bool
+    generation: int
+    source_revision: str
+    added: Tuple[str, ...] = ()
+    removed: Tuple[str, ...] = ()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1393,15 +1404,69 @@ class PluginState:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(
+        self,
+        manifest: PluginManifest,
+        manager: "PluginManager",
+        *,
+        registration_registry: Any = None,
+    ):
         self.manifest = manifest
         self._manager = manager
+        if registration_registry is None:
+            from tools.registry import registry as registration_registry
+        # Keep registration authority context-bound. Transactional plugin
+        # loaders can inject an isolated registry view without this facade
+        # reaching around it to the process singleton.
+        self._registration_registry = registration_registry
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
         self._state: PluginState | None = None
         # Lazy-built capability-gated platform action facade (#64176).
         self._platform_actions: Any = None
+        self._toolset_snapshot_owner = object()
+        self._toolset_snapshot_namespaces: Set[str] = set()
+        self._toolset_snapshots_closed = False
+        self._toolset_snapshot_lock = threading.RLock()
+        register_context = getattr(
+            self._manager, "_register_snapshot_context_identity", None
+        )
+        self._toolset_snapshot_epoch = (
+            register_context(self.plugin_id) if callable(register_context) else None
+        )
+
+    def _release_toolset_snapshots(self) -> None:
+        """Revoke this context and remove every snapshot it ever published."""
+        with (
+            self._toolset_snapshot_lock,
+            self._manager._plugin_tool_names_lock,
+        ):
+            self._toolset_snapshots_closed = True
+            removed_names: Set[str] = set()
+            for toolset in tuple(self._toolset_snapshot_namespaces):
+                removed_names.update(
+                    self._registration_registry._remove_plugin_toolset_snapshot(
+                        owner=self._toolset_snapshot_owner,
+                        scope=self._manager.scope_key,
+                        toolset=toolset,
+                    )
+                )
+            self._toolset_snapshot_namespaces.clear()
+            self._manager._plugin_tool_names.difference_update(removed_names)
+            plugin_key = self.manifest.key or self.manifest.name
+            snapshot_names = self._manager._plugin_snapshot_tool_names.get(plugin_key)
+            if snapshot_names is not None:
+                snapshot_names.difference_update(removed_names)
+                if not snapshot_names:
+                    self._manager._plugin_snapshot_tool_names.pop(plugin_key, None)
+            loaded = self._manager._plugins.get(plugin_key)
+            if loaded is not None:
+                loaded.tools_registered = [
+                    name
+                    for name in loaded.tools_registered
+                    if name not in removed_names
+                ]
 
     @property
     def plugin_id(self) -> str:
@@ -1701,6 +1766,65 @@ class PluginContext:
 
     # -- tool registration --------------------------------------------------
 
+    @property
+    def registry_generation(self) -> int:
+        """Return the current public tool-registry generation."""
+        return self._registration_registry.generation
+
+    @_serialized_replacement
+    def replace_toolset_snapshot(
+        self,
+        toolset: str,
+        source_revision: str,
+        entries: Iterable[Mapping[str, Any]],
+    ) -> SnapshotReplacement:
+        """Atomically replace one profile-scoped toolset owned by this context."""
+        with self._toolset_snapshot_lock:
+            if self._toolset_snapshots_closed:
+                raise RuntimeError("plugin snapshot context has been unloaded")
+            prepared_entries = list(entries)
+            if self._toolset_snapshots_closed:
+                raise RuntimeError("plugin snapshot context has been unloaded")
+            activate_context = getattr(
+                self._manager, "_activate_snapshot_context", None
+            )
+            if callable(activate_context):
+                activate_context(self, self._toolset_snapshot_epoch)
+            scope = self._manager.scope_key
+            registry = self._registration_registry
+            with self._manager._plugin_tool_names_lock:
+                result = registry._replace_plugin_toolset_snapshot(
+                    owner=self._toolset_snapshot_owner,
+                    owner_is_live=lambda: not self._toolset_snapshots_closed,
+                    scope=scope,
+                    toolset=toolset,
+                    source_revision=source_revision,
+                    entries=prepared_entries,
+                )
+                self._toolset_snapshot_namespaces.add(toolset)
+                self._manager._plugin_tool_names.difference_update(result["removed"])
+                self._manager._plugin_tool_names.update(result["added"])
+                plugin_key = self.manifest.key or self.manifest.name
+                snapshot_names = self._manager._plugin_snapshot_tool_names.setdefault(
+                    plugin_key, set()
+                )
+                snapshot_names.difference_update(result["removed"])
+                snapshot_names.update(result["added"])
+                loaded = self._manager._plugins.get(plugin_key)
+                if loaded is not None:
+                    loaded.tools_registered = sorted(
+                        (set(loaded.tools_registered) - set(result["removed"]))
+                        | set(result["added"])
+                    )
+
+            return SnapshotReplacement(
+                changed=result["changed"],
+                generation=result["generation"],
+                source_revision=source_revision,
+                added=result["added"],
+                removed=result["removed"],
+            )
+
     @_serialized_replacement
     def register_tool(
         self,
@@ -1742,51 +1866,53 @@ class PluginContext:
         from tools.registry import registry
 
         scope = self._manager.scope_key
-        previous = registry.snapshot_registration(name, scope=scope)
-        effective = registry.get_entry(name, scope=scope)
-        if previous is None and effective is not None and not override:
-            logger.warning(
-                "Plugin %s tried to shadow global tool %s without override=True",
-                self.manifest.name,
-                name,
-            )
-            return None
-        registry.register(
-            name=name,
-            toolset=toolset,
-            schema=schema,
-            handler=handler,
-            check_fn=check_fn,
-            requires_env=requires_env,
-            is_async=is_async,
-            description=description,
-            emoji=emoji,
-            override=override,
-            scope=scope,
-        )
-        registered = registry.snapshot_registration(name, scope=scope)
-        if (
-            registered is not None
-            and registered is not previous
-            and registered.handler is handler
-        ):
-            self._manager._plugin_tool_names.add(name)
-            def _restore_tool(replacement: Any) -> bool:
-                return registry.restore_registration(
-                    name, registered, replacement, scope=scope
+        with self._manager._plugin_tool_names_lock:
+            previous = registry.snapshot_registration(name, scope=scope)
+            effective = registry.get_entry(name, scope=scope)
+            if previous is None and effective is not None and not override:
+                logger.warning(
+                    "Plugin %s tried to shadow global tool %s without override=True",
+                    self.manifest.name,
+                    name,
                 )
-
-            handle = self._track_replacement(
-                "tool",
-                name,
-                slot=("tool", scope, name),
-                current=registered,
-                previous=previous,
-                restore=_restore_tool,
-                finalize=lambda: self._manager._remove_tool_name_if_unowned(name),
+                return None
+            registry.register(
+                name=name,
+                toolset=toolset,
+                schema=schema,
+                handler=handler,
+                check_fn=check_fn,
+                requires_env=requires_env,
+                is_async=is_async,
+                description=description,
+                emoji=emoji,
+                override=override,
+                scope=scope,
             )
-        else:
-            handle = None
+            registered = registry.snapshot_registration(name, scope=scope)
+            if (
+                registered is not None
+                and registered is not previous
+                and registered.handler is handler
+            ):
+                self._manager._plugin_tool_names.add(name)
+
+                def _restore_tool(replacement: Any) -> bool:
+                    return registry.restore_registration(
+                        name, registered, replacement, scope=scope
+                    )
+
+                handle = self._track_replacement(
+                    "tool",
+                    name,
+                    slot=("tool", scope, name),
+                    current=registered,
+                    previous=previous,
+                    restore=_restore_tool,
+                    finalize=lambda: self._manager._remove_tool_name_if_unowned(name),
+                )
+            else:
+                handle = None
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
@@ -3403,7 +3529,13 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
+        self._plugin_tool_names_lock = threading.RLock()
         self._plugin_tool_names: Set[str] = set()
+        self._snapshot_context_lock = threading.RLock()
+        self._snapshot_context_global_epoch = 0
+        self._snapshot_context_epochs: Dict[str, int] = {}
+        self._snapshot_context_keys: Set[str] = set()
+        self._active_snapshot_contexts: Dict[str, Set[PluginContext]] = {}
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
@@ -3467,10 +3599,41 @@ class PluginManager:
         # full plugin loads.
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
+        self._plugin_snapshot_tool_names: Dict[str, Set[str]] = {}
 
     # -----------------------------------------------------------------------
     # Registration ledger internals
     # -----------------------------------------------------------------------
+
+    def _register_snapshot_context_identity(self, plugin_key: str) -> tuple[int, int]:
+        """Record a context identity without retaining an unused context."""
+        with self._snapshot_context_lock:
+            self._snapshot_context_keys.add(plugin_key)
+            return (
+                self._snapshot_context_global_epoch,
+                self._snapshot_context_epochs.get(plugin_key, 0),
+            )
+
+    def _activate_snapshot_context(
+        self,
+        context: PluginContext,
+        epoch: tuple[int, int] | None,
+    ) -> None:
+        """Bind first publication to the manager generation that created it."""
+        plugin_key = context.plugin_id
+        with self._snapshot_context_lock:
+            current = (
+                self._snapshot_context_global_epoch,
+                self._snapshot_context_epochs.get(plugin_key, 0),
+            )
+            if epoch != current:
+                raise RuntimeError("plugin snapshot context has been unloaded")
+            self._active_snapshot_contexts.setdefault(plugin_key, set()).add(context)
+
+    def _snapshot_plugin_tool_names(self) -> Set[str]:
+        """Return coherent manager attribution for discovery/introspection."""
+        with self._plugin_tool_names_lock:
+            return set(self._plugin_tool_names)
 
     def _track_registration(
         self,
@@ -3545,13 +3708,14 @@ class PluginManager:
         return True
 
     def _remove_tool_name_if_unowned(self, name: str) -> None:
-        if not any(
-            registration.active
-            and registration.kind == "tool"
-            and registration.key == name
-            for registration in self._registration_order
-        ):
-            self._plugin_tool_names.discard(name)
+        with self._plugin_tool_names_lock:
+            if not any(
+                registration.active
+                and registration.kind == "tool"
+                and registration.key == name
+                for registration in self._registration_order
+            ):
+                self._plugin_tool_names.discard(name)
 
     def _remove_platform_name_if_unowned(self, name: str) -> None:
         if not any(
@@ -3637,14 +3801,24 @@ class PluginManager:
         Returns ``True`` when at least one plugin or registration was found.
         """
         unload_all = plugin is None
+        with self._snapshot_context_lock:
+            snapshot_context_keys = set(self._snapshot_context_keys)
         if unload_all:
-            target_keys = set(self._ownership_ledger) | set(self._plugins)
+            target_keys = (
+                set(self._ownership_ledger)
+                | set(self._plugins)
+                | snapshot_context_keys
+            )
             registrations = list(self._registration_order)
         else:
             requested = self._resolve_plugin_key(plugin)
             exact = {
                 requested,
-            } if requested in self._ownership_ledger or requested in self._plugins else set()
+            } if (
+                requested in self._ownership_ledger
+                or requested in self._plugins
+                or requested in snapshot_context_keys
+            ) else set()
             if exact:
                 target_keys = exact
             else:
@@ -3658,13 +3832,48 @@ class PluginManager:
                     for key in self._ownership_ledger
                     if key == requested
                 )
+                target_keys.update(
+                    key for key in snapshot_context_keys if key == requested
+                )
             registrations = [
                 registration
                 for registration in self._registration_order
                 if registration.plugin_key in target_keys
             ]
 
-        found = bool(target_keys or registrations)
+        with self._snapshot_context_lock:
+            if unload_all:
+                self._snapshot_context_global_epoch += 1
+                snapshot_contexts = [
+                    context
+                    for contexts in self._active_snapshot_contexts.values()
+                    for context in contexts
+                ]
+                self._active_snapshot_contexts.clear()
+                self._snapshot_context_keys.clear()
+                self._snapshot_context_epochs.clear()
+            else:
+                snapshot_contexts = []
+                for key in target_keys:
+                    self._snapshot_context_epochs[key] = (
+                        self._snapshot_context_epochs.get(key, 0) + 1
+                    )
+                    snapshot_contexts.extend(
+                        self._active_snapshot_contexts.pop(key, set())
+                    )
+                    self._snapshot_context_keys.discard(key)
+
+        found = bool(target_keys or registrations or snapshot_contexts)
+        for context in snapshot_contexts:
+            try:
+                context._release_toolset_snapshots()
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                logger.warning(
+                    "Failed to unload plugin snapshot context %s: %s",
+                    context.plugin_id,
+                    exc,
+                    exc_info=_PLUGINS_DEBUG,
+                )
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
 
@@ -3732,6 +3941,7 @@ class PluginManager:
             self._slack_action_handlers.clear()
             self._predeclared_modules.clear()
             self._predeclared_tools.clear()
+            self._plugin_snapshot_tool_names.clear()
             self._context_engine = None
             self._discovered = False
         else:
@@ -4554,6 +4764,7 @@ class PluginManager:
 
         self._register_deferred_platform_tools(manifest, loaded)
 
+    @_serialized_replacement
     def _register_deferred_platform_tools(
         self, manifest: PluginManifest, loaded: LoadedPlugin
     ) -> None:
@@ -4604,7 +4815,7 @@ class PluginManager:
 
         # Snapshotted outside the try so the failure path can tell which tools
         # a partially-successful register_tools() left behind.
-        before = set(self._plugin_tool_names)
+        before = self._snapshot_plugin_tool_names()
         try:
             module = self._load_directory_module(manifest)
             # Record the module even if nothing below registers: the package
@@ -4626,9 +4837,7 @@ class PluginManager:
                 return
 
             register_tools(PluginContext(manifest, self))
-            registered = [
-                t for t in self._plugin_tool_names if t not in before
-            ]
+            registered = sorted(self._snapshot_plugin_tool_names() - before)
 
             loaded.tools_registered = registered
             self._predeclared_tools[lookup_key] = registered
@@ -4644,7 +4853,7 @@ class PluginManager:
             # `hermes plugins list` under-reports what the process is actually
             # carrying — and _load_plugin's own diff would miss them later
             # too, since they are already in its "before" snapshot.
-            partial = [t for t in self._plugin_tool_names if t not in before]
+            partial = sorted(self._snapshot_plugin_tool_names() - before)
             if partial:
                 loaded.tools_registered = partial
                 self._predeclared_tools[lookup_key] = partial
@@ -4836,9 +5045,10 @@ class PluginManager:
                 # above cannot see them and `hermes plugins list` would
                 # under-report once the deferred adapter materializes (#78050).
                 # Credit them back to the plugin that actually registered them.
+                active_tool_names = self._snapshot_plugin_tool_names()
                 _predeclared = [
                     t for t in self._predeclared_tools.pop(plugin_key, [])
-                    if t in self._plugin_tool_names
+                    if t in active_tool_names
                 ]
                 loaded.tools_registered = _predeclared + [
                     registration.key
@@ -4881,6 +5091,30 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            # Snapshot contexts are generation-bound rather than ordinary
+            # ownership-ledger entries. Revoke this failed registration
+            # generation explicitly so a tool published before `register()`
+            # raised cannot survive as a callable zombie.
+            with self._snapshot_context_lock:
+                self._snapshot_context_epochs[plugin_key] = (
+                    self._snapshot_context_epochs.get(plugin_key, 0) + 1
+                )
+                failed_snapshot_contexts = tuple(
+                    self._active_snapshot_contexts.pop(plugin_key, set())
+                )
+                self._snapshot_context_keys.discard(plugin_key)
+            for failed_context in failed_snapshot_contexts:
+                try:
+                    failed_context._release_toolset_snapshots()
+                except Exception as cleanup_exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Failed to clean up snapshot context for plugin %s: %s",
+                        plugin_key,
+                        cleanup_exc,
+                        exc_info=_PLUGINS_DEBUG,
+                    )
+            with self._plugin_tool_names_lock:
+                self._plugin_snapshot_tool_names.pop(plugin_key, None)
             owned = [
                 registration
                 for registration in self._registration_order
@@ -4907,7 +5141,16 @@ class PluginManager:
         # bookkeeping outlive the load attempt (#78050).
         if not loaded.enabled:
             self._predeclared_tools.pop(plugin_key, None)
-        self._plugins[manifest.key or manifest.name] = loaded
+        with self._plugin_tool_names_lock:
+            if loaded.enabled:
+                loaded.tools_registered = sorted(
+                    set(loaded.tools_registered)
+                    | self._plugin_snapshot_tool_names.get(plugin_key, set())
+                )
+            # Publish the loaded placeholder under the same lock snapshot
+            # refresh uses to update attribution. A refresh after this point
+            # sees `_plugins[plugin_key]` and updates the live record itself.
+            self._plugins[plugin_key] = loaded
 
     def _load_portable_plugin(
         self, manifest: PluginManifest, loaded: LoadedPlugin
@@ -6556,39 +6799,42 @@ def get_plugin_toolsets() -> List[tuple]:
     alongside the built-in ones and can be toggled on/off per platform.
     """
     manager = get_plugin_manager()
-    if not manager._plugin_tool_names:
-        return []
+    with manager._plugin_tool_names_lock:
+        if not manager._plugin_tool_names:
+            return []
 
-    try:
-        from tools.registry import registry
-    except Exception:
-        return []
+        try:
+            from tools.registry import registry
+        except Exception:
+            return []
 
-    # Group plugin tool names by their toolset
-    toolset_tools: Dict[str, List[str]] = {}
-    toolset_plugin: Dict[str, LoadedPlugin] = {}
-    for tool_name in manager._plugin_tool_names:
-        entry = registry.get_entry(tool_name)
-        if not entry:
-            continue
-        ts = entry.toolset
-        toolset_tools.setdefault(ts, []).append(entry.name)
-
-    # Map toolsets back to the plugin that registered them
-    for _name, loaded in manager._plugins.items():
-        for tool_name in loaded.tools_registered:
+        # Hold the attribution lock through registry reads so a dynamic
+        # replacement publishes registry state and manager metadata as one
+        # observable unit for this introspection surface.
+        toolset_tools: Dict[str, List[str]] = {}
+        toolset_plugin: Dict[str, LoadedPlugin] = {}
+        for tool_name in manager._plugin_tool_names:
             entry = registry.get_entry(tool_name)
-            if entry and entry.toolset in toolset_tools:
-                toolset_plugin.setdefault(entry.toolset, loaded)
+            if not entry:
+                continue
+            ts = entry.toolset
+            toolset_tools.setdefault(ts, []).append(entry.name)
 
-    result = []
-    for ts_key in sorted(toolset_tools):
-        plugin = toolset_plugin.get(ts_key)
-        label = f"🔌 {ts_key.replace('_', ' ').title()}"
-        if plugin and plugin.manifest.description:
-            desc = plugin.manifest.description
-        else:
-            desc = ", ".join(sorted(toolset_tools[ts_key]))
-        result.append((ts_key, label, desc))
+        # Map toolsets back to the plugin that registered them.
+        for _name, loaded in manager._plugins.items():
+            for tool_name in loaded.tools_registered:
+                entry = registry.get_entry(tool_name)
+                if entry and entry.toolset in toolset_tools:
+                    toolset_plugin.setdefault(entry.toolset, loaded)
 
-    return result
+        result = []
+        for ts_key in sorted(toolset_tools):
+            plugin = toolset_plugin.get(ts_key)
+            label = f"🔌 {ts_key.replace('_', ' ').title()}"
+            if plugin and plugin.manifest.description:
+                desc = plugin.manifest.description
+            else:
+                desc = ", ".join(sorted(toolset_tools[ts_key]))
+            result.append((ts_key, label, desc))
+
+        return result
