@@ -4665,6 +4665,97 @@ def _launchd_unsupported_marker_path() -> Path:
     return get_hermes_home() / ".gateway-launchd-unsupported"
 
 
+def _write_bind_conflict_status(host: str, port: int, detail: str) -> None:
+    """Surface a port bind conflict in the gateway status file (t_57aac3e7 fix 2).
+
+    A duplicate instance on the same port causes an infinite silent restart
+    loop (KeepAlive + ThrottleInterval). This writes a ``bind_conflict``
+    marker next to the existing gateway state so ``hermes gateway status``
+    and the dashboard can surface it without the operator tailing a log.
+    Best-effort: never throws.
+    """
+    import json
+    import time as _time
+    try:
+        from hermes_constants import get_hermes_home
+        status_path = get_hermes_home() / "gateway" / "bind_conflict.json"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({
+                "host": host,
+                "port": port,
+                "detail": detail[:500],
+                "at": int(_time.time()),
+                "hint": f"Port {port} is already in use on {host}. Stop the duplicate instance (lsof -i :{port} / hermes gateway stop) and retry.",
+            }),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _bind_conflict_status_path():
+    """Path of the bind-conflict status file (t_57aac3e7 fix 2)."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "gateway" / "bind_conflict.json"
+
+
+def _read_bind_conflict_status(max_age_seconds: int = 3600) -> dict | None:
+    """Read the bind-conflict status file, or None if absent/stale/corrupt.
+
+    A conflict older than ``max_age_seconds`` is treated as stale (the port was
+    presumably freed since) and not surfaced. Best-effort: never throws.
+    """
+    import json
+    import time as _time
+    try:
+        p = _bind_conflict_status_path()
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        at = int(data.get("at", 0) or 0)
+        if at and (_time.time() - at) > max_age_seconds:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _clear_bind_conflict_status() -> None:
+    """Delete the bind-conflict status file (called on a successful bind)."""
+    try:
+        _bind_conflict_status_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _print_bind_conflict_block() -> bool:
+    """Print a prominent bind-conflict block from the status file.
+
+    Returns True if a (non-stale) conflict was found and printed. Stale
+    conflicts are cleared silently. Used by ``hermes gateway status`` and
+    ``launchd_status`` so the operator sees the conflict without tailing a log.
+    """
+    data = _read_bind_conflict_status()
+    if not data:
+        return False
+    port = data.get("port", "?")
+    host = data.get("host", "?")
+    print()
+    print(f"✗ BIND CONFLICT: port {port} is already in use on {host}")
+    print(f"  Another dashboard/gateway instance holds {host}:{port}.")
+    print(f"  Stop the duplicate (`hermes gateway stop` / `lsof -i :{port}`) and retry.")
+    print(f"  The supervisor (launchd/systemd) may keep respawning it every")
+    print(f"  ThrottleInterval until the conflict clears — this message is how")
+    print(f"  you tell that apart from a crash-loop.")
+    hint = data.get("hint")
+    if hint:
+        print(f"  {hint}")
+    return True
+
+
 def _write_launchd_unsupported_marker() -> None:
     """Persist that launchd cannot supervise the gateway on this host."""
     import json
@@ -4894,7 +4985,17 @@ def generate_launchd_plist() -> str:
     <key>KeepAlive</key>
     <true/>
 
-    <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
+    <!-- KeepAlive stays unconditionally true (#37388): the drain-then-exit
+         graceful-restart protocol (SIGUSR1 to request_restart) relies on a
+         clean exit(0) being relaunched, so a SuccessfulExit=false dict would
+         silently break the graceful restart flag. That means a bind-conflict
+         clean exit (t_57aac3e7 D2) does NOT stop the respawn loop by itself —
+         it still restarts every ThrottleInterval like a crash would. What D2
+         actually buys under this KeepAlive policy is the loud stderr message
+         plus the bind_conflict.json status file surfaced by
+         `hermes gateway status` / launchd_status, so the operator sees WHY
+         it's looping instead of a silent unauthenticated-request storm.
+         ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
          respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain
          headroom before launchd escalates from SIGTERM to SIGKILL on stop. -->
@@ -5579,6 +5680,13 @@ def launchd_status(deep: bool = False):
         print("  Run: hermes gateway start")
         if fallback_pid:
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
+
+    # Surface a bind conflict (t_57aac3e7 fix 2): the service exits cleanly on
+    # EADDRINUSE (rather than a raw traceback / rc=1), but KeepAlive/Restart
+    # policy is unconditional (#37388), so the supervisor may still keep
+    # respawning it. This block is how the operator learns WHY, whether it's
+    # currently up or mid-restart-loop.
+    _print_bind_conflict_block()
 
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
@@ -8324,6 +8432,13 @@ def _gateway_command_inner(args):
         full = getattr(args, "full", False)
         system = getattr(args, "system", False)
         snapshot = get_gateway_runtime_snapshot(system=system)
+
+        # Surface a bind conflict up front, on every platform (t_57aac3e7 fix
+        # 2): the service exits cleanly on EADDRINUSE instead of a raw
+        # traceback, but the supervisor's unconditional restart policy
+        # (#37388) may still be respawning it — this block tells the operator
+        # WHY, in either case.
+        _print_bind_conflict_block()
 
         # Check for service first
         _windows_service_installed = False

@@ -19358,7 +19358,43 @@ def start_server(
             config.load()
         server.lifespan = config.lifespan_class(config)
         with server.capture_signals():
-            await server.startup()
+            try:
+                await server.startup()
+            except OSError as _startup_exc:
+                # Bind-conflict backstop (t_57aac3e7 fix 2): uvicorn holds the
+                # socket for the whole startup (no separate preflight probe —
+                # that TOCTOU-prone bind/close/rebind dance was removed), so a
+                # duplicate instance on this port surfaces here as EADDRINUSE
+                # from create_server(). Give it a loud, terminal shape — stderr
+                # message + status file + clean exit(0) instead of a raw
+                # traceback — so `hermes gateway status` can explain it. Note
+                # the supervisor's restart policy is unconditional (launchd
+                # KeepAlive=true / systemd Restart=always, #37388), so this
+                # does not by itself stop a respawn loop; it only makes the
+                # cause visible instead of a silent crash-loop.
+                _errno = getattr(_startup_exc, "errno", None)
+                _is_in_use = (
+                    _errno in (48, 98, 10048)
+                    or "in use" in str(_startup_exc).lower()
+                    or "already in use" in str(_startup_exc).lower()
+                )
+                if not _is_in_use:
+                    raise
+                _msg = (
+                    f"Port {port} is already in use — another dashboard/gateway "
+                    f"instance is bound to {host}:{port} ({_startup_exc}). "
+                    f"Stop the duplicate (`hermes gateway stop` / `lsof -i :{port}`) "
+                    f"and retry. This is a terminal bind conflict, not a transient "
+                    f"error — check `hermes gateway status` if the supervisor keeps "
+                    f"respawning it."
+                )
+                print(f"ERROR: {_msg}", file=sys.stderr, flush=True)
+                try:
+                    from hermes_cli.gateway import _write_bind_conflict_status
+                    _write_bind_conflict_status(host, port, str(_startup_exc))
+                except Exception:
+                    pass
+                raise SystemExit(0)
             if server.should_exit:
                 return
 
@@ -19402,6 +19438,16 @@ def start_server(
 
             actual_port = _read_bound_port(server, fallback=port)
             app.state.bound_port = actual_port
+
+            # Stale-clear (t_57aac3e7 fix 2): we just bound successfully, so any
+            # prior bind-conflict status file is now stale — delete it so a
+            # resolved conflict doesn't linger in `hermes gateway status`.
+            if actual_port:
+                try:
+                    from hermes_cli.gateway import _clear_bind_conflict_status
+                    _clear_bind_conflict_status()
+                except Exception:
+                    pass
 
             _write_dashboard_ready_file(actual_port)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
