@@ -45,7 +45,9 @@ describe('RoadmapsPage', () => {
   it('shows the active profile and keeps the roadmap selector disabled without a project', () => {
     renderPage()
     // The active gateway profile resolves to `default` and is displayed read-only.
-    expect(screen.getByText('default')).toBeTruthy()
+    // Use getAllByText because the profile name appears in both the scope bar
+    // and the footer ("· profile default").
+    expect(screen.getAllByText('default').length).toBeGreaterThan(0)
     // No project id → no roadmap list is fetched or rendered.
     expect(screen.queryByText(/No roadmaps/)).toBeNull()
   })
