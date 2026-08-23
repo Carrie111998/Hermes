@@ -14,6 +14,34 @@ describe('desktop i18n languages', () => {
     })
   })
 
+  it('keeps the complete French session filter menu localized', () => {
+    expect(fr.sidebar.filterMenu).toMatchObject({
+      archived: 'Archivées',
+      collapseAll: 'Tout replier',
+      filters: 'Filtres',
+      grouping: 'Regroupement',
+      inboxStyle: 'Style boîte de réception',
+      ordering: 'Tri',
+      pullRequest: 'Demande de fusion',
+      resetToDefaults: 'Rétablir les valeurs par défaut',
+      show: 'Afficher'
+    })
+    expect(fr.sidebar.filterMenu.options).toMatchObject({
+      closed: 'Fermées',
+      cost: 'Coût',
+      created: 'Création',
+      idle: 'Inactives',
+      merged: 'Fusionnées',
+      needsInput: 'Saisie requise',
+      noPullRequest: 'Sans PR',
+      open: 'Ouvertes',
+      tokens: 'Jetons',
+      unread: 'Non lues',
+      updated: 'Dernière activité',
+      working: 'En cours'
+    })
+  })
+
   it('keeps reviewed French copy localized and plural-aware', () => {
     expect(fr.settings.gateway.sshErrHostKey).not.toContain('CHANGED')
     expect(fr.settings.mcp.testOk(1)).toContain('1 outil disponible')
