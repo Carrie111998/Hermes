@@ -1049,6 +1049,16 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _decode_review_artifacts(raw: Any) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1057,6 +1067,8 @@ class Task:
     title: str
     body: Optional[str]
     assignee: Optional[str]
+    # Implementation ownership is stable across review. The independently
+    # attributable reviewer is routed through a separate column.
     status: str
     priority: int
     created_by: Optional[str]
@@ -1068,6 +1080,13 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    # Optional additive fields stay defaulted so integrations constructing Task
+    # directly remain source-compatible with pre-review releases.
+    review_assignee: Optional[str] = None
+    review_artifacts: Optional[dict] = None
+    scheduled_for: Optional[int] = None
+    due_at: Optional[int] = None
+    pre_notice_sent_at: Optional[int] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -1159,6 +1178,18 @@ class Task:
             title=row["title"],
             body=row["body"],
             assignee=row["assignee"],
+            review_assignee=(
+                row["review_assignee"] if "review_assignee" in keys else None
+            ),
+            review_artifacts=(
+                _decode_review_artifacts(row["review_artifacts"])
+                if "review_artifacts" in keys else None
+            ),
+            scheduled_for=(row["scheduled_for"] if "scheduled_for" in keys else None),
+            due_at=(row["due_at"] if "due_at" in keys else None),
+            pre_notice_sent_at=(
+                row["pre_notice_sent_at"] if "pre_notice_sent_at" in keys else None
+            ),
             status=row["status"],
             priority=row["priority"],
             created_by=row["created_by"],
@@ -1335,6 +1366,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     title                TEXT NOT NULL,
     body                 TEXT,
     assignee             TEXT,
+    -- Stable, independently attributable review routing. ``assignee`` remains
+    -- the implementation owner; the frozen artifact identity is immutable for
+    -- a review cycle and survives reviewer retries/restarts.
+    review_assignee      TEXT,
+    review_artifacts     TEXT,
+    -- UTC Unix epochs avoid worker-local timezone/DST disagreement.
+    scheduled_for        INTEGER,
+    due_at               INTEGER,
+    pre_notice_sent_at   INTEGER,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
@@ -2679,6 +2719,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # Additive review-v2 migration. Legacy cards remain readable with NULL
+    # values; new native review requests populate both columns atomically.
+    if "review_assignee" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_assignee", "review_assignee TEXT"
+        )
+    if "review_artifacts" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_artifacts", "review_artifacts TEXT"
+        )
+
+    # Additive native scheduling migration. NULL means legacy/immediate work.
+    for column in ("scheduled_for", "due_at", "pre_notice_sent_at"):
+        if column not in cols:
+            _add_column_if_missing(conn, "tasks", column, f"{column} INTEGER")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2693,6 +2749,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    schedule_index_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if {"status", "scheduled_for", "created_at"} <= schedule_index_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_schedule "
+            "ON tasks(status, scheduled_for, created_at)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3183,6 +3247,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    scheduled_for: Optional[int] = None,
+    due_at: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3228,6 +3294,12 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    scheduled_for = int(scheduled_for) if scheduled_for is not None else None
+    due_at = int(due_at) if due_at is not None else None
+    if scheduled_for is not None and scheduled_for < 0:
+        raise ValueError("scheduled_for must be a non-negative UTC Unix epoch")
+    if due_at is not None and due_at < 0:
+        raise ValueError("due_at must be a non-negative UTC Unix epoch")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3449,6 +3521,12 @@ def create_task(
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 elif triage:
                     task_status = "triage"
+                elif scheduled_for is not None and scheduled_for > now:
+                    task_status = "scheduled"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 else:
                     task_status = "ready"
                     if parents:
@@ -3497,8 +3575,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        scheduled_for, due_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3603,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        scheduled_for,
+                        due_at,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3633,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "scheduled_for": scheduled_for,
+                        "due_at": due_at,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3575,6 +3658,68 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     ).fetchall()
     present = {r["id"] for r in rows}
     return [p for p in parents if p not in present]
+
+
+def process_scheduled_tasks(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    pre_notice_seconds: int = 15 * 60,
+) -> dict[str, list[str]]:
+    """Emit idempotent T-15 notices and promote due scheduled cards.
+
+    Values are UTC Unix epochs. The durable marker and event append share one
+    transaction, so duplicate ticks and restarts cannot duplicate a notice or
+    promotion. Cards with open parents land in ``todo``; others in ``ready``.
+    """
+    current = int(time.time()) if now is None else int(now)
+    lead = max(0, int(pre_notice_seconds))
+    noticed: list[str] = []
+    promoted: list[str] = []
+    with write_txn(conn):
+        notice_rows = conn.execute(
+            "SELECT id, scheduled_for FROM tasks WHERE status = 'scheduled' "
+            "AND scheduled_for IS NOT NULL AND pre_notice_sent_at IS NULL "
+            "AND scheduled_for > ? AND scheduled_for - ? <= ? "
+            "ORDER BY priority DESC, created_at ASC",
+            (current, lead, current),
+        ).fetchall()
+        for row in notice_rows:
+            changed = conn.execute(
+                "UPDATE tasks SET pre_notice_sent_at = ? WHERE id = ? "
+                "AND status = 'scheduled' AND pre_notice_sent_at IS NULL",
+                (current, row["id"]),
+            )
+            if changed.rowcount == 1:
+                _append_event(
+                    conn,
+                    row["id"],
+                    "scheduled_pre_notice",
+                    {"scheduled_for": int(row["scheduled_for"]), "lead_seconds": lead},
+                )
+                noticed.append(row["id"])
+
+        due_rows = conn.execute(
+            "SELECT id, scheduled_for FROM tasks WHERE status = 'scheduled' "
+            "AND scheduled_for IS NOT NULL AND scheduled_for <= ? "
+            "ORDER BY priority DESC, created_at ASC",
+            (current,),
+        ).fetchall()
+        for row in due_rows:
+            landing = _landing_status_after_parents(conn, row["id"])
+            changed = conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = 'scheduled'",
+                (landing, row["id"]),
+            )
+            if changed.rowcount == 1:
+                _append_event(
+                    conn,
+                    row["id"],
+                    "scheduled_promoted",
+                    {"scheduled_for": int(row["scheduled_for"]), "status": landing},
+                )
+                promoted.append(row["id"])
+    return {"noticed": noticed, "promoted": promoted}
 
 
 def _inherit_notify_subs(
@@ -3712,6 +3857,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
+        if row["status"] == "review":
+            raise RuntimeError(
+                f"cannot reassign {task_id}: review artifact identity is frozen; "
+                "request changes or reopen review first"
+            )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -4742,6 +4892,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    actor_profile: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4758,6 +4909,20 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        routing = conn.execute(
+            "SELECT assignee, review_assignee FROM tasks "
+            "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if routing is None:
+            return None
+        effective_reviewer = _canonical_assignee(
+            routing["review_assignee"] or routing["assignee"]
+        )
+        if actor_profile is not None and (
+            _canonical_assignee(actor_profile) != effective_reviewer
+        ):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4805,7 +4970,7 @@ def claim_review_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                effective_reviewer,
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -4821,7 +4986,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review", "profile": effective_reviewer},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -5393,6 +5558,44 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # Review verdicts are security-sensitive lifecycle transitions. Generic
+    # completion must never approve a parked review or an active reviewer run;
+    # callers use pass_review(), which authenticates profile + run token and
+    # emits review_passed rather than the ambiguous completed event.
+    review_gate = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if review_gate is not None:
+        # Native v2 reviews carry a frozen artifact identity and require the
+        # authenticated pass_review() verdict.  Legacy review rows predate
+        # that field and retain their operator-driven complete behavior during
+        # the additive migration window.
+        native_review = conn.execute(
+            "SELECT review_artifacts FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            review_gate["status"] == "review"
+            and native_review is not None
+            and native_review["review_artifacts"] is not None
+        ):
+            return False
+        if review_gate["status"] == "running" and review_gate["current_run_id"]:
+            source = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+                (task_id, int(review_gate["current_run_id"])),
+            ).fetchone()
+            try:
+                source_payload = json.loads(source["payload"]) if source and source["payload"] else {}
+            except (json.JSONDecodeError, TypeError):
+                source_payload = {}
+            if (
+                isinstance(source_payload, dict)
+                and source_payload.get("source_status") == "review"
+                and native_review is not None
+                and native_review["review_artifacts"] is not None
+            ):
+                return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5453,6 +5656,7 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND review_artifacts IS NULL
                 """,
                 (result, now, task_id),
             )
@@ -5470,6 +5674,7 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND review_artifacts IS NULL
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -6487,6 +6692,48 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _validate_frozen_review_artifacts(value: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Return canonical frozen artifact metadata or a fail-closed reason."""
+    if not isinstance(value, dict):
+        return None, "frozen artifacts object is required"
+    commit = value.get("commit")
+    tree = value.get("tree")
+    artifacts = value.get("artifacts")
+    oid = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+    if not isinstance(commit, str) or not oid.fullmatch(commit):
+        return None, "frozen artifacts.commit must be a 40- or 64-hex object id"
+    if not isinstance(tree, str) or not oid.fullmatch(tree):
+        return None, "frozen artifacts.tree must be a 40- or 64-hex object id"
+    if not isinstance(artifacts, list):
+        return None, "frozen artifacts.artifacts must be a list"
+    normalized: list[dict] = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return None, "each frozen artifact must be an object"
+        path = item.get("path")
+        digest = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path.strip()
+            or path.startswith("/")
+            or "\\" in path
+            or "\x00" in path
+            or any(part in {"", ".", ".."} for part in path.strip().split("/"))
+        ):
+            return None, (
+                "each frozen artifact path must be canonical, relative, and "
+                "must not contain dot segments"
+            )
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            return None, "each frozen artifact sha256 must be 64 hex characters"
+        normalized.append({"path": path.strip(), "sha256": digest.lower()})
+    return {
+        "commit": commit.lower(),
+        "tree": tree.lower(),
+        "artifacts": normalized,
+    }, None
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6494,159 +6741,230 @@ def request_review(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     reviewer: Optional[str] = None,
+    artifacts: Optional[dict] = None,
+    actor_profile: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
 ):
-    """Transition implementation work into the first-class review phase.
+    """Atomically close a writer run and route a frozen tree to review.
 
-    Unlike :func:`block_task`, this transition never touches block recurrence
-    accounting.  The current implementer and resolved reviewer are recorded on
-    the event so an autonomous reviewer can route requested changes back to the
-    right profile.  Supplying ``reviewer`` reassigns the task before it is
-    exposed to the review dispatcher.  On re-review, omitting it reuses the
-    reviewer provenance persisted by the latest ``changes_requested`` event.
-
-    When the task is ``running`` under a live claim, a caller that supplies no
-    ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
-    — otherwise the request is refused instead of silently clearing the live
-    worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
-    their own run id as ``expected_run_id`` (unchanged).
-
-    Returns ``bool`` by default. With ``with_reason=True`` returns
-    ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
-    diagnostic string on failure, ``None`` on success.
+    Authenticated v2 callers pass ``actor_profile`` and must also provide the
+    active run token, an independent reviewer, and a valid frozen artifact
+    identity. Legacy operator/CLI callers remain readable during migration,
+    but are explicitly compatibility-only and do not get v2 authorization
+    claims unless they provide those arguments.
     """
-
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    native_v2 = actor_profile is not None or artifacts is not None
+    canonical_artifacts: Optional[dict] = None
+    if native_v2:
+        canonical_artifacts, artifact_error = _validate_frozen_review_artifacts(
+            redact_review_value(artifacts)
+        )
+        if artifact_error:
+            return _ret(False, artifact_error)
+    actor = _canonical_assignee(actor_profile) if actor_profile is not None else None
+
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, review_assignee, status, claim_lock, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
-        # Refuse to clear a live worker's claim without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True).
-        if (
-            expected_run_id is None
-            and not force
-            and trow["status"] == "running"
+        implementer = _canonical_assignee(trow["assignee"])
+        if native_v2:
+            if expected_run_id is None:
+                return _ret(False, "active writer run token is required")
+            run = conn.execute(
+                "SELECT profile, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if (
+                run is None or run["ended_at"] is not None
+                or trow["current_run_id"] != int(expected_run_id)
+            ):
+                return _ret(False, "stale or missing writer run token")
+            run_profile = _canonical_assignee(run["profile"])
+            if actor != implementer or run_profile != actor:
+                return _ret(False, "writer profile does not own the active run")
+        elif (
+            expected_run_id is None and not force and trow["status"] == "running"
             and trow["claim_lock"] is not None
         ):
-            return _ret(
-                False,
-                "task is running under a live claim; pass expected_run_id "
-                "(worker ownership) or force=True (explicit operator "
-                "override) instead of clearing the live run's claim",
-            )
-        implementer = trow["assignee"]
+            return _ret(False, "task is running under a live claim; pass expected_run_id or force=True")
+
         if reviewer is None:
-            changes_run = conn.execute(
-                "SELECT id FROM task_runs "
-                "WHERE task_id = ? AND outcome = 'changes_requested' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            changes_event = None
-            if changes_run is not None:
+            # Native v2 persists routing independently from assignee. Legacy
+            # re-review intentionally continues to prove reviewer provenance
+            # from the latest changes_requested event so malformed historical
+            # data fails closed exactly as it did before this migration.
+            reviewer = trow["review_assignee"] if native_v2 else None
+            if reviewer is None:
                 changes_event = conn.execute(
-                    "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND run_id = ? "
-                    "AND kind = 'changes_requested' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (task_id, int(changes_run["id"])),
+                    "SELECT payload FROM task_events WHERE task_id = ? "
+                    "AND kind = 'changes_requested' ORDER BY id DESC LIMIT 1",
+                    (task_id,),
                 ).fetchone()
-            try:
-                changes_payload = (
-                    json.loads(changes_event["payload"])
-                    if changes_event and changes_event["payload"]
-                    else {}
-                )
-            except (json.JSONDecodeError, TypeError):
-                changes_payload = {}
-            prior_reviewer = (
-                changes_payload.get("reviewer")
-                if isinstance(changes_payload, dict)
-                else None
-            )
-            if changes_run is not None:
-                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
-                    return _ret(
-                        False,
-                        "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
-                reviewer = prior_reviewer
+                try:
+                    payload = json.loads(changes_event["payload"]) if changes_event and changes_event["payload"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+                reviewer = payload.get("reviewer") if isinstance(payload, dict) else None
+                if not native_v2:
+                    changes_run = conn.execute(
+                        "SELECT id FROM task_runs WHERE task_id = ? "
+                        "AND outcome = 'changes_requested' ORDER BY id DESC LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    if changes_run is not None and (
+                        not isinstance(reviewer, str) or not reviewer.strip()
+                    ):
+                        return _ret(
+                            False,
+                            "re-review has no durable reviewer provenance; "
+                            "pass reviewer= explicitly",
+                        )
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
-        assignee_sql = ", assignee = ?" if reviewer is not None else ""
-        params: tuple[Any, ...]
-        if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
-            run_guard = ""
-        else:
-            params = (
-                (reviewer, task_id, int(expected_run_id))
-                if reviewer is not None
-                else (task_id, int(expected_run_id))
-            )
+        if native_v2 and not reviewer:
+            return _ret(False, "independent reviewer is required")
+        if reviewer and reviewer == implementer:
+            return _ret(False, "reviewer must be independent from the writer")
+
+        params: list[Any] = [reviewer]
+        assignment_sql = ""
+        # Compatibility-only legacy rows used assignee as the routing field.
+        if not native_v2 and reviewer is not None:
+            assignment_sql = ", assignee = ?"
+            params.append(reviewer)
+        params.extend([
+            json.dumps(canonical_artifacts, sort_keys=True) if canonical_artifacts else None,
+            task_id,
+        ])
+        run_guard = ""
+        if expected_run_id is not None:
             run_guard = " AND current_run_id = ?"
+            params.append(int(expected_run_id))
         cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'review',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL
-            """ + assignee_sql + """
-             WHERE id = ?
-               AND status IN ('running', 'ready')
-            """ + run_guard,
-            params,
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, review_assignee = ?"
+            + assignment_sql
+            + ", review_artifacts = ? WHERE id = ? "
+            "AND status IN ('running', 'ready')" + run_guard,
+            tuple(params),
         )
         if cur.rowcount != 1:
-            return _ret(
-                False,
-                "task is not in running/ready (or expected_run_id did not "
-                "match the current run)",
-            )
+            return _ret(False, "task is not in running/ready or run token is stale")
         run_id = _end_run(
-            conn,
-            task_id,
-            outcome="review_requested",
-            status="review",
-            summary=summary,
-            metadata=metadata,
+            conn, task_id, outcome="review_requested", status="review",
+            summary=summary, metadata=metadata,
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
-                conn,
-                task_id,
-                outcome="review_requested",
-                summary=summary,
-                metadata=metadata,
+                conn, task_id, outcome="review_requested",
+                summary=summary, metadata=metadata,
             )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
         _append_event(
-            conn,
-            task_id,
-            "review_requested",
+            conn, task_id, "review_requested",
             {
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "artifacts": canonical_artifacts,
             },
             run_id=run_id,
         )
     return _ret(True)
+
+
+def pass_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    actor_profile: str,
+    expected_run_id: int,
+) -> tuple[bool, Optional[str]]:
+    """Authenticated PASS verdict for an active independently routed review."""
+    summary = str(redact_review_value(summary or "")).strip()
+    if not summary:
+        return False, "review evidence summary is required"
+    actor = _canonical_assignee(actor_profile)
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, review_assignee, review_artifacts, "
+            "current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        if row["status"] != "running" or row["current_run_id"] is None:
+            return False, "task is not in an active review run"
+        if int(row["current_run_id"]) != int(expected_run_id):
+            return False, "stale reviewer run token"
+        reviewer = _canonical_assignee(row["review_assignee"] or row["assignee"])
+        if actor != reviewer:
+            return False, "actor is not the bound reviewer"
+        if actor == _canonical_assignee(row["assignee"]):
+            return False, "self-approval is forbidden"
+        run = conn.execute(
+            "SELECT profile, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        claimed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        try:
+            claim_payload = json.loads(claimed["payload"]) if claimed and claimed["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            claim_payload = {}
+        if (
+            run is None or run["ended_at"] is not None
+            or _canonical_assignee(run["profile"]) != actor
+            or not isinstance(claim_payload, dict)
+            or claim_payload.get("source_status") != "review"
+        ):
+            return False, "run is not an authenticated review claim"
+        if _decode_review_artifacts(row["review_artifacts"]) is None:
+            return False, "frozen review artifact identity is missing or malformed"
+        if not _parents_satisfied(conn, task_id):
+            return False, "parent dependencies are not satisfied"
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
+            "block_recurrences = 0 WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ?",
+            (now, task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during review verdict"
+        run_id = _end_run(
+            conn, task_id, outcome="review_passed", status="done", summary=summary,
+        )
+        _append_event(
+            conn, task_id, "review_passed",
+            {"reviewer": actor, "implementer": row["assignee"], "summary": summary[:400]},
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_completed", task_id, board=get_current_board(),
+        assignee=row["assignee"], run_id=run_id,
+    )
+    return True, None
 
 
 def request_changes(
@@ -6654,6 +6972,7 @@ def request_changes(
     task_id: str,
     *,
     reason: str,
+    actor_profile: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
@@ -6670,7 +6989,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, review_assignee, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6680,6 +7000,24 @@ def request_changes(
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
+        effective_reviewer = _canonical_assignee(
+            task_row["review_assignee"] or task_row["assignee"]
+        )
+        if actor_profile is not None:
+            if expected_run_id is None:
+                return False, "active reviewer run token is required"
+            actor = _canonical_assignee(actor_profile)
+            run_profile = conn.execute(
+                "SELECT profile, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                (int(current_run_id), task_id),
+            ).fetchone()
+            if (
+                actor != effective_reviewer
+                or run_profile is None
+                or run_profile["ended_at"] is not None
+                or _canonical_assignee(run_profile["profile"]) != actor
+            ):
+                return False, "actor is not the bound reviewer for the active run"
 
         claimed_event = conn.execute(
             "SELECT payload FROM task_events "
@@ -6721,11 +7059,7 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
-        reviewer = task_row["assignee"]
-        if isinstance(reviewer, str) and reviewer.strip():
-            reviewer = _canonical_assignee(reviewer)
-        else:
-            reviewer = None
+        reviewer = effective_reviewer
 
         new_status = _landing_status_after_parents(conn, task_id)
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
@@ -6737,6 +7071,7 @@ def request_changes(
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
+                   review_artifacts = NULL,
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL
@@ -9578,9 +9913,10 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     should have spawned a review agent.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "SELECT DISTINCT COALESCE(review_assignee, assignee) AS assignee "
+        "FROM tasks WHERE status = 'review' "
+        "AND COALESCE(review_assignee, assignee) IS NOT NULL "
+        "AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
         return False
@@ -9608,6 +9944,17 @@ def review_dispatch_enabled() -> bool:
         )
     except Exception:
         return True
+
+
+def native_scheduling_enabled() -> bool:
+    """Fail closed until an operator explicitly activates native scheduling."""
+    try:
+        from hermes_cli.config import load_config
+        return bool(
+            (load_config() or {}).get("kanban", {}).get("native_scheduling", False)
+        )
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -9942,6 +10289,11 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # Scheduling runs under the singleton dispatcher before queue enumeration.
+    # It is fail-closed behind an explicit activation knob; a restart or missed
+    # tick catches up exactly once and can spawn the newly-ready card this tick.
+    if native_scheduling_enabled():
+        process_scheduled_tasks(conn)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10043,8 +10395,8 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
+            "SELECT id, COALESCE(review_assignee, assignee) AS assignee "
+            "FROM tasks WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
@@ -10090,9 +10442,10 @@ def _dispatch_once_locked(
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
         for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
+            "SELECT r.profile AS assignee, COUNT(*) AS n FROM tasks t "
+            "JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND r.profile IS NOT NULL "
+            "GROUP BY r.profile"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
@@ -10354,9 +10707,15 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn, row["id"], ttl_seconds=ttl_seconds,
+            actor_profile=row["assignee"],
+        )
         if claimed is None:
             continue
+        # Spawn routing is the effective reviewer while durable task.assignee
+        # remains the writer. This mutation is in-memory only.
+        claimed.assignee = row["assignee"]
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

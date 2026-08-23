@@ -42,6 +42,11 @@ def test_review_tools_redact_handoff_and_route_changes(
             "summary": f"Ready; temporary token was {secret}",
             "metadata": {"token": secret, "tests_run": 7},
             "reviewer": "reviewer",
+            "artifacts": {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "artifacts": [{"path": "dist/x", "sha256": "c" * 64}],
+            },
         })
     )
     assert requested["ok"] is True
@@ -50,12 +55,15 @@ def test_review_tools_redact_handoff_and_route_changes(
         task = kb.get_task(conn, review_worker)
         assert task is not None
         assert task.status == "review"
-        assert task.assignee == "reviewer"
+        assert task.assignee == "builder"
+        assert task.review_assignee == "reviewer"
         handoff = kb.latest_run(conn, review_worker)
         assert handoff is not None
         assert secret not in (handoff.summary or "")
         assert secret not in json.dumps(handoff.metadata)
-        review = kb.claim_review_task(conn, review_worker, claimer="reviewer:1")
+        review = kb.claim_review_task(
+            conn, review_worker, claimer="reviewer:1", actor_profile="reviewer"
+        )
         assert review is not None
 
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
@@ -319,7 +327,14 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             False,
         ),
     )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
+    rejected = json.loads(tools._handle_request_review({
+        "summary": "Looks ready.",
+        "artifacts": {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "artifacts": [{"path": "dist/x", "sha256": "c" * 64}],
+        },
+    }))
     assert "error" in rejected
     assert "rejected by judge" in rejected["error"]
     with kb.connect() as conn:
