@@ -2670,6 +2670,7 @@ from gateway.session import (
     build_channel_continuity_note,
     build_session_key,
     is_shared_multi_user_session,
+    neutralize_untrusted_envelope_field,
     neutralize_untrusted_inline_text,
 )
 from gateway.delivery import (
@@ -10111,6 +10112,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    # Hard ceiling for the paths that are allowed to bypass the ordinary busy
+    # cap.  A cross-sender refusal must not cost the incoming sender a message,
+    # so it may append past ``_BUSY_QUEUE_MAX_PENDING`` — but that allowance
+    # cannot be unconditional: two participants alternating media in a shared
+    # session hit the refusal exit on *every* message, and an unbounded bypass
+    # lets any authorised group participant drive unbounded ``MessageEvent`` and
+    # media retention.  A bounded margin over the busy cap keeps the refusal
+    # lossless in every realistic backlog while still terminating a flood.
+    _BUSY_QUEUE_HARD_MAX_PENDING = 2 * _BUSY_QUEUE_MAX_PENDING
+
+    def _enqueue_fifo_bounded(
+        self, session_key: str, event: MessageEvent, adapter: Any
+    ) -> None:
+        """Append via the refusal allowance, stopping at the hard ceiling."""
+        if (
+            self._queue_depth(session_key, adapter=adapter)
+            >= self._BUSY_QUEUE_HARD_MAX_PENDING
+        ):
+            logger.warning(
+                "Dropping cross-sender follow-up for session %s — pending queue "
+                "at hard cap (%d).",
+                session_key,
+                self._BUSY_QUEUE_HARD_MAX_PENDING,
+            )
+            return
+        self._enqueue_fifo(session_key, event, adapter)
+
     def _queue_or_replace_pending_event(
         self,
         session_key: str,
@@ -10181,11 +10209,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # rather than mutating the existing event. ``tail_slot``
                     # is only a probe around the real FIFO tail, so retain the
                     # replacement as its own turn instead of discarding it.
-                    self._enqueue_fifo(session_key, event, adapter)
+                    self._enqueue_fifo_bounded(session_key, event, adapter)
                     return
                 # A cross-sender media refusal remains lossless even at the
-                # ordinary busy cap, but must append after the current tail.
-                self._enqueue_fifo(session_key, event, adapter)
+                # ordinary busy cap, but must append after the current tail —
+                # and only up to the hard ceiling, so alternating senders
+                # cannot turn this exit into an unbounded queue.
+                self._enqueue_fifo_bounded(session_key, event, adapter)
                 return
             if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
                 logger.warning(
@@ -10223,12 +10253,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # occupied head. Restore the head and queue the incoming event
                 # as the next turn instead.
                 adapter._pending_messages[session_key] = existing
-                self._enqueue_fifo(session_key, event, adapter)
+                self._enqueue_fifo_bounded(session_key, event, adapter)
                 return
-            # Refusal transfers ownership back to this caller. It must bypass
-            # the ordinary busy-queue cap: the refusal itself must never cost
-            # the incoming sender a message.
-            self._enqueue_fifo(session_key, event, adapter)
+            # Refusal transfers ownership back to this caller. It may bypass
+            # the ordinary busy-queue cap — the refusal itself must never cost
+            # the incoming sender a message — but only up to the hard ceiling.
+            self._enqueue_fifo_bounded(session_key, event, adapter)
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
@@ -18491,13 +18521,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _has_trusted_sender_id = bool(source.user_id or source.user_id_alt)
             # Strip any user-supplied copy of Hermes' canonical sender envelope
             # before attaching the gateway-authenticated one. In a shared
-            # session, leaving a forged leading envelope in place lets one
-            # participant impersonate another in the exact metadata shape we ask
-            # the model to trust.
+            # session, leaving a forged envelope in place lets one participant
+            # impersonate another in the exact metadata shape we ask the model
+            # to trust. Anchored per LINE, not just at start-of-string: this PR
+            # is what makes the envelope a trusted attestation, so a forgery
+            # that merely sits one line down defeats exactly the property this
+            # strip exists to protect.
             message_text = re.sub(
-                r"^(?:\s*\[Verified sender:[^\]\n]*\]\s*)+",
+                r"^(?:[^\S\n]*\[Verified sender:[^\]\n]*\][^\S\n]*)+",
                 "",
                 message_text,
+                flags=re.MULTILINE,
             )
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
@@ -18506,7 +18540,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a hostile name can masquerade as a fake markdown section
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(
+            # The envelope below is additionally a ``|``-delimited field list
+            # wrapped in ``[...]``, so its own structural delimiters must be
+            # neutralized too: otherwise a name carrying ``|`` mints an extra
+            # authenticated-looking field (an attacker-chosen mention target)
+            # and a name carrying ``]`` closes the envelope early and emits a
+            # second, fully attacker-controlled one.
+            _safe_user_name = neutralize_untrusted_envelope_field(
                 source.user_name or "unknown sender"
             )
             if _has_trusted_sender_id:
