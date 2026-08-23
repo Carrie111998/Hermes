@@ -1,13 +1,16 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useState } from 'react'
 
-import { useStore } from '@nanostores/react'
-
-import { Input } from '@/components/ui/input'
 import { ListRow } from '@/app/settings/primitives'
-import { loadPoolLimits, savePoolLimits, $poolLimits } from '@/store/pool-limits'
+import { Input } from '@/components/ui/input'
+import { $poolLimits, loadPoolLimits, savePoolLimits } from '@/store/pool-limits'
 
-const MAX_BACKENDS_MAX = 32
-const IDLE_MS_MAX = 7 * 24 * 60 * 60_000
+// Bounds imported from main's clamp module so the advertised input ranges
+// can never drift from what the pool actually enforces (review note on #92581).
+import { POOL_LIMITS_BOUNDS } from '../../../electron/pool-limits'
+
+const MAX_BACKENDS_MAX = POOL_LIMITS_BOUNDS.maxBackendsMax
+const IDLE_MS_MAX = POOL_LIMITS_BOUNDS.idleMsMax
 
 /** Settings → Advanced: warm-bot-backends count + backend idle timeout.
  *  Device-local (not profile-scoped): the pool is sized once per machine and

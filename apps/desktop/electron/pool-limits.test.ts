@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS, POOL_LIMITS_MIN } from './pool-limits'
+import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_BOUNDS, POOL_LIMITS_DEFAULTS, POOL_LIMITS_MIN } from './pool-limits'
 
 describe('parsePoolLimits', () => {
   it('falls back to defaults for null/empty/corrupt input', () => {
@@ -35,6 +35,10 @@ describe('clampPoolLimits', () => {
 
   it('clamps absurdly high backend counts', () => {
     expect(clampPoolLimits({ maxBackends: 10_000 }).maxBackends).toBeLessThanOrEqual(64)
+  })
+
+  it('clamps idleMs to the shared ceiling (7 days)', () => {
+    expect(clampPoolLimits({ idleMs: 999_000_000 }).idleMs).toBe(POOL_LIMITS_BOUNDS.idleMsMax)
   })
 
   it('floors fractional values', () => {

@@ -252,7 +252,7 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { selectPoolEvictions } from './pool-eviction'
-import { clampPoolLimits, parsePoolLimits } from './pool-limits'
+import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
@@ -1364,21 +1364,40 @@ const POOL_LIMITS_PATH = path.join(app.getPath('userData'), 'pool-limits.json')
 
 function readPersistedPoolLimits() {
   try {
-    return parsePoolLimits(fs.readFileSync(POOL_LIMITS_PATH, 'utf8'))
+    const limits = parsePoolLimits(fs.readFileSync(POOL_LIMITS_PATH, 'utf8'))
+    rememberLog(
+      `[pool-limits] loaded from ${POOL_LIMITS_PATH}: maxBackends=${limits.maxBackends}, idleMs=${limits.idleMs}`
+    )
+
+    return limits
   } catch {
-    const fromEnv = {
+    // No persisted file yet — fall back to the legacy env vars so scripted
+    // setups keep working. Log which source won: a silently-ignored env var
+    // here costs a scripted-setup user a debugging session.
+    const fromEnv = clampPoolLimits({
       maxBackends: Number(process.env.HERMES_DESKTOP_POOL_MAX) || undefined,
       idleMs: Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || undefined
+    })
+
+    if (fromEnv.maxBackends !== POOL_LIMITS_DEFAULTS.maxBackends || fromEnv.idleMs !== POOL_LIMITS_DEFAULTS.idleMs) {
+      rememberLog(`[pool-limits] no saved file; using env-var overrides: maxBackends=${fromEnv.maxBackends}, idleMs=${fromEnv.idleMs}`)
+    } else {
+      rememberLog('[pool-limits] no saved file and no env overrides; using defaults')
     }
 
-    return parsePoolLimits(null) && clampPoolLimits(fromEnv)
+    return fromEnv
   }
 }
 
 function persistPoolLimits(limits) {
   try {
     fs.mkdirSync(path.dirname(POOL_LIMITS_PATH), { recursive: true })
-    fs.writeFileSync(POOL_LIMITS_PATH, JSON.stringify(limits, null, 2), 'utf8')
+    // Atomic write: write to a temp file in the same directory, then rename.
+    // A crash mid-write would otherwise leave truncated JSON and silently
+    // lose the user's saved sizing.
+    const tmpPath = `${POOL_LIMITS_PATH}.tmp`
+    fs.writeFileSync(tmpPath, JSON.stringify(limits, null, 2), 'utf8')
+    fs.renameSync(tmpPath, POOL_LIMITS_PATH)
   } catch (error) {
     rememberLog(`[pool-limits] write failed: ${error.message}`)
   }
