@@ -244,3 +244,22 @@ export function resolveRouteProfile(
 ): string | null | undefined {
   return tornDownProfile ? null : profile
 }
+
+/**
+ * Local registry requests should not try to respawn a profile whose directory
+ * has already been deleted. Fall back to the primary backend instead so the
+ * request can fail or recover there without recreating the removed profile.
+ */
+export function resolveMissingLocalRegistryProfileRoute(
+  connectionKind: string,
+  routeProfile: string | null | undefined,
+  profileDirectoryExists: (profile: string) => boolean
+): string | null | undefined {
+  const key = String(routeProfile ?? '').trim().toLowerCase()
+
+  if (connectionKind === 'local' && key && key !== 'default' && !profileDirectoryExists(key)) {
+    return null
+  }
+
+  return routeProfile
+}

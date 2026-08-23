@@ -11,6 +11,7 @@ import {
   getAllSessionMessages,
   getLatestSessionMessages,
   getSession,
+  STARTUP_REQUEST_TIMEOUT_MS,
   type SessionInfo,
   type SessionResumeResponse
 } from '@/hermes'
@@ -617,7 +618,8 @@ describe('createBackendSessionForSend profile routing', () => {
       'source-a',
       'default',
       'session.create',
-      expect.objectContaining({ profile: 'backend-default', source: 'desktop' })
+      expect.objectContaining({ profile: 'backend-default', source: 'desktop' }),
+      STARTUP_REQUEST_TIMEOUT_MS
     )
     expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })

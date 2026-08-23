@@ -236,6 +236,7 @@ import {
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
+  resolveMissingLocalRegistryProfileRoute,
   resolveRouteProfile
 } from './profile-delete-routing'
 import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
@@ -13691,11 +13692,17 @@ async function dispatchRegistryApiRequest(
   routeProfile = request?.profile,
   requestProfile = request?.profile
 ) {
-  const connection: any = await ensureRegistryBackend(registryConnectionId, routeProfile)
+  const connectionKind = registryConnectionKind(registryConnectionId)
+  const resolvedRouteProfile = resolveMissingLocalRegistryProfileRoute(connectionKind, routeProfile, key =>
+    directoryExists(path.join(HERMES_HOME, 'profiles', key))
+  )
+  const resolvedRequestProfile =
+    connectionKind === 'local' && resolvedRouteProfile === null && routeProfile ? null : requestProfile
+  const connection: any = await ensureRegistryBackend(registryConnectionId, resolvedRouteProfile)
 
   const requestPath = connection.sharedRemote
-    ? pathWithProfileScope(request.path, requestProfile)
-    : translateSelfProfileQuery(request.path, requestProfile, connection.remoteProfile)
+    ? pathWithProfileScope(request.path, resolvedRequestProfile)
+    : translateSelfProfileQuery(request.path, resolvedRequestProfile, connection.remoteProfile)
 
   return fetchJsonForBackend(connection, requestPath, {
     method: request?.method,

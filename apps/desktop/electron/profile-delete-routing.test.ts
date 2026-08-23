@@ -8,6 +8,7 @@ import {
   dispatchConnectionScopedProfileDelete,
   localProfilePoolKeys,
   ProfileDeletionGate,
+  resolveMissingLocalRegistryProfileRoute,
   profileNameFromDeleteRequest,
   resolveRouteProfile
 } from './profile-delete-routing'
@@ -151,6 +152,13 @@ test('localProfilePoolKeys returns every local process scope for one profile', (
 
 test('resolveRouteProfile preserves a primary-backend route from another routing policy', () => {
   assert.equal(resolveRouteProfile(null, null), null)
+})
+
+test('resolveMissingLocalRegistryProfileRoute falls back to primary for a deleted local profile', () => {
+  assert.equal(resolveMissingLocalRegistryProfileRoute('local', 'worker', () => false), null)
+  assert.equal(resolveMissingLocalRegistryProfileRoute('local', 'default', () => false), 'default')
+  assert.equal(resolveMissingLocalRegistryProfileRoute('ssh', 'worker', () => false), 'worker')
+  assert.equal(resolveMissingLocalRegistryProfileRoute('local', 'worker', profile => profile === 'worker'), 'worker')
 })
 
 test('explicit registered local DELETE holds one gate through teardown and dispatch', async () => {

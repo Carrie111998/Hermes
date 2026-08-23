@@ -5,7 +5,13 @@ import type { NavigateFunction } from 'react-router'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
-import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
+import {
+  deleteSession,
+  getAllSessionMessages,
+  getLatestSessionMessages,
+  setSessionArchived,
+  STARTUP_REQUEST_TIMEOUT_MS
+} from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -134,7 +140,7 @@ interface SessionActionsOptions {
   getRoutedStoredSessionId: () => null | string
   navigate: NavigateFunction
   onFreshDraftRouteIntent?: () => void
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => Promise<T>
   resetViewSync: () => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
@@ -486,9 +492,10 @@ export function useSessionActions({
               capturedRoute.connectionId,
               capturedRoute.profile,
               'session.create',
-              params
+              params,
+              STARTUP_REQUEST_TIMEOUT_MS
             )
-          : await requestGateway<SessionCreateResponse>('session.create', params)
+          : await requestGateway<SessionCreateResponse>('session.create', params, STARTUP_REQUEST_TIMEOUT_MS)
 
         const stored = created.stored_session_id ?? null
 
@@ -626,9 +633,10 @@ export function useSessionActions({
               capturedRoute.connectionId,
               capturedRoute.profile,
               'session.create',
-              params
+              params,
+              STARTUP_REQUEST_TIMEOUT_MS
             )
-          : await requestGateway<SessionCreateResponse>('session.create', params)
+          : await requestGateway<SessionCreateResponse>('session.create', params, STARTUP_REQUEST_TIMEOUT_MS)
 
         const stored = created.stored_session_id
 
@@ -1607,7 +1615,7 @@ export function useSessionActions({
               ...(profile ? { profile } : {}),
               messages: branchMessages.map(({ content, role }) => ({ content, role })),
               ...(parentStoredId && { parent_session_id: parentStoredId })
-            })
+            }, STARTUP_REQUEST_TIMEOUT_MS)
 
         const responseBranchMessages =
           sourceSessionId && branched.messages?.length ? toBranchMessages(toChatMessages(branched.messages)) : []
