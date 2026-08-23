@@ -300,6 +300,16 @@ class WeComAdapter(BasePlatformAdapter):
             self._heartbeat_task = None
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
+
+        # Tear down any open thinking bubbles' keepalive tasks so they don't
+        # leak across reconnects (the bubble itself dies with the connection;
+        # WeCom's own stream timeout cleans the client-side placeholder).
+        for ka in self._thinking_keepalives.values():
+            ka.cancel()
+        self._thinking_keepalives.clear()
+        self._thinking_streams.clear()
+        self._finished_streams.clear()
+
         await self._cleanup_ws()
 
         if self._http_client:
