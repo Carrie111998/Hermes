@@ -179,7 +179,10 @@ def test_iteration_limit_result_is_not_reported_as_complete(emits, turn_env):
             "final_response": summary,
             "completed": False,
             "failed": False,
-            "turn_exit_reason": "max_iterations_reached(240/240)",
+            # The machine-readable kind remains authoritative even if the
+            # diagnostic reason's presentation changes.
+            "turn_exit_reason": "iteration_budget_exhausted(240/240)",
+            "turn_exit_kind": "max_iterations",
         },
         clear_interrupt=lambda: None,
     )
@@ -193,11 +196,13 @@ def test_iteration_limit_result_is_not_reported_as_complete(emits, turn_env):
     assert payload["status"] == "error"
     assert payload["error"] == summary
     assert payload["recoverable"] is True
+    assert payload["incomplete_reason"] == "max_iterations"
 
     snapshot = server._inflight_snapshot(session)
     assert snapshot is not None
     assert snapshot["status"] == "error"
     assert snapshot["error"] == summary
+    assert snapshot["incomplete_reason"] == "max_iterations"
 
 
 def test_returned_error_result_carries_error_surface(emits, turn_env):

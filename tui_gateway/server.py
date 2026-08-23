@@ -7915,7 +7915,10 @@ def _clear_inflight_turn(session: dict) -> None:
 
 
 def _fail_inflight_turn(
-    session: dict, error: Any, error_surface: Optional[dict] = None
+    session: dict,
+    error: Any,
+    error_surface: Optional[dict] = None,
+    incomplete_reason: Optional[str] = None,
 ) -> None:
     """Mark the in-flight turn terminal-error but keep it replayable.
 
@@ -7940,6 +7943,10 @@ def _fail_inflight_turn(
     turn["error"] = message or "turn failed"
     turn["status"] = "error"
     turn["recoverable"] = True
+    if incomplete_reason:
+        turn["incomplete_reason"] = incomplete_reason
+    else:
+        turn.pop("incomplete_reason", None)
     if error_surface:
         # Structured {layer, code, retryable} descriptor — replayed to
         # resuming clients via the resume snapshot so a reconnect renders the
@@ -8506,6 +8513,9 @@ def _inflight_snapshot(session: dict) -> dict | None:
         snapshot["error"] = error
         snapshot["status"] = str(turn.get("status") or "error")
         snapshot["recoverable"] = bool(turn.get("recoverable"))
+        incomplete_reason = str(turn.get("incomplete_reason") or "").strip()
+        if incomplete_reason:
+            snapshot["incomplete_reason"] = incomplete_reason
         surface = turn.get("error_surface")
         if isinstance(surface, dict) and surface:
             snapshot["error_surface"] = surface
@@ -11232,9 +11242,11 @@ def _run_prompt_submit(
                 # The iteration-summary fallback is useful assistant text, but
                 # it does not mean the requested work completed. Preserve it
                 # while exposing recoverable error semantics to clients.
-                _iteration_limit_incomplete = (
-                    result.get("completed") is False
-                    and str(result.get("turn_exit_reason") or "").startswith(
+                _iteration_limit_incomplete = result.get("completed") is False and (
+                    result.get("turn_exit_kind") == "max_iterations"
+                    # Compatibility with result producers predating the
+                    # structured turn-exit kind.
+                    or str(result.get("turn_exit_reason") or "").startswith(
                         "max_iterations_reached("
                     )
                 )
@@ -11323,6 +11335,9 @@ def _run_prompt_submit(
                             else raw
                         ),
                         error_surface=_error_surface,
+                        incomplete_reason=(
+                            "max_iterations" if _iteration_limit_incomplete else None
+                        ),
                     )
                     turn_error_retained = True
                 else:
@@ -11332,6 +11347,10 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
+                if _iteration_limit_incomplete:
+                    # Keep status/error for older clients' recoverable-turn
+                    # contract while giving newer UIs a non-failure semantic.
+                    payload["incomplete_reason"] = "max_iterations"
                 if _error_surface:
                     payload["error_surface"] = _error_surface
             _retire_turn_marker(session, marker_key)

@@ -704,6 +704,10 @@ def finalize_turn(
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
+        # Stable machine-readable provenance for callers. Human-readable
+        # turn_exit_reason keeps its diagnostic detail and may evolve without
+        # silently changing gateway completion semantics.
+        "turn_exit_kind": "max_iterations" if iteration_limit_fallback else None,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,

@@ -142,6 +142,7 @@ def test_blank_response_at_iteration_limit_requests_summary(monkeypatch):
     assert agent._handle_max_iterations_called is True
     assert result["final_response"] == "summary from extra call"
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    assert result["turn_exit_kind"] == "max_iterations"
     assert result["completed"] is False
 
 
