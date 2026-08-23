@@ -15,6 +15,7 @@ def test_classify_tool_failure_ignores_null_error_in_structured_success():
     results = (
         '{"results":[{"content":"short page","error":null}]}',
         '{"results":[{"error": \n\t null,"content":"short page"}]}',
+        '{"success":true,"error":null,"message":"done"}',
     )
     for result in results:
         assert classify_tool_failure("web_extract", result) == (False, "")
@@ -189,7 +190,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

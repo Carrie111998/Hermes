@@ -106,6 +106,10 @@ class TestDetectToolFailureStructured:
         result = '{"results":[{"error": \n\t null,"content":"short page"}]}'
         assert _detect_tool_failure("web_extract", result) == (False, "")
 
+    def test_null_error_with_success_message_not_flagged(self):
+        result = '{"success":true,"error":null,"message":"done"}'
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
     def test_other_structured_failure_markers_keep_legacy_fallback(self):
         results = (
             '{"results":[{"error":"timeout"}]}',
