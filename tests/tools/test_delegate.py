@@ -1400,7 +1400,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "route me",
-                    "route": "agy-flash-low",
+                    "route": "route-b-low",
                     "difficulty": "routine",
                     "difficulty_reason": "single literal response",
                     "required_capabilities": ["reasoning"],
@@ -1409,7 +1409,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(captured["route"], "agy-flash-low")
+        self.assertEqual(captured["route"], "route-b-low")
         self.assertEqual(captured["difficulty"], "routine")
         self.assertEqual(captured["difficulty_reason"], "single literal response")
         self.assertEqual(captured["required_capabilities"], ["reasoning"])
