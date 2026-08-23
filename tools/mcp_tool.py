@@ -100,6 +100,7 @@ import concurrent.futures
 import errno
 import fnmatch
 import inspect
+from importlib import metadata as importlib_metadata
 import json
 import logging
 import math
@@ -118,6 +119,13 @@ from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
+from tools.mcp_protocol import (
+    ProtocolNegotiationState,
+    ProtocolPolicy,
+    StaleConnectionGenerationError,
+    negotiate_protocol,
+    normalize_protocol_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -556,6 +564,8 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+_MAX_SUBSCRIPTION_RELISTENS = 3
+_SUBSCRIPTION_RELISTEN_DELAY = 0.25
 # While parked (reconnect budget exhausted, tools deregistered) the run task
 # wakes on this cadence and attempts one revival probe. Without it a parked
 # server is unrevivable: its tools are out of the registry, so no tool call
@@ -767,35 +777,6 @@ def _exc_str(exc: BaseException) -> str:
 # lazy so this module never triggers the ~260ms `mcp` import at import time).
 _JSONRPC_METHOD_NOT_FOUND = -32601
 
-# 2026-07-28 stateless servers answering a legacy ``initialize`` reject it
-# with one of these: UnsupportedProtocolVersion (-32022, spec-reserved range)
-# or plain method-not-found when the handshake methods are gone entirely.
-# Structural codes only — checked via _handshake_rejected_as_modern().
-_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION = -32022
-
-
-def _handshake_rejected_as_modern(exc: BaseException) -> bool:
-    """True when a failed ``initialize`` signals a 2026-07-28-only server.
-
-    Mirrors :func:`_is_method_not_found_error`'s structural-then-substring
-    shape (never ``isinstance`` on SDK exception types — the SDK wraps
-    task-group errors in ``ExceptionGroup`` and symbols drift across
-    generations; see references/sdk-exceptiongroup-wrapping.md).
-    """
-    err = getattr(exc, "error", None)
-    code = getattr(err, "code", None) or getattr(exc, "code", None)
-    if code in (_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION, _JSONRPC_METHOD_NOT_FOUND):
-        return True
-    msg = str(exc).lower()
-    if not msg:
-        return False
-    return (
-        "unsupported protocol version" in msg
-        or str(_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION) in msg
-        or _is_method_not_found_error(exc)
-    )
-
-
 def _is_method_not_found_error(exc: BaseException) -> bool:
     """Return True if *exc* is a JSON-RPC ``method not found`` (-32601).
 
@@ -900,8 +881,26 @@ def _prepend_path(env: dict, directory: str) -> dict:
 _MCP_LIST_MAX_PAGES = 50
 
 
+def _coerce_cache_ttl(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 async def _paginate_full_list(list_method, items_attr: str, server_name: str,
-                              cache_meta_out: Optional[dict] = None):
+                              cache_meta_out: Optional[dict] = None,
+                              protocol_era: Optional[str] = None):
     """Drain a paginated MCP ``list_*`` call by following ``nextCursor``.
 
     The MCP spec allows servers to paginate ``tools/list``,
@@ -917,10 +916,10 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
         items_attr: Result attribute holding the page's items
             (``"tools"``, ``"resources"``, or ``"prompts"``).
         server_name: For log messages.
-        cache_meta_out: Optional dict that receives the first page's
-            SEP-2549 cache hints (``ttl_ms``, ``cache_scope``) when the
-            server provides them (2026-07-28 servers MUST; earlier ones
-            won't). Callers use ``ttl_ms`` to bound the schema cache.
+        cache_meta_out: Optional dict that receives conservative SEP-2549
+            cache metadata aggregated across every page.
+        protocol_era: Negotiated era used to distinguish modern missing or
+            zero TTL metadata from legacy hintlessness.
 
     Returns:
         Combined list of items across all pages. Callers must hold the
@@ -929,6 +928,12 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
     """
     items: list = []
     cursor = None
+    era = protocol_era or "legacy"
+    missing_ttl = False
+    missing_scope = False
+    if cache_meta_out is not None:
+        cache_meta_out["protocol_era"] = era
+        cache_meta_out["metadata_complete"] = True
     for _ in range(_MCP_LIST_MAX_PAGES):
         if not cursor:
             result = await list_method()
@@ -944,13 +949,36 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
                     result = await list_method(cursor=cursor)
             except TypeError:
                 result = await list_method(cursor=cursor)
-        if cache_meta_out is not None and not items:
-            _ttl = mcp_field(result, "ttl_ms", "ttlMs")
-            _scope = mcp_field(result, "cache_scope", "cacheScope")
-            if _ttl is not None:
-                cache_meta_out["ttl_ms"] = _ttl
-            if _scope is not None:
-                cache_meta_out["cache_scope"] = _scope
+        if cache_meta_out is not None:
+            ttl = _coerce_cache_ttl(mcp_field(result, "ttl_ms", "ttlMs"))
+            scope = mcp_field(result, "cache_scope", "cacheScope")
+            if ttl is None:
+                missing_ttl = True
+                cache_meta_out["metadata_complete"] = False
+                if era == "modern" or "ttl_ms" in cache_meta_out:
+                    cache_meta_out["ttl_ms"] = 0.0
+            else:
+                previous_ttl = cache_meta_out.get("ttl_ms")
+                cache_meta_out["ttl_ms"] = (
+                    ttl if previous_ttl is None else min(float(previous_ttl), ttl)
+                )
+                if missing_ttl:
+                    cache_meta_out["ttl_ms"] = 0.0
+            if scope not in {"public", "private"}:
+                missing_scope = True
+                cache_meta_out["metadata_complete"] = False
+                if era == "modern" or "cache_scope" in cache_meta_out:
+                    cache_meta_out["cache_scope"] = "private"
+            else:
+                previous_scope = cache_meta_out.get("cache_scope")
+                if previous_scope is not None and previous_scope != scope:
+                    cache_meta_out["cache_scope"] = "private"
+                    cache_meta_out["scope_conflict"] = True
+                elif missing_scope:
+                    cache_meta_out["cache_scope"] = "private"
+                    cache_meta_out["scope_conflict"] = True
+                else:
+                    cache_meta_out["cache_scope"] = scope
         items.extend(getattr(result, items_attr, None) or [])
         cursor = mcp_field(result, "next_cursor", "nextCursor")
         # Per the MCP spec the cursor is an opaque string; anything else
@@ -2292,7 +2320,12 @@ class ElicitationHandler:
         # owner._pending_call_context we replay it here via
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
-        captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        captured = None
+        if self.owner is not None and (
+            getattr(self.owner, "_pending_call_generation", None)
+            == getattr(self.owner, "_connection_generation", None)
+        ):
+            captured = getattr(self.owner, "_pending_call_context", None)
 
         def _invoke_consent() -> str:
             if captured is None:
@@ -2363,11 +2396,15 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_mrtr_tasks", "_listen_task", "_listen_generation",
+        "_pending_call_context", "_pending_call_generation",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked",
+        "_protocol_policy", "_protocol_state", "_connection_generation",
+        "negotiated_era", "negotiated_protocol_version", "fallback_reason",
+        "subscription_state", "catalogue_state", "liveness_strategy", "cache_state",
     )
 
     def __init__(self, name: str):
@@ -2394,7 +2431,7 @@ class MCPServerTask:
         # UNPROVEN until it demonstrates real health — it survived at least
         # one full keepalive interval (keepalive success path) or served at
         # least one successful tool call. Only a proven session clears the
-        # reconnect budget; a transport that flaps right after the handshake
+        # reconnect budget; a transport that flaps right after negotiation
         # keeps getting charged and still reaches the park instead of
         # hot-cycling respawns forever.
         self._session_proven: bool = False
@@ -2412,6 +2449,9 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
+        self._pending_mrtr_tasks: set[asyncio.Task] = set()
+        self._listen_task: Optional[asyncio.Task] = None
+        self._listen_generation: Optional[int] = None
         # contextvars snapshot of the agent task that's currently in
         # session.call_tool(). The MCP recv loop dispatches incoming
         # elicitation/create requests on a SEPARATE asyncio task whose
@@ -2422,17 +2462,16 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._pending_call_generation: Optional[int] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
         self._idle_timeout_seconds: Optional[float] = None
         self._max_lifetime_seconds: Optional[float] = None
         self._recycled_reason: Optional[str] = None
-        # Captures the ``InitializeResult`` returned by
-        # ``await session.initialize()`` so downstream code can inspect the
-        # server's real advertised capabilities (``.capabilities.resources``,
-        # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
-        # method attribute corresponds to a supported server method. See #18051.
+        # Captures the negotiated discover or initialize result so downstream
+        # code can inspect the server's advertised capabilities instead of
+        # treating every ClientSession method as supported. See #18051.
         self.initialize_result: Optional[Any] = None
         # SEP-2549 cache hints from the last tools/list (ttl_ms, cache_scope).
         self._list_cache_meta: dict = {}
@@ -2442,6 +2481,16 @@ class MCPServerTask:
         # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
         # nor reconnect-loop. Reset on each fresh transport connection.
         self._ping_unsupported: bool = False
+        self._protocol_policy: Optional[ProtocolPolicy] = None
+        self._protocol_state: Optional[ProtocolNegotiationState] = None
+        self._connection_generation: int = 0
+        self.negotiated_era: Optional[str] = None
+        self.negotiated_protocol_version: Optional[str] = None
+        self.fallback_reason: Optional[str] = None
+        self.subscription_state: str = "idle"
+        self.catalogue_state: str = "stale"
+        self.liveness_strategy: str = "none"
+        self.cache_state: str = "uninitialised"
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -2467,86 +2516,91 @@ class MCPServerTask:
             return True
         return getattr(caps, "tools", None) is not None
 
+    def _assert_connection_generation(self, generation: int) -> None:
+        if generation != self._connection_generation:
+            raise StaleConnectionGenerationError(
+                generation,
+                self._connection_generation,
+            )
+
+    async def _cancel_generation_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in (
+                *self._pending_refresh_tasks,
+                *self._pending_mrtr_tasks,
+                self._listen_task,
+            )
+            if task is not None and task is not current
+        }
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending_refresh_tasks.clear()
+        self._pending_mrtr_tasks.clear()
+        self._listen_task = None
+        self._listen_generation = None
+
+    async def _begin_connection_generation(self) -> int:
+        self._connection_generation += 1
+        generation = self._connection_generation
+        self._pending_call_context = None
+        self._pending_call_generation = None
+        await self._cancel_generation_tasks()
+        self._protocol_state = None
+        self.negotiated_era = None
+        self.negotiated_protocol_version = None
+        self.fallback_reason = None
+        self._list_cache_meta = {}
+        self._ping_unsupported = False
+        self.subscription_state = "idle"
+        self.catalogue_state = "stale"
+        self.liveness_strategy = "none"
+        self.cache_state = "stale"
+        return generation
+
     async def _negotiate_session(self, session, connect_timeout: float):
-        """Negotiate the protocol era with the server and return its result.
-
-        MCP 2026-07-28 replaced the ``initialize``/``initialized`` handshake
-        with a stateless core: every request is self-describing and clients
-        MAY probe ``server/discover`` up front (SEP-2575). The SDK exposes
-        both paths on ``ClientSession`` (``initialize()`` / ``discover()``)
-        and ``adopt()``s whichever result installs the outbound stamp, so
-        the rest of this file is era-agnostic.
-
-        Per-server ``protocol`` config key:
-
-        - ``auto`` (default): try the legacy handshake FIRST, and fall back
-          to ``server/discover`` when the server signals it is modern-only
-          (``UnsupportedProtocolVersion`` -32022, or ``initialize`` missing
-          -32601). This is the reverse of the SDK's own discover-first auto
-          mode, on purpose: nearly every configured/catalog server today
-          speaks the handshake era, and initialize-first means ZERO extra
-          round-trips and zero behavior change for all of them, while
-          stateless-only servers still connect via the fallback.
-        - ``stateless``: probe ``server/discover`` first (one legacy retry
-          on MCPError, so a handshake-only server still connects).
-        - ``legacy``: handshake only, no fallback (escape hatch for servers
-          that misbehave on unknown methods).
-
-        Both result types expose ``.capabilities``, so downstream gates
-        (``_advertises_tools``, ``_select_utility_schemas``, the config
-        probe) work unchanged on either.
-        """
-        mode = str((self._config or {}).get("protocol", "auto")).lower().strip()
-        if mode in ("stateless", "modern", "2026-07-28"):
-            try:
-                return await asyncio.wait_for(
-                    session.discover(), timeout=connect_timeout
-                )
-            except asyncio.TimeoutError:
-                raise
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.info(
-                    "MCP server '%s': server/discover rejected (%s) despite "
-                    "protocol=%s — falling back to the legacy handshake",
-                    self.name, exc, mode,
-                )
-                return await asyncio.wait_for(
-                    session.initialize(), timeout=connect_timeout
-                )
-        if mode in ("legacy", "handshake"):
-            return await asyncio.wait_for(
-                session.initialize(), timeout=connect_timeout
-            )
-        if mode != "auto":
-            logger.warning(
-                "MCP server '%s': unknown protocol=%r — treating as 'auto' "
-                "(valid: auto, stateless, legacy)", self.name, mode,
-            )
+        policy = self._protocol_policy
+        if policy is None:
+            if "protocol" in (self._config or {}):
+                policy = normalize_protocol_policy(self._config["protocol"])
+            else:
+                policy = normalize_protocol_policy()
+        self._protocol_policy = policy
+        generation = await self._begin_connection_generation()
+        state = ProtocolNegotiationState(generation=generation, policy=policy)
+        self._protocol_state = state
         try:
-            return await asyncio.wait_for(
-                session.initialize(), timeout=connect_timeout
+            outcome = await negotiate_protocol(
+                session,
+                state,
+                timeout=connect_timeout,
+                assert_generation=self._assert_connection_generation,
             )
-        except asyncio.TimeoutError:
+        except BaseException:
+            self._assert_connection_generation(generation)
+            self.fallback_reason = state.fallback_reason
             raise
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if not _handshake_rejected_as_modern(exc):
-                raise
-            if not hasattr(session, "discover"):
-                # Legacy SDK generation (mcp 1.x) has no server/discover
-                # client — nothing to fall back to.
-                raise
-            logger.info(
-                "MCP server '%s': legacy handshake rejected (%s) — "
-                "retrying via server/discover (2026-07-28 stateless server)",
-                self.name, exc,
-            )
-            return await asyncio.wait_for(
-                session.discover(), timeout=connect_timeout
-            )
+        self._assert_connection_generation(generation)
+        self.negotiated_era = outcome.era
+        self.negotiated_protocol_version = outcome.protocol_version
+        self.fallback_reason = outcome.fallback_reason
+        self.liveness_strategy = (
+            "stateless-discover" if outcome.era == "modern" else "legacy-session-ping"
+        )
+        logger.info(
+            "MCP server '%s': protocol policy=%s negotiated era=%s version=%s "
+            "generation=%d",
+            self.name,
+            policy.value,
+            outcome.era,
+            outcome.protocol_version or "unknown",
+            generation,
+        )
+        return outcome.result
 
     def _is_recycled_stdio(self) -> bool:
         """Return True when a stdio server was intentionally recycled."""
@@ -2597,10 +2651,10 @@ class MCPServerTask:
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
-    async def _refresh_tools_task(self):
+    async def _refresh_tools_task(self, generation: int):
         """Run a dynamic tool refresh and log failures from background tasks."""
         try:
-            await self._refresh_tools()
+            await self._refresh_tools(generation=generation)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2608,10 +2662,202 @@ class MCPServerTask:
 
     def _schedule_tools_refresh(self) -> asyncio.Task:
         """Schedule a background tool refresh and keep it strongly referenced."""
-        task = asyncio.create_task(self._refresh_tools_task())
+        generation = self._connection_generation
+        task = asyncio.create_task(self._refresh_tools_task(generation))
         self._pending_refresh_tasks.add(task)
         task.add_done_callback(self._pending_refresh_tasks.discard)
         return task
+
+    def _subscription_filters(self) -> dict[str, bool]:
+        caps = getattr(self.initialize_result, "capabilities", None)
+        return {
+            "tools_list_changed": caps is None or getattr(caps, "tools", None) is not None,
+            "prompts_list_changed": caps is None or getattr(caps, "prompts", None) is not None,
+            "resources_list_changed": caps is None or getattr(caps, "resources", None) is not None,
+        }
+
+    async def _reconcile_subscription_catalogue(
+        self,
+        generation: int,
+        session: Any,
+        families: set[str],
+    ) -> None:
+        self._assert_connection_generation(generation)
+        if self.session is not session:
+            raise StaleConnectionGenerationError(
+                generation,
+                self._connection_generation,
+            )
+        self.catalogue_state = "stale"
+        filters = self._subscription_filters()
+        if "tools" in families and filters["tools_list_changed"]:
+            await self._refresh_tools(generation=generation)
+            self.catalogue_state = "stale"
+        for family, method_name in (
+            ("prompts", "list_prompts"),
+            ("resources", "list_resources"),
+        ):
+            if family not in families or not filters[f"{family}_list_changed"]:
+                continue
+            async with self._rpc_lock:
+                await _paginate_full_list(
+                    getattr(session, method_name),
+                    family,
+                    self.name,
+                    protocol_era=self.negotiated_era,
+                )
+            self._assert_connection_generation(generation)
+            if self.session is not session:
+                raise StaleConnectionGenerationError(
+                    generation,
+                    self._connection_generation,
+                )
+        self._assert_connection_generation(generation)
+        if self.session is not session:
+            raise StaleConnectionGenerationError(
+                generation,
+                self._connection_generation,
+            )
+        self.catalogue_state = "current"
+
+    async def _subscription_supervisor(self, generation: int, session: Any) -> None:
+        from mcp.client.subscriptions import (
+            ListenNotSupportedError,
+            PromptsListChanged,
+            ResourcesListChanged,
+            ToolsListChanged,
+            listen,
+        )
+
+        if generation != self._connection_generation or self.session is not session:
+            return
+
+        filters = self._subscription_filters()
+        relistens = 0
+        gap = False
+        try:
+            while generation == self._connection_generation and self.session is session:
+                self.subscription_state = "relistening" if gap else "establishing"
+                try:
+                    async with listen(session, **filters) as subscription:
+                        self._assert_connection_generation(generation)
+                        if self.session is not session:
+                            return
+                        honored = getattr(subscription, "honored", None)
+                        if honored is not None and not any(
+                            bool(getattr(honored, name, None))
+                            for name, requested in filters.items()
+                            if requested
+                        ):
+                            self.subscription_state = "unsupported"
+                            return
+                        self.subscription_state = "active"
+                        if gap:
+                            await self._reconcile_subscription_catalogue(
+                                generation,
+                                session,
+                                {
+                                    family
+                                    for family in ("tools", "prompts", "resources")
+                                    if filters[f"{family}_list_changed"]
+                                },
+                            )
+                        async for event in subscription:
+                            self._assert_connection_generation(generation)
+                            if self.session is not session:
+                                return
+                            if isinstance(event, ToolsListChanged):
+                                families = {"tools"}
+                            elif isinstance(event, PromptsListChanged):
+                                families = {"prompts"}
+                            elif isinstance(event, ResourcesListChanged):
+                                families = {"resources"}
+                            else:
+                                relistens = 0
+                                continue
+                            await self._reconcile_subscription_catalogue(
+                                generation,
+                                session,
+                                families,
+                            )
+                            relistens = 0
+                    gap_reason = "clean EOF"
+                except asyncio.CancelledError:
+                    raise
+                except ListenNotSupportedError:
+                    self._assert_connection_generation(generation)
+                    self.subscription_state = "unsupported"
+                    return
+                except StaleConnectionGenerationError:
+                    return
+                except Exception as exc:
+                    if _is_method_not_found_error(exc):
+                        self._assert_connection_generation(generation)
+                        self.subscription_state = "unsupported"
+                        return
+                    gap_reason = _exc_str(exc)
+
+                self._assert_connection_generation(generation)
+                if self.session is not session:
+                    return
+                self.catalogue_state = "stale"
+                if relistens >= _MAX_SUBSCRIPTION_RELISTENS:
+                    self.subscription_state = "exhausted"
+                    logger.warning(
+                        "MCP server '%s': subscription relisten exhausted after %d "
+                        "attempts (%s); reconnecting",
+                        self.name,
+                        relistens,
+                        gap_reason,
+                    )
+                    self._reconnect_event.set()
+                    return
+                relistens += 1
+                gap = True
+                self.subscription_state = "relistening"
+                logger.info(
+                    "MCP server '%s': subscription gap (%s); relisten %d/%d",
+                    self.name,
+                    gap_reason,
+                    relistens,
+                    _MAX_SUBSCRIPTION_RELISTENS,
+                )
+                await asyncio.sleep(_SUBSCRIPTION_RELISTEN_DELAY)
+        finally:
+            if generation == self._connection_generation and self.session is session:
+                if self.subscription_state not in {"unsupported", "exhausted"}:
+                    self.subscription_state = "stopped"
+
+    def _start_subscription_supervisor(self, generation: int) -> Optional[asyncio.Task]:
+        if self.negotiated_era != "modern":
+            self.subscription_state = "legacy-not-applicable"
+            return None
+        self._assert_connection_generation(generation)
+        session = self.session
+        if session is None:
+            return None
+        listener = self._listen_task
+        if listener is not None and not listener.done():
+            if self._listen_generation == generation:
+                return listener
+            raise RuntimeError(
+                f"MCP server '{self.name}' already owns a listener for generation "
+                f"{self._listen_generation}"
+            )
+        listener = asyncio.create_task(
+            self._subscription_supervisor(generation, session),
+            name=f"mcp-subscription-{self.name}-{generation}",
+        )
+        self._listen_task = listener
+        self._listen_generation = generation
+
+        def clear_owner(done: asyncio.Task) -> None:
+            if self._listen_task is done and self._listen_generation == generation:
+                self._listen_task = None
+                self._listen_generation = None
+
+        listener.add_done_callback(clear_owner)
+        return listener
 
     def _make_logging_callback(self):
         """Build a ``logging_callback`` for ``ClientSession``.
@@ -2647,17 +2893,26 @@ class MCPServerTask:
                 )
         return _on_log
 
-    def _make_message_handler(self):
+    def _make_message_handler(self, generation: Optional[int] = None):
         """Build a ``message_handler`` callback for ``ClientSession``.
 
         Dispatches on notification type.  Only ``ToolListChangedNotification``
         triggers a refresh; prompt and resource change notifications are
         logged as stubs for future work.
         """
+        handler_generation = (
+            self._connection_generation if generation is None else generation
+        )
+
         async def _handler(message):
             try:
+                if handler_generation != self._connection_generation:
+                    return
                 if isinstance(message, Exception):
                     logger.debug("MCP message handler (%s): exception: %s", self.name, message)
+                    self.catalogue_state = "stale"
+                    if not self._shutdown_event.is_set():
+                        self._reconnect_event.set()
                     return
                 if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
                     # mcp 2.0 turned ServerNotification from a RootModel into
@@ -2675,7 +2930,7 @@ class MCPServerTask:
                                 self.name,
                             )
                             # Some servers (notably mongodb-mcp-server) emit
-                            # tools/list_changed immediately after initialize,
+                            # tools/list_changed immediately after negotiation,
                             # while the client may already be executing another
                             # request. Refreshing synchronously inside the SDK
                             # notification handler can race with that request
@@ -2698,7 +2953,7 @@ class MCPServerTask:
                 logger.exception("Error in MCP message handler for '%s'", self.name)
         return _handler
 
-    async def _refresh_tools(self):
+    async def _refresh_tools(self, generation: Optional[int] = None):
         """Re-fetch tools from the server and update the registry.
 
         Called when the server sends ``notifications/tools/list_changed``.
@@ -2708,20 +2963,36 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
-        if not self._advertises_tools():
+        generation = self._connection_generation if generation is None else generation
+        self._assert_connection_generation(generation)
+        session = self.session
+        if session is None or not self._advertises_tools():
             # A server that doesn't implement tools/* should never send
             # tools/list_changed, but guard anyway — calling tools/list
             # would raise MCPError(-32601).
             return
 
         async with self._refresh_lock:
+            self._assert_connection_generation(generation)
+            self.catalogue_state = "stale"
             # Capture old tool names for change diff
             old_tool_names = set(self._registered_tool_names)
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
+                cache_meta: dict = {}
                 new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                    session.list_tools,
+                    "tools",
+                    self.name,
+                    cache_meta_out=cache_meta,
+                    protocol_era=self.negotiated_era,
+                )
+            self._assert_connection_generation(generation)
+            if self.session is not session:
+                raise StaleConnectionGenerationError(
+                    generation,
+                    self._connection_generation,
                 )
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
@@ -2746,6 +3017,7 @@ class MCPServerTask:
 
             # 3. Re-register with the fresh list. The helper may skip names that
             # are ambiguous after normalization.
+            self._list_cache_meta = cache_meta
             self._tools = new_mcp_tools
             registered_names = _register_server_tools(
                 self.name, self, self._config
@@ -2783,6 +3055,8 @@ class MCPServerTask:
                     "MCP server '%s': dynamically refreshed %d tool(s) (no changes)",
                     self.name, len(self._registered_tool_names),
                 )
+            self.catalogue_state = "current"
+            self.cache_state = "live"
 
     async def _keepalive_probe(self) -> None:
         """Exercise the session to detect a stale/expired connection.
@@ -2800,9 +3074,25 @@ class MCPServerTask:
         Raises on a genuine connection failure so the caller triggers a
         reconnect; returns normally when the session is alive.
         """
+        generation = self._connection_generation
+        session = self.session
+        if self.negotiated_era == "modern":
+            version = self.negotiated_protocol_version or "2026-07-28"
+            self.liveness_strategy = "stateless-discover"
+            async with self._rpc_lock:
+                await asyncio.wait_for(session.send_discover(version), timeout=30.0)
+            self._assert_connection_generation(generation)
+            if self.session is not session:
+                raise StaleConnectionGenerationError(
+                    generation,
+                    self._connection_generation,
+                )
+            return
+
+        self.liveness_strategy = "legacy-session-ping"
         if not self._ping_unsupported:
             try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
+                await asyncio.wait_for(session.send_ping(), timeout=30.0)
                 return
             except Exception as exc:
                 # Only a "method not found" means ping is unsupported. Any
@@ -2814,6 +3104,7 @@ class MCPServerTask:
                     # No ping, no tools → no cheaper probe to fall back to.
                     raise
                 self._ping_unsupported = True
+                self.liveness_strategy = "legacy-tools-list"
                 logger.info(
                     "MCP server '%s': does not implement the optional 'ping' "
                     "utility (-32601); using 'list_tools' for keepalive on "
@@ -2822,14 +3113,15 @@ class MCPServerTask:
                 )
 
         # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+        self.liveness_strategy = "legacy-tools-list"
+        await asyncio.wait_for(session.list_tools(), timeout=30.0)
 
     def _mark_session_proven(self) -> None:
         """Record that the current session demonstrated real health.
 
         Called from the keepalive success path (session survived at least one
         full keepalive interval) and the tool-call success path. Only then is
-        the reconnect budget cleared: a handshake that completes but drops
+        the reconnect budget cleared: negotiation that completes but drops
         moments later must keep consuming ``_reconnect_retries`` so a flapping
         transport still reaches the park instead of respawning forever
         (#62212 — 6212 spawns in 63h).
@@ -2949,6 +3241,12 @@ class MCPServerTask:
             return "shutdown"
         self._reconnect_event.clear()
         return "reconnect"
+
+    async def _wait_for_lifecycle_and_stop_generation(self) -> str:
+        try:
+            return await self._wait_for_lifecycle_event()
+        finally:
+            await self._cancel_generation_tasks()
 
     async def _wait_for_reconnect_or_shutdown(
         self, timeout: Optional[float] = None
@@ -3074,7 +3372,9 @@ class MCPServerTask:
         if self._elicitation:
             sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
-            sampling_kwargs["message_handler"] = self._make_message_handler()
+            sampling_kwargs["message_handler"] = self._make_message_handler(
+                self._connection_generation + 1
+            )
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
 
@@ -3134,8 +3434,8 @@ class MCPServerTask:
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
-                    # Bound the MCP handshake. A stdio server that never
-                    # completes ``initialize`` (e.g. emits a non-JSON-RPC frame
+                    # Bound MCP negotiation. A stdio server that never answers
+                    # the first flight (e.g. emits a non-JSON-RPC frame
                     # and then blocks on stdin) otherwise hangs this coroutine
                     # forever on the background loop: ``connect_timeout`` only
                     # bounds the caller's ``.result()`` wait, not the coroutine
@@ -3154,13 +3454,14 @@ class MCPServerTask:
                     self.session = session
                     self._mark_lifecycle_started()
                     await self._discover_tools()
+                    self._start_subscription_supervisor(self._connection_generation)
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
                     _reset_server_error(self.name)
-                    # A completed handshake alone is NOT proof of health: a
-                    # flapping transport can handshake fine and drop moments
+                    # Completed negotiation alone is NOT proof of health: a
+                    # flapping transport can negotiate and drop moments
                     # later, forever (#62212). The session must prove itself
                     # (keepalive success or a successful tool call) before the
                     # reconnect budget is cleared — see _mark_session_proven.
@@ -3168,7 +3469,7 @@ class MCPServerTask:
                     # stdio transport does not use OAuth, but we still honor
                     # _reconnect_event (e.g. future manual /mcp refresh) for
                     # consistency with _run_http.
-                    return await self._wait_for_lifecycle_event()
+                    return await self._wait_for_lifecycle_and_stop_generation()
         finally:
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
@@ -3228,19 +3529,16 @@ class MCPServerTask:
         here catches that in ≤ ``timeout`` seconds and raises
         :class:`NonMcpEndpointError` with an actionable message.
 
-        Detection is allow-list based: a 2xx response is rejected only when it
-        carries a definite content type that is NOT one an MCP endpoint uses
-        (``application/json`` / ``text/event-stream``).  When HEAD/GET returns
-        a non-MCP content type (e.g. ``text/html``), a lightweight JSON-RPC
-        ``initialize`` POST is attempted before giving up — some servers
-        (e.g. DocuSeal) serve a web UI on GET but speak Streamable HTTP only
-        via POST.
+        Detection is allow-list based. A 2xx response with a non-MCP content
+        type is rejected only when the endpoint explicitly advertises an
+        ``Allow`` set without POST. Otherwise it is ambiguous because some
+        servers expose HTML on HEAD/GET and MCP only on POST, so the response
+        is left to the authoritative protocol negotiation.
 
         A missing or empty content type, non-2xx status, or any
         network/transport error passes through silently — the probe is
-        strictly best-effort, and the real handshake remains the source of
-        truth for everything except the unambiguous "this is a web page,
-        not MCP" case.
+        strictly best-effort. It never sends JSON-RPC, ensuring the actual
+        ``server/discover`` request remains the protocol first flight.
 
         Runs on its own httpx client OUTSIDE the SDK's anyio task group, so the
         raised error propagates as itself rather than being wrapped in an
@@ -3269,51 +3567,11 @@ class MCPServerTask:
                 if resp.status_code in (405, 501):
                     resp = await client.get(url, headers=probe_headers)
 
-                # Some MCP servers (e.g. DocuSeal) serve their web UI on
-                # HEAD/GET but speak Streamable HTTP only via POST.  Before
-                # rejecting the endpoint, try a lightweight JSON-RPC POST
-                # probe so we don't false-positive on POST-only servers.
-                ct = (
-                    resp.headers.get("content-type", "")
-                    .split(";")[0]
-                    .strip()
-                    .lower()
-                )
-                if (
-                    ct
-                    and ct not in self._MCP_CONTENT_TYPES
-                    and 200 <= resp.status_code < 300
-                ):
-                    post_resp = await client.post(
-                        url,
-                        headers={
-                            **probe_headers,
-                            "Content-Type": "application/json",
-                            "Accept": "application/json, text/event-stream",
-                        },
-                        content=(
-                            '{"jsonrpc":"2.0","id":"_probe",'
-                            '"method":"initialize",'
-                            '"params":{"protocolVersion":"2025-03-26",'
-                            '"capabilities":{},'
-                            '"clientInfo":{"name":"hermes-probe",'
-                            '"version":"0.1"}}}'
-                        ),
-                    )
-                    if 200 <= post_resp.status_code < 300:
-                        post_ct = (
-                            post_resp.headers.get("content-type", "")
-                            .split(";")[0]
-                            .strip()
-                            .lower()
-                        )
-                        if post_ct in self._MCP_CONTENT_TYPES:
-                            resp = post_resp
         except _httpx.HTTPError:
             return  # DNS/connect/timeout/transport error — let the SDK try.
 
         # Only judge successful responses. A 4xx/5xx may be an auth challenge
-        # or a transient error the real handshake handles correctly.
+        # or a transient error the real negotiation handles correctly.
         if not (200 <= resp.status_code < 300):
             return
 
@@ -3322,6 +3580,17 @@ class MCPServerTask:
             return  # No content type advertised — don't second-guess the SDK.
         if ct_base in self._MCP_CONTENT_TYPES:
             return  # Looks like a real MCP endpoint.
+
+        allow_header = resp.headers.get("allow", "")
+        if not allow_header:
+            return
+        allowed_methods = {
+            method.strip().upper()
+            for method in allow_header.split(",")
+            if method.strip()
+        }
+        if "POST" in allowed_methods:
+            return
 
         raise NonMcpEndpointError(
             f"MCP server '{self.name}' at {url} returned Content-Type "
@@ -3356,7 +3625,7 @@ class MCPServerTask:
         - the group carries a real ``CancelledError`` (task cancellation must
           propagate to asyncio, mirroring the ``run()`` guard for #9930);
         - we never reached a live session this attempt (``_ready`` unset) — a
-          connect/handshake failure SHOULD fall through to ``run()``'s backoff
+          connect/negotiation failure SHOULD fall through to ``run()``'s backoff
           rather than hot-loop reconnects against a broken endpoint.
         """
         if self._shutdown_event.is_set():
@@ -3398,18 +3667,10 @@ class MCPServerTask:
         # Optional per-user identity header (config-gated; static or
         # profile-derived). Explicit headers of the same name win.
         headers = _apply_identity_header(self.name, config, headers)
-        # Some MCP servers require MCP-Protocol-Version on the initial
-        # initialize request and reject session-less POSTs otherwise.
-        # Seed it as a client-level default, but treat user overrides as
-        # case-insensitive so conventional casing is preserved.
-        #
-        # Seeded from the HANDSHAKE version, not the latest one: this transport
-        # connects via `ClientSession.initialize()`, which sends
-        # LATEST_HANDSHAKE_VERSION (2025-11-25) in the body. Advertising
-        # 2026-07-28 in the header routes the request onto the server's
-        # per-request-envelope ladder, which then rejects the legacy body for
-        # missing its required `params._meta` envelope keys. The header has to
-        # agree with what the body actually speaks.
+        # Keep a handshake-compatible client default for the one bounded
+        # discover-to-initialize legacy proof. Modern discover requests carry
+        # a per-message 2026-07-28 header from ClientSession and override this
+        # default; the SDK clears that modern stamp before initialize.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
@@ -3437,7 +3698,9 @@ class MCPServerTask:
         if self._elicitation:
             sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
-            sampling_kwargs["message_handler"] = self._make_message_handler()
+            sampling_kwargs["message_handler"] = self._make_message_handler(
+                self._connection_generation + 1
+            )
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
 
@@ -3516,15 +3779,16 @@ class MCPServerTask:
                     async with ClientSession(
                         read_stream, write_stream, **sampling_kwargs
                     ) as session:
-                        # Bound the handshake — same orphaned-task hang as the
+                        # Bound negotiation — same orphaned-task hang as the
                         # stdio path (#59349): an endpoint that accepts the
-                        # connection but never answers ``initialize`` parks this
+                        # connection but never answers the first flight parks this
                         # coroutine forever on the background loop.
                         self.initialize_result = await self._negotiate_session(
                             session, float(connect_timeout)
                         )
                         self.session = session
                         await self._discover_tools()
+                        self._start_subscription_supervisor(self._connection_generation)
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
@@ -3532,7 +3796,7 @@ class MCPServerTask:
                         _reset_server_error(self.name)
                         # Unproven until keepalive/tool-call success (#62212).
                         self._session_proven = False
-                        reason = await self._wait_for_lifecycle_event()
+                        reason = await self._wait_for_lifecycle_and_stop_generation()
                         if reason == "reconnect":
                             logger.info(
                                 "MCP server '%s': reconnect requested — "
@@ -3584,12 +3848,13 @@ class MCPServerTask:
                     async with streamable_http_client(url, http_client=http_client) as _streams:
                         read_stream, write_stream = _streams[0], _streams[1]
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                            # Bound the handshake (#59349) — see stdio path.
+                            # Bound negotiation (#59349) — see stdio path.
                             self.initialize_result = await self._negotiate_session(
                                 session, float(connect_timeout)
                             )
                             self.session = session
                             await self._discover_tools()
+                            self._start_subscription_supervisor(self._connection_generation)
                             self._ready.set()
                             # Session is live again: clear any breaker state from
                             # a prior outage so the first call after recovery
@@ -3597,7 +3862,7 @@ class MCPServerTask:
                             _reset_server_error(self.name)
                             # Unproven until keepalive/tool-call success (#62212).
                             self._session_proven = False
-                            reason = await self._wait_for_lifecycle_event()
+                            reason = await self._wait_for_lifecycle_and_stop_generation()
                             if reason == "reconnect":
                                 logger.info(
                                     "MCP server '%s': reconnect requested — "
@@ -3631,12 +3896,13 @@ class MCPServerTask:
                     read_stream, write_stream, _get_session_id,
                 ):
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                        # Bound the handshake (#59349) — see stdio path.
+                        # Bound negotiation (#59349) — see stdio path.
                         self.initialize_result = await self._negotiate_session(
                             session, float(connect_timeout)
                         )
                         self.session = session
                         await self._discover_tools()
+                        self._start_subscription_supervisor(self._connection_generation)
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
@@ -3644,7 +3910,7 @@ class MCPServerTask:
                         _reset_server_error(self.name)
                         # Unproven until keepalive/tool-call success (#62212).
                         self._session_proven = False
-                        reason = await self._wait_for_lifecycle_event()
+                        reason = await self._wait_for_lifecycle_and_stop_generation()
                         if reason == "reconnect":
                             logger.info(
                                 "MCP server '%s': reconnect requested — "
@@ -3656,7 +3922,7 @@ class MCPServerTask:
                 reason = self._reconnect_or_reraise_group(_eg)
             return reason
 
-    async def _discover_tools(self):
+    async def _discover_tools(self, generation: Optional[int] = None):
         """Discover tools from the connected session.
 
         Capability-gated: prompt-only / resource-only MCP servers don't
@@ -3666,13 +3932,23 @@ class MCPServerTask:
         server doesn't advertise the ``tools`` capability.
         (Ported from anomalyco/opencode#31271.)
         """
+        generation = self._connection_generation if generation is None else generation
+        self._assert_connection_generation(generation)
+        session = self.session
+
         # Fresh transport connection → re-probe with the cheap ``ping`` path.
         # Clears any latch from a prior connection in case the server gained
         # ping support across the reconnect.
         self._ping_unsupported = False
-        if self.session is None:
+        if session is None:
             return
         if not self._advertises_tools():
+            self._assert_connection_generation(generation)
+            if self.session is not session:
+                raise StaleConnectionGenerationError(
+                    generation,
+                    self._connection_generation,
+                )
             logger.info(
                 "MCP server '%s': does not advertise 'tools' capability — "
                 "skipping tools/list (prompts/resources remain available)",
@@ -3680,14 +3956,27 @@ class MCPServerTask:
             )
             self._tools = []
             self._register_discovered_tools_if_needed()
+            self.catalogue_state = "current"
+            self.cache_state = "live"
             return
         async with self._rpc_lock:
-            self._list_cache_meta = {}
-            self._tools = await _paginate_full_list(
-                self.session.list_tools, "tools", self.name,
-                cache_meta_out=self._list_cache_meta,
+            cache_meta: dict = {}
+            tools = await _paginate_full_list(
+                session.list_tools, "tools", self.name,
+                cache_meta_out=cache_meta,
+                protocol_era=self.negotiated_era,
             )
+        self._assert_connection_generation(generation)
+        if self.session is not session:
+            raise StaleConnectionGenerationError(
+                generation,
+                self._connection_generation,
+            )
+        self._list_cache_meta = cache_meta
+        self._tools = tools
         self._register_discovered_tools_if_needed()
+        self.catalogue_state = "current"
+        self.cache_state = "live"
 
     def _register_discovered_tools_if_needed(self) -> None:
         """Re-register tools after an owned server reconnects if needed.
@@ -3725,6 +4014,10 @@ class MCPServerTask:
         connection drops unexpectedly (unless shutdown was requested).
         """
         self._config = config
+        if "protocol" in config:
+            self._protocol_policy = normalize_protocol_policy(config["protocol"])
+        else:
+            self._protocol_policy = normalize_protocol_policy()
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
@@ -3842,7 +4135,7 @@ class MCPServerTask:
                 # A clean transport return means a session was established and
                 # then asked to rebuild (auth recovery / manual refresh /
                 # keepalive failure / transport TaskGroup drop). That alone is
-                # NOT proof of health: a flapping transport handshakes fine and
+                # NOT proof of health: a flapping transport negotiates and
                 # drops moments later, and resetting the budget here let such
                 # servers respawn forever (#62212 — 6212 spawns in 63h).
                 # Only clear the consecutive-failure budget once the session
@@ -4122,6 +4415,7 @@ class MCPServerTask:
                 if self._shutdown_event.is_set():
                     return
             finally:
+                await self._cancel_generation_tasks()
                 self.session = None
 
     async def start(self, config: dict):
@@ -4165,11 +4459,7 @@ class MCPServerTask:
                     await self._task
                 except asyncio.CancelledError:
                     pass
-        if self._pending_refresh_tasks:
-            for task in list(self._pending_refresh_tasks):
-                task.cancel()
-            await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
-            self._pending_refresh_tasks.clear()
+        await self._cancel_generation_tasks()
         self._deregister_tools()
         self.session = None
 
@@ -5743,6 +6033,155 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+async def _call_with_input_required(
+    server: MCPServerTask,
+    session_method,
+    *args,
+    timeout: Optional[float] = None,
+    **kwargs,
+):
+    from mcp.client import InputRequiredRoundsExceededError
+    from mcp.client.session import ClientRequestContext
+    from mcp.shared.exceptions import MCPError
+    from mcp.types import ErrorData, InputRequiredResult
+
+    session = server.session
+    if session is None:
+        raise RuntimeError(f"MCP server '{server.name}' is not connected")
+    generation = getattr(server, "_connection_generation", None)
+    raw_max_rounds = (getattr(server, "_config", None) or {}).get(
+        "input_required_max_rounds", 10
+    )
+    try:
+        max_rounds = int(raw_max_rounds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("input_required_max_rounds must be a positive integer") from exc
+    if max_rounds < 1:
+        raise ValueError("input_required_max_rounds must be a positive integer")
+
+    supports_read_timeout = "read_timeout_seconds" in _method_params(session_method)
+    captured_context = contextvars.copy_context()
+    operation = asyncio.current_task()
+    pending_tasks = getattr(server, "_pending_mrtr_tasks", None)
+    if operation is not None and pending_tasks is not None:
+        pending_tasks.add(operation)
+    server._pending_call_context = captured_context
+    server._pending_call_generation = generation
+
+    def assert_current() -> None:
+        current_generation = getattr(server, "_connection_generation", None)
+        if generation is not None and current_generation != generation:
+            raise StaleConnectionGenerationError(generation, current_generation)
+        if server.session is not session:
+            raise RuntimeError(
+                f"MCP server '{server.name}' replaced its session without advancing "
+                "the connection generation"
+            )
+
+    async def invoke(
+        *,
+        input_responses=None,
+        request_state=None,
+        continuation: bool = False,
+    ):
+        assert_current()
+        call_kwargs = dict(kwargs)
+        call_kwargs["allow_input_required"] = True
+        if continuation:
+            call_kwargs["input_responses"] = input_responses
+            call_kwargs["request_state"] = request_state
+        if supports_read_timeout and timeout is not None:
+            call_kwargs["read_timeout_seconds"] = float(timeout)
+        result = await session_method(*args, **call_kwargs)
+        assert_current()
+        return result
+
+    async def dispatch(key: str, request):
+        assert_current()
+        context = ClientRequestContext(
+            session=session,
+            request_id=key,
+            meta=getattr(getattr(request, "params", None), "meta", None),
+        )
+        task = asyncio.create_task(
+            session.dispatch_input_request(context, request),
+            context=captured_context.copy(),
+        )
+        response = await task
+        assert_current()
+        return response
+
+    async def drive():
+        result = await invoke()
+        rounds = 0
+        state_only_delay = 0.05
+        while isinstance(result, InputRequiredResult):
+            rounds += 1
+            if rounds > max_rounds:
+                raise InputRequiredRoundsExceededError(max_rounds)
+            input_requests = getattr(result, "input_requests", None)
+            request_state = getattr(result, "request_state", None)
+            if input_requests is not None and not isinstance(input_requests, dict):
+                raise RuntimeError("malformed MCP continuation input_requests")
+            if request_state is not None and not isinstance(request_state, str):
+                raise RuntimeError("malformed MCP continuation request_state")
+            if not input_requests and request_state is None:
+                raise RuntimeError(
+                    "malformed MCP continuation has neither input requests nor request state"
+                )
+
+            responses = None
+            if input_requests:
+                state_only_delay = 0.05
+                responses = {}
+                for key, request in input_requests.items():
+                    if not isinstance(key, str):
+                        raise RuntimeError("malformed MCP continuation request key")
+                    response = await dispatch(key, request)
+                    if isinstance(response, ErrorData):
+                        raise MCPError.from_error_data(response)
+                    responses[key] = response
+            else:
+                await asyncio.sleep(state_only_delay)
+                assert_current()
+                state_only_delay = min(state_only_delay * 2, 0.25)
+
+            result = await invoke(
+                input_responses=responses,
+                request_state=request_state,
+                continuation=True,
+            )
+        return result
+
+    try:
+        async with asyncio.timeout(timeout):
+            return await drive()
+    except asyncio.CancelledError:
+        current_generation = getattr(server, "_connection_generation", None)
+        if generation is not None and current_generation != generation:
+            raise StaleConnectionGenerationError(
+                generation,
+                current_generation,
+            ) from None
+        raise
+    finally:
+        if operation is not None and pending_tasks is not None:
+            pending_tasks.discard(operation)
+        if (
+            getattr(server, "_pending_call_generation", None) == generation
+            and getattr(server, "_pending_call_context", None) is captured_context
+        ):
+            server._pending_call_context = None
+            server._pending_call_generation = None
+
+
+def _method_params(session_method) -> set[str]:
+    try:
+        return set(inspect.signature(session_method).parameters)
+    except (TypeError, ValueError):
+        return set()
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -5807,7 +6246,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # transport — which respawns a dead stdio subprocess — and
                 # return a clean "reconnecting" error so the model backs off
                 # without burning iterations. The breaker resets once the
-                # fresh session initializes (_run_stdio/_run_http call
+                # fresh session negotiates (_run_stdio/_run_http call
                 # _reset_server_error).
                 _bump_server_error(server_name)
                 if _signal_reconnect(server):
@@ -5821,15 +6260,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                # Snapshot the agent's context so an elicitation callback
-                # triggered during this call (fired on the MCP recv loop
-                # task, which doesn't inherit our contextvars) can replay
-                # it and detect the gateway platform / session for routing.
-                server._pending_call_context = contextvars.copy_context()
-                try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
-                finally:
-                    server._pending_call_context = None
+                result = await _call_with_input_required(
+                    server,
+                    server.session.call_tool,
+                    tool_name,
+                    arguments=args,
+                    timeout=tool_timeout,
+                )
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
@@ -6084,7 +6521,12 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                result = await server.session.read_resource(uri)
+                result = await _call_with_input_required(
+                    server,
+                    server.session.read_resource,
+                    uri,
+                    timeout=tool_timeout,
+                )
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
             contents = result.contents if hasattr(result, "contents") else []
@@ -6207,7 +6649,13 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                result = await server.session.get_prompt(name, arguments=arguments)
+                result = await _call_with_input_required(
+                    server,
+                    server.session.get_prompt,
+                    name,
+                    arguments=arguments,
+                    timeout=tool_timeout,
+                )
             # GetPromptResult has .messages list
             messages = []
             for msg in (result.messages if hasattr(result, "messages") else []):
@@ -6639,7 +7087,7 @@ _UTILITY_CAPABILITY_METHODS = {
 }
 
 # Maps each utility handler to the MCP capability key that must be non-None
-# on the server's ``initialize`` response for the handler to be registered.
+# on the negotiated capabilities for the handler to be registered.
 # Source of truth: MCP spec — capabilities.resources / capabilities.prompts
 # are present on the response only when the server actually implements
 # those request families. Without this gate, tools-only servers (e.g.
@@ -6709,7 +7157,7 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
                 continue
         else:
             # Legacy fallback for test fixtures or older code paths where
-            # initialize_result wasn't captured. Preserves the old behavior
+            # Negotiation result wasn't captured. Preserves the old behavior
             # of registering every stub in that case rather than regressing
             # any server that was working before this fix.
             required_method = _UTILITY_CAPABILITY_METHODS[handler_key]
@@ -6974,7 +7422,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
         try:
-            from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+            from tools.mcp_schema_cache import (
+                config_digest,
+                config_fingerprint,
+                write_cache_entry,
+            )
 
             tools_payload: List[dict] = []
             for mcp_tool in server._tools:
@@ -6998,7 +7450,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             ]
             write_cache_entry(
                 name,
-                config_fingerprint(config),
+                config_fingerprint(config, server_name=name),
+                config_digest=config_digest(config),
+                protocol_era=server.negotiated_era or "legacy",
                 tools=tools_payload,
                 utility_tools=utility_payload,
                 ttl_ms=(getattr(server, "_list_cache_meta", None) or {}).get("ttl_ms"),
@@ -7037,7 +7491,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
-    fingerprint = config_fingerprint(config)
+    fingerprint = config_fingerprint(config, server_name=name)
     tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(
@@ -7299,16 +7753,38 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     eager_servers: Dict[str, dict] = dict(new_servers)
     lazy_registered = 0
     lazy_server_count = 0
+    cache_helpers = None
     try:
-        from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
+        from tools.mcp_schema_cache import (
+            config_digest,
+            config_fingerprint,
+            expected_protocol_era,
+            get_cached_entry,
+        )
+        cache_helpers = (
+            config_digest,
+            config_fingerprint,
+            expected_protocol_era,
+            get_cached_entry,
+        )
     except Exception:  # pragma: no cover - cache module missing
-        config_fingerprint = None  # type: ignore[assignment]
-        get_cached_entry = None  # type: ignore[assignment]
-    if config_fingerprint is not None and get_cached_entry is not None:
+        pass
+    if cache_helpers is not None:
+        (
+            config_digest,
+            config_fingerprint,
+            expected_protocol_era,
+            get_cached_entry,
+        ) = cache_helpers
         for name, cfg in new_servers.items():
             if not _resolve_server_lazy(name, cfg):
                 continue
-            entry = get_cached_entry(name, config_fingerprint(cfg))
+            entry = get_cached_entry(
+                name,
+                config_fingerprint(cfg, server_name=name),
+                config_digest=config_digest(cfg),
+                protocol_era=expected_protocol_era(cfg),
+            )
             if not entry:
                 continue
             with _lock:
@@ -7539,6 +8015,46 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return bool(server_name and server_name in _parallel_safe_servers)
 
 
+def _mcp_sdk_version() -> Optional[str]:
+    try:
+        return importlib_metadata.version("mcp")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _mcp_protocol_status(server: Optional[MCPServerTask], config: dict) -> dict:
+    policy = getattr(server, "_protocol_policy", None)
+    if isinstance(policy, ProtocolPolicy):
+        configured_policy = policy.value
+    else:
+        try:
+            configured_policy = normalize_protocol_policy(
+                config["protocol"] if "protocol" in config else "auto"
+            ).value
+        except (TypeError, ValueError):
+            configured_policy = "invalid"
+    protocol_state = getattr(server, "_protocol_state", None)
+    return {
+        "configured_policy": configured_policy,
+        "negotiated_era": getattr(server, "negotiated_era", None),
+        "negotiated_protocol_version": getattr(
+            server,
+            "negotiated_protocol_version",
+            None,
+        ),
+        "connection_generation": getattr(server, "_connection_generation", 0),
+        "fallback_reason": getattr(server, "fallback_reason", None),
+        "legacy_proof_attempted": bool(
+            getattr(protocol_state, "legacy_proof_attempted", False)
+        ),
+        "liveness_strategy": getattr(server, "liveness_strategy", "none"),
+        "subscription_state": getattr(server, "subscription_state", "idle"),
+        "catalogue_state": getattr(server, "catalogue_state", "stale"),
+        "cache_state": getattr(server, "cache_state", "uninitialised"),
+        "mcp_sdk_version": _mcp_sdk_version(),
+    }
+
+
 def get_mcp_status() -> List[dict]:
     """Return status of all configured MCP servers for banner display.
 
@@ -7574,30 +8090,29 @@ def get_mcp_status() -> List[dict]:
             }
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
-            result.append(entry)
         elif not enabled:
             # A server with enabled: false is intentionally not connected — it is
             # disabled, not failed. Surface that distinction so consumers (banner,
             # TUI) can render "disabled" rather than an alarming "failed".
-            result.append({
+            entry = {
                 "name": name,
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
                 "disabled": True,
                 "status": "disabled",
-            })
+            }
         elif name in connecting:
-            result.append({
+            entry = {
                 "name": name,
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
                 "disabled": False,
                 "status": "connecting",
-            })
+            }
         elif name in connect_errors:
-            result.append({
+            entry = {
                 "name": name,
                 "transport": transport,
                 "tools": 0,
@@ -7605,16 +8120,18 @@ def get_mcp_status() -> List[dict]:
                 "disabled": False,
                 "status": "failed",
                 "error": connect_errors[name],
-            })
+            }
         else:
-            result.append({
+            entry = {
                 "name": name,
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
                 "disabled": False,
                 "status": "configured",
-            })
+            }
+        entry["protocol"] = _mcp_protocol_status(server, cfg)
+        result.append(entry)
 
     return result
 

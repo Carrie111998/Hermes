@@ -1623,9 +1623,31 @@ class _CuaDriverSession:
             )
 
             async with stdio_client(params) as (read, write):
-                self._startup_phase = "mcp-initialize"
+                self._startup_phase = "mcp-negotiate"
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    from tools.mcp_protocol import (
+                        ProtocolNegotiationState,
+                        ProtocolPolicy,
+                        StaleConnectionGenerationError,
+                        negotiate_protocol,
+                    )
+
+                    generation = self._transport_generation + 1
+
+                    def assert_generation(expected: int) -> None:
+                        current = self._transport_generation + 1
+                        if current != expected:
+                            raise StaleConnectionGenerationError(expected, current)
+
+                    await negotiate_protocol(
+                        session,
+                        ProtocolNegotiationState(
+                            generation=generation,
+                            policy=ProtocolPolicy.AUTO,
+                        ),
+                        timeout=30.0,
+                        assert_generation=assert_generation,
+                    )
                     _t_init = _time.monotonic()
                     # Populate capabilities + capability_version BEFORE
                     # exposing the session to callers, so the first
