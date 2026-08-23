@@ -1,18 +1,21 @@
 # Stress / battle-test suite
 
-Long-running tests that exercise the Kanban kernel under adversarial
-conditions. **Not run by `scripts/run_tests.sh`** because they can
+Long-running scripts that exercise the Kanban kernel under adversarial
+conditions. They are **not run by `scripts/run_tests.sh`** because they can
 take 30+ seconds each and spawn real subprocesses.
 
-Run manually:
+These files are standalone `__main__` programs, not pytest test modules.
+Running `pytest tests/stress/` intentionally collects zero tests. Run the
+scripts directly, or use `.github/workflows/stress-nightly.yml`.
+
+Run manually from the repository root:
 
 ```bash
-./venv/bin/python -m pytest tests/stress/ -v -s
-# or individual files:
-./venv/bin/python tests/stress/test_concurrency.py
-./venv/bin/python tests/stress/test_subprocess_e2e.py
-./venv/bin/python tests/stress/test_property_fuzzing.py
-./venv/bin/python tests/stress/test_benchmarks.py
+source .venv/bin/activate
+python tests/stress/test_concurrency.py
+python tests/stress/test_subprocess_e2e.py
+python tests/stress/test_property_fuzzing.py
+python tests/stress/test_benchmarks.py
 ```
 
 ## What's covered

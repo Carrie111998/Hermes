@@ -12,6 +12,7 @@ This validates the IPC + lifecycle story that mocks can't:
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,9 @@ def make_spawn_fn(home: str):
             "PYTHONPATH": WT,
             "HERMES_KANBAN_TASK": task.id,
             "HERMES_KANBAN_WORKSPACE": workspace,
-            "PATH": f"{os.path.dirname(PY)}:{os.environ.get('PATH','')}",
+            "PATH": os.pathsep.join(
+                [os.path.dirname(PY), os.environ.get("PATH", "")]
+            ),
         }
         log_f = open(log_path, "ab")
         proc = subprocess.Popen(
@@ -52,6 +55,10 @@ def make_spawn_fn(home: str):
 
 
 def main():
+    if os.name == "nt":
+        print("SKIP: test_subprocess_e2e requires a POSIX shell shim")
+        return
+
     home = tempfile.mkdtemp(prefix="hermes_e2e_")
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
@@ -68,7 +75,13 @@ def main():
 exec {PY} -m hermes_cli.main "$@"
 """)
     os.chmod(shim_path, 0o755)
-    os.environ["PATH"] = f"{shim_dir}:{os.environ.get('PATH','')}"
+    os.environ["PATH"] = os.pathsep.join([shim_dir, os.environ.get("PATH", "")])
+    resolved_hermes = shutil.which("hermes")
+    if not resolved_hermes or Path(resolved_hermes).resolve() != Path(shim_path).resolve():
+        raise RuntimeError(
+            "test_subprocess_e2e resolved the wrong hermes executable: "
+            f"expected {shim_path!r}, got {resolved_hermes!r}"
+        )
 
     kb.init_db()
     conn = kb.connect()

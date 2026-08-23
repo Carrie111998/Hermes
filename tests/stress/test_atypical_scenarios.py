@@ -456,8 +456,8 @@ def _(home, kb):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="bad-workspace", assignee="w",
-            workspace_kind="dir",
+            conn, title="bad-workspace", assignee="default",
+            workspace_kind="worktree",
             workspace_path="/nonexistent/path/that/does/not/exist",
         )
         # Run dispatch_once with a dummy spawn_fn
@@ -466,14 +466,14 @@ def _(home, kb):
         task = kb.get_task(conn, tid)
         # Possible outcomes:
         # - Task back in ready (workspace issue = spawn_failed, retries)
-        # - Task in running (kernel accepted the bogus path and spawned)
+        # - Task in running (the workspace resolver accepted the path)
         # - Task auto-blocked (after N retries, but we only ran 1 tick)
         print(f"  after 1 tick with nonexistent workspace: status={task.status}")
         if task.status == "ready":
             # Expected path: workspace failure led to release
-            spawn_failures = task.spawn_failures
-            print(f"  spawn_failures counter: {spawn_failures}")
-            assert spawn_failures >= 1, "spawn_failures counter didn't increment"
+            consecutive_failures = task.consecutive_failures
+            print(f"  consecutive_failures counter: {consecutive_failures}")
+            assert consecutive_failures >= 1, "consecutive_failures counter didn't increment"
         elif task.status == "running":
             # Workspace not checked before spawn — the worker would hit
             # the bad path itself. Defensible for `dir:` workspaces that
@@ -938,7 +938,7 @@ def _(home, kb):
 @scenario("parent_in_different_status_states")
 def _(home, kb):
     """recompute_ready promotes a todo child only if ALL parents are
-    in 'done'. Verify against parents in every non-done state."""
+    terminal ('done' or 'archived'). Verify every other parent state."""
     kb.init_db()
     conn = kb.connect()
     try:
@@ -961,8 +961,9 @@ def _(home, kb):
             (p_running, "todo"),
             (p_blocked, "todo"),
             (p_triage, "todo"),
-            (p_archived, "todo"),  # archived != done!
-            (p_done, "ready"),     # only done parent unblocks child
+            # archived is terminal for dependency resolution.
+            (p_archived, "ready"),
+            (p_done, "ready"),
         ]:
             child = kb.create_task(
                 conn, title=f"child-of-{parent}", assignee="w", parents=[parent],
@@ -973,7 +974,7 @@ def _(home, kb):
                 f"child of {parent} ({kb.get_task(conn, parent).status}): "
                 f"expected {expected}, got {actual}"
             )
-        print("  child promotion correctly gated on parent.status == 'done'")
+        print("  child promotion correctly gated on terminal parent status")
     finally:
         conn.close()
 
