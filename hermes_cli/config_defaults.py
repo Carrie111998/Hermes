@@ -2597,6 +2597,16 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Profiles may create/link tasks unless explicitly restricted. Agent,
+        # CLI, swarm, and decomposer fan-out paths all enforce this centrally
+        # before opening a write transaction. Set false on analysis-only
+        # expert profiles that should propose work but never create it.
+        "can_create": True,
+        # Separate human-dashboard policy. "authenticated" lets a human who
+        # passed the dashboard auth middleware create/link cards regardless of
+        # the backend profile's can_create value; "disabled" turns those two
+        # dashboard writes off. Unknown values fail closed.
+        "dashboard_create_policy": "authenticated",
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
