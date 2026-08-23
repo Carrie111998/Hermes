@@ -281,12 +281,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "starlette==1.3.1",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
         "python-multipart==0.0.32",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
     ),
-    # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
-    # (pyproject `dependencies`), so this entry is a belt-and-suspenders fallback
-    # for stripped/source-build installs that somehow dropped it. The vision
-    # call site uses prompt=False so it can never raise a blocking input()
-    # prompt mid-session (#40490).
-    "tool.vision": ("Pillow==12.3.0",),
+    # Vision image normalization/resizing. Pillow is now a CORE dependency
+    # (pyproject `dependencies`); pillow-heif is lazy because only HEIC/HEIF/
+    # AVIF inputs need its native codec. Vision calls use prompt=False so a
+    # missing codec can never raise a blocking input() prompt mid-session.
+    "tool.vision": ("Pillow==12.3.0", "pillow-heif==1.5.0"),
     # Document-to-Markdown extraction for read_file (firecrawl-anydoc, Rust
     # core, imports as `anydoc`). Widens read_file's auto-extraction beyond
     # the stdlib .ipynb/.docx/.xlsx to PDF, legacy Office (.doc/.ppt/.xls),

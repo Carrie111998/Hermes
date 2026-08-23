@@ -236,6 +236,11 @@ def _media_cache_roots() -> list:
         home / "video_cache",
         home / "temp_vision_images",
         home / "temp_video_files",
+        # WebUI uploads are agent-managed inbound media, just like gateway
+        # image caches.  They are bind-mounted into the WebUI container and
+        # must remain host-readable when the terminal backend is SSH/Docker;
+        # otherwise vision incorrectly falls through to the sandbox path.
+        home / "webui" / "attachments",
     ]
 
 

@@ -8,6 +8,12 @@ const IMAGE_MIME_EXT: Record<string, string> = {
   "image/gif": "gif",
   "image/webp": "webp",
   "image/bmp": "bmp",
+  // iOS screenshots/clipboard payloads are often HEIC bytes with a misleading
+  // .jpg filename. Keep the actual MIME in the data URL; the server sniffs
+  // magic bytes and the vision path normalizes locally before the API call.
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "image/avif": "avif",
 };
 
 // Anthropic caps a single vision image at ~25 MB; reject earlier client-side

@@ -17,6 +17,7 @@ import pytest
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 JPEG = b"\xff\xd8\xff" + b"\x00" * 64
+HEIC = b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00heic" + b"\x00" * 64
 
 
 def _reload(monkeypatch, hermes_home: Path):
@@ -56,6 +57,17 @@ class TestDataUrl:
         with pytest.raises(isrc.NotAnImage):
             await isrc.resolve_image_source(
                 f"data:text/plain;base64,{b64}", isrc.ResolveContext())
+
+    @pytest.mark.asyncio
+    async def test_heic_magic_is_detected_even_with_wrong_filename(self, tmp_path, monkeypatch):
+        """Clipboard/WebUI may label HEIC bytes as .jpg; bytes are authoritative."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = tmp_path / "screenshot.jpg"
+        img.write_bytes(HEIC)
+        res = await isrc.resolve_image_source(str(img), isrc.ResolveContext())
+        assert res.mime == "image/heic"
+        assert res.data == HEIC
 
 
 class TestLocalBackend:
