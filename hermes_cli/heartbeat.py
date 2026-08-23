@@ -202,15 +202,16 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
 class HeartbeatManager:
     """Per-session heartbeat state + due-tick decisions.
 
-    Drivers (CLI thread / gateway task) call :meth:`due_prompt` on a poll
-    cadence while the session is idle; a non-None return is the user-role
-    message to inject. Firing is recorded immediately so a slow turn can't
-    double-fire.
+    Drivers poll while the session is idle. CLI uses :meth:`due_prompt` for
+    its always-accepting local queue; gateway uses :meth:`claim_due_prompt`
+    and confirms only after an adapter accepts the turn. Claims are recorded
+    immediately so a slow turn can't double-fire.
     """
 
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        self._fire_claim: Optional[tuple[float, int]] = None
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -281,21 +282,51 @@ class HeartbeatManager:
 
     # --- driver entry point --------------------------------------------
 
-    def due_prompt(self, now: Optional[float] = None) -> Optional[str]:
-        """Return the injection prompt if the heartbeat is due, else None.
+    def claim_due_prompt(self, now: Optional[float] = None) -> Optional[str]:
+        """Claim and return a due prompt pending delivery acceptance.
 
-        Records the fire immediately (before the turn runs) so overlapping
-        polls or a long turn can never double-fire the same tick. Missed
-        ticks coalesce into one — the anchor resets to NOW, not to the
-        theoretical schedule.
+        The claim is persisted immediately to prevent overlapping polls from
+        double-firing. Drivers that can reject delivery must call
+        :meth:`abandon_claim`; accepted deliveries call :meth:`confirm_claim`.
         """
         s = self._state
-        if s is None or not s.is_due(now):
+        if self._fire_claim is not None or s is None or not s.is_due(now):
             return None
+        self._fire_claim = (s.last_fired_at, s.fire_count)
         s.last_fired_at = now if now is not None else time.time()
         s.fire_count += 1
         save_heartbeat(self.session_id, s)
         return s.render_prompt()
+
+    def confirm_claim(self) -> bool:
+        """Confirm that the claimed prompt was accepted as a turn."""
+        if self._fire_claim is None:
+            return False
+        self._fire_claim = None
+        return True
+
+    def abandon_claim(self) -> bool:
+        """Roll back a claimed prompt that no turn accepted."""
+        if self._fire_claim is None or self._state is None:
+            return False
+        last_fired_at, fire_count = self._fire_claim
+        self._state.last_fired_at = last_fired_at
+        self._state.fire_count = fire_count
+        self._fire_claim = None
+        save_heartbeat(self.session_id, self._state)
+        return True
+
+    def due_prompt(self, now: Optional[float] = None) -> Optional[str]:
+        """Return and immediately confirm a due prompt.
+
+        CLI drivers enqueue into an unbounded local queue, so acceptance is
+        synchronous. Gateway drivers use the explicit claim lifecycle because
+        an adapter can reject an internal turn.
+        """
+        prompt = self.claim_due_prompt(now)
+        if prompt is not None:
+            self.confirm_claim()
+        return prompt
 
 
 def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:

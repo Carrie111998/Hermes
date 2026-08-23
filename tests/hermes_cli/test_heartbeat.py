@@ -147,6 +147,34 @@ def test_due_prompt_fires_once_and_reanchors():
     assert mgr.due_prompt() is None
 
 
+def test_claimed_prompt_can_be_abandoned_without_counting_delivery():
+    mgr = HeartbeatManager(session_id="hb-abandoned-sid")
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+
+    prompt = mgr.claim_due_prompt(now=time.time())
+
+    assert prompt is not None
+    assert mgr.state.fire_count == 1
+    assert mgr.abandon_claim() is True
+    assert mgr.state.fire_count == 0
+    assert mgr.state.last_fired_at == 0.0
+    assert HeartbeatManager("hb-abandoned-sid").state.fire_count == 0
+
+
+def test_confirmed_claim_keeps_delivery_count():
+    mgr = HeartbeatManager(session_id="hb-confirmed-sid")
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+
+    assert mgr.claim_due_prompt(now=time.time()) is not None
+    assert mgr.confirm_claim() is True
+
+    persisted = HeartbeatManager("hb-confirmed-sid").state
+    assert persisted.fire_count == 1
+    assert persisted.last_fired_at > 0
+
+
 def test_missed_ticks_coalesce():
     mgr = HeartbeatManager(session_id="hb-coalesce-sid")
     mgr.set("tick", 600)

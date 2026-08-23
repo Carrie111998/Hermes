@@ -21565,41 +21565,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _poll_loop():
             while True:
                 await asyncio.sleep(POLL_SECONDS)
-                watch = getattr(self, "_heartbeat_watch", None)
-                if not watch:
-                    continue
-                # Warm the cache off-loop once per poll. A watch can only
-                # be registered through the warmed /heartbeat command, so
-                # this covers only the degraded path where that warm-up
-                # failed.
-                await self._warm_goals_session_db("heartbeat poll")
-                for quick_key, (source, session_id) in list(watch.items()):
-                    try:
-                        # Busy sessions coalesce their tick to the next idle poll.
-                        if quick_key in self._running_agents:
-                            continue
-                        from hermes_cli.heartbeat import HeartbeatManager
-
-                        mgr = HeartbeatManager(session_id=session_id)
-                        if not mgr.has_heartbeat():
-                            watch.pop(quick_key, None)
-                            continue
-                        prompt = mgr.due_prompt()
-                        if not prompt:
-                            continue
-                        adapter = self._adapter_for_source(source)
-                        if adapter is None:
-                            continue
-                        hb_event = MessageEvent(
-                            text=prompt,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            message_id=None,
-                            channel_prompt=None,
-                        )
-                        self._enqueue_fifo(quick_key, hb_event, adapter)
-                    except Exception as exc:
-                        logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
+                await self._poll_heartbeat_watches_once()
 
         try:
             task = asyncio.create_task(_poll_loop())
@@ -21615,6 +21581,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 task.add_done_callback(_bg.discard)
         except Exception:
             logger.debug("Failed to start heartbeat poller", exc_info=True)
+
+    async def _poll_heartbeat_watches_once(self) -> None:
+        """Attempt one accepted turn for every due, idle heartbeat watch."""
+        watch = getattr(self, "_heartbeat_watch", None)
+        if not watch:
+            return
+        # Warm the cache off-loop once per poll. A watch can only be registered
+        # through the warmed /heartbeat command, so this covers the degraded
+        # path where that warm-up failed.
+        await self._warm_goals_session_db("heartbeat poll")
+        for quick_key, (source, session_id) in list(watch.items()):
+            manager = None
+            try:
+                # Busy sessions coalesce their tick to the next idle poll.
+                if quick_key in self._running_agents:
+                    continue
+                from hermes_cli.heartbeat import HeartbeatManager
+
+                manager = HeartbeatManager(session_id=session_id)
+                if not manager.has_heartbeat():
+                    watch.pop(quick_key, None)
+                    continue
+                prompt = manager.claim_due_prompt()
+                if not prompt:
+                    continue
+                adapter = self._adapter_for_source(source)
+                accepted = False
+                if adapter is not None:
+                    heartbeat_event = MessageEvent(
+                        text=prompt,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=None,
+                        channel_prompt=None,
+                        internal=True,
+                        allow_gateway_control=False,
+                        metadata={"gateway_session_key": quick_key},
+                    )
+                    accepted = adapter.start_internal_turn(heartbeat_event, quick_key)
+                if accepted:
+                    manager.confirm_claim()
+                    logger.info("heartbeat delivery accepted for session %s", quick_key)
+                    continue
+                manager.abandon_claim()
+                logger.warning(
+                    "heartbeat delivery was not accepted for session %s; tick remains due",
+                    quick_key,
+                )
+            except Exception as exc:
+                if manager is not None:
+                    try:
+                        manager.abandon_claim()
+                    except Exception:
+                        pass
+                logger.warning("heartbeat poll for %s failed: %s", quick_key, exc)
 
 
 

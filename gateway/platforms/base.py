@@ -5896,6 +5896,21 @@ class BasePlatformAdapter(ABC):
             task.add_done_callback(self._expected_cancelled_tasks.discard)
         return True
 
+    def start_internal_turn(self, event: MessageEvent, session_key: str) -> bool:
+        """Atomically start an idle synthetic turn, or reject it for retry.
+
+        Internal schedulers already hold a durable routing key and must know
+        whether a turn was actually accepted. Unlike ``_pending_messages``,
+        this path starts a consumer when the session is idle. Real user input
+        or an active turn wins races: the scheduler remains due and retries at
+        its next poll instead of claiming a delivery that never ran.
+        """
+        if self._message_handler is None:
+            return False
+        if session_key in self._active_sessions or session_key in self._pending_messages:
+            return False
+        return self._start_session_processing(event, session_key)
+
     async def cancel_session_processing(
         self,
         session_key: str,
