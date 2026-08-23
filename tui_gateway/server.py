@@ -13736,6 +13736,9 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if resolved is not None:
             name = resolved.name
     except Exception:
+        logger.debug(
+            "slash-command alias resolution failed for %r", name, exc_info=True
+        )
         pass
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
