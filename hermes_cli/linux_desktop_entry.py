@@ -78,7 +78,14 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            #
+            # Do NOT .resolve() it: a venv's bin/python is a SYMLINK to the
+            # base interpreter (uv, pyenv, python3 -m venv all do this).
+            # Resolving walks out of the venv to the base prefix, which has
+            # no site-packages of its own — so the entry dies on the first
+            # third-party import (`No module named 'yaml'`), silently,
+            # because Terminal=false. Keep the venv path verbatim.
+            argv = [str(Path(sys.executable)), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
@@ -106,8 +113,12 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # Compare against BOTH the venv bin dir and the resolved base bin dir:
+    # a shebang naming either one already lands in an environment that can
+    # import Hermes' dependencies.
+    exe = Path(sys.executable)
+    candidates = {str(exe.parent), str(exe.resolve().parent)}
+    return not any(d in shebang for d in candidates)
 
 
 def _quote_exec_arg(arg: str) -> str:

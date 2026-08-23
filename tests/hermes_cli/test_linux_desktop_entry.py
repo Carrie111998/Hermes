@@ -107,10 +107,46 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # The interpreter must be the venv path VERBATIM, never .resolve()d: a
+    # venv's bin/python is a symlink to the base interpreter, and resolving
+    # it walks out of the venv into a prefix with no site-packages, which
+    # reintroduces the ModuleNotFoundError this test guards against.
+    assert exec_line.split(" ")[0].strip('"') == sys.executable
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+# Regression guard for the venv-symlink escape: when the running interpreter
+# is a venv whose bin/python symlinks to a base interpreter, the Exec line
+# must keep the venv path (which can import Hermes' deps), not the base one.
+def test_exec_keeps_venv_interpreter_not_symlink_target(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+
+    base_bin = tmp_path / "base" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python3.11"
+    base_python.write_text("#!/bin/false\n", encoding="utf-8")
+    base_python.chmod(0o755)
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(base_python)
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(base_python) not in exec_line
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
