@@ -550,6 +550,34 @@ def test_gui_launches_even_when_desktop_entry_install_fails(tmp_path, monkeypatc
     assert mock_run.call_args.args[0] == [str(packaged_exe)]
 
 
+@pytest.mark.linux_only
+def test_gui_falls_back_to_no_sandbox_when_sudo_is_unusable(tmp_path, monkeypatch):
+    """A non-interactive launch (e.g. the .desktop entry, Terminal=false) has
+    no TTY for sudo to prompt on. That must degrade to --no-sandbox instead
+    of silently exiting 1 with no window ever appearing (#93312)."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    monkeypatch.setattr("hermes_cli.linux_desktop_entry.is_supported", lambda: True)
+    monkeypatch.setattr("hermes_cli.linux_desktop_entry.install_desktop_entry", lambda project_root: tmp_path / "hermes.desktop")
+    monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000, raising=False)
+
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 0
+    launch_call = mock_run.call_args
+    assert launch_call.args[0][0] == str(packaged_exe)
+    assert "--no-sandbox" in launch_call.args[0]
+
+
 @pytest.mark.macos_only
 def test_gui_skips_desktop_entry_off_linux(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)

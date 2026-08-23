@@ -8092,8 +8092,24 @@ def cmd_gui(args: argparse.Namespace):
 
     launch_command = [str(packaged_executable)]
     if not _desktop_linux_sandbox_fixup(packaged_executable):
-        if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
-            print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
+        # _desktop_linux_sandbox_fixup() already hard-fails (returns False
+        # without a usable helper) for integrity problems — a missing file,
+        # or one that isn't a plain regular file (e.g. a symlink). What
+        # reaches here past that is "the helper is a legitimate file, we
+        # just couldn't chown/chmod it": sudo missing, or unusable because
+        # there's no TTY/askpass (any non-interactive launch, e.g. the
+        # .desktop entry with Terminal=false — not only Ubuntu's AppArmor
+        # unprivileged-userns hosts, which was the only case this used to
+        # cover; see #93312). Fall back to --no-sandbox in all of those,
+        # same as the explicit ELECTRON_DISABLE_SANDBOX=1 opt-in. Root stays
+        # excluded (see _desktop_linux_needs_no_sandbox) since running
+        # unsandboxed as root is a qualitatively riskier, explicit choice.
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if (
+            _desktop_linux_sandbox_helper_is_regular_file(packaged_executable)
+            and (_desktop_linux_needs_no_sandbox() or not is_root)
+        ):
+            print("⚠ Falling back to --no-sandbox because Electron's Linux sandbox helper could not be configured (sudo unavailable or non-interactive).")
             launch_command.append("--no-sandbox")
         else:
             sys.exit(1)
