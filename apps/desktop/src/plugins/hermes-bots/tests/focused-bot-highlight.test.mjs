@@ -61,14 +61,40 @@ test('BotRow keys the highlight off the focused profile, not the socket home', (
   assert.match(row, /const isActive = botRowOwnsWorkspace\([\s\S]*?focusedOwner,[\s\S]*?selectedRosterKey/)
 })
 
-test('BotRow keeps turn-busy (work mood) a socket fact', () => {
+// Iterations 1-3 each pinned ONE global turn bit to ONE bot, so only the
+// focused row could ever show work. Iteration 3's expression, restored here,
+// also had to be wrong: `host.state.gateway` is socket state and never reads
+// 'busy'. Mid-turn is now per-chat, keyed by the bot's own stored session ids.
+test('BotRow reads mid-turn per chat, not from focus or the socket', () => {
   const rowStart = source.indexOf('function BotRow(')
   const row = source.slice(rowStart, rowStart + 5000)
 
-  // Only the gateway-home profile can actually be mid-turn: the mood must NOT
-  // switch to the focus-keyed identity.
-  assert.match(row, /const isGatewayHome = !bot\.remoteSource && bot\.name === activeProfile/)
-  assert.match(row, /const botMood = workerActive \|\| \(isGatewayHome && gatewayState === 'busy'\) \? 'work' : 'idle'/)
+  assert.match(row, /const workingChats = useValue\(\$workingChats\)/)
+  assert.match(row, /const working = workerWorking \|\| \(!answered && botOwnsWorkingChat\(bot, workingChats\)\)/)
+  assert.match(row, /const botMood = working \? 'work' : 'idle'/)
+  assert.ok(!/gatewayState === 'busy'/.test(row), 'the socket atom never reads busy')
+  assert.ok(!/focusedTurnBusy/.test(row), 'a single focused-chat bit cannot answer a roster')
+})
+
+test('the working-chats atom is feature-detected for older desktops', () => {
+  assert.match(source, /const \$workingChats = host\.state\.workingStoredSessionIds \|\| atom\(\[\]\)/)
+})
+
+// The turn lands on whichever id the runtime bound, so both must match.
+test('botOwnsWorkingChat matches the registry id and the lineage tip', () => {
+  const idsStart = source.indexOf('function botChatIds(')
+  const start = source.indexOf('function botOwnsWorkingChat(')
+  const body =
+    source.slice(idsStart, source.indexOf('\n}', idsStart) + 2) +
+    source.slice(start, source.indexOf('\n}', start) + 2)
+  const owns = new Function(`${body}; return botOwnsWorkingChat`)()
+
+  const bot = { canonical_session: { id: 'reg-1', resolved_id: 'tip-9' } }
+  assert.equal(owns(bot, ['tip-9']), true)
+  assert.equal(owns(bot, ['reg-1']), true)
+  assert.equal(owns(bot, ['someone-else']), false)
+  assert.equal(owns(bot, []), false)
+  assert.equal(owns({}, ['tip-9']), false)
 })
 
 test('RoutinesPane scopes the Cronjobs tile to the focused chat owner', () => {
@@ -83,4 +109,28 @@ test('RoutinesPane scopes the Cronjobs tile to the focused chat owner', () => {
 
 test('the $selectedBot tracker binds the focused profile ladder (reseed + unbind captured)', () => {
   assert.match(source, /const unbindProfileListener = bindProfileSync\(\$focusedBotOwner\)/)
+})
+
+// The gateway reports the newest tool/kanban row whether or not it is alive,
+// and the 150s window is heartbeat tolerance, not proof — so a finished turn's
+// tool row used to hold the typing dots lit for the whole window.
+test('a finished turn does not keep the dots on via its tool row', () => {
+  const rowStart = source.indexOf('function BotRow(')
+  const row = source.slice(rowStart, rowStart + 5000)
+
+  assert.match(row, /const workerWorking = workerLive && workerTs > chatTs/)
+  // The age label still counts a live worker, dots or not.
+  assert.match(row, /const rowAgeTs = workerLive \? Math\.max\(chatTs, workerTs\) : chatTs/)
+})
+
+// Every bot runs its own gateway process, so a background bot's turn-end never
+// reaches the renderer and its busy flag is stranded true forever (observed:
+// dots still running minutes after the reply landed, with no worker session on
+// the profile at all). The roster poll is the witness that always arrives.
+test('a stranded busy flag cannot outlive the answer', () => {
+  const rowStart = source.indexOf('function BotRow(')
+  const row = source.slice(rowStart, rowStart + 6000)
+
+  assert.match(row, /const answered = String\(activitySession\?\.last_role \|\| ''\)\.toLowerCase\(\) === 'assistant'/)
+  assert.match(row, /const working = workerWorking \|\| \(!answered && botOwnsWorkingChat\(bot, workingChats\)\)/)
 })

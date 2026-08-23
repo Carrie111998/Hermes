@@ -104,6 +104,9 @@ function renderBotRow(input = 'alpha') {
     workerActiveAt: () => false,
     ACTIVE_WINDOW_S: 90,
     A2A_PREFIX_RE: /^$/,
+    // Mid-turn state of the FOCUSED chat — what the row's typing dots read.
+    $workingChats: atom([]),
+    botOwnsWorkingChat: () => false,
     useEffect: () => undefined,
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
@@ -292,6 +295,9 @@ test('behavior: remote default never opens the same-name local chat', async () =
     workerActiveAt: () => false,
     ACTIVE_WINDOW_S: 90,
     A2A_PREFIX_RE: /^$/,
+    // Mid-turn state of the FOCUSED chat — what the row's typing dots read.
+    $workingChats: atom([]),
+    botOwnsWorkingChat: () => false,
     useEffect: () => undefined,
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
