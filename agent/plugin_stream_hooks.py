@@ -1,4 +1,4 @@
-"""Asynchronous per-consumer plugin observers for streaming LLM output."""
+"""Asynchronous per-consumer plugin observers for streaming and memory events."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
+# One bounded FIFO is owned by each (hook, callback) consumer. Producers never
+# wait for plugin code: when full, enqueue drops the oldest pending event.
 _QUEUE_SIZE = 1024
 _STOP = object()
 
@@ -119,8 +121,14 @@ def _dispatchers_for(hook_name: str) -> list[_ConsumerDispatcher]:
     return ready
 
 
-def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
-    """Queue an observer hook for each consumer without running plugin code inline."""
+def enqueue_plugin_observer_hook(hook_name: str, **payload: Any) -> bool:
+    """Queue an observer hook without running plugin code on the caller.
+
+    The shared dispatcher keeps one daemon worker and bounded FIFO per
+    registered callback. ``put_nowait`` makes the producer non-blocking; a
+    full queue drops its oldest pending event so a slow consumer cannot grow
+    memory or delay the agent. Callback exceptions are isolated in the worker.
+    """
     queued = False
     item = dict(payload)
     for dispatcher in _dispatchers_for(hook_name):
@@ -146,6 +154,11 @@ def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
     return queued
 
 
+def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
+    """Backward-compatible name for the shared observer dispatcher."""
+    return enqueue_plugin_observer_hook(hook_name, **payload)
+
+
 def has_stream_observer_hooks() -> bool:
     return any(_registered_callbacks(name) for name in ("on_stream_start", "on_stream_delta", "on_stream_end"))
 
@@ -166,11 +179,22 @@ def stream_reasoning_deltas_enabled() -> bool:
         return False
 
 
-def shutdown_plugin_stream_hook_dispatcher(timeout: float = 1.0) -> None:
-    """Stop background stream hook dispatchers; used by tests and clean shutdown paths."""
+def shutdown_plugin_observer_dispatcher(timeout: float = 1.0) -> None:
+    """Stop observer workers with a bounded drain, used by tests/shutdown.
+
+    A stop sentinel is placed after pending events when possible, allowing a
+    short FIFO drain. The worker join is bounded by ``timeout``; a blocked
+    callback remains on its daemon worker and is never allowed to hold process
+    teardown indefinitely.
+    """
     global _dispatchers
     with _dispatcher_lock:
         dispatchers = list(_dispatchers.values())
         _dispatchers = {}
     for dispatcher in dispatchers:
         _stop_dispatcher(dispatcher, timeout=timeout)
+
+
+def shutdown_plugin_stream_hook_dispatcher(timeout: float = 1.0) -> None:
+    """Backward-compatible name for the shared observer dispatcher shutdown."""
+    shutdown_plugin_observer_dispatcher(timeout=timeout)
