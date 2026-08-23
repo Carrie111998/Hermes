@@ -233,6 +233,7 @@ function ChoiceButton({
   disabled,
   keyShortcuts,
   onClick,
+  onKeyDown,
   selected,
   title
 }: {
@@ -242,6 +243,7 @@ function ChoiceButton({
   disabled?: boolean
   keyShortcuts?: string
   onClick: () => void
+  onKeyDown?: (event: KeyboardEvent<HTMLButtonElement>) => void
   selected?: boolean
   title?: string
 }) {
@@ -269,6 +271,7 @@ function ChoiceButton({
         data-highlighted={active || undefined}
         disabled={disabled}
         onClick={onClick}
+        onKeyDown={onKeyDown}
         type="button"
       >
         <KeyBadge char={char} preview={active} selected={Boolean(selected)} />
@@ -574,6 +577,18 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
     [submitAnswer]
   )
 
+  const handleChoiceKey = useCallback(
+    (event: KeyboardEvent<HTMLButtonElement>) => {
+      if (event.nativeEvent.isComposing || event.key !== 'Enter') {
+        return
+      }
+
+      event.preventDefault()
+      submitAnswer()
+    },
+    [submitAnswer]
+  )
+
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault()
@@ -712,6 +727,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
                 key={`${index}-${choice}`}
                 keyShortcuts={`${letterFor(index)} ${index + 1}`}
                 onClick={() => selectChoice(choice, index)}
+                onKeyDown={handleChoiceKey}
                 selected={selectedChoices.includes(choice)}
               />
             ))}
