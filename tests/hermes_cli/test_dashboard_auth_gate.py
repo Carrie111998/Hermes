@@ -40,6 +40,19 @@ def client_loopback():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_declared_public_url(monkeypatch):
+    """Pin the operator-declared public URL out of the gate's view.
+
+    should_require_auth() consults resolve_public_url() (#93026), which
+    reads HERMES_DASHBOARD_PUBLIC_URL and dashboard.public_url. The
+    autouse HERMES_HOME isolation already empties the config side; pin
+    the env side too so a developer's exported variable can't flip the
+    loopback rows of the truth table.
+    """
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+
+
 @pytest.mark.parametrize("host,allow_public,expected", [
     ("127.0.0.1", False, False),
     ("127.0.0.1", True,  False),
@@ -57,6 +70,50 @@ def client_loopback():
 def test_should_require_auth_truth_table(host, allow_public, expected):
     from hermes_cli.web_server import should_require_auth
     assert should_require_auth(host, allow_public) is expected
+
+
+# ---------------------------------------------------------------------------
+# declared public URL engages the gate on a loopback bind (#93026)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_loopback_with_declared_public_url_requires_auth(monkeypatch, host):
+    """A reverse proxy publishing a loopback bind must get the auth gate."""
+    from hermes_cli.web_server import should_require_auth
+
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+        lambda: "https://hermes.example.com",
+    )
+    assert should_require_auth(host) is True
+
+
+def test_env_declared_public_url_requires_auth_on_loopback(monkeypatch):
+    """HERMES_DASHBOARD_PUBLIC_URL alone (no config.yaml entry) engages it."""
+    from hermes_cli.web_server import should_require_auth
+
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://h.example.com")
+    assert should_require_auth("127.0.0.1") is True
+
+
+def test_resolver_failure_keeps_historical_loopback_behavior(monkeypatch):
+    """If the resolver blows up, don't break plain local startups."""
+    from hermes_cli.web_server import should_require_auth
+
+    def _boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url", _boom
+    )
+    assert should_require_auth("127.0.0.1") is False
+
+
+def test_non_loopback_unaffected_by_missing_public_url():
+    """The non-loopback rows never consult (or need) the resolver."""
+    from hermes_cli.web_server import should_require_auth
+    assert should_require_auth("0.0.0.0") is True
 
 
 # ---------------------------------------------------------------------------

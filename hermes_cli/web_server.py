@@ -653,8 +653,11 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
     Truth table:
-      host == loopback        → False (no auth — local-only, trusted operator)
-      host != loopback        → True  (gate engages — OAuth or password required)
+      host != loopback       → True  (gate engages — OAuth or password required)
+      host == loopback,
+        no declared public URL → False (no auth — local-only, trusted operator)
+      host == loopback,
+        declared public URL    → True  (#93026 — something publishes this process)
 
     "Loopback" is 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local are
     deliberately treated as PUBLIC — a hostile device on the same LAN is exactly
@@ -667,8 +670,24 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     unauthenticated-public-dashboard hole behind the June 2026 ``hermes-0day``
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
     config/MCP/agent surface open to internet scanners.
+
+    A loopback bind no longer implies local-only exposure when the operator
+    declared a public URL (#93026): ``dashboard.public_url`` /
+    ``HERMES_DASHBOARD_PUBLIC_URL`` is the operator's statement that a reverse
+    proxy or tunnel on the same host publishes this process, so the bind
+    address no longer describes who can reach it. The declaration is local
+    configuration — not a request header — so it cannot be forged by a
+    caller, and failing closed is the safe direction for an exposed
+    deployment. If the resolver can't be consulted we keep the historical
+    loopback behavior rather than breaking local startups.
     """
-    return host not in _LOOPBACK_HOST_VALUES
+    if host not in _LOOPBACK_HOST_VALUES:
+        return True
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+        return bool(resolve_public_url())
+    except Exception:
+        return False
 
 
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
