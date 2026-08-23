@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 
+from jobflow_dispatch.quarantine_control import _normalize_st_dev
+
 import pytest
 
 
@@ -369,9 +371,9 @@ def test_pre_identity_control_database_is_migrated_once_under_exclusion(tmp_path
     assert identity == tuple(
         str(value)
         for value in (
-            db.stat().st_dev,
+            _normalize_st_dev(db.stat().st_dev),
             db.stat().st_ino,
-            lock.stat().st_dev,
+            _normalize_st_dev(lock.stat().st_dev),
             lock.stat().st_ino,
         )
     )

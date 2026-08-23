@@ -93,6 +93,16 @@ def default_control_path() -> Path:
     return _canonical_hermes_root() / "telemetry" / "jobflow_quarantine_fence.db"
 
 
+def _normalize_st_dev(st_dev: int) -> int:
+    """Collapse interpreter-dependent st_dev width to one stable value.
+
+    CPython 3.12 on Windows reports the full 64-bit NTFS volume id while 3.11
+    reports its low 32 bits; the durable identity marker must not flip when the
+    gateway's interpreter changes.
+    """
+    return int(st_dev) & 0xFFFFFFFF
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -353,7 +363,7 @@ class QuarantineControlStore:
     @staticmethod
     def _path_identity(path: Path) -> tuple[int, int]:
         stat = path.stat()
-        return (int(stat.st_dev), int(stat.st_ino))
+        return (_normalize_st_dev(stat.st_dev), int(stat.st_ino))
 
     @staticmethod
     def _identity_marker(identity: tuple[int, int]) -> bytes:
@@ -382,7 +392,7 @@ class QuarantineControlStore:
     def _initialize_or_verify_store(self, lock_handle: Any) -> None:
         database_identity_before = self._current_database_identity()
         lock_stat = os.fstat(lock_handle.fileno())
-        lock_identity = (int(lock_stat.st_dev), int(lock_stat.st_ino))
+        lock_identity = (_normalize_st_dev(lock_stat.st_dev), int(lock_stat.st_ino))
         if lock_identity != self._path_identity(self.lock_path):
             raise RuntimeError("canonical dispatch lock file identity changed")
         marker_before = self._read_lock_identity_marker(lock_handle)

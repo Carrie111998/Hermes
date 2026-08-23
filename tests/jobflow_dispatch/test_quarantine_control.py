@@ -55,6 +55,16 @@ def test_store_refuses_database_disappearance_without_recreating_it(
     assert store._database_identity == original_identity
 
 
+def test_path_identity_normalizes_st_dev_across_interpreters():
+    """Windows py3.12 reports the full 64-bit NTFS volume id as st_dev while
+    py3.11 reports its low 32 bits; the durable identity marker must not flip
+    when the gateway's interpreter changes."""
+    import jobflow_dispatch.quarantine_control as control
+
+    assert control._normalize_st_dev(15573486248296390604) == 539172812
+    assert control._normalize_st_dev(539172812) == 539172812
+
+
 def test_default_control_store_does_not_heal_semantic_corruption(monkeypatch, tmp_path):
     import sqlite3
 
