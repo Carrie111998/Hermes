@@ -357,7 +357,7 @@ THREAT_PATTERNS = [
      "chain of unicode escapes (possible obfuscation)"),
 
     # ── SQL Injection (query concatenation) ──
-    (r'query\s*\(\s*[\'"`][^\'"`]*\s+\+|execute\s*\(\s*[\'"`][^\'"`]*\$',
+    (r'query\s*\(\s*[\'"`][^\'"`]*\s+\+|execute\s*\(\s*[\'"`][^\'"`]*\$|execute\s*\(\s*f[\'"`]',
      "sql_injection_concat", "high", "injection",
      "SQL injection risk — string concatenation in database query"),
 
@@ -385,16 +385,18 @@ THREAT_PATTERNS = [
      "Unicode tag characters (U+E0000-E0FFF) — used for hidden instructions"),
 
     # ── Unicode Bidi Overrides ──
-    (r'[\u202A\u202B\u202C\u202D\u202E]', "unicode_bidi_override", "high", "obfuscation",
+    (r'[\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069]', "unicode_bidi_override", "high", "obfuscation",
      "Unicode bidi override characters — can reverse text meaning"),
 
     # ── MCP Tool Poisoning ──
-    (r'(mcp_servers|register_mcp|add_mcp_server)', "mcp_poison", "high", "supply_chain",
-     "MCP server configuration or registration — verify source and permissions"),
+    (r'(mcp_servers|register_mcp|add_mcp_server)\s*\S*[=:>]\s*\S*(https?:|url|exec|curl|wget)',
+     "mcp_poison", "medium", "supply_chain",
+     "MCP server config with a remote/exec source — verify source and permissions"),
 
     # ── Memory Poisoning (OWASP ASI06) ──
-    (r'\bmemory\b.*(save|set|update|write|persist)\s*\(', "memory_poison", "high", "execution",
-     "Memory write API call — potential memory poisoning (cross-session persistence)"),
+    (r'\bmemory\b.*(save|set|update|write|persist)\s*\(\s*[^)]*(tool_output|user_text|input|content)',
+     "memory_poison", "medium", "execution",
+     "Memory write from tool output / user text — potential cross-session poisoning"),
 
     # ── raw.githubusercontent.com installs ──
     (r'raw\.githubusercontent\.com.*(install|setup|bootstrap)',
