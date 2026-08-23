@@ -170,6 +170,13 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # rolling summary, so dropping or rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
+# Marks a message dict as carried-forward compaction tail (verbatim rows the
+# compressor protected from summarization). archive_and_compact() archives
+# these originals as rewind-style (active=0, compacted=0) instead of
+# compacted=1, so they stop satisfying search_messages' recall filter and
+# duplicating their live copies (#86366). Never persisted: _insert_message_rows
+# only reads known columns.
+_COMPACTION_TAIL_MARKER = "_compaction_tail"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
@@ -6977,7 +6984,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            # The splice result is [..verbatim prefix.., summary_marker,
+            # ..verbatim suffix..]: every row except the single marker is a
+            # carried-forward original (#86366) — archive their pre-splice
+            # originals rewind-style instead of compacted=1.
+            session_db.archive_and_compact(
+                session_id,
+                compacted_messages,
+                tail_count=max(0, len(compacted_messages) - 1),
+            )
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
@@ -7851,6 +7866,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         if _force_user_leading and first_tail_visible_idx is not None:
             _merge_target_idx = first_tail_visible_idx
         for tail_idx, msg in enumerate(tail_messages):
+            # Tag the carried-forward tail so archive_and_compact() can
+            # classify these rows' originals as superseded-duplicate
+            # (rewind semantics) instead of "summarized away" (#86366).
+            if isinstance(msg, dict):
+                msg[_COMPACTION_TAIL_MARKER] = True
             if _merge_summary_into_tail and tail_idx == _merge_target_idx:
                 # Merge the summary into the tail message that collided.
                 old_content = msg.get("content", "")
