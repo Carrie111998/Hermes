@@ -308,6 +308,324 @@ function groupActivityTone(kind) {
 }
 
 const GROUP_CHAT_SYNC_META_KEY = 'hermes-bots-groups'
+const ROSTER_STATE_META_KEY = 'hermes-bots-roster'
+
+// ── roster ordering model (pure) ───────────────────────────────────────────
+const ROSTER_STATE_VERSION = 1
+const MAX_ORDERED_PEERS = 192
+const MAX_PINNED_GROUPS = 64
+const MAX_PEER_ID_LENGTH = 256
+const MAX_ROSTER_STATE_BYTES = 48000
+const rosterStateNormalizationCache = new WeakMap()
+
+function rosterStateGatewayJsonSize(value) {
+  const json = JSON.stringify(value)
+  let bytes = 0
+
+  for (const character of json) {
+    const codePoint = character.codePointAt(0)
+
+    if (codePoint <= 0x7f) {
+      bytes += 1
+      if (character === ',' || character === ':') {
+        bytes += 1
+      }
+    } else {
+      bytes += codePoint <= 0xffff ? 6 : 12
+    }
+  }
+
+  return bytes
+}
+
+function uniqueRosterStrings(values, limit = MAX_ORDERED_PEERS) {
+  const seen = new Set()
+  const result = []
+
+  for (const value of Array.isArray(values) ? values : []) {
+    if (
+      typeof value !== 'string' ||
+      !value ||
+      value.length > MAX_PEER_ID_LENGTH ||
+      seen.has(value)
+    ) {
+      continue
+    }
+
+    seen.add(value)
+    result.push(value)
+
+    if (result.length >= limit) {
+      break
+    }
+  }
+
+  return result
+}
+
+function emptyRosterState() {
+  return { version: ROSTER_STATE_VERSION, manual: false, order: [], pinnedGroups: [] }
+}
+
+function normalizeRosterState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return emptyRosterState()
+  }
+
+  const cached = rosterStateNormalizationCache.get(value)
+  if (cached) {
+    return cached
+  }
+
+  const normalized = {
+    version: ROSTER_STATE_VERSION,
+    manual: Boolean(value.manual),
+    order: uniqueRosterStrings(value.order, MAX_ORDERED_PEERS),
+    pinnedGroups: uniqueRosterStrings(value.pinnedGroups, MAX_PINNED_GROUPS)
+  }
+
+  // profiles.configure caps each incoming ui_meta patch at 64 KiB after
+  // Python JSON escaping. Leave the same healthy margin as room sync and
+  // favor group pins over the optional tail of a long manual order.
+  while (normalized.order.length && rosterStateGatewayJsonSize(normalized) > MAX_ROSTER_STATE_BYTES) {
+    normalized.order.pop()
+  }
+  while (normalized.pinnedGroups.length && rosterStateGatewayJsonSize(normalized) > MAX_ROSTER_STATE_BYTES) {
+    normalized.pinnedGroups.pop()
+  }
+
+  rosterStateNormalizationCache.set(value, normalized)
+  rosterStateNormalizationCache.set(normalized, normalized)
+  return normalized
+}
+
+function rosterStatesEqual(left, right) {
+  const a = normalizeRosterState(left)
+  const b = normalizeRosterState(right)
+
+  return (
+    a.manual === b.manual &&
+    a.order.length === b.order.length &&
+    a.order.every((id, index) => id === b.order[index]) &&
+    a.pinnedGroups.length === b.pinnedGroups.length &&
+    a.pinnedGroups.every((id, index) => id === b.pinnedGroups[index])
+  )
+}
+
+/** Pinned rows always form the first band. Before the first explicit reorder,
+ *  both bands retain the existing activity order; afterward, saved positions
+ *  win and newly discovered rows append to their band. */
+function sortRosterRows(rows, state) {
+  const normalized = normalizeRosterState(state)
+  const rank = new Map(normalized.order.map((id, index) => [id, index]))
+
+  return (Array.isArray(rows) ? rows : [])
+    .map((row, index) => ({ row, index }))
+    .sort((left, right) => {
+      const leftPinned = left.row?.pinned ? 1 : 0
+      const rightPinned = right.row?.pinned ? 1 : 0
+
+      if (leftPinned !== rightPinned) {
+        return rightPinned - leftPinned
+      }
+
+      if (normalized.manual) {
+        const leftRank = rank.get(left.row?.peerId)
+        const rightRank = rank.get(right.row?.peerId)
+
+        if (leftRank !== undefined || rightRank !== undefined) {
+          if (leftRank === undefined) return 1
+          if (rightRank === undefined) return -1
+          if (leftRank !== rightRank) return leftRank - rightRank
+        }
+      }
+
+      const byActivity = Number(right.row?.activity || 0) - Number(left.row?.activity || 0)
+
+      return byActivity || left.index - right.index
+    })
+    .map(({ row }) => row)
+}
+
+/** Reconcile durable order with the complete, unfiltered roster. Search and
+ *  hidden-row projections must never call this with only their visible subset.
+ *  Missing rows are retained by default so a temporarily unreachable source
+ *  cannot erase its positions; explicit delete/disband uses removeRosterPeer. */
+function reconcileRosterState(state, rows, { prune = false } = {}) {
+  const normalized = normalizeRosterState(state)
+  const rowIds = uniqueRosterStrings((Array.isArray(rows) ? rows : []).map(row => row?.peerId))
+  const live = new Set(rowIds)
+  const order = normalized.order.filter(id => !prune || live.has(id))
+  const seen = new Set(order)
+
+  for (const id of rowIds) {
+    if (!seen.has(id)) {
+      seen.add(id)
+      order.push(id)
+    }
+  }
+
+  const pinnedGroups = prune
+    ? normalized.pinnedGroups.filter(id => live.has(id))
+    : normalized.pinnedGroups
+
+  const next = { ...normalized, order, pinnedGroups }
+
+  return rosterStatesEqual(normalized, next) ? state : next
+}
+
+function orderWithCurrentRosterRows(state, rows) {
+  const normalized = normalizeRosterState(state)
+  const current = sortRosterRows(rows, normalized).map(row => row.peerId)
+  const currentSet = new Set(current)
+
+  return [...current, ...normalized.order.filter(id => !currentSet.has(id))]
+}
+
+/** Move one row onto another row inside the same pin band. A successful move
+ *  is the opt-in boundary that makes manual ordering durable. */
+function reorderRosterRows(state, rows, activeId, overId, movableIds = null) {
+  const normalized = normalizeRosterState(state)
+  const orderedRows = sortRosterRows(rows, normalized)
+  const active = orderedRows.find(row => row.peerId === activeId)
+  const over = orderedRows.find(row => row.peerId === overId)
+  const movable = movableIds ? new Set(movableIds) : null
+
+  if (
+    !active ||
+    !over ||
+    active.peerId === over.peerId ||
+    Boolean(active.pinned) !== Boolean(over.pinned) ||
+    (movable && (!movable.has(activeId) || !movable.has(overId)))
+  ) {
+    return state
+  }
+
+  const band = orderedRows
+    .filter(row => Boolean(row.pinned) === Boolean(active.pinned) && (!movable || movable.has(row.peerId)))
+    .map(row => row.peerId)
+  const from = band.indexOf(activeId)
+  const to = band.indexOf(overId)
+
+  if (from < 0 || to < 0 || from === to) {
+    return state
+  }
+
+  const moved = [...band]
+  const [item] = moved.splice(from, 1)
+  moved.splice(to, 0, item)
+  const movedAt = new Map(moved.map((id, index) => [id, index]))
+  const currentOrder = orderWithCurrentRosterRows(normalized, orderedRows)
+  const bandSlots = currentOrder
+    .map((id, index) => (movedAt.has(id) ? index : -1))
+    .filter(index => index >= 0)
+
+  for (let index = 0; index < bandSlots.length; index += 1) {
+    currentOrder[bandSlots[index]] = moved[index]
+  }
+
+  return { ...normalized, manual: true, order: currentOrder }
+}
+
+function moveRosterRow(state, rows, peerId, direction, movableIds = null) {
+  const ordered = sortRosterRows(rows, state)
+  const row = ordered.find(candidate => candidate.peerId === peerId)
+  const movable = movableIds ? new Set(movableIds) : null
+
+  if (!row || (direction !== -1 && direction !== 1)) {
+    return state
+  }
+
+  const band = ordered.filter(candidate =>
+    Boolean(candidate.pinned) === Boolean(row.pinned) && (!movable || movable.has(candidate.peerId))
+  )
+  const index = band.findIndex(candidate => candidate.peerId === peerId)
+  const target = band[index + direction]
+
+  return target ? reorderRosterRows(state, rows, peerId, target.peerId, movable) : state
+}
+
+/** Pin/unpin transitions keep manual order intact by placing the changed row
+ *  at the end of its new band. In recency mode the existing activity sort is
+ *  untouched. */
+function moveRosterPeerToBandEnd(state, rows, peerId, pinned) {
+  const normalized = normalizeRosterState(state)
+
+  if (!normalized.manual) {
+    return state
+  }
+
+  const projected = (Array.isArray(rows) ? rows : []).map(row =>
+    row.peerId === peerId ? { ...row, pinned: Boolean(pinned) } : row
+  )
+  const ordered = sortRosterRows(projected, normalized)
+  const band = ordered.filter(row => Boolean(row.pinned) === Boolean(pinned)).map(row => row.peerId)
+  const without = band.filter(id => id !== peerId)
+
+  if (without.length === band.length) {
+    return state
+  }
+
+  without.push(peerId)
+  const bandSet = new Set(band)
+  const order = orderWithCurrentRosterRows(normalized, ordered)
+  let cursor = 0
+
+  for (let index = 0; index < order.length; index += 1) {
+    if (bandSet.has(order[index])) {
+      order[index] = without[cursor++]
+    }
+  }
+
+  return { ...normalized, order }
+}
+
+function setGroupPinned(state, rows, peerId, pinned) {
+  const normalized = normalizeRosterState(state)
+  const pins = new Set(normalized.pinnedGroups)
+
+  if (pinned) {
+    pins.add(peerId)
+  } else {
+    pins.delete(peerId)
+  }
+
+  return moveRosterPeerToBandEnd(
+    { ...normalized, pinnedGroups: [...pins] },
+    rows,
+    peerId,
+    pinned
+  )
+}
+
+function removeRosterPeer(state, peerId) {
+  const normalized = normalizeRosterState(state)
+  const next = {
+    ...normalized,
+    order: normalized.order.filter(id => id !== peerId),
+    pinnedGroups: normalized.pinnedGroups.filter(id => id !== peerId)
+  }
+
+  return rosterStatesEqual(normalized, next) ? state : next
+}
+
+function replaceRosterPeer(state, previousId, nextId) {
+  if (!previousId || !nextId || previousId === nextId) {
+    return state
+  }
+
+  const normalized = normalizeRosterState(state)
+  const replace = values => uniqueRosterStrings(values.map(id => (id === previousId ? nextId : id)))
+  const next = {
+    ...normalized,
+    order: replace(normalized.order),
+    pinnedGroups: replace(normalized.pinnedGroups)
+  }
+
+  return rosterStatesEqual(normalized, next) ? state : next
+}
+// ── end roster ordering model ───────────────────────────────────────────────
+
 // Gateway ui_meta is capped after Python JSON serialization. Keep a healthy
 // margin below that limit because Python escapes Unicode while JS does not.
 const GROUP_CHAT_SYNC_MAX_BYTES = 48000
@@ -1118,6 +1436,228 @@ function scheduleGroupChatServerSync(
   }, 350)
 }
 
+// ── flat roster organization sync ──────────────────────────────────────────
+// Group pins and manual mixed-row order belong to the roster, not to one
+// member profile or room transcript. Keep them in their own ui_meta namespace
+// so older clients that rewrite the group-room projection cannot erase them.
+// The active default profile is mirrored to every registered gateway through
+// the same route/CAS conventions as group rooms; plugin storage is the instant
+// local fallback for older or temporarily unavailable gateways.
+const $rosterState = atom(emptyRosterState())
+let rosterStateGeneration = 0
+let rosterStateSyncTimer = null
+const rosterStateSyncPendingConnections = new Set()
+const rosterStateSyncInFlightConnections = new Set()
+const rosterStateSyncRetryTimers = new Map()
+const rosterStateSyncRetryCounts = new Map()
+let rosterStateSyncDisposed = false
+
+function persistRosterStateLocal(state = $rosterState.get()) {
+  try {
+    Promise.resolve(pluginCtx?.storage?.set?.('roster-state', normalizeRosterState(state))).catch(() => undefined)
+  } catch {
+    /* storage unavailable — state survives for this window */
+  }
+}
+
+function applyRosterState(next, { sync = false } = {}) {
+  const normalized = normalizeRosterState(next)
+
+  if (rosterStatesEqual($rosterState.get(), normalized)) {
+    return false
+  }
+
+  rosterStateGeneration += 1
+  $rosterState.set(normalized)
+  persistRosterStateLocal(normalized)
+
+  if (sync) {
+    scheduleRosterStateServerSync()
+  }
+
+  return true
+}
+
+function rosterStateHasContent(state = $rosterState.get()) {
+  const normalized = normalizeRosterState(state)
+  return normalized.manual || normalized.order.length > 0 || normalized.pinnedGroups.length > 0
+}
+
+async function rosterStateRemoteState(job) {
+  const result = await groupChatSyncRequest(job, 'profiles.list', { include_sessions: false })
+  const profile = (Array.isArray(result?.profiles) ? result.profiles : []).find(row => row?.name === 'default')
+  const raw = profile?.ui_meta?.[ROSTER_STATE_META_KEY]
+  const supportsCas = Boolean(profile && Object.prototype.hasOwnProperty.call(profile, 'ui_meta_revisions'))
+
+  return {
+    snapshot: raw && typeof raw === 'object' && !Array.isArray(raw) ? normalizeRosterState(raw) : null,
+    revision: Math.max(0, Number(profile?.ui_meta_revisions?.[ROSTER_STATE_META_KEY] || 0)),
+    supportsCas
+  }
+}
+
+async function pullRosterStateServerState(
+  connectionId = groupChatSyncConnectionId(),
+  expectedGeneration = rosterStateGeneration
+) {
+  const { snapshot } = await rosterStateRemoteState({ connectionId: String(connectionId || '') })
+
+  if (!snapshot || expectedGeneration !== rosterStateGeneration) {
+    return false
+  }
+
+  applyRosterState(snapshot)
+  return true
+}
+
+function rosterStateSyncBackoff(connectionId) {
+  const count = Number(rosterStateSyncRetryCounts.get(connectionId) || 0)
+  return Math.min(30000, 1000 * 2 ** Math.min(count, 5))
+}
+
+async function flushRosterStateServerSync(connectionId) {
+  if (connectionId === undefined) {
+    for (const pendingId of [...rosterStateSyncPendingConnections]) {
+      void flushRosterStateServerSync(pendingId)
+    }
+    return
+  }
+
+  const id = String(connectionId || '')
+
+  if (
+    rosterStateSyncDisposed ||
+    rosterStateSyncInFlightConnections.has(id) ||
+    !rosterStateSyncPendingConnections.has(id)
+  ) {
+    return
+  }
+
+  rosterStateSyncPendingConnections.delete(id)
+  rosterStateSyncInFlightConnections.add(id)
+  const job = { connectionId: id }
+  const generation = rosterStateGeneration
+  const snapshot = normalizeRosterState($rosterState.get())
+
+  try {
+    const remote = await rosterStateRemoteState(job)
+
+    if (remote.snapshot && rosterStatesEqual(remote.snapshot, snapshot)) {
+      rosterStateSyncRetryCounts.delete(id)
+      return
+    }
+
+    const params = {
+      name: 'default',
+      ui_meta: { [ROSTER_STATE_META_KEY]: snapshot }
+    }
+    if (remote.supportsCas) {
+      params.ui_meta_expected_revisions = { [ROSTER_STATE_META_KEY]: remote.revision }
+    }
+
+    const result = await groupChatSyncRequest(job, 'profiles.configure', params)
+    const writeRevision = remote.revision + 1
+
+    if (result?.applied?.ui_meta !== true) {
+      throw new Error('Gateway rejected roster ui_meta')
+    }
+    if (
+      remote.supportsCas &&
+      Number(result?.applied?.ui_meta_revisions?.[ROSTER_STATE_META_KEY] || 0) !== writeRevision
+    ) {
+      throw new Error('Gateway did not advance roster ui_meta revision')
+    }
+
+    const confirmed = await rosterStateRemoteState(job)
+
+    if (remote.supportsCas && confirmed.revision < writeRevision) {
+      throw new Error('Roster ui_meta revision missing after read-back')
+    }
+    if (confirmed.snapshot && generation === rosterStateGeneration) {
+      applyRosterState(confirmed.snapshot)
+    }
+    rosterStateSyncRetryCounts.delete(id)
+  } catch {
+    if (!rosterStateSyncDisposed) {
+      const retries = Number(rosterStateSyncRetryCounts.get(id) || 0) + 1
+
+      if (retries <= 8) {
+        rosterStateSyncPendingConnections.add(id)
+        rosterStateSyncRetryCounts.set(id, retries)
+
+        if (typeof setTimeout === 'function' && !rosterStateSyncRetryTimers.has(id)) {
+          rosterStateSyncRetryTimers.set(id, setTimeout(() => {
+            rosterStateSyncRetryTimers.delete(id)
+            void flushRosterStateServerSync(id)
+          }, rosterStateSyncBackoff(id)))
+        }
+      } else {
+        rosterStateSyncRetryCounts.delete(id)
+      }
+    }
+  } finally {
+    rosterStateSyncInFlightConnections.delete(id)
+
+    if (
+      rosterStateSyncPendingConnections.has(id) &&
+      !rosterStateSyncRetryTimers.has(id) &&
+      !rosterStateSyncDisposed
+    ) {
+      void flushRosterStateServerSync(id)
+    }
+  }
+}
+
+function scheduleRosterStateServerSync() {
+  if (typeof setTimeout !== 'function') {
+    return
+  }
+
+  const activeId = String(groupChatSyncConnectionId() || '')
+  const queueFor = connectionId => {
+    const id = String(connectionId || '')
+    const retryTimer = rosterStateSyncRetryTimers.get(id)
+
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer)
+      rosterStateSyncRetryTimers.delete(id)
+    }
+
+    rosterStateSyncPendingConnections.add(id)
+  }
+
+  queueFor(activeId)
+
+  if (rosterStateSyncTimer !== null) {
+    clearTimeout(rosterStateSyncTimer)
+  }
+
+  rosterStateSyncTimer = setTimeout(() => {
+    rosterStateSyncTimer = null
+    void groupChatSyncTargetConnections()
+      .then(targets => targets.forEach(queueFor))
+      .catch(() => undefined)
+      .then(() => flushRosterStateServerSync())
+  }, 250)
+}
+
+function stopRosterStateServerSync() {
+  rosterStateSyncDisposed = true
+  rosterStateSyncPendingConnections.clear()
+
+  if (rosterStateSyncTimer !== null) {
+    clearTimeout(rosterStateSyncTimer)
+    rosterStateSyncTimer = null
+  }
+
+  for (const timer of rosterStateSyncRetryTimers.values()) {
+    clearTimeout(timer)
+  }
+
+  rosterStateSyncRetryTimers.clear()
+  rosterStateSyncRetryCounts.clear()
+}
+
 function handleSessionsGatewayTransition() {
   // A gateway swap invalidates any in-flight room drive: bump every room's
   // epoch so running loops bail at their next member boundary.
@@ -1133,6 +1673,15 @@ function handleSessionsGatewayTransition() {
   void pullGroupChatServerState()
     .catch(() => false)
     .then(() => scheduleGroupChatServerSync($groupChats.get()))
+
+  const generation = rosterStateGeneration
+  void pullRosterStateServerState(groupChatSyncConnectionId(), generation)
+    .catch(() => false)
+    .then(pulled => {
+      if (!pulled && generation === rosterStateGeneration && rosterStateHasContent()) {
+        scheduleRosterStateServerSync()
+      }
+    })
 }
 
 /** Per-bot appearance + display meta, persisted via ctx.storage:
@@ -1658,6 +2207,7 @@ async function deleteBot(bot) {
   rosterWatermarks.delete(bot.name)
   avatarFetchInflight.delete(bot.name)
   avatarPushInflight.delete(bot.name)
+  applyRosterState(removeRosterPeer($rosterState.get(), botRosterPeerId(bot)), { sync: true })
 
   if ($selectedBot.get() === bot.name) {
     $selectedBot.set('default')
@@ -3968,6 +4518,14 @@ function botRosterKey(bot) {
   return `${bot?.connectionId || 'legacy'}::${bot?.name || 'default'}`
 }
 
+function botRosterPeerId(bot) {
+  return `bot:${botRosterKey(bot)}`
+}
+
+function groupRosterPeerId(name, room = $groupChats.get()[name]) {
+  return `group:${groupChatRoomKey(name, room)}`
+}
+
 // ── cross-connection routing ─────────────────────────────────────────────────
 // A bot from another registered connection (remoteSource rows) is reached
 // through host.requestProfile with a route descriptor; local bots keep the
@@ -4745,6 +5303,7 @@ async function disbandGroupChat(group, members) {
   // the user just discarded.
   const all = { ...$groupChats.get() }
   const prior = all[group] || {}
+  const rosterPeerId = groupRosterPeerId(group, prior)
 
   delete all[group]
   // Keep a runtime-only tombstone while a drive may still be mid-turn; it
@@ -4795,6 +5354,7 @@ async function disbandGroupChat(group, members) {
     /* storage unavailable — the atom reset above still empties the room */
   }
   scheduleGroupChatServerSync($groupChats.get(), { allowEmpty: true, deletedRooms: [group] })
+  applyRosterState(removeRosterPeer($rosterState.get(), rosterPeerId), { sync: true })
 
   // Remove this membership last. saveBotMeta never throws (local storage +
   // best-effort profiles.configure per member), so a flaky gateway can't
@@ -4864,12 +5424,19 @@ async function renameGroupChat(oldName, newName, members) {
   const room = all[oldName]
 
   delete all[oldName]
+  const previousRosterPeerId = groupRosterPeerId(oldName, room)
 
   if (room) {
     all[next] = room
   }
 
+  const nextRosterPeerId = groupRosterPeerId(next, room)
+
   $groupChats.set(all)
+  applyRosterState(
+    replaceRosterPeer($rosterState.get(), previousRosterPeerId, nextRosterPeerId),
+    { sync: true }
+  )
 
   const needs = { ...$groupNeedsYou.get() }
 
@@ -5931,7 +6498,7 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
-function BotRow({ bot, onDelete, onEdit, onGroup }) {
+function BotRow({ bot, onDelete, onEdit, onGroup, onPin, reorder }) {
   const activeProfile = useValue(host.state.profile)
   const focusedProfile = useValue($focusedBotProfile)
   const activeGroup = useValue($groupChatWorkspace)
@@ -6075,12 +6642,22 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
 
   const row = jsxs('button', {
     type: 'button',
+    draggable: Boolean(reorder?.enabled),
+    'aria-keyshortcuts': reorder?.enabled ? 'Alt+ArrowUp Alt+ArrowDown' : undefined,
+    onDragStart: reorder?.onDragStart,
+    onDragOver: reorder?.onDragOver,
+    onDrop: reorder?.onDrop,
+    onDragEnd: reorder?.onDragEnd,
+    onKeyDown: reorder?.onKeyDown,
     onPointerEnter: warm,
     onClick: open,
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
       isActive && 'bg-(--chrome-action-hover)',
+      reorder?.enabled && 'cursor-grab active:cursor-grabbing',
+      reorder?.dragging && 'opacity-50',
+      reorder?.over && 'ring-1 ring-inset ring-(--ui-accent,#4f9cf9)',
       // Hidden bots only render while the header eye toggle is on — dimmed,
       // so the temporary reveal reads as a different state from the roster.
       meta?.hidden && 'opacity-60'
@@ -6196,11 +6773,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
           jsx(ContextMenuItem, {
             onSelect: () => {
               const pinned = Boolean($botMeta.get()[bot.name]?.pinned)
-              saveBotMeta(bot.name, { pinned: !pinned })
-              host.notify({
-                kind: 'info',
-                message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}`
-              })
+              onPin(bot, !pinned)
             },
             children: meta?.pinned ? 'Unpin' : 'Pin to top'
           }),
@@ -10737,6 +11310,7 @@ function openGroupChat(group) {
  *  needs-you badge on the row itself. Sorts into the same recency ordering
  *  as bot rows; clicking opens the room in the main chat window. */
 function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
+  const { onPin, pinned, reorder } = arguments[0]
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [] }
@@ -10754,6 +11328,13 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
 
   const row = jsxs('button', {
     type: 'button',
+    draggable: Boolean(reorder?.enabled),
+    'aria-keyshortcuts': reorder?.enabled ? 'Alt+ArrowUp Alt+ArrowDown' : undefined,
+    onDragStart: reorder?.onDragStart,
+    onDragOver: reorder?.onDragOver,
+    onDrop: reorder?.onDrop,
+    onDragEnd: reorder?.onDragEnd,
+    onKeyDown: reorder?.onKeyDown,
     onClick: () => {
       haptic('tap')
       onOpen(group)
@@ -10761,7 +11342,10 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
-      active && 'bg-(--ui-row-active-background)'
+      active && 'bg-(--ui-row-active-background)',
+      reorder?.enabled && 'cursor-grab active:cursor-grabbing',
+      reorder?.dragging && 'opacity-50',
+      reorder?.over && 'ring-1 ring-inset ring-(--ui-accent,#4f9cf9)'
     ),
     children: [
       // Room picture when the user set one; else a composite avatar of up to
@@ -10810,6 +11394,13 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
               jsxs('div', {
                 className: 'flex min-w-0 items-baseline gap-1.5 truncate',
                 children: [
+                  pinned
+                    ? jsx('span', {
+                        className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                        title: 'Pinned',
+                        children: '📌'
+                      })
+                    : null,
                   jsx('span', { className: 'truncate text-[0.8125rem] font-medium', children: group }),
                   jsx('span', {
                     className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
@@ -10848,6 +11439,10 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
       jsxs(ContextMenuContent, {
         children: [
           jsx(ContextMenuItem, {
+            onSelect: () => onPin(!pinned),
+            children: pinned ? 'Unpin' : 'Pin to top'
+          }),
+          jsx(ContextMenuItem, {
             onSelect: () => onOpen(group),
             children: 'Open Group Chat'
           }),
@@ -10875,7 +11470,10 @@ function BotsPane() {
   const [deletingGroup, setDeletingGroup] = useState(null)
   const [grouping, setGrouping] = useState(null)
   const [query, setQuery] = useState('')
+  const [draggingPeerId, setDraggingPeerId] = useState(null)
+  const [dragOverPeerId, setDragOverPeerId] = useState(null)
   const activityToasts = useValue($activityToasts)
+  const rosterState = useValue($rosterState)
   const groupChatName = useValue($groupChatWorkspace)
   // Main-tab ownership is a module Map; this rev subscription makes the
   // shouldRenderGroupChatInPane gate below reactive to tab open/close
@@ -10934,32 +11532,143 @@ function BotsPane() {
   const hiddenUnread = hiddenBots.some(bot => !bot.remoteSource && unreadByName[bot.name])
   const visibleRoster = showHidden ? roster : roster.filter(bot => !isBotHidden(bot, allMeta))
   const filteredRoster = filterBots(visibleRoster, allMeta, query)
-  // Group chats are first-class roster rows (Discord-style): one standalone
-  // row per room, competing in the SAME recency ordering as bot rows — a
-  // group's activity is its newest room-log line. Pinned bots still lead;
-  // groups and unpinned bots interleave by recency below them.
+  // Group chats are first-class roster peers. The complete row set (including
+  // hidden/search-filtered bots) is sorted first so projections cannot mutate
+  // durable slots. Before the first explicit move, both pin bands preserve
+  // the existing recency behavior; afterward the saved mixed bot/group order
+  // wins and activity updates no longer reshuffle it.
   const needle = query.trim().toLowerCase()
   const groupRows = groupChatNames(allMeta, groupRooms)
-    .filter(name => !needle || name.toLowerCase().includes(needle))
     .map(name => ({
       kind: 'group',
       name,
+      peerId: groupRosterPeerId(name, groupRooms[name]),
       members: groupChatMemberBots(name, roster, allMeta),
       activity: groupLastActivity(groupRooms[name])
     }))
-  const rosterRows = [
-    ...filteredRoster.map(bot => ({ kind: 'bot', bot, pinned: isPinned(bot), activity: activityOf(bot) })),
+  // A legacy name-keyed room can later hydrate an immutable roomId from a
+  // newer gateway. Project the saved slot/pin onto that durable identity on
+  // the very first paint; the effect below persists the migration.
+  const projectedRosterState = groupRows.reduce(
+    (state, row) => replaceRosterPeer(state, `group:name:${row.name}`, row.peerId),
+    rosterState
+  )
+  const pinnedGroups = new Set(projectedRosterState.pinnedGroups)
+  for (const row of groupRows) {
+    row.pinned = pinnedGroups.has(row.peerId)
+  }
+  const allRosterRows = [
+    ...roster.map(bot => ({
+      kind: 'bot',
+      bot,
+      peerId: botRosterPeerId(bot),
+      pinned: isPinned(bot),
+      activity: activityOf(bot)
+    })),
     ...groupRows
-  ].sort((a, b) => {
-    const pa = a.pinned ? 1 : 0
-    const pb = b.pinned ? 1 : 0
+  ]
+  const visibleBotPeers = new Set(filteredRoster.map(botRosterPeerId))
+  const rosterRows = sortRosterRows(allRosterRows, projectedRosterState).filter(row =>
+    row.kind === 'group'
+      ? !needle || row.name.toLowerCase().includes(needle)
+      : visibleBotPeers.has(row.peerId)
+  )
+  const visibleRosterPeerIds = new Set(rosterRows.map(row => row.peerId))
+  const peerSignature = JSON.stringify(allRosterRows.map(row => row.peerId))
+  const rosterStateSignature = JSON.stringify(rosterState)
 
-    if (pa !== pb) {
-      return pb - pa
+  useEffect(() => {
+    const current = $rosterState.get()
+    let next = groupRows.reduce(
+      (state, row) => replaceRosterPeer(state, `group:name:${row.name}`, row.peerId),
+      current
+    )
+
+    if (next.manual) {
+      next = reconcileRosterState(next, allRosterRows)
     }
 
-    return b.activity - a.activity
+    applyRosterState(next, { sync: true })
+  }, [peerSignature, rosterStateSignature])
+
+  const finishDragging = () => {
+    setDraggingPeerId(null)
+    setDragOverPeerId(null)
+  }
+  const commitRosterOrder = next => {
+    if (applyRosterState(next, { sync: true })) {
+      haptic('tap')
+    }
+  }
+  const reorderProps = row => ({
+    enabled: !needle,
+    dragging: draggingPeerId === row.peerId,
+    over: dragOverPeerId === row.peerId && draggingPeerId !== row.peerId,
+    onDragStart: event => {
+      if (needle) return
+      event.dataTransfer.effectAllowed = 'move'
+      event.dataTransfer.setData('text/plain', row.peerId)
+      setDraggingPeerId(row.peerId)
+    },
+    onDragOver: event => {
+      const active = rosterRows.find(candidate => candidate.peerId === draggingPeerId)
+
+      if (!needle && active && Boolean(active.pinned) === Boolean(row.pinned)) {
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'move'
+        setDragOverPeerId(row.peerId)
+      }
+    },
+    onDrop: event => {
+      event.preventDefault()
+      const activeId = draggingPeerId || event.dataTransfer.getData('text/plain')
+      commitRosterOrder(
+        reorderRosterRows(
+          $rosterState.get(),
+          allRosterRows,
+          activeId,
+          row.peerId,
+          visibleRosterPeerIds
+        )
+      )
+      finishDragging()
+    },
+    onDragEnd: finishDragging,
+    onKeyDown: event => {
+      if (needle || !event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) {
+        return
+      }
+
+      event.preventDefault()
+      commitRosterOrder(
+        moveRosterRow(
+          $rosterState.get(),
+          allRosterRows,
+          row.peerId,
+          event.key === 'ArrowUp' ? -1 : 1,
+          visibleRosterPeerIds
+        )
+      )
+    }
   })
+  const pinBot = (bot, pinned) => {
+    void saveBotMeta(bot.name, { pinned })
+    applyRosterState(
+      moveRosterPeerToBandEnd($rosterState.get(), allRosterRows, botRosterPeerId(bot), pinned),
+      { sync: true }
+    )
+    host.notify({
+      kind: 'info',
+      message: `${displayName(bot, botRosterMeta(bot, allMeta))} ${pinned ? 'pinned to top' : 'unpinned'}`
+    })
+  }
+  const pinGroup = (row, pinned) => {
+    applyRosterState(setGroupPinned($rosterState.get(), allRosterRows, row.peerId, pinned), { sync: true })
+    host.notify({
+      kind: 'info',
+      message: `${row.name} ${pinned ? 'pinned to top' : 'unpinned'}`
+    })
+  }
 
   if (live) {
     $lastRoster.set(roster)
@@ -11205,14 +11914,24 @@ function BotsPane() {
                               members: row.members,
                               needsYou: Boolean(groupNeedsYou[row.name]),
                               onOpen: openGroupChat,
-                              onDisband: setDeletingGroup
+                              onDisband: setDeletingGroup,
+                              onPin: pinned => pinGroup(row, pinned),
+                              pinned: row.pinned,
+                              reorder: reorderProps(row)
                             },
-                            `group:${row.name}`
+                            row.peerId
                           )
                         : jsx(
                             BotRow,
-                            { bot: row.bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping },
-                            botRosterKey(row.bot)
+                            {
+                              bot: row.bot,
+                              onDelete: setDeleting,
+                              onEdit: setEditing,
+                              onGroup: setGrouping,
+                              onPin: pinBot,
+                              reorder: reorderProps(row)
+                            },
+                            row.peerId
                           )
                     )
                   })
@@ -11311,6 +12030,7 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+    rosterStateSyncDisposed = false
     startFaceClock()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
@@ -11407,6 +12127,30 @@ export default {
       /* no storage on this shell — defaults stay */
     }
 
+    // Roster organization is a small, independent projection: local storage
+    // paints immediately, then the active gateway's default profile wins
+    // when it carries a server snapshot. A generation fence protects a drag
+    // or pin gesture that lands while hydration is still in flight.
+    try {
+      Promise.resolve(ctx.storage?.get?.('roster-state'))
+        .then(async value => {
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            applyRosterState(value)
+          }
+
+          const generation = rosterStateGeneration
+          const pulled = await pullRosterStateServerState(groupChatSyncConnectionId(), generation)
+            .catch(() => false)
+
+          if (!pulled && generation === rosterStateGeneration && rosterStateHasContent()) {
+            scheduleRosterStateServerSync()
+          }
+        })
+        .catch(() => undefined)
+    } catch {
+      /* no storage/gateway support — recency order remains the default */
+    }
+
     // Bot Mode sessions are always hidden now — the old "hide Bot Chats"
     // pref is gone (its stored key is simply ignored). The reconciliation
     // sweep below hides any rows born visible under the old pref.
@@ -11479,6 +12223,7 @@ export default {
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
         stopGroupChatServerSync()
+        stopRosterStateServerSync()
         if (typeof unbindProfileListener === 'function') {
           unbindProfileListener()
         }

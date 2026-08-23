@@ -196,7 +196,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, applyRosterState, pullRosterStateServerState, scheduleRosterStateServerSync, $rosterState, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -1044,6 +1044,40 @@ test('fan-out class: a room write is mirrored to every reachable default-profile
   )
   assert.ok(configured.has('gw-a'), 'gateway A received the room mirror')
   assert.ok(configured.has('gw-b'), 'gateway B received the room mirror')
+})
+
+test('roster pins and manual order round-trip through revisioned gateway metadata', async () => {
+  const gc = load(() => '(pass)', { deferredTimers: true })
+  const local = {
+    version: 1,
+    manual: true,
+    order: ['group:id:room-1', 'bot:local::default'],
+    pinnedGroups: ['group:id:room-1']
+  }
+
+  gc.applyRosterState(local, { sync: true })
+  for (let i = 0; i < 60 && !gc.sharedUiMeta['hermes-bots-roster']; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  assert.equal(JSON.stringify(gc.sharedUiMeta['hermes-bots-roster']), JSON.stringify(local))
+  assert.equal(gc.uiMetaRevisions['hermes-bots-roster'], 1)
+  const write = gc.requests.find(request =>
+    request.method === 'profiles.configure' && request.params.ui_meta?.['hermes-bots-roster']
+  )
+  assert.equal(write.params.ui_meta_expected_revisions['hermes-bots-roster'], 0)
+
+  const remote = {
+    version: 1,
+    manual: true,
+    order: ['bot:local::default', 'group:id:room-1'],
+    pinnedGroups: []
+  }
+  gc.sharedUiMeta['hermes-bots-roster'] = remote
+  gc.uiMetaRevisions['hermes-bots-roster'] = 2
+  assert.equal(await gc.pullRosterStateServerState(), true)
+  assert.equal(JSON.stringify(gc.$rosterState.get()), JSON.stringify(remote))
+  assert.equal(JSON.stringify(gc.storageWrites.get('roster-state')), JSON.stringify(remote))
 })
 
 test('source contract: workspace + main-window door + prompt rules are wired', () => {
