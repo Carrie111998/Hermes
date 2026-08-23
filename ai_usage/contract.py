@@ -12,6 +12,10 @@ PROVIDERS: list[tuple[str, str, str]] = [
     ("openai-codex", "Codex", "budget"),
     ("kimi", "Kimi K3", "budget"),
     ("deepseek", "DeepSeek", "balance"),
+    # Gemini has NO quantitative usage surface off a cookie session (verified
+    # 2026-08-22: v1beta/rateLimits is 404; AI Studio is login-walled in the
+    # automation browser). spend-mode keeps the row honest -- it reports
+    # Hermes-routed traffic only, never a fabricated %.
     ("gemini", "Gemini", "spend"),
     ("xai", "Grok", "budget"),
     ("opencode-go", "OpenCode Go", "budget"),
