@@ -132,6 +132,18 @@ def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
     return _fallback_socket_path(home), _pointer_path(home)
 
 
+def _current_euid() -> Optional[int]:
+    """The effective uid, or None where the platform has no such concept.
+
+    ``os.geteuid`` is absent on Windows, so it is resolved through
+    ``getattr`` rather than referenced directly — the Windows-footgun lint
+    flags a bare call even inside a platform-gated branch, and looking it up
+    removes the hazard instead of annotating it.
+    """
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter is not None else None
+
+
 def _is_trustworthy_socket(candidate: Path) -> bool:
     """True when *candidate* is a socket this user owns, with no group/other access.
 
@@ -161,10 +173,11 @@ def _is_trustworthy_socket(candidate: Path) -> bool:
     if not stat.S_ISSOCK(info.st_mode):
         logger.debug("Control socket %s is not a socket; ignoring", candidate)
         return False
-    if info.st_uid != os.geteuid():
+    euid = _current_euid()
+    if euid is not None and info.st_uid != euid:
         logger.warning(
             "Ignoring control socket %s: owned by uid %d, not %d",
-            candidate, info.st_uid, os.geteuid(),
+            candidate, info.st_uid, euid,
         )
         return False
     if stat.S_IMODE(info.st_mode) & 0o077:
