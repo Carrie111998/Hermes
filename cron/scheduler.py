@@ -1708,6 +1708,17 @@ def _maybe_mirror_cron_delivery(
         session_store = getattr(adapter, "_session_store", None)
         if (
             session_store is not None
+            and getattr(session_store.config, "multiplex_profiles", False)
+            and getattr(session_store, "_db", None) is None
+        ):
+            logger.debug(
+                "Job '%s': delivery mirror skipped for %s:%s "
+                "(multiplex session DB unavailable)",
+                job.get("id", "?"), platform_name, chat_id,
+            )
+            return
+        if (
+            session_store is not None
             and getattr(session_store, "_db", None) is not None
         ):
             session_key_prefix = None
@@ -1869,7 +1880,6 @@ def _seed_cron_thread_session(
         from gateway.config import Platform
         from gateway.session import SessionSource
 
-        seeded_session_id: Optional[str] = None
         session_store = getattr(adapter, "_session_store", None)
         if session_store is not None:
             try:
@@ -1933,7 +1943,6 @@ def _seed_cron_thread_session(
             thread_id=str(thread_id),
             user_id="system:cron",
             role="user",
-            session_id=seeded_session_id,
         )
         if ok:
             logger.info(
@@ -2009,7 +2018,6 @@ def _seed_cron_channel_session(
 
         chat_type = "dm" if is_dm else "group"
         session_store = getattr(adapter, "_session_store", None)
-        seeded_session_id: Optional[str] = None
         if session_store is not None:
             try:
                 platform_enum = Platform(platform_name.lower())
@@ -2056,7 +2064,6 @@ def _seed_cron_channel_session(
             source_label="cron",
             thread_id=None,
             user_id=str(user_id) if user_id else None,
-            session_id=seeded_session_id,
             role="user",
         )
         if ok:

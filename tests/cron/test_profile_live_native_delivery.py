@@ -246,6 +246,30 @@ def test_live_cron_mirror_filters_the_shared_db_by_profile(tmp_path):
         db.close()
 
 
+def test_live_cron_mirror_does_not_use_global_fallback_without_multiplex_db():
+    """A degraded shared store must not rediscover another profile's row."""
+    store = SimpleNamespace(
+        _db=None,
+        config=GatewayConfig(multiplex_profiles=True),
+        append_to_transcript=MagicMock(),
+    )
+    adapter = SimpleNamespace(_session_store=store)
+
+    with patch("gateway.mirror.mirror_to_session") as mirror:
+        _maybe_mirror_cron_delivery(
+            {"id": "reports-cron"},
+            "discord",
+            "123",
+            "Reports-only output",
+            user_id="user-1",
+            enabled=True,
+            adapter=adapter,
+        )
+
+    mirror.assert_not_called()
+    store.append_to_transcript.assert_not_called()
+
+
 def test_named_profile_adapter_resolution_owns_local_platform_boundaries(
     tmp_path, monkeypatch
 ):
