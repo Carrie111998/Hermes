@@ -37,6 +37,10 @@ export interface PreviewTarget {
   path?: string
   previewKind?: 'binary' | 'html' | 'image' | 'pdf' | 'text'
   renderMode?: 'preview' | 'source'
+  /** Tombstone set when a read/watch confirmed the file is gone. The tab stays
+   *  open for the session showing an explicit "file no longer exists" state,
+   *  but is dropped at the next restore so day-2 boots stop re-probing it. */
+  missing?: boolean
   source: string
   /** Runtime-only target that cannot be restored from persisted state. */
   transient?: boolean
@@ -129,7 +133,10 @@ export function decodePreviewTabs(raw: string): PreviewTab[] {
   // LAST — the most recently opened page is the one the browser shows.
   const lastUrl = tabs.findLast(tab => tab.target.kind === 'url')
 
+  // Drop tombstoned file tabs (a previous session confirmed the file is gone).
+  // Keeping them would re-probe a known-dead path on every boot.
   return tabs
+    .filter(tab => !tab.target.missing)
     .filter(tab => tab.target.kind !== 'url' || tab === lastUrl)
     .map(tab => (tab.target.kind === 'url' ? { ...tab, id: previewTabId(tab.target) } : tab))
 }
@@ -224,6 +231,23 @@ export function openPreview(target: PreviewTarget, source: PreviewRecordSource =
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
   selectRightRailTab(id)
+}
+
+/** Tombstone the tab for a confirmed-missing file: keep it open this session
+ *  (the pane shows "file no longer exists"), but flag the target so the next
+ *  restore drops it instead of re-probing the dead path on every boot. */
+export function markPreviewTabMissing(targetUrl: string) {
+  const current = $previewTabs.get()
+  const id = targetUrl.startsWith('file:') ? targetUrl : `file:${targetUrl}`
+  const index = current.findIndex(tab => tab.id === id)
+
+  if (index === -1 || current[index]!.target.missing) {
+    return
+  }
+
+  $previewTabs.set(
+    current.map((tab, i) => (i === index ? { ...tab, target: { ...tab.target, missing: true } } : tab))
+  )
 }
 
 /** Open the Browser tab — the surface, not a page. Keeps whatever it was last

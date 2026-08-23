@@ -24,8 +24,10 @@ import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import {
   desktopFileDiff,
+  DesktopFileMissingError,
   desktopFsCacheKey,
   desktopGitRoot,
+  isReadFileErrorResult,
   readDesktopFileDataUrl,
   readDesktopFileText,
   writeDesktopFileText
@@ -36,6 +38,7 @@ import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { normalizeFilePreviewMath } from '@/lib/markdown-preprocess'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
+import { markPreviewTabMissing } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
 import { $connection, $currentCwd } from '@/store/session'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
@@ -157,8 +160,11 @@ interface LocalPreviewState {
   diff?: string
   error?: string
   language?: string
-  loading: boolean
+  /** The read confirmed the file is gone (not a transient failure) — renders
+   *  the explicit tombstone and prunes the tab from future restores. */
+  missing?: boolean
   text?: string
+  loading: boolean
   truncated?: boolean
 }
 
@@ -279,6 +285,11 @@ async function readTextPreview(filePath: string) {
   // Back-compat for a running Electron process whose preload hasn't been
   // restarted since readFileText was added. readFileDataUrl already existed.
   const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath)
+
+  if (isReadFileErrorResult(dataUrl)) {
+    throw new Error(dataUrl.message || `File read failed: ${dataUrl.error}`)
+  }
+
   const [, metadata = '', data = ''] = dataUrl.match(/^data:([^,]*),(.*)$/) || []
   const base64 = metadata.includes(';base64')
   const mimeType = metadata.replace(/;base64$/, '') || undefined
@@ -798,9 +809,19 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
         }
       } catch (error) {
         if (active) {
+          // Expected absence (deleted / moved / cleared /tmp): tombstone the
+          // tab so the next launch drops it instead of re-probing the dead
+          // path, and show the explicit "file no longer exists" state.
+          const missing = error instanceof DesktopFileMissingError
+
+          if (missing) {
+            markPreviewTabMissing(target.url)
+          }
+
           setState({
             error: error instanceof Error ? error.message : String(error),
-            loading: false
+            loading: false,
+            missing
           })
         }
       }
@@ -822,7 +843,8 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     reloadKey,
     selfReload,
     target.dataUrl,
-    target.language
+    target.language,
+    target.url
   ])
 
   useEffect(() => {
@@ -1038,6 +1060,10 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
 
   if (state.loading) {
     return <PageLoader label={t.preview.loading} />
+  }
+
+  if (state.missing) {
+    return <PreviewEmptyState body={t.preview.missingBody(target.label)} title={t.preview.missingTitle} tone="warning" />
   }
 
   if (state.error) {
