@@ -3,6 +3,7 @@ import { useStore } from '@nanostores/react'
 import { $restartPreviewServer } from '@/app/contrib/panes'
 import { $previewReloadRequest, $previewTabs } from '@/store/preview'
 
+import { closePreviewTab } from './preview-close'
 import { PreviewPane } from './preview-pane'
 
 interface PreviewTilePaneProps {
@@ -35,6 +36,7 @@ export function PreviewTilePane({ tabId }: PreviewTilePaneProps) {
   return (
     <PreviewPane
       embedded
+      onClose={() => closePreviewTab(tabId)}
       onRestartServer={target.kind === 'url' ? (restartPreviewServer ?? undefined) : undefined}
       reloadRequest={previewReloadRequest}
       tabId={tabId}

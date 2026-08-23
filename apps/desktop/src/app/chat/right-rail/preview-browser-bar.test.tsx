@@ -10,6 +10,7 @@ const baseProps = {
   devToolsOpen: false,
   loading: false,
   onBack: vi.fn(),
+  onClose: vi.fn(),
   onForward: vi.fn(),
   onNavigate: vi.fn(),
   onOpenExternal: vi.fn(),
@@ -89,7 +90,17 @@ describe('PreviewBrowserBar', () => {
     expect(rendered.getByRole('button', { name: 'Open in browser' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Show preview console' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Open preview DevTools' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Close' })).toBeTruthy()
     expect(address(rendered)).toBeTruthy()
+  })
+
+  it('invokes the tab-scoped close owner exactly once', () => {
+    const onClose = vi.fn()
+    const rendered = render(<PreviewBrowserBar {...baseProps} onClose={onClose} />)
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Close' }))
+
+    expect(onClose).toHaveBeenCalledOnce()
   })
 
   it('disables back and forward when there is no history', () => {
