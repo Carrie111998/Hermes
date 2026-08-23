@@ -1163,6 +1163,12 @@ _CODEX_INCOMPLETE_NUDGE = (
     "you were planning).]"
 )
 
+# Chat-completions reasoning-only turns are removed from the per-call wire copy
+# by _drop_thinking_only_and_merge_users (required for strict Anthropic-style
+# endpoints). A user-role continuation therefore has to survive that cleanup;
+# otherwise every "prefill" retry is byte-identical to the failed request.
+_THINKING_PREFILL_NUDGE = _CODEX_INCOMPLETE_NUDGE
+
 
 # Re-prompt sent after a Codex/Responses turn ends with an acknowledgment-only
 # reply (no tool calls, no final answer) — named so
@@ -7683,12 +7689,14 @@ def run_conversation(
                         })
                         continue
 
-                    # ── Thinking-only prefill continuation ──────────
+                    # ── Thinking-only continuation ──────────────────
                     # The model produced structured reasoning (via API
-                    # fields) but no visible text content.  Rather than
-                    # giving up, append the assistant message as-is and
-                    # continue — the model will see its own reasoning
-                    # on the next turn and produce the text portion.
+                    # fields) but no visible text content. Keep the assistant
+                    # message internally, then append an explicit user-role
+                    # continuation. The per-call sanitizer intentionally drops
+                    # thinking-only assistants for strict providers, so without
+                    # the user nudge this retry would resend the original request
+                    # byte-for-byte and deterministically repeat the failure.
                     # Inspired by clawdbot's "incomplete-text" recovery.
                     # Also covers Qwen3/Ollama in-content <think> blocks
                     # (detected above as _has_inline_thinking).
@@ -7714,6 +7722,11 @@ def run_conversation(
                         )
                         interim_msg["_thinking_prefill"] = True
                         append_message(messages, interim_msg)
+                        append_message(messages, {
+                            "role": "user",
+                            "content": _THINKING_PREFILL_NUDGE,
+                            "_thinking_prefill": True,
+                        })
                         agent._session_messages = messages
                         continue
 

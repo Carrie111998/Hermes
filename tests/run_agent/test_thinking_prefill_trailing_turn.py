@@ -1,8 +1,8 @@
 """Regression test for the thinking-only prefill reaching the wire.
 
 A thinking-only response (reasoning tokens, no visible text) makes the loop
-append an empty assistant turn and re-send so the model continues its own
-reasoning. On providers that don't echo reasoning back, the API copy has its
+append an internal assistant turn plus a user-role continuation so the model
+finishes with visible output. On providers that don't echo reasoning back, the API copy has its
 reasoning fields stripped before ``_drop_thinking_only_and_merge_users`` runs,
 so the drop pass used to see a bare ``{"role": "assistant", "content": ""}``
 and let it through. Gemini rejects that with
@@ -103,27 +103,43 @@ class TestThinkingPrefillTrailingTurn:
             f"dropped before send. Got roles: {[m['role'] for m in final_request]}"
         )
 
-    def test_prefill_stubs_are_absent_from_the_wire_payload(self, loop_agent):
-        """The stubs should be gone entirely, not merely trailed by a nudge."""
-        loop_agent.client.chat.completions.create.side_effect = [
-            _thinking_only_response(),
-            _final_response(),
-        ]
+    def test_prefill_retry_explicitly_requests_visible_output(self, loop_agent):
+        """Dropping the thinking stub must not make the retry byte-identical."""
+        requests = []
+
+        def respond(**kwargs):
+            requests.append(kwargs["messages"])
+            if "Produce your final answer as plain text now" in str(
+                kwargs["messages"][-1].get("content", "")
+            ):
+                return _final_response()
+            return _thinking_only_response()
+
+        loop_agent.client.chat.completions.create.side_effect = respond
 
         with (
             patch.object(loop_agent, "_persist_session"),
             patch.object(loop_agent, "_save_trajectory"),
             patch.object(loop_agent, "_cleanup_task_resources"),
         ):
-            loop_agent.run_conversation("do the thing")
+            result = loop_agent.run_conversation("do the thing")
 
-        sent = _sent_messages(loop_agent.client.chat.completions.create, 1)
+        assert loop_agent.client.chat.completions.create.call_count == 2
+        assert requests[0] != requests[1]
+        sent = requests[1]
         empty_assistants = [
             m for m in sent
             if m.get("role") == "assistant" and not (m.get("content") or "").strip()
         ]
         assert not empty_assistants, (
             f"Empty assistant stub(s) reached the wire: {empty_assistants}"
+        )
+        assert "Produce your final answer as plain text now" in sent[-1]["content"]
+        assert result["final_response"] == "Here is the answer."
+        assert all(
+            "Produce your final answer as plain text now"
+            not in str(message.get("content", ""))
+            for message in result["messages"]
         )
 
     def test_internal_marker_never_reaches_the_wire(self, loop_agent):
