@@ -29,6 +29,21 @@ describe('session date-group collapse persistence', () => {
     expect(remounted.getCollapsedSessionDateGroups(scope)).toEqual(new Set(['week:2026-07-20']))
   })
 
+  it('caps persisted collapsed keys per scope and retains the most recent entries', async () => {
+    const store = await import('./session-date-group-collapse')
+    const scope = store.sessionDateGroupScope(connection(), 'default')
+
+    for (let index = 0; index < store.MAX_COLLAPSED_DATE_GROUPS_PER_SCOPE + 5; index += 1) {
+      store.setSessionDateGroupCollapsed(scope, `day:2026-01-${String(index + 1).padStart(2, '0')}`, true)
+    }
+
+    const persisted = [...store.getCollapsedSessionDateGroups(scope)]
+
+    expect(persisted).toHaveLength(store.MAX_COLLAPSED_DATE_GROUPS_PER_SCOPE)
+    expect(persisted[0]).toBe('day:2026-01-06')
+    expect(persisted.at(-1)).toBe('day:2026-01-69')
+  })
+
   it('isolates state between profiles on the same backend', async () => {
     const store = await import('./session-date-group-collapse')
     const defaultScope = store.sessionDateGroupScope(connection(), 'default')

@@ -4,6 +4,7 @@ import type { SidebarListRow } from '@/lib/session-date-groups'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
+  mergeVisibleReorderIds,
   orderByIds,
   orderRowsWithinGroups,
   rankSessions,
@@ -169,5 +170,13 @@ describe('reorderableRowIds', () => {
     const rows = [session('a'), session('branch', '├─ '), divider('yesterday'), session('b')]
 
     expect(reorderableRowIds(rows)).toEqual(['a', 'b'])
+  })
+})
+
+describe('mergeVisibleReorderIds', () => {
+  it('reorders visible rows without dropping or moving collapsed rows', () => {
+    expect(mergeVisibleReorderIds(['hidden-a', 'visible-a', 'visible-b', 'hidden-b'], ['visible-b', 'visible-a'])).toEqual(
+      ['hidden-a', 'visible-b', 'visible-a', 'hidden-b']
+    )
   })
 })

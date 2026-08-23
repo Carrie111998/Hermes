@@ -4,6 +4,12 @@ import { Codecs, persistentAtom } from '@/lib/persisted'
 export type CollapsedSessionDateGroups = Record<string, string[]>
 
 export const SESSION_DATE_GROUP_COLLAPSE_STORAGE_KEY = 'hermes.desktop.sessionDateGroups.collapsed.v1'
+export const MAX_COLLAPSED_DATE_GROUPS_PER_SCOPE = 64
+
+const sanitizeCollapsedKeys = (keys: unknown[]): string[] =>
+  [...new Set(keys.filter((key): key is string => typeof key === 'string' && key.length > 0))].slice(
+    -MAX_COLLAPSED_DATE_GROUPS_PER_SCOPE
+  )
 
 const sanitizeCollapsedGroups = (value: unknown): CollapsedSessionDateGroups => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -16,7 +22,7 @@ const sanitizeCollapsedGroups = (value: unknown): CollapsedSessionDateGroups => 
         return []
       }
 
-      const cleanKeys = [...new Set(keys.filter((key): key is string => typeof key === 'string' && key.length > 0))]
+      const cleanKeys = sanitizeCollapsedKeys(keys)
 
       return cleanKeys.length > 0 ? [[scope, cleanKeys]] : []
     })
@@ -71,7 +77,7 @@ const writeCollapsedSessionDateGroups = (scope: string, keys: ReadonlySet<string
   if (keys.size === 0) {
     delete next[scope]
   } else {
-    next[scope] = [...keys]
+    next[scope] = [...keys].slice(-MAX_COLLAPSED_DATE_GROUPS_PER_SCOPE)
   }
 
   $collapsedSessionDateGroups.set(next)

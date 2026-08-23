@@ -24,7 +24,7 @@ import { $collapsedSessionDateGroups, setSessionDateGroupCollapsed } from '@/sto
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
-import { orderRowsWithinGroups, reorderableRowIds } from './order'
+import { mergeVisibleReorderIds, orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
   ProjectOverviewRow,
@@ -267,7 +267,7 @@ export function SidebarSessionsSection({
 
   // The flat recents/pinned list is the only place sessions reorder by hand;
   // grouped/tree views always sort by creation date and never drag.
-  const sessionsDraggable = sortable && !!onReorderSessions && !(grouping === 'date' && collapsedDateGroupKeys.size > 0)
+  const sessionsDraggable = sortable && !!onReorderSessions
 
   // Only Pinned arrives pre-ordered as a flat sequence. Recents keeps its
   // recency sort — the drag order is layered on per date group below, so the
@@ -391,7 +391,7 @@ export function SidebarSessionsSection({
   // The hand-picked order is then applied INSIDE each date group, so dragging a
   // row ranks it among its own day's chats instead of freezing the whole list
   // into an undated manual mode.
-  const flatRows: SidebarListRow[] = useMemo(() => {
+  const orderedFlatRows: SidebarListRow[] = useMemo(() => {
     const rows =
       grouping === 'date'
         ? groupEntriesByRecency(displayEntries)
@@ -403,16 +403,22 @@ export function SidebarSessionsSection({
             )
           : toSessionRows(displayEntries)
 
-    const orderedRows = manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
+    return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
+  }, [grouping, displayEntries, dotStates, manualOrderIds, statusDividerLabels])
 
-    return visibleDateRows(orderedRows)
-  }, [grouping, displayEntries, dotStates, manualOrderIds, statusDividerLabels, visibleDateRows])
+  const flatRows = useMemo(() => visibleDateRows(orderedFlatRows), [orderedFlatRows, visibleDateRows])
 
   // dnd-kit must see exactly the ids it renders, in render order: the sortable
   // set is derived from the rows, not from `sessions`. Feeding it the unrendered
   // session order made a drop compute its target index against a list the user
   // wasn't looking at — the drag that landed a row in the wrong slot.
   const sortableRowIds = useMemo(() => reorderableRowIds(flatRows), [flatRows])
+  const allSortableRowIds = useMemo(() => reorderableRowIds(orderedFlatRows), [orderedFlatRows])
+
+  const reorderVisibleSessions = useCallback(
+    (visibleIds: string[]) => onReorderSessions?.(mergeVisibleReorderIds(allSortableRowIds, visibleIds)),
+    [allSortableRowIds, onReorderSessions]
+  )
 
   // Pinned never virtualizes. Virtualization needs a bounded viewport to
   // measure against, and Pinned deliberately has none — however many chats you
@@ -533,16 +539,16 @@ export function SidebarSessionsSection({
     )
 
     inner =
-      sessionsDraggable && onReorderSessions ? (
-        <ReorderableList ids={sortableRowIds} onReorder={onReorderSessions} sensors={dndSensors}>
+      sessionsDraggable ? (
+        <ReorderableList ids={sortableRowIds} onReorder={reorderVisibleSessions} sensors={dndSensors}>
           {virtual}
         </ReorderableList>
       ) : (
         virtual
       )
-  } else if (sessionsDraggable && onReorderSessions) {
+  } else if (sessionsDraggable) {
     inner = (
-      <ReorderableList ids={sortableRowIds} onReorder={onReorderSessions} sensors={dndSensors}>
+      <ReorderableList ids={sortableRowIds} onReorder={reorderVisibleSessions} sensors={dndSensors}>
         {flatRows.map(row => renderListRow(row, true, dividerAction))}
       </ReorderableList>
     )
