@@ -775,6 +775,25 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
+    def _adopt_refresh_result(
+        self, expected: PooledCredential, refreshed: PooledCredential
+    ) -> Optional[PooledCredential]:
+        """Install a refresh result only while its starting generation is current."""
+        with self._lock:
+            for idx, current in enumerate(self._entries):
+                if current.id != expected.id:
+                    continue
+                if (
+                    current.access_token == expected.access_token
+                    and current.refresh_token == expected.refresh_token
+                ):
+                    self._entries[idx] = refreshed
+                    return refreshed
+                # Another actor already advanced this row after the refresh
+                # authority was released. Preserve and adopt that generation.
+                return current
+        return None
+
     def _persist(
         self,
         *,
@@ -1397,6 +1416,7 @@ class CredentialPool:
         """Refresh one canonical PKCE generation without lock-order inversion."""
         result: Optional[PooledCredential] = None
         refresh_failed = False
+        settlement_failed = False
         removed = False
         with _auth_store_lock(
             timeout_seconds=self._single_use_refresh_lock_timeout()
@@ -1463,24 +1483,39 @@ class CredentialPool:
                                 "anthropic", winner
                             )
                             if candidate.refresh_token != entry.refresh_token:
-                                result = candidate
+                                result = replace(
+                                    candidate,
+                                    last_status=STATUS_OK,
+                                    last_status_at=None,
+                                    last_error_code=None,
+                                    last_error_reason=None,
+                                    last_error_message=None,
+                                    last_error_reset_at=None,
+                                )
                         refresh_failed = result is None
                     else:
-                        # Persistence errors must not turn a successful token
-                        # redemption into a false exhausted state. Commit the
-                        # canonical row first, then independently repair the
-                        # singleton; either store can heal the other on load.
-                        try:
-                            write_credential_pool(
-                                "anthropic",
-                                [result.to_dict()],
-                                authoritative_ids=[result.id],
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Failed to persist refreshed Anthropic PKCE pool row: %s",
-                                exc,
-                            )
+                        # A single-use redemption is not settled until its
+                        # successor is durable in the store every waiter reads.
+                        # Retry one transient atomic-write failure while still
+                        # holding the refresh authority; never report a
+                        # memory-only winner as ordinary success.
+                        canonical_committed = False
+                        for attempt in range(2):
+                            try:
+                                write_credential_pool(
+                                    "anthropic",
+                                    [result.to_dict()],
+                                    authoritative_ids=[result.id],
+                                )
+                                canonical_committed = True
+                                break
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to persist refreshed Anthropic PKCE pool row"
+                                    " (attempt %s/2): %s",
+                                    attempt + 1,
+                                    exc,
+                                )
                         try:
                             _write_hermes_oauth_credentials(
                                 result.access_token,
@@ -1492,6 +1527,9 @@ class CredentialPool:
                                 "Failed to persist refreshed Anthropic PKCE singleton: %s",
                                 exc,
                             )
+                        if not canonical_committed:
+                            settlement_failed = True
+                            result = None
 
         if removed:
             with self._lock:
@@ -1500,8 +1538,9 @@ class CredentialPool:
                     self._current_id = None
             return None
         if result is not None:
-            self._replace_entry(entry, result)
-            return result
+            return self._adopt_refresh_result(entry, result)
+        if settlement_failed:
+            return None
         if refresh_failed:
             self._mark_exhausted(entry, None)
         return None

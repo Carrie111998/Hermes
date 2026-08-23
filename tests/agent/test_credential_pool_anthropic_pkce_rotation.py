@@ -157,7 +157,7 @@ def test_removed_pkce_row_is_not_resurrected(monkeypatch):
     assert refresh_calls == []
 
 
-def test_rotated_pkce_remains_usable_when_both_persistence_writes_fail(monkeypatch):
+def test_rotated_pkce_is_not_successful_without_canonical_persistence(monkeypatch):
     entry = _pkce_entry(access_token="old-access", refresh_token="old-refresh")
     pool = CredentialPool("anthropic", [entry])
     attempts = []
@@ -188,10 +188,60 @@ def test_rotated_pkce_remains_usable_when_both_persistence_writes_fail(monkeypat
 
     updated = pool._refresh_entry(entry, force=True)
 
+    assert updated is None
+    assert pool.entries() == [entry]
+    assert attempts == ["pool", "pool", "singleton"]
+
+
+def test_rotated_pkce_retries_canonical_persistence_before_releasing_authority(
+    monkeypatch,
+):
+    entry = _pkce_entry(access_token="old-access", refresh_token="old-refresh")
+    pool = CredentialPool("anthropic", [entry])
+    persisted = [entry.to_dict()]
+    writes = []
+    monkeypatch.setattr(
+        "agent.credential_pool.read_credential_pool", lambda _p: persisted
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "expires_at_ms": 5_000,
+        },
+    )
+
+    def flaky_pool_write(_provider, entries, **_kwargs):
+        writes.append(entries[0]["refresh_token"])
+        if len(writes) == 1:
+            raise PermissionError("transient contention")
+        persisted[:] = entries
+
+    monkeypatch.setattr("agent.credential_pool.write_credential_pool", flaky_pool_write)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._write_hermes_oauth_credentials",
+        lambda *_args: None,
+    )
+
+    updated = pool._refresh_entry(entry, force=True)
+
     assert updated is not None
     assert updated.refresh_token == "rotated-refresh"
-    assert updated.last_status == "ok"
-    assert attempts == ["pool", "singleton"]
+    assert writes == ["rotated-refresh", "rotated-refresh"]
+    assert persisted[0]["refresh_token"] == "rotated-refresh"
+
+
+def test_delayed_refresh_handoff_preserves_newer_local_generation():
+    original = _pkce_entry(access_token="n", refresh_token="n")
+    delayed = _pkce_entry(access_token="n+1", refresh_token="n+1")
+    current = _pkce_entry(access_token="n+2", refresh_token="n+2")
+    pool = CredentialPool("anthropic", [current])
+
+    adopted = pool._adopt_refresh_result(original, delayed)
+
+    assert adopted == current
+    assert pool.entries() == [current]
 
 
 def test_terminal_refresh_failure_adopts_newer_canonical_row(monkeypatch):
@@ -214,12 +264,12 @@ def test_terminal_refresh_failure_adopts_newer_canonical_row(monkeypatch):
     monkeypatch.setattr(
         "agent.anthropic_adapter.refresh_anthropic_oauth_pure", fail_refresh
     )
+    reads = iter([[stale.to_dict()], [winner.to_dict()]])
     monkeypatch.setattr(
-        "agent.credential_pool.read_credential_pool", lambda _provider: [winner.to_dict()]
+        "agent.credential_pool.read_credential_pool", lambda _provider: next(reads)
     )
-    monkeypatch.setattr(pool, "_persist", lambda **_kwargs: None)
 
-    updated = pool._refresh_entry_impl(stale, force=True)
+    updated = pool._refresh_entry(stale, force=True)
 
     assert updated is not None
     assert updated.refresh_token == "winner-refresh"

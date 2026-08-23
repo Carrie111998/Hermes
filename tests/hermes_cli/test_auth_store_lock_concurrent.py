@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from agent.credential_pool import AUTH_TYPE_OAUTH, PooledCredential
 from hermes_cli.auth import _auth_store_lock, read_credential_pool, write_credential_pool
 
 
+@pytest.mark.windows_only
 def test_concurrent_windows_lock_initialization_is_retried(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     concurrency = 40
