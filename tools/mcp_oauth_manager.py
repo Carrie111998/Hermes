@@ -103,6 +103,11 @@ class _ProviderEntry:
 # ---------------------------------------------------------------------------
 
 
+# Sent on SDK-built OAuth discovery/registration requests that would
+# otherwise carry no User-Agent (see _ensure_auth_request_user_agent).
+DEFAULT_AUTH_REQUEST_USER_AGENT = "Hermes-Agent"
+
+
 def _make_hermes_provider_class() -> Optional[type]:
     """Lazy-import the SDK base class and return our subclass.
 
@@ -155,6 +160,24 @@ def _make_hermes_provider_class() -> Optional[type]:
             if ua:
                 request.headers["User-Agent"] = ua
             return request
+
+        def _ensure_auth_request_user_agent(self, outgoing, original):
+            """Give SDK-built auth requests a User-Agent if they have none.
+
+            The SDK constructs discovery (``/.well-known/...``) and dynamic
+            client registration requests as bare ``httpx.Request`` objects,
+            so the client's default headers never apply and they leave with
+            NO User-Agent at all. Some WAFs reject header-less requests
+            outright (coda.io returns 403 on every one, which Hermes then
+            misreports as "only allows pre-approved OAuth clients").
+
+            Only requests the SDK built itself are touched — never the
+            caller's MCP request — and only when the header is absent, so
+            an ``oauth.user_agent`` stamped on token requests still wins.
+            """
+            if outgoing is original or "user-agent" in outgoing.headers:
+                return
+            outgoing.headers["User-Agent"] = DEFAULT_AUTH_REQUEST_USER_AGENT
 
         def _coerce_client_secret_post(self) -> None:
             """Use client_secret_post when dynamic registration returned a secret.
@@ -534,6 +557,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             try:
                 outgoing = await inner.__anext__()
                 while True:
+                    self._ensure_auth_request_user_agent(outgoing, request)
                     incoming = yield outgoing
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
