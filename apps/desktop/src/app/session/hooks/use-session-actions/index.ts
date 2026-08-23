@@ -83,6 +83,7 @@ import {
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { forgetSessionUnread } from '@/store/session-unread'
 import { $archivedSessions } from '@/store/sidebar-archive'
+import { requestScrollToBottom } from '@/store/thread-scroll'
 import { dropTranscriptTail, loadTranscriptTail, saveTranscriptTail } from '@/store/transcript-tail-cache'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
@@ -98,6 +99,7 @@ import {
   type BranchMessage,
   chatMessageArraysEquivalent,
   dedupeInflightUserAgainstTranscript,
+  ensurePendingClarifyToolRow,
   goneSessionVerdict,
   isSessionGoneError,
   overlayConcurrentMessageChanges,
@@ -973,6 +975,11 @@ export function useSessionActions({
                 )
               }
 
+              if (pendingClarify) {
+                activatedMessages = ensurePendingClarifyToolRow(activatedMessages, activated.pending_clarify)
+                requestScrollToBottom()
+              }
+
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => ({
@@ -1272,10 +1279,14 @@ export function useSessionActions({
 
         // Prefetch-hit fast path: reuse the live array when neither runtime
         // changes nor in-flight recovery changed the reconciled transcript.
-        const messagesForView =
+        let messagesForView =
           inFlightRecovery.messages === currentMessages
             ? currentMessages
             : preserveLocalAssistantErrors(inFlightRecovery.messages, currentMessages)
+
+        if (resumed.pending_clarify) {
+          messagesForView = ensurePendingClarifyToolRow(messagesForView, resumed.pending_clarify)
+        }
 
         // Fail-latch on the PRE-recovery transcript: an orphan journal tail
         // must not mask a lost transcript (a retry that reloads real history
@@ -1303,6 +1314,11 @@ export function useSessionActions({
         activeSessionIdRef.current = resumed.session_id
         const pendingApproval = restorePendingApproval(resumed, resumed.session_id)
         const pendingClarify = restorePendingClarify(resumed, resumed.session_id)
+
+        if (pendingClarify) {
+          requestScrollToBottom()
+        }
+
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
