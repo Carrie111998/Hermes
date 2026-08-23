@@ -41,14 +41,22 @@ def marker(tmp_path):
     return tmp_path / ".hermes-update-in-progress"
 
 
-def test_marker_path_follows_process_hermes_home(tmp_path, monkeypatch):
-    """The lock must land where the Rust updater and Electron gate look.
+def test_two_profile_homes_sharing_one_install_serialize(tmp_path, monkeypatch):
+    """Profiles from one checkout must contend on one installation lock."""
+    install_root = tmp_path / "install"
+    monkeypatch.setattr("hermes_cli.update_lock.PROJECT_ROOT", install_root)
 
-    All three resolve the *process* HERMES_HOME; a profile-scoped path would
-    put the lock somewhere the other two owners never read.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    assert update_marker_path() == tmp_path / ".hermes-update-in-progress"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+    first = UpdateLock()
+    assert first.path == install_root / ".hermes-update-in-progress"
+    assert first.acquire() is True
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+    second = UpdateLock()
+    assert second.path == first.path
+    assert second.acquire() is False
+
+    first.release()
 
 
 def test_acquire_writes_pid_and_start_time(marker):

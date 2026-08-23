@@ -18,10 +18,12 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 under a live interpreter and leaving the tree half-updated.
 
 This module makes that same marker the single lock for **all** update
-entrypoints instead of adding a fourth mechanism. Format and location are
-unchanged and remain byte-compatible with the Rust and Electron readers:
+entrypoints instead of adding a fourth mechanism. The wire format remains
+byte-compatible with the Rust and Electron readers, while the location is
+installation-scoped so every profile using one checkout contends on the same
+lock:
 
-    <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
+    <PROJECT_ROOT>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
 
 A marker only counts as a live update when its pid is alive AND it is younger
 than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
@@ -58,6 +60,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 # Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
 # apps/desktop/electron/update-marker.ts — the same marker is read by both, and
 # a shorter ceiling here would let Python steal a lock Electron still considers
@@ -83,16 +87,8 @@ UPDATE_EXIT_CONCURRENT = 2
 
 
 def update_marker_path() -> Path:
-    """Path of the shared update marker.
-
-    Uses the *process* Hermes home (never the context-local profile override):
-    the Rust updater resolves ``$HERMES_HOME`` or the platform default, and the
-    desktop pins that same value into the updater's env. A profile-scoped path
-    here would put the lock somewhere the other two owners never look.
-    """
-    from hermes_constants import get_process_hermes_home
-
-    return get_process_hermes_home() / MARKER_NAME
+    """Path of the update marker shared by every profile in this install."""
+    return PROJECT_ROOT / MARKER_NAME
 
 
 def _pid_alive(pid: int) -> bool:

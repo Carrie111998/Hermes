@@ -4982,6 +4982,102 @@ def _cold_start_windows_gateway_after_update() -> None:
         print()
         gateway_windows._report_gateway_start(f"cold-start after update (PID {pid})")
 
+def _batch_systemd_gateway_restarts(
+    entries: list[dict],
+    *,
+    signal_unit,
+    finish_unit,
+) -> None:
+    """Signal the manageable systemd fleet before waiting on any one unit.
+
+    An unprivileged system service must not be drained: without a usable
+    management command, systemd may not bring it back.  Its finish step emits
+    the existing manual/root fallback instead.
+    """
+    unique_entries = []
+    seen = set()
+    for entry in entries:
+        key = (entry["scope"], entry["svc_name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_entries.append(entry)
+
+    for entry in unique_entries:
+        if entry.get("manage_cmd") is not None:
+            signal_unit(entry)
+    for entry in unique_entries:
+        finish_unit(entry)
+
+
+def _force_systemd_unit_restart(
+    entry: dict,
+    *,
+    restarted_services: list[str],
+    failed_units: list[str],
+    wait_for_active=None,
+) -> None:
+    """Force one systemd unit, or print the non-interactive root fallback."""
+    scope = entry["scope"]
+    scope_cmd = entry["scope_cmd"]
+    svc_name = entry["svc_name"]
+    manage_cmd = entry["manage_cmd"]
+    if manage_cmd is None:
+        failed_units.append(svc_name)
+        print(
+            f"  ⚠ {svc_name} is a system service and restarting it needs root.\n"
+            f"    Restart it manually to load the new version:\n"
+            f"      sudo systemctl restart {svc_name}\n"
+            f"    To let `hermes update` restart it automatically, allow\n"
+            f"    passwordless sudo for systemctl, or run updates with sudo."
+        )
+        return
+
+    if wait_for_active is None:
+        raise TypeError("wait_for_active is required for managed systemd units")
+
+    run_kwargs = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    subprocess.run(
+        manage_cmd + ["reset-failed", svc_name], timeout=10, **run_kwargs
+    )
+    restart = subprocess.run(
+        manage_cmd + ["restart", svc_name], timeout=15, **run_kwargs
+    )
+    if restart.returncode != 0:
+        failed_units.append(svc_name)
+        print(f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}")
+        return
+    if wait_for_active(scope_cmd, svc_name, timeout=10.0):
+        restarted_services.append(svc_name)
+        return
+
+    print(f"  ⚠ {svc_name} died after restart, retrying...")
+    subprocess.run(
+        manage_cmd + ["reset-failed", svc_name], timeout=10, **run_kwargs
+    )
+    subprocess.run(manage_cmd + ["restart", svc_name], timeout=15, **run_kwargs)
+    if wait_for_active(scope_cmd, svc_name, timeout=10.0):
+        restarted_services.append(svc_name)
+        print(f"  ✓ {svc_name} recovered on retry")
+        return
+
+    failed_units.append(svc_name)
+    scope_flag = "--user " if scope == "user" else ""
+    sudo_hint = "sudo " if scope == "system" else ""
+    print(
+        f"  ✗ {svc_name} failed to stay running after restart.\n"
+        f"    Check logs: {sudo_hint}journalctl {scope_flag}-u {svc_name} --since '2 min ago'\n"
+        f"    Recover manually:\n"
+        f"      {sudo_hint}systemctl {scope_flag}reset-failed {svc_name}\n"
+        f"      {sudo_hint}systemctl {scope_flag}restart {svc_name}"
+    )
+
+
 def _for_each_systemd_gateway_unit(
     list_units_stdout: str,
     *,
@@ -4995,6 +5091,7 @@ def _for_each_systemd_gateway_unit(
     that unit via ``on_unit_timeout`` so one wedged systemctl call cannot
     abort the rest of the fleet (#68523).
     """
+    seen_units: set[str] = set()
     for line in (list_units_stdout or "").strip().splitlines():
         parts = line.split()
         if not parts:
@@ -5015,10 +5112,14 @@ def _for_each_systemd_gateway_unit(
         ):
             continue
         svc_name = unit.removesuffix(".service")
+        if svc_name in seen_units:
+            continue
+        seen_units.add(svc_name)
         try:
             process_unit(svc_name)
         except subprocess.TimeoutExpired as exc:
             on_unit_timeout(svc_name, exc)
+
 
 def _service_unit_supports_graceful_sigusr1_restart(svc_name: str) -> bool:
     """Whether *svc_name* wires SIGUSR1 to a graceful drain-then-restart.
@@ -7529,14 +7630,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _pre_restart_gateway_pids = None
 
             # --- Systemd services (Linux) ---
-            # Discover all hermes-gateway* units (default + profiles) plus
-            # hermes-serve* units (the Desktop app's backend, #83438).
+            # Discover the complete fleet first. Then signal every drain-capable
+            # gateway before waiting on any one unit, so profile drains overlap
+            # without sacrificing the existing graceful/fallback safety paths.
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
                 except Exception:
                     pass
 
+                systemd_entries = []
                 for scope, scope_cmd in [
                     ("user", ["systemctl", "--user"]),
                     ("system", ["systemctl"]),
@@ -7553,13 +7656,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 "--no-pager",
                             ],
                             capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
                             timeout=10,
                         )
                     except FileNotFoundError:
                         continue
                     except subprocess.TimeoutExpired as exc:
-                        # Discovery timeout — skip this scope, keep the other.
                         print(
                             f"  ⚠ systemctl timed out listing {scope}-scope "
                             f"gateway units ({exc.cmd if exc.cmd else 'unknown command'}). "
@@ -7567,8 +7671,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         continue
 
-                    def _restart_one_systemd_gateway_unit(svc_name: str) -> None:
-                        # Check if active
+                    def _collect_systemd_gateway_unit(svc_name: str) -> None:
                         check = subprocess.run(
                             scope_cmd + ["is-active", svc_name],
                             capture_output=True,
@@ -7578,31 +7681,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         if check.stdout.strip() != "active":
                             return
 
-                        # Resolve how we may run manage-units verbs
-                        # (reset-failed/start/restart) for this scope.
-                        # None ⇒ no non-interactive privilege path; we
-                        # must avoid those verbs entirely or polkit will
-                        # throw an interactive auth prompt inside our
-                        # captured 10-15s subprocess (the user sees it
-                        # flash and "exit directly" — reported June 2026).
-                        _manage_cmd = _resolve_manage_cmd(
-                            scope, scope_cmd, svc_name
-                        )
-
-                        # Prefer a graceful SIGUSR1 restart so in-flight
-                        # agent runs drain instead of being SIGKILLed.
-                        # The gateway's SIGUSR1 handler calls
-                        # request_restart(via_service=True) → drain →
-                        # exit; systemd's Restart=always respawns the unit.
-                        # hermes-serve has no such handler (it isn't
-                        # gateway/run.py), so skip straight to the blunt
-                        # restart below rather than sending it an unhandled
-                        # signal and waiting out the drain budget for
-                        # nothing.
-                        _main_pid = 0
+                        manage_cmd = _resolve_manage_cmd(scope, scope_cmd, svc_name)
+                        main_pid = 0
                         if _service_unit_supports_graceful_sigusr1_restart(svc_name):
                             try:
-                                _show = subprocess.run(
+                                show = subprocess.run(
                                     scope_cmd
                                     + [
                                         "show",
@@ -7614,254 +7697,150 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                     text=True, encoding="utf-8", errors="replace",
                                     timeout=5,
                                 )
-                                _main_pid = int((_show.stdout or "").strip() or 0)
+                                main_pid = int((show.stdout or "").strip() or 0)
                             except (
                                 ValueError,
                                 subprocess.TimeoutExpired,
                                 FileNotFoundError,
                             ):
-                                _main_pid = 0
+                                main_pid = 0
+                        systemd_entries.append(
+                            {
+                                "scope": scope,
+                                "scope_cmd": scope_cmd,
+                                "svc_name": svc_name,
+                                "manage_cmd": manage_cmd,
+                                "main_pid": main_pid,
+                                "signal_sent": False,
+                                "graceful_ok": False,
+                            }
+                        )
 
-                        _graceful_ok = False
-                        if _main_pid > 0:
-                            from hermes_cli.gateway import (
-                                GATEWAY_LOOP_WEDGED,
-                                _escalate_wedged_gateway,
-                                probe_gateway_loop_liveness,
+                    def _on_discovery_timeout(
+                        svc_name: str, exc: subprocess.TimeoutExpired
+                    ) -> None:
+                        failed_or_stale_units.append(svc_name)
+                        print(
+                            f"  ⚠ systemctl timed out inspecting {svc_name} "
+                            f"({exc.cmd if exc.cmd else 'unknown command'}); "
+                            "continuing with remaining gateways"
+                        )
+
+                    _for_each_systemd_gateway_unit(
+                        result.stdout,
+                        process_unit=_collect_systemd_gateway_unit,
+                        on_unit_timeout=_on_discovery_timeout,
+                    )
+
+                def _signal_systemd_gateway(entry: dict) -> None:
+                    main_pid = entry["main_pid"]
+                    if main_pid <= 0:
+                        return
+                    from hermes_cli.gateway import (
+                        GATEWAY_LOOP_WEDGED,
+                        _escalate_wedged_gateway,
+                        probe_gateway_loop_liveness,
+                    )
+
+                    svc_name = entry["svc_name"]
+                    if probe_gateway_loop_liveness(main_pid) == GATEWAY_LOOP_WEDGED:
+                        print(
+                            f"  ⚠ {svc_name}: gateway event loop is "
+                            "unresponsive — skipping drain, forcing a bounded stop..."
+                        )
+                        _escalate_wedged_gateway(main_pid)
+                        entry["graceful_ok"] = True
+                        return
+
+                    print(
+                        f"  → {svc_name}: draining (up to {int(_drain_budget)}s)..."
+                    )
+                    try:
+                        os.kill(main_pid, _signal.SIGUSR1)
+                        entry["signal_sent"] = True
+                    except ProcessLookupError:
+                        entry["graceful_ok"] = True
+                    except (PermissionError, OSError):
+                        pass
+
+                def _finish_systemd_gateway(entry: dict) -> None:
+                    scope_cmd = entry["scope_cmd"]
+                    svc_name = entry["svc_name"]
+                    manage_cmd = entry["manage_cmd"]
+                    try:
+                        graceful_ok = entry["graceful_ok"]
+                        if entry["signal_sent"]:
+                            from hermes_cli.gateway import _wait_for_pid_exit
+
+                            graceful_ok = _wait_for_pid_exit(
+                                entry["main_pid"], max(_drain_budget, 1.0)
                             )
 
-                            if (
-                                probe_gateway_loop_liveness(_main_pid)
-                                == GATEWAY_LOOP_WEDGED
-                            ):
-                                # Loop-liveness probe says the gateway's event
-                                # loop is provably dead (#81642): SIGUSR1 can
-                                # never drain it, so waiting the full budget
-                                # (180s default) only wedges the update too.
-                                # Bounded escalation (SIGTERM grace → SIGKILL,
-                                # ~10s) then restart the unit. A busy gateway
-                                # keeps a fresh heartbeat and never takes this
-                                # path — its drain (incl. the #86684 cron
-                                # floor) is untouched.
-                                print(
-                                    f"  ⚠ {svc_name}: gateway event loop is "
-                                    "unresponsive — skipping drain, forcing "
-                                    "a bounded stop..."
-                                )
-                                _escalate_wedged_gateway(_main_pid)
-                                _graceful_ok = True
-                            else:
-                                print(
-                                    f"  → {svc_name}: draining (up to {int(_drain_budget)}s)..."
-                                )
-                                _graceful_ok = _graceful_restart_via_sigusr1(
-                                    _main_pid,
-                                    drain_timeout=_drain_budget,
-                                )
-
-                        if _graceful_ok:
-                            # Gateway exited after a planned restart.
-                            # ``Restart=always`` means systemd WILL respawn
-                            # the unit — but only after
-                            # ``RestartSec`` (default 60s on our unit
-                            # file). That 60s wait is a crash-loop guard,
-                            # and is the right default when the gateway
-                            # dies unexpectedly. For a voluntary restart
-                            # on update, it's dead time the user watches.
-                            #
-                            # Shortcut it: ``reset-failed`` + ``start``
-                            # skips RestartSec entirely (we're manually
-                            # initiating the unit, not waiting for
-                            # systemd's auto-restart logic). Takes about
-                            # as long as the process takes to come up
-                            # (~1-3s on a warm box).
-                            #
-                            # If the unit is already active because
-                            # RestartSec elapsed while we were draining,
-                            # ``start`` is a no-op and we fall through to
-                            # the poll below. Either way we collapse the
-                            # 60s+ delay to a ~5s one.
-                            #
-                            # The shortcut needs manage-units privileges.
-                            # Without them (system service, non-root, no
-                            # passwordless sudo) skip it — systemd's own
-                            # auto-restart still relaunches the unit after
-                            # RestartSec, no privileges required.
-                            if _manage_cmd is not None:
+                        if graceful_ok:
+                            if manage_cmd is not None:
                                 subprocess.run(
-                                    _manage_cmd + ["reset-failed", svc_name],
+                                    manage_cmd + ["reset-failed", svc_name],
                                     capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace",
+                                    text=True,
+                                    encoding="utf-8",
+                                    errors="replace",
                                     timeout=10,
                                 )
                                 subprocess.run(
-                                    _manage_cmd + ["start", svc_name],
+                                    manage_cmd + ["start", svc_name],
                                     capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace",
+                                    text=True,
+                                    encoding="utf-8",
+                                    errors="replace",
                                     timeout=15,
                                 )
-                                # Short poll: the gateway should be up
-                                # within a few seconds now that we
-                                # bypassed RestartSec.
                                 if _wait_for_service_active(
-                                    scope_cmd,
-                                    svc_name,
-                                    timeout=10.0,
+                                    scope_cmd, svc_name, timeout=10.0
                                 ):
                                     restarted_services.append(svc_name)
                                     return
-                            # Passive poll: systemd's auto-restart fires
-                            # after RestartSec regardless of privileges.
-                            # This is the primary path when _manage_cmd is
-                            # None, and the fallback when the explicit
-                            # start didn't take.
-                            _restart_sec = _service_restart_sec(
-                                scope_cmd,
-                                svc_name,
-                                default=0.0,
+
+                            restart_sec = _service_restart_sec(
+                                scope_cmd, svc_name, default=0.0
                             )
-                            _post_drain_timeout = max(
-                                10.0,
-                                _restart_sec + 10.0,
-                            )
-                            if _manage_cmd is None and _restart_sec > 5.0:
+                            post_drain_timeout = max(10.0, restart_sec + 10.0)
+                            if manage_cmd is None and restart_sec > 5.0:
                                 print(
                                     f"  → {svc_name}: waiting for systemd "
-                                    f"auto-restart (~{int(_restart_sec)}s; "
+                                    f"auto-restart (~{int(restart_sec)}s; "
                                     "no root for an immediate restart)..."
                                 )
                             if _wait_for_service_active(
                                 scope_cmd,
                                 svc_name,
-                                timeout=_post_drain_timeout,
+                                timeout=post_drain_timeout,
                             ):
                                 restarted_services.append(svc_name)
                                 return
-                            # Process exited but wasn't respawned (older
-                            # unit without Restart=on-failure or
-                            # RestartForceExitStatus=75).  Fall through
-                            # to systemctl start/restart.
                             print(
-                                f"  ⚠ {svc_name} drained but didn't relaunch — forcing restart"
+                                f"  ⚠ {svc_name} drained but didn't relaunch — "
+                                "forcing restart"
                             )
 
-                        # Forcing a restart requires manage-units
-                        # privileges.  Without a non-interactive path,
-                        # running systemctl here would spawn a polkit
-                        # auth prompt inside a captured 10-15s subprocess
-                        # — it flashes and dies before the user can
-                        # answer.  Skip with clear instructions instead.
-                        if _manage_cmd is None:
-                            failed_or_stale_units.append(svc_name)
-                            print(
-                                f"  ⚠ {svc_name} is a system service and restarting it needs root.\n"
-                                f"    Restart it manually to load the new version:\n"
-                                f"      sudo systemctl restart {svc_name}\n"
-                                f"    To let `hermes update` restart it automatically, allow\n"
-                                f"    passwordless sudo for systemctl, or run updates with sudo."
-                            )
-                            return
-
-                        # Fallback: blunt systemctl restart.  This is
-                        # what the old code always did; we get here only
-                        # when the graceful path failed (unit missing
-                        # SIGUSR1 wiring, drain exceeded the budget,
-                        # restart-policy mismatch).
-                        #
-                        # Always `reset-failed` first.  If systemd's own
-                        # auto-restart attempts already parked the unit
-                        # in a failed state (transient CHDIR / OOM /
-                        # filesystem race after our drain + exit-75),
-                        # a plain `systemctl restart` can wedge against
-                        # the RestartSec backoff and leave the unit
-                        # dead.  Clearing the failed state first makes
-                        # the restart idempotent.  Mirrors the recovery
-                        # path in `hermes gateway restart`
-                        # (`systemd_restart()`) as of PR #20949.
-                        subprocess.run(
-                            _manage_cmd + ["reset-failed", svc_name],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=10,
+                        _force_systemd_unit_restart(
+                            entry,
+                            restarted_services=restarted_services,
+                            failed_units=failed_or_stale_units,
+                            wait_for_active=_wait_for_service_active,
                         )
-                        restart = subprocess.run(
-                            _manage_cmd + ["restart", svc_name],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=15,
-                        )
-                        if restart.returncode == 0:
-                            # Verify the service actually survived the
-                            # restart.  systemctl restart returns 0 even
-                            # if the new process crashes immediately.
-                            if _wait_for_service_active(
-                                scope_cmd,
-                                svc_name,
-                                timeout=10.0,
-                            ):
-                                restarted_services.append(svc_name)
-                            else:
-                                # Retry once — transient startup failures
-                                # (stale module cache, import race) often
-                                # resolve on the second attempt.  Again
-                                # clear any failed state first so the
-                                # retry isn't blocked by the previous
-                                # crash.
-                                print(
-                                    f"  ⚠ {svc_name} died after restart, retrying..."
-                                )
-                                subprocess.run(
-                                    _manage_cmd + ["reset-failed", svc_name],
-                                    capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace",
-                                    timeout=10,
-                                )
-                                subprocess.run(
-                                    _manage_cmd + ["restart", svc_name],
-                                    capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace",
-                                    timeout=15,
-                                )
-                                if _wait_for_service_active(
-                                    scope_cmd,
-                                    svc_name,
-                                    timeout=10.0,
-                                ):
-                                    restarted_services.append(svc_name)
-                                    print(f"  ✓ {svc_name} recovered on retry")
-                                else:
-                                    failed_or_stale_units.append(svc_name)
-                                    _scope_flag = "--user " if scope == "user" else ""
-                                    _sudo_hint = "sudo " if scope == "system" else ""
-                                    print(
-                                        f"  ✗ {svc_name} failed to stay running after restart.\n"
-                                        f"    Check logs: {_sudo_hint}journalctl {_scope_flag}-u {svc_name} --since '2 min ago'\n"
-                                        f"    Recover manually:\n"
-                                        f"      {_sudo_hint}systemctl {_scope_flag}reset-failed {svc_name}\n"
-                                        f"      {_sudo_hint}systemctl {_scope_flag}restart {svc_name}"
-                                    )
-                        else:
-                            failed_or_stale_units.append(svc_name)
-                            print(
-                                f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}"
-                            )
-
-                    def _on_unit_timeout(svc_name: str, exc: subprocess.TimeoutExpired) -> None:
-                        # Isolate the timeout to this unit and keep going
-                        # (#68523). A scope-wide handler used to abort every
-                        # later gateway and leave the fleet on mixed code.
+                    except subprocess.TimeoutExpired as exc:
                         failed_or_stale_units.append(svc_name)
                         print(
                             f"  ⚠ systemctl timed out restarting {svc_name} "
                             f"({exc.cmd if exc.cmd else 'unknown command'}); "
-                            f"continuing with remaining gateways"
+                            "continuing with remaining gateways"
                         )
 
-                    _for_each_systemd_gateway_unit(
-                        result.stdout,
-                        process_unit=_restart_one_systemd_gateway_unit,
-                        on_unit_timeout=_on_unit_timeout,
-                    )
+                _batch_systemd_gateway_restarts(
+                    systemd_entries,
+                    signal_unit=_signal_systemd_gateway,
+                    finish_unit=_finish_systemd_gateway,
+                )
 
             # --- Launchd services (macOS) ---
             # Restart EVERY ai.hermes.gateway* LaunchAgent, not only the

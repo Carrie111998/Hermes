@@ -10,10 +10,13 @@ checkout on disk was already new (mixed-generation crashes).
 from __future__ import annotations
 
 import subprocess
+from unittest.mock import Mock
 
 import pytest
 
 from hermes_cli.main import (
+    _batch_systemd_gateway_restarts,
+    _force_systemd_unit_restart,
     _for_each_systemd_gateway_unit,
     _service_unit_supports_graceful_sigusr1_restart,
     _warn_incomplete_gateway_fleet_restart,
@@ -22,6 +25,73 @@ from hermes_cli.main import (
 
 def _list_units_stdout(names: list[str]) -> str:
     return "\n".join(f"{name}.service loaded active running" for name in names)
+
+
+def test_systemd_fleet_signals_all_units_before_waiting():
+    entries = [
+        {
+            "scope": "user",
+            "svc_name": "hermes-gateway-a",
+            "manage_cmd": ["systemctl", "--user"],
+        },
+        {
+            "scope": "user",
+            "svc_name": "hermes-gateway-b",
+            "manage_cmd": ["systemctl", "--user"],
+        },
+    ]
+    events: list[tuple[str, str]] = []
+
+    _batch_systemd_gateway_restarts(
+        entries,
+        signal_unit=lambda entry: events.append(("signal", entry["svc_name"])),
+        finish_unit=lambda entry: events.append(("wait", entry["svc_name"])),
+    )
+
+    assert events == [
+        ("signal", "hermes-gateway-a"),
+        ("signal", "hermes-gateway-b"),
+        ("wait", "hermes-gateway-a"),
+        ("wait", "hermes-gateway-b"),
+    ]
+
+
+def test_system_service_without_root_is_not_signalled_before_manual_fallback():
+    entry = {
+        "scope": "system",
+        "svc_name": "hermes-gateway-work",
+        "manage_cmd": None,
+    }
+    events: list[str] = []
+
+    _batch_systemd_gateway_restarts(
+        [entry],
+        signal_unit=lambda _: events.append("signal"),
+        finish_unit=lambda _: events.append("manual-fallback"),
+    )
+
+    assert events == ["manual-fallback"]
+
+
+def test_system_unit_without_root_uses_manual_fallback(monkeypatch, capsys):
+    run = Mock()
+    monkeypatch.setattr("hermes_cli.update_cmd.subprocess.run", run)
+    failed: list[str] = []
+
+    _force_systemd_unit_restart(
+        {
+            "scope": "system",
+            "scope_cmd": ["systemctl"],
+            "svc_name": "hermes-gateway-work",
+            "manage_cmd": None,
+        },
+        restarted_services=[],
+        failed_units=failed,
+    )
+
+    run.assert_not_called()
+    assert failed == ["hermes-gateway-work"]
+    assert "sudo systemctl restart hermes-gateway-work" in capsys.readouterr().out
 
 
 class TestFleetRestartTimeoutIsolation:
@@ -90,6 +160,19 @@ class TestFleetRestartTimeoutIsolation:
         )
 
         assert seen == ["hermes-gateway-coder"]
+
+    def test_duplicate_unit_rows_are_processed_once(self):
+        seen: list[str] = []
+
+        _for_each_systemd_gateway_unit(
+            _list_units_stdout(
+                ["hermes-gateway-work", "hermes-gateway-work"]
+            ),
+            process_unit=seen.append,
+            on_unit_timeout=lambda *_: pytest.fail("unexpected timeout"),
+        )
+
+        assert seen == ["hermes-gateway-work"]
 
     def test_hermes_serve_units_are_included(self):
         # #83438 — hermes update restarted hermes-gateway* units but left
