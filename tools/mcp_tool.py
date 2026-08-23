@@ -4363,10 +4363,11 @@ def _normalize_server_trust(value: Any) -> str:
 def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     """Return True only when the tool's annotations carry readOnlyHint=True.
 
-    Accepts both SDK annotation objects (attribute access) and plain dicts
-    (schema-cache JSON). Anything else — missing annotations, missing key,
-    non-bool truthy values — is False: unknown metadata means the tool must
-    be treated as write-capable.
+    Accepts MCP SDK annotation objects, whose Pydantic field is exposed as
+    ``read_only_hint``, legacy/test objects using the wire alias
+    ``readOnlyHint``, and plain schema-cache dicts. Anything else — missing
+    annotations, missing key, non-bool truthy values — is False: unknown
+    metadata means the tool must be treated as write-capable.
     """
     annotations = getattr(mcp_tool, "annotations", None)
     if annotations is None:
@@ -4374,7 +4375,9 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     if isinstance(annotations, dict):
         hint = annotations.get("readOnlyHint")
     else:
-        hint = getattr(annotations, "readOnlyHint", None)
+        hint = getattr(annotations, "read_only_hint", None)
+        if hint is None:
+            hint = getattr(annotations, "readOnlyHint", None)
     return hint is True
 
 

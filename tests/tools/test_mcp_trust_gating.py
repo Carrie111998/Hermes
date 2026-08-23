@@ -245,3 +245,12 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+    def test_mcp_sdk_snake_case_annotation_supported(self):
+        """Current MCP SDK objects expose Pydantic's snake_case field name."""
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=SimpleNamespace(read_only_hint=True))
+        ) is True
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=SimpleNamespace(read_only_hint="yes"))
+        ) is False
