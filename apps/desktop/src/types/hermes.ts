@@ -663,10 +663,21 @@ export interface SessionResumeResponse {
   // The clarify question still blocking this session, if any. Same replay
   // class as pending_approval: emitted-while-detached prompts are restored
   // from the resume snapshot instead of being lost until server-side timeout.
+  // Mirrors the live clarify.request wire shape: single-question payloads
+  // carry `question`/`choices`/`multi_select`; batch (multi-question) ones
+  // carry `questions` (+ `answers` already locked server-side) and no
+  // top-level `question`.
   pending_clarify?: {
+    answers?: Record<string, unknown>
     choices?: null | string[]
     multi_select?: boolean
     question?: string
+    questions?: Array<{
+      choices?: null | string[]
+      multi_select?: boolean
+      qid?: string
+      question?: string
+    }>
     request_id?: string
   }
   info?: SessionRuntimeInfo
