@@ -61,3 +61,25 @@ def test_malformed_non_synthetic_agent_error_fails_closed():
 def test_mapping_input_uses_serialized_event_shape():
     event = _event(EventType.CRON_FAILED, {"error": "boom"})
     assert failure_cluster_eligible(event.to_dict())
+
+
+def test_derived_failure_cluster_alert_is_never_raw_evidence():
+    """AGENT_FAILURE_CLUSTER is a DERIVED aggregate alert, not raw failure
+    evidence. Feeding it back into clustering let the watchdog count its own
+    emissions: cluster_size grew +1 per 5-minute sweep (7 -> 44 on
+    2026-08-23) and 5 phantom notifications reached Telegram's watchdog-alerts
+    topic. Mission Control still renders these red via evaluate_outcome, and
+    the Critic trigger subscribes by event type directly -- excluding them
+    here only stops audit-tail consumers from re-ingesting the alarm as data.
+    """
+    derived = _event(
+        EventType.AGENT_FAILURE_CLUSTER,
+        {
+            "watchdog_type": "agent_failure_cluster",
+            "source": "watchdog",
+            "cluster_size": 44,
+            "last_event_type": "agent_failure_cluster",
+        },
+        source="watchdog",
+    )
+    assert not failure_cluster_eligible(derived)
