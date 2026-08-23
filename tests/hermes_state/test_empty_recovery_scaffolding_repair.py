@@ -83,11 +83,21 @@ def test_similar_real_content_is_preserved(db):
         role="user",
         content=_EMPTY_RECOVERY_NUDGE + " Please include details.",
     )
+    db.append_message("clean", role="assistant", content="(empty)")
+    db.append_message("clean", role="user", content="Continue the real conversation.")
+    db.append_message("clean", role="assistant", content="Still part of the answer.")
+    db.append_message("clean", role="user", content=_EMPTY_RECOVERY_NUDGE)
 
-    messages = db.get_messages_as_conversation("clean")
+    model_history, display_history = db.get_resume_conversations("clean")
 
-    assert [message["content"] for message in messages] == [
+    expected = [
         "Explain an empty response",
         "The set is (empty), but this is a real explanation.",
         _EMPTY_RECOVERY_NUDGE + " Please include details.",
+        "(empty)",
+        "Continue the real conversation.",
+        "Still part of the answer.",
+        _EMPTY_RECOVERY_NUDGE,
     ]
+    for history in (model_history, display_history):
+        assert [message["content"] for message in history] == expected

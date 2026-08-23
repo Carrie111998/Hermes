@@ -801,29 +801,30 @@ def _strip_persisted_empty_recovery_scaffolding(
     Prevention at the write boundary uses private in-memory flags, but builds
     predating that guard (and interrupted writes that lost private metadata)
     can leave the assistant failure sentinel and synthetic user nudge active in
-    ``state.db``. Replaying either row as genuine history teaches the model to
-    continue returning empty responses. Match only the exact role/content
-    signatures; similar user or assistant text remains ordinary conversation.
+    ``state.db``. Replaying the pair as genuine history teaches the model to
+    continue returning empty responses. Match only the exact adjacent pair;
+    either content signature on its own remains ordinary conversation.
     """
     repaired = 0
     restored: List[Dict[str, Any]] = []
-    for msg in messages:
-        role = msg.get("role") if isinstance(msg, dict) else None
-        content = msg.get("content") if isinstance(msg, dict) else None
-        is_empty_sentinel = (
-            role == "assistant"
-            and isinstance(content, str)
-            and content.strip() == _PERSISTED_EMPTY_RESPONSE_SENTINEL
+    index = 0
+    while index < len(messages):
+        msg = messages[index]
+        next_msg = messages[index + 1] if index + 1 < len(messages) else None
+        is_recovery_pair = (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and msg.get("content") == _PERSISTED_EMPTY_RESPONSE_SENTINEL
+            and isinstance(next_msg, dict)
+            and next_msg.get("role") == "user"
+            and next_msg.get("content") == _PERSISTED_EMPTY_RECOVERY_NUDGE
         )
-        is_recovery_nudge = (
-            role == "user"
-            and isinstance(content, str)
-            and content.strip() == _PERSISTED_EMPTY_RECOVERY_NUDGE
-        )
-        if is_empty_sentinel or is_recovery_nudge:
-            repaired += 1
+        if is_recovery_pair:
+            repaired += 2
+            index += 2
             continue
         restored.append(msg)
+        index += 1
     if repaired:
         logger.info(
             "Removed %d persisted empty-response recovery message(s) while "
