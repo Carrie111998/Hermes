@@ -26,6 +26,7 @@ const {
   ensureGatewayProfile,
   invalidateProfileListFetches,
   prewarmProfileBackend,
+  profileLabel,
   profileWearsHomeGlyph,
   refreshProfiles
 } = await import('./profile')
@@ -254,6 +255,23 @@ describe('profileWearsHomeGlyph — who gets a face (#92033)', () => {
 
   it('treats a blank display name as no name at all', () => {
     expect(profileWearsHomeGlyph({ ...profile('default', true), display_name: '   ' })).toBe(true)
+  })
+
+  it('agrees with profileLabel — the mark appears exactly when the label is not the id', () => {
+    // Both helpers read `display_name` through the same trim, so the mark and
+    // the tooltip can never disagree about which name a profile is wearing.
+    // Pinned here so a refactor of either one has to keep them in step.
+    for (const profileUnderTest of [
+      profile('default', true),
+      { ...profile('default', true), display_name: 'Hermes' },
+      { ...profile('default', true), display_name: '   ' },
+      profile('work'),
+      { ...profile('work'), display_name: 'Work' }
+    ]) {
+      const labelIsTheCanonicalId = profileLabel(profileUnderTest) === profileUnderTest.name
+
+      expect(profileWearsHomeGlyph(profileUnderTest)).toBe(profileUnderTest.is_default && labelIsTheCanonicalId)
+    }
   })
 
   it('never claims the home glyph for a named profile', () => {

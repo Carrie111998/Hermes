@@ -192,6 +192,19 @@ describe('ProfileRail default-profile identity (#92033)', () => {
     expect(defaultSlot().textContent).toBe('?')
   })
 
+  it('draws the mark from the same name the tooltip shows', () => {
+    profiles.set([NAMED_DEFAULT])
+    render(<ProfileRail />)
+
+    const slot = defaultSlot()
+    const tooltipName = slot.getAttribute('aria-label') ?? ''
+
+    // Deliberately not a hardcoded 'H': the initial is asserted against the
+    // pill's own label, so the mark and the tooltip cannot drift apart.
+    expect(tooltipName).toBe('Hermes')
+    expect(slot.textContent).toBe(tooltipName.charAt(0).toUpperCase())
+  })
+
   it('still names the pill by the display name once it carries a mark', () => {
     profiles.set([NAMED_DEFAULT])
     const single = render(<ProfileRail />)
