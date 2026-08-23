@@ -16,8 +16,8 @@ const secondaryGateways: Array<{
   request: ReturnType<typeof vi.fn>
 }> = []
 
-vi.mock('@/hermes', () => ({
-  HermesGateway: class {
+vi.mock('@/orion', () => ({
+  OrionGateway: class {
     connectionState = 'closed'
     connect = vi.fn(async () => {
       this.connectionState = 'open'
@@ -56,7 +56,7 @@ const {
 const { requestForSessionProfile, sessionRpcNeedsProfileRoute } = await import('./session-request-router')
 
 function installDesktop(): void {
-  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+  ;(window as unknown as { orionDesktop: unknown }).orionDesktop = {
     getConnection: vi.fn(async (profile: null | string) =>
       profile ? { port: 5151, profile, token: 'secondary-token' } : { port: 4242, token: 'primary-token' }
     ),
@@ -85,7 +85,7 @@ beforeEach(() => {
 afterEach(() => {
   closeSecondaryGateways()
   vi.clearAllMocks()
-  delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+  delete (window as unknown as { orionDesktop?: unknown }).orionDesktop
 })
 
 describe('$activeGatewayRoute (registry-owned active profile)', () => {
@@ -152,9 +152,9 @@ describe('requestForSessionProfile', () => {
 
     const desktop = (
       window as unknown as {
-        hermesDesktop: { getConnectionFor: ReturnType<typeof vi.fn> }
+        orionDesktop: { getConnectionFor: ReturnType<typeof vi.fn> }
       }
-    ).hermesDesktop
+    ).orionDesktop
 
     const ambient = vi.fn(async () => ({ ambient: true }))
 

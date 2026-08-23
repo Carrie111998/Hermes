@@ -49,7 +49,7 @@ import {
   useQuery,
   useQueryClient,
   useValue
-} from '@hermes/plugin-sdk'
+} from '@orion/plugin-sdk'
 import {
   type CSSProperties,
   type DragEvent as ReactDragEvent,

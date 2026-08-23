@@ -142,7 +142,7 @@ def get_trusted_peers() -> set[str]:
     if env_peers:
         return {p.strip() for p in env_peers.split(",") if p.strip()}
     try:
-        from hermes_cli.config import load_config
+        from orion_cli.config import load_config
         cfg = load_config() or {}
         peers_list = (cfg.get("a2a") or {}).get("trusted_peers", [])
         if isinstance(peers_list, list):
@@ -347,10 +347,10 @@ def is_safe_callback_url(url: str) -> bool:
 
 def _audit_path() -> Path:
     try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
+        from orion_constants import get_orion_home
+        base = Path(get_orion_home())
     except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
+        base = Path(os.path.expanduser("~/.orion"))
     return base / "a2a_audit.jsonl"
 
 

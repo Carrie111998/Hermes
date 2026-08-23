@@ -1,6 +1,6 @@
 """Tests for the strict gateway command-line matcher.
 
-Regression guard for the Windows ``hermes gateway restart`` silent-outage bug:
+Regression guard for the Windows ``orion gateway restart`` silent-outage bug:
 the previous loose substring match (``"... gateway" in cmdline``) false-matched
 ``gateway status``/``dashboard`` siblings and unrelated processes such as
 ``python -m tui_gateway``, which let ``restart()`` race a still-draining old
@@ -18,35 +18,35 @@ from gateway.status import (
 
 
 ACCEPT = [
-    "pythonw.exe -m hermes_cli.main gateway run",
-    r"C:\Users\me\hermes\venv\Scripts\pythonw.exe -m hermes_cli.main gateway run",
-    "python -m hermes_cli.main --profile work gateway run",
-    "python -m hermes_cli.main gateway run --replace",
-    "python -m hermes_cli/main.py gateway run",
+    "pythonw.exe -m orion_cli.main gateway run",
+    r"C:\Users\me\orion\venv\Scripts\pythonw.exe -m orion_cli.main gateway run",
+    "python -m orion_cli.main --profile work gateway run",
+    "python -m orion_cli.main gateway run --replace",
+    "python -m orion_cli/main.py gateway run",
     "python gateway/run.py",
-    "hermes-gateway.exe",
-    "hermes gateway",          # bare `hermes gateway` defaults to run
-    "hermes gateway run",
+    "orion-gateway.exe",
+    "orion gateway",          # bare `orion gateway` defaults to run
+    "orion gateway run",
     # profile selector AFTER the `gateway` token (argv is profile-position
     # agnostic — _apply_profile_override strips --profile/-p anywhere)
-    "hermes gateway --profile work run",
-    "python -m hermes_cli.main gateway -p work run",
-    "hermes gateway --profile=work run",
+    "orion gateway --profile work run",
+    "python -m orion_cli.main gateway -p work run",
+    "orion gateway --profile=work run",
     # a profile literally NAMED "gateway"
-    "hermes -p gateway gateway run",
-    "python -m hermes_cli.main --profile gateway gateway run",
+    "orion -p gateway gateway run",
+    "python -m orion_cli.main --profile gateway gateway run",
     # quoted Windows paths with spaces (shlex-aware tokenization)
-    r'"C:\Program Files\Hermes\hermes-gateway.exe"',
-    r'"C:\Program Files\Hermes\gateway\run.py" run',
-    r'"C:\Program Files\Py\pythonw.exe" -m hermes_cli.main gateway run',
+    r'"C:\Program Files\Orion\orion-gateway.exe"',
+    r'"C:\Program Files\Orion\gateway\run.py" run',
+    r'"C:\Program Files\Py\pythonw.exe" -m orion_cli.main gateway run',
 ]
 
 REJECT = [
     "python -m tui_gateway",                              # unrelated module
-    "python -m hermes_cli.main gateway status",           # other subcommand
-    "python -m hermes_cli.main gateway restart",
-    "python -m hermes_cli.main gateway stop",
-    "python -m hermes_cli.main --profile x dashboard",    # non-gateway subcommand
+    "python -m orion_cli.main gateway status",           # other subcommand
+    "python -m orion_cli.main gateway restart",
+    "python -m orion_cli.main gateway stop",
+    "python -m orion_cli.main --profile x dashboard",    # non-gateway subcommand
     "some random python -m mygateway thing",
     "",
     None,

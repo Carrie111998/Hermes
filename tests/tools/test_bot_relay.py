@@ -35,9 +35,9 @@ def _rows():
     return [
         {
             "profile": "default",
-            "handle": "hermes",
+            "handle": "orion",
             "connection_id": "cloud-1",
-            "connection_label": "Hermes Cloud",
+            "connection_label": "Orion Cloud",
             "title": "Moxie",
             "description": "Main cloud agent",
         },
@@ -58,7 +58,7 @@ def test_roster_roundtrip_and_validation(root):
         {"profile": "", "handle": "x", "connection_id": "c"},  # no profile
         {"profile": "bad name!", "connection_id": "c"},  # bad charset
         "not-a-dict",
-        {"profile": "default", "handle": "hermes", "connection_id": "cloud-1"},  # dupe
+        {"profile": "default", "handle": "orion", "connection_id": "cloud-1"},  # dupe
     ]
     count = bot_relay.write_remote_roster(root, rows)
     assert count == 2
@@ -79,12 +79,12 @@ def test_resolve_remote_target_forms(root):
     bot_relay.write_remote_roster(root, _rows())
     roster = bot_relay.read_remote_roster(root)
     assert bot_relay.resolve_remote_target("researcher", roster)["connection_id"] == "ssh-vps"
-    assert bot_relay.resolve_remote_target("@hermes", roster)["profile"] == "default"
+    assert bot_relay.resolve_remote_target("@orion", roster)["profile"] == "default"
     # profile name resolves too
     assert bot_relay.resolve_remote_target("default", roster)["connection_id"] == "cloud-1"
     # exact connection-qualified form
-    assert bot_relay.resolve_remote_target("hermes@cloud-1", roster)["profile"] == "default"
-    assert bot_relay.resolve_remote_target("hermes@nope", roster) is None
+    assert bot_relay.resolve_remote_target("orion@cloud-1", roster)["profile"] == "default"
+    assert bot_relay.resolve_remote_target("orion@nope", roster) is None
     assert bot_relay.resolve_remote_target("ghost", roster) is None
 
 
@@ -99,7 +99,7 @@ def test_resolve_ambiguous_handle_across_connections(root):
     assert match["connection_id"] == "ssh-vps"
     forms = bot_relay.remote_target_forms(roster)
     assert "researcher@ssh-vps" in forms and "researcher@cloud-1" in forms
-    assert "hermes" in forms  # unique handle stays bare
+    assert "orion" in forms  # unique handle stays bare
 
 
 # ── outbox / replies ─────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ import textwrap
 
 
 def _managed_home(tmp_path, *, legacy_soul=False):
-    home = tmp_path / ".hermes"
+    home = tmp_path / ".orion"
     home.mkdir(exist_ok=True)
     d = home / "profiles" / "researcher"
     d.mkdir(parents=True, exist_ok=True)
@@ -151,7 +151,7 @@ def _managed_home(tmp_path, *, legacy_soul=False):
             """\
             description: teammate for tests
             ui_meta:
-              hermes-bots:
+              orion-bots:
                 shape: cloud
             """
         ),
@@ -214,8 +214,8 @@ def test_tool_injects_despite_legacy_soul_protocol(tmp_path):
 def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     home = _managed_home(tmp_path)
     bot_relay.write_remote_roster(home, [
-        {"profile": "default", "handle": "hermes", "connection_id": "cloud-1",
-         "connection_label": "Hermes Cloud", "title": "Moxie"},
+        {"profile": "default", "handle": "orion", "connection_id": "cloud-1",
+         "connection_label": "Orion Cloud", "title": "Moxie"},
     ])
 
     spawned = {}
@@ -227,15 +227,15 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
 
     monkeypatch.setattr("tools.bot_mode_dm._spawn_delivery", _fake_spawn)
     agent = _FakeAgent(home)
-    out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
+    out = json.loads(message_agent_tool(target="orion", message="ping", agent=agent))
     assert out.get("status") == "sent"
-    assert "Hermes Cloud" in spawned["label"]
+    assert "Orion Cloud" in spawned["label"]
     # envelope landed in the outbox with attribution prefixed
     pending = bot_relay.claim_pending_envelopes(home)
     assert len(pending) == 1
     assert pending[0]["target_connection"] == "cloud-1"
     assert pending[0]["target_profile"] == "default"
-    assert pending[0]["message"].startswith("Message from 🤖 hermes (@hermes): ping")
+    assert pending[0]["message"].startswith("Message from 🤖 orion (@orion): ping")
     # waiter watches this envelope's reply file
     assert pending[0]["id"] in spawned["command"]
 
@@ -270,12 +270,12 @@ def test_protocol_section_lists_remote_teammates(tmp_path):
 
     home = _managed_home(tmp_path)
     bot_relay.write_remote_roster(home, [
-        {"profile": "default", "handle": "hermes", "connection_id": "cloud-1",
-         "connection_label": "Hermes Cloud", "title": "Moxie"},
+        {"profile": "default", "handle": "orion", "connection_id": "cloud-1",
+         "connection_label": "Orion Cloud", "title": "Moxie"},
     ])
     section = bot_mode_probe.get_bot_mode_protocol_section(home, force_refresh=True)
     assert "OTHER connected machines" in section
-    assert "`@hermes` — on Hermes Cloud — Moxie" in section
+    assert "`@orion` — on Orion Cloud — Moxie" in section
 
 
 def test_capability_fingerprint_changes_with_relay_roster(tmp_path):
@@ -284,7 +284,7 @@ def test_capability_fingerprint_changes_with_relay_roster(tmp_path):
     home = _managed_home(tmp_path)
     before = bot_mode_probe.capability_fingerprint(home)
     bot_relay.write_remote_roster(home, [
-        {"profile": "default", "handle": "hermes", "connection_id": "cloud-1"},
+        {"profile": "default", "handle": "orion", "connection_id": "cloud-1"},
     ])
     after = bot_mode_probe.capability_fingerprint(home)
     assert before != after  # eternal Bot Chats refresh once on roster change
@@ -297,16 +297,16 @@ def test_cleanup_bot_relay_artifacts_sweeps_stale_plaintext(tmp_path, monkeypatc
     import os as _os
     import time as _time
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("ORION_HOME", str(tmp_path))
     target = {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
               "connection_label": "", "title": "", "description": ""}
     stale_env = bot_relay.enqueue_envelope(
         tmp_path, target=target, message="old secret",
-        sender_profile="default", sender_handle="hermes",
+        sender_profile="default", sender_handle="orion",
     )
     fresh_env = bot_relay.enqueue_envelope(
         tmp_path, target=target, message="new secret",
-        sender_profile="default", sender_handle="hermes",
+        sender_profile="default", sender_handle="orion",
     )
     base = bot_relay.relay_root(tmp_path)
     stale_reply = bot_relay.write_reply(tmp_path, stale_env["id"], reply="done")
@@ -323,5 +323,5 @@ def test_cleanup_bot_relay_artifacts_sweeps_stale_plaintext(tmp_path, monkeypatc
 
 
 def test_cleanup_bot_relay_artifacts_missing_dir_is_zero(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "nope"))
+    monkeypatch.setenv("ORION_HOME", str(tmp_path / "nope"))
     assert bot_relay.cleanup_bot_relay_artifacts() == 0

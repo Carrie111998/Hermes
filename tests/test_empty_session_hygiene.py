@@ -2,14 +2,14 @@
 
 Starting the CLI and immediately quitting (or rotating sessions with /new)
 used to leave empty untitled rows in the session DB that clutter /resume
-and `hermes sessions list`. ``SessionDB.delete_session_if_empty`` removes
+and `orion sessions list`. ``SessionDB.delete_session_if_empty`` removes
 a just-ended session row only when it never gained resumable content:
 no messages, no title, and no child sessions.
 """
 
 import pytest
 
-from hermes_state import SessionDB
+from orion_state import SessionDB
 
 
 @pytest.fixture()
@@ -81,12 +81,12 @@ class TestDeleteSessionIfEmpty:
 
 
 class TestCLIDiscardSessionIfEmpty:
-    """Wiring tests for HermesCLI._discard_session_if_empty."""
+    """Wiring tests for OrionCLI._discard_session_if_empty."""
 
     def _make_cli(self, db):
-        from cli import HermesCLI
+        from cli import OrionCLI
 
-        cli = HermesCLI.__new__(HermesCLI)
+        cli = OrionCLI.__new__(OrionCLI)
         cli._session_db = db
         cli.conversation_history = []
         return cli

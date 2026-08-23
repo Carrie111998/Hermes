@@ -10,9 +10,9 @@ import type {
   MemoryProviderConfig,
   MemoryProviderOAuthStatus,
   MemoryStatusResponse
-} from '@/types/hermes'
+} from '@/types/orion'
 
-import { capabilityScoped, hermesApi, type ProfileScope, profileScoped } from './client'
+import { capabilityScoped, orionApi, type ProfileScope, profileScoped } from './client'
 
 export const AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS = 180_000
 export const AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS = 600_000
@@ -47,7 +47,7 @@ export function audioTranscribeRequestTimeoutMs(dataUrl: string): number {
 
 // surface=declared serves the curated desktop schema; the dashboard consumes the raw plugin schema.
 export function getMemoryProviderConfig(provider: string, profile?: null | string): Promise<MemoryProviderConfig> {
-  return hermesApi<MemoryProviderConfig>({
+  return orionApi<MemoryProviderConfig>({
     ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/config?surface=declared`
   })
@@ -58,7 +58,7 @@ export function saveMemoryProviderConfig(
   values: Record<string, string>,
   profile?: null | string
 ): Promise<{ ok: boolean }> {
-  return hermesApi<{ ok: boolean }>({
+  return orionApi<{ ok: boolean }>({
     ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/config?surface=declared`,
     method: 'PUT',
@@ -72,7 +72,7 @@ export function startMemoryProviderOAuth(
   provider: string,
   profile?: null | string
 ): Promise<MemoryProviderOAuthStatus> {
-  return hermesApi<MemoryProviderOAuthStatus>({
+  return orionApi<MemoryProviderOAuthStatus>({
     ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/oauth/start`,
     method: 'POST'
@@ -83,25 +83,25 @@ export function getMemoryProviderOAuthStatus(
   provider: string,
   profile?: null | string
 ): Promise<MemoryProviderOAuthStatus> {
-  return hermesApi<MemoryProviderOAuthStatus>({
+  return orionApi<MemoryProviderOAuthStatus>({
     ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/oauth/status`
   })
 }
 
 // ---------------------------------------------------------------------------
-// Memory data + curator (parity with `hermes memory` / `hermes curator`).
+// Memory data + curator (parity with `orion memory` / `orion curator`).
 // ---------------------------------------------------------------------------
 
 export function getMemoryStatus(): Promise<MemoryStatusResponse> {
-  return hermesApi<MemoryStatusResponse>({
+  return orionApi<MemoryStatusResponse>({
     ...profileScoped(),
     path: '/api/memory'
   })
 }
 
 export function resetMemory(target: 'all' | 'memory' | 'user'): Promise<{ ok: boolean; deleted: string[] }> {
-  return hermesApi<{ ok: boolean; deleted: string[] }>({
+  return orionApi<{ ok: boolean; deleted: string[] }>({
     ...profileScoped(),
     path: '/api/memory/reset',
     method: 'POST',
@@ -110,14 +110,14 @@ export function resetMemory(target: 'all' | 'memory' | 'user'): Promise<{ ok: bo
 }
 
 export function getCuratorStatus(): Promise<CuratorStatusResponse> {
-  return hermesApi<CuratorStatusResponse>({
+  return orionApi<CuratorStatusResponse>({
     ...profileScoped(),
     path: '/api/curator'
   })
 }
 
 export function setCuratorPaused(paused: boolean): Promise<{ ok: boolean; paused: boolean }> {
-  return hermesApi<{ ok: boolean; paused: boolean }>({
+  return orionApi<{ ok: boolean; paused: boolean }>({
     ...profileScoped(),
     path: '/api/curator/paused',
     method: 'PUT',
@@ -126,7 +126,7 @@ export function setCuratorPaused(paused: boolean): Promise<{ ok: boolean; paused
 }
 
 export function runCurator(): Promise<ActionResponse> {
-  return hermesApi<ActionResponse>({
+  return orionApi<ActionResponse>({
     ...profileScoped(),
     path: '/api/curator/run',
     method: 'POST',
@@ -135,17 +135,17 @@ export function runCurator(): Promise<ActionResponse> {
 }
 
 export function restartGateway(): Promise<ActionResponse> {
-  return hermesApi<ActionResponse>({
+  return orionApi<ActionResponse>({
     ...profileScoped(),
     path: '/api/gateway/restart',
     method: 'POST'
   })
 }
 
-export function updateHermes(): Promise<ActionResponse> {
-  return hermesApi<ActionResponse>({
+export function updateOrion(): Promise<ActionResponse> {
+  return orionApi<ActionResponse>({
     ...profileScoped(),
-    path: '/api/hermes/update',
+    path: '/api/orion/update',
     method: 'POST'
   })
 }
@@ -153,22 +153,22 @@ export function updateHermes(): Promise<ActionResponse> {
 /** Query the connected backend's own update state. In remote mode this is the
  *  authoritative source for the backend's behind-count + "what's changed",
  *  distinct from the Electron client clone's git state. */
-export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
-  return hermesApi<BackendUpdateCheckResponse>({
+export function checkOrionUpdate(force = false): Promise<BackendUpdateCheckResponse> {
+  return orionApi<BackendUpdateCheckResponse>({
     ...profileScoped(),
-    path: `/api/hermes/update/check${force ? '?force=true' : ''}`
+    path: `/api/orion/update/check${force ? '?force=true' : ''}`
   })
 }
 
 export function getActionStatus(name: string, lines = 200, profile?: ProfileScope): Promise<ActionStatusResponse> {
-  return window.hermesDesktop.api<ActionStatusResponse>({
+  return window.orionDesktop.api<ActionStatusResponse>({
     ...capabilityScoped(profile),
     path: `/api/actions/${encodeURIComponent(name)}/status?lines=${Math.max(1, lines)}`
   })
 }
 
 export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
-  return hermesApi<AudioTranscriptionResponse>({
+  return orionApi<AudioTranscriptionResponse>({
     path: '/api/audio/transcribe',
     method: 'POST',
     ...profileScoped(),
@@ -184,7 +184,7 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
 }
 
 export function speakText(text: string): Promise<AudioSpeakResponse> {
-  return hermesApi<AudioSpeakResponse>({
+  return orionApi<AudioSpeakResponse>({
     ...profileScoped(),
     path: '/api/audio/speak',
     method: 'POST',
@@ -197,7 +197,7 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
 }
 
 export function getElevenLabsVoices(profile?: null | string): Promise<ElevenLabsVoicesResponse> {
-  return hermesApi<ElevenLabsVoicesResponse>({
+  return orionApi<ElevenLabsVoicesResponse>({
     path: '/api/audio/elevenlabs/voices',
     ...profileScoped(profile)
   })
@@ -207,29 +207,29 @@ export function getElevenLabsVoices(profile?: null | string): Promise<ElevenLabs
  *  (GitHub is deliberately not an MCP — the github/* skills are the
  *  integration). Backend caches for 5 minutes; `refresh` bypasses. */
 export function getGhAuthStatus(refresh = false): Promise<{ available: boolean; authenticated: boolean }> {
-  return hermesApi<{ available: boolean; authenticated: boolean }>({
+  return orionApi<{ available: boolean; authenticated: boolean }>({
     ...profileScoped(),
     path: `/api/git/gh-auth${refresh ? '?refresh=true' : ''}`
   })
 }
 
 // ---------------------------------------------------------------------------
-// Maintenance operations (parity with `hermes doctor` / `hermes security
-// audit` / `hermes backup` / `hermes debug share` and the dashboard System
+// Maintenance operations (parity with `orion doctor` / `orion security
+// audit` / `orion backup` / `orion debug share` and the dashboard System
 // page). All except debug share are spawn-based background actions tailed via
 // getActionStatus().
 // ---------------------------------------------------------------------------
 
 export function runDoctor(): Promise<ActionResponse> {
-  return hermesApi<ActionResponse>({ path: '/api/ops/doctor', method: 'POST', body: {} })
+  return orionApi<ActionResponse>({ path: '/api/ops/doctor', method: 'POST', body: {} })
 }
 
 export function runSecurityAudit(): Promise<ActionResponse> {
-  return hermesApi<ActionResponse>({ path: '/api/ops/security-audit', method: 'POST', body: {} })
+  return orionApi<ActionResponse>({ path: '/api/ops/security-audit', method: 'POST', body: {} })
 }
 
 export function runBackup(): Promise<ActionResponse & { archive?: string }> {
-  return hermesApi<ActionResponse & { archive?: string }>({
+  return orionApi<ActionResponse & { archive?: string }>({
     path: '/api/ops/backup',
     method: 'POST',
     body: {}
@@ -237,7 +237,7 @@ export function runBackup(): Promise<ActionResponse & { archive?: string }> {
 }
 
 export function runDebugShare(): Promise<DebugShareResponse> {
-  return hermesApi<DebugShareResponse>({
+  return orionApi<DebugShareResponse>({
     path: '/api/ops/debug-share',
     method: 'POST',
     body: {},

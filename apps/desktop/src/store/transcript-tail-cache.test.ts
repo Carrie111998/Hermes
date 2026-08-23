@@ -62,10 +62,10 @@ describe('transcript tail cache', () => {
   })
 
   it('self-evicts a corrupt entry instead of returning garbage', () => {
-    window.localStorage.setItem('hermes.transcript-tail.v1:sess-bad', '{not json')
+    window.localStorage.setItem('orion.transcript-tail.v1:sess-bad', '{not json')
 
     expect(loadTranscriptTail('sess-bad')).toBeNull()
-    expect(window.localStorage.getItem('hermes.transcript-tail.v1:sess-bad')).toBeNull()
+    expect(window.localStorage.getItem('orion.transcript-tail.v1:sess-bad')).toBeNull()
   })
 
   it('drops a deleted session and wipes everything on a gateway re-home', () => {
@@ -110,7 +110,7 @@ describe('transcript tail cache', () => {
       savedAt: Date.now()
     }
 
-    window.localStorage.setItem('hermes.transcript-tail.v1:sess-poisoned', JSON.stringify(poisoned))
+    window.localStorage.setItem('orion.transcript-tail.v1:sess-poisoned', JSON.stringify(poisoned))
 
     const loaded = loadTranscriptTail('sess-poisoned')
 

@@ -13,11 +13,11 @@ through a thin wrapper that mirrors the real dispatch shape.
 
 from unittest.mock import patch
 
-from cli import HermesCLI
+from cli import OrionCLI
 
 
 def _make_cli():
-    cli = HermesCLI.__new__(HermesCLI)
+    cli = OrionCLI.__new__(OrionCLI)
     cli._should_exit = False
     cli.conversation_history = []
     cli.agent = None

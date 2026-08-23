@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { setApiRequestConnection, setApiRequestProfile } from '@/hermes'
+import { setApiRequestConnection, setApiRequestProfile } from '@/orion'
 
 import {
   clearVoiceClientConfigCache,
@@ -26,7 +26,7 @@ const relay = { mode: 'relay', reason: 'local provider' } as const
 function mockDesktopApi(response: unknown) {
   const api = vi.fn(async (_request: unknown) => response)
 
-  Object.defineProperty(window, 'hermesDesktop', {
+  Object.defineProperty(window, 'orionDesktop', {
     configurable: true,
     value: { api }
   })
@@ -40,7 +40,7 @@ describe('fetchVoiceClientConfig', () => {
   afterEach(() => {
     setApiRequestConnection(null)
     setApiRequestProfile(null)
-    Reflect.deleteProperty(window, 'hermesDesktop')
+    Reflect.deleteProperty(window, 'orionDesktop')
     vi.restoreAllMocks()
   })
 
@@ -60,7 +60,7 @@ describe('fetchVoiceClientConfig', () => {
     const request = api.mock.calls[0][0] as { connectionId?: string; path: string; profile?: string }
     expect(request.path).toBe('/api/audio/voice-config')
     expect(request.profile).toBe('research')
-    // hermesApi carries the ambient registry connection tag — the config
+    // orionApi carries the ambient registry connection tag — the config
     // must come from the backend the user is talking to.
     expect(request.connectionId).toBe('gw-remote')
   })
@@ -77,7 +77,7 @@ describe('fetchVoiceClientConfig', () => {
   })
 
   it('resolves null on an older backend without the endpoint', async () => {
-    Object.defineProperty(window, 'hermesDesktop', {
+    Object.defineProperty(window, 'orionDesktop', {
       configurable: true,
       value: { api: vi.fn(async () => Promise.reject(new Error('404'))) }
     })
@@ -92,7 +92,7 @@ describe('transcribeAudioClientDirect', () => {
   afterEach(() => {
     setApiRequestConnection(null)
     setApiRequestProfile(null)
-    Reflect.deleteProperty(window, 'hermesDesktop')
+    Reflect.deleteProperty(window, 'orionDesktop')
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })

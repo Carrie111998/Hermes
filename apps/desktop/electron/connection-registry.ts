@@ -4,7 +4,7 @@
  * Pure, electron-free helpers for the desktop's multi-connection registry —
  * the v2 successor to the single global `mode` + `remote` block in
  * connection.json. The registry is a named list of agent SOURCES (local
- * runtime, remote gateways, Hermes Cloud instances, SSH hosts) that are all
+ * runtime, remote gateways, Orion Cloud instances, SSH hosts) that are all
  * registered at once; routing/pooling changes that consume the registry land
  * separately, so this module is deliberately storage-shaped, not
  * transport-shaped.
@@ -69,7 +69,7 @@ export interface RegistryConnection {
   user?: string
   port?: number
   keyPath?: string
-  remoteHermesPath?: string
+  remoteOrionPath?: string
   remoteProfile?: string
 }
 
@@ -155,7 +155,7 @@ export function agentHandle(profile: string, connectionLabel: string, duplicated
  * profile names).
  *
  * NOTE: the renderer's socket registry uses the twin implementation in
- * apps/shared/src/backend-scope.ts (`@hermes/shared`) — tsconfig project
+ * apps/shared/src/backend-scope.ts (`@orion/shared`) — tsconfig project
  * boundaries prevent a single physical module here. The two are pinned
  * byte-identical by the cross-copy contract test in
  * connection-registry.test.ts; change BOTH or that test fails.
@@ -188,7 +188,7 @@ export interface ResolvedConnectionSshDescriptor {
   host?: string
   keyPath?: string
   port?: number
-  remoteHermesPath?: string
+  remoteOrionPath?: string
   remoteProfile?: string
   user?: string
 }
@@ -492,7 +492,7 @@ export function shouldRetrySshInventory(
 
 const PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
 
-/** Turn `ls ~/.hermes/profiles` output into roster names. Always includes
+/** Turn `ls ~/.orion/profiles` output into roster names. Always includes
  *  `default`. Drops rollback snapshots and junk lines. */
 export function parseRemoteProfileListing(text: string): string[] {
   const names = new Set<string>(['default'])
@@ -626,8 +626,8 @@ export interface UpdateEligibility {
 }
 
 /**
- * Whether "Update all instances" may drive this connection. Hermes Cloud
- * instances are platform-managed — we never run `hermes update` against them.
+ * Whether "Update all instances" may drive this connection. Orion Cloud
+ * instances are platform-managed — we never run `orion update` against them.
  * Local, remote, and ssh sources are all eligible (reachability and busy
  * checks happen at dispatch time, not here).
  */
@@ -672,7 +672,7 @@ export interface ConnectionInput {
   user?: string
   port?: number | string
   keyPath?: string
-  remoteHermesPath?: string
+  remoteOrionPath?: string
   remoteProfile?: string
 }
 
@@ -730,7 +730,7 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
       user: input.user,
       port: input.port,
       keyPath: input.keyPath,
-      remoteHermesPath: input.remoteHermesPath,
+      remoteOrionPath: input.remoteOrionPath,
       remoteProfile: input.remoteProfile
     })
 
@@ -786,7 +786,7 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
     // Extra gateway headers (access-proxy credentials) apply to any
     // remote-shaped entry regardless of auth mode — Cloudflare Access sits in
     // front of both token- and OAuth-gated gateways. Normalization drops
-    // transport-/Hermes-managed names; an empty result stores nothing.
+    // transport-/Orion-managed names; an empty result stores nothing.
     if (input.headers !== undefined) {
       const headers = normalizeRemoteHeaders(input.headers)
 
@@ -812,7 +812,7 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
  * editor doesn't carry survive a save. Renaming a migrated cloud entry must
  * not drop its `org` (downstream update-fanout uses it to skip
  * platform-managed instances), and renaming an ssh entry must not drop
- * `remoteHermesPath`/`remoteProfile`. Only fields the payload explicitly
+ * `remoteOrionPath`/`remoteProfile`. Only fields the payload explicitly
  * carries (non-undefined) override; `token` is deliberately NOT merged here —
  * the caller owns secret handling.
  */
@@ -834,7 +834,7 @@ export function mergeConnectionInput(input: ConnectionInput, existing?: null | R
   inherit('org')
   inherit('host')
   inherit('keyPath')
-  inherit('remoteHermesPath')
+  inherit('remoteOrionPath')
   inherit('remoteProfile')
   // Headers inherit like other dial fields: an edit payload that omits the
   // field keeps the stored set; an explicit payload (even {}) is
@@ -876,7 +876,7 @@ export function connectionDialFieldsChanged(before: RegistryConnection, after: R
     'user',
     'port',
     'keyPath',
-    'remoteHermesPath',
+    'remoteOrionPath',
     'remoteProfile'
   ]
 
@@ -1043,7 +1043,7 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
     }
 
     const label = uniqueLabel(
-      hostLabelFromBaseUrl(url) || (kind === 'cloud' ? 'Hermes Cloud' : 'Remote gateway'),
+      hostLabelFromBaseUrl(url) || (kind === 'cloud' ? 'Orion Cloud' : 'Remote gateway'),
       connections.map(c => c.label)
     )
 

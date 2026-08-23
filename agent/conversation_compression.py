@@ -715,7 +715,7 @@ class CompressionCommitFence:
 
 
 # Defaults for the in-agent (non-hygiene) progress-aware compress_context wrap.
-# Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
+# Mirror orion_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
 
@@ -811,7 +811,7 @@ def resolve_context_compression_timeouts(
     cfg = compression_cfg
     if cfg is None:
         try:
-            from hermes_cli.config import load_config
+            from orion_cli.config import load_config
 
             raw = load_config()
             maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
@@ -1116,13 +1116,13 @@ def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
     """Whether the live in-memory SessionDB class structurally predates locks.
 
     In the supported hot-reload skew, this module is new while the already
-    imported ``hermes_state.SessionDB`` class (and its live instances) is old.
+    imported ``orion_state.SessionDB`` class (and its live instances) is old.
     Only that exact class identity may fail open. Proxies, nominal lookalikes,
     non-callables, and descriptor failures must fail closed. Static lookup
     avoids invoking a present-but-broken descriptor.
     """
     try:
-        from hermes_state import SessionDB
+        from orion_state import SessionDB
 
         missing = object()
         return (
@@ -1274,9 +1274,9 @@ def _adopt_live_compression_child(
 
         set_current_session_id(child_session_id)
     except Exception:
-        os.environ["HERMES_SESSION_ID"] = child_session_id
+        os.environ["ORION_SESSION_ID"] = child_session_id
     try:
-        from hermes_logging import set_session_context
+        from orion_logging import set_session_context
 
         set_session_context(child_session_id)
     except Exception:
@@ -1691,7 +1691,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 msg = (
                     "⚠ No auxiliary LLM provider configured — context "
                     "compression will drop middle turns without a summary. "
-                    "Run `hermes setup` or set OPENROUTER_API_KEY."
+                    "Run `orion setup` or set OPENROUTER_API_KEY."
                 )
             agent._compression_warning = msg
             agent._emit_status(msg)
@@ -1734,7 +1734,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
             raise ValueError(
                 f"Auxiliary compression model {aux_model} has a context "
                 f"window of {aux_context:,} tokens, which is below the "
-                f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
+                f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Orion "
                 f"Agent.  Choose a compression model with at least "
                 f"{MINIMUM_CONTEXT_LENGTH // 1000}K context (set "
                 f"auxiliary.compression.model in config.yaml), or set "
@@ -1855,7 +1855,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                     f"           model: <model-with-{old_threshold:,}+-context>\n"
                     f"  (Lowering compression.threshold cannot help here — "
                     f"with {_main_label}'s {main_ctx:,}-token window, "
-                    f"Hermes's small-context floor and output reservation "
+                    f"Orion's small-context floor and output reservation "
                     f"would recompute the trigger to "
                     f"{recomputed_threshold:,} tokens, still above the "
                     f"compression model's {aux_context:,}.)"
@@ -2333,11 +2333,11 @@ def compress_context(
         pass
 
     # Codex app-server sessions: the codex agent owns the real thread context;
-    # Hermes' summarizer would only rewrite a local mirror without shrinking
+    # Orion' summarizer would only rewrite a local mirror without shrinking
     # the actual thread (#36801). Route compaction to the app server's own
     # thread/compact mechanism. Behavior is controlled by
-    # ``compression.codex_app_server_auto`` (native|hermes|off).
-    # The memory-provider context handoff below is intentionally Hermes-only:
+    # ``compression.codex_app_server_auto`` (native|orion|off).
+    # The memory-provider context handoff below is intentionally Orion-only:
     # the app server does not expose its native summary prompt, so there is no
     # truthful injection point for ``on_pre_compress()`` return text here.
     if getattr(agent, "api_mode", None) == "codex_app_server":
@@ -2549,7 +2549,7 @@ def compress_context(
                     "compression lock subsystem unavailable for session=%s "
                     "— proceeding without lock. This usually means a stale "
                     "in-memory module after an update; restart the process "
-                    "(or `hermes update`) to resync.",
+                    "(or `orion update`) to resync.",
                     _lock_sid,
                 )
             _lock_acquired = True  # acquired-but-unlocked compatibility path
@@ -3650,9 +3650,9 @@ def compress_context(
                     # mirror _ensure_db_session's stamp ("default" persists as
                     # NULL). publish_compression_child additionally COALESCEs
                     # from the parent row, covering app-global remote sessions
-                    # whose thread lacks the HERMES_HOME context.
+                    # whose thread lacks the ORION_HOME context.
                     try:
-                        from hermes_cli.profiles import get_active_profile_name
+                        from orion_cli.profiles import get_active_profile_name
 
                         _profile_for_child = get_active_profile_name()
                         if _profile_for_child == "default":
@@ -3668,7 +3668,7 @@ def compress_context(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
                         source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        or os.environ.get("ORION_SESSION_SOURCE", "cli"),
                         model=agent.model,
                         model_config=agent._session_init_model_config,
                         system_prompt=new_system_prompt,
@@ -3690,9 +3690,9 @@ def compress_context(
 
                         set_current_session_id(agent.session_id)
                     except Exception:
-                        os.environ["HERMES_SESSION_ID"] = agent.session_id
+                        os.environ["ORION_SESSION_ID"] = agent.session_id
                     try:
-                        from hermes_logging import set_session_context
+                        from orion_logging import set_session_context
 
                         set_session_context(agent.session_id)
                     except Exception:
@@ -3704,13 +3704,13 @@ def compress_context(
                     # per-session lookup with no parent walk, so without this an
                     # active goal silently dies at the boundary (#33618).
                     try:
-                        from hermes_cli.goals import migrate_goal_to_session
+                        from orion_cli.goals import migrate_goal_to_session
                         migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _goal_err:
                         logger.debug("Could not migrate goal on compression: %s", _goal_err)
                     # Same boundary hazard for /heartbeat state — carry it too.
                     try:
-                        from hermes_cli.heartbeat import migrate_heartbeat_to_session
+                        from orion_cli.heartbeat import migrate_heartbeat_to_session
                         migrate_heartbeat_to_session(old_session_id, agent.session_id)
                     except Exception as _hb_err:
                         logger.debug("Could not migrate heartbeat on compression: %s", _hb_err)
@@ -3718,7 +3718,7 @@ def compress_context(
                     # onto the continuation session so the recurring wakeups
                     # survive compression.
                     try:
-                        from hermes_cli.loops import migrate_loop_to_session
+                        from orion_cli.loops import migrate_loop_to_session
                         migrate_loop_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _loop_err:
                         logger.debug("Could not migrate loop on compression: %s", _loop_err)
@@ -3870,9 +3870,9 @@ def compress_context(
                 )
 
         # Notify the context engine that a compaction boundary occurred. Plugin
-        # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
+        # engines (e.g. orion-lcm) use boundary_reason="compression" to preserve
         # DAG lineage / checkpoint per-session state across the boundary instead of
-        # re-initializing fresh. See hermes-lcm#68. Built-in ContextCompressor
+        # re-initializing fresh. See orion-lcm#68. Built-in ContextCompressor
         # ignores kwargs. Fires in BOTH modes: rotation passes old→new ids; in-place
         # passes the SAME id (the boundary is real even though the id didn't move).
         if _context_engine_boundary_committed:
@@ -4033,17 +4033,17 @@ def _compress_context_via_codex_app_server(
 ) -> Tuple[list, str]:
     """Route compaction to Codex app-server for Codex-owned threads.
 
-    Hermes' normal compressor rewrites the local OpenAI-style transcript.
+    Orion' normal compressor rewrites the local OpenAI-style transcript.
     That does not shrink the actual Codex app-server thread context. For this
-    runtime, ask Codex to compact its own thread and keep Hermes' transcript
+    runtime, ask Codex to compact its own thread and keep Orion' transcript
     unchanged.
     """
     auto_mode = str(
         getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
     ).lower()
-    if auto_mode not in {"native", "hermes", "off"}:
+    if auto_mode not in {"native", "orion", "off"}:
         auto_mode = "native"
-    if not force and auto_mode != "hermes":
+    if not force and auto_mode != "orion":
         logger.info(
             "codex app-server compaction skipped: mode=%s force=false "
             "(session=%s messages=%d tokens=~%s)",
@@ -4284,7 +4284,7 @@ def try_shrink_image_parts_in_messages(
                 "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/bmp": ".bmp",
             }.get(mime, ".jpg")
             tmp = tempfile.NamedTemporaryFile(
-                prefix="hermes_shrink_", suffix=suffix, delete=False,
+                prefix="orion_shrink_", suffix=suffix, delete=False,
             )
             try:
                 tmp.write(raw)

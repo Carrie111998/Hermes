@@ -1,12 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from cli import HermesCLI, _rich_text_from_ansi
-from hermes_cli.skin_engine import get_active_skin, set_active_skin
+from cli import OrionCLI, _rich_text_from_ansi
+from orion_cli.skin_engine import get_active_skin, set_active_skin
 
 
 def _make_cli_stub():
-    cli = HermesCLI.__new__(HermesCLI)
+    cli = OrionCLI.__new__(OrionCLI)
     cli._sudo_state = None
     cli._secret_state = None
     cli._approval_state = None
@@ -50,7 +50,7 @@ class TestCliSkinPromptIntegration:
         cli._voice_recording = True
         cli._voice_recorder = SimpleNamespace(current_rms=3000)
 
-        with patch.object(HermesCLI, "_get_tui_terminal_width", return_value=50):
+        with patch.object(OrionCLI, "_get_tui_terminal_width", return_value=50):
             frags = cli._get_tui_prompt_fragments()
 
         assert frags[0][0] == "class:voice-recording"

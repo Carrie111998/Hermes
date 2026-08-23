@@ -10,7 +10,7 @@ This module covers the chat_completions path (/v1 endpoint).
 from typing import Any
 from urllib.parse import urlparse
 
-from hermes_cli import __version__ as _HERMES_VERSION
+from orion_cli import __version__ as _ORION_VERSION
 from providers import register_provider
 from providers.base import OMIT_TEMPERATURE, ProviderProfile
 
@@ -118,9 +118,9 @@ kimi = KimiProfile(
     fixed_temperature=OMIT_TEMPERATURE,
     default_max_tokens=32000,
     default_headers={
-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-        "X-Title": "Hermes Agent",
-        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+        "HTTP-Referer": "https://your-orion-docs.example",
+        "X-Title": "Orion Agent",
+        "User-Agent": f"OrionAgent/{_ORION_VERSION}",
     },
     default_aux_model="kimi-k2-turbo-preview",
 )
@@ -133,9 +133,9 @@ kimi_cn = KimiProfile(
     fixed_temperature=OMIT_TEMPERATURE,
     default_max_tokens=32000,
     default_headers={
-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-        "X-Title": "Hermes Agent",
-        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+        "HTTP-Referer": "https://your-orion-docs.example",
+        "X-Title": "Orion Agent",
+        "User-Agent": f"OrionAgent/{_ORION_VERSION}",
     },
     default_aux_model="kimi-k2-turbo-preview",
 )

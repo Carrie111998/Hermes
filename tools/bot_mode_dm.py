@@ -1,11 +1,11 @@
 """Bot Mode agent-to-agent DM tool — ``message_agent``.
 
 A structured, Bot-Chat-only tool that lets a Bot Mode agent message a
-teammate agent (another Hermes profile on this install, or an agent on a
+teammate agent (another Orion profile on this install, or an agent on a
 registered peer gateway) WITHOUT hand-assembling shell commands.
 
 Why this exists (Aug 2026): the Bot Mode teammate protocol taught agents to
-DM each other via a prompt-injected ``hermes -p <bot> chat ...`` shellout.
+DM each other via a prompt-injected ``orion -p <bot> chat ...`` shellout.
 That transport works, but the *invocation* was fragile — quoting traps
 (#91339/#91304), temp-file choreography, dead-profile races — and the
 Desktop's remote-mention path forwarded raw user text verbatim (#91397).
@@ -26,12 +26,12 @@ Containment contract (MUST hold — reviewers check all three):
   forged call from a session that shouldn't have the tool returns a
   structured error instead of delivering.
 - Everything here is additive. The legacy protocol transports
-  (``hermes -p`` / ``hermes peer dm``) keep working for older prompts.
+  (``orion -p`` / ``orion peer dm``) keep working for older prompts.
 
 The transports themselves are unchanged and proven:
-- local teammate  → ``hermes -p <name> chat --in ~ -c "Bot Chat"
+- local teammate  → ``orion -p <name> chat --in ~ -c "Bot Chat"
   --create-if-missing -Q --query-file <tmp>`` (one turn, reply on stdout)
-- peer teammate   → ``hermes peer dm <peer>[/<name>] < <tmp>``
+- peer teammate   → ``orion peer dm <peer>[/<name>] < <tmp>``
 
 Both run through ``terminal_tool(background=True, notify_on_complete=True)``
 so the reply lands as a completion notification on the sender's NEXT turn —
@@ -64,7 +64,7 @@ MESSAGE_MAX_CHARS = 16000
 # A runner normally owns and removes each file. This bounds the residual
 # plaintext lifetime if the machine dies after background-spawn acknowledgement
 # but before the runner reaches its ``finally`` block.
-_DM_DIR_NAME = "hermes-dm"
+_DM_DIR_NAME = "orion-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
@@ -106,7 +106,7 @@ def message_agent_tool_schema() -> dict:
                         "type": "string",
                         "description": (
                             "Who to message: a teammate profile name from your roster "
-                            "('researcher', 'hermes' for the default agent), or "
+                            "('researcher', 'orion' for the default agent), or "
                             "'<peer>' / '<peer>/<agent>' for a registered peer gateway."
                         ),
                     },
@@ -171,7 +171,7 @@ def ensure_message_agent_tool(agent: Any) -> bool:
 # ── roster resolution ────────────────────────────────────────────────────────
 
 
-def _hermes_root(home: Path) -> Path:
+def _orion_root(home: Path) -> Path:
     if home.parent.name == "profiles":
         return home.parent.parent
     return home
@@ -207,15 +207,15 @@ def _peers(root: Path) -> list[str]:
 
 
 def _handle(name: str) -> str:
-    return "hermes" if name == "default" else name
+    return "orion" if name == "default" else name
 
 
 def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
-    """Map a target handle to a profile name ('hermes' → 'default')."""
+    """Map a target handle to a profile name ('orion' → 'default')."""
     want = target.strip()
     if not want:
         return None
-    if want.lower() == "hermes":
+    if want.lower() == "orion":
         return "default" if "default" in roster else None
     for name in roster:
         if name.lower() == want.lower():
@@ -266,7 +266,7 @@ def message_agent_tool(
     except Exception as exc:  # pragma: no cover — defensive
         return _err(f"Bot Mode gate check failed: {exc}")
 
-    root = _hermes_root(Path(home))
+    root = _orion_root(Path(home))
     me = _self_profile_name(Path(home))
     roster = _local_roster(root)
     peers = _peers(root)
@@ -301,7 +301,7 @@ def message_agent_tool(
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
         return _start_delivery(
-            ["hermes", "peer", "dm", dm_target],
+            ["orion", "peer", "dm", dm_target],
             prefix + body,
             label,
             stdin_file=True,
@@ -343,7 +343,7 @@ def message_agent_tool(
 
     return _start_delivery(
         [
-            "hermes",
+            "orion",
             "-p",
             resolved,
             "chat",
@@ -456,8 +456,8 @@ def cleanup_bot_dm_cache(
     # by versions predating the dedicated directory.
     temp_root = Path(tempfile.gettempdir())
     locations: list[tuple[Path, str]] = [
-        (temp_root, "hermes-dm-*.txt"),
-        (temp_root, "hermes-relay-dm-*.txt"),
+        (temp_root, "orion-dm-*.txt"),
+        (temp_root, "orion-relay-dm-*.txt"),
     ]
     try:
         locations.append((_dm_dir(), "*.txt"))
@@ -649,7 +649,7 @@ def _agent_home(agent: Any) -> str:
             return str(Path(db_path).parent)
     except Exception:
         pass
-    return os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.getenv("ORION_HOME") or os.path.expanduser("~/.orion")
 
 
 def _session_title(agent: Any) -> str:
