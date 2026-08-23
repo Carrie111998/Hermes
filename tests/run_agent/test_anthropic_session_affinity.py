@@ -134,3 +134,59 @@ def test_agent_reuses_one_affinity_across_all_anthropic_client_paths(
         fallback_headers,
     ):
         assert headers["x-session-affinity"] == expected
+
+
+def test_delegated_child_uses_its_own_session_affinity(tmp_path, monkeypatch):
+    """A delegated agent's proxy client must be keyed to the child session."""
+    from hermes_cli import config as config_module
+    from tools.delegate_tool import _build_child_agent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "\n".join([
+            "privacy:",
+            "  allow_third_party_identifiers: true",
+            "providers:",
+            "  test-anthropic-proxy:",
+            f"    api: {PROXY_BASE_URL}",
+            "    transport: anthropic_messages",
+            "    session_affinity: true",
+        ]),
+        encoding="utf-8",
+    )
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._RAW_CONFIG_CACHE.clear()
+
+    with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        parent = AIAgent(
+            api_key="proxy-key",
+            base_url=PROXY_BASE_URL,
+            provider="custom-proxy",
+            api_mode="anthropic_messages",
+            model="claude-test",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        parent_headers = mock_sdk.Anthropic.call_args.kwargs["default_headers"]
+
+        child = _build_child_agent(
+            task_index=0,
+            goal="verify delegated affinity",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+        )
+        child_headers = mock_sdk.Anthropic.call_args.kwargs["default_headers"]
+
+    assert child.session_id != parent.session_id
+    assert child_headers["x-session-affinity"] == hashlib.sha256(
+        child.session_id.encode("utf-8")
+    ).hexdigest()
+    assert parent_headers["x-session-affinity"] == hashlib.sha256(
+        parent.session_id.encode("utf-8")
+    ).hexdigest()
+    assert child_headers["x-session-affinity"] != parent_headers["x-session-affinity"]
