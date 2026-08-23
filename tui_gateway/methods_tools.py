@@ -450,7 +450,7 @@ def _(rid, params: dict) -> dict:
 
             r = subprocess.run(
                 qc.get("command", ""),
-                shell=True,
+                shell=True,  # nosec B602 — user-defined quick command from config, not LLM-controlled
                 capture_output=True,
                 text=True,
                 # Force UTF-8 + lossy decode so non-UTF-8 child output can't
@@ -2553,7 +2553,7 @@ def _(rid, params: dict) -> dict:
         from hermes_cli._subprocess_compat import windows_hide_flags
 
         r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
+            cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd(),  # nosec B602 — user command after danger-check approval
             # Force UTF-8 + lossy decode so non-UTF-8 child output can't crash
             # the gateway thread on locale-mismatched Windows (#53137).
             encoding="utf-8", errors="replace",

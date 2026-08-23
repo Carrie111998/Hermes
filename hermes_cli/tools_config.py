@@ -1663,7 +1663,7 @@ def _run_cua_driver_installer(
         # keep streaming live.
         if verbose:
             proc = subprocess.Popen(
-                install_cmd, shell=use_shell, env=installer_env,
+                install_cmd, shell=use_shell, env=installer_env,  # nosec B602 — use_shell is always False
                 creationflags=_post_setup_no_window_flags(streams_to_console=True),
                 **popen_kwargs
             )
@@ -1678,7 +1678,7 @@ def _run_cua_driver_installer(
             )
         else:
             proc = subprocess.Popen(
-                install_cmd, shell=use_shell, env=installer_env,
+                install_cmd, shell=use_shell, env=installer_env,  # nosec B602 — use_shell is always False
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=_post_setup_no_window_flags(),
