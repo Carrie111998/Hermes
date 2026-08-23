@@ -22,17 +22,53 @@ two enabled levels — ``high`` and ``max`` — on the OpenAI-compatible endpoin
 (per Z.AI / BigModel docs).  Hermes' richer effort scale is collapsed onto
 those two so the user's effort preference actually reaches the model instead
 of being silently dropped.
+
+Vision routing is endpoint-aware: the Coding Plan endpoint serves
+``glm-4.5v`` but not the general API's ``glm-5v-turbo`` (429 code 1311 —
+not in subscription).  :meth:`ZaiProfile.default_vision_model` picks the
+vision default for the billing pool the request actually lands on (issue
+#92817).
 """
 
 from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
+
+#: Z.AI / BigModel hosts.  Host-anchored matching so a lookalike host
+#: (``api.z.ai.evil.example.com``) or a path marker on a gateway URL never
+#: triggers endpoint-specific routing.
+_ZAI_HOSTS = ("api.z.ai", "open.bigmodel.cn")
+
+
+def _is_zai_coding_endpoint(base_url: str | None) -> bool:
+    """True when *base_url* is a Z.AI Coding Plan endpoint.
+
+    Covers the OpenAI-wire form ``/api/coding/paas/v4`` and the
+    Anthropic-wire form ``/api/anthropic`` (whose OpenAI sibling is the
+    coding endpoint — see ``_to_openai_base_url``).  The general API
+    (``/api/paas/v4``) is billed independently and is NOT a coding endpoint.
+    """
+    url = str(base_url or "").strip().rstrip("/")
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host not in _ZAI_HOSTS:
+        return False
+    return (
+        "/coding/" in url
+        or url.endswith("/coding")
+        or url.endswith("/api/anthropic")
+    )
 
 
 def _model_supports_thinking(model: str | None) -> bool:
@@ -121,6 +157,19 @@ def _glm_5_2_reasoning_effort(
 
 class ZaiProfile(ProviderProfile):
     """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort."""
+
+    def default_vision_model(self, base_url: str | None = None) -> str | None:
+        """Vision default for the billing pool *base_url* lands on.
+
+        The Coding Plan endpoint (``/api/coding/paas/v4``, or its
+        Anthropic-wire form ``/api/anthropic``) does not serve
+        ``glm-5v-turbo`` — it answers 429 code 1311 ("not in subscription").
+        It serves ``glm-4.5v``, which is included in the plan (measured live,
+        issue #92817).  The general API keeps ``glm-5v-turbo``.
+        """
+        if _is_zai_coding_endpoint(base_url):
+            return "glm-4.5v"
+        return "glm-5v-turbo"
 
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, model: str | None = None, **context

@@ -21,7 +21,7 @@ class _DeepInfraProfile(ProviderProfile):
     "deepinfra"`` branch reaching into the catalog helpers).
     """
 
-    def default_vision_model(self):  # type: ignore[override]
+    def default_vision_model(self, base_url=None):  # type: ignore[override]
         """First vision-capable *chat* model from the live catalog, or None.
 
         Key-gated so a box without ``DEEPINFRA_API_KEY`` never pays the
