@@ -1275,9 +1275,17 @@ def _save_disabled_set(disabled: set) -> None:
     See ``_save_enabled_set`` — same round-trip writer, same rationale.
     """
     from hermes_cli.config import is_managed, managed_error, get_config_path
+    from hermes_cli import managed_scope
     from utils import atomic_roundtrip_yaml_update
     if is_managed():
         managed_error("save configuration")
+        return
+    if managed_scope.is_key_managed("plugins.disabled"):
+        print(
+            "Note: 1 managed setting(s) were not saved (managed by your "
+            "administrator): plugins.disabled",
+            file=sys.stderr,
+        )
         return
     config_path = get_config_path()
     atomic_roundtrip_yaml_update(config_path, "plugins.disabled", sorted(disabled))
@@ -1341,9 +1349,17 @@ def _save_enabled_set(enabled: set) -> None:
     security/fallback-model boilerplate on each write (#92554).
     """
     from hermes_cli.config import is_managed, managed_error, get_config_path
+    from hermes_cli import managed_scope
     from utils import atomic_roundtrip_yaml_update
     if is_managed():
         managed_error("save configuration")
+        return
+    if managed_scope.is_key_managed("plugins.enabled"):
+        print(
+            "Note: 1 managed setting(s) were not saved (managed by your "
+            "administrator): plugins.enabled",
+            file=sys.stderr,
+        )
         return
     config_path = get_config_path()
     atomic_roundtrip_yaml_update(config_path, "plugins.enabled", sorted(enabled))
