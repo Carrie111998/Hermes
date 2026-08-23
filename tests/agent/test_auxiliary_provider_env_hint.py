@@ -3,7 +3,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.auxiliary_client import async_call_llm, call_llm
-from hermes_cli.auth import PROVIDER_REGISTRY, provider_api_key_env_hint
+from hermes_cli.auth import PROVIDER_REGISTRY, ProviderConfig, provider_api_key_env_hint
 
 
 def test_provider_api_key_env_hint_uses_registry_and_safe_fallback():
@@ -11,6 +11,21 @@ def test_provider_api_key_env_hint_uses_registry_and_safe_fallback():
     assert PROVIDER_REGISTRY["minimax-oauth"].api_key_env_vars == ()
     assert provider_api_key_env_hint("alibaba") == "DASHSCOPE_API_KEY"
     assert provider_api_key_env_hint("future-provider") == "FUTURE-PROVIDER_API_KEY"
+
+
+@pytest.mark.parametrize(
+    "minimax_config",
+    [None, ProviderConfig(id="minimax", name="MiniMax", auth_type="api_key")],
+)
+def test_minimax_oauth_hint_falls_back_when_api_key_metadata_is_unavailable(
+    monkeypatch, minimax_config
+):
+    if minimax_config is None:
+        monkeypatch.delitem(PROVIDER_REGISTRY, "minimax")
+    else:
+        monkeypatch.setitem(PROVIDER_REGISTRY, "minimax", minimax_config)
+
+    assert provider_api_key_env_hint("minimax-oauth") == "MINIMAX-OAUTH_API_KEY"
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

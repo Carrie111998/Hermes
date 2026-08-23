@@ -383,6 +383,8 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="minimax-oauth",
         name="MiniMax (OAuth \u00b7 minimax.io)",
         auth_type="oauth_minimax",
+        # Keep api_key_env_vars empty: OAuth credential discovery must not
+        # consume MINIMAX_API_KEY, which is only a user-facing fallback hint.
         portal_base_url=MINIMAX_OAUTH_GLOBAL_BASE,
         inference_base_url=MINIMAX_OAUTH_GLOBAL_INFERENCE,
         client_id=MINIMAX_OAUTH_CLIENT_ID,
@@ -561,7 +563,9 @@ def provider_api_key_env_hint(provider_id: str) -> str:
     if config and config.api_key_env_vars:
         return config.api_key_env_vars[0]
     if provider_id == "minimax-oauth":
-        return PROVIDER_REGISTRY["minimax"].api_key_env_vars[0]
+        minimax = PROVIDER_REGISTRY.get("minimax")
+        if minimax and minimax.api_key_env_vars:
+            return minimax.api_key_env_vars[0]
     return f"{provider_id.upper()}_API_KEY"
 
 # Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
