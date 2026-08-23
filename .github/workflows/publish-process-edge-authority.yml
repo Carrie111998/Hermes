@@ -5,6 +5,8 @@ on:
     branches:
       - security/process-edge-authority-broker
     paths:
+      - .github/materialize-process-edge-authority.py
+      - .github/harden-process-edge-authority.py
       - .github/finalize-process-edge-authority.py.gz.b64
       - .github/workflows/publish-process-edge-authority.yml
   workflow_dispatch:
@@ -17,50 +19,59 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BASE_SHA: f293e7206b4ddd66042329442c6afebc19a8808d
   PRODUCT_BRANCH: phase-g-capability-bound-process-creation
+  # Consistency checksum only: this detects a partial blob/hash update in the
+  # exact transport commit. It is not an authenticity root. Authenticity comes
+  # from review of the exact transport head and the final clean product PR.
   FINALIZER_SHA256: f2b303f3c6648a7e8293229bd9cf4f4dad82df7d21e1bd46bca8ea0f5a746087
 
 jobs:
   publish:
-    name: Materialize, self-review, test, and publish clean product
+    name: Materialize, verify, test, and publish clean product
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout private transport branch
+      - name: Checkout transport branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - name: Verify upstream base did not move
+      - name: Resolve and pin upstream main for this run
+        id: base
         run: |
           set -euo pipefail
-          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+          git fetch --no-tags --force https://github.com/NousResearch/hermes-agent.git \
             refs/heads/main:refs/remotes/upstream/main
-          actual="$(git rev-parse refs/remotes/upstream/main)"
-          test "$actual" = "$BASE_SHA" || {
-            echo "::error::upstream main moved: expected $BASE_SHA, found $actual"
-            exit 1
-          }
+          base_sha="$(git rev-parse refs/remotes/upstream/main)"
+          echo "BASE_SHA=$base_sha" >> "$GITHUB_ENV"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "resolved_upstream_main=$base_sha"
 
-      - name: Reconstruct reviewed product on exact upstream main
+      - name: Reconstruct reviewed product on pinned upstream main
         run: |
           set -euo pipefail
           work=/tmp/phase-g-reviewed-product
+          finalizer=/tmp/phase-g-finalizer.py
           rm -rf "$work"
+          rm -f "$finalizer"
           git worktree add --detach "$work" "$BASE_SHA"
           mkdir -p "$work/.github"
           cp .github/materialize-process-edge-authority.py \
             "$work/.github/materialize-process-edge-authority.py"
+          cp .github/harden-process-edge-authority.py \
+            "$work/.github/harden-process-edge-authority.py"
           base64 --decode .github/finalize-process-edge-authority.py.gz.b64 \
-            | gzip --decompress > "$work/.github/finalize-process-edge-authority.py"
-          echo "$FINALIZER_SHA256  $work/.github/finalize-process-edge-authority.py" \
+            | gzip --decompress > "$finalizer"
+          echo "$FINALIZER_SHA256  $finalizer" \
             | sha256sum --check --strict -
+          cp "$finalizer" "$work/.github/finalize-process-edge-authority.py"
           python "$work/.github/materialize-process-edge-authority.py"
           python "$work/.github/finalize-process-edge-authority.py"
+          python "$work/.github/harden-process-edge-authority.py" "$work"
           rm -f \
             "$work/.github/materialize-process-edge-authority.py" \
-            "$work/.github/finalize-process-edge-authority.py"
+            "$work/.github/finalize-process-edge-authority.py" \
+            "$work/.github/harden-process-edge-authority.py"
 
           cd "$work"
           python - <<'PY'
@@ -159,14 +170,29 @@ jobs:
           git config user.email "84248988+andrexibiza@users.noreply.github.com"
           git commit -m "feat(security): bind child processes to typed authority"
           commit_sha="$(git rev-parse HEAD)"
+
+          git fetch --no-tags --force https://github.com/NousResearch/hermes-agent.git \
+            refs/heads/main:refs/remotes/upstream/main
+          actual_base="$(git rev-parse refs/remotes/upstream/main)"
+          test "$actual_base" = "$BASE_SHA" || {
+            echo "::error::upstream main moved during publication: expected $BASE_SHA, found $actual_base"
+            exit 1
+          }
+
+          remote_sha="$(
+            git ls-remote --heads origin "refs/heads/$PRODUCT_BRANCH" \
+              | awk 'NR == 1 {print $1}'
+          )"
           git push origin HEAD:"refs/heads/$PRODUCT_BRANCH" \
-            --force-with-lease="refs/heads/$PRODUCT_BRANCH:$BASE_SHA"
+            --force-with-lease="refs/heads/$PRODUCT_BRANCH:$remote_sha"
           echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "replaced_remote_sha=${remote_sha:-<absent>}"
 
       - name: Emit content-addressed publication receipt
         working-directory: /tmp/phase-g-reviewed-product
         env:
           COMMIT_SHA: ${{ steps.publish.outputs.commit_sha }}
+          TRANSPORT_HEAD_SHA: ${{ github.sha }}
         run: |
           python - <<'PY'
           import hashlib
@@ -182,6 +208,7 @@ jobs:
           receipt = {
               "base_sha": os.environ["BASE_SHA"],
               "commit_sha": os.environ["COMMIT_SHA"],
+              "transport_head_sha": os.environ["TRANSPORT_HEAD_SHA"],
               "product_branch": os.environ["PRODUCT_BRANCH"],
               "product_file_count": len(paths),
               "files": {
@@ -194,6 +221,8 @@ jobs:
                   "ruff format --check",
                   "git diff --check",
                   "exact product path assertion",
+                  "upstream main unchanged across publication",
+                  "remote-head-bound force-with-lease",
               ],
           }
           Path("phase-g-publication-receipt.json").write_text(
@@ -203,10 +232,12 @@ jobs:
           print(json.dumps(receipt, indent=2, sort_keys=True))
           PY
 
-      - name: Upload publication receipt
+      - name: Upload publication receipt and decoded finalizer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: phase-g-publication-${{ steps.publish.outputs.commit_sha }}
-          path: /tmp/phase-g-reviewed-product/phase-g-publication-receipt.json
+          path: |
+            /tmp/phase-g-reviewed-product/phase-g-publication-receipt.json
+            /tmp/phase-g-finalizer.py
           if-no-files-found: error
           retention-days: 7

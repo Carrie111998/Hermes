@@ -3,8 +3,9 @@
 The fork's Actions executor is not producing observable runs. The upstream PR
 lane is authoritative and already executes PR-controlled Python tests, so this
 test applies the materializer's literal transformation table in an isolated
-temporary tree and emits a content-addressed archive of only the final product
-paths. It never mutates the checked-out repository.
+temporary tree, applies the readable final hardening pass, and emits a
+content-addressed archive of only the final product paths. It never mutates the
+checked-out repository.
 
 This file is transport scaffolding. It must not exist in the final PR.
 """
@@ -19,6 +20,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -28,8 +30,18 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MATERIALIZER = REPO_ROOT / ".github" / "materialize-process-edge-authority.py"
+HARDENER = REPO_ROOT / ".github" / "harden-process-edge-authority.py"
+MATERIALIZE_WORKFLOW = (
+    REPO_ROOT / ".github" / "workflows" / "materialize-process-edge-authority.yml"
+)
+PUBLISH_WORKFLOW = (
+    REPO_ROOT / ".github" / "workflows" / "publish-process-edge-authority.yml"
+)
 ARCHIVE_PATH = REPO_ROOT / "phase-g-product.tar.gz"
 CHUNK_CHARS = 3000
+TRANSPORT_SENTINEL = (
+    "deterministic Phase-G product archive emitted above; transport PR closes unmerged"
+)
 
 
 def _literal_assignment(module: ast.Module, name: str):
@@ -53,6 +65,23 @@ def _materializer_data(source: str) -> tuple[dict, tuple, tuple]:
     assert isinstance(exact, (list, tuple))
     assert isinstance(regex, (list, tuple))
     return new_files, tuple(exact), tuple(regex)
+
+
+def _assert_workflow_contracts() -> None:
+    materialize = MATERIALIZE_WORKFLOW.read_text(encoding="utf-8")
+    publish = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "--junitxml=phase-g-transport.xml" in materialize
+    assert "TRANSPORT_SENTINEL" in materialize
+    assert "phase-g-finalizer.py" in materialize
+
+    assert "git ls-remote --heads origin" in publish
+    assert '--force-with-lease="refs/heads/$PRODUCT_BRANCH:$remote_sha"' in publish
+    assert "upstream main moved during publication" in publish
+    assert "BASE_SHA=" in publish and "GITHUB_ENV" in publish
+    assert "FINALIZER_SHA256" in publish
+    assert "consistency checksum only" in publish.lower()
+    assert "harden-process-edge-authority.py" in publish
 
 
 def _copy_existing(paths: set[str], destination: Path) -> None:
@@ -97,7 +126,7 @@ def _replace_cli_exec_import(content: str, old: str, new: str) -> str:
         f"{handler.count(old)}"
     )
     handler = handler.replace(old, new, 1)
-    return content[:start] + handler + content[end:]
+    return content[:staru} + handler + content[end:]
 
 
 def _apply_materializer(
@@ -190,13 +219,16 @@ def _emit_archive(archive: bytes, receipt: dict) -> None:
     print(f"encoded_chars={len(encoded)}")
     print(f"checkout_sha={receipt['checkout_sha']}")
     print(f"materializer_sha256={receipt['materializer_sha256']}")
+    print(f"hardener_sha256={receipt['hardener_sha256']}")
     for index, start in enumerate(range(0, len(encoded), CHUNK_CHARS)):
         print(f"chunk={index:06d}:{encoded[start:start + CHUNK_CHARS]}")
     print("PHASE_G_MATERIALIZED_ARCHIVE_END")
 
 
 def test_export_assertion_guarded_phase_g_product_object():
+    _assert_workflow_contracts()
     source = MATERIALIZER.read_text(encoding="utf-8")
+    hardener_source = HARDENER.read_text(encoding="utf-8")
     new_files, exact, regex = _materializer_data(source)
     existing = {str(item[0]) for item in (*exact, *regex)}
     generated = {str(path) for path in new_files}
@@ -211,6 +243,14 @@ def test_export_assertion_guarded_phase_g_product_object():
         root = Path(tmp)
         _copy_existing(existing, root)
         adaptations = _apply_materializer(root, new_files, exact, regex)
+        subprocess.run(
+            [sys.executable, str(HARDENER), str(root)],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+        adaptations.append(
+            "readable hardener: route compute-host PYTHONPATH through broker output"
+        )
 
         missing = [rel for rel in sorted(product_paths) if not (root / rel).is_file()]
         assert not missing, f"materializer did not produce: {missing}"
@@ -226,6 +266,7 @@ def test_export_assertion_guarded_phase_g_product_object():
             "schema": "hermes.phase-g-materialized-object.v1",
             "checkout_sha": checkout_sha,
             "materializer_sha256": _sha256(source.encode("utf-8")),
+            "hardener_sha256": _sha256(hardener_source.encode("utf-8")),
             "product_file_count": len(files),
             "current_main_adaptations": adaptations,
             "files": files,
@@ -233,7 +274,4 @@ def test_export_assertion_guarded_phase_g_product_object():
         archive = _archive_product(root, product_paths, receipt)
         _emit_archive(archive, receipt)
 
-    pytest.fail(
-        "deterministic Phase-G product archive emitted above; transport PR closes unmerged",
-        pytrace=False,
-    )
+    pytest.fail(TRANSPORT_SENTINEL, pytrace=False)

@@ -11,6 +11,9 @@ concurrency:
   group: phase-g-export-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  TRANSPORT_SENTINEL: deterministic Phase-G product archive emitted above; transport PR closes unmerged
+
 jobs:
   export:
     name: Materialize and export reviewed product tree
@@ -43,41 +46,74 @@ jobs:
           source .venv/bin/activate
           set +e
           python -m pytest -q \
+            --junitxml=phase-g-transport.xml \
             tests/security/test_process_edge_authority_materializer_transport.py \
             > phase-g-transport.log 2>&1
           status=$?
           set -e
           cat phase-g-transport.log
-          if [ "$status" -ne 1 ]; then
+          test "$status" -eq 1 || {
             echo "::error::transport must terminate with pytest's assertion-failure status 1; got $status"
             exit 1
-          fi
+          }
           test -s phase-g-product.tar.gz
+          test -s phase-g-transport.xml
           python - <<'PY'
           import hashlib
           import json
+          import os
           import tarfile
+          import xml.etree.ElementTree as ET
           from pathlib import Path
+
+          report = ET.parse("phase-g-transport.xml").getroot()
+          suites = [report] if report.tag == "testsuite" else report.findall("testsuite")
+          totals = {
+              key: sum(int(suite.attrib.get(key, "0")) for suite in suites)
+              for key in ("tests", "failures", "errors", "skipped")
+          }
+          assert totals == {"tests": 1, "failures": 1, "errors": 0, "skipped": 0}, totals
+          failure = report.find(".//failure")
+          assert failure is not None
+          failure_text = " ".join(
+              part
+              for part in (failure.attrib.get("message", ""), failure.text or "")
+              if part
+          )
+          assert os.environ["TRANSPORT_SENTINEL"] in failure_text, failure_text
 
           archive = Path("phase-g-product.tar.gz")
           digest = hashlib.sha256(archive.read_bytes()).hexdigest()
           with tarfile.open(archive, "r:gz") as bundle:
               names = bundle.getnames()
               assert "phase-g-materialization-receipt.json" in names
-              receipt = json.load(bundle.extractfile("phase-g-materialization-receipt.json"))
+              receipt_file = bundle.extractfile("phase-g-materialization-receipt.json")
+              assert receipt_file is not None
+              receipt = json.load(receipt_file)
               assert receipt["product_file_count"] == len(names) - 1
+              assert receipt["hardener_sha256"]
               assert not any(name.startswith(".github/") for name in names)
               assert not any("materializer_transport" in name for name in names)
           print(f"archive_sha256={digest}")
           print(f"product_file_count={receipt['product_file_count']}")
           PY
 
-      - name: Upload clean product archive
+      - name: Decode finalizer for human review
+        run: |
+          set -euo pipefail
+          base64 --decode .github/finalize-process-edge-authority.py.gz.b64 \
+            | gzip --decompress > phase-g-finalizer.py
+          python -m py_compile phase-g-finalizer.py
+          sha256sum phase-g-finalizer.py
+
+      - name: Upload clean product archive and review inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: phase-g-product-${{ github.event.pull_request.head.sha }}
           path: |
             phase-g-product.tar.gz
             phase-g-transport.log
+            phase-g-transport.xml
+            phase-g-finalizer.py
           if-no-files-found: error
           retention-days: 2
