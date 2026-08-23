@@ -33,7 +33,7 @@ The following is the complete skill definition that Hermes loads when this skill
 
 Turn a topic into a beginner-friendly visual explanation delivered as one self-contained HTML file. The output reads like a picture book for adults: large headings, big diagrams, very few words.
 
-This skill does not produce prose essays, slide decks, or production web pages. For designed one-off artifacts use the design-taste sibling skill; for dense educational SVG diagrams use `concept-diagrams`; for software architecture use `architecture-diagram`.
+This skill does not produce prose essays, slide decks, or production web pages. For designed one-off artifacts use `claude-design`; for dense educational SVG diagrams use `concept-diagrams`; for software architecture use `architecture-diagram`.
 
 ## When to Use
 
@@ -69,7 +69,7 @@ None. The skill uses only native Hermes tools and produces a single offline HTML
 2. **Outline first.** Before writing HTML, list 3 to 7 sections, each carrying exactly one idea, in the order a beginner needs them.
 3. **Preserve identifiers exactly.** Code, commands, URLs, file paths, error messages, and names must appear verbatim. Never paraphrase a command or "fix" an identifier while explaining it.
 4. **Write the artifact.** Create one self-contained `.html` file at an absolute path (for example `/opt/data/eli5/dns-explainer.html`) using `write_file`.
-5. **Verify, then report** per Verification below, quoting the path in the final reply.
+5. **Verify, then report** per Verification below. End the final reply with the bare absolute path on its own line: do not wrap it in backticks or inline code, because gateway deliverable mode ignores paths inside backticks.
 
 The bare absolute path is enough: gateway deliverable mode detects `.html` paths in replies and uploads the file as a native attachment on messaging platforms.
 
@@ -98,7 +98,7 @@ The generated file must satisfy all of these:
 Before claiming success, confirm with `read_file` or `search_files` that:
 
 1. the file exists at the stated absolute path;
-2. the file contains no `http://` or `https://` resource references inside markup attributes (`src=`, `href=` pointing to remote assets), meaning it truly renders offline;
+2. the file contains no remote resource references, meaning it truly renders offline. Check all of: `src=` and `href=` attribute values (`href="#..."` same-page anchors are allowed), CSS `url(...)`, `@import` rules, `srcset` attributes, and protocol-relative URLs starting with `//`;
 3. every outlined section appears in the file;
 4. identifiers quoted from sources match the originals character-for-character.
 
