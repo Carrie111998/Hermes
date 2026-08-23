@@ -10852,6 +10852,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "reasoning_config": copy.deepcopy(
+                getattr(self, "reasoning_config", None)
+            ),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -10870,6 +10873,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key",
             "base_url",
             "api_mode",
+            "reasoning_config",
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))

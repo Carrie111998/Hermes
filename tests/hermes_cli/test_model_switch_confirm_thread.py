@@ -191,3 +191,25 @@ def test_switch_before_agent_init_resolves_target_model_override(monkeypatch):
     )
 
     assert stub.reasoning_config == {"enabled": False}
+
+
+def test_one_turn_switch_restores_cli_reasoning_config(monkeypatch):
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    stub._snapshot_model_runtime = cli_mod.HermesCLI._snapshot_model_runtime.__get__(stub)
+    printed = []
+    _patch_deps(monkeypatch, printed)
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub, "/model claude-sonnet-4.6 --provider anthropic --once"
+    )
+
+    assert stub.reasoning_config == {"enabled": False}
+    cli_mod.HermesCLI._restore_model_runtime_snapshot(
+        stub, stub._pending_one_turn_model_restore
+    )
+
+    assert stub.model == "old/model"
+    assert stub.reasoning_config == {"enabled": True, "effort": "medium"}
