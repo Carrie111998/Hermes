@@ -18944,6 +18944,39 @@ def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
     return fallback
 
 
+def _announce_ready_port(token: str, port: int) -> None:
+    """Print the port-discovery sentinel on the process's real stdout.
+
+    The desktop spawns this backend and reads the sentinel off the child's
+    **stdout** to learn the ephemeral port
+    (``apps/desktop/electron/backend-ready.ts``), so delivery on stdout is
+    this line's contract.
+
+    A plain ``print`` cannot honour that contract, because whether
+    ``sys.stdout`` is still stdout by the time we get here depends on import
+    order. ``tui_gateway.server`` runs ``sys.stdout = sys.stderr`` at module
+    scope so a stray library ``print`` cannot corrupt the JSON-RPC stream it
+    owns — a sound guard for the gateway, but a process-wide one. Any import
+    of that module before ``start_server`` therefore silently moves the
+    sentinel to stderr. ``discover_plugins()`` runs first, so a single plugin
+    importing the gateway from its ``register()`` is enough.
+
+    The resulting failure is severe and self-concealing: the desktop's port
+    waiter watches stdout only and times out after 90s with a healthy backend
+    listening, while its log tap — attached to both streams — puts the
+    announcement in ``desktop.log`` for the whole window the waiter spends
+    starving.
+
+    ``sys.__stdout__`` is the interpreter's own reference to the real stream,
+    which no rebind touches, so the sentinel lands on stdout regardless of
+    what imported what. It is ``None`` under pythonw.exe, which has no
+    console at all; fall back to ``sys.stdout`` there to keep the previous
+    behavior on the one platform where this value cannot be read from stdout
+    anyway.
+    """
+    print(f"{token} port={port}", flush=True, file=sys.__stdout__ or sys.stdout)
+
+
 def _write_dashboard_ready_file(actual_port: int) -> None:
     """Optionally publish the dashboard port through an atomic ready file.
 
@@ -19373,7 +19406,7 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            _announce_ready_port(ready_token, actual_port)
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
