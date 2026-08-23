@@ -224,13 +224,57 @@ def test_creates_ccd_registry_record_for_visible_mirror(db, tmp_path) -> None:
     records = _registry_records(registry)
     assert len(records) == 1
     record = records[0]
-    assert record["sessionId"] == "local_11111111-2222-4333-8444-555555555555"
+    # Record id is DERIVED from cliSessionId, not minted per-harness, so every
+    # harness store holds the same filename for one logical session.
+    assert record["sessionId"] == f"local_{identity.claude_uuid}"
     assert record["cliSessionId"] == identity.claude_uuid
     assert record["lastActivityAt"] == 5_000_000
     assert record["title"] == "claude session"
     assert record["cwd"] == "C:/workspace/project"
-    assert record["isArchived"] is False
+    # Mirrors land archived so imported automation traffic never buries the
+    # user's real sessions in the sidebar.
+    assert record["isArchived"] is True
     assert record["permissionMode"] == "default"
+
+
+def test_registry_record_title_falls_back_to_cwd_not_uuid(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    identity, _ = _seed_visible_mirror(db, store, tmp_path)
+    # Wipe the catalog title to force the fallback path.
+    store.db._conn.execute(
+        "UPDATE sessions SET title = NULL WHERE id = ?",
+        (f"claude:{identity.claude_uuid}",),
+    )
+    store.db._conn.commit()
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    worker = ClaudeMirrorFloatWorker(store, min_interval_seconds=900.0,
+                                     registry_root=registry)
+
+    result = worker.run_once()
+
+    assert result["registered"] == 1
+    record = _registry_records(registry)[0]
+    assert "[Bridge]" in record["title"]
+    assert identity.claude_uuid not in record["title"]
+
+
+def test_registry_record_ids_are_identical_across_harnesses(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    identity, _ = _seed_visible_mirror(db, store, tmp_path)
+    root_a = tmp_path / "registry-a"
+    root_b = tmp_path / "registry-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    worker = ClaudeMirrorFloatWorker(store, min_interval_seconds=900.0,
+                                     registry_roots=[root_a, root_b])
+
+    result = worker.run_once()
+
+    assert result["registered"] == 1
+    names_a = {p.name for p in root_a.glob("local_*.json")}
+    names_b = {p.name for p in root_b.glob("local_*.json")}
+    assert names_a == names_b == {f"local_{identity.claude_uuid}.json"}
 
 
 def test_registry_record_is_idempotent_by_cli_session_id(db, tmp_path) -> None:

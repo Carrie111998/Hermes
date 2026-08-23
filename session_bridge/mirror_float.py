@@ -263,14 +263,21 @@ class ClaudeMirrorFloatWorker:
         session_row: Mapping[str, Any] | None = None
         registered = False
         floated = False
+        # Deterministic record id derived from the session's own Claude UUID so
+        # every harness store holds the SAME record id for one logical session.
+        # A per-harness random id produced cross-harness duplicates once the
+        # account union sync spread both variants into every store.
+        if session_row is None:
+            session_row = self._store.db.get_session(canonical_id) or {}
+        record_id = f"local_{claude_uuid}"
         for root in self._registry_roots:
             index = registry_index.setdefault(root, {})
             existing = index.get(claude_uuid)
             if existing is None:
-                if session_row is None:
-                    session_row = self._store.db.get_session(canonical_id) or {}
-                record_id = f"local_{self._id_factory()}"
-                title = session_row.get("title") or f"[Bridge] {claude_uuid}"
+                title = (
+                    session_row.get("title")
+                    or f"[Bridge] {session_row.get('cwd') or 'untitled session'}"
+                )
                 cwd = session_row.get("cwd") or ""
                 started_at = session_row.get("started_at")
                 created_ms = (
@@ -288,7 +295,10 @@ class ClaudeMirrorFloatWorker:
                     "createdAt": created_ms,
                     "lastActivityAt": activity_ms,
                     "model": session_row.get("model") or "claude-fable-5",
-                    "isArchived": False,
+                    # Mirrors land archived: they are imported automation
+                    # traffic, and an unarchived default once buried the user's
+                    # real sidebar under thousands of visible imports.
+                    "isArchived": True,
                     "title": title,
                     "permissionMode": "default",
                     "alwaysAllowedReasons": [],

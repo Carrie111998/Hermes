@@ -71,6 +71,12 @@ _CURRENT_CODEX_REGISTRATION_PREAMBLE = "\n".join((
 ))
 _CODEX_REGISTRATION_PREFIXES = (
     _CURRENT_CODEX_REGISTRATION_PREAMBLE,
+    # Same preamble with single-space joins -- some launch wrappers collapse
+    # newlines, and those variants slipped past this exclusion and became
+    # visible "[Codex] This is a Hermes..." sidebar records.
+    "This is a Hermes Session Bridge Claude visibility registration. "
+    "Do not perform project work or use tools. "
+    "Signed marker: HERMES_SESSION_BRIDGE_V1:",
     (
         "Hermes Session Bridge registration only. "
         "Hermes Session Bridge placeholder.\n"
