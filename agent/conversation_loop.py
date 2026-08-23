@@ -755,10 +755,6 @@ def _billing_failure_result(
         "failed": True,
         "error": summary,
         "failure_reason": classified.reason.value,
-        # The classifier's own retry verdict — carried so UI surfaces
-        # (agent/error_surface.py) show Retry only when a re-run can differ,
-        # instead of re-deriving retryability from a second taxonomy.
-        "failure_retryable": bool(classified.retryable),
         # The billing verdict may rest on an ambiguous body (#82154) — carry
         # that through the structured result, not just the prose.
         "billing_unverified": unverified,
@@ -2893,6 +2889,32 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
+                # Opt-in log-reconstruction desync check (dev invariant).
+                # Default off — single bool guard, zero cost when disabled.
+                # Projects known wire transforms onto live history, then
+                # soft-reports silent loss; raise only if
+                # log_reconstruction_check_raise. Does not mutate
+                # messages/api_messages/system prompt.
+                if getattr(agent, "log_reconstruction_check", False):
+                    # Never abort a live request on diagnostic failure unless
+                    # log_reconstruction_check_raise is explicitly on.
+                    try:
+                        from agent.log_reconstruction import maybe_check_before_request
+
+                        maybe_check_before_request(
+                            agent,
+                            messages=messages,
+                            api_messages=api_messages,
+                            api_kwargs=api_kwargs,
+                            current_turn_user_idx=current_turn_user_idx,
+                        )
+                    except Exception:
+                        if getattr(agent, "log_reconstruction_check_raise", False):
+                            raise
+                        logger.exception(
+                            "log-reconstruction check failed unexpectedly; "
+                            "continuing live request"
+                        )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -6443,9 +6465,6 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
-                        # The classifier's own retry verdict — UI surfaces use
-                        # this instead of re-deriving from the reason string.
-                        "failure_retryable": bool(classified.retryable),
                         # True when the billing verdict rests on an ambiguous
                         # body (#82154) — may be a content-filter rejection.
                         "billing_unverified": _billing_unverified,
