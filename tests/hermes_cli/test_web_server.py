@@ -259,6 +259,26 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_status_active_session_count_includes_child_sessions(self):
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            db.create_session("parent", source="cli")
+            db.create_session(
+                "active-child",
+                source="cli",
+                parent_session_id="parent",
+                model_config={"_delegate_from": "parent"},
+            )
+            db.end_session("parent", end_reason="completed")
+        finally:
+            db.close()
+
+        assert web_server._count_status_active_sessions() == 1
+
     @pytest.mark.requires_wal
     def test_get_sessions_poll_preserves_pending_wal(self):
         """Repeated GET-only polls must not checkpoint another writer's WAL."""
