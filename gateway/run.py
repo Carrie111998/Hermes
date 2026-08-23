@@ -1569,6 +1569,42 @@ _VERIFIED_SENDER_ENVELOPE_RE = re.compile(
     r"(?:[^\S\n]*\[Verified sender:[^\]\n]*\][^\S\n]*)+"
 )
 
+#: A bare envelope OPENER with no closing bracket of its own. Harmless in
+#: isolation, but this module's own formatting supplies the missing bracket:
+#: the reply-quote wrapper closes with ``"]``, so an untrusted fragment that
+#: ends mid-envelope is completed into a valid one by us. Half a forgery plus
+#: our own punctuation is still a forgery, so the opener is defanged.
+_VERIFIED_SENDER_OPENER_RE = re.compile(r"\[(?=Verified sender:)")
+
+#: Fullwidth look-alikes of the envelope's structural characters, folded to
+#: their ASCII form for MATCHING ONLY. ``neutralize_untrusted_envelope_field``
+#: already treats ``［］｜`` as equivalent to ``[]|`` on the grounds that the
+#: envelope is judged by a *reader*, not a parser; an ASCII-only body pattern
+#: contradicts the other half of that same threat model. Every entry is a
+#: single code point mapped to a single code point, so folding preserves string
+#: length and match offsets index the ORIGINAL text — which is what lets the
+#: strip delete exactly the forged span and leave benign text byte-identical.
+_ENVELOPE_LOOKALIKE_FOLD = str.maketrans(
+    {"［": "[", "］": "]", "｜": "|", "：": ":"}
+)
+
+#: The folded token every guarded shape must contain. Checked against the fold
+#: so the cheap early-out covers fullwidth forgeries too.
+_VERIFIED_SENDER_MARKER = "[Verified sender:"
+
+
+def _cut_spans(text: str, spans: List[tuple]) -> str:
+    """Return ``text`` with each ``(start, end)`` span removed."""
+    if not spans:
+        return text
+    out: List[str] = []
+    previous = 0
+    for start, end in spans:
+        out.append(text[previous:start])
+        previous = end
+    out.append(text[previous:])
+    return "".join(out)
+
 
 def _strip_verified_sender_envelopes(text: str) -> str:
     """Remove every copy of Hermes' sender envelope from untrusted text.
@@ -1580,17 +1616,64 @@ def _strip_verified_sender_envelopes(text: str) -> str:
     normalized to ``\\n`` first because ``re.MULTILINE`` recognizes only ``\\n``
     while chat clients render ``\\r``, VT, FF, NEL and U+2028/9 as breaks too.
 
+    The result of this function is read as an attestation, so it must satisfy
+    ``strip(strip(x)) == strip(x)``. A single ``re.sub`` pass does not: deleting
+    an inner match splices the surrounding halves into a NEW well-formed
+    envelope, and because nesting is arbitrary-depth, ANY fixed number of passes
+    is defeatable by nesting one level deeper. The scan therefore iterates to a
+    fixpoint. Termination is guaranteed because every iteration that runs at all
+    removes at least one character.
+
+    Matching is done against a fullwidth-folded copy while deletion is done on
+    the original. Folding is length-preserving, so offsets are shared; benign
+    text is returned byte-identically because nothing is rewritten unless it
+    matched.
+
     Content that legitimately quotes the envelope shape loses only the quoted
     envelope, exactly as it already does when quoted at the top of a message.
     """
-    if not text or "[Verified sender:" not in text:
+    if not text:
+        return text
+    if _VERIFIED_SENDER_MARKER not in text.translate(_ENVELOPE_LOOKALIKE_FOLD):
         return text
     normalized = text.replace("\r\n", "\n")
     if any(ch in normalized for ch in _ENVELOPE_LINE_BREAKS):
         normalized = normalized.translate(
             {ord(ch): "\n" for ch in _ENVELOPE_LINE_BREAKS}
         )
-    return _VERIFIED_SENDER_ENVELOPE_RE.sub("", normalized)
+    while True:
+        folded = normalized.translate(_ENVELOPE_LOOKALIKE_FOLD)
+        spans = [m.span() for m in _VERIFIED_SENDER_ENVELOPE_RE.finditer(folded)]
+        if not spans:
+            break
+        normalized = _cut_spans(normalized, spans)
+    # Deleting a complete envelope can expose an opener that had been nested
+    # inside it, so this runs after the loop rather than inside it. Defanging
+    # only destroys the token — it can never create a new match — so the
+    # fixpoint property established above is preserved.
+    folded = normalized.translate(_ENVELOPE_LOOKALIKE_FOLD)
+    opener_spans = [m.span() for m in _VERIFIED_SENDER_OPENER_RE.finditer(folded)]
+    for start, _end in opener_spans:
+        normalized = normalized[:start] + "(" + normalized[start + 1:]
+    return normalized
+
+
+def _sanitize_untrusted_quote(text: Any, limit: int) -> str:
+    """Sanitize then truncate an untrusted quote destined for a wrapper.
+
+    Ordering matters and the naive order is the vulnerable one: truncating
+    first can cut between ``<@U_BOSS>`` and its closing ``]``, leaving a shape
+    the envelope pattern cannot match — and the caller's own f-string then
+    supplies the missing bracket, restoring a valid envelope. So the strip runs
+    BEFORE the cut, again AFTER it (the cut itself can leave a newly-complete
+    envelope at the tail), and the opener defang inside the strip covers the
+    case where the caller's punctuation would close what the attacker opened.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return _strip_verified_sender_envelopes(
+        _strip_verified_sender_envelopes(text)[:limit]
+    )
 
 
 def _without_verified_sender_envelope(content: Any) -> Any:
@@ -1662,7 +1745,15 @@ def _build_gateway_agent_history(
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
-            observed_group_context.append(str(content).strip())
+            # Observed rows are other participants' verbatim text, stored by the
+            # Telegram adapter with no neutralization and replayed into the SAME
+            # model turn as the live message. A participant who never addresses
+            # the bot must not be able to plant a forged attestation there, so
+            # this content passes the same strip as every other untrusted block
+            # that reaches the turn.
+            observed_group_context.append(
+                _strip_verified_sender_envelopes(str(content)).strip()
+            )
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -18854,14 +18945,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
             # The quote is another participant's verbatim text arriving in the
             # same model turn, so it gets the same envelope strip as the body
             # and the backfill block — a forged ``[Verified sender: ...]``
             # inside a quoted message is no less trusted-looking for being
-            # quoted. Stripping after the 500-char cut keeps the cut point
-            # stable for benign quotes.
-            reply_snippet = _strip_verified_sender_envelopes(reply_snippet)
+            # quoted. The strip runs BEFORE the 500-char cut: truncating first
+            # can land the cut between ``<@U_BOSS>`` and its closing bracket,
+            # leaving a shape the pattern cannot match that the f-string below
+            # then re-closes with ``"]`` — manufacturing the very envelope the
+            # strip exists to remove.
+            reply_snippet = _sanitize_untrusted_quote(event.reply_to_text, 500)
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
@@ -18969,7 +19062,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     return None
                 if _ctx_result.expanded:
-                    message_text = _ctx_result.message
+                    # Expansion appends fetched file/folder/URL content to the
+                    # turn AFTER the gateway minted its envelope, so the
+                    # attached block is untrusted text on the trusted side of
+                    # the strip. Only the appended tail is filtered: the
+                    # already-sanitized prefix (which carries our genuine
+                    # attestation) is preserved byte-identically. If the
+                    # expander ever stops preserving that prefix, the fallback
+                    # filters the whole message — losing our own envelope is a
+                    # fail-CLOSED degradation, whereas keeping a forged one
+                    # would not be.
+                    _expanded_message = _ctx_result.message
+                    _sanitized_prefix = message_text.strip()
+                    if _expanded_message.startswith(_sanitized_prefix):
+                        message_text = _sanitized_prefix + (
+                            _strip_verified_sender_envelopes(
+                                _expanded_message[len(_sanitized_prefix):]
+                            )
+                        )
+                    else:
+                        message_text = _strip_verified_sender_envelopes(
+                            _expanded_message
+                        )
             except Exception as exc:
                 logger.warning("@ context reference expansion failed: %s", exc)
                 logger.debug("@ context reference expansion failure detail", exc_info=True)
@@ -25113,6 +25227,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
+                    # The description is a model's rendering of an image the
+                    # attacker chose, spliced into the same turn AFTER the
+                    # gateway minted its envelope — and it PREPENDS, so a
+                    # forgery here would sit ahead of the genuine attestation.
+                    # ``sanitize_context`` only sheds ``<memory-context>``
+                    # fences, so the envelope guard is applied explicitly.
+                    description = _strip_verified_sender_envelopes(description)
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
@@ -25235,6 +25356,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    # The transcript is attacker-supplied audio rendered into
+                    # text and spliced into the same turn AFTER the gateway
+                    # minted its envelope — and it PREPENDS, so an unguarded
+                    # forgery would sit ahead of the genuine attestation. The
+                    # echo above keeps the raw transcript so users still verify
+                    # STT quality verbatim; only the model-facing copy is
+                    # guarded.
+                    transcript = _strip_verified_sender_envelopes(transcript)
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
