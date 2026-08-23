@@ -14,12 +14,14 @@ from agent.context_compressor import (
     MAX_ITERATIONS_SUMMARY_REQUEST,
     SUMMARY_PREFIX,
     ContextCompressor,
+    _KANBAN_WAKE_NOTIFICATION_PREFIX,
     _NO_USER_TASK_SENTINEL,
 )
 from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     compress_context,
 )
+from agent.i18n import SUPPORTED_LANGUAGES
 from hermes_state import SessionDB
 from tools.process_registry import format_process_notification
 from tools.todo_tool import TODO_INJECTION_HEADER
@@ -313,6 +315,24 @@ def test_kanban_wake_notifications_do_not_become_compaction_anchors(compressor):
         "Recent user focus:\n- Refactor the auth module and add tests."
     )
     assert compressor._find_last_user_message_idx(messages, head_end=0) == 0
+
+
+@pytest.mark.parametrize("lang", SUPPORTED_LANGUAGES)
+def test_kanban_wake_message_prefix_is_locale_invariant(lang):
+    """The `[kanban] ` tag `_KANBAN_WAKE_NOTIFICATION_PREFIX` matches against
+    must be verbatim in every locale catalog, not just the default one."""
+    from agent.i18n import t
+
+    wake_text = t(
+        "gateway.kanban.wake.message",
+        lang=lang,
+        task_id="k7",
+        status="completed",
+        title="Ship release notes",
+        assignee="worker1",
+        board="main",
+    )
+    assert wake_text.startswith(_KANBAN_WAKE_NOTIFICATION_PREFIX)
 
 
 @pytest.mark.parametrize(
