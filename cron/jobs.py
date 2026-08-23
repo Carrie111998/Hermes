@@ -1313,6 +1313,10 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
+        # Support ID-keyed jobs maps: the public load_jobs() contract and every
+        # CRUD/scheduler caller expect a list of job records.
+        if isinstance(jobs, dict):
+            jobs = list(jobs.values())
         if _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
