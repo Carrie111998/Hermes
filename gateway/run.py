@@ -10560,7 +10560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        status_detail = (t("gateway.busy_ack.status_detail", parts=t("gateway.busy_ack.status_join", parts=", ".join(status_parts)))) if status_parts else ""
         if is_steer_mode:
             message = (
                 t("gateway.busy_ack.steered", detail=status_detail)
@@ -29846,6 +29846,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+
+            # WeCom thinking-bubble safety net: if this turn is unwinding
+            # without a final delivery (abort, timeout, exception), close any
+            # open bubble with a localized notice instead of leaving the
+            # placeholder to rot into WeCom's "无结果" state. Best-effort —
+            # mirrors wecom-bridge's turn_end finally block. When the turn DID
+            # deliver, the bubble was already finished in-place by send() and
+            # this is a no-op.
+            try:
+                _rh = result_holder[0] if result_holder[0] else {}
+                _delivered = bool(_rh.get("final_response"))
+                if not _delivered:
+                    _turn_adapter = self._adapter_for_source(source)
+                    _abort = getattr(_turn_adapter, "_abort_thinking", None)
+                    if callable(_abort):
+                        _notice = "aborted" if _rh.get("interrupted") else "timeout"
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, _abort, source.chat_id, _notice,
+                        )
+            except Exception:
+                pass
 
             # Wait for stream consumer to finish its final edit
             if stream_task:

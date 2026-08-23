@@ -453,12 +453,16 @@ gateway:
     status_elapsed:             "{minutes} min elapsed"
     status_iteration:           "iteration {current}/{max}"
     status_running:             "running: {tool}"
+    status_join:                "{parts}"
+    status_detail:              " ({parts})"
     steered:                    "⏩ Steered into current run{detail}. Your message arrives after the next tool call."
     redirected:                 "↪ Redirected current run{detail}. I'll adjust using your correction."
     queued_subagent:            "⏳ Subagent working{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
     queued_compression:         "⏳ Compressing context{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
     queued:                     "⏳ Queued for the next turn{detail}. I'll respond once the current task finishes."
     interrupting:               "⚡ Interrupting current task{detail}. I'll respond to your message shortly."
+    aborted:                    "(This turn was aborted.)"
+    timeout:                    "(Processing timed out — please try again.)"
 
   shared:
     session_db_unavailable:      "Session database not available."

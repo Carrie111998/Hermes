@@ -219,6 +219,10 @@ class WeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids: Dict[str, str] = {}
         # Official "thinking" bubble state (per chat): streamId + inbound req_id + last-keepalive ts
         self._thinking_streams: Dict[str, Dict[str, Any]] = {}
+        # Per-chat keepalive asyncio tasks (independent 2.5s heartbeat)
+        self._thinking_keepalives: Dict[str, "asyncio.Task"] = {}
+        # Last finished stream per chat (for traceable message_id on send())
+        self._finished_streams: Dict[str, Dict[str, Any]] = {}
         self.THINKING_KEEPALIVE_S = 2.5
         self.MAX_THINKING_STREAMS = 64
         # Opt-out switch: platforms.wecom.extra.thinking_bubble (default on).
@@ -1443,10 +1447,13 @@ class WeComAdapter(BasePlatformAdapter):
         # If a thinking bubble is open for this chat, replace it in place with
         # the final content and SKIP the normal markdown (else WeCom shows the
         # answer twice: once via the stream finish frame, once as markdown).
+        # message_id is the bare streamId — the only correlation key WeCom
+        # has for this reply; no synthetic uuid is fabricated.
         if await self._finish_thinking(chat_id, content):
+            st = self._finished_streams.get(chat_id)
             return SendResult(
                 success=True,
-                message_id=uuid.uuid4().hex[:12],
+                message_id=st["id"] if st else None,
             )
 
         try:
@@ -1578,43 +1585,100 @@ class WeComAdapter(BasePlatformAdapter):
         ``finish=false`` and empty ``<think></think>`` content correlated to
         the inbound req_id — WeCom renders it as a "thinking..." placeholder.
         The same streamId is later finished by ``_finish_thinking`` when the
-        final response lands (send() replaces the bubble in place). A 2.5s
-        keepalive re-arms the placeholder so WeCom doesn't show "无结果" on
-        long turns. Best-effort: any failure is swallowed.
+        final response lands (send() replaces the bubble in place). An
+        independent 2.5s asyncio keepalive task re-arms the placeholder (same
+        as wecom-bridge's setInterval heartbeat) so WeCom doesn't show
+        "无结果" on long turns even when no tool runs. Best-effort: any
+        failure is swallowed.
         """
         reply_req_id = self._last_chat_req_ids.get(chat_id)
         if not reply_req_id:
             return
         if not self._thinking_bubble_enabled:
             return
-        now = time.monotonic()
         st = self._thinking_streams.get(chat_id)
         if st is not None:
-            # Already open — periodic keepalive only.
-            if now - st["ts"] >= self.THINKING_KEEPALIVE_S:
-                try:
-                    await self._send_reply_request(
-                        reply_req_id,
-                        {"msgtype": "stream", "stream": {"id": st["id"], "finish": False,
-                                                         "content": "<think></think>"}},
-                    )
-                    st["ts"] = now
-                except Exception:
-                    pass
-            return
+            return  # already open; its keepalive task is running
+
         stream_id = f"stream_{uuid.uuid4().hex[:16]}"
+
+        async def _keepalive() -> None:
+            """Independent heartbeat — same role as bridge's setInterval."""
+            while True:
+                await asyncio.sleep(self.THINKING_KEEPALIVE_S)
+                cur = self._thinking_streams.get(chat_id)
+                if cur is None or cur["id"] != stream_id:
+                    return  # finished or replaced
+                try:
+                    if self._ws and not self._ws.closed:
+                        await self._ws.send_json({
+                            "cmd": APP_CMD_RESPONSE,
+                            "headers": {"req_id": cur["req"]},
+                            "body": {"msgtype": "stream",
+                                     "stream": {"id": stream_id, "finish": False,
+                                                "content": "<think></think>"}},
+                        })
+                except Exception:
+                    pass  # transient ws hiccup; next tick retries
+
         try:
             await self._send_reply_request(
                 reply_req_id,
                 {"msgtype": "stream", "stream": {"id": stream_id, "finish": False,
                                                  "content": "<think></think>"}},
             )
-            self._thinking_streams[chat_id] = {"id": stream_id, "req": reply_req_id, "ts": now}
+            self._thinking_streams[chat_id] = {"id": stream_id, "req": reply_req_id,
+                                               "ts": time.monotonic()}
+            self._thinking_keepalives[chat_id] = asyncio.create_task(_keepalive())
             while len(self._thinking_streams) > self.MAX_THINKING_STREAMS:
-                self._thinking_streams.pop(next(iter(self._thinking_streams)))
+                # Evict the STALEST chat by ts, stop its heartbeat and
+                # best-effort close its bubble first — silently dropping the
+                # entry would orphan an open placeholder until WeCom's own
+                # timeout ("无结果" state).
+                oldest = min(self._thinking_streams, key=lambda c: self._thinking_streams[c]["ts"])
+                stale = self._thinking_streams.pop(oldest)
+                ka = self._thinking_keepalives.pop(oldest, None)
+                if ka:
+                    ka.cancel()
+                try:
+                    if self._ws and not self._ws.closed:
+                        await self._ws.send_json({
+                            "cmd": APP_CMD_RESPONSE,
+                            "headers": {"req_id": stale["req"]},
+                            "body": {"msgtype": "stream",
+                                     "stream": {"id": stale["id"], "finish": True,
+                                                "content": "<think></think>"}},
+                        })
+                except Exception:
+                    pass  # best-effort; bubble degrades to WeCom's native timeout
             logger.info("[%s] thinking bubble opened -> %s (%s)", self.name, chat_id, stream_id)
         except Exception as e:
             logger.debug("[%s] thinking bubble failed: %s", self.name, e)
+
+    def _abort_thinking(self, chat_id: str, notice_key: str) -> None:
+        """Close an open bubble with a localized notice (abort/timeout path).
+
+        Mirrors wecom-bridge: when a turn is aborted or times out, the bubble
+        must still land somewhere — replace it with the catalog notice text
+        instead of leaving the placeholder to rot into "无结果".
+        """
+        st = self._thinking_streams.pop(chat_id, None)
+        ka = self._thinking_keepalives.pop(chat_id, None)
+        if ka:
+            ka.cancel()
+        if st is None or not self._ws or self._ws.closed:
+            return
+        from agent.i18n import t
+        try:
+            self._ws.send_json({
+                "cmd": APP_CMD_RESPONSE,
+                "headers": {"req_id": st["req"]},
+                "body": {"msgtype": "stream",
+                         "stream": {"id": st["id"], "finish": True,
+                                    "content": t(f"gateway.busy_ack.{notice_key}")}},
+            })
+        except Exception:
+            pass
 
     async def _finish_thinking(self, chat_id: str, content: str) -> bool:
         """Close the open thinking bubble with finish=true (in-place replace).
@@ -1628,8 +1692,12 @@ class WeComAdapter(BasePlatformAdapter):
         (caller should then SKIP the normal markdown reply).
         """
         st = self._thinking_streams.pop(chat_id, None)
+        ka = self._thinking_keepalives.pop(chat_id, None)
+        if ka:
+            ka.cancel()
         if st is None:
             return False
+        self._finished_streams[chat_id] = {"id": st["id"], "req": st["req"]}
         body = {"msgtype": "stream", "stream": {"id": st["id"], "finish": True,
                                                 "content": content[:self.MAX_MESSAGE_LENGTH]}}
         if not self._ws or self._ws.closed:
