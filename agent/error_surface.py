@@ -93,7 +93,9 @@ _CUSTOM_ENDPOINT_PROVIDERS = {
 
 # Message fragments that mark a mid-stream connection drop. Deliberately
 # narrow: these strings come from our own retry-exhaustion summaries and the
-# OpenAI SDK's stream-abort errors.
+# OpenAI SDK's stream-abort errors. Each fragment must be unambiguous as a
+# RAW SUBSTRING — a short generic token here silently matches ordinary
+# provider prose and misroutes the layer (see _SSE_TOKEN_RE below).
 _STREAM_DROP_FRAGMENTS = (
     "stream connection",
     "peer closed connection",
@@ -106,6 +108,8 @@ _STREAM_DROP_FRAGMENTS = (
 # "sse" must match as a standalone token only: as a bare substring it hits
 # ordinary provider prose ("processed", "surpassed", "dismissed") and
 # misroutes provider-layer failures to the streaming layer.
+# Input is pre-lowered by _looks_like_stream_drop(), so re.IGNORECASE is
+# intentionally omitted — keep the lowering and this pattern in sync.
 _SSE_TOKEN_RE = re.compile(r"\bsse\b")
 
 # Exception modules that indicate the failure came from an API/transport call
