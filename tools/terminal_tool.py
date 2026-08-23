@@ -3022,6 +3022,22 @@ def terminal_tool(
                     "status": "blocked",
                 }, ensure_ascii=False)
 
+        # Non-bypassable protected-instruction gate. File tools already guard
+        # direct writes, but arbitrary shell/Python commands can otherwise
+        # mutate the same files behind terminal(force=True). Run before the
+        # ordinary approval ladder so force/YOLO cannot skip it.
+        from tools.file_tools import _check_protected_instruction_command
+        _instruction_block = _check_protected_instruction_command(
+            command, task_id or "default"
+        )
+        if _instruction_block:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _instruction_block,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None

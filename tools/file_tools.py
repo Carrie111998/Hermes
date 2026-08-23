@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -954,6 +955,58 @@ def _check_protected_instruction_write(paths: list[str],
             p, task_id, enabled=enabled, extra_patterns=extra)
         if reason:
             reasons.append(reason)
+    if not reasons:
+        return None
+    return _request_protected_instruction_approval(reasons, task_id)
+
+
+_PROTECTED_INSTRUCTION_MUTATION_RE = re.compile(
+    r"(?:"
+    r"(?:^|[;&|\s])(?:rm|mv|cp|install|touch|truncate|chmod|chown|tee)\b"
+    r"|(?:^|[;&|\s])(?:sed\s+-[^\s;|]*i|perl\s+-[^\s;|]*i)\b"
+    r"|(?:^|[^>])>{1,2}(?!>)"
+    r"|\bopen\s*\([^)]{0,500},\s*['\"][wax+][^'\"]*['\"]"
+    r"|\.(?:write_text|write_bytes|unlink|rename|replace)\s*\("
+    r"|\bos\.(?:remove|unlink|rename|replace)\s*\("
+    r"|\bshutil\.(?:copy|copy2|copyfile|move)\s*\("
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _check_protected_instruction_command(text: str,
+                                         task_id: str = "default") -> str | None:
+    """Gate terminal/execute_code text that can mutate instruction files.
+
+    File tools already know their exact destination paths. Shell and Python
+    execution are less structured, so this intentionally uses a conservative
+    lexical gate: a protected basename (or configured extra pattern) must be
+    present together with a file-mutation primitive. Read-only references are
+    left alone. The gate is non-bypassable by terminal ``force=True`` because
+    callers invoke it before the normal dangerous-command approval ladder.
+    """
+    if not text or not _PROTECTED_INSTRUCTION_MUTATION_RE.search(text):
+        return None
+    enabled, extra = _protected_instruction_config()
+    if not enabled:
+        return None
+
+    reasons: list[str] = []
+    lowered = text.casefold()
+    for basename in sorted(_PROTECTED_INSTRUCTION_BASENAMES):
+        if basename.casefold() in lowered:
+            reasons.append(basename)
+
+    if extra:
+        import fnmatch
+        tokens = re.findall(r"[^\s'\"`<>|;&()]+", text)
+        for token in tokens:
+            base = os.path.basename(token.replace("\\", "/")).casefold()
+            for pattern in extra:
+                if fnmatch.fnmatch(base, pattern.casefold()):
+                    reasons.append(base)
+                    break
+
     if not reasons:
         return None
     return _request_protected_instruction_approval(reasons, task_id)

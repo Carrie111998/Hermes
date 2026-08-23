@@ -1286,6 +1286,22 @@ def execute_code(
             "terminal(command=...) instead."
         )
 
+    # Match the direct file-tool boundary for arbitrary Python. This runs
+    # before backend selection and before the normal approval ladder, so local,
+    # remote, force, and YOLO paths cannot silently rewrite global/project
+    # instruction files.
+    from tools.file_tools import _check_protected_instruction_command
+    _instruction_block = _check_protected_instruction_command(
+        code, task_id or "default"
+    )
+    if _instruction_block:
+        return json.dumps({
+            "status": "error",
+            "error": _instruction_block,
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
