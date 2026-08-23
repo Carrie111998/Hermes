@@ -145,9 +145,12 @@ async def commit_session_runtime_options(
     which creates the entry first) leaves live state untouched instead.
 
     ``durable=False`` is reserved for ``/model --once``: the one-turn override
-    is live-only by contract (#29923). While such an override is live, any
-    durable write made by a sibling path (e.g. ``/reasoning``) persists the
-    PRE-once model from the restore snapshot, never the one-turn model.
+    is live-only by contract (#29923). While a one-turn override is live
+    (``conversation.one_turn_restore`` is set -- ``/model --once`` and the
+    ``/moa`` one-shot both park their restore snapshot there), any durable
+    write made by a sibling path (e.g. ``/reasoning``, the host API) persists
+    the PRE-switch model from the snapshot, never the one-turn model or the
+    virtual ``moa`` provider.
     """
     async with session_admission_lock(runner, session_key):
         return await _commit_session_runtime_options_locked(
@@ -190,8 +193,9 @@ async def _commit_session_runtime_options_locked(
 
     durable_model = new_model
     if durable and model_override is UNSET and conversation.one_turn_restore:
-        # A /model --once override is live: persist what the post-turn restore
-        # will put back, never the one-turn model.
+        # A one-turn override (/model --once or the /moa one-shot) is live:
+        # persist what the post-turn restore will put back, never the
+        # one-turn model.
         snapshot = conversation.one_turn_restore
         durable_model = (
             dict(snapshot.get("override") or {})

@@ -19349,24 +19349,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 moa_cfg = normalize_moa_config({})
             preset = moa_cfg["default_preset"]
-            try:
-                event.text = moa_payload
-                # Rehydrate first so the post-turn restore puts back the
-                # persisted override, not a pre-rehydrate None.
-                self._rehydrate_session_runtime_options(_quick_key)
-                _moa_state = self._session_state(_quick_key)
-                event._moa_restore_override = _moa_state.conversation.model_override
-                _moa_state.conversation.model_override = {
-                    "provider": "moa",
-                    "model": preset,
-                    "base_url": "moa://local",
-                    "api_key": "moa-virtual-provider",
-                    "api_mode": "chat_completions",
-                }
-                self._evict_cached_agent(_quick_key)
-                event._moa_disable_after_turn = True
-            except Exception:
-                return "Failed to prepare MoA turn."
+            event.text = moa_payload
+            # Only stage the preset here. The live model_override is installed
+            # by _install_moa_one_shot AFTER this turn's idle->running claim
+            # below, so a host apply_session_options() (which persists the
+            # live model) cannot land between the install and the claim and
+            # write provider "moa" to disk.
+            event._moa_pending_preset = preset
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -19668,6 +19657,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # The session is claimed (turn.agent sentinel set, no await since),
+            # so apply_session_options() now sees it busy. Returning from here
+            # still runs the finally below, which unwinds the claim.
+            if getattr(event, "_moa_pending_preset", None) is not None:
+                if not self._install_moa_one_shot(event, _quick_key):
+                    return "Failed to prepare MoA turn."
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -19699,15 +19694,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
+            # One-turn model restore (/model --once and the /moa one-shot share
+            # conversation.one_turn_restore) must run on EVERY exit path, not
+            # just success: if _handle_message_with_agent raises, a restore in
+            # the try block would be skipped and the one-turn override would
+            # leak permanently (every later message silently fanning out
+            # through MoA). Putting it in finally guarantees the revert on
+            # success, exception, and interrupt alike.
             self._restore_pending_one_turn_model_override(_quick_key)
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
@@ -19726,26 +19719,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
 
-    def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
-        """Revert a ``/moa <prompt>`` one-shot model override after its turn.
+    def _install_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> bool:
+        """Install the ``/moa <prompt>`` one-shot model override for this turn.
 
-        Called from the ``finally`` of the message-handling path so the revert
-        fires whether the turn succeeded, raised, or was interrupted. A no-op
-        unless ``event._moa_disable_after_turn`` is set. ``_moa_restore_override``
-        carries the prior per-session override (``None`` means the user had no
-        override, so the MoA override is cleared outright).
+        Must be called after the idle->running claim in ``_handle_message`` and
+        before ``_handle_message_with_agent``, so the MoA turn itself always
+        runs on MoA and a ``/moa`` refused before the claim never leaves the
+        override live. The virtual ``moa`` provider is live-only: the prior
+        override is parked in ``conversation.one_turn_restore`` (the slot
+        ``/model --once`` uses) BEFORE the live swap, so a durable commit that
+        lands while the override is live -- the post-turn window after
+        ``_run_agent_inner`` releases the running slot included -- persists
+        the parked snapshot, never provider ``moa``, and the ``finally`` in
+        ``_handle_message`` (``_restore_pending_one_turn_model_override``)
+        reverts even a partially applied install. Returns ``False`` when the
+        install failed.
         """
-        if not getattr(event, "_moa_disable_after_turn", False):
-            return
+        preset = getattr(event, "_moa_pending_preset", None)
+        event._moa_pending_preset = None
         try:
-            _restore = getattr(event, "_moa_restore_override", None)
-            self._session_state(quick_key).conversation.model_override = _restore
+            # Rehydrate first so the post-turn restore puts back the
+            # persisted override, not a pre-rehydrate None.
+            self._rehydrate_session_runtime_options(quick_key)
+            _moa_state = self._session_state(quick_key)
+            # Park the prior override in the same slot /model --once uses so
+            # the durable-first primitive persists the pre-MoA model (never
+            # provider "moa") for any commit that lands while the virtual
+            # override is live -- including the post-turn window after
+            # _run_agent_inner releases the running slot and before this
+            # turn's finally restores. An older pending /model --once
+            # snapshot wins. _restore_pending_one_turn_model_override in the
+            # finally puts it back; a durable model commit in between clears
+            # the slot and supersedes the restore.
+            if _moa_state.conversation.one_turn_restore is None:
+                _moa_state.conversation.one_turn_restore = (
+                    self._snapshot_session_model_override(quick_key)
+                )
+            _moa_state.conversation.model_override = {
+                "provider": "moa",
+                "model": preset,
+                "base_url": "moa://local",
+                "api_key": "moa-virtual-provider",
+                "api_mode": "chat_completions",
+            }
             self._evict_cached_agent(quick_key)
+            return True
         except Exception:
-            pass
+            logger.debug("Failed to install MoA one-shot override", exc_info=True)
+            return False
 
     def _restore_pending_one_turn_model_override(self, session_key: str) -> None:
-        """Restore a per-session model override after ``/model --once`` runs."""
+        """Restore a per-session model override after a one-turn switch.
+
+        Both ``/model --once`` and the ``/moa <prompt>`` one-shot park the prior
+        override in ``conversation.one_turn_restore``; the message-handling
+        ``finally`` calls this on every exit path. A durable model commit made
+        while the one-turn override was live has already cleared the slot, so
+        this is then a no-op and live stays equal to disk.
+        """
         if not session_key:
             return
         try:
