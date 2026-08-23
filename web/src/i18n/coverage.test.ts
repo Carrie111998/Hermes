@@ -108,6 +108,8 @@ const NO_OPTIONAL_PLACEHOLDERS = new Set<string>();
 // `{s}` is an English-only plural suffix at these exact call sites. Keep the
 // exemption key-scoped so a future data placeholder also named `{s}` is checked.
 const OPTIONAL_FORMATTING_PLACEHOLDERS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "skills.skillCount": new Set(["s"]),
+  "skills.resultCount": new Set(["s"]),
   "config.fields": new Set(["s"]),
   "env.keysCount": new Set(["s"]),
   "env.customConfigured": new Set(["s"]),
