@@ -24,6 +24,12 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        # build_system_prompt drains pending truncation warnings and forwards
+        # each to agent._emit_status(). The unit-test agent is a plain
+        # SimpleNamespace, so give it a no-op status sink: otherwise any
+        # warning leaked into the current context (e.g. by another test file
+        # that ran first and recorded one) raises AttributeError. See #93018.
+        _emit_status=lambda _warning: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

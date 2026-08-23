@@ -766,6 +766,17 @@ class TestPromptBuilderConstants:
 # =========================================================================
 
 class TestEnvironmentHints:
+    @pytest.fixture(autouse=True)
+    def _drain_truncation_warnings(self):
+        """Drain any truncation warnings recorded during this test so they
+        don't leak into the context of tests in other files (which may run
+        after this one). build_system_prompt() forwards drained warnings to
+        agent._emit_status(), and unit-test agents without that attribute
+        raise AttributeError — see #93018."""
+        from agent.prompt_builder import drain_truncation_warnings
+        drain_truncation_warnings()
+        yield
+        drain_truncation_warnings()
 
 
 
