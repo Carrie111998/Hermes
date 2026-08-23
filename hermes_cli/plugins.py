@@ -5123,6 +5123,26 @@ class PluginManager:
         system prompt stays identical across turns so cached tokens
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
+
+        A callback may also return a ``runtime_override`` dict (optionally
+        alongside ``context``) to proactively override LLM API call
+        parameters for the current turn: ::
+
+            {"context": "recalled text...",
+             "runtime_override": {
+                 "model": "gpt-5.6",
+                 "provider": "openai",
+                 "base_url": "https://api.openai.com/v1",
+                 "api_key": "sk-...",
+                 "api_mode": "chat_completions",
+                 "system_prompt": "You are ...",
+             }}
+
+        The override is applied before API kwargs/client resolution (proactive,
+        unlike the error-driven failover redirect), is ephemeral and turn-
+        scoped, and is never written into session history.  Unsupported keys
+        are logged and ignored.  ``system_prompt`` affects only the API-call
+        copy of the messages, never the cached session prompt.
         """
         # Most legacy observer hooks carry the shared telemetry marker. Gateway
         # platform events define event-local additive envelopes instead: injecting

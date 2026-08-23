@@ -28,9 +28,10 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent.runtime_override import validate_runtime_override
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -422,6 +423,10 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
+    # Runtime override contributed by ``pre_llm_call`` plugins
+    # (model/provider/base_url/api_key/api_mode/system_prompt).  Ephemeral and
+    # turn-scoped — never persisted to session history.
+    runtime_override: dict = field(default_factory=dict)
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
@@ -1243,6 +1248,11 @@ def build_turn_context(
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
+    # Runtime override from pre_llm_call hooks — ephemeral, turn-scoped, and
+    # NEVER written into the user message / session history.  Reset first so a
+    # turn whose hooks return no override cannot inherit a stale one.
+    plugin_runtime_override: dict = {}
+    agent._runtime_override = {}
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -1292,6 +1302,21 @@ def build_turn_context(
             _ctx_parts.append(_piece)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
+        # Runtime override: merge every hook's {"runtime_override": {...}}
+        # (later hooks win).  Validated + type-checked; unsupported keys are
+        # logged and ignored.  Consumed by the API-attempt wrappers in
+        # conversation_loop.py; never persisted to session history.
+        for _r in _pre_results:
+            if not isinstance(_r, dict):
+                continue
+            _ro_piece = _r.get("runtime_override")
+            if _ro_piece is None:
+                continue
+            _valid_ro = validate_runtime_override(_ro_piece)
+            if _valid_ro:
+                plugin_runtime_override.update(_valid_ro)
+        if plugin_runtime_override:
+            agent._runtime_override = dict(plugin_runtime_override)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
@@ -1476,6 +1501,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        runtime_override=plugin_runtime_override,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

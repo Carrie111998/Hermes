@@ -1503,6 +1503,14 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     ``active_system_prompt`` for subsequent call-block rebuilds.
     """
     sp = getattr(agent, "_cached_system_prompt", None)
+    # pre_llm_call runtime_override: keep the overridden system prompt stable
+    # across a mid-turn failover instead of reverting to the cached prompt.
+    _ro_system_prompt = (getattr(agent, "_runtime_override", None) or {}).get("system_prompt")
+    if _ro_system_prompt:
+        if api_messages and api_messages[0].get("role") == "system":
+            if not _rewrite_system_content_blocks(api_messages[0], str(_ro_system_prompt)):
+                api_messages[0]["content"] = str(_ro_system_prompt)
+        return str(_ro_system_prompt)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
@@ -2312,9 +2320,17 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        _runtime_ov = getattr(agent, "_runtime_override", None) or {}
+        _ro_system_prompt = _runtime_ov.get("system_prompt")
+        if _ro_system_prompt:
+            # pre_llm_call runtime_override: replace the system prompt for
+            # THIS call only.  Applied to the ephemeral api_messages copy —
+            # the cached session prompt and persisted history are untouched.
+            effective_system = str(_ro_system_prompt)
+        else:
+            effective_system = active_system_prompt or ""
+            if agent.ephemeral_system_prompt:
+                effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2886,13 +2902,23 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                from agent.runtime_override import (
+                    apply_runtime_override as _apply_runtime_override,
+                )
+                _runtime_ov = getattr(agent, "_runtime_override", None) or {}
+                if _runtime_ov:
+                    _ro_cm = _apply_runtime_override(agent, _runtime_ov)
                 else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
+                    from contextlib import nullcontext as _nullcontext
+                    _ro_cm = _nullcontext()
+                with _ro_cm:
+                    if tools_for_api == agent.tools:
+                        api_kwargs = agent._build_api_kwargs(api_messages)
+                    else:
+                        api_kwargs = agent._build_api_kwargs(
+                            api_messages,
+                            tools_for_api=tools_for_api,
+                        )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -3090,6 +3116,16 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    from agent.runtime_override import (
+                        apply_runtime_override as _apply_runtime_override,
+                    )
+                    _runtime_ov = getattr(agent, "_runtime_override", None) or {}
+                    if _runtime_ov:
+                        with _apply_runtime_override(agent, _runtime_ov):
+                            return _perform_api_call_inner(next_api_kwargs)
+                    return _perform_api_call_inner(next_api_kwargs)
+
+                def _perform_api_call_inner(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
