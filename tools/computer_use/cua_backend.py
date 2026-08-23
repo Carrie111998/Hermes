@@ -137,6 +137,35 @@ def _action_result_from(
     # `path` records the rung that ran; this records what we asked for).
     delivery_mode = requested_delivery if isinstance(requested_delivery, str) else None
 
+    # `escalation.reason == "delivery_failed"` on a FOREGROUND action is not
+    # trustworthy on Linux/X11. Verified by observation: text typed with
+    # delivery_mode="foreground" lands correctly in the target widget while
+    # the driver reports delivery_failed for that same call. The driver has
+    # no read-back channel to confirm with — its own AT-SPI elements carry
+    # only role/label/frame/enabled and never a `value` — so "could not
+    # confirm" is being reported as "failed".
+    #
+    # Taken at face value this reads as "typing is broken", which is how an
+    # agent ends up retrying, escalating, and reporting a false blocker to
+    # the user. Annotate rather than suppress: a real failure looks identical
+    # from here, so the only sound move is a visual check.
+    if (
+        escalation
+        and escalation.get("reason") == "delivery_failed"
+        and delivery_mode == "foreground"
+        and sys.platform.startswith("linux")
+    ):
+        message = (
+            f"{message}\n\n" if message else ""
+        ) + (
+            "⚠️ The driver reports escalation.reason='delivery_failed', but on "
+            "Linux/X11 this signal is unreliable for foreground delivery — it "
+            "fires even when the input landed correctly, because the driver has "
+            "no way to read the target back. DO NOT treat this as proof of "
+            "failure and DO NOT retry blindly. Take a capture and look at the "
+            "target widget: if the text/effect is there, the action succeeded."
+        )
+
     return ActionResult(
         ok=ok,
         action=name,
