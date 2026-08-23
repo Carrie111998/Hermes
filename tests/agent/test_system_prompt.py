@@ -19,6 +19,11 @@ def _make_agent(**overrides):
         _kanban_worker_guidance="",
         _memory_store=None,
         _memory_manager=None,
+        # build_system_prompt drains pending truncation warnings through
+        # agent._emit_status; the warning store is a ContextVar that survives
+        # across test files on the main thread, so a stray warning from
+        # another module must not break this contract (#93018).
+        _emit_status=lambda _warning: None,
         model="",
         provider="",
         platform="",

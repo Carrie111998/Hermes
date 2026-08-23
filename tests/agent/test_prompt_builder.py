@@ -101,6 +101,12 @@ class TestTruncateContent:
         monkeypatch.setattr("hermes_cli.config.load_config", default_load_config)
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", default_load_config)
 
+        yield
+        # Teardown drain: truncation warnings live in a ContextVar on the main
+        # thread and would otherwise survive this module into later test files
+        # (order-dependent failure in test_system_prompt.py, #93018).
+        drain_truncation_warnings()
+
 
 
     def test_long_content_truncated(self):
