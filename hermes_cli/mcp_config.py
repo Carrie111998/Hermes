@@ -825,12 +825,32 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         return False
 
     # Wipe both disk and in-memory cache so the next probe forces a fresh
-    # OAuth flow.
+    # OAuth flow, but make the operation transactional: if the replacement
+    # OAuth attempt fails, restore the exact prior on-disk state so a failed
+    # reauth cannot destroy a still-useful refresh token/client/meta set.
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import get_manager
+
+    storage = HermesTokenStorage(name)
+    oauth_snapshot = storage.snapshot()
+    removed_entry = None
+    manager = get_manager()
     try:
-        from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+        removed_entry = manager.remove(name)
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
+
+    def _rollback_oauth_state() -> None:
+        try:
+            if oauth_snapshot:
+                storage.restore(oauth_snapshot)
+                manager.restore_entry(name, removed_entry)
+            else:
+                # Brand-new failed logins must not leave partially written
+                # token/client/meta artifacts behind.
+                storage.remove()
+        except Exception as rollback_exc:
+            _warning(f"Could not restore previous OAuth state: {rollback_exc}")
 
     print()
     _info(f"Starting OAuth flow for '{name}'...")
@@ -868,6 +888,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         # real tool call later hangs until timeout because there's no token.
         # Verify a token actually landed on disk before claiming success.
         if not _oauth_tokens_present(name):
+            _rollback_oauth_state()
             _warning(
                 "Server responded, but no OAuth token was obtained — "
                 "authentication did not complete."
@@ -895,6 +916,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _success("Authenticated (server reported no tools)")
         return True
     except Exception as exc:
+        _rollback_oauth_state()
         try:
             from tools.mcp_oauth import humanize_oauth_registration_error
 
