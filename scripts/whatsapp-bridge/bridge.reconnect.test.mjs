@@ -16,12 +16,70 @@
 import { strict as assert } from 'node:assert';
 
 import {
+  createInboundActivityWatchdog,
   createReconnectScheduler,
   createVersionResolver,
 } from './bridge_helpers.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// -- createInboundActivityWatchdog ----------------------------------------
+
+// A connected socket that stops producing inbound events is recovered once
+// the silence threshold is reached. Repeated checks do not trigger duplicate
+// process exits while the supervisor is still stopping the bridge.
+{
+  let now = 1_000;
+  const staleEvents = [];
+  const logs = [];
+  const watchdog = createInboundActivityWatchdog({
+    timeoutMs: 5_000,
+    nowFn: () => now,
+    onStale: event => staleEvents.push(event),
+    log: line => logs.push(line),
+  });
+
+  watchdog.markConnected();
+  now = 5_999;
+  assert.equal(watchdog.check(), false);
+  now = 6_000;
+  assert.equal(watchdog.check(), true);
+  assert.equal(staleEvents.length, 1);
+  assert.equal(staleEvents[0].silentForMs, 5_000);
+  assert.match(logs[0], /inbound activity stalled for 5s/);
+  assert.equal(watchdog.check(), false, 'stale recovery must be one-shot');
+}
+
+// Real inbound activity refreshes the deadline, while disconnected sockets
+// never trip regardless of how much wall time passes.
+{
+  let now = 10_000;
+  let staleCalls = 0;
+  const watchdog = createInboundActivityWatchdog({
+    timeoutMs: 2_000,
+    nowFn: () => now,
+    onStale: () => { staleCalls += 1; },
+    log: () => {},
+  });
+
+  watchdog.markConnected();
+  now = 11_500;
+  watchdog.markActivity();
+  now = 13_499;
+  assert.equal(watchdog.check(), false);
+  watchdog.markDisconnected();
+  now = 99_999;
+  assert.equal(watchdog.check(), false);
+  assert.equal(staleCalls, 0);
+  assert.deepEqual(watchdog.snapshot(), {
+    connected: false,
+    lastInboundActivityAt: null,
+    silentForMs: null,
+    timeoutMs: 2_000,
+    stale: false,
+  });
+}
 
 // -- createReconnectScheduler ---------------------------------------------
 

@@ -35,6 +35,7 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
+  createInboundActivityWatchdog,
   createReconnectScheduler,
   createVersionResolver,
   buildLocationPayload,
@@ -124,6 +125,13 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+const inboundStaleTimeoutRaw = Number.parseInt(
+  process.env.WHATSAPP_INBOUND_STALE_TIMEOUT_MS || '600000',
+  10,
+);
+const INBOUND_STALE_TIMEOUT_MS = Number.isFinite(inboundStaleTimeoutRaw)
+  ? Math.max(0, inboundStaleTimeoutRaw)
+  : 600_000;
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -388,6 +396,15 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+const inboundWatchdog = createInboundActivityWatchdog({
+  timeoutMs: INBOUND_STALE_TIMEOUT_MS,
+  onStale: () => {
+    // A fresh socket in the same process can inherit a wedged Baileys receive
+    // pipeline, so let the gateway supervisor perform a process-level reset.
+    process.exit(1);
+  },
+});
+
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
@@ -402,7 +419,7 @@ async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const version = await getWAVersion();
 
-  sock = makeWASocket({
+  const socket = makeWASocket({
     ...(version ? { version } : {}),
     auth: state,
     logger,
@@ -418,10 +435,12 @@ async function startSocket() {
       return { conversation: '' };
     },
   });
+  sock = socket;
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
   sock.ev.on('connection.update', (update) => {
+    if (sock !== socket) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -437,6 +456,7 @@ async function startSocket() {
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
+      inboundWatchdog.markDisconnected();
 
       if (reason === DisconnectReason.loggedOut) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
@@ -458,6 +478,7 @@ async function startSocket() {
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      inboundWatchdog.markConnected();
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -479,6 +500,8 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.update', async (updates) => {
+    if (sock !== socket) return;
+    inboundWatchdog.markActivity();
     for (const { key, update } of updates || []) {
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
@@ -530,6 +553,8 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (sock !== socket) return;
+    inboundWatchdog.markActivity();
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -775,6 +800,10 @@ async function startSocket() {
         messageQueue.shift();
       }
     }
+  });
+
+  sock.ev.on('message-receipt.update', () => {
+    if (sock === socket) inboundWatchdog.markActivity();
   });
 }
 
@@ -1105,12 +1134,19 @@ app.get('/chat/:id', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  const inboundHealth = inboundWatchdog.snapshot();
   res.json({
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    inboundWatchdog: {
+      timeoutMs: inboundHealth.timeoutMs,
+      lastActivityAt: inboundHealth.lastInboundActivityAt,
+      silentForMs: inboundHealth.silentForMs,
+      stale: inboundHealth.stale,
+    },
   });
 });
 
@@ -1150,6 +1186,7 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
+    if (INBOUND_STALE_TIMEOUT_MS > 0) inboundWatchdog.start();
     scheduleReconnect(0);
   });
 }

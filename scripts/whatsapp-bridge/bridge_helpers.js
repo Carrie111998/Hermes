@@ -569,6 +569,85 @@ export function pollCreationMessageFromPayload(payload) {
 }
 
 /**
+ * Detect a Baileys socket whose connection stays open while its inbound event
+ * pipeline has gone silent. Keepalive responses only prove that the WebSocket
+ * is open; they do not prove that message events are still being delivered.
+ */
+export function createInboundActivityWatchdog({
+  timeoutMs,
+  checkIntervalMs = Math.min(30_000, timeoutMs),
+  nowFn = Date.now,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+  onStale,
+  log = console.log,
+}) {
+  let connected = false;
+  let lastInboundActivityAt = null;
+  let stale = false;
+  let timer = null;
+
+  function markConnected() {
+    connected = true;
+    stale = false;
+    lastInboundActivityAt = nowFn();
+  }
+
+  function markActivity() {
+    if (!connected) return;
+    stale = false;
+    lastInboundActivityAt = nowFn();
+  }
+
+  function markDisconnected() {
+    connected = false;
+    stale = false;
+    lastInboundActivityAt = null;
+  }
+
+  function snapshot() {
+    const silentForMs = connected && lastInboundActivityAt !== null
+      ? Math.max(0, nowFn() - lastInboundActivityAt)
+      : null;
+    return {
+      connected,
+      lastInboundActivityAt,
+      silentForMs,
+      timeoutMs,
+      stale,
+    };
+  }
+
+  function check() {
+    const state = snapshot();
+    if (!state.connected || stale || state.silentForMs < timeoutMs) return false;
+    stale = true;
+    log(`⚠️  WhatsApp inbound activity stalled for ${Math.round(state.silentForMs / 1000)}s; restarting bridge...`);
+    onStale({ ...state, stale: true });
+    return true;
+  }
+
+  function start() {
+    if (timer === null) timer = setIntervalFn(check, checkIntervalMs);
+  }
+
+  function stop() {
+    if (timer !== null) clearIntervalFn(timer);
+    timer = null;
+  }
+
+  return {
+    markConnected,
+    markActivity,
+    markDisconnected,
+    snapshot,
+    check,
+    start,
+    stop,
+  };
+}
+
+/**
  * Reconnect scheduling guard. startSocket() awaits network I/O before it
  * creates a socket or registers event handlers, so a bare
  * `setTimeout(startSocket, ...)` has two unrecoverable failure modes: a

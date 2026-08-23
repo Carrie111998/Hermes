@@ -238,6 +238,20 @@ gateway:
 
 Set `text_batch_delay_seconds: 0` to dispatch each message immediately (disables batching).
 
+### Inbound Activity Watchdog
+
+Baileys can rarely leave a socket connected for keepalives and outbound sends while inbound message events have stopped. The bridge tracks inbound message, update, and receipt events and exits after 10 minutes of connected silence so the gateway supervisor can start a clean process. Tune or disable the watchdog in `config.yaml`:
+
+```yaml
+gateway:
+  platforms:
+    whatsapp:
+      extra:
+        inbound_stale_timeout_seconds: 600  # set to 0 to disable
+```
+
+The bridge's `/health` response includes `inboundWatchdog.lastActivityAt`, `silentForMs`, `timeoutMs`, and `stale` for diagnostics. A shorter timeout recovers faster but can restart an otherwise healthy bridge during quiet periods.
+
 ---
 
 ## Troubleshooting

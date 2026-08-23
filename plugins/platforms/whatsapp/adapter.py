@@ -455,6 +455,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             read_receipts if isinstance(read_receipts, bool)
             else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
         )
+        self._inbound_stale_timeout_seconds = self._coerce_float_extra(
+            "inbound_stale_timeout_seconds", 600.0
+        )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -648,7 +651,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                desired_watchdog_ms = round(
+                                    getattr(self, "_inbound_stale_timeout_seconds", 600.0) * 1000
+                                )
+                                running_watchdog_ms = (
+                                    data.get("inboundWatchdog") or {}
+                                ).get("timeoutMs")
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and running_watchdog_ms == desired_watchdog_ms
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -664,7 +676,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
                                     if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
+                                    else "bridge config changed"
                                 )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
@@ -694,6 +706,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
+            )
+            bridge_env["WHATSAPP_INBOUND_STALE_TIMEOUT_MS"] = str(
+                round(getattr(self, "_inbound_stale_timeout_seconds", 600.0) * 1000)
             )
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
