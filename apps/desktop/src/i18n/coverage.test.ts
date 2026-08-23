@@ -136,7 +136,8 @@ describe('desktop locale coverage', () => {
 
   for (const { id } of LOCALE_OPTIONS) {
     it(`${id} matches its untranslated-string baseline of ${EXPECTED_UNTRANSLATED[id]}`, () => {
-      const untranslated = [...ENGLISH_KEYS].filter(key => !authoredKeys(id).has(key))
+      const authored = authoredKeys(id)
+      const untranslated = [...ENGLISH_KEYS].filter(key => !authored.has(key))
 
       expect(
         untranslated.length,
@@ -220,7 +221,7 @@ describe('desktop locale coverage', () => {
       ).toEqual([])
     })
 
-    it(`${id} keeps array-valued entries the same length as English`, () => {
+    it(`${id} keeps authored array-valued entries the same length as English`, () => {
       const authored = leafEntries(authoredEntries(id))
       const mismatched: string[] = []
 
@@ -230,6 +231,12 @@ describe('desktop locale coverage', () => {
         }
 
         const localeValue = authored.get(key)
+
+        // Missing keys belong to the coverage baseline above. Shape checks only
+        // apply once this locale actually authors the array-valued entry.
+        if (localeValue === undefined) {
+          continue
+        }
 
         if (!Array.isArray(localeValue)) {
           mismatched.push(`${key} (en is an array, ${id} is not)`)
