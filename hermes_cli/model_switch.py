@@ -3986,4 +3986,47 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
+    # Surface ``model_aliases:`` entries that have no matching provider row.
+    # A dict-based alias pointing at a custom endpoint (e.g. a local
+    # llama.cpp/Ollama server) resolves correctly via the typed
+    # ``/model <alias>`` command, but was otherwise invisible here because
+    # this function only enumerates providers, never DIRECT_ALIASES / the
+    # ``model_aliases:`` config section. Add a minimal row per unshadowed
+    # alias so it is discoverable and selectable (#92763).
+    _picker_slugs = {str(p.get("slug", "")).strip().lower() for p in filtered}
+    try:
+        from hermes_cli.config import load_config
+        alias_cfg = load_config().get("model_aliases")
+    except Exception:
+        alias_cfg = None
+    if isinstance(alias_cfg, dict):
+        for alias_name, alias_entry in alias_cfg.items():
+            slug = str(alias_name).strip()
+            if not slug or slug.lower() in _picker_slugs or not isinstance(alias_entry, dict):
+                continue
+            model = str(alias_entry.get("model", "")).strip()
+            if not model:
+                continue
+            base_url = str(alias_entry.get("base_url", "")).strip()
+            is_current = (
+                bool(current_model)
+                and model == current_model
+                and (
+                    not base_url
+                    or base_url.strip().rstrip("/").lower()
+                    == str(current_base_url or "").strip().rstrip("/").lower()
+                )
+            )
+            filtered.append({
+                "slug": slug,
+                "name": slug,
+                "is_current": is_current,
+                "is_user_defined": True,
+                "models": [model],
+                "total_models": 1,
+                "source": "user-config",
+                "api_url": base_url,
+            })
+            _picker_slugs.add(slug.lower())
+
     return filtered

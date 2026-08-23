@@ -133,6 +133,69 @@ def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     assert row["models"] == ["glm-5.1", "qwen3"]
 
 
+def test_model_alias_with_no_provider_row_gets_a_picker_row(monkeypatch):
+    """A ``model_aliases:`` entry not also registered under ``providers:``
+    must still surface in the interactive picker (#92763).
+
+    Before the fix, ``list_picker_providers`` only enumerated providers, so a
+    local endpoint configured purely via ``model_aliases:`` (e.g. a
+    llama.cpp/Ollama server) was reachable via typed ``/model local`` but
+    never appeared as a selectable row.
+    """
+    monkeypatch.setattr(model_switch, "list_authenticated_providers", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model_aliases": {
+                "local": {
+                    "model": "qwen3-30b-a3b",
+                    "provider": "custom",
+                    "base_url": "http://localhost:8080/v1",
+                },
+            },
+        },
+    )
+
+    result = model_switch.list_picker_providers()
+
+    alias_rows = [p for p in result if p.get("slug") == "local"]
+    assert len(alias_rows) == 1
+    row = alias_rows[0]
+    assert row["is_user_defined"] is True
+    assert row["models"] == ["qwen3-30b-a3b"]
+
+
+def test_model_alias_shadowed_by_provider_row_is_not_duplicated(monkeypatch):
+    """An alias sharing a slug with an existing provider row must not double up."""
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers",
+        lambda **kw: [_make_provider("local", models=["already-here"],
+                                      is_user_defined=True, api_url="http://x")],
+    )
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model_aliases": {
+                "local": {
+                    "model": "qwen3-30b-a3b",
+                    "provider": "custom",
+                    "base_url": "http://localhost:8080/v1",
+                },
+            },
+        },
+    )
+
+    result = model_switch.list_picker_providers()
+
+    matching = [p for p in result if p.get("slug") == "local"]
+    assert len(matching) == 1
+    assert matching[0]["models"] == ["already-here"]
+
+
 
 # ---------------------------------------------------------------------------
 # list_authenticated_providers: alias/canonical de-dup for Kimi (#49439)
