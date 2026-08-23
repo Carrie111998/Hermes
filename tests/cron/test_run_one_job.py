@@ -211,6 +211,75 @@ def test_structured_nonzero_exit_overrides_green_model_turn_everywhere(monkeypat
     assert iteration["payload"]["counters"]["exit_code"] == 1
 
 
+def test_reason_error_without_exit_code_marks_workload_failed(monkeypatch):
+    """A parsed iteration block carrying reason="error" is an authoritative
+    workload failure even when counters.exit_code is absent (jobflow-matcher
+    publishes real failures with reason=error but no exit code)."""
+    response = (
+        '<AGENT_ITERATION_JSON>{"agent":"matcher","summary":"publisher rejected",'
+        '"counters":{"failed":46},"reason":"error"}</AGENT_ITERATION_JSON>'
+    )
+    job = {"id": "j-reason-error", "name": "jobflow-matcher"}
+    marks = []
+
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda _job, *, defer_agent_teardown=None: (True, "raw output", response, None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_k: "/tmp/output")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+    )
+
+    assert s.run_one_job(job) is True
+    assert ("j-reason-error", False) in marks
+
+
+def test_reason_error_message_names_the_declared_failure(monkeypatch):
+    """The workload error text must distinguish a reason-declared failure from
+    the exit_code form so operators can tell which contract fired."""
+    response = (
+        '<AGENT_ITERATION_JSON>{"agent":"matcher","summary":"blocked",'
+        '"counters":{},"reason":"error"}</AGENT_ITERATION_JSON>'
+    )
+    error = s._resolve_agent_iteration_workload(response)[1]
+
+    assert error is not None
+    assert "reason=error" in error
+
+
+def test_exit_code_still_wins_over_success_reason(monkeypatch):
+    """The exit_code gate keeps precedence: a nonzero exit code fails the run
+    even when the block claims reason=success."""
+    response = (
+        '<AGENT_ITERATION_JSON>{"agent":"devflow","summary":"green prose",'
+        '"counters":{"exit_code":3},"reason":"success"}</AGENT_ITERATION_JSON>'
+    )
+    error = s._resolve_agent_iteration_workload(response)[1]
+
+    assert error is not None
+    assert "exit_code=3" in error
+
+
+def test_non_error_reasons_do_not_fail_workload(monkeypatch):
+    """no_work / success / partial remain non-failing verdicts; only the
+    schema-bounded "error" value flips the run."""
+    for reason in ("no_work", "success", "partial"):
+        response = (
+            '<AGENT_ITERATION_JSON>{"agent":"matcher","summary":"fine",'
+            f'"counters":{{}},"reason":"{reason}"}}'
+            "</AGENT_ITERATION_JSON>"
+        )
+        extracted, error = s._resolve_agent_iteration_workload(response)
+
+        assert extracted[0] is not None  # block parses cleanly
+        assert error is None
+
+
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""

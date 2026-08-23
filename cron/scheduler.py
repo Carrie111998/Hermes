@@ -1640,7 +1640,16 @@ _AGENT_ITERATION_UNPARSED = object()
 def _resolve_agent_iteration_workload(
     final_response: str,
 ) -> tuple[tuple, str | None]:
-    """Parse iteration evidence once and return any authoritative workload error."""
+    """Parse iteration evidence once and return any authoritative workload error.
+
+    Two structured failure declarations are honoured, in precedence order:
+      1. ``counters.exit_code`` != 0 — the wrapper-script contract.
+      2. ``reason == "error"`` — the schema-bounded iteration enum value that
+         the cron-agent-iteration-reporting skill defines as "the run failed".
+    Producers without a wrapper script (e.g. jobflow-matcher) declare failures
+    through the reason enum alone; ignoring it left real publication failures
+    classified as successful completions.
+    """
     extracted = _extract_agent_iteration(final_response)
     parsed, error_reason, _raw_block = extracted
     if error_reason is not None or parsed is None:
@@ -1653,6 +1662,16 @@ def _resolve_agent_iteration_workload(
                 extracted,
                 f"Workload reported exit_code={exit_code:g} in AGENT_ITERATION_JSON",
             )
+
+    # Only the exact schema-bounded value fails; unknown reason strings stay
+    # non-failing so prompt drift cannot mint new failure classes.
+    if parsed.get("reason") == "error":
+        summary = str(parsed.get("summary") or "").strip()
+        detail = f": {summary}" if summary else ""
+        return (
+            extracted,
+            f"Workload reported reason=error in AGENT_ITERATION_JSON{detail}",
+        )
     return extracted, None
 
 
