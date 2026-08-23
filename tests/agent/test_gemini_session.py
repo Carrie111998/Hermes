@@ -128,3 +128,131 @@ def test_fetch_none_on_transport_error(monkeypatch):
     monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _DummyWS())
     monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.2)
     assert gs.fetch_gemini_budget_usage() is None
+
+
+# --- wedged-tab recovery -----------------------------------------------------
+#
+# Production incident 2026-08-23: the FIRST aistudio tab (_find_aistudio_target
+# always picks it) wedged -- its page loaded but the lazy RPC chain never
+# completed -- so five consecutive PT5M runs burned the full 30s settle window.
+# A same-target retry is useless against a wedged tab; recovery requires a
+# FRESH tab. These tests pin that behavior.
+
+
+class _OnceIdle(_FakeInterceptor):
+    """First attempt idles out (wedged tab); later attempts succeed.
+
+    One instance per _attempt() -- fetch_gemini_budget_usage builds a fresh
+    _Interceptor for each try, mirroring that here via _mint().
+    """
+
+    instances: list = []
+
+    @classmethod
+    def _mint(cls, ws):
+        inst = cls([])
+        cls.instances.append(inst)
+        return inst
+
+    def recv_event(self, seconds):
+        if len(self.instances) == 1:
+            return None  # first (wedged) attempt: idle -> timeout
+        if not self._bodies:
+            self._bodies = [_IMPORTED_PROJECTS_BODY, _USAGE_LIMITS_BODY]
+        tail = (
+            "ListImportedProjects"
+            if len(self._bodies) == 2
+            else "BatchGetProjectUsageLimits"
+        )
+        return {
+            "method": "Fetch.requestPaused",
+            "params": {"requestId": "r1", "request": {"url": f"https://x/{tail}"}},
+        }
+
+
+def _patch_fresh_tab(monkeypatch, ws="ws://fresh", tid="fresh-tab"):
+    """Stub /json/new + /json/close so no real browser is touched."""
+    monkeypatch.setattr(
+        gs, "_new_aistudio_target", lambda http: (ws, tid)
+    )
+    closed = []
+    monkeypatch.setattr(
+        gs, "_close_target", lambda http, t: closed.append(t) or True
+    )
+    return closed
+
+
+def test_retry_after_wedged_tab_uses_fresh_tab(monkeypatch):
+    _OnceIdle.instances = []
+    _patch_discovery(monkeypatch)
+    closed = _patch_fresh_tab(monkeypatch)
+    monkeypatch.setattr(gs, "_Interceptor", _OnceIdle._mint)
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _DummyWS())
+    monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr(gs, "_RETRY_BACKOFF_SECONDS", 0.01)
+
+    result = gs.fetch_gemini_budget_usage(timeout=5.0, budget_seconds=60.0)
+    # The fresh-tab attempt produced the snapshot...
+    assert result == (14.9896, 250.0)
+    # ...on a SECOND interceptor instance (first was the wedged tab)...
+    assert len(_OnceIdle.instances) == 2
+    # ...and the throwaway tab was closed afterwards.
+    assert closed == ["fresh-tab"]
+
+
+def test_no_retry_when_budget_cannot_cover_it(monkeypatch):
+    _OnceIdle.instances = []
+    _patch_discovery(monkeypatch)
+    _patch_fresh_tab(monkeypatch)
+    monkeypatch.setattr(gs, "_Interceptor", _OnceIdle._mint)
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _DummyWS())
+    monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.05)
+    # Default backoff (7.5s) + settle exceeds this budget -> the retry would
+    # overrun the collector's deadline and must be skipped.
+    result = gs.fetch_gemini_budget_usage(timeout=5.0, budget_seconds=5.0)
+    assert result is None
+    assert len(_OnceIdle.instances) == 1
+
+
+def test_retry_when_budget_is_none_runs_unbounded(monkeypatch):
+    # CLI/`/usage` callers pass no budget: retry proceeds even though the
+    # per-request timeout is small (their deadline is not our business).
+    _OnceIdle.instances = []
+    _patch_discovery(monkeypatch)
+    _patch_fresh_tab(monkeypatch)
+    monkeypatch.setattr(gs, "_Interceptor", _OnceIdle._mint)
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _DummyWS())
+    monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr(gs, "_RETRY_BACKOFF_SECONDS", 0.01)
+
+    assert gs.fetch_gemini_budget_usage(timeout=1.0, budget_seconds=None) == (
+        14.9896,
+        250.0,
+    )
+    assert len(_OnceIdle.instances) == 2
+
+
+def test_success_on_existing_tab_never_retries_or_closes(monkeypatch):
+    _OnceIdle.instances = []
+    _patch_discovery(monkeypatch)
+    closed = _patch_fresh_tab(monkeypatch)
+
+    class _FirstTryOk(_FakeInterceptor):
+        instances: list = []
+
+        def __init__(self, bodies):
+            super().__init__(bodies)
+            _FirstTryOk.instances.append(self)
+
+    fake = _FirstTryOk([_IMPORTED_PROJECTS_BODY, _USAGE_LIMITS_BODY])
+    monkeypatch.setattr(gs, "_Interceptor", lambda ws: fake)
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _DummyWS())
+    monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.05)
+
+    assert gs.fetch_gemini_budget_usage(timeout=5.0, budget_seconds=60.0) == (
+        14.9896,
+        250.0,
+    )
+    # One attempt only; nothing opened, nothing to close.
+    assert len(_FirstTryOk.instances) == 1
+    assert closed == []

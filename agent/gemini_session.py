@@ -35,6 +35,13 @@ _APIKEY_URL = _AISTUDIO_ORIGIN + "/apikey"
 # BatchGetProjectUsageLimits fires late in the apikey page's lazy RPC chain
 # (~15-20s after navigation), so the settle window must cover the full chain.
 _SETTLE_SECONDS = 30.0
+# Production incident 2026-08-23: the first existing aistudio tab wedged (page
+# loaded, lazy RPC chain never completed), so five consecutive PT5M runs burned
+# the full settle window while the tab stayed broken. A same-target retry is
+# useless against a wedged tab -- after one idle attempt we back off briefly and
+# retry once against a FRESH throwaway tab. The backoff lets a concurrent probe
+# holding the tab finish and release it first.
+_RETRY_BACKOFF_SECONDS = 7.5
 
 
 def _find_aistudio_target(http_url: str) -> Optional[str]:
@@ -56,8 +63,11 @@ def _find_aistudio_target(http_url: str) -> Optional[str]:
     return None
 
 
-def _new_aistudio_target(http_url: str) -> Optional[str]:
-    """Open a background aistudio.google.com/apikey tab via /json/new."""
+def _new_aistudio_target(http_url: str) -> Optional[tuple[str, str]]:
+    """Open a background aistudio.google.com/apikey tab via /json/new.
+
+    Returns (ws_url, target_id); the caller closes the tab when done.
+    """
     import urllib.request
 
     try:
@@ -69,8 +79,25 @@ def _new_aistudio_target(http_url: str) -> Optional[str]:
             target = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
-    ws = str(target.get("webSocketDebuggerUrl") or "") if isinstance(target, dict) else ""
-    return ws or None
+    if not isinstance(target, dict):
+        return None
+    ws = str(target.get("webSocketDebuggerUrl") or "")
+    target_id = str(target.get("id") or "")
+    return (ws, target_id) if ws and target_id else None
+
+
+def _close_target(http_url: str, target_id: str) -> bool:
+    """Close a tab we opened; best-effort -- failure is never fatal."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"{http_url}/json/close/{target_id}", timeout=3.0
+        ) as resp:
+            resp.read()
+    except Exception:
+        return False
+    return True
 
 
 class _Interceptor:
@@ -167,25 +194,12 @@ def _parse_usage_limits(jspb_text: str) -> Optional[tuple[float, float]]:
     return None
 
 
-def fetch_gemini_budget_usage(
-    *,
-    timeout: float = 15.0,
+def _attempt(
+    http_url: str,
+    ws_url: str,
+    timeout: float,
 ) -> Optional[tuple[float, float]]:
-    """Return ``(used_percent, budget_usd)`` from AI Studio's apikey page RPCs.
-
-    ``None`` when no CDP browser is reachable, no aistudio.google.com tab can
-    be opened, the page never issues the two RPCs (logged out), or the
-    response shapes are unknown.
-    """
-    http_url = discover_local_cdp_url(DEFAULT_BROWSER_CDP_PORT, timeout=1.5)
-    if not http_url:
-        logger.debug("gemini_session: no CDP browser on :%s", DEFAULT_BROWSER_CDP_PORT)
-        return None
-    ws_url = _find_aistudio_target(http_url) or _new_aistudio_target(http_url)
-    if not ws_url:
-        logger.debug("gemini_session: no aistudio.google.com tab available")
-        return None
-
+    """One interception attempt against one tab. Degrades to None."""
     from websocket import create_connection
 
     try:
@@ -239,6 +253,67 @@ def fetch_gemini_budget_usage(
         except Exception:
             pass
     return limits
+
+
+def fetch_gemini_budget_usage(
+    *,
+    timeout: float = 15.0,
+    budget_seconds: Optional[float] = None,
+) -> Optional[tuple[float, float]]:
+    """Return ``(used_percent, budget_usd)`` from AI Studio's apikey page RPCs.
+
+    ``None`` when no CDP browser is reachable, no aistudio.google.com tab can
+    be opened, the page never issues the two RPCs (logged out), or the
+    response shapes are unknown.
+
+    One idle attempt against an existing tab is retried once against a fresh
+    throwaway tab after ``_RETRY_BACKOFF_SECONDS`` -- but only when
+    ``budget_seconds`` (the collector's remaining wall-clock) plausibly covers
+    backoff plus one more settle window; ``None`` means unlimited (CLI paths).
+    """
+    http_url = discover_local_cdp_url(DEFAULT_BROWSER_CDP_PORT, timeout=1.5)
+    if not http_url:
+        logger.debug("gemini_session: no CDP browser on :%s", DEFAULT_BROWSER_CDP_PORT)
+        return None
+
+    ws_url = _find_aistudio_target(http_url)
+    fresh_target_id: Optional[str] = None
+    try:
+        if ws_url is not None:
+            limits = _attempt(http_url, ws_url, timeout)
+            if limits is not None:
+                return limits
+        else:
+            opened = _new_aistudio_target(http_url)
+            if opened is None:
+                logger.debug("gemini_session: no aistudio.google.com tab available")
+                return None
+            ws_url, fresh_target_id = opened
+            limits = _attempt(http_url, ws_url, timeout)
+            # Our tab was already fresh; a retry would just open an identical
+            # second throwaway. Fall through to close it.
+            return limits
+
+        # The existing tab went idle for a full window: genuinely wedged or
+        # logged out, or another probe is starving us for it. Back off, then
+        # try once more on a fresh tab nobody else can already be attached to.
+        if budget_seconds is not None and budget_seconds < (
+            _RETRY_BACKOFF_SECONDS + _SETTLE_SECONDS
+        ):
+            logger.debug("gemini_session: budget cannot cover fresh-tab retry")
+            return None
+        time.sleep(_RETRY_BACKOFF_SECONDS)
+
+        opened = _new_aistudio_target(http_url)
+        if opened is None:
+            logger.debug("gemini_session: fresh-tab retry could not open a tab")
+            return None
+        fresh_target_id = opened[1]
+        logger.debug("gemini_session: retrying on fresh tab after idle first pass")
+        return _attempt(http_url, opened[0], timeout)
+    finally:
+        if fresh_target_id is not None:
+            _close_target(http_url, fresh_target_id)
 
 
 def _parse_imported_projects(jspb_text: str) -> Optional[list]:

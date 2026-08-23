@@ -1163,6 +1163,7 @@ def _fetch_gemini_account_usage(
     api_key: Optional[str] = None,
     *,
     timeout: float = _DEFAULT_USAGE_TIMEOUT,
+    budget_seconds: Optional[float] = None,
 ) -> Optional[AccountUsageSnapshot]:
     """Gemini budget usage scraped from AI Studio's apikey page over CDP.
 
@@ -1174,12 +1175,17 @@ def _fetch_gemini_account_usage(
     CDP (:9222) and reads those response bodies passively -- no replay, no
     cookie decryption. Browser down / logged out / shape changed -> None ->
     the row shows no data instead of erroring every cycle.
+
+    ``budget_seconds`` threads through so the scraper may spend one backoff +
+    settle window on a fresh-tab retry when the collector can afford it.
     """
     try:
         from agent.gemini_session import fetch_gemini_budget_usage
     except ImportError:
         return None
-    result = fetch_gemini_budget_usage(timeout=timeout)
+    result = fetch_gemini_budget_usage(
+        timeout=timeout, budget_seconds=budget_seconds
+    )
     if not result:
         return None
     used_pct, budget_usd = result
@@ -1586,7 +1592,10 @@ def fetch_account_usage(
             )
         if normalized == "gemini":
             return _fetch_gemini_account_usage(
-                base_url=base_url, api_key=api_key, timeout=timeout
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+                budget_seconds=budget_seconds,
             )
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(
