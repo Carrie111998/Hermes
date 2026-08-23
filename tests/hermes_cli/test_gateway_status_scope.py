@@ -264,10 +264,10 @@ class TestGetServicePidsSystemdScope:
             f"No list-units calls were made. All calls: {recorded_calls}"
         )
         for call in list_units_calls:
-            assert expected_service in call, (
+            assert any(expected_service in arg for arg in call), (
                 f"Expected specific service name '{expected_service}' in {call}"
             )
-            assert "hermes-gateway*" not in call, (
+            assert not any("hermes-gateway*" in arg for arg in call), (
                 f"Wildcard 'hermes-gateway*' should NOT appear when "
                 f"all_profiles=False, but was found in {call}"
             )

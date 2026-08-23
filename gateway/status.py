@@ -620,6 +620,20 @@ def _record_matches_live_gateway_pid(
             live_cmdline, expected_home
         ):
             return False
+        # Env-based verification: the argv-based check above can false-match
+        # a default-profile gateway running under a different HERMES_HOME
+        # root.  Read the process's actual HERMES_HOME to confirm (#4671).
+        if expected_home is not None:
+            try:
+                import psutil  # type: ignore
+
+                proc_env = psutil.Process(pid).environ() or {}
+                proc_home = proc_env.get("HERMES_HOME", "").strip()
+                if proc_home:
+                    if Path(proc_home).resolve() != Path(expected_home).resolve():
+                        return False
+            except Exception:  # noqa: BLE001
+                pass  # Best-effort — fall through to argv-only verdict
         return True
     return _record_looks_like_gateway(record)
 
