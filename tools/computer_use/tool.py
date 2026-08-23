@@ -650,6 +650,7 @@ def _request_approval(action: str, args: Dict[str, Any],
         if scope_key in _always_allow.get(session_id, set()):
             return None
     if _computer_use_approval_bypass_active(session_id):
+        _warn_bypass_escalation(session_id)
         return None
     cb = _approval_callback
     if cb is None:
