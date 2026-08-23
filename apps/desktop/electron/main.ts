@@ -252,7 +252,7 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { selectPoolEvictions } from './pool-eviction'
-import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
+import { clampPoolLimits, parsePoolLimits } from './pool-limits'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
@@ -1370,6 +1370,7 @@ function readPersistedPoolLimits() {
       maxBackends: Number(process.env.HERMES_DESKTOP_POOL_MAX) || undefined,
       idleMs: Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || undefined
     }
+
     return parsePoolLimits(null) && clampPoolLimits(fromEnv)
   }
 }
@@ -1407,6 +1408,7 @@ function setPoolLimits(raw) {
 
   return { ...poolLimits }
 }
+
 // A backend touched within this window has a live renderer socket (the keepalive
 // pings every 60s for every open profile). LRU eviction must spare these — a
 // concurrent multi-profile session keeps several backends "fresh" at once, and

@@ -43,8 +43,8 @@ import {
   isCurrentGatewaySwitch,
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
-import { loadPoolLimits } from '@/store/pool-limits'
 import { notify, notifyError } from '@/store/notifications'
+import { loadPoolLimits } from '@/store/pool-limits'
 import {
   $activeGatewayProfile,
   normalizeProfileKey,
