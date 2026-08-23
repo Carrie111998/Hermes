@@ -2955,7 +2955,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     corruption source.
 
     Returns a report dict: ``{repaired: bool, strategy: str|None,
-    backup_path: str|None, error: str|None}``.
+    backup_path: str|None, error: str|None}``, with an optional
+    ``cleanup_error`` when the canonical result is usable but disposable
+    repair artefacts could not yet be removed.
     """
     report: Dict[str, Any] = {
         "repaired": False,
