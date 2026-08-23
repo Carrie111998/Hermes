@@ -2134,7 +2134,19 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+    #
+    # Bucket the dedup cache by a SESSION-STABLE key. `task_id` is only
+    # meaningful for explicit sub-agent tasks; for ordinary user turns the
+    # agent loop passes an effective_task_id that is re-generated as a fresh
+    # UUID on every turn (see `agent/turn_context.py`), so keying the cache
+    # on it makes every repeat-view a different bucket and dedup never fires.
+    # Use `session_id` (stable for a conversation) as the working key, falling
+    # back to task_id when session_id is unavailable, so cross-turn repeat
+    # views of the same skill are deduped while distinct sessions stay
+    # isolated. reset() uses the same stable key so compression still clears it.
+    _session_id = kw.get("session_id") or ""
+    _dedup_key = _session_id or (task_id or "")
+    stub = _check_skill_view_dedup(_dedup_key, name, args.get("file_path"))
     if stub is not None:
         return stub
     result = skill_view(
@@ -2143,7 +2155,7 @@ def _skill_view_with_bump(args, **kw):
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
+            _record_skill_view(_dedup_key, name, args.get("file_path"), parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name

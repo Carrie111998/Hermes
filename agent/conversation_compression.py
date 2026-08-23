@@ -3987,7 +3987,12 @@ def compress_context(
         # re-view must return the full skill content again.
         try:
             from tools.skills_tool import reset_skill_view_dedup
-            reset_skill_view_dedup(task_id)
+            # The skill_view dedup cache is bucketed by a session-stable key
+            # (see _skill_view_with_bump), so clear by session_id to match.
+            # Falling back to task_id (per-turn UUID) would miss the bucket and
+            # leave stale dedup entries that suppress a genuinely-changed skill.
+            _sv_dedup_reset_key = getattr(agent, "session_id", "") or ""
+            reset_skill_view_dedup(_sv_dedup_reset_key or task_id)
         except Exception:
             pass
 

@@ -92,3 +92,33 @@ class TestSkillViewDedup:
         # conversation_compression imports this lazily; keep the seam stable.
         from tools.skills_tool import reset_skill_view_dedup as f
         f(None)
+
+
+class TestSkillViewDedupCrossTurn:
+    """Regression: normal user turns get a fresh task_id UUID every turn (see
+    agent/turn_context.py effective_task_id = task_id or uuid4()), so the dedup
+    cache keyed on task_id never fires across turns. Bucket by session_id so a
+    repeat skill_view in the SAME conversation is deduped even when task_id
+    differs between turns.
+    """
+
+    def test_same_session_different_task_id_dedups(self, skills_home):
+        # Simulates two turns of the same conversation: session_id stable,
+        # task_id re-generated each turn (the real-world case).
+        args = {"name": "demo-dedup-skill"}
+        r1 = json.loads(_skill_view_with_bump(args, task_id="turn-1", session_id="sess-1"))
+        r2 = json.loads(_skill_view_with_bump(args, task_id="turn-2", session_id="sess-1"))
+        assert r2.get("dedup") is True, "same session + different task_id should dedup"
+
+    def test_different_sessions_stay_isolated(self, skills_home):
+        args = {"name": "demo-dedup-skill"}
+        r1 = json.loads(_skill_view_with_bump(args, task_id="turn-1", session_id="sess-A"))
+        r2 = json.loads(_skill_view_with_bump(args, task_id="turn-1", session_id="sess-B"))
+        assert "Step one" in r2.get("content", ""), "different sessions must not share cache"
+
+    def test_session_id_reset_clears_bucket(self, skills_home):
+        args = {"name": "demo-dedup-skill"}
+        _skill_view_with_bump(args, task_id="t-1", session_id="sess-X")
+        reset_skill_view_dedup("sess-X")
+        r2 = json.loads(_skill_view_with_bump(args, task_id="t-2", session_id="sess-X"))
+        assert "Step one" in r2.get("content", ""), "reset by session_id must clear the bucket"
