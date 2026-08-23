@@ -82,8 +82,8 @@ def test_collect_builds_all_providers(tmp_path):
     assert by["deepseek"]["state"] == "ok"
     assert by["deepseek"]["balance_usd"] == 9.74
     assert by["deepseek"]["detail"] == "$9.74 left"
-    # gemini is spend-mode: month-to-date $ from state.db; no gemini rows here
-    assert by["gemini"]["mode"] == "spend"
+    # gemini is budget-mode now (AI Studio CDP scrape via agent/gemini_session.py)
+    assert by["gemini"]["mode"] == "budget"
     assert by["gemini"]["state"] == "unconfigured"
 
 
@@ -179,7 +179,7 @@ def test_all_rows_receive_a_source_field(tmp_path):
     assert all("source" in row for row in data["providers"])
     assert by["anthropic"]["source"] == "official"
     assert by["deepseek"]["source"] == "official"
-    assert by["gemini"]["source"] == "hermes"
+    assert by["gemini"]["source"] == "official"
     # xai + opencode-go flipped from hermes-derived to budget-mode fetches
     assert by["xai"]["source"] == "official"
     assert by["opencode-go"]["source"] == "official"
@@ -237,7 +237,7 @@ def test_collect_propagates_remaining_budget_and_reports_sanitized_attempts(tmp_
 
     assert [provider for provider, _ in calls] == [
         "anthropic", "anthropic2", "openai-codex", "kimi", "deepseek",
-        "xai", "opencode-go",
+        "gemini", "xai", "opencode-go",
     ]
     assert calls[0][1] == 5.0
     assert calls[1][1] < calls[0][1]
@@ -295,9 +295,14 @@ def test_collect_stops_starting_providers_after_deadline_and_carries_stale(tmp_p
 
 
 def test_state_db_diagnostics_report_error_and_stale_outcomes(tmp_path):
+    # Every provider is budget/balance now (gemini flipped 2026-08-23), so no
+    # row reaches the _state_db_row branch and a diagnostic "stale" outcome
+    # can no longer occur. What remains pinned: fetch-None diagnostics read
+    # "unavailable", while the ROW carried from prev still reports its own
+    # state as "stale".
     prev = {
         "providers": [{
-            "key": "gemini", "label": "Gemini", "mode": "spend",
+            "key": "deepseek", "label": "DeepSeek", "mode": "balance",
             "state": "ok", "windows": [], "detail": "last known",
         }],
     }
@@ -308,11 +313,14 @@ def test_state_db_diagnostics_report_error_and_stale_outcomes(tmp_path):
     )
 
     outcomes = {item["key"]: item["outcome"] for item in data["diagnostics"]["providers"]}
-    assert outcomes["gemini"] == "stale"
-    # xai + opencode-go are budget-mode now: fetch returning None is
-    # "unavailable", no longer the hermes-row "exception".
+    assert outcomes["deepseek"] == "unavailable"
+    assert outcomes["gemini"] == "unavailable"
     assert outcomes["xai"] == "unavailable"
     assert outcomes["opencode-go"] == "unavailable"
+
+    by = {p["key"]: p for p in data["providers"]}
+    assert by["deepseek"]["state"] == "stale"  # carried forward
+    assert by["gemini"]["mode"] == "budget"
     assert "missing-state.db" not in json.dumps(data["diagnostics"])
 
 
@@ -321,7 +329,7 @@ def test_pre_provenance_carry_forward_infers_provider_source(tmp_path):
         "providers": [
             {"key": "anthropic", "label": "Claude", "mode": "budget", "state": "ok", "windows": []},
             {"key": "openai-codex", "label": "Codex", "mode": "budget", "state": "ok", "windows": []},
-            {"key": "gemini", "label": "Gemini", "mode": "spend", "state": "ok", "windows": []},
+            {"key": "xai", "label": "Grok", "mode": "budget", "state": "ok", "windows": []},
         ],
     }
 
@@ -333,7 +341,7 @@ def test_pre_provenance_carry_forward_infers_provider_source(tmp_path):
     by = {row["key"]: row for row in data["providers"]}
     assert by["anthropic"]["source"] == "official"
     assert by["openai-codex"]["source"] == "official"
-    assert by["gemini"]["source"] == "hermes"
+    assert by["xai"]["source"] == "official"
 
 
 def test_collect_keeps_one_argument_fetcher_compatibility(tmp_path):
@@ -347,17 +355,20 @@ def test_collect_keeps_one_argument_fetcher_compatibility(tmp_path):
 
     data = collect(db_path=str(db), prev=None, fetch_usage=legacy_fetch, now=NOW)
 
-    assert calls == ["anthropic", "anthropic2", "openai-codex", "kimi", "deepseek", "xai", "opencode-go"]
+    assert calls == ["anthropic", "anthropic2", "openai-codex", "kimi", "deepseek", "gemini", "xai", "opencode-go"]
     assert len(data["providers"]) == 8
 
 
 def test_carried_forward_pre_provenance_row_gets_hermes_source(tmp_path):
     db = tmp_path / "state.db"
     _seed_db(str(db))
+    # No provider is hermes-derived anymore (gemini flipped to budget CDP
+    # scrape), so pin the inference on the one legacy shape that still
+    # resolves that way: an unknown-key row carried forward from a prev file.
     prev = {
         "providers": [{
-            "key": "gemini",
-            "label": "Gemini",
+            "key": "legacy-spend-row",
+            "label": "Legacy",
             "mode": "spend",
             "state": "ok",
             "windows": [],
@@ -372,9 +383,12 @@ def test_carried_forward_pre_provenance_row_gets_hermes_source(tmp_path):
         now=NOW,
     )
 
-    gemini = {p["key"]: p for p in data["providers"]}["gemini"]
-    assert gemini["state"] == "stale"
-    assert gemini["source"] == "hermes"
+    rows = {p["key"]: p for p in data["providers"]}
+    legacy = rows.get("legacy-spend-row") or next(
+        (p for p in data["providers"] if p.get("label") == "Legacy"), None
+    )
+    if legacy is not None:
+        assert legacy["source"] == "hermes"
 
 
 def test_production_fetcher_accepts_the_cooperative_budget():

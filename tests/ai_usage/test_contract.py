@@ -16,7 +16,9 @@ def test_providers_grid_order_and_modes():
     # ANTHROPIC2_OAUTH_TOKEN; same oauth usage endpoint, same window labels.
     assert modes["anthropic2"] == "budget"
     assert modes["deepseek"] == "balance"  # pay-as-you-go outstanding-$
-    assert modes["gemini"] == "spend"  # month-to-date estimated-$ from tokens
+    # Gemini: AI Studio apikey-page RPC scrape over CDP
+    # (agent/gemini_session.py); no official usage API exists.
+    assert modes["gemini"] == "budget"
     # Grok: grok.com web-session scrape over CDP (agent/grok_session.py);
     # api.x.ai has no usage endpoint.
     assert modes["xai"] == "budget"
@@ -37,6 +39,8 @@ def test_window_label_map_covers_both_providers():
     assert WINDOW_LABEL_TO_ID["Monthly"] == ("mo", "Monthly")
     # Grok CDP scrape label
     assert WINDOW_LABEL_TO_ID["Grok window"] == ("5h", "Grok")
+    # Gemini CDP scrape shares OpenCode Go's Monthly mapping
+    assert WINDOW_LABEL_TO_ID["Monthly"] == ("mo", "Monthly")
 
 
 def test_token_windows_are_ordered_and_sized():

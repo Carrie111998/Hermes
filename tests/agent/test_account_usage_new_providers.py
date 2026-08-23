@@ -320,3 +320,55 @@ def test_grok_zero_total_returns_none(monkeypatch):
     )
 
     assert account_usage._fetch_grok_account_usage() is None
+
+
+# ---------------------------------------------------------------------------
+# Gemini (CDP scrape via agent/gemini_session.py) -- added 2026-08-23
+
+
+class _FakeGeminiSession:
+    """Stands in for agent.gemini_session.fetch_gemini_budget_usage."""
+
+    def __init__(self, result):
+        self.result = result
+        self.kwargs = None
+
+    def __call__(self, **kwargs):
+        self.kwargs = kwargs
+        return self.result
+
+
+def test_gemini_maps_pct_and_budget_to_monthly_window(monkeypatch):
+    fake = _FakeGeminiSession((14.9896, 250.0))
+    import agent.gemini_session as gemini_session
+    monkeypatch.setattr(gemini_session, "fetch_gemini_budget_usage", fake)
+
+    snap = account_usage._fetch_gemini_account_usage()
+
+    assert fake.kwargs["timeout"] == account_usage._DEFAULT_USAGE_TIMEOUT
+    assert snap.provider == "gemini"
+    assert snap.source == "web_scrape"
+    window = snap.windows[0]
+    assert window.label == "Monthly"
+    assert window.used_percent == pytest.approx(14.9896)
+    assert "$250 budget" in (window.detail or "")
+
+
+def test_gemini_no_data_returns_none(monkeypatch):
+    import agent.gemini_session as gemini_session
+    monkeypatch.setattr(
+        gemini_session, "fetch_gemini_budget_usage", lambda **kw: None
+    )
+
+    assert account_usage._fetch_gemini_account_usage() is None
+
+
+def test_gemini_dispatched_from_fetch_account_usage(monkeypatch):
+    import agent.gemini_session as gemini_session
+    monkeypatch.setattr(
+        gemini_session, "fetch_gemini_budget_usage", lambda **kw: (10.0, 100.0)
+    )
+
+    snap = account_usage.fetch_account_usage("gemini")
+    assert snap is not None
+    assert snap.provider == "gemini"

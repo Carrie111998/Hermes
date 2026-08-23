@@ -1158,6 +1158,45 @@ def _fetch_opencode_go_account_usage(
     )
 
 
+def _fetch_gemini_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
+) -> Optional[AccountUsageSnapshot]:
+    """Gemini budget usage scraped from AI Studio's apikey page over CDP.
+
+    Google exposes no usage API for Gemini API billing, but AI Studio's own
+    "API keys" page calls internal MakerSuiteService RPCs whose responses
+    carry month-to-date spend vs the account budget (verified 2026-08-23:
+    BatchGetProjectUsageLimits -> [["USD",null,<micros>],["USD","<budget>"]]).
+    agent/gemini_session.py drives an existing aistudio.google.com tab over
+    CDP (:9222) and reads those response bodies passively -- no replay, no
+    cookie decryption. Browser down / logged out / shape changed -> None ->
+    the row shows no data instead of erroring every cycle.
+    """
+    try:
+        from agent.gemini_session import fetch_gemini_budget_usage
+    except ImportError:
+        return None
+    result = fetch_gemini_budget_usage(timeout=timeout)
+    if not result:
+        return None
+    used_pct, budget_usd = result
+    return AccountUsageSnapshot(
+        provider="gemini",
+        source="web_scrape",
+        fetched_at=_utc_now(),
+        windows=(
+            AccountUsageWindow(
+                label="Monthly",
+                used_percent=max(0.0, min(100.0, float(used_pct))),
+                detail=f"${budget_usd:.0f} budget" if budget_usd else None,
+            ),
+        ),
+    )
+
+
 def _fetch_grok_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -1543,6 +1582,10 @@ def fetch_account_usage(
             )
         if normalized == "xai":
             return _fetch_grok_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
+        if normalized == "gemini":
+            return _fetch_gemini_account_usage(
                 base_url=base_url, api_key=api_key, timeout=timeout
             )
         if normalized == "openrouter":

@@ -12,11 +12,10 @@ PROVIDERS: list[tuple[str, str, str]] = [
     ("openai-codex", "Codex", "budget"),
     ("kimi", "Kimi K3", "budget"),
     ("deepseek", "DeepSeek", "balance"),
-    # Gemini has NO quantitative usage surface off a cookie session (verified
-    # 2026-08-22: v1beta/rateLimits is 404; AI Studio is login-walled in the
-    # automation browser). spend-mode keeps the row honest -- it reports
-    # Hermes-routed traffic only, never a fabricated %.
-    ("gemini", "Gemini", "spend"),
+    # Gemini: quantitative % scraped from AI Studio's own apikey-page RPCs
+    # (BatchGetProjectUsageLimits carries month-to-date spend vs budget) via
+    # agent/gemini_session.py over CDP -- see that module's docstring.
+    ("gemini", "Gemini", "budget"),
     ("xai", "Grok", "budget"),
     ("opencode-go", "OpenCode Go", "budget"),
 ]
@@ -32,7 +31,8 @@ WINDOW_LABEL_TO_ID: dict[str, tuple[str, str]] = {
     # Codex (_fetch_codex_account_usage)
     "Session": ("5h", "Session"),
     "Weekly": ("wk", "Weekly"),
-    # OpenCode Go (_fetch_opencode_go_account_usage)
+    # OpenCode Go (_fetch_opencode_go_account_usage) and Gemini
+    # (_fetch_gemini_account_usage, monthly budget %)
     "Rolling": ("5h", "Rolling"),
     "Monthly": ("mo", "Monthly"),
     # Grok (_fetch_grok_account_usage, via agent/grok_session.py CDP scrape)
