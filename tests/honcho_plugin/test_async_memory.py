@@ -265,6 +265,119 @@ class TestFlushAll:
 
 
 # ---------------------------------------------------------------------------
+# _flush_session concurrency (#92458)
+# ---------------------------------------------------------------------------
+
+class TestConcurrentFlushSession:
+    """The async writer thread and an exit-time flush_all() can both enter
+    _flush_session for the same session back-to-back in a short-lived
+    process. Without serialization, both read the same unsynced messages
+    before either marks them synced, and both POST the batch — every turn
+    of a one-shot run gets stored twice."""
+
+    def _prime(self, mgr, sess, *, send_delay=0.05):
+        """Cache real peer/session objects (not MagicMocks that auto-track
+        calls independently of timing) so add_messages is the single choke
+        point both flushers race through."""
+        honcho_session = MagicMock()
+        call_log = []
+        call_lock = threading.Lock()
+
+        def _slow_add_messages(messages):
+            # Widen the race window: without the lock, both threads' reads
+            # (identical new_messages, since neither has marked _synced yet)
+            # land here before either returns.
+            import time
+            time.sleep(send_delay)
+            with call_lock:
+                call_log.append(len(messages))
+
+        honcho_session.add_messages.side_effect = _slow_add_messages
+        mgr._sessions_cache[sess.honcho_session_id] = honcho_session
+        mgr._peers_cache[sess.user_peer_id] = MagicMock(
+            message=lambda content: {"role": "user", "content": content}
+        )
+        mgr._peers_cache[sess.assistant_peer_id] = MagicMock(
+            message=lambda content: {"role": "assistant", "content": content}
+        )
+        return honcho_session, call_log
+
+    def test_racing_flushes_send_the_batch_once(self, make_manager):
+        mgr = make_manager(write_frequency="session")
+        sess = _make_session(key="one-shot", honcho_session_id="one-shot")
+        sess.add_message("user", "hi")
+        sess.add_message("assistant", "hello")
+        mgr._cache[sess.key] = sess
+
+        _honcho_session, call_log = self._prime(mgr, sess)
+
+        # Simulates the reported pair: the async writer thread draining the
+        # queue for this session, racing an exit-time flush_all() for the
+        # same session — both handed the SAME HonchoSession object, exactly
+        # as save()/flush_all() do (they don't clone it).
+        results = []
+        results_lock = threading.Lock()
+
+        def flush():
+            ok = mgr._flush_session(sess)
+            with results_lock:
+                results.append(ok)
+
+        t1 = threading.Thread(target=flush)
+        t2 = threading.Thread(target=flush)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert len(call_log) == 1, f"expected exactly one send, got {call_log}"
+        assert call_log[0] == 2, "the single send must carry both messages"
+        assert results == [True, True]
+        assert all(m["_synced"] for m in sess.messages)
+
+    def test_distinct_sessions_still_flush_concurrently(self, make_manager):
+        # The lock must be per-session, not global — two DIFFERENT sessions
+        # must not block on each other.
+        mgr = make_manager(write_frequency="session")
+        s1 = _make_session(key="s1", honcho_session_id="s1")
+        s2 = _make_session(key="s2", honcho_session_id="s2")
+        s1.add_message("user", "a")
+        s2.add_message("user", "b")
+        mgr._cache[s1.key] = s1
+        mgr._cache[s2.key] = s2
+
+        gate = threading.Barrier(2, timeout=5)
+
+        for sess in (s1, s2):
+            honcho_session = MagicMock()
+
+            def _gated_add_messages(messages, _gate=gate):
+                # Both sends must be inside add_messages AT THE SAME TIME —
+                # if the lock were global, the second thread would still be
+                # blocked waiting to ENTER _flush_session and never reach here.
+                _gate.wait()
+
+            honcho_session.add_messages.side_effect = _gated_add_messages
+            mgr._sessions_cache[sess.honcho_session_id] = honcho_session
+            mgr._peers_cache[sess.user_peer_id] = MagicMock(message=lambda c: {"content": c})
+            mgr._peers_cache[sess.assistant_peer_id] = MagicMock(message=lambda c: {"content": c})
+
+        results = {}
+
+        def flush(sess, name):
+            results[name] = mgr._flush_session(sess)
+
+        t1 = threading.Thread(target=flush, args=(s1, "s1"))
+        t2 = threading.Thread(target=flush, args=(s2, "s2"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert results == {"s1": True, "s2": True}
+
+
+# ---------------------------------------------------------------------------
 # async writer thread lifecycle
 # ---------------------------------------------------------------------------
 

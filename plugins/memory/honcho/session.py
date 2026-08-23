@@ -151,6 +151,17 @@ class HonchoSessionManager:
         self._cache_lock = threading.RLock()
         self._peers_cache: dict[str, Any] = {}
         self._sessions_cache: dict[str, Any] = {}
+        # Per-session flush locks (#92458): the async writer thread and an
+        # exit-time flush_all() can both enter _flush_session for the same
+        # session back-to-back — in a short-lived process (one-shot CLI, -z)
+        # the enqueue and the exit flush land close enough together that both
+        # read the same unsynced messages before either marks them synced,
+        # and both POST the batch. Serializing per session (not globally —
+        # distinct sessions must still flush concurrently) closes the window:
+        # the second flusher enters after the first already marked _synced
+        # and finds nothing left to send. Created lazily under _cache_lock,
+        # like the other per-key caches on this manager.
+        self._flush_locks: dict[str, threading.Lock] = {}
         # Bumped (under _cache_lock) whenever _force_reauth rebuilds the client.
         # In-flight resolvers compare it around their SDK fetch so an object
         # bound to the discarded client is never stored into the fresh cache.
@@ -657,46 +668,65 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
+    def _get_flush_lock(self, session_key: str) -> threading.Lock:
+        """Get or create this session's flush lock (create step under _cache_lock)."""
+        with self._cache_lock:
+            lock = self._flush_locks.get(session_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._flush_locks[session_key] = lock
+            return lock
+
     def _flush_session(self, session: HonchoSession) -> bool:
-        """Internal: write unsynced messages to Honcho synchronously."""
-        if not session.messages:
-            return True
+        """Internal: write unsynced messages to Honcho synchronously.
 
-        new_messages = [m for m in session.messages if not m.get("_synced")]
-        if not new_messages:
-            return True
+        Serialized per session (#92458): the read (unsynced messages) → send
+        (POST) → mark (_synced = True) sequence has no atomicity of its own,
+        so two flushers racing the same session — typically the async writer
+        thread against an exit-time flush_all() — can both read the same
+        unsynced messages before either marks them, and both send the batch.
+        Holding this lock across the whole body makes the second flusher wait
+        for the first to mark _synced, so it finds nothing left to send.
+        """
+        with self._get_flush_lock(session.key):
+            if not session.messages:
+                return True
 
-        # Resolved inside the operation so a retry after a client rebuild gets fresh objects.
-        def _sync_messages() -> int:
-            user_peer = self._get_or_create_peer(session.user_peer_id)
-            assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
-            honcho_session = self._sessions_cache.get(session.honcho_session_id)
-            if honcho_session is None:
-                honcho_session, _ = self._get_or_create_honcho_session(
-                    session.honcho_session_id, user_peer, assistant_peer
-                )
-            honcho_messages = [
-                (user_peer if m["role"] == "user" else assistant_peer).message(m["content"])
-                for m in new_messages
-            ]
-            honcho_session.add_messages(honcho_messages)
-            return len(honcho_messages)
+            new_messages = [m for m in session.messages if not m.get("_synced")]
+            if not new_messages:
+                return True
 
-        try:
-            synced = self._authed_call("message sync", _sync_messages)
-            for msg in new_messages:
-                msg["_synced"] = True
-            logger.debug("Synced %d messages to Honcho for %s", synced, session.key)
-            with self._cache_lock:
-                self._cache[session.key] = session
-            return True
-        except Exception as e:
-            for msg in new_messages:
-                msg["_synced"] = False
-            logger.error("Failed to sync messages to Honcho: %s", e)
-            with self._cache_lock:
-                self._cache[session.key] = session
-            return False
+            # Resolved inside the operation so a retry after a client rebuild gets fresh objects.
+            def _sync_messages() -> int:
+                user_peer = self._get_or_create_peer(session.user_peer_id)
+                assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
+                honcho_session = self._sessions_cache.get(session.honcho_session_id)
+                if honcho_session is None:
+                    honcho_session, _ = self._get_or_create_honcho_session(
+                        session.honcho_session_id, user_peer, assistant_peer
+                    )
+                honcho_messages = [
+                    (user_peer if m["role"] == "user" else assistant_peer).message(m["content"])
+                    for m in new_messages
+                ]
+                honcho_session.add_messages(honcho_messages)
+                return len(honcho_messages)
+
+            try:
+                synced = self._authed_call("message sync", _sync_messages)
+                for msg in new_messages:
+                    msg["_synced"] = True
+                logger.debug("Synced %d messages to Honcho for %s", synced, session.key)
+                with self._cache_lock:
+                    self._cache[session.key] = session
+                return True
+            except Exception as e:
+                for msg in new_messages:
+                    msg["_synced"] = False
+                logger.error("Failed to sync messages to Honcho: %s", e)
+                with self._cache_lock:
+                    self._cache[session.key] = session
+                return False
 
     def _async_writer_loop(self) -> None:
         """Background daemon thread: drains the async write queue."""
