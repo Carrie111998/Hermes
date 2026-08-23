@@ -822,6 +822,17 @@ def _install_ssrf_guard_on_client(client: Any) -> None:
     )
 
 
+# Identifying UA for Hermes-owned direct downloads (media caches, platform
+# adapter fallbacks). CDNs with basic bot detection — upload.wikimedia.org
+# confirmed in #89260 — 403 the bare httpx default (``python-httpx/x``).
+# Wikimedia's UA policy (meta.wikimedia.org/wiki/User-Agent_policy) asks
+# clients to identify themselves rather than impersonate a browser, so this
+# names the agent instead of spoofing Chrome/Firefox. Already used ad hoc in
+# gateway/platforms/base.py and the teams/feishu adapters; call sites should
+# import this constant rather than re-typing the literal.
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; HermesAgent/1.0)"
+
+
 def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
     """Create an ``httpx.AsyncClient`` with connect-time SSRF validation.
 

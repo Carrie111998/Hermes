@@ -8089,10 +8089,16 @@ class TelegramAdapter(BasePlatformAdapter):
             # Fallback: download and upload as file (supports up to 10MB)
             try:
                 from gateway.platforms.base import _ssrf_redirect_guard
-                from tools.url_safety import create_ssrf_safe_async_client
+                from tools.url_safety import (
+                    DEFAULT_USER_AGENT,
+                    create_ssrf_safe_async_client,
+                )
 
+                # Same identifying UA already used for direct downloads in
+                # gateway/platforms/base.py and the teams/feishu adapters —
+                # bare httpx gets 403'd by bot-detecting CDNs (#89260).
                 _dl_headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "User-Agent": DEFAULT_USER_AGENT,
                     "Accept": "image/*,*/*;q=0.8",
                 }
                 async with create_ssrf_safe_async_client(
