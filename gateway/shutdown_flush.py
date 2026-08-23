@@ -446,6 +446,14 @@ def recover_pending_to_db(
         session_db = SessionDB()
         own_db = True
 
+    def _close_owned_db() -> None:
+        if not own_db:
+            return
+        try:
+            session_db.close()
+        except Exception:
+            pass
+
     recovered = 0
     blocked_session_keys: set[str] = set()
     for path in flush_files:
@@ -534,12 +542,12 @@ def recover_pending_to_db(
             # Leave the file for next startup retry.
             if session_key:
                 blocked_session_keys.add(session_key)
+        except BaseException:
+            # Shutdown cancellation/interrupt must not strand an owned DB.
+            _close_owned_db()
+            raise
 
-    if own_db:
-        try:
-            session_db.close()
-        except Exception:
-            pass
+    _close_owned_db()
 
     if recovered:
         logger.info(

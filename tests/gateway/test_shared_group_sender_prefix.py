@@ -547,6 +547,28 @@ def test_queue_or_replace_pending_event_preserves_a_b_a_arrival_order(
     ]
 
 
+def test_queue_or_replace_pending_event_preserves_photo_text_photo_fifo():
+    """A text turn between photos is a hard album boundary in arrival order."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:photo-text-photo"
+    events = (
+        _photo_event(_alice_source(), "/tmp/a-1.jpg", message_id="a1"),
+        _text_event("bob middle", _bob_source(), message_id="b1"),
+        _photo_event(_alice_source(), "/tmp/a-2.jpg", message_id="a2"),
+    )
+
+    for event in events:
+        runner._queue_or_replace_pending_event(session_key, event)
+
+    turns = _queued_turns(runner, adapter, session_key)
+    assert [turn.message_id for turn in turns] == ["a1", "b1", "a2"]
+    assert [turn.media_urls for turn in turns] == [
+        ["/tmp/a-1.jpg"],
+        [],
+        ["/tmp/a-2.jpg"],
+    ]
+
+
 def test_queue_or_replace_pending_event_merges_contiguous_media_at_fifo_tail():
     """An adjacent Bob photo burst may merge, but only behind Alice's head."""
     runner, adapter = _runner_with_adapter()
