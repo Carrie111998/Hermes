@@ -703,8 +703,8 @@ def _demote_inert_path_reference(pid: str, severity: str, description: str,
       verb that could touch the path, drops to ``medium``. It stays a rung
       above the comment because a string literal, unlike a comment, can be
       read by code elsewhere in the file; and the verb guard is there because
-      the construct's NAME is attacker-chosen. ``BLOCKED = os.system("cat
-      ~/.ssh/authorized_keys")`` is a denylist by name only.
+      the construct's NAME is attacker-chosen. A ``BLOCKED_FILES`` whose
+      right-hand side shells out to read the path is a denylist by name only.
 
     Neither reaches the ``high``/``critical`` bar in ``_determine_verdict``, so
     neither decides a verdict on its own, and both keep their file, line and
