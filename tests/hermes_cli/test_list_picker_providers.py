@@ -73,17 +73,38 @@ def test_excluded_models_filter_runs_after_openrouter_live_refresh(monkeypatch):
     assert result[0]["total_models"] == 1
 
 
+def test_exclusions_run_before_non_openrouter_picker_cap(monkeypatch):
+    base = [_make_provider(
+        "together",
+        models=[
+            "blocked/model-1",
+            "blocked/model-2",
+            "blocked/model-3",
+            "blocked/model-4",
+            "blocked/model-5",
+            "allowed/model-6",
+        ],
+    )]
+    captured = {}
 
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return list(base)
 
+    monkeypatch.setattr(
+        model_switch,
+        "list_authenticated_providers",
+        _capture,
+    )
 
+    result = model_switch.list_picker_providers(
+        max_models=5,
+        excluded_models={"together": ["blocked/*"]},
+    )
 
-
-
-
-
-
-
-
+    assert captured["max_models"] is None
+    assert result[0]["models"] == ["allowed/model-6"]
+    assert result[0]["total_models"] == 1
 
 
 def test_passthrough_kwargs_to_base(monkeypatch):
@@ -117,7 +138,7 @@ def test_passthrough_kwargs_to_base(monkeypatch):
     assert captured["current_model"] == "openai/gpt-5.4"
     assert captured["user_providers"] == {"foo": {"api": "http://x"}}
     assert captured["custom_providers"] == [{"name": "bar", "base_url": "http://y"}]
-    assert captured["max_models"] == 12
+    assert captured["max_models"] is None
 
 
 

@@ -3956,12 +3956,15 @@ def list_picker_providers(
     from hermes_cli.model_filters import filter_model_ids
     from hermes_cli.models import fetch_openrouter_models
 
+    # Exclusions must run against the complete provider inventory. Passing the
+    # picker cap into the base builder would discard later allowed models when
+    # the first ``max_models`` entries all match exclusion rules.
     providers = list_authenticated_providers(
         current_provider=current_provider,
         current_base_url=current_base_url,
         user_providers=user_providers,
         custom_providers=custom_providers,
-        max_models=max_models,
+        max_models=None,
         current_model=current_model,
         for_picker=True,
         excluded_providers=excluded_providers,
@@ -3975,26 +3978,23 @@ def list_picker_providers(
         if slug == "openrouter":
             try:
                 live = fetch_openrouter_models()
-                live_ids = [mid for mid, _ in live]
+                model_ids = [mid for mid, _ in live]
             except Exception:
-                live_ids = list(p.get("models", []))
-            allowed_ids = filter_model_ids(slug, live_ids, excluded_models)
-            p = dict(p)
-            p["models"] = (
-                allowed_ids[:max_models]
-                if max_models is not None
-                else allowed_ids
-            )
-            p["total_models"] = len(allowed_ids)
+                model_ids = list(p.get("models", []))
         else:
-            models = list(p.get("models") or [])
-            allowed_ids = filter_model_ids(slug, models, excluded_models)
-            if allowed_ids != models:
-                p = dict(p)
-                p["models"] = allowed_ids
-                p["total_models"] = len(allowed_ids)
+            model_ids = list(p.get("models") or [])
 
-        has_models = bool(p.get("models"))
+        allowed_ids = filter_model_ids(slug, model_ids, excluded_models)
+        if slug in _UNCAPPED_PICKER_PROVIDERS or max_models is None:
+            visible_ids = allowed_ids
+        else:
+            visible_ids = allowed_ids[:max_models]
+
+        p = dict(p)
+        p["models"] = visible_ids
+        p["total_models"] = len(allowed_ids)
+
+        has_models = bool(visible_ids)
         is_custom_endpoint = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
         if not has_models and not is_custom_endpoint:
             continue
