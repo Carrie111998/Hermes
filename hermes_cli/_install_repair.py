@@ -41,14 +41,11 @@ def _is_windows() -> bool:
 
 def _is_termux_env(env: dict | None = None) -> bool:
     """Stdlib Termux probe (hermes_cli.main's version lives behind imports)."""
-    env = env if env is not None else os.environ
-    try:
-        if env.get("TERMUX_VERSION"):
-            return True
-        prefix = env.get("PREFIX", "")
-        return "com.termux" in prefix
-    except Exception:
-        return False
+    return _er._is_termux_env(env)
+
+
+prefer_termux_bionic_path = _er.prefer_termux_bionic_path
+with_uv_termux_python_platform = _er.with_uv_termux_python_platform
 
 
 @contextlib.contextmanager
@@ -549,6 +546,9 @@ def _run_install_cmd(cmd: list[str], *, env: dict | None, root: Path) -> None:
     Raises CalledProcessError on install failure (callers implement the
     per-extra fallback ladder).
     """
+    if _is_termux_env(env):
+        env = prefer_termux_bionic_path(env)
+        cmd = with_uv_termux_python_platform(cmd, env)
     scripts_dir = _venv_scripts_dir(root) if _is_windows() else None
     failed: list[str] = []
     moved = (
