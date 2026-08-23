@@ -49,9 +49,9 @@ def _materializer_data(source: str) -> tuple[dict, tuple, tuple]:
     exact = _literal_assignment(module, "EXACT_REPLACEMENTS")
     regex = _literal_assignment(module, "REGEX_REPLACEMENTS")
     assert isinstance(new_files, dict)
-    assert isinstance(exact, tuple)
-    assert isinstance(regex, tuple)
-    return new_files, exact, regex
+    assert isinstance(exact, (list, tuple))
+    assert isinstance(regex, (list, tuple))
+    return new_files, tuple(exact), tuple(regex)
 
 
 def _copy_existing(paths: set[str], destination: Path) -> None:
