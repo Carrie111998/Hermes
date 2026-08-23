@@ -16,12 +16,16 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $panesFlipped, dismissAutoProject } from '@/store/layout'
+import { notifyError } from '@/store/notifications'
 import {
   copyPath,
   deleteProject,
@@ -34,6 +38,7 @@ import {
 
 import { ProjectAppearancePicker } from './project-appearance'
 import type { SidebarProjectTree } from './workspace-groups'
+import { useActiveProjectsGrouping } from '../projects-presentation'
 
 // Shared per-project state + handlers, so the kebab dropdown and the row's
 // right-click menu drive the exact same actions. Modeled on git GUIs (GitHub
@@ -56,6 +61,21 @@ function useProjectActions({
   const p = t.sidebar.projects
   const target = { id: project.id, name: project.label }
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
+  const grouping = useActiveProjectsGrouping()
+  const [groupPending, setGroupPending] = useState(false)
+  const claimedGroupId = grouping?.snapshot.groups.find(group => group.projectIds.includes(project.id))?.id ?? null
+
+  const assignProject = async (groupId: string | null) => {
+    if (!grouping?.contribution.assignProject || groupPending || groupId === claimedGroupId) return
+    setGroupPending(true)
+    try {
+      await grouping.contribution.assignProject(project.id, groupId)
+    } catch (error) {
+      notifyError(error, p.groupUpdateFailed)
+    } finally {
+      setGroupPending(false)
+    }
+  }
 
   const removeAuto = () => {
     dismissAutoProject(project.id)
@@ -134,7 +154,7 @@ function useProjectActions({
     />
   )
 
-  return { confirmDialog, dangerItem, identityItems, pathItems }
+  return { assignProject, claimedGroupId, confirmDialog, dangerItem, grouping, groupPending, identityItems, pathItems }
 }
 
 // Per-project actions. The kebab keeps its row-anchored Appearance popover; the
@@ -166,12 +186,13 @@ export function ProjectMenu({
   // when the panes are flipped (sidebar on the right).
   const panesFlipped = useStore($panesFlipped)
 
-  const { confirmDialog, dangerItem, identityItems, pathItems } = useProjectActions({
-    isActive,
-    onExitScope,
-    project,
-    scoped
-  })
+  const { assignProject, claimedGroupId, confirmDialog, dangerItem, grouping, groupPending, identityItems, pathItems } =
+    useProjectActions({
+      isActive,
+      onExitScope,
+      project,
+      scoped
+    })
 
   // Appearance writes route through the adopt-aware helper: an auto project is
   // materialized on its first change (its id then changes), so close the picker
@@ -249,6 +270,27 @@ export function ProjectMenu({
             </>
           )}
           {pathItems.map(item => renderActionItem(DROPDOWN_KIT, item))}
+          {grouping?.contribution.assignProject && (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger disabled={groupPending}>
+                <Codicon name="folder" size="0.875rem" />
+                <span>{p.moveToGroup}</span>
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent>
+                {grouping.snapshot.groups.map(group => (
+                  <DropdownMenuItem key={group.id} onSelect={() => void assignProject(group.id)}>
+                    <Codicon name={claimedGroupId === group.id ? 'check' : 'blank'} size="0.875rem" />
+                    {group.label}
+                  </DropdownMenuItem>
+                ))}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={() => void assignProject(null)}>
+                  <Codicon name={claimedGroupId === null ? 'check' : 'blank'} size="0.875rem" />
+                  {p.ungrouped}
+                </DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          )}
           <DropdownMenuSeparator />
           {renderActionItem(DROPDOWN_KIT, dangerItem)}
         </DropdownMenuContent>
@@ -294,12 +336,13 @@ export function ProjectContextMenu({
   const { t } = useI18n()
   const p = t.sidebar.projects
 
-  const { confirmDialog, dangerItem, identityItems, pathItems } = useProjectActions({
-    isActive,
-    onExitScope,
-    project,
-    scoped
-  })
+  const { assignProject, claimedGroupId, confirmDialog, dangerItem, grouping, groupPending, identityItems, pathItems } =
+    useProjectActions({
+      isActive,
+      onExitScope,
+      project,
+      scoped
+    })
 
   const canTheme = !project.isAuto || Boolean(project.path)
 
@@ -329,6 +372,27 @@ export function ProjectContextMenu({
       )}
       {(identityItems.length > 0 || canTheme) && <kit.Separator />}
       {pathItems.map(item => renderActionItem(kit, item))}
+      {grouping?.contribution.assignProject && (
+        <kit.Sub>
+          <kit.SubTrigger disabled={groupPending}>
+            <Codicon name="folder" size="0.875rem" />
+            <span>{p.moveToGroup}</span>
+          </kit.SubTrigger>
+          <kit.SubContent>
+            {grouping.snapshot.groups.map(group => (
+              <kit.Item key={group.id} onSelect={() => void assignProject(group.id)}>
+                <Codicon name={claimedGroupId === group.id ? 'check' : 'blank'} size="0.875rem" />
+                {group.label}
+              </kit.Item>
+            ))}
+            <kit.Separator />
+            <kit.Item onSelect={() => void assignProject(null)}>
+              <Codicon name={claimedGroupId === null ? 'check' : 'blank'} size="0.875rem" />
+              {p.ungrouped}
+            </kit.Item>
+          </kit.SubContent>
+        </kit.Sub>
+      )}
       <kit.Separator />
       {renderActionItem(kit, dangerItem)}
     </>

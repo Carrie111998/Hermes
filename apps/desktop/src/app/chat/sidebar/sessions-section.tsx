@@ -9,7 +9,7 @@ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { useContributions } from '@/contrib/react/use-contributions'
+import { notifyError } from '@/store/notifications'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import {
   groupEntriesByRecency,
@@ -23,7 +23,7 @@ import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
-import { PROJECTS_PRESENTATION_AREA, presentProjects } from './projects-presentation'
+import { useProjectsGrouping } from './projects-presentation'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -217,9 +217,7 @@ export function SidebarSessionsSection({
   card = false
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
-  // Subscribe so a runtime plugin re-registration immediately re-resolves the
-  // native Project overview instead of waiting for unrelated sidebar state.
-  useContributions(PROJECTS_PRESENTATION_AREA)
+  const projectsGrouping = useProjectsGrouping(projectOverview ?? [])
   const dividerLabels = t.sidebar.dateDivider
   const statusDividerLabels = t.sidebar.statusDivider
   const dotStates = useStore($sessionDotStateById)
@@ -409,11 +407,10 @@ export function SidebarSessionsSection({
   } else if (showEmptyState) {
     inner = emptyState
   } else if (projectOverview?.length) {
-    const presented = presentProjects(projectOverview)
+    const presented = projectsGrouping
 
     if (presented) {
-      const projectsDraggable = Boolean(onReorderProjects && presented.groups.some(group => group.projects.length > 1))
-      const NativeRow = projectsDraggable ? SortableProjectOverviewRow : ProjectOverviewRow
+      const NativeRow = ProjectOverviewRow
       const nativeRow = (project: SidebarProjectTree) => (
         <NativeRow
           activeProjectId={activeProjectId}
@@ -428,26 +425,36 @@ export function SidebarSessionsSection({
 
       inner = (
         <>
+          {presented.home && nativeRow(presented.home)}
           {presented.groups.map(group => (
             <div className="pb-1" key={group.id}>
-              <div className="px-2 pb-1 pt-1.5 text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
+              <button
+                aria-expanded={!group.collapsed}
+                className="flex w-full items-center gap-1 px-2 pb-1 pt-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)"
+                disabled={!presented.contribution.setGroupCollapsed}
+                onClick={() => {
+                  const setCollapsed = presented.contribution.setGroupCollapsed
+                  if (!setCollapsed) return
+                  void Promise.resolve(setCollapsed(group.id, !group.collapsed)).catch(error =>
+                    notifyError(error, t.sidebar.projects.groupUpdateFailed)
+                  )
+                }}
+                type="button"
+              >
+                <DisclosureCaret open={!group.collapsed} />
                 {group.label}
-              </div>
-              {!group.collapsed &&
-                (projectsDraggable && onReorderProjects && group.projects.length > 1 ? (
-                  <ReorderableList
-                    ids={group.projects.map(project => project.id)}
-                    onReorder={onReorderProjects}
-                    sensors={dndSensors}
-                  >
-                    {group.projects.map(nativeRow)}
-                  </ReorderableList>
-                ) : (
-                  group.projects.map(nativeRow)
-                ))}
+              </button>
+              {!group.collapsed && group.projects.map(nativeRow)}
             </div>
           ))}
-          {presented.ungrouped.map(nativeRow)}
+          {presented.ungrouped.length > 0 && (
+            <div className="pb-1">
+              <div className="px-2 pb-1 pt-1.5 text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
+                {t.sidebar.projects.ungrouped}
+              </div>
+              {presented.ungrouped.map(nativeRow)}
+            </div>
+          )}
         </>
       )
     } else {

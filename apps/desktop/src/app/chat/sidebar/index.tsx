@@ -151,6 +151,8 @@ import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } 
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
+import { ProjectGroupDialog } from './project-group-dialog'
+import { useActiveProjectsGrouping } from './projects-presentation'
 import {
   excludeProjectSessions,
   liveSessionProjectId,
@@ -327,6 +329,8 @@ export function ChatSidebar({
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
   // below the built-ins with the same chrome; active = at their route.
   const navContributions = useContributions(SIDEBAR_NAV_AREA)
+  const projectsGrouping = useActiveProjectsGrouping()
+  const [projectGroupDialogOpen, setProjectGroupDialogOpen] = useState(false)
 
   const contributedNav = useMemo<SidebarNavItem[]>(
     () =>
@@ -1753,25 +1757,43 @@ export function ChatSidebar({
                     ) : (
                       <>
                         {!showAllProfiles ? (
-                          <Tip label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}>
-                            <Button
-                              aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
-                              className={HEADER_ACTION_BTN}
-                              onClick={event => {
-                                event.stopPropagation()
+                          <>
+                            <Tip label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}>
+                              <Button
+                                aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
+                                className={HEADER_ACTION_BTN}
+                                onClick={event => {
+                                  event.stopPropagation()
 
-                                if (agentsGrouped) {
-                                  openProjectCreate()
-                                } else {
-                                  onNewSessionInWorkspace(null)
-                                }
-                              }}
-                              size="icon-xs"
-                              variant="ghost"
-                            >
-                              <Codicon name="add" size="0.75rem" />
-                            </Button>
-                          </Tip>
+                                  if (agentsGrouped) {
+                                    openProjectCreate()
+                                  } else {
+                                    onNewSessionInWorkspace(null)
+                                  }
+                                }}
+                                size="icon-xs"
+                                variant="ghost"
+                              >
+                                <Codicon name="add" size="0.75rem" />
+                              </Button>
+                            </Tip>
+                            {agentsGrouped && projectsGrouping?.contribution.createGroup ? (
+                              <Tip label={s.projects.createGroup}>
+                                <Button
+                                  aria-label={s.projects.createGroup}
+                                  className={HEADER_ACTION_BTN}
+                                  onClick={event => {
+                                    event.stopPropagation()
+                                    setProjectGroupDialogOpen(true)
+                                  }}
+                                  size="icon-xs"
+                                  variant="ghost"
+                                >
+                                  <Codicon name="new-folder" size="0.75rem" />
+                                </Button>
+                              </Tip>
+                            ) : null}
+                          </>
                         ) : null}
                         <div className="grid size-6 place-items-center">
                           <SidebarFilterMenu className={HEADER_NAV_BTN} />
@@ -1891,6 +1913,14 @@ export function ChatSidebar({
         </div>
       </SidebarContent>
       <ProjectDialog />
+      {projectsGrouping?.contribution.createGroup ? (
+        <ProjectGroupDialog
+          contribution={projectsGrouping.contribution}
+          onOpenChange={setProjectGroupDialogOpen}
+          open={projectGroupDialogOpen}
+          snapshot={projectsGrouping.snapshot}
+        />
+      ) : null}
       {/* One mount for the whole app. The header of WorktreeDialog tells why. */}
       <WorktreeDialog />
     </Sidebar>

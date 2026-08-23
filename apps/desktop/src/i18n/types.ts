@@ -1831,6 +1831,15 @@ export interface Translations {
       primaryBadge: string
       removeFolder: string
       create: string
+      createGroup: string
+      createGroupTitle: string
+      groupNamePlaceholder: string
+      groupNameInvalid: string
+      groupNameDuplicate: string
+      groupCreateFailed: string
+      groupUpdateFailed: string
+      moveToGroup: string
+      ungrouped: string
       menu: string
       menuRename: string
       menuAppearance: string
