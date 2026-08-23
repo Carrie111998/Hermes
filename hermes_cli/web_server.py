@@ -4473,6 +4473,9 @@ def _validated_terminal_update_receipt(
     if not isinstance(summary, dict):
         return None, None, False
     typed_summary = cast(Dict[str, Any], summary)
+    refusal = typed_summary.get("refusal")
+    if refusal is not None and not isinstance(refusal, dict):
+        return None, None, False
     has_correlation_id = "correlation_id" in typed_summary
     action_id = _valid_update_action_id(typed_summary.get("correlation_id"))
     outcome = typed_summary.get("outcome")
@@ -6057,7 +6060,10 @@ def _latest_update_receipt_summary() -> Optional[Dict[str, Any]]:
             return None
         fleet_value = receipt.get("fleet")
         fleet = fleet_value if isinstance(fleet_value, list) else []
-        refusal = receipt.get("refusal")
+        _MISSING = object()
+        refusal = receipt.get("refusal", _MISSING)
+        if refusal is not _MISSING and not isinstance(refusal, dict):
+            return None
         refusal_summary = None
         if isinstance(refusal, dict) and refusal:
             refusal_summary = {

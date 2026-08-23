@@ -351,6 +351,49 @@ def test_malformed_nested_refusal_scalar_is_sanitized(
     assert status["receipt"]["refusal"][field] is None
 
 
+def test_non_object_nested_refusal_never_arbitrates(monkeypatch):
+    import hermes_cli.update_receipt as update_receipt
+
+    action_id = "e" * 32
+    payload = _receipt(correlation_id=action_id, outcome="refused")
+    payload["refusal"] = []
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: payload)
+
+    summary = web_server._latest_update_receipt_summary()
+    assert summary is None
+    assert web_server._validated_terminal_update_receipt(summary) == (
+        None,
+        None,
+        False,
+    )
+
+    summary = _receipt(correlation_id=action_id, outcome="refused")
+    summary["refusal"] = []
+    assert web_server._validated_terminal_update_receipt(summary) == (
+        None,
+        None,
+        False,
+    )
+
+
+def test_object_nested_refusal_arbitrates(monkeypatch):
+    import hermes_cli.update_receipt as update_receipt
+
+    action_id = "f" * 32
+    payload = _receipt(correlation_id=action_id, outcome="refused")
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: payload)
+
+    summary = web_server._latest_update_receipt_summary()
+
+    assert summary is not None
+    assert summary["refusal"] == payload["refusal"]
+    assert web_server._validated_terminal_update_receipt(summary) == (
+        action_id,
+        "refused",
+        False,
+    )
+
+
 def test_latest_receipt_summary_sanitizes_all_other_exposed_scalars(monkeypatch):
     import hermes_cli.update_receipt as update_receipt
 
