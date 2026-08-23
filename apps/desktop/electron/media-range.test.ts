@@ -15,6 +15,10 @@ describe('media-range: parseByteRange', () => {
     expect(parseByteRange('bytes=990-5000', 1000)).toEqual({ start: 990, end: 999 })
   })
 
+  it('ignores multi-range requests as a whole (RFC 7233 allows answering 200 instead of multipart)', () => {
+    expect(parseByteRange('bytes=0-99,500-599', 1000)).toBeNull()
+  })
+
   it('returns null without a usable Range and unsatisfiable when out of bounds', () => {
     expect(parseByteRange(null, 1000)).toBeNull()
     expect(parseByteRange('', 1000)).toBeNull()
@@ -75,6 +79,19 @@ describe('media-range: buildLocalMediaResponse', () => {
 
     expect(bad.status).toBe(416)
     expect(bad.headers.get('content-range')).toBe('bytes */1000')
+  })
+
+  it('serves the whole file (200) for a multi-range request and 404 for a missing file', async () => {
+    const { file } = await fixture()
+    const multi = await buildLocalMediaResponse(file, { rangeHeader: 'bytes=0-99,500-599' })
+
+    expect(multi.status).toBe(200)
+    expect(multi.headers.get('content-length')).toBe('1000')
+    expect((await multi.arrayBuffer()).byteLength).toBe(1000)
+
+    const missing = await buildLocalMediaResponse(path.join(path.dirname(file), 'nope.mp4'))
+
+    expect(missing.status).toBe(404)
   })
 
   it('answers HEAD with headers only', async () => {

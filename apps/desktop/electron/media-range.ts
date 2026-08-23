@@ -14,7 +14,7 @@ import { Readable } from 'node:stream'
  *
  * This module answers the request itself: it parses `Range`, slices the file with
  * `createReadStream`, and returns `206` with `Content-Range` / `Accept-Ranges` (plus `416` for
- * unsatisfiable ranges and header-only `HEAD` responses).
+ * unsatisfiable ranges, header-only `HEAD` responses, and `404` when the file is gone).
  */
 
 const MEDIA_MIME: Record<string, string> = {
@@ -46,16 +46,20 @@ export interface ByteRange {
 }
 
 /**
- * Parse `Range: bytes=a-b` / `bytes=a-` / `bytes=-n`. Only the first range of a multi-range
- * header is honored. Returns `null` when there is no usable Range header (serve the whole
- * file) and `'unsatisfiable'` when the range starts beyond the end of the file (answer 416).
+ * Parse `Range: bytes=a-b` / `bytes=a-` / `bytes=-n`.
+ *
+ * Multi-range requests (any comma in the header) are deliberately ignored as a whole — RFC 7233
+ * lets a server answer `200` with the full representation instead of `multipart/byteranges`,
+ * and Chromium's media stack only ever sends a single range. Returns `null` when there is no
+ * usable Range header (serve the whole file) and `'unsatisfiable'` when the range starts beyond
+ * the end of the file (answer 416).
  */
 export function parseByteRange(header: string | null | undefined, size: number): ByteRange | null | 'unsatisfiable' {
-  if (!header) {
+  if (!header || header.includes(',')) {
     return null
   }
 
-  const m = /^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*(?:,|$)/i.exec(header)
+  const m = /^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$/i.exec(header)
 
   if (!m || (m[1] === '' && m[2] === '')) {
     return null
@@ -95,9 +99,25 @@ export interface LocalMediaResponseInit {
   rangeHeader?: string | null
 }
 
-/** Build the 200 / 206 / 416 response for a local media file (HEAD gets headers only). */
+/** Build the 200 / 206 / 404 / 416 response for a local media file (HEAD gets headers only). */
 export async function buildLocalMediaResponse(resolvedPath: string, init: LocalMediaResponseInit = {}): Promise<Response> {
-  const stat = await fsp.stat(resolvedPath)
+  let handle: fsp.FileHandle
+
+  try {
+    handle = await fsp.open(resolvedPath, 'r')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code
+
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return new Response('Media not found', { status: 404 })
+    }
+
+    throw error
+  }
+
+  // fstat the handle we are about to read from, so `Content-Length` and the streamed bytes come
+  // from the same open file even if the path is truncated or replaced meanwhile.
+  const stat = await handle.stat()
   const size = stat.size
   const mime = mediaMimeFor(resolvedPath)
   const isHead = (init.method || 'GET').toUpperCase() === 'HEAD'
@@ -110,7 +130,14 @@ export async function buildLocalMediaResponse(resolvedPath: string, init: LocalM
     'Last-Modified': stat.mtime.toUTCString()
   }
 
+  const stream = (opts: { end?: number; start?: number }) =>
+    // Hand the FileHandle itself (not the raw fd) to the stream: it owns and closes it on end, so
+    // the handle is never closed twice (EBADF on garbage collection).
+    Readable.toWeb(createReadStream(resolvedPath, { ...opts, autoClose: true, fd: handle })) as unknown as ReadableStream
+
   if (range === 'unsatisfiable') {
+    await handle.close()
+
     return new Response(null, { headers: { ...baseHeaders, 'Content-Range': `bytes */${size}` }, status: 416 })
   }
 
@@ -118,10 +145,12 @@ export async function buildLocalMediaResponse(resolvedPath: string, init: LocalM
     const headers = { ...baseHeaders, 'Content-Length': String(size) }
 
     if (isHead || size === 0) {
+      await handle.close()
+
       return new Response(null, { headers, status: 200 })
     }
 
-    return new Response(Readable.toWeb(createReadStream(resolvedPath)) as unknown as ReadableStream, { headers, status: 200 })
+    return new Response(stream({}), { headers, status: 200 })
   }
 
   const length = range.end - range.start + 1
@@ -132,11 +161,10 @@ export async function buildLocalMediaResponse(resolvedPath: string, init: LocalM
   }
 
   if (isHead) {
+    await handle.close()
+
     return new Response(null, { headers, status: 206 })
   }
 
-  return new Response(
-    Readable.toWeb(createReadStream(resolvedPath, { end: range.end, start: range.start })) as unknown as ReadableStream,
-    { headers, status: 206 }
-  )
+  return new Response(stream({ end: range.end, start: range.start }), { headers, status: 206 })
 }
