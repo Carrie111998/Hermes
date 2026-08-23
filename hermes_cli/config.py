@@ -1767,10 +1767,19 @@ def _normalize_custom_provider_entry(
     # resolve_runtime_provider() map this onto AIAgent.max_tokens when the
     # global model.max_tokens isn't set (gateway/run.py).
     for _mot_key in ("max_output_tokens", "max_tokens"):
+        if _mot_key not in entry:
+            continue
         _mot = entry.get(_mot_key)
         if isinstance(_mot, int) and _mot > 0:
             normalized["max_output_tokens"] = _mot
             break
+        # Present-but-invalid: say so. A silent drop here is exactly the
+        # quiet-misconfiguration class this key exists to fix.
+        _warn_once_per_provider(
+            provider_key, f"bad-cap:{_mot_key}",
+            "providers.%s: %s value %r ignored (must be a positive integer)",
+            provider_key or "?", _mot_key, _mot,
+        )
 
     rate_limit_delay = entry.get("rate_limit_delay")
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
