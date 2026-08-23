@@ -835,6 +835,10 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     oauth_snapshot = storage.snapshot()
     removed_entry = None
     manager = get_manager()
+    # Snapshot/restore is intentionally scoped to the normal single interactive
+    # CLI login/reauth flow. A concurrent reauth for the same server could race
+    # between snapshot, manager.remove(), and replacement writes; this is not a
+    # cross-process transaction primitive.
     try:
         removed_entry = manager.remove(name)
     except Exception as exc:
@@ -888,11 +892,11 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         # real tool call later hangs until timeout because there's no token.
         # Verify a token actually landed on disk before claiming success.
         if not _oauth_tokens_present(name):
-            _rollback_oauth_state()
             _warning(
                 "Server responded, but no OAuth token was obtained — "
                 "authentication did not complete."
             )
+            _rollback_oauth_state()
             print()
             _info(
                 "Some providers (e.g. Google Drive, Atlassian) do not support "

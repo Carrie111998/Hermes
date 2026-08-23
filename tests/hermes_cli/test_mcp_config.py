@@ -748,6 +748,7 @@ class TestMcpLogin:
         out = capsys.readouterr().out
 
         assert "no OAuth token was obtained" in out
+        assert "Could not restore previous OAuth state" not in out
         assert "Authenticated" not in out
         assert "client_id" in out
 
@@ -812,12 +813,26 @@ class TestMcpLogin:
             "hermes_cli.mcp_config._probe_single_server", mock_probe
         )
 
+        from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+
+        reset_manager_for_tests()
+        _set_interactive_stdin(monkeypatch)
+        manager = get_manager()
+        provider = manager.get_or_build_provider(
+            "linear", "https://mcp.linear.app/mcp", None
+        )
+        assert manager._key("linear") in manager._entries
+
         from hermes_cli.mcp_config import cmd_mcp_login
 
         cmd_mcp_login(_make_args(name="linear"))
         out = capsys.readouterr().out
 
         assert "Authentication failed" in out
+        assert "Could not restore previous OAuth state" not in out
+        assert manager.get_or_build_provider(
+            "linear", "https://mcp.linear.app/mcp", None
+        ) is provider
         for name, data in original.items():
             path = token_dir / name
             assert path.read_bytes() == data

@@ -593,12 +593,30 @@ class HermesTokenStorage:
         for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
             try:
                 st = p.stat()
-                snap[p.name] = {
-                    "data": p.read_bytes(),
-                    "mode": stat.S_IMODE(st.st_mode),
-                }
-            except OSError:
-                pass
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "Incomplete OAuth state snapshot for %s: could not stat %s: %s",
+                    self._server_name,
+                    p.name,
+                    exc,
+                )
+                continue
+            try:
+                data = p.read_bytes()
+            except OSError as exc:
+                logger.warning(
+                    "Incomplete OAuth state snapshot for %s: could not read %s: %s",
+                    self._server_name,
+                    p.name,
+                    exc,
+                )
+                continue
+            snap[p.name] = {
+                "data": data,
+                "mode": stat.S_IMODE(st.st_mode),
+            }
         return snap
 
     def restore(self, snapshot: dict[str, dict[str, Any]], *, only_if_absent: bool = False) -> None:
