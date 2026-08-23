@@ -782,6 +782,57 @@ def _strip_background_review_harness(
     return out
 
 
+# Historical content signatures for empty-response recovery scaffolding.
+# Private ``_empty_*`` flags are intentionally not part of SessionDB's durable
+# schema, so load-time repair must recognize rows written by older/racing paths
+# after those flags have been projected away.
+_PERSISTED_EMPTY_RESPONSE_SENTINEL = "(empty)"
+_PERSISTED_EMPTY_RECOVERY_NUDGE = (
+    "You just executed tool calls but returned an empty response. "
+    "Please process the tool results above and continue with the task."
+)
+
+
+def _strip_persisted_empty_recovery_scaffolding(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Remove empty-response retry scaffolding from restored transcripts.
+
+    Prevention at the write boundary uses private in-memory flags, but builds
+    predating that guard (and interrupted writes that lost private metadata)
+    can leave the assistant failure sentinel and synthetic user nudge active in
+    ``state.db``. Replaying either row as genuine history teaches the model to
+    continue returning empty responses. Match only the exact role/content
+    signatures; similar user or assistant text remains ordinary conversation.
+    """
+    repaired = 0
+    restored: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        is_empty_sentinel = (
+            role == "assistant"
+            and isinstance(content, str)
+            and content.strip() == _PERSISTED_EMPTY_RESPONSE_SENTINEL
+        )
+        is_recovery_nudge = (
+            role == "user"
+            and isinstance(content, str)
+            and content.strip() == _PERSISTED_EMPTY_RECOVERY_NUDGE
+        )
+        if is_empty_sentinel or is_recovery_nudge:
+            repaired += 1
+            continue
+        restored.append(msg)
+    if repaired:
+        logger.info(
+            "Removed %d persisted empty-response recovery message(s) while "
+            "restoring session",
+            repaired,
+        )
+    return restored
+
+
 # Matches a bare protocol/tool-name marker such as "[memory]" or "[skill_manage]".
 _STALE_TOOL_CALL_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 
@@ -11198,6 +11249,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # assistant reply immediately following it, so a polluted session
         # resumes clean even if stray rows exist.
         messages = _strip_background_review_harness(messages)
+        # Empty-response recovery markers are private in-memory metadata and do
+        # not survive SessionDB projection. Heal already-contaminated sessions
+        # by their narrow role/content signatures before they re-enter either
+        # the model replay or display history.
+        messages = _strip_persisted_empty_recovery_scaffolding(messages)
         # DEFENSE-IN-DEPTH against #78148: before that fix, a bare tool-call
         # marker (e.g. "[memory]") could get cached as a fallback and
         # persisted as if it were the model's real answer. Sessions written
