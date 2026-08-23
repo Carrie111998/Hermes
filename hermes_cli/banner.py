@@ -301,9 +301,23 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         )
         if ancestor.returncode == 0:
             return 0
-        # Genuinely behind (or diverged). Recover the exact count via the
-        # GitHub compare API; a local-only HEAD 404s there, which safely
-        # degrades to the honest no-count sentinel — never a fabricated 1.
+        # Genuinely behind (or diverged). Prefer the exact LOCAL count when
+        # the objects are present: rev-list from the merge base counts only
+        # the commits strictly after it, which stays correct for a merge
+        # commit whose second parent is an old upstream snapshot — the
+        # GitHub compare API inflates the count there by reporting the total
+        # divergence between the two tips (#93146).
+        merge_base = _git_stdout(["merge-base", "HEAD", upstream_rev], cwd=repo_dir)
+        if merge_base:
+            counted_str = _git_stdout(
+                ["rev-list", "--count", f"{merge_base}..{upstream_rev}"],
+                cwd=repo_dir,
+            )
+            if counted_str and counted_str.strip().isdigit():
+                return int(counted_str.strip())
+        # Local objects unavailable (never fetched) — fall back to the GitHub
+        # compare API; a local-only HEAD 404s there, which safely degrades to
+        # the honest no-count sentinel — never a fabricated 1.
         counted = _github_compare_behind(head_rev, upstream_rev)
         return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 

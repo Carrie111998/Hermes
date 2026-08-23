@@ -87,6 +87,8 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
             return "b" * 40
+        if args == ["merge-base", "HEAD", "a" * 40]:
+            return None  # upstream objects not fetched locally -> API fallback
         raise AssertionError(f"unexpected git call: {args}")
 
     with (
@@ -99,6 +101,48 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
         behind = banner._check_via_local_git(repo_dir)
 
     assert behind == 3
+
+
+def test_check_via_local_git_ssh_prefers_local_count_over_compare_api(tmp_path):
+    """#93146: when the local repo has the upstream objects, the exact local
+    rev-list count wins over the GitHub compare API — the API inflates the
+    count for a merge commit whose second parent is an old upstream snapshot
+    (reported 1567 where the merge-base-anchored count is 5)."""
+    from unittest.mock import MagicMock
+
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+    upstream_tip = "a" * 40
+
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "git@github.com:NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "HEAD"]:
+            return "b" * 40
+        if args == ["merge-base", "HEAD", upstream_tip]:
+            return "c" * 40  # old upstream snapshot merged as 2nd parent
+        if args == ["rev-list", "--count", f"{'c' * 40}..{upstream_tip}"]:
+            return "5"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(banner, "_upstream_main_sha", return_value=upstream_tip),
+        # not an ancestor: the merge's 2nd parent is an OLD upstream tip
+        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
+        # The API would report the inflated total divergence (1567 in the
+        # report) — the local count must win without consulting it.
+        patch.object(
+            banner,
+            "_github_compare_behind",
+            side_effect=AssertionError("local count must win over the compare API"),
+        ),
+    ):
+        behind = banner._check_via_local_git(repo_dir)
+
+    assert behind == 5
 
 
 def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
@@ -115,6 +159,8 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
             return "b" * 40
+        if args == ["merge-base", "HEAD", "a" * 40]:
+            return None  # upstream objects not fetched locally -> API fallback
         raise AssertionError(f"unexpected git call: {args}")
 
     with (
