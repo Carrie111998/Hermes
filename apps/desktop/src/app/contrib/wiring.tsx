@@ -452,6 +452,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const { handleGatewayEvent } = useMessageStream({
     activeGatewayProfile,
     activeSessionIdRef,
+    selectedStoredSessionIdRef,
     hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,

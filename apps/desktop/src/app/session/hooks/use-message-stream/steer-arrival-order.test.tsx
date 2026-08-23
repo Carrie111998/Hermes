@@ -64,6 +64,7 @@ function Harness() {
 
   const stream = useMessageStream({
     activeSessionIdRef,
+    selectedStoredSessionIdRef,
     hydrateFromStoredSession: vi.fn(async () => undefined),
     queryClient: queryClientRef.current,
     refreshHermesConfig: vi.fn(async () => undefined),

@@ -53,11 +53,13 @@ export function renderMessageStream(
 
   function Harness() {
     const activeSessionIdRef = useRef<string | null>(sessionId)
+    const selectedStoredSessionIdRef = useRef<string | null>(sessionId)
     const sessionStateByRuntimeIdRef = useRef(states)
     const queryClientRef = useRef(new QueryClient())
 
     const stream = useMessageStream({
       activeSessionIdRef,
+      selectedStoredSessionIdRef,
       hydrateFromStoredSession: vi.fn(async () => undefined),
       queryClient: queryClientRef.current,
       refreshHermesConfig: vi.fn(async () => undefined),

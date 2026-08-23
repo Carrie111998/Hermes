@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalReplaySessionId, gatewayEventRequiresSessionId, resolveGatewayEventSessionId } from './gateway-events'
+import {
+  approvalReplaySessionId,
+  gatewayEventIsActive,
+  gatewayEventRequiresSessionId,
+  resolveGatewayEventSessionId
+} from './gateway-events'
 
 describe('gateway event routing', () => {
   it('rehydrates pending approvals on reconnect ready and resumed session info', () => {
@@ -126,5 +131,53 @@ describe('gateway event routing', () => {
       pinned: true,
       sessionId: 'session-a'
     })
+  })
+
+  it('accepts a recovered runtime for the selected conversation from the active source', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-stale',
+        eventRuntimeSessionId: 'runtime-current',
+        eventStoredSessionId: 'stored-visible',
+        fromActiveSource: true,
+        selectedStoredSessionId: 'stored-visible'
+      })
+    ).toBe(true)
+  })
+
+  it('rejects a stored-session-id collision from an inactive source', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-background',
+        eventStoredSessionId: 'stored-visible',
+        fromActiveSource: false,
+        selectedStoredSessionId: 'stored-visible'
+      })
+    ).toBe(false)
+  })
+
+  it('rejects an exact runtime-id collision from an inactive source', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-visible',
+        eventStoredSessionId: 'stored-visible',
+        fromActiveSource: false,
+        selectedStoredSessionId: 'stored-visible'
+      })
+    ).toBe(false)
+  })
+
+  it('rejects a runtime mismatch without a durable conversation mapping', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-recovered',
+        eventStoredSessionId: null,
+        fromActiveSource: true,
+        selectedStoredSessionId: 'stored-visible'
+      })
+    ).toBe(false)
   })
 })

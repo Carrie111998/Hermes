@@ -38,6 +38,7 @@ import { completionErrorText, delegateTaskPayloads, MAX_STREAM_FLUSH_GAP_MS, STR
 interface MessageStreamOptions {
   activeGatewayProfile?: string
   activeSessionIdRef: MutableRefObject<string | null>
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
   hydrateFromStoredSession: (
     attempts?: number,
     storedSessionId?: string | null,
@@ -70,6 +71,7 @@ const nextStreamMessageId = (prefix: string) => `${prefix}-${Date.now()}-${++str
 export function useMessageStream({
   activeGatewayProfile = 'default',
   activeSessionIdRef,
+  selectedStoredSessionIdRef,
   hydrateFromStoredSession,
   queryClient,
   refreshHermesConfig,
@@ -845,6 +847,7 @@ export function useMessageStream({
     appendAssistantDelta,
     appendReasoningDelta,
     activeSessionIdRef,
+    selectedStoredSessionIdRef,
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,

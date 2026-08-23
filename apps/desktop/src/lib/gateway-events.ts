@@ -80,6 +80,33 @@ export interface GatewayEventSessionRoute {
   sessionId: null | string
 }
 
+interface GatewayEventActiveInput {
+  activeRuntimeSessionId: null | string
+  eventRuntimeSessionId: null | string
+  eventStoredSessionId: null | string
+  fromActiveSource: boolean
+  selectedStoredSessionId: null | string
+}
+
+/** Runtime ids can be replaced while resuming/reclaiming a conversation. The
+ * stored id remains the durable statement of which transcript is on screen, so
+ * use it as the second leg of the foreground guard instead of falsely treating
+ * the newly recovered runtime as background. */
+export function gatewayEventIsActive({
+  activeRuntimeSessionId,
+  eventRuntimeSessionId,
+  eventStoredSessionId,
+  fromActiveSource,
+  selectedStoredSessionId
+}: GatewayEventActiveInput): boolean {
+  return Boolean(
+    fromActiveSource &&
+      eventRuntimeSessionId &&
+      (eventRuntimeSessionId === activeRuntimeSessionId ||
+        (eventStoredSessionId && eventStoredSessionId === selectedStoredSessionId))
+  )
+}
+
 export function approvalReplaySessionId(
   eventType: string | undefined,
   activeSessionId: null | string,

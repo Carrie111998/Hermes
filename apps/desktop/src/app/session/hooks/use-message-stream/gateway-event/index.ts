@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef } from 'react'
 import type { GatewayEventPayload } from '@/lib/chat-messages'
 import {
   approvalReplaySessionId,
+  gatewayEventIsActive,
   resolveGatewayEventSessionId,
   UNSCOPED_STREAM_EVENT_TYPES
 } from '@/lib/gateway-events'
@@ -193,7 +194,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
       }
 
-      const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+      const payloadStoredSessionId =
+        typeof payload?.stored_session_id === 'string' ? payload.stored_session_id.trim() || null : null
+
+      const eventStoredSessionId =
+        payloadStoredSessionId ??
+        (sessionId ? (sessionStateByRuntimeIdRef.current.get(sessionId)?.storedSessionId ?? null) : null)
+
+      const isActiveEvent = gatewayEventIsActive({
+        activeRuntimeSessionId: activeSessionIdRef.current,
+        eventRuntimeSessionId: sessionId,
+        eventStoredSessionId,
+        fromActiveSource: fromActiveSource(),
+        selectedStoredSessionId: deps.selectedStoredSessionIdRef.current
+      })
 
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 
@@ -243,6 +257,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       deps.appendAssistantDelta,
       deps.appendReasoningDelta,
       deps.activeSessionIdRef,
+      deps.selectedStoredSessionIdRef,
       deps.activeGatewayProfile,
       deps.compactedTurnRef,
       deps.completeAssistantMessage,

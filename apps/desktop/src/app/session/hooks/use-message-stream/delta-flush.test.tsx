@@ -261,6 +261,7 @@ describe('useMessageStream composed with the real useSessionStateCache', () => {
 
     const stream = useMessageStream({
       activeSessionIdRef: sessionCache.activeSessionIdRef,
+      selectedStoredSessionIdRef: sessionCache.selectedStoredSessionIdRef,
       hydrateFromStoredSession: vi.fn(async () => undefined),
       queryClient: queryClientRef.current,
       refreshHermesConfig: vi.fn(async () => undefined),
