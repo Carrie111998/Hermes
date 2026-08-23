@@ -1,0 +1,258 @@
+name: rebase-pr91559-current-main
+
+on:
+  push:
+    branches:
+      - fix/update-fleet-pid-incarnation
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-pr91559-current-main
+  cancel-in-progress: false
+
+jobs:
+  rebase-and-publish:
+    if: github.repository == 'andrexibiza/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact publication trigger
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Rebuild one exact commit on reviewed upstream main
+        env:
+          EXPECTED_MAIN: 933c209e96630a6026b0a18ecf6a86e65110f5b8
+          EXPECTED_TRIGGER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git 2>/dev/null || true
+          git fetch --no-tags upstream main
+          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_MAIN"
+          git reset --hard "$EXPECTED_MAIN"
+
+          python - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"{path}: expected one exact source seam, found {count}"
+                  )
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "hermes_cli/update_inventory.py",
+              "        from gateway.status import _pid_exists, read_runtime_status\n",
+              "        from gateway.status import (\n"
+              "            read_runtime_status,\n"
+              "            runtime_status_pid_is_live,\n"
+              "        )\n",
+          )
+          replace_once(
+              "hermes_cli/update_inventory.py",
+              "            if pid is None or not _pid_exists(pid):\n",
+              "            if pid is None or not runtime_status_pid_is_live(record):\n",
+          )
+
+          replace_once(
+              "hermes_cli/update_cmd.py",
+              "        _pre_restart_gateway_pids: list | None = []\n",
+              "        _pre_restart_gateway_pids: list | None = []\n"
+              "        # Destructive settlement authority is process incarnation, not\n"
+              "        # PID membership.  Keep a separate qualified snapshot for the\n"
+              "        # post-restart DOWN verdict while the PID list remains available\n"
+              "        # to legacy restart-failure diagnostics.\n"
+              "        _pre_restart_gateway_incarnations: list[tuple[int, object]] | None = []\n",
+          )
+          replace_once(
+              "hermes_cli/update_cmd.py",
+              "            try:\n"
+              "                _pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))\n"
+              "            except Exception:\n"
+              "                _pre_restart_gateway_pids = None\n",
+              "            try:\n"
+              "                _pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))\n"
+              "            except Exception:\n"
+              "                _pre_restart_gateway_pids = None\n"
+              "            if _pre_restart_gateway_pids is not None:\n"
+              "                try:\n"
+              "                    from gateway.status import _get_process_start_time\n"
+              "\n"
+              "                    _pre_restart_gateway_incarnations = []\n"
+              "                    for _pid in _pre_restart_gateway_pids:\n"
+              "                        _start_time = _get_process_start_time(_pid)\n"
+              "                        if _start_time is not None:\n"
+              "                            _pre_restart_gateway_incarnations.append(\n"
+              "                                (int(_pid), _start_time)\n"
+              "                            )\n"
+              "                except Exception:\n"
+              "                    _pre_restart_gateway_incarnations = None\n",
+          )
+          replace_once(
+              "hermes_cli/update_cmd.py",
+              "            # Pass the pre-restart PID snapshot so a gateway the restart\n"
+              "            # phase stopped WITHOUT a verified replacement shows as a DOWN\n"
+              "            # row (exit 1) instead of silently producing no row at all.\n"
+              "            _fleet_snapshot = collect_fleet_versions(\n"
+              "                pre_restart_pids=_pre_restart_gateway_pids\n"
+              "            )\n",
+              "            # Pass the exact pre-restart process-incarnation snapshot so\n"
+              "            # a gateway stopped without replacement becomes DOWN without\n"
+              "            # letting a recycled PID inherit the prior owner's authority.\n"
+              "            _fleet_snapshot = collect_fleet_versions(\n"
+              "                pre_restart_incarnations=_pre_restart_gateway_incarnations\n"
+              "            )\n",
+          )
+
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "def collect_fleet_versions(\n"
+              "    *, pre_restart_pids: Optional[list[int]] = None\n"
+              ") -> list[dict[str, Any]]:\n",
+              "def collect_fleet_versions(\n"
+              "    *, pre_restart_incarnations: Optional[list[tuple[int, object]]] = None\n"
+              ") -> list[dict[str, Any]]:\n",
+          )
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "    ``down``    — the gateway was ALIVE when this update started\n"
+              "                  (``pre_restart_pids``), its runtime status still says\n"
+              "                  running, but the PID is dead and no successor rewrote the\n"
+              "                  record: the restart phase stopped it and nothing came\n"
+              "                  back. Without this row a killed-and-never-replaced gateway\n"
+              "                  produced NO entry at all and the matrix passed silently\n"
+              "                  (Phase-1 verification gap, #88848/#74973 class).\n"
+              "\n"
+              "    Rollout safety: ``down`` requires membership in ``pre_restart_pids`` —\n"
+              "    a stale state file from a long-dead gateway (machine reboot, manual\n"
+              "    kill weeks ago) must NOT fail every future update. Callers that don't\n"
+              "    have a pre-restart snapshot (``None``/empty) get the historical\n"
+              "    behavior: dead PIDs are skipped.\n",
+              "    ``down``    — the exact persisted ``(pid, start_time)`` incarnation was\n"
+              "                  ALIVE when this update started, its runtime status still\n"
+              "                  says running, but that process is dead and no successor\n"
+              "                  rewrote the record. Without this row a killed-and-never-\n"
+              "                  replaced gateway produced no entry and the matrix passed\n"
+              "                  silently (#88848/#74973 class).\n"
+              "\n"
+              "    Rollout safety: ``down`` requires exact membership in\n"
+              "    ``pre_restart_incarnations``. A stale file, a missing start-time, or a\n"
+              "    recycled PID cannot inherit the prior gateway's settlement authority.\n"
+              "    Callers without a qualified snapshot keep the historical no-row result.\n",
+          )
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "    _pre_restart = {int(p) for p in (pre_restart_pids or []) if isinstance(p, int)}\n",
+              "    _pre_restart: set[tuple[int, object]] = set()\n"
+              "    for item in pre_restart_incarnations or []:\n"
+              "        try:\n"
+              "            pid, start_time = item\n"
+              "            if start_time is not None:\n"
+              "                _pre_restart.add((int(pid), start_time))\n"
+              "        except (TypeError, ValueError):\n"
+              "            continue\n",
+          )
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "        from gateway.status import _pid_exists, read_runtime_status\n",
+              "        from gateway.status import (\n"
+              "            _pid_exists,\n"
+              "            read_runtime_status,\n"
+              "            runtime_status_pid_is_live,\n"
+              "        )\n",
+          )
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "            if not _pid_exists(pid):\n"
+              "                # Dead PID: a DOWN row only when this exact pid was alive at\n",
+              "            if not runtime_status_pid_is_live(record):\n"
+              "                # A live PID with a mismatched start_time is a recycled\n"
+              "                # process, not a down Hermes gateway. It is excluded from\n"
+              "                # both the live fleet and the DOWN settlement path.\n"
+              "                if _pid_exists(pid):\n"
+              "                    continue\n"
+              "                # Dead process: a DOWN row only when this exact incarnation\n"
+              "                # was admitted before mutation.\n",
+          )
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "                    pid in _pre_restart\n",
+              "                    (pid, record.get(\"start_time\")) in _pre_restart\n",
+          )
+          replace_once(
+              "hermes_cli/update_receipt.py",
+              "                # update start AND the record still claims a running state —\n",
+              "                # and the record still claims a running state —\n",
+          )
+
+          Path("tests/hermes_cli/test_update_fleet_pid_incarnation.py").write_text(
+              '''"""Process-incarnation regressions for update fleet proof surfaces."""\n\nfrom __future__ import annotations\n\nimport json\nfrom pathlib import Path\n\nimport hermes_cli.update_inventory as update_inventory\nimport hermes_cli.update_receipt as update_receipt\n\n\n_EXPECTED_SHA = "a" * 40\n\n\ndef _write_gateway_state(home: Path, *, start_time: int) -> None:\n    home.mkdir(parents=True, exist_ok=True)\n    (home / "gateway_state.json").write_text(\n        json.dumps(\n            {\n                "pid": 4242,\n                "start_time": start_time,\n                "gateway_state": "running",\n                "code_sha": _EXPECTED_SHA,\n                "code_version": "1.0",\n            }\n        ),\n        encoding="utf-8",\n    )\n\n\ndef _bind_one_profile(monkeypatch, tmp_path: Path, *, live_start_time: int) -> Path:\n    home = tmp_path / "home"\n    _write_gateway_state(home, start_time=111)\n    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)\n    monkeypatch.setattr(\n        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles"\n    )\n    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda *a, **k: None)\n    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4242)\n    monkeypatch.setattr(\n        "gateway.status._get_process_start_time", lambda pid: live_start_time\n    )\n    monkeypatch.setattr(\n        "hermes_cli.build_info.get_code_identity",\n        lambda refresh=False: {\n            "sha": _EXPECTED_SHA,\n            "short_sha": _EXPECTED_SHA[:8],\n            "version": "1.0",\n            "source": "git",\n        },\n    )\n    monkeypatch.setattr(\n        "hermes_cli.gateway._get_service_pids", lambda all_profiles=False: set()\n    )\n    monkeypatch.setattr(\n        "hermes_cli.gateway.find_profile_gateway_processes", lambda: []\n    )\n    monkeypatch.setattr(\n        "hermes_cli.config.detect_install_method", lambda *args, **kwargs: "git"\n    )\n    monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: None)\n    monkeypatch.setattr(\n        "hermes_cli.config.recommended_update_command_for_method",\n        lambda method: "hermes update",\n    )\n    return home\n\n\ndef test_recycled_pid_is_excluded_from_both_fleet_proof_surfaces(\n    monkeypatch, tmp_path\n):\n    _bind_one_profile(monkeypatch, tmp_path, live_start_time=222)\n    assert update_receipt.collect_fleet_versions() == []\n    assert update_inventory.collect_runtime_inventory().runtimes == []\n\n\ndef test_matching_incarnation_is_admitted_by_both_fleet_proof_surfaces(\n    monkeypatch, tmp_path\n):\n    _bind_one_profile(monkeypatch, tmp_path, live_start_time=111)\n    fleet = update_receipt.collect_fleet_versions()\n    assert [(entry["pid"], entry["state"]) for entry in fleet] == [(4242, "current")]\n    inventory = update_inventory.collect_runtime_inventory()\n    assert [(runtime.pid, runtime.code_sha) for runtime in inventory.runtimes] == [\n        (4242, _EXPECTED_SHA)\n    ]\n''',
+              encoding="utf-8",
+          )
+
+          Path("tests/hermes_cli/test_fleet_matrix_down_state.py").write_text(
+              '''"""Incarnation-bound DOWN-state coverage for update fleet settlement."""\n\nimport json\n\nimport hermes_cli.update_receipt as ur\n\n\n_DEAD_PID = 999999899\n\n\ndef _setup(monkeypatch, tmp_path, record: dict):\n    home = tmp_path / ".hermes"\n    home.mkdir(exist_ok=True)\n    monkeypatch.setattr(\n        "hermes_cli.build_info.get_code_identity",\n        lambda refresh=False: {"sha": "HEADSHA", "version": "1.0"},\n    )\n    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)\n    monkeypatch.setattr(\n        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "no-profiles"\n    )\n    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda *a, **k: None)\n    (home / "gateway_state.json").write_text(json.dumps(record), encoding="utf-8")\n\n\ndef test_killed_never_replaced_exact_incarnation_is_down(monkeypatch, tmp_path):\n    _setup(\n        monkeypatch, tmp_path,\n        {"pid": _DEAD_PID, "start_time": 111, "gateway_state": "running",\n         "kind": "hermes-gateway", "code_version": "0.20.5"},\n    )\n    fleet = ur.collect_fleet_versions(\n        pre_restart_incarnations=[(_DEAD_PID, 111)]\n    )\n    assert [(row["pid"], row["state"]) for row in fleet] == [(_DEAD_PID, "down")]\n    assert ur.print_fleet_version_matrix(fleet) is True\n\n\ndef test_dead_pid_with_wrong_or_missing_incarnation_is_not_down(monkeypatch, tmp_path):\n    _setup(\n        monkeypatch, tmp_path,\n        {"pid": _DEAD_PID, "start_time": 111, "gateway_state": "running",\n         "kind": "hermes-gateway"},\n    )\n    assert ur.collect_fleet_versions(\n        pre_restart_incarnations=[(_DEAD_PID, 222)]\n    ) == []\n    assert ur.collect_fleet_versions(pre_restart_incarnations=None) == []\n    assert ur.collect_fleet_versions() == []\n\n\ndef test_recycled_live_pid_cannot_inherit_down_authority(monkeypatch, tmp_path):\n    _setup(\n        monkeypatch, tmp_path,\n        {"pid": 4242, "start_time": 111, "gateway_state": "running",\n         "kind": "hermes-gateway"},\n    )\n    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4242)\n    monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: 222)\n    assert ur.collect_fleet_versions(\n        pre_restart_incarnations=[(4242, 111)]\n    ) == []\n\n\ndef test_cleanly_stopped_gateway_is_not_down(monkeypatch, tmp_path):\n    for benign_state in ("stopped", "startup_failed"):\n        _setup(\n            monkeypatch, tmp_path,\n            {"pid": _DEAD_PID, "start_time": 111,\n             "gateway_state": benign_state, "kind": "hermes-gateway"},\n        )\n        assert ur.collect_fleet_versions(\n            pre_restart_incarnations=[(_DEAD_PID, 111)]\n        ) == []\n\n\ndef test_live_gateway_row_uses_matching_incarnation(monkeypatch, tmp_path):\n    _setup(\n        monkeypatch, tmp_path,\n        {"pid": 4242, "start_time": 111, "gateway_state": "running",\n         "code_sha": "HEADSHA", "kind": "hermes-gateway"},\n    )\n    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4242)\n    monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: 111)\n    fleet = ur.collect_fleet_versions(\n        pre_restart_incarnations=[(4242, 111)]\n    )\n    assert [(row["pid"], row["state"]) for row in fleet] == [(4242, "current")]\n    assert ur.print_fleet_version_matrix(fleet) is False\n\n\ndef test_down_and_stale_both_escalate_with_remediation(capsys):\n    fleet = [\n        {"profile": "default", "pid": 1, "code_sha": "OLD", "state": "stale"},\n        {"profile": "coder", "pid": 2, "code_sha": None, "state": "down"},\n    ]\n    assert ur.print_fleet_version_matrix(fleet) is True\n    out = capsys.readouterr().out\n    assert "STALE" in out\n    assert "DOWN" in out\n    assert "hermes gateway restart" in out\n''',
+              encoding="utf-8",
+          )
+          PY
+
+          python -m compileall -q \
+            hermes_cli/update_cmd.py \
+            hermes_cli/update_inventory.py \
+            hermes_cli/update_receipt.py
+          git diff --check
+
+      - name: Install locked test environment
+        run: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Verify the composed authority class
+        run: |
+          set -euo pipefail
+          uv run ruff check \
+            hermes_cli/update_cmd.py \
+            hermes_cli/update_inventory.py \
+            hermes_cli/update_receipt.py \
+            tests/hermes_cli/test_update_fleet_pid_incarnation.py \
+            tests/hermes_cli/test_fleet_matrix_down_state.py
+          uv run pytest -q \
+            tests/hermes_cli/test_update_fleet_pid_incarnation.py \
+            tests/hermes_cli/test_fleet_matrix_down_state.py \
+            tests/hermes_cli/test_update_inventory.py \
+            tests/hermes_cli/test_update_receipt.py
+
+      - name: Publish one final product commit and retire this workflow
+        env:
+          EXPECTED_TRIGGER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "Axl Ibiza"
+          git config user.email "84248988+andrexibiza@users.noreply.github.com"
+          git add \
+            hermes_cli/update_cmd.py \
+            hermes_cli/update_inventory.py \
+            hermes_cli/update_receipt.py \
+            tests/hermes_cli/test_update_fleet_pid_incarnation.py \
+            tests/hermes_cli/test_fleet_matrix_down_state.py
+          git diff --cached --check
+          git commit -m "fix(update): bind fleet DOWN proof to process incarnation"
+          git push \
+            --force-with-lease=refs/heads/fix/update-fleet-pid-incarnation:${EXPECTED_TRIGGER} \
+            origin HEAD:refs/heads/fix/update-fleet-pid-incarnation
