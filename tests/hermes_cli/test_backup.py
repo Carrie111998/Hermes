@@ -146,6 +146,15 @@ class TestShouldExclude:
         # The live DB is still backed up.
         assert not _should_exclude(Path("state.db"))
 
+    def test_excludes_update_staging_without_excluding_maintenance_records(self):
+        """Disposable update worktrees must not bloat recovery archives."""
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(Path("maintenance/staging/safe-update-20260823-083110/package-lock.json"))
+        assert _should_exclude(Path("hermes-agent-update-staging/package-lock.json"))
+        assert not _should_exclude(Path("maintenance/patches/carried-security-remediation.patch"))
+        assert not _should_exclude(Path("maintenance/logs/safe-update.log"))
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state

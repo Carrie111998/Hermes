@@ -65,6 +65,14 @@ _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 # scanner doesn't need to prune but a backup walk does. We deliberately do NOT
 # exclude ``.archive`` here because the curator's ``skills/.archive/`` holds
 # restorable user skills that must survive a backup.
+# Disposable update worktrees can contain complete source and dependency trees.
+# Exclude only these exact relative paths: maintenance logs and carried patches
+# remain valuable recovery evidence and must still be captured.
+_EXCLUDED_RELATIVE_DIRS = {
+    ("maintenance", "staging"),
+    ("hermes-agent-update-staging",),
+}
+
 _EXCLUDED_DIRS = {
     "hermes-agent",     # the codebase repo — re-clone instead
     "__pycache__",      # bytecode caches — regenerated on import
@@ -323,6 +331,9 @@ def _iter_external_files(base: Path) -> List[Path]:
 def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
+
+    if any(parts[:len(excluded)] == excluded for excluded in _EXCLUDED_RELATIVE_DIRS):
+        return True
 
     for part in parts:
         if part not in _EXCLUDED_DIRS:
