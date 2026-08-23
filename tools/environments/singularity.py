@@ -20,6 +20,7 @@ from tools.environments.base import (
     _load_json_store,
     _popen_bash,
     _save_json_store,
+    safe_path_component,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,7 +192,7 @@ class SingularityEnvironment(BaseEnvironment):
         if self._persistent:
             overlay_base = _get_scratch_dir() / "hermes-overlays"
             overlay_base.mkdir(parents=True, exist_ok=True)
-            self._overlay_dir = overlay_base / f"overlay-{task_id}"
+            self._overlay_dir = overlay_base / f"overlay-{safe_path_component(task_id)}"
             self._overlay_dir.mkdir(parents=True, exist_ok=True)
 
         self._start_instance()

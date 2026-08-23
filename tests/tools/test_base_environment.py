@@ -405,3 +405,49 @@ class TestCwdMarker:
         env1 = _TestableEnv()
         env2 = _TestableEnv()
         assert env1._cwd_marker != env2._cwd_marker
+
+
+class TestSafePathComponent:
+    """safe_path_component must yield mountable, collision-free segments.
+
+    A raw task id like ``session:20260822_221751_75e446`` used as a sandbox
+    directory name made docker -v split the bind-mount on the embedded colon
+    and the daemon rejected it with "invalid mode" (#92743).
+    """
+
+    def test_docker_unsafe_characters_are_encoded(self):
+        from tools.environments.base import safe_path_component
+
+        out = safe_path_component("session:20260822_221751_75e446")
+        assert out == "session%3A20260822_221751_75e446"
+        assert ":" not in out
+
+    def test_safe_characters_pass_through(self):
+        from tools.environments.base import safe_path_component
+
+        assert safe_path_component("task-01.abc_def") == "task-01.abc_def"
+
+    def test_encoding_is_reversible(self):
+        from urllib.parse import unquote
+
+        from tools.environments.base import safe_path_component
+
+        for raw in ("a:b/c", "x y/z", "ümlaut:id", "100%:done"):
+            assert unquote(safe_path_component(raw)) == raw
+
+    def test_deterministic_and_collision_free_for_distinct_inputs(self):
+        from tools.environments.base import safe_path_component
+
+        assert safe_path_component("a:b") == safe_path_component("a:b")
+        assert safe_path_component("a:b") != safe_path_component("a_b")
+
+    def test_oversized_input_truncates_with_unique_digest(self):
+        from tools.environments.base import _MAX_PATH_COMPONENT_LEN, safe_path_component
+
+        long_a = "a" * 300 + ":1"
+        long_b = "a" * 300 + ":2"
+        out_a = safe_path_component(long_a)
+        out_b = safe_path_component(long_b)
+        assert len(out_a) <= _MAX_PATH_COMPONENT_LEN + 9
+        assert ":" not in out_a
+        assert out_a != out_b

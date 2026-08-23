@@ -1488,3 +1488,48 @@ def test_extra_args_set_shm_size_helper():
     assert docker_env._extra_args_set_shm_size(None) is False
     # non-string entries must not crash (config.yaml can be malformed)
     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
+
+
+def test_persistent_sandbox_dir_encodes_colon_in_task_id(monkeypatch, tmp_path):
+    """A task id containing ':' must never reach a bind-mount path raw.
+
+    docker -v splits on EVERY colon, so a sandbox directory named
+    ``session:2026…`` made the daemon parse the mount as
+    host=…/session, container=2026…/home, mode=/root and fail with
+    "invalid mode: /root" (exit 125) — issue #92743.
+    """
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+
+    task_id = "session:20260822_221751_75e446"
+    env = docker_env.DockerEnvironment(
+        image="python:3.11",
+        cwd="/root",
+        timeout=60,
+        task_id=task_id,
+        persistent_filesystem=True,
+    )
+
+    assert ":" not in os.path.basename(env._home_dir)
+    assert os.path.isdir(env._home_dir)
+    assert env._workspace_dir is not None
+    assert ":" not in os.path.basename(env._workspace_dir)
+
+    # Every -v mount must parse as host-path : container-path [: mode].
+    # Peel an optional trailing mode first ("…:/root/.hermes/skills:ro" is
+    # legal docker syntax) — a raw colon inside the HOST path instead makes
+    # the spec split into >2 non-mode parts, which is what the daemon
+    # rejected as "invalid mode" before the fix.
+    valid_modes = {"ro", "rw", "z", "ro+z", "nocopy"}
+    for flag, spec in zip(env._all_run_args, env._all_run_args[1:]):
+        if flag != "-v":
+            continue
+        body = spec
+        tail = spec.rsplit(":", 1)[-1]
+        if tail in valid_modes:
+            body = body[: -(len(tail) + 1)]
+        parts = body.split(":")
+        assert len(parts) == 2, f"mount spec {spec!r} splits into {len(parts)} parts"
+        assert parts[0] and parts[1]

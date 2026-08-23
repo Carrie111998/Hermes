@@ -7,6 +7,7 @@ or a temp file (local).
 """
 
 import codecs
+import hashlib
 import json
 import logging
 import os
@@ -292,6 +293,34 @@ def get_sandbox_dir() -> Path:
         p = get_hermes_home() / "sandboxes"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+_SAFE_PATH_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_.\-]")
+_MAX_PATH_COMPONENT_LEN = 200
+
+
+def safe_path_component(value: str) -> str:
+    """Coerce *value* into a single filesystem-safe path segment.
+
+    Percent-encodes every character outside ``[A-Za-z0-9_.-]`` so task ids
+    containing ``:`` or other separators can never break consumers that join
+    the component into a bind-mount spec — ``docker -v host:container[:mode]``
+    splits on EVERY colon, so one raw colon in a sandbox directory name makes
+    the daemon parse the mount as host=…/session, container=2026…/home,
+    mode=/root and fail with "invalid mode" (#92743).
+
+    The encoding is deterministic, reversible (urllib.parse.unquote), and
+    collision-free. Inputs long enough to threaten per-component filesystem
+    limits are truncated and suffixed with a short digest of the full
+    encoding, so distinct ids still map to distinct directories.
+    """
+    encoded = _SAFE_PATH_COMPONENT_RE.sub(
+        lambda m: "".join(f"%{b:02X}" for b in m.group().encode("utf-8")), value
+    )
+    if len(encoded) <= _MAX_PATH_COMPONENT_LEN:
+        return encoded
+    digest = hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:8]
+    return f"{encoded[:_MAX_PATH_COMPONENT_LEN]}~{digest}"
 
 
 # ---------------------------------------------------------------------------
