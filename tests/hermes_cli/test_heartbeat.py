@@ -9,6 +9,7 @@ from hermes_cli.heartbeat import (
     HeartbeatState,
     MIN_INTERVAL_SECONDS,
     format_interval,
+    list_heartbeats,
     load_heartbeat,
     migrate_heartbeat_to_session,
     parse_interval,
@@ -67,6 +68,21 @@ def test_state_roundtrip():
     assert loaded.prompt == "check CI"
     assert loaded.interval_seconds == 600
     assert loaded.status == "active"
+
+
+def test_list_heartbeats_enumerates_active_and_paused_but_not_cleared():
+    active = HeartbeatState(prompt="active", interval_seconds=600)
+    paused = HeartbeatState(prompt="paused", interval_seconds=600, status="paused")
+    cleared = HeartbeatState(prompt="cleared", interval_seconds=600, status="cleared")
+    save_heartbeat("list-active", active)
+    save_heartbeat("list-paused", paused)
+    save_heartbeat("list-cleared", cleared)
+
+    states = list_heartbeats()
+
+    assert states["list-active"].status == "active"
+    assert states["list-paused"].status == "paused"
+    assert "list-cleared" not in states
 
 
 def test_is_due_anchors_on_created_then_last_fired():

@@ -194,6 +194,36 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
 
+def list_heartbeats() -> Dict[str, HeartbeatState]:
+    """Return all persisted, non-cleared heartbeats keyed by session id."""
+    db = _get_session_db()
+    if db is None:
+        return {}
+    try:
+        rows = db.list_meta_prefix("heartbeat:")
+    except Exception as exc:
+        logger.warning("HeartbeatManager: could not enumerate heartbeats: %s", exc)
+        return {}
+
+    states: Dict[str, HeartbeatState] = {}
+    for key, raw in rows:
+        session_id = key[len("heartbeat:"):]
+        if not session_id:
+            continue
+        try:
+            state = HeartbeatState.from_json(raw)
+        except Exception as exc:
+            logger.warning(
+                "HeartbeatManager: could not parse stored heartbeat for %s: %s",
+                session_id,
+                exc,
+            )
+            continue
+        if state.status != "cleared":
+            states[session_id] = state
+    return states
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Manager — the surface CLI + gateway talk to
 # ──────────────────────────────────────────────────────────────────────
@@ -327,6 +357,7 @@ __all__ = [
     "parse_interval",
     "format_interval",
     "load_heartbeat",
+    "list_heartbeats",
     "save_heartbeat",
     "migrate_heartbeat_to_session",
     "HEARTBEAT_PROMPT_TEMPLATE",

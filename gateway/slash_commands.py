@@ -2899,10 +2899,18 @@ class GatewaySlashCommandsMixin:
         quick_key = self._session_key_for_source(event.source) if event.source else None
 
         if not args or lower == "status":
-            return mgr.status_line()
+            line = mgr.status_line()
+            if mgr.is_active() and quick_key:
+                watch = getattr(self, "_heartbeat_watch", None) or {}
+                registered = watch.get(quick_key)
+                if not registered or registered[1] != mgr.session_id:
+                    line += "\n⚠ Runtime: active but not registered; routing is unavailable."
+            return line
 
         if lower == "pause":
             state = mgr.pause()
+            if quick_key:
+                self._unregister_heartbeat_watch(quick_key)
             return f"⏸ Heartbeat paused: {state.prompt}" if state else "No heartbeat set."
 
         if lower == "resume":
@@ -2949,7 +2957,7 @@ class GatewaySlashCommandsMixin:
         return (
             f"♥ Heartbeat set (every {format_interval(state.interval_seconds)}): {state.prompt}\n"
             "Fires as a normal turn whenever this session is idle and the interval has "
-            "elapsed. Lives while the gateway runs — use `hermes cron` for durable schedules."
+            "elapsed. The gateway restores it after restart; use `hermes cron` for isolated schedules."
         )
 
     async def _handle_refine_command(self, event: "MessageEvent") -> str:

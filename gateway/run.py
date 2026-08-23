@@ -13232,6 +13232,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        await self._restore_heartbeat_watches()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -14365,6 +14366,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.debug(
                                 "resume-pending reschedule after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+                        try:
+                            await self._restore_heartbeat_watches(platform=platform)
+                        except Exception:
+                            logger.debug(
+                                "heartbeat restoration after %s reconnect failed",
                                 platform.value,
                                 exc_info=True,
                             )
@@ -21325,14 +21334,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
         return HeartbeatManager(session_id=sid), session_entry
 
+    async def _restore_heartbeat_watches(self, platform=None) -> int:
+        """Rebuild active heartbeat watches from durable session routing.
+
+        Heartbeat intent lives in ``state_meta`` while the source needed to
+        route a turn lives in the gateway session index. Join those durable
+        records after adapters connect so a restart cannot leave an active
+        heartbeat without an executable watch.
+
+        ``platform`` limits reconnect-time passes. The registry is a dict, so
+        repeating a pass replaces the same route rather than creating a second
+        tick source. Returns the number of newly registered watches.
+        """
+        try:
+            from hermes_cli.heartbeat import list_heartbeats
+
+            await self._warm_goals_session_db("heartbeat restore")
+            persisted = list_heartbeats()
+            with self.session_store._lock:  # noqa: SLF001 — atomic routing snapshot
+                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                entries = list(self.session_store._entries.values())  # noqa: SLF001
+        except Exception as exc:
+            logger.warning("Could not enumerate persisted heartbeat routes: %s", exc)
+            return 0
+
+        restored = 0
+        watch = getattr(self, "_heartbeat_watch", None)
+        if watch is None:
+            watch = {}
+            self._heartbeat_watch = watch
+
+        entries_by_session = {
+            str(getattr(entry, "session_id", None) or ""): entry
+            for entry in entries
+            if getattr(entry, "session_id", None)
+        }
+        for session_id, state in persisted.items():
+            if state.status != "active":
+                continue
+            entry = entries_by_session.get(session_id)
+            if entry is None:
+                logger.warning(
+                    "Persisted heartbeat %s is active but unroutable: no durable "
+                    "gateway route exists",
+                    session_id,
+                )
+                continue
+            source = getattr(entry, "origin", None)
+            quick_key = str(getattr(entry, "session_key", None) or "")
+            if not source or not session_id or not quick_key:
+                continue
+            if platform is not None and source.platform != platform:
+                continue
+
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                logger.warning(
+                    "Persisted heartbeat %s is active but unroutable: adapter "
+                    "for %s is not connected",
+                    session_id,
+                    getattr(source.platform, "value", source.platform),
+                )
+                continue
+            try:
+                if not self._is_user_authorized(source):
+                    logger.warning(
+                        "Persisted heartbeat %s is active but unroutable: "
+                        "session owner is no longer authorized",
+                        session_id,
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "Persisted heartbeat %s routing authorization failed: %s",
+                    session_id,
+                    exc,
+                )
+                continue
+
+            previous = watch.get(quick_key)
+            current = (source, session_id)
+            if previous == current:
+                continue
+            watch[quick_key] = current
+            restored += 1
+
+        if restored:
+            self._start_heartbeat_poller()
+            logger.info("Restored %d persisted heartbeat watch(es)", restored)
+        return restored
+
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track a session with an active heartbeat and start the poller.
 
         The registry maps ``quick_key`` → ``(source, session_id)`` so the
         poller can rebuild a MessageEvent and enqueue via the adapter FIFO.
-        In-memory by design: heartbeat STATE survives restarts in SessionDB,
-        but firing resumes when the user touches /heartbeat again in the new
-        gateway process (documented; durable schedules belong to cron).
+        Startup joins persisted heartbeat state with the durable gateway
+        routing entry to rebuild this process-local execution registry.
         """
         watch = getattr(self, "_heartbeat_watch", None)
         if watch is None:
