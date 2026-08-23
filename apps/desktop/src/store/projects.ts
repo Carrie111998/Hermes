@@ -408,15 +408,11 @@ function applyPayload(payload: ProjectsPayload): void {
 
 let projectsRefreshGeneration = 0
 
-// Pull the full project list + active pointer. Best-effort: a failure (gateway
-// not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
-export async function refreshProjects(): Promise<void> {
-  const generation = ++projectsRefreshGeneration
-  let context: ActiveProjectsContext | null = null
-
+async function refreshProjectsOn(
+  context: ActiveProjectsContext,
+  generation = ++projectsRefreshGeneration
+): Promise<void> {
   try {
-    context = await activeProjectsContext()
-
     const payload = await gatewayRequestOn<ProjectsPayload>(
       context.gateway,
       'projects.list',
@@ -430,9 +426,21 @@ export async function refreshProjects(): Promise<void> {
     applyPayload(payload)
     markProjectsRpcSuccess()
   } catch (err) {
-    if (context && generation === projectsRefreshGeneration && stillOnProjectsContext(context)) {
+    if (generation === projectsRefreshGeneration && stillOnProjectsContext(context)) {
       markProjectsRpcFailure(err)
     }
+    // Backend may not be ready; keep the last known list.
+  }
+}
+
+// Pull the full project list + active pointer. Best-effort: a failure (gateway
+// not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
+export async function refreshProjects(): Promise<void> {
+  const generation = ++projectsRefreshGeneration
+
+  try {
+    await refreshProjectsOn(await activeProjectsContext(), generation)
+  } catch {
     // Backend may not be ready; keep the last known list.
   }
 }
@@ -474,7 +482,7 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
   const generation = ++projectTreeRefreshGeneration
   const { gateway, profile } = context
 
-  if (activeGateway() === gateway) {
+  if (stillOnProjectsContext(context)) {
     $projectTreeLoading.set(true)
   }
 
@@ -496,7 +504,7 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
       markProjectsRpcFailure(err)
     }
   } finally {
-    if (generation === projectTreeRefreshGeneration && activeGateway() === gateway) {
+    if (generation === projectTreeRefreshGeneration && stillOnProjectsContext(context)) {
       $projectTreeLoading.set(false)
     }
   }
@@ -878,6 +886,13 @@ const reconcileProjects = (): void => {
   void refreshProjectTree()
 }
 
+const reconcileProjectsOn = (context: ActiveProjectsContext): void => {
+  if (!stillOnProjectsContext(context)) return
+
+  void refreshProjectsOn(context)
+  void refreshProjectTreeOn(context)
+}
+
 // Map a ProjectInfo (list shape) onto a minimal overview tree node so a created
 // project paints instantly. The backend seeds each folder as an (empty) repo, so
 // the next tree refresh fills in repos/counts; this is just the optimistic stub.
@@ -1037,7 +1052,9 @@ async function authoritativeProjectForPath(context: ActiveProjectsContext, path:
     'projects.list',
     projectParams({}, context.profile)
   )
-  markProjectsRpcSuccess()
+  if (stillOnProjectsContext(context)) {
+    markProjectsRpcSuccess()
+  }
   const listed = findProjectByPath(payload.projects ?? [], path)
 
   if (!listed) return null
@@ -1051,12 +1068,48 @@ async function authoritativeProjectForPath(context: ActiveProjectsContext, path:
   return project && !project.archived && findProjectByPath([project], path) ? project : null
 }
 
-function cacheMaterializedProject(context: ActiveProjectsContext, project: ProjectInfo): void {
+function cacheMaterializedProject(
+  context: ActiveProjectsContext,
+  source: AutoProjectIdentity,
+  project: ProjectInfo
+): void {
   if (!stillOnProjectsContext(context)) return
 
   const cached = $projects.get()
   const index = cached.findIndex(candidate => candidate.id === project.id)
   $projects.set(index === -1 ? [...cached, project] : cached.map((candidate, i) => (i === index ? project : candidate)))
+
+  const tree = $projectTree.get()
+  const transientMatches = (node: SidebarProjectTree): boolean =>
+    node.id === source.id || Boolean(node.isAuto && node.path && source.path && samePath(node.path, source.path))
+  const carried = tree.find(node => node.id === project.id) ?? tree.find(transientMatches)
+  const stable = carried
+    ? {
+        ...carried,
+        archived: project.archived,
+        color: project.color ?? null,
+        icon: project.icon ?? null,
+        id: project.id,
+        isAuto: false,
+        label: project.name || project.id,
+        path: project.primary_path ?? project.folders?.[0]?.path ?? null
+      }
+    : projectInfoToTreeNode(project)
+  const next: SidebarProjectTree[] = []
+  let inserted = false
+
+  for (const node of tree) {
+    if (node.id === project.id || transientMatches(node)) {
+      if (!inserted) {
+        next.push(stable)
+        inserted = true
+      }
+    } else {
+      next.push(node)
+    }
+  }
+
+  $projectTree.set(inserted ? next : [stable, ...next])
 }
 
 async function createMaterializedProject(
@@ -1083,7 +1136,9 @@ async function createMaterializedProject(
     )
   } catch (error) {
     if (isMissingRpcMethod(error)) {
-      $projectsRpcAvailable.set(false)
+      if (stillOnProjectsContext(context)) {
+        $projectsRpcAvailable.set(false)
+      }
       throw projectsStaleBackendError()
     }
 
@@ -1098,7 +1153,9 @@ async function createMaterializedProject(
     return raced
   }
 
-  markProjectsRpcSuccess()
+  if (stillOnProjectsContext(context)) {
+    markProjectsRpcSuccess()
+  }
   return response.project
 }
 
@@ -1111,7 +1168,9 @@ async function resolveMaterializedAutoProject(
     return existing ?? createMaterializedProject(context, project)
   } catch (error) {
     if (isMissingRpcMethod(error)) {
-      $projectsRpcAvailable.set(false)
+      if (stillOnProjectsContext(context)) {
+        $projectsRpcAvailable.set(false)
+      }
       throw projectsStaleBackendError()
     }
 
@@ -1163,7 +1222,9 @@ export async function materializeAutoProject(
   }
 
   let pending = pendingByPath.get(key)
+  let ownsMaterialization = false
   if (!pending) {
+    ownsMaterialization = true
     pending = resolveMaterializedAutoProject(context, project).finally(() => {
       pendingByPath?.delete(key)
     })
@@ -1173,14 +1234,18 @@ export async function materializeAutoProject(
   let materialized = await pending
   if (!materialized) return null
 
-  cacheMaterializedProject(context, materialized)
+  cacheMaterializedProject(context, project, materialized)
   if (stillOnProjectsContext(context)) {
     setSidebarAgentsGrouped(true)
   }
 
   if (patch.color !== undefined || patch.icon !== undefined) {
     materialized = await patchMaterializedProject(context, materialized, patch)
-    cacheMaterializedProject(context, materialized)
+    cacheMaterializedProject(context, project, materialized)
+  }
+
+  if (ownsMaterialization) {
+    reconcileProjectsOn(context)
   }
 
   return materialized

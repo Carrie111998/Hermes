@@ -2,7 +2,13 @@ import { atom } from 'nanostores'
 import { JsonRpcGatewayError } from '@hermes/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import {
+  PROJECTS_GROUPING_AREA,
+  resolveProjectsGrouping,
+  type ProjectsGroupingContribution
+} from '@/app/chat/sidebar/projects-presentation'
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+import { registry } from '@/contrib/registry'
 import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
@@ -91,12 +97,14 @@ const notify = vi.mocked(notifications.notify)
 
 function deferred<T>() {
   let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
 
-  const promise = new Promise<T>(done => {
+  const promise = new Promise<T>((done, fail) => {
     resolve = done
+    reject = fail
   })
 
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
 
 describe('project scope', () => {
@@ -535,8 +543,87 @@ describe('materializeAutoProject authority', () => {
     await expect(materializeAutoProject(autoProject)).resolves.toEqual(authoritative)
     expect(request.mock.calls).toEqual([
       ['projects.list', { profile: 'default' }],
-      ['projects.get', { id: 'p_stable', profile: 'default' }]
+      ['projects.get', { id: 'p_stable', profile: 'default' }],
+      ['projects.list', { profile: 'default' }],
+      ['projects.tree', { preview_limit: 3, profile: 'default' }]
     ])
+  })
+
+  it('immediately replaces the transient tree node so the adopted appearance is visible in its target group', async () => {
+    const previewSession = { cwd: '/repo', id: 'session-1', title: 'Current work' }
+    const transientTree = {
+      color: null,
+      icon: 'repo',
+      id: '/repo',
+      isAuto: true,
+      label: 'repo',
+      lastActive: 42,
+      path: '/repo',
+      previewSessions: [previewSession],
+      repos: [
+        {
+          groups: [{ id: 'main', label: 'main', path: '/repo', sessions: [previewSession] }],
+          id: '/repo',
+          label: 'repo',
+          path: '/repo',
+          sessionCount: 1
+        }
+      ],
+      sessionCount: 1,
+      totalTokens: 99
+    } as SidebarProjectTree
+    const patched = { ...authoritative, color: '#123456', icon: 'rocket' }
+    const listRefresh = deferred<{ active_id: null; projects: (typeof patched)[] }>()
+    const treeRefresh = deferred<{ active_id: null; projects: SidebarProjectTree[]; scoped_session_ids: string[] }>()
+    let listCalls = 0
+    const request = vi.fn((method: string) => {
+      if (method === 'projects.list') {
+        listCalls += 1
+        return listCalls === 1 ? Promise.resolve({ active_id: null, projects: [] }) : listRefresh.promise
+      }
+      if (method === 'projects.create') return Promise.resolve({ project: authoritative })
+      if (method === 'projects.update') return Promise.resolve({ project: patched })
+      if (method === 'projects.tree') return treeRefresh.promise
+      throw new Error(`unexpected ${method}`)
+    })
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    $projectTree.set([transientTree])
+
+    const contribution: ProjectsGroupingContribution = {
+      getSnapshot: () => ({ groups: [{ id: 'target', label: 'Target', projectIds: ['p_stable'] }] }),
+      subscribe: () => () => undefined
+    }
+    const dispose = registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'materialize-target' })
+
+    try {
+      expect(resolveProjectsGrouping($projectTree.get())?.groups[0].projects).toEqual([])
+
+      await expect(materializeAutoProject(autoProject, { color: '#123456', icon: 'rocket' })).resolves.toEqual(patched)
+
+      const stableTree = $projectTree.get()
+      expect(stableTree).toHaveLength(1)
+      expect(stableTree[0]).toMatchObject({
+        color: '#123456',
+        icon: 'rocket',
+        id: 'p_stable',
+        isAuto: false,
+        label: 'Authoritative',
+        lastActive: 42,
+        path: '/repo',
+        previewSessions: [previewSession],
+        repos: transientTree.repos,
+        sessionCount: 1,
+        totalTokens: 99
+      })
+      expect(resolveProjectsGrouping(stableTree)?.groups[0].projects).toEqual([stableTree[0]])
+      expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(2)
+      expect(request.mock.calls.filter(([method]) => method === 'projects.tree')).toHaveLength(1)
+    } finally {
+      dispose()
+      listRefresh.resolve({ active_id: null, projects: [patched] })
+      treeRefresh.resolve({ active_id: null, projects: $projectTree.get(), scoped_session_ids: ['session-1'] })
+    }
   })
 
   it('coalesces concurrent stale-cache materialization onto one authoritative row', async () => {
@@ -553,8 +640,9 @@ describe('materializeAutoProject authority', () => {
     listing.resolve({ active_id: null, projects: [listed] })
 
     await expect(Promise.all([first, second])).resolves.toEqual([authoritative, authoritative])
-    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(1)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(2)
     expect(request.mock.calls.filter(([method]) => method === 'projects.get')).toHaveLength(1)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.tree')).toHaveLength(1)
   })
 
   it('reconciles one duplicate-primary create race through list/get instead of failing', async () => {
@@ -576,8 +664,9 @@ describe('materializeAutoProject authority', () => {
 
     await expect(materializeAutoProject(autoProject)).resolves.toEqual(authoritative)
     expect(request.mock.calls.filter(([method]) => method === 'projects.create')).toHaveLength(1)
-    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(2)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(3)
     expect(request.mock.calls.filter(([method]) => method === 'projects.get')).toHaveLength(1)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.tree')).toHaveLength(1)
   })
 
   it('bounds duplicate-primary reconciliation and preserves the original rejection when no row appears', async () => {
@@ -595,6 +684,57 @@ describe('materializeAutoProject authority', () => {
     await expect(materializeAutoProject(autoProject)).rejects.toBe(duplicate)
     expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(2)
     expect(request.mock.calls.filter(([method]) => method === 'projects.create')).toHaveLength(1)
+  })
+
+  it('does not let a late successful gateway A materialization change gateway B controls or caches', async () => {
+    const listing = deferred<{ active_id: null; projects: (typeof listed)[] }>()
+    const gatewayA = {
+      connectionState: 'open',
+      request: vi.fn((method: string) => {
+        if (method === 'projects.list') return listing.promise
+        if (method === 'projects.get') return Promise.resolve({ project: authoritative })
+        throw new Error(`unexpected ${method}`)
+      })
+    }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+    let current = gatewayA
+    activeGateway.mockImplementation(() => current as never)
+
+    const pendingA = materializeAutoProject(autoProject)
+    current = gatewayB
+    $projectsRpcAvailable.set(false)
+    $projects.set([{ ...authoritative, id: 'source-b', name: 'Source B' }])
+    $projectTree.set([{ id: 'source-b', label: 'Source B', path: '/b', repos: [], sessionCount: 0 }])
+    setSidebarAgentsGrouped(false)
+    listing.resolve({ active_id: null, projects: [listed] })
+
+    await expect(pendingA).resolves.toEqual(authoritative)
+    expect($projectsRpcAvailable.get()).toBe(false)
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
+    expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
+    expect($sidebarAgentsGrouped.get()).toBe(false)
+    expect(gatewayB.request).not.toHaveBeenCalled()
+  })
+
+  it('does not let a late method-missing failure from gateway A disable gateway B controls', async () => {
+    const listing = deferred<{ active_id: null; projects: (typeof listed)[] }>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => listing.promise) }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+    let current = gatewayA
+    activeGateway.mockImplementation(() => current as never)
+
+    const pendingA = materializeAutoProject(autoProject)
+    current = gatewayB
+    $projectsRpcAvailable.set(true)
+    $projects.set([{ ...authoritative, id: 'source-b', name: 'Source B' }])
+    $projectTree.set([{ id: 'source-b', label: 'Source B', path: '/b', repos: [], sessionCount: 0 }])
+    listing.reject(new Error('unknown method: projects.list'))
+
+    await expect(pendingA).rejects.toThrow('sidebar.projects.staleBackend')
+    expect($projectsRpcAvailable.get()).toBe(true)
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
+    expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
+    expect(gatewayB.request).not.toHaveBeenCalled()
   })
 })
 
