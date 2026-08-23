@@ -155,19 +155,25 @@ def _restore_app_state_after_test(monkeypatch, *names):
         )
 
 
-def test_start_server_loopback_sets_auth_required_false(monkeypatch):
-    """Loopback bind: app.state.auth_required is False after start_server."""
+def test_start_server_loopback_legacy_flag_sets_auth_required_false(
+    monkeypatch, caplog
+):
+    """The legacy flag on loopback does not emit a public-bind warning."""
     _stub_uvicorn_run(monkeypatch)
     # Force a fresh state to detect that start_server actually set it.
     web_server.app.state.auth_required = None
     web_server.start_server(
         host="127.0.0.1", port=9119,
-        open_browser=False, allow_public=False,
+        open_browser=False, allow_public=True,
     )
     assert web_server.app.state.auth_required is False
+    assert not any(
+        "agent and command execution" in record.message
+        for record in caplog.records
+    )
 
 
-def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
+def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch, caplog):
     """``--insecure`` (allow_public=True) on a public host: gate now ENGAGES.
 
     June 2026 hardening: --insecure no longer disables auth. With no providers
@@ -183,6 +189,11 @@ def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
             open_browser=False, allow_public=True,
         )
     assert web_server.app.state.auth_required is True
+    assert any(
+        "agent and command execution" in record.message
+        and "operating-system privileges" in record.message
+        for record in caplog.records
+    )
 
 
 def test_start_server_public_without_insecure_records_auth_required(monkeypatch):
@@ -209,7 +220,9 @@ def test_start_server_public_without_insecure_records_auth_required(monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeypatch):
+def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(
+    monkeypatch, caplog
+):
     """With at least one provider, public bind + no --insecure starts the server.
 
     The SystemExit-refusing-to-bind guard is REPLACED in gated mode by
@@ -236,6 +249,15 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
             "127.0.0.1",
             "::1",
         ]
+        assert any(
+            "agent and command execution" in record.message
+            and "operating-system privileges" in record.message
+            for record in caplog.records
+        )
+        assert not any(
+            "--insecure no longer bypasses" in record.message
+            for record in caplog.records
+        )
     finally:
         clear_providers()
 
