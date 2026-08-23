@@ -1,4 +1,4 @@
-import { atom } from 'nanostores'
+import { atom, batch } from 'nanostores'
 
 import {
   liveSessionProjectId,
@@ -1068,17 +1068,7 @@ async function authoritativeProjectForPath(context: ActiveProjectsContext, path:
   return project && !project.archived && findProjectByPath([project], path) ? project : null
 }
 
-function cacheMaterializedProject(
-  context: ActiveProjectsContext,
-  source: AutoProjectIdentity,
-  project: ProjectInfo
-): void {
-  if (!stillOnProjectsContext(context)) return
-
-  const cached = $projects.get()
-  const index = cached.findIndex(candidate => candidate.id === project.id)
-  $projects.set(index === -1 ? [...cached, project] : cached.map((candidate, i) => (i === index ? project : candidate)))
-
+function reconcileMaterializedProjectTree(source: AutoProjectIdentity, project: ProjectInfo): void {
   const tree = $projectTree.get()
   const transientMatches = (node: SidebarProjectTree): boolean =>
     node.id === source.id || Boolean(node.isAuto && node.path && source.path && samePath(node.path, source.path))
@@ -1109,7 +1099,26 @@ function cacheMaterializedProject(
     }
   }
 
-  $projectTree.set(inserted ? next : [stable, ...next])
+  batch(() => {
+    $projectTree.set(inserted ? next : [stable, ...next])
+
+    if ($projectScope.get() === source.id) {
+      $projectScope.set(project.id)
+    }
+  })
+}
+
+function cacheMaterializedProject(
+  context: ActiveProjectsContext,
+  source: AutoProjectIdentity,
+  project: ProjectInfo
+): void {
+  if (!stillOnProjectsContext(context)) return
+
+  const cached = $projects.get()
+  const index = cached.findIndex(candidate => candidate.id === project.id)
+  $projects.set(index === -1 ? [...cached, project] : cached.map((candidate, i) => (i === index ? project : candidate)))
+  reconcileMaterializedProjectTree(source, project)
 }
 
 async function createMaterializedProject(

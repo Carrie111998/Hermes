@@ -526,6 +526,7 @@ describe('materializeAutoProject authority', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     $activeGatewayProfile.set('default')
+    $projectScope.set(ALL_PROJECTS)
     setShowAllProfiles(false)
     $projectsRpcAvailable.set(null)
     $projects.set([])
@@ -547,6 +548,72 @@ describe('materializeAutoProject authority', () => {
       ['projects.list', { profile: 'default' }],
       ['projects.tree', { preview_limit: 3, profile: 'default' }]
     ])
+  })
+
+  it.each([
+    {
+      adopt: () => materializeAutoProject(autoProject),
+      label: 'grouping'
+    },
+    {
+      adopt: () => setProjectAppearance(autoProject, { color: '#123456' }),
+      label: 'appearance'
+    }
+  ])('keeps an entered auto Project open when $label adopts it', async ({ adopt }) => {
+    const patched = { ...authoritative, color: '#123456' }
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.list') return { active_id: null, projects: [listed] }
+      if (method === 'projects.get') return { project: authoritative }
+      if (method === 'projects.update') return { project: patched }
+      if (method === 'projects.tree') return { active_id: null, projects: [], scoped_session_ids: [] }
+      throw new Error(`unexpected ${method}`)
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    $projectTree.set([
+      {
+        id: autoProject.id,
+        isAuto: true,
+        label: autoProject.label,
+        path: autoProject.path,
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+    $projectScope.set(autoProject.id)
+
+    await adopt()
+
+    expect($projectTree.get()[0]?.id).toBe(authoritative.id)
+    expect($projectScope.get()).toBe(authoritative.id)
+  })
+
+  it.each([
+    { label: 'another Project', scope: 'p_elsewhere' },
+    { label: 'no Project', scope: null }
+  ])('preserves $label scope when an auto Project is adopted', async ({ scope }) => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.list') return { active_id: null, projects: [listed] }
+      if (method === 'projects.get') return { project: authoritative }
+      if (method === 'projects.tree') return { active_id: null, projects: [], scoped_session_ids: [] }
+      throw new Error(`unexpected ${method}`)
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    $projectTree.set([
+      {
+        id: autoProject.id,
+        isAuto: true,
+        label: autoProject.label,
+        path: autoProject.path,
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+    $projectScope.set(scope as never)
+
+    await materializeAutoProject(autoProject)
+
+    expect($projectTree.get()[0]?.id).toBe(authoritative.id)
+    expect($projectScope.get()).toBe(scope)
   })
 
   it('immediately replaces the transient tree node so the adopted appearance is visible in its target group', async () => {
