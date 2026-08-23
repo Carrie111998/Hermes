@@ -329,6 +329,93 @@ def _cua_grant_existing_profile() -> bool:
     return bool(_computer_use_cfg().get("grant_existing_profile", False))
 
 
+# Driver refusal codes that mean "the existing browser profile needs human
+# consent before DevTools access". A stale launch grant makes every one of
+# these unsatisfiable until the session is rebound (#93068).
+_CONSENT_REFUSAL_CODES = frozenset({"browser_consent_required"})
+
+
+def _is_consent_refusal(payload: Dict[str, Any]) -> bool:
+    """True when a refused driver payload is about existing-profile consent.
+
+    The refusal code is the primary signal (``browser_consent_required``),
+    but the driver also emits verify-ladder refusals whose message names the
+    Chrome remote-debugging consent sheet (e.g. ``browser_wrong_target_refused``
+    — "no exact Chrome remote-debugging consent sheet appeared"). Under a
+    stale launch grant those are equally unsatisfiable, so the consent term in
+    the message matches too. Never matches successful payloads.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("ok") is True or payload.get("status") == "ok":
+        return False
+    code = payload.get("code")
+    if isinstance(code, str) and code:
+        lowered = code.lower()
+        if lowered in _CONSENT_REFUSAL_CODES or "consent" in lowered:
+            return True
+    message = payload.get("message")
+    return isinstance(message, str) and "consent" in message.lower()
+
+
+def _annotate_browser_harness_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Annotate driver guidance that names a helper absent from the PATH.
+
+    cua-driver refusal text can recommend ``browser-harness mac-approve``
+    while that command is not a standalone binary on the user's shell PATH —
+    it ships inside the cua-driver install. Name where it lives instead of
+    letting the passthrough imply a bare command exists (#93068).
+    """
+    if not isinstance(payload, dict):
+        return payload
+    message = payload.get("message")
+    if not isinstance(message, str) or "browser-harness" not in message:
+        return payload
+    annotated = dict(payload)
+    annotated["message"] = (
+        message
+        + " (Note: `browser-harness` is not a standalone command on your "
+        "shell PATH — it is part of the cua-driver install. Run "
+        "`hermes computer-use status` to locate the installed driver binary "
+        "and invoke the helper through it.)"
+    )
+    return annotated
+
+
+def _stale_grant_refusal(
+    payload: Dict[str, Any],
+    *,
+    bound_grant: bool,
+    granted_now: bool,
+) -> Dict[str, Any]:
+    """Rewrite consent-family refusals into the one actionable blocker.
+
+    When the config now carries ``computer_use.grant_existing_profile`` but
+    the backend was created before it existed, the running driver can never
+    honor the grant: it was launched without ``--grant existing-profile``
+    and no amount of accepting Chrome consent prompts will change that. The
+    only correct action is binding a fresh session, and the refusal says so
+    exactly once instead of looping between a successful config write and a
+    repeating driver refusal (#93068).
+    """
+    if bound_grant or not granted_now or not _is_consent_refusal(payload):
+        return payload
+    return {
+        "ok": False,
+        "status": "refused",
+        "code": "browser_existing_profile_grant_stale",
+        "message": (
+            "computer_use.grant_existing_profile is enabled now, but this "
+            "computer-use session was started before it was set. The grant "
+            "is handed to the cua-driver runtime at launch and cannot take "
+            "effect mid-session. Start a new Hermes session (or restart the "
+            "agent) and retry — the driver will relaunch with the grant and "
+            "no repeated Chrome consent prompts will be needed."
+        ),
+        "driver_refusal": payload,
+    }
+
+
 def _manifest_is_mode_independent(path: str) -> bool:
     """True when this capability manifest may accompany any permission mode.
 
@@ -2739,6 +2826,13 @@ class CuaDriverBackend(ComputerUseBackend):
         if permission_mode not in {"standard", "bounded", "unrestricted"}:
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
+        # The existing-profile grant is handed to the driver at launch
+        # (`--grant existing-profile`) and is immutable for the life of this
+        # backend. Remember what was in effect at bind time so a mid-session
+        # `hermes config set computer_use.grant_existing_profile true` that
+        # cannot reach the running driver is detected and reported instead of
+        # looping on consent refusals (#93068).
+        self._grant_existing_profile_at_bind = _cua_grant_existing_profile()
         if permission_mode == "unrestricted":
             # Carry the manifest into unrestricted too. It is optional here
             # (unlike bounded), but when the user declared one it still caps
@@ -3946,6 +4040,65 @@ class CuaDriverBackend(ComputerUseBackend):
         # property. It is a standalone native focus operation, not a
         # session-scoped input action.
         return self._action("bring_to_front", args, inject_session=False)
+
+    # ── Typed browser (cua-driver 0.9 contract) ───────────────────
+    def _postprocess_browser_refusal(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize driver browser refusals into one actionable contract.
+
+        Two recovery-path defects share a root cause (#93068):
+
+        * a mid-session ``hermes config set computer_use.grant_existing_profile
+          true`` writes a value the running driver can never see (the grant is
+          baked into the launch args at bind time), so consent refusals loop
+          forever unless the refusal states the rebind action; and
+        * driver guidance naming ``browser-harness mac-approve`` recommends a
+          helper that is not on the user's PATH, so the passthrough says where
+          it lives.
+        """
+        payload = _annotate_browser_harness_hint(payload)
+        bound_grant = bool(getattr(self, "_grant_existing_profile_at_bind", False))
+        try:
+            granted_now = _cua_grant_existing_profile()
+        except Exception:
+            granted_now = False
+        return _stale_grant_refusal(
+            payload, bound_grant=bound_grant, granted_now=granted_now
+        )
+
+    def typed_browser_state(self, **kwargs: Any) -> Dict[str, Any]:
+        """Exact-bind a native browser window or read fresh semantic state."""
+        return self._postprocess_browser_refusal(
+            self._browser_route().observe(**kwargs)
+        )
+
+    def typed_browser_prepare(self, **kwargs: Any) -> Dict[str, Any]:
+        """Prepare an explicitly approved driver-owned browser profile.
+
+        The authorization inputs are resolved here, from config and this
+        backend's immutable mode — never from model-supplied kwargs.
+        """
+        kwargs.pop("grant_existing_profile", None)
+        kwargs.pop("permission_mode", None)
+        result = self._browser_route().prepare(
+            grant_existing_profile=_cua_grant_existing_profile(),
+            permission_mode=self.permission_mode,
+            **kwargs,
+        )
+        # The stale-grant rewrite is scoped to existing-profile attachment;
+        # an isolated launch must never be rewritten into profile advice.
+        if kwargs.get("profile_mode") != "existing_profile":
+            return _annotate_browser_harness_hint(result)
+        return self._postprocess_browser_refusal(result)
+
+    def typed_browser_action(
+        self,
+        driver_tool: str,
+        *,
+        tab_id: Optional[str] = None,
+        args: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run one namespaced typed-browser mutation in this exact route."""
+        return self._browser_route().mutate(driver_tool, tab_id=tab_id, args=args)
 
     # ── Pointer + display introspection ─────────────────────────────
 

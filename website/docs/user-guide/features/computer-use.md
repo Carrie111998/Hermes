@@ -128,6 +128,13 @@ Hermes then launches the cua-driver runtime with the trusted-launcher grant
 existing-profile attachment fails closed; driver-owned isolated profiles work
 either way and are what the agent prefers.
 
+The grant is a launch setting: if you set it while Hermes is already running,
+it binds only when the computer-use session restarts. The running session
+keeps its launch-time grant, and both the refusal messages and a
+`browser_existing_profile_grant_stale` result say exactly that — start a new
+session (or restart the agent) after changing the key, and the attach will
+work without repeated Chrome consent prompts.
+
 ### Bounded mode for repeatable automation
 
 For recurring browser automation (cron jobs, scheduled research against an
