@@ -201,6 +201,14 @@ class TestCLIWrapper(unittest.TestCase):
 
     The wrapper is the never-gate boundary: whatever goes wrong underneath, the
     user's input has to reach the model unchanged.
+
+    These exercise the wiring, not the matching -- the matcher itself is covered
+    above against the real implementation. The wrapper resolves its impl through
+    an ``import`` inside the function body, so driving the real matcher through
+    it would make these tests depend on the module state every other test in the
+    suite shares, and the wrapper's own ``except`` would swallow the evidence:
+    an unrelated import problem elsewhere would surface here as a bare
+    "None != '/trip-brief ...'" with no traceback to follow.
     """
 
     def _cli(self):
@@ -208,21 +216,61 @@ class TestCLIWrapper(unittest.TestCase):
 
         return cli
 
-    def test_rewrite_is_returned_on_match(self):
+    def _impl(self, **kwargs):
+        """Patch the impl the wrapper imports, so these test wiring only."""
+        import agent.skill_commands
+
+        return mock.patch.object(
+            agent.skill_commands, "match_skill_trigger", **kwargs
+        )
+
+    def test_impl_result_is_returned_verbatim(self):
         cli = self._cli()
-        with mock.patch.object(
-            cli, "get_skill_commands", return_value=_cmds({"/trip-brief": ["brief"]})
-        ):
-            self.assertEqual(
-                cli.match_skill_trigger("brief me"), "/trip-brief brief me"
-            )
+        commands = _cmds({"/trip-brief": ["brief"]})
+        with mock.patch.object(cli, "get_skill_commands", return_value=commands):
+            with self._impl(return_value="/trip-brief brief me") as impl:
+                self.assertEqual(
+                    cli.match_skill_trigger("brief me"), "/trip-brief brief me"
+                )
+        # The scanned command map has to reach the matcher; passing None would
+        # make it rescan the filesystem on every submitted message.
+        impl.assert_called_once_with("brief me", commands)
 
     def test_no_match_returns_none(self):
         cli = self._cli()
         with mock.patch.object(
             cli, "get_skill_commands", return_value=_cmds({"/trip-brief": ["brief"]})
         ):
-            self.assertIsNone(cli.match_skill_trigger("what is the weather"))
+            with self._impl(return_value=None):
+                self.assertIsNone(cli.match_skill_trigger("what is the weather"))
+
+    def test_matcher_failure_is_swallowed_too(self):
+        # Not just a failing scan: the matcher itself must not be able to take
+        # the prompt down.
+        cli = self._cli()
+        with mock.patch.object(cli, "_trigger_routing_failed", False):
+            with mock.patch.object(cli, "get_skill_commands", return_value={}):
+                with self._impl(side_effect=ValueError("boom")):
+                    self.assertIsNone(cli.match_skill_trigger("brief me"))
+
+    def test_real_matcher_reaches_the_wrapper(self):
+        """One end-to-end pass with nothing stubbed but the scan.
+
+        Asserts the wrapper did not silently fall into its except branch, so a
+        genuine wiring break is reported as an error rather than a no-match.
+        """
+        cli = self._cli()
+        with mock.patch.object(cli, "_trigger_routing_failed", False):
+            with mock.patch.object(
+                cli,
+                "get_skill_commands",
+                return_value=_cmds({"/trip-brief": ["brief"]}),
+            ):
+                with mock.patch.object(cli.logger, "warning") as warned:
+                    got = cli.match_skill_trigger("brief me")
+        if warned.called:
+            self.fail(f"wrapper swallowed an exception: {warned.call_args}")
+        self.assertEqual(got, "/trip-brief brief me")
 
     def test_scan_failure_is_swallowed_but_logged(self):
         cli = self._cli()
