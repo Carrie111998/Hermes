@@ -590,6 +590,26 @@ def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     )
 
 
+def test_persistent_sandbox_dir_sanitizes_unsafe_task_id(monkeypatch, tmp_path):
+    """A task_id containing colons (e.g. a gateway session key like
+    ``session:agent:main:weixin:dm:<id>@im.wechat``) must not reach the
+    persistent sandbox directory path unsanitized: Docker's ``-v`` bind-mount
+    parser treats ``:`` as a field separator, so an unsanitized path makes
+    every ``docker run`` for that session fail with exit 125 "too many
+    colons"."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        task_id="session:agent:main:weixin:dm:12345@im.wechat",
+        persistent_filesystem=True,
+    )
+
+    assert ":" not in env._home_dir, f"colon leaked into sandbox home dir: {env._home_dir}"
+    assert ":" not in env._workspace_dir, f"colon leaked into sandbox workspace dir: {env._workspace_dir}"
+
+
 def test_labels_attribute_populated_after_init(monkeypatch):
     """``self._labels`` must be set to the same key/value pairs that went onto
     docker run, so subsequent reuse / reaper paths can match without re-running
