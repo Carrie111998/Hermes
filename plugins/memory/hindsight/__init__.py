@@ -2027,9 +2027,12 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._parent_session_id:
             tags.append(f"parent:{self._parent_session_id}")
         if session_title:
-            self._session_title = str(session_title).strip()
+            # Cap + flatten: a long or multi-line title would bloat every
+            # downstream lineage tag/metadata row.
+            clean_title = " ".join(str(session_title).split())[:100]
+            self._session_title = clean_title
             if self._session_title:
-                tags.append(f"title:{self._session_title}")
+                tags.append(f"title:{clean_title}")
         return tags
 
     def _build_retain_kwargs(

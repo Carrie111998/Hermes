@@ -4342,7 +4342,12 @@ class AIAgent:
                     row = self._session_db.get_session(self.session_id)
                     session_title = (row.get("title") or "").strip() if row else ""
             except Exception:
-                pass
+                # Silent for sync safety, but diagnosable: a DB-lock or schema
+                # issue here would otherwise drop titles with no trace
+                # (Enough1122 review on #86870).
+                logger.debug(
+                    "session-title lookup for memory sync failed", exc_info=True
+                )
             if session_title:
                 sync_kwargs["session_title"] = session_title
             if messages is not None:
