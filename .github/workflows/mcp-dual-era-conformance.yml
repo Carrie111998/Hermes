@@ -15,6 +15,8 @@ on:
       - "tests/test_mcp_serve.py"
       - "tests/agent/transports/test_hermes_tools_mcp_server.py"
       - "tests/hermes_cli/test_mcp_dashboard_oauth.py"
+      - "tests/website/test_mcp_config_reference.py"
+      - "website/docs/reference/mcp-config-reference.md"
       - ".github/workflows/mcp-dual-era-conformance.yml"
   push:
     branches:
@@ -32,6 +34,8 @@ on:
       - "tests/test_mcp_serve.py"
       - "tests/agent/transports/test_hermes_tools_mcp_server.py"
       - "tests/hermes_cli/test_mcp_dashboard_oauth.py"
+      - "tests/website/test_mcp_config_reference.py"
+      - "website/docs/reference/mcp-config-reference.md"
       - ".github/workflows/mcp-dual-era-conformance.yml"
   workflow_dispatch:
 
@@ -91,6 +95,7 @@ jobs:
             tests/tools/test_mcp_stateless_liveness.py \
             tests/test_mcp_serve.py \
             tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/website/test_mcp_config_reference.py \
             tests/tools/test_computer_use.py::TestCuaEnvironmentScrubbing::test_cua_session_sanitizes_provider_env_vars \
             -o addopts= \
             -q
