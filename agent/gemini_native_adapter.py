@@ -90,6 +90,13 @@ def is_native_gemini_base_url(base_url: str) -> bool:
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if not normalized:
         return False
+    # Palantir Foundry's google surface proxies Gemini-native REST under
+    # /api/v2/llm/proxy/google/v1 (verified 2026-06-10: dispatch fell through
+    # to the OpenAI SDK, which appends /v1beta and sends the wrong shape —
+    # HTTP 404). Upstream's check only matches the public Google host;
+    # recognize the proxy surface too.
+    if "/api/v2/llm/proxy/google" in normalized:
+        return not normalized.endswith("/openai")
     if "generativelanguage.googleapis.com" not in normalized:
         return False
     return not normalized.endswith("/openai")
