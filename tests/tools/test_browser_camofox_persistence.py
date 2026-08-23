@@ -301,6 +301,7 @@ class TestConfiguredCamofoxIdentity:
         with mod._sessions_lock:
             assert "task-1" not in mod._sessions
 
+
 class TestVncUrlDiscovery:
     """VNC URL is derived from the Camofox health endpoint."""
 
