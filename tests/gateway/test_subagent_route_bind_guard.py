@@ -216,3 +216,64 @@ class TestIsInternalSubagentRow:
     )
     def test_leaves_real_sessions_alone(self, row):
         assert is_internal_subagent_row(row) is False
+
+
+class TestGuardSurvivesSessionGenerationChanges:
+    """The #92872 review's case 1: a compression rotation must not reopen this.
+
+    Merged #69312 makes compression a logical continuation that can advance the
+    gateway route from parent ``P`` to live tip ``P2`` while a delegation
+    spawned by ``P`` is still running. Any guard keyed on
+    ``child.parent_session_id == <currently routed id>`` stops firing at that
+    point, because the child still points at ``P`` while the route is on
+    ``P2``. This guard reads the *target's* provenance and never the parent
+    edge, so the route generation is irrelevant — pinned here so a future
+    refactor cannot quietly reintroduce the edge comparison.
+    """
+
+    def test_child_cannot_take_the_route_after_its_parent_compressed(
+        self, store_and_db
+    ):
+        store, db = store_and_db
+        entry = store.get_or_create_session(_dm_source())
+        p_id = entry.session_id
+
+        # C is spawned by P while P is still the routed session.
+        db.create_session(
+            "child_leaf", source="subagent", parent_session_id=p_id,
+            model_config={"_delegate_from": p_id},
+        )
+        # P then compresses; the route legitimately advances to tip P2.
+        db.end_session(p_id, "compression")
+        db.create_session("p2_tip", source="discord", parent_session_id=p_id)
+        assert store.switch_session(entry.session_key, "p2_tip") is not None
+        assert store.get_or_create_session(_dm_source()).session_id == "p2_tip"
+
+        # Now the completion stamped C arrives. C.parent_session_id is P, and
+        # the route is P2 — a parent-edge guard would not fire here.
+        assert store.switch_session(entry.session_key, "child_leaf") is None
+
+        assert store.get_or_create_session(_dm_source()).session_id == "p2_tip"
+        assert db.get_session("p2_tip")["ended_at"] is None
+
+    def test_grandchild_after_compression_is_also_refused(self, store_and_db):
+        """Both review objections composed: nested provenance + rotated route."""
+        store, db = store_and_db
+        entry = store.get_or_create_session(_dm_source())
+        p_id = entry.session_id
+
+        db.create_session(
+            "child_leaf", source="subagent", parent_session_id=p_id,
+            model_config={"_delegate_from": p_id},
+        )
+        db.create_session(
+            "grandchild", source="subagent", parent_session_id="child_leaf",
+            model_config={"_delegate_from": "child_leaf"},
+        )
+        db.end_session(p_id, "compression")
+        db.create_session("p2_tip", source="discord", parent_session_id=p_id)
+        store.switch_session(entry.session_key, "p2_tip")
+
+        assert store.switch_session(entry.session_key, "grandchild") is None
+        assert store.get_or_create_session(_dm_source()).session_id == "p2_tip"
+        assert db.get_session("p2_tip")["ended_at"] is None
