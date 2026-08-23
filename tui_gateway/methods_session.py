@@ -42,6 +42,7 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
     conversation_worktree = {}
+    conversation_root_lease = None
     if source in {"desktop", "tui"}:
         try:
             binding = _bind_conversation_worktree_for_new_root(
@@ -50,11 +51,20 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5000, f"conversation worktree setup failed: {exc}")
         if binding is not None:
-            conversation_worktree = _conversation_worktree_metadata(binding)
-            resolved_cwd = conversation_worktree["path"]
-            # A manager-bound workspace is as explicit as a user-selected one:
-            # terminal settlement must never move it back to the stable source.
-            explicit_cwd = True
+            try:
+                conversation_root_lease = _acquire_conversation_root_lease(
+                    binding, surface=source
+                )
+                conversation_worktree = _conversation_worktree_metadata(binding)
+                resolved_cwd = conversation_worktree["path"]
+                # A manager-bound workspace is as explicit as a user-selected one:
+                # terminal settlement must never move it back to the stable source.
+                explicit_cwd = True
+            except Exception as exc:
+                if conversation_root_lease is not None:
+                    with contextlib.suppress(Exception):
+                        conversation_root_lease.release()
+                return _err(rid, 5000, f"conversation worktree setup failed: {exc}")
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -98,6 +108,7 @@ def _(rid, params: dict) -> dict:
             "active_session_lease": lease,
             "cols": cols,
             "conversation_worktree": conversation_worktree,
+            "conversation_root_lease": conversation_root_lease,
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
@@ -615,6 +626,7 @@ def _(rid, params: dict) -> dict:
             profile_home
         )
         resume_conversation_worktree = {}
+        resume_binding = None
         stored_source = str(found.get("source") or "").strip()
         # A normal desktop/TUI resume may target a compression continuation.
         # Resolve only a ready binding (never create here) and deliberately
@@ -631,6 +643,7 @@ def _(rid, params: dict) -> dict:
             except Exception as exc:
                 return _err(rid, 5000, f"conversation worktree resume failed: {exc}")
             if binding is not None:
+                resume_binding = binding
                 resume_conversation_worktree = _conversation_worktree_metadata(binding)
                 profile_resume_cwd = resume_conversation_worktree["path"]
 
@@ -776,19 +789,34 @@ def _(rid, params: dict) -> dict:
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
-            record = _deferred_session_record(
-                target,
-                cols=cols,
-                cwd=cwd,
-                history=[],
-                lease=lease,
-                source=source,
-                close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
-                profile_home=profile_home,
-                model_override=overrides.get("model_override"),
-                resume_runtime_overrides=overrides or None,
-                conversation_worktree=resume_conversation_worktree,
-            )
+            resume_root_lease = None
+            try:
+                resume_root_lease = (
+                    _acquire_conversation_root_lease(resume_binding, surface=stored_source)
+                    if resume_binding is not None
+                    else None
+                )
+                record = _deferred_session_record(
+                    target,
+                    cols=cols,
+                    cwd=cwd,
+                    history=[],
+                    lease=lease,
+                    source=source,
+                    close_on_disconnect=is_truthy_value(
+                        params.get("close_on_disconnect", False)
+                    ),
+                    profile_home=profile_home,
+                    model_override=overrides.get("model_override"),
+                    resume_runtime_overrides=overrides or None,
+                    conversation_worktree=resume_conversation_worktree,
+                    conversation_root_lease=resume_root_lease,
+                )
+            except Exception as exc:
+                if resume_root_lease is not None:
+                    with contextlib.suppress(Exception):
+                        resume_root_lease.release()
+                return _err(rid, 5000, f"conversation worktree resume failed: {exc}")
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
             record["resume_message_count"] = int(found.get("message_count") or 0)
@@ -873,20 +901,35 @@ def _(rid, params: dict) -> dict:
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
-            record = _deferred_session_record(
-                target,
-                cols=cols,
-                cwd=cwd,
-                history=history,
-                lease=lease,
-                source=source,
-                close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
-                display_history_prefix=prefix,
-                profile_home=profile_home,
-                model_override=overrides.get("model_override"),
-                resume_runtime_overrides=overrides or None,
-                conversation_worktree=resume_conversation_worktree,
-            )
+            resume_root_lease = None
+            try:
+                resume_root_lease = (
+                    _acquire_conversation_root_lease(resume_binding, surface=stored_source)
+                    if resume_binding is not None
+                    else None
+                )
+                record = _deferred_session_record(
+                    target,
+                    cols=cols,
+                    cwd=cwd,
+                    history=history,
+                    lease=lease,
+                    source=source,
+                    close_on_disconnect=is_truthy_value(
+                        params.get("close_on_disconnect", False)
+                    ),
+                    display_history_prefix=prefix,
+                    profile_home=profile_home,
+                    model_override=overrides.get("model_override"),
+                    resume_runtime_overrides=overrides or None,
+                    conversation_worktree=resume_conversation_worktree,
+                    conversation_root_lease=resume_root_lease,
+                )
+            except Exception as exc:
+                if resume_root_lease is not None:
+                    with contextlib.suppress(Exception):
+                        resume_root_lease.release()
+                return _err(rid, 5000, f"conversation worktree resume failed: {exc}")
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
@@ -1001,7 +1044,15 @@ def _(rid, params: dict) -> dict:
                 if lease is not None:
                     lease.release()
                 return _reuse_live_response(*live)
+            resume_root_lease = None
             try:
+                resume_root_lease = (
+                    _acquire_conversation_root_lease(
+                        resume_binding, surface=stored_source
+                    )
+                    if resume_binding is not None
+                    else None
+                )
                 init_home_token = (
                     set_hermes_home_override(str(profile_home))
                     if profile_home is not None
@@ -1023,6 +1074,7 @@ def _(rid, params: dict) -> dict:
                         session_db=db,
                         source=source,
                         conversation_worktree=resume_conversation_worktree or None,
+                        conversation_root_lease=resume_root_lease,
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -1054,6 +1106,7 @@ def _(rid, params: dict) -> dict:
                     if owns_db:
                         _transfer_db_to_agent(agent, db)
                     owns_db = False
+                    resume_root_lease = None
                 finally:
                     if init_home_token is not None:
                         reset_hermes_home_override(init_home_token)
@@ -1086,6 +1139,8 @@ def _(rid, params: dict) -> dict:
                         _sessions.pop(sid, None)
                 if lease is not None:
                     lease.release()
+                if resume_root_lease is not None:
+                    resume_root_lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             session = _sessions.get(sid) or {}
     finally:
@@ -1394,6 +1449,8 @@ def _(rid, params: dict) -> dict:
                         active_session_bound=active,
                     )
                     removed = False
+                    failure_phase = None
+                    failure_message = None
                 else:
                     result = manager.remove_after_explicit_request(
                         root_session_id,
@@ -1401,6 +1458,8 @@ def _(rid, params: dict) -> dict:
                     )
                     verdict = result.verdict
                     removed = result.removed
+                    failure_phase = result.failure_phase
+                    failure_message = result.failure_message
 
             record = db.get_conversation_worktree(root_session_id)
             if record is None:
@@ -1409,7 +1468,13 @@ def _(rid, params: dict) -> dict:
 
             return _ok(
                 rid,
-                conversation_cleanup_status(verdict, record, removed=removed),
+                conversation_cleanup_status(
+                    verdict,
+                    record,
+                    removed=removed,
+                    failure_phase=failure_phase,
+                    failure_message=failure_message,
+                ),
             )
         except Exception as exc:
             return _err(rid, 5036, f"conversation worktree cleanup failed: {exc}")
@@ -3279,6 +3344,8 @@ def _(rid, params: dict) -> dict:
         new_sid = uuid.uuid4().hex[:8]
         source = _session_source(session)
         conversation_worktree = {}
+        conversation_root_lease = None
+        branch_binding = None
         branch_cwd = _session_cwd(session)
         if source in {"desktop", "tui"}:
             try:
@@ -3288,6 +3355,7 @@ def _(rid, params: dict) -> dict:
             except Exception as exc:
                 return _err(rid, 5008, f"conversation worktree setup failed: {exc}")
             if binding is not None:
+                branch_binding = binding
                 conversation_worktree = _conversation_worktree_metadata(binding)
                 branch_cwd = conversation_worktree["path"]
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -3392,6 +3460,11 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
+            conversation_root_lease = (
+                _acquire_conversation_root_lease(branch_binding, surface=source)
+                if branch_binding is not None
+                else None
+            )
             tokens = _set_session_context(new_key)
             try:
                 agent = _make_agent(
@@ -3415,6 +3488,7 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 profile_home=parent_home,
                 conversation_worktree=conversation_worktree or None,
+                conversation_root_lease=conversation_root_lease,
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is
@@ -3423,6 +3497,7 @@ def _(rid, params: dict) -> dict:
             # handle, so the finally must not close it.
             _transfer_db_to_agent(agent, branch_db)
             branch_owns_db = False
+            conversation_root_lease = None
         finally:
             if secret_token is not None:
                 reset_secret_scope(secret_token)
@@ -3433,6 +3508,8 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
+        if conversation_root_lease is not None:
+            conversation_root_lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     finally:
         if branch_owns_db and branch_db is not None:
