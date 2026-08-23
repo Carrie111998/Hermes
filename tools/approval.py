@@ -1067,7 +1067,12 @@ DANGEROUS_PATTERNS = [
     # is indistinguishable after folding and is treated as dangerous. Failing
     # closed there costs one prompt on `git restore -S f`; failing open costs
     # the file.
-    (r'\bgit\s+restore\b(?:(?![^\n;|&`]*--staged)|(?=[^\n;|&`]*--worktree))', "git restore (discards uncommitted working-tree changes)"),
+    # `--staged` and `--worktree` must be their own tokens: a bare substring
+    # scan lets a path that merely CONTAINS the text suppress the prompt for
+    # the whole segment (`git restore -- ./--staged`). Residual, stated rather
+    # than hidden: a file named exactly `--staged` after the `--` separator is
+    # still indistinguishable from the flag by regex alone.
+    (r'\bgit\s+restore\b(?:(?![^\n;|&`]*\s--staged\b)|(?=[^\n;|&`]*\s--worktree\b))', "git restore (discards uncommitted working-tree changes)"),
     # `git checkout` only overwrites the working tree when it is given a
     # pathspec or forced, so match those three spellings and nothing else --
     # `git checkout <branch>` and `git checkout -b <new>` refuse rather than
@@ -1075,7 +1080,16 @@ DANGEROUS_PATTERNS = [
     # command there is. `--` is git's explicit pathspec separator; a bare `.`
     # operand is a pathspec (a ref cannot be named `.`); `-f`/`--force` is
     # documented as "throw away local modifications".
-    (r'\bgit\s+checkout\b(?:[^\n;|&`]*?\s--\s|[^\n;|&`]*?\s--force\b|[^\n;|&`]*?\s-f\b|\s+\.(?:\s|$))', "git checkout with pathspec or --force (discards uncommitted working-tree changes)"),
+    # `--pathspec-from-file` reads the pathspec from a file, and `--ours` /
+    # `--theirs` write a conflicted path back over the working tree; all three
+    # overwrite without ever spelling `--`.
+    (r'\bgit\s+checkout\b(?:[^\n;|&`]*?\s--\s|[^\n;|&`]*?\s(?:--force|--pathspec-from-file|--ours|--theirs)\b|[^\n;|&`]*?\s-f\b|\s+\.(?:\s|$))', "git checkout with pathspec or --force (discards uncommitted working-tree changes)"),
+    # `git switch` is git's modern replacement for the branch half of
+    # `checkout`, and `--discard-changes` (aliased `-f`/`--force`) is
+    # documented as "throw away local modifications". An agent steered away
+    # from `checkout -f` reaches for this one. Plain `git switch <branch>` and
+    # `git switch -c <new>` refuse rather than discard and stay ungated.
+    (r'\bgit\s+switch\b[^\n;|&`]*?\s(?:--discard-changes|--force|-f)\b', "git switch --discard-changes (discards uncommitted working-tree changes)"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
