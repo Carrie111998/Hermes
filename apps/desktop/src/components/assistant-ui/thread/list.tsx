@@ -106,8 +106,9 @@ export const transcriptPaneBudget = (mountedPanes: number, hidden: boolean): num
     ? HIDDEN_TRANSCRIPT_RENDER_BUDGET
     : Math.max(Math.ceil(RENDER_BUDGET / Math.max(1, mountedPanes)), RENDER_BUDGET / 4)
 // Units the backfill adds per committed step (see the backfill effect). ~8-15
-// ordinary turns or 1-2 tool-heavy ones per frame — big enough to fill a page
-// in ~10 frames, small enough that no single commit approaches a frame budget.
+// ordinary turns or 1-2 tool-heavy ones per frame — enough visible progress
+// while keeping each commit bounded. A full single-pane page can take about 60
+// frames at the 3600-unit budget.
 const BACKFILL_STEP = 60
 
 // Browsers may quantize a requested scrollTop to a nearby device-pixel
@@ -475,12 +476,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // (budget > paneBudget) never re-enter here.
   //
   // In BOUNDED STEPS, not one jump to the full budget. A transition render is
-  // interruptible but its COMMIT is not, and one 20→600 step commits every
-  // backfilled turn at once — measured as a 780ms uninterruptible frame when
-  // the session was revealed while other tiles streamed (the flushes kept
-  // interrupting the transition, which finally landed whole, seconds later,
-  // mid-stream). Each step commits at most BACKFILL_STEP units (~40-80ms);
-  // the effect re-arms off the committed budget, so steps pace one per frame.
+  // interruptible but its COMMIT is not, and the previous one-shot 20→600
+  // implementation committed every backfilled turn at once — measured as a
+  // 780ms uninterruptible frame when the session was revealed while other tiles
+  // streamed (the flushes kept interrupting the transition, which finally
+  // landed whole, seconds later, mid-stream). Each step commits at most
+  // BACKFILL_STEP units (~40-80ms); the effect re-arms off the committed budget,
+  // so steps pace one per frame.
   useEffect(() => {
     if (renderBudget >= paneBudget) {
       return
