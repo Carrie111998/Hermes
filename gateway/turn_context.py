@@ -89,6 +89,7 @@ class TurnContext:
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
+    is_heartbeat: bool = False
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     # display_kind stamped on the persisted user row at turn start when this
