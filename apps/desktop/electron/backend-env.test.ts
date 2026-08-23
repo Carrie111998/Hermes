@@ -10,7 +10,8 @@ import {
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  sanitizeInheritedDesktopEnv
 } from './backend-env'
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
@@ -188,4 +189,53 @@ test('Windows PATH casing and delimiter are preserved without POSIX sane entries
 
 test('appendUniquePathEntries drops empty entries and keeps first occurrence', () => {
   assert.equal(appendUniquePathEntries([':/a::/b', ['/a', '/c']], { delimiter: ':' }), '/a:/b:/c')
+})
+
+test('sanitizeInheritedDesktopEnv strips worker lifecycle and resets desk profile', () => {
+  const env = {
+    HERMES_PROFILE: 'company-infra',
+    HERMES_HOME: '/Users/shermanlye/.hermes/profiles/company-infra',
+    HERMES_KANBAN_TASK: 't_22bb7847',
+    HERMES_KANBAN_RUN_ID: '45',
+    HERMES_KANBAN_CLAIM_LOCK: 'host:1',
+    HERMES_KANBAN_WORKSPACE: '/tmp/ws',
+    HERMES_KANBAN_BRANCH: 'infra/x',
+    HERMES_KANBAN_BOARD: 'personal',
+    HERMES_KANBAN_DB: '/tmp/kanban.db',
+    HERMES_SESSION_SOURCE: 'kanban',
+    HERMES_SESSION_ID: '20260823_230728_ce516e',
+    PATH: '/usr/bin'
+  }
+
+  sanitizeInheritedDesktopEnv(env, { pathModule: path.posix })
+
+  assert.equal(env.HERMES_KANBAN_TASK, undefined)
+  assert.equal(env.HERMES_KANBAN_RUN_ID, undefined)
+  assert.equal(env.HERMES_KANBAN_CLAIM_LOCK, undefined)
+  assert.equal(env.HERMES_KANBAN_WORKSPACE, undefined)
+  assert.equal(env.HERMES_KANBAN_BRANCH, undefined)
+  assert.equal(env.HERMES_KANBAN_BOARD, 'personal')
+  assert.equal(env.HERMES_PROFILE, undefined)
+  assert.equal(env.HERMES_HOME, '/Users/shermanlye/.hermes')
+  assert.equal(env.HERMES_SESSION_SOURCE, undefined)
+  assert.equal(env.PATH, '/usr/bin')
+})
+
+test('sanitizeInheritedDesktopEnv keeps an explicit desk profile', () => {
+  const env = {
+    HERMES_PROFILE: 'company-infra',
+    HERMES_HOME: '/Users/x/.hermes/profiles/company-infra',
+    HERMES_KANBAN_TASK: 't_1'
+  }
+
+  sanitizeInheritedDesktopEnv(env, { explicitProfile: 'company-cpo', pathModule: path.posix })
+  assert.equal(env.HERMES_PROFILE, 'company-cpo')
+  assert.equal(env.HERMES_KANBAN_TASK, undefined)
+})
+
+test('sanitizeInheritedDesktopEnv is a noop without worker identity', () => {
+  const env = { HERMES_HOME: '/Users/x/.hermes', HERMES_KANBAN_BOARD: 'personal' }
+  sanitizeInheritedDesktopEnv(env, { pathModule: path.posix })
+  assert.equal(env.HERMES_HOME, '/Users/x/.hermes')
+  assert.equal(env.HERMES_KANBAN_BOARD, 'personal')
 })

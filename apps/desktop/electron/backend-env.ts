@@ -118,6 +118,66 @@ function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatfor
   return resolved
 }
 
+const KANBAN_LIFECYCLE_ENV_KEYS = Object.freeze([
+  'HERMES_KANBAN_TASK',
+  'HERMES_KANBAN_RUN_ID',
+  'HERMES_KANBAN_WORKSPACE',
+  'HERMES_KANBAN_WORKSPACES_ROOT',
+  'HERMES_KANBAN_CLAIM_LOCK',
+  'HERMES_KANBAN_BRANCH',
+  'HERMES_KANBAN_GOAL_MODE',
+  'HERMES_KANBAN_GOAL_MAX_TURNS'
+])
+
+const WORKER_SESSION_KEYS = Object.freeze(['HERMES_SESSION_ID', 'HERMES_SINGLE_QUERY_SESSION'])
+
+function inheritedKanbanLifecycle(env: Record<string, string | undefined> = {}) {
+  if (KANBAN_LIFECYCLE_ENV_KEYS.some(key => String(env?.[key] || '').trim())) {
+    return true
+  }
+
+  return String(env?.HERMES_SESSION_SOURCE || '').trim().toLowerCase() === 'kanban'
+}
+
+/**
+ * Drop dispatcher worker ownership inherited by Hermes.app / its backend.
+ * Mutates *env* and returns it. Board routing pins (BOARD / DB) stay.
+ */
+function sanitizeInheritedDesktopEnv(
+  env: Record<string, string | undefined> = {},
+  { explicitProfile = null, pathModule = pathModuleForPlatform(process.platform) }: any = {}
+) {
+  if (!inheritedKanbanLifecycle(env)) {
+    return env
+  }
+
+  for (const key of KANBAN_LIFECYCLE_ENV_KEYS) {
+    delete env[key]
+  }
+
+  if (String(env.HERMES_SESSION_SOURCE || '').trim().toLowerCase() === 'kanban') {
+    delete env.HERMES_SESSION_SOURCE
+  }
+
+  for (const key of WORKER_SESSION_KEYS) {
+    delete env[key]
+  }
+
+  if (env.HERMES_HOME) {
+    env.HERMES_HOME = normalizeHermesHomeRoot(env.HERMES_HOME, { pathModule })
+  }
+
+  const chosen = typeof explicitProfile === 'string' ? explicitProfile.trim() : ''
+
+  if (chosen && chosen !== 'default') {
+    env.HERMES_PROFILE = chosen
+  } else {
+    delete env.HERMES_PROFILE
+  }
+
+  return env
+}
+
 function buildDesktopBackendEnv({
   hermesHome,
   pythonPathEntries = [],
@@ -155,7 +215,10 @@ export {
   buildDesktopBackendPath,
   delimiterForPlatform,
   hermesManagedNodePathEntries,
+  inheritedKanbanLifecycle,
+  KANBAN_LIFECYCLE_ENV_KEYS,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  sanitizeInheritedDesktopEnv
 }
