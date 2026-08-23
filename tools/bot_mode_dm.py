@@ -227,7 +227,9 @@ def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
 
 
 def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | None = None) -> str:
-    payload: dict[str, Any] = {"error": message}
+    from tools.bot_failure_reasons import classify_agent_error
+
+    payload: dict[str, Any] = {"error": message, "reason": classify_agent_error(message)}
     if roster is not None:
         payload["teammates"] = roster
     if peers is not None:
@@ -382,6 +384,7 @@ def _try_relay_delivery(
     """
     try:
         from tools.bot_relay import (
+            EnvelopeRefusedError,
             enqueue_envelope,
             read_remote_roster,
             resolve_remote_target,
@@ -404,13 +407,19 @@ def _try_relay_delivery(
                 f"'{raw_target}' exists on several connected machines — "
                 f"disambiguate with one of: {forms}."
             )
-        envelope = enqueue_envelope(
-            root,
-            target=match,
-            message=f"Message from 🤖 {sender_handle} (@{sender_handle}): {body}",
-            sender_profile=me,
-            sender_handle=sender_handle,
-        )
+        try:
+            envelope = enqueue_envelope(
+                root,
+                target=match,
+                message=f"Message from 🤖 {sender_handle} (@{sender_handle}): {body}",
+                sender_profile=me,
+                sender_handle=sender_handle,
+            )
+        except EnvelopeRefusedError as exc:
+            # Fail fast: target definitively offline — nothing was queued.
+            # Structured refusal so the agent can distinguish it from a
+            # resolution error ('runtime_offline' per the #93091 reason enum).
+            return json.dumps({"error": str(exc), "reason": exc.reason})
         label = f"@{match['handle']} on {match['connection_label'] or match['connection_id']}"
         return _spawn_delivery(
             waiter_command(root, envelope), label, task_id=task_id, agent=agent
