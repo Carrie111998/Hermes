@@ -217,6 +217,12 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+        # Official "thinking" bubble state (per chat): streamId + inbound req_id + last-keepalive ts
+        self._thinking_streams: Dict[str, Dict[str, Any]] = {}
+        self.THINKING_KEEPALIVE_S = 2.5
+        self.MAX_THINKING_STREAMS = 64
+        # Opt-out switch: platforms.wecom.extra.thinking_bubble (default on).
+        self._thinking_bubble_enabled = bool(extra.get("thinking_bubble", True))
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1434,6 +1440,15 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
+        # If a thinking bubble is open for this chat, replace it in place with
+        # the final content and SKIP the normal markdown (else WeCom shows the
+        # answer twice: once via the stream finish frame, once as markdown).
+        if await self._finish_thinking(chat_id, content):
+            return SendResult(
+                success=True,
+                message_id=uuid.uuid4().hex[:12],
+            )
+
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
 
@@ -1557,8 +1572,79 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WeCom does not expose typing indicators in this adapter."""
-        del chat_id, metadata
+        """Open the official WeCom "thinking" bubble for this chat.
+
+        Protocol (mirrors the wecom-bridge SDK): send a ``stream`` frame with
+        ``finish=false`` and empty ``<think></think>`` content correlated to
+        the inbound req_id — WeCom renders it as a "thinking..." placeholder.
+        The same streamId is later finished by ``_finish_thinking`` when the
+        final response lands (send() replaces the bubble in place). A 2.5s
+        keepalive re-arms the placeholder so WeCom doesn't show "无结果" on
+        long turns. Best-effort: any failure is swallowed.
+        """
+        reply_req_id = self._last_chat_req_ids.get(chat_id)
+        if not reply_req_id:
+            return
+        if not self._thinking_bubble_enabled:
+            return
+        now = time.monotonic()
+        st = self._thinking_streams.get(chat_id)
+        if st is not None:
+            # Already open — periodic keepalive only.
+            if now - st["ts"] >= self.THINKING_KEEPALIVE_S:
+                try:
+                    await self._send_reply_request(
+                        reply_req_id,
+                        {"msgtype": "stream", "stream": {"id": st["id"], "finish": False,
+                                                         "content": "<think></think>"}},
+                    )
+                    st["ts"] = now
+                except Exception:
+                    pass
+            return
+        stream_id = f"stream_{uuid.uuid4().hex[:16]}"
+        try:
+            await self._send_reply_request(
+                reply_req_id,
+                {"msgtype": "stream", "stream": {"id": stream_id, "finish": False,
+                                                 "content": "<think></think>"}},
+            )
+            self._thinking_streams[chat_id] = {"id": stream_id, "req": reply_req_id, "ts": now}
+            while len(self._thinking_streams) > self.MAX_THINKING_STREAMS:
+                self._thinking_streams.pop(next(iter(self._thinking_streams)))
+            logger.info("[%s] thinking bubble opened -> %s (%s)", self.name, chat_id, stream_id)
+        except Exception as e:
+            logger.debug("[%s] thinking bubble failed: %s", self.name, e)
+
+    async def _finish_thinking(self, chat_id: str, content: str) -> bool:
+        """Close the open thinking bubble with finish=true (in-place replace).
+
+        Mirrors wecom-bridge exactly: the finish=true frame is fire-and-forget
+        (raw wsManager send, no ack wait — WeCom does NOT ack finish frames,
+        and awaiting one times out after the frame was already delivered,
+        which used to double-render: stream content + follow-up markdown).
+
+        Returns True when a bubble existed and the finish frame was sent
+        (caller should then SKIP the normal markdown reply).
+        """
+        st = self._thinking_streams.pop(chat_id, None)
+        if st is None:
+            return False
+        body = {"msgtype": "stream", "stream": {"id": st["id"], "finish": True,
+                                                "content": content[:self.MAX_MESSAGE_LENGTH]}}
+        if not self._ws or self._ws.closed:
+            return False
+        try:
+            await self._ws.send_json({"cmd": APP_CMD_RESPONSE,
+                                      "headers": {"req_id": st["req"]},
+                                      "body": body})
+            logger.info("[%s] thinking bubble finished in-place -> %s (%s)",
+                        self.name, chat_id, st["id"])
+            return True
+        except Exception as e:
+            logger.warning("[%s] finish frame failed (%s); falling back to markdown",
+                           self.name, e)
+            return False
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""

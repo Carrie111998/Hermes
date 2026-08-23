@@ -449,6 +449,17 @@ gateway:
     disabled:                   "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."
     enabled:                    "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
 
+  busy_ack:
+    status_elapsed:             "{minutes} min elapsed"
+    status_iteration:           "iteration {current}/{max}"
+    status_running:             "running: {tool}"
+    steered:                    "⏩ Steered into current run{detail}. Your message arrives after the next tool call."
+    redirected:                 "↪ Redirected current run{detail}. I'll adjust using your correction."
+    queued_subagent:            "⏳ Subagent working{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
+    queued_compression:         "⏳ Compressing context{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
+    queued:                     "⏳ Queued for the next turn{detail}. I'll respond once the current task finishes."
+    interrupting:               "⚡ Interrupting current task{detail}. I'll respond to your message shortly."
+
   shared:
     session_db_unavailable:      "Session database not available."
     session_db_unavailable_prefix: "Session database not available"
