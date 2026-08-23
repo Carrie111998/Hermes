@@ -3274,6 +3274,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 def _build_partial_stream_stub(
     role, full_content, full_reasoning, model_name, usage_obj, *,
     dropped_tool_names=None,
+    reasoning_details=None,
 ):
     """Build a partial-stream-stub response for mid-stream drop scenarios.
 
@@ -3288,6 +3289,7 @@ def _build_partial_stream_stub(
         content=full_content,
         tool_calls=None,
         reasoning_content=full_reasoning,
+        reasoning_details=reasoning_details or None,
     )
     mock_choice = SimpleNamespace(
         index=0,
@@ -4448,6 +4450,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
                 dropped_tool_names=_dropped_names or None,
+                reasoning_details=reasoning_details_acc or None,
             )
 
         # Text-only stream drop: the upstream closed the connection (or the
@@ -4469,6 +4472,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
+                reasoning_details=reasoning_details_acc or None,
             )
 
         effective_finish_reason = finish_reason or "stop"

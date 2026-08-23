@@ -12,7 +12,7 @@ from agent.chat_completion_helpers import coerce_stream_reasoning_details
 from agent.transports.chat_completions import ChatCompletionsTransport
 
 
-def _chunk(*, content=None, reasoning=None, reasoning_content=None, reasoning_details=None, finish=None):
+def _chunk(*, content=None, reasoning=None, reasoning_content=None, reasoning_details=None, finish=None, tool_calls=None):
     extra = {}
     if reasoning_details is not None:
         extra["reasoning_details"] = reasoning_details
@@ -21,7 +21,7 @@ def _chunk(*, content=None, reasoning=None, reasoning_content=None, reasoning_de
         reasoning=reasoning,
         reasoning_content=reasoning_content,
         reasoning_details=reasoning_details,
-        tool_calls=[],
+        tool_calls=tool_calls or [],
         model_extra=extra,
     )
     choice = SimpleNamespace(delta=delta, finish_reason=finish)
@@ -81,3 +81,37 @@ def test_details_not_promoted_to_content():
     acc.feed(_chunk(finish="stop"))
     msg = acc.finish().choices[0].message
     assert "secret cot" not in (msg.content or "")
+
+
+def test_details_then_tool_call_keeps_tools_and_details():
+    acc = _ChatStreamAccumulator(model="glm-4.7")
+    acc.feed(_chunk(reasoning_details=[{"type": "reasoning.summary", "summary": "plan tool"}]))
+    tc = SimpleNamespace(
+        index=0,
+        id="call_1",
+        function=SimpleNamespace(name="terminal", arguments='{"command":"true"}'),
+    )
+    acc.feed(_chunk(tool_calls=[tc]))
+    acc.feed(_chunk(finish="tool_calls"))
+    msg = acc.finish().choices[0].message
+    assert msg.reasoning_details == [{"type": "reasoning.summary", "summary": "plan tool"}]
+    assert msg.tool_calls is not None
+    assert msg.tool_calls[0].id == "call_1"
+    assert msg.tool_calls[0].function.name == "terminal"
+    assert "plan tool" not in (msg.content or "")
+
+
+def test_partial_stub_preserves_details():
+    from agent.chat_completion_helpers import _build_partial_stream_stub
+    stub = _build_partial_stream_stub(
+        "assistant",
+        None,
+        None,
+        "glm-4.7",
+        None,
+        reasoning_details=[{"type": "reasoning.summary", "summary": "mid drop"}],
+    )
+    assert stub.choices[0].message.reasoning_details == [
+        {"type": "reasoning.summary", "summary": "mid drop"}
+    ]
+    assert not (stub.choices[0].message.content or "")
