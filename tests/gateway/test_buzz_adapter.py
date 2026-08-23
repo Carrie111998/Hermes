@@ -342,6 +342,18 @@ class TestThreadSessions:
         adapter._message_handler = AsyncMock()
         return adapter
 
+    def test_legacy_positional_markers_resolve_root_and_reply(self):
+        event = _tagged_event(NESTED_REPLY_A, CHANNEL, content="legacy")
+        event["tags"] = [
+            ["e", ROOT_A, "root"],
+            ["e", REPLY_A, "reply"],
+        ]
+
+        assert _buzz_mod.BuzzAdapter._thread_ids_from_event(event) == (
+            ROOT_A,
+            REPLY_A,
+        )
+
     @pytest.mark.asyncio
     async def test_root_and_nested_replies_share_one_thread_source(self):
         adapter = self._adapter()

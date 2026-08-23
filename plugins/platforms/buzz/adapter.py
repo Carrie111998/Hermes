@@ -1123,9 +1123,10 @@ class BuzzAdapter(BasePlatformAdapter):
 
         Buzz follows NIP-10 for nested replies: a direct reply to a root often
         has only an ``e`` tag marked ``reply``; a nested reply has both a
-        ``root`` tag and an immediate ``reply`` tag. A top-level message is its
-        own prospective thread root. Invalid IDs are ignored rather than used
-        in persistent session keys.
+        ``root`` tag and an immediate ``reply`` tag. Accept both the current
+        four-field marker shape and the legacy three-field positional shape.
+        A top-level message is its own prospective thread root. Invalid IDs are
+        ignored rather than used in persistent session keys.
         """
         event_id = str(event.get("id") or "").lower()
         if not _NOSTR_EVENT_ID_RE.fullmatch(event_id):
@@ -1142,6 +1143,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 if not _NOSTR_EVENT_ID_RE.fullmatch(target):
                     continue
                 marker = str(tag[3] or "").lower() if len(tag) > 3 else ""
+                if not marker and len(tag) > 2:
+                    positional_marker = str(tag[2] or "").lower()
+                    if positional_marker in {"root", "reply"}:
+                        marker = positional_marker
                 if marker == "root" and root_id is None:
                     root_id = target
                 elif marker == "reply" and reply_to_id is None:
