@@ -83,6 +83,17 @@ describe('clearUnreadOnOpen', () => {
     expect($sessions.get().find(s => s.id === 'a')?.unread).toBe(false)
   })
 
+  // The `!row` early-return is what keeps a brand-new chat (no persisted
+  // backend row yet) from issuing a doomed PATCH — guard against
+  // regression.
+  it('no-ops for a runtime-only session with no persisted row', async () => {
+    $sessions.set([])
+
+    await clearUnreadOnOpen('ghost')
+
+    expect(patch).not.toHaveBeenCalled()
+  })
+
   it('swallows a failed PATCH (the next honest refresh heals the dot)', async () => {
     $sessions.set([row('a', { unread: true })])
     patch.mockImplementationOnce(() => Promise.reject(new Error('offline')))
