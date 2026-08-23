@@ -16347,6 +16347,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return session_entry
 
         prior_session_id = session_entry.session_id
+        if (
+            not follows_compression
+            and str(pinned_row.get("parent_session_id") or "")
+            == prior_session_id
+        ):
+            # A delegated child can inherit the gateway peer metadata while its
+            # task-local session id correctly points at the child.  A background
+            # process notification from that mixed context must never move the
+            # parent's route to the child: switch_session() would end the parent
+            # as a hard session_switch boundary, and the delegation's eventual
+            # aggregate completion would then be terminally dropped.  Genuine
+            # compression continuations use the verified lineage path above.
+            logger.warning(
+                "Async-delegation completion refused to move routing key %s "
+                "from parent session %s to its child %s.",
+                session_entry.session_key,
+                prior_session_id,
+                target_session_id,
+            )
+            return None
         if follows_compression:
             switched = await self.async_session_store.advance_compression_session(
                 session_entry.session_key,

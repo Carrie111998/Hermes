@@ -118,6 +118,26 @@ class TestGatewayPinningFailsClosed:
         )
 
     @pytest.mark.asyncio
+    async def test_delegated_child_cannot_replace_parent_route(self):
+        current = self._entry("sess_parent")
+        runner = self._make_runner(
+            {
+                "sess_child": {
+                    "id": "sess_child",
+                    "ended_at": None,
+                    "parent_session_id": "sess_parent",
+                }
+            }
+        )
+
+        resolved = await runner._resolve_async_delegation_session(
+            current, "sess_child"
+        )
+
+        assert resolved is None
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
     async def test_non_compression_ended_parent_drops(self):
         current = self._entry("sess_old")
         runner = self._make_runner(
