@@ -2576,6 +2576,7 @@ def init_agent(
                 model=agent.model,
                 base_url=agent.base_url,
                 custom_providers=_custom_providers,
+                provider=agent.provider,
             )
             if _cp_ctx_resolved:
                 _config_context_length = int(_cp_ctx_resolved)

@@ -1804,6 +1804,7 @@ def get_custom_provider_context_length(
     base_url: str,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
     config: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = "",
 ) -> Optional[int]:
     """Look up a per-model ``context_length`` override from ``custom_providers``.
 
@@ -1840,9 +1841,23 @@ def get_custom_provider_context_length(
     if not target_url:
         return None
 
+    provider_lower = (provider or "").strip().lower()
+
     for entry in custom_providers:
         if not isinstance(entry, dict):
             continue
+        # Provider-scoped match: when a provider is supplied, only entries whose
+        # provider_key/name/slug match it are eligible. Multiple providers can
+        # share one base_url (e.g. an OpenAI-compatible aggregator such as
+        # new-api/one-api) and serve identically named models with different
+        # context windows; matching on base_url alone would resolve whichever
+        # provider appears first in config order instead of the one in use.
+        if provider_lower:
+            entry_provider = str(
+                entry.get("provider_key") or entry.get("name") or entry.get("slug") or ""
+            ).strip().lower()
+            if entry_provider and entry_provider != provider_lower:
+                continue
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue

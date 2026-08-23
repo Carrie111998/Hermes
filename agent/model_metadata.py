@@ -2926,6 +2926,7 @@ def get_model_context_length(
                 model=model,
                 base_url=base_url,
                 custom_providers=custom_providers,
+                provider=provider,
             )
             if cp_ctx:
                 return cp_ctx
