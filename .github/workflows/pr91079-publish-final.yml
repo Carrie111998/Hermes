@@ -34,7 +34,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          branch=fix/windows-desktop-pack-transaction
           implementation=db32f7bb0864f5944c6ed9f505d0b979bedc8f2f
 
           git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
@@ -67,7 +66,7 @@ jobs:
           replacements = (
               (
                   '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs",',
-                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
+                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
               ),
               (
                   '    "check:test:desktop:all": "npm run test:desktop:all",',
@@ -86,7 +85,7 @@ jobs:
           data = json.loads(s)
           scripts = data['scripts']
           assert scripts['build'].endswith('node scripts/stage-native-deps-recovery.mjs')
-          assert 'vite build' not in scripts['build']
+          assert 'vite build' in scripts['build']
           assert scripts['check:test:desktop:all'].startswith(
               'node --test scripts/stage-native-deps-recovery.test.mjs && '
           )
@@ -217,7 +216,20 @@ jobs:
           done < /tmp/actual-paths
 
           python - <<'PY'
+          import json
           from pathlib import Path
+
+          package_text = Path('apps/desktop/package.json').read_text(encoding='utf-8')
+          package = json.loads(package_text)
+          scripts = package['scripts']
+          assert 'vite build' in scripts['build']
+          assert scripts['build'].endswith('node scripts/stage-native-deps-recovery.mjs')
+          assert scripts['check:test:desktop:all'].startswith(
+              'node --test scripts/stage-native-deps-recovery.test.mjs && '
+          )
+          assert package['build']['beforePack'] == 'scripts/before-pack-recovery.mjs'
+          assert scripts['check:test:plugins'] == 'node --test src/plugins/*/tests/*.test.mjs'
+          assert 'run-ui-shard.mjs' not in package_text
 
           s = Path('hermes_cli/main.py').read_text(encoding='utf-8')
           block = s.split(
@@ -234,6 +246,10 @@ jobs:
               assert token in block, token
           assert 'shutil.rmtree(unpacked' not in block
           PY
+
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+            +refs/heads/main:refs/remotes/upstream/main
+          test "$(git rev-parse refs/remotes/upstream/main)" = "$PR91079_BASE"
 
           echo "base=$PR91079_BASE"
           echo "final_sha=$PR91079_FINAL_SHA"
