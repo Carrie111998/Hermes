@@ -5889,7 +5889,16 @@ class TurnRunner:
                 _credits_notices_enabled = bool(_credits_display.get("credits_notices"))
         except Exception:
             _credits_notices_enabled = True
-        agent.stamp_credits_notices_policy(_credits_notices_enabled)
+        # Prefer the public AIAgent method (the gateway-facing encapsulation
+        # boundary for the cache write).  Fall back to the direct field for
+        # duck-typed agent stand-ins (gateway test fakes / plugin agents that
+        # don't subclass AIAgent) — same getattr pattern as the
+        # _agent_cache_lock reads below.
+        _stamp_policy = getattr(agent, "stamp_credits_notices_policy", None)
+        if callable(_stamp_policy):
+            _stamp_policy(_credits_notices_enabled)
+        else:
+            agent._credits_notices_enabled_cache = _credits_notices_enabled
 
         def _notice_callback_sync(notice) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
