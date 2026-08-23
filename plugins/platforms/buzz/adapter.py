@@ -627,7 +627,12 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        # Keep all channel-thread responses at the Buzz root. The gateway's
+        # generic ``reply_to`` anchor is the triggering reply event; preferring
+        # it here creates a nested sub-thread and hides the agent's response
+        # from the root thread pane. DMs have no thread metadata and retain the
+        # immediate reply anchor.
+        reply_target = (metadata or {}).get("thread_id") or reply_to
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)

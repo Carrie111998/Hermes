@@ -666,6 +666,24 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_thread_send_prefers_root_over_nested_reply_anchor(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-thread"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "answer",
+            reply_to=NESTED_REPLY_A,
+            metadata={"thread_id": ROOT_A},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == ROOT_A
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
