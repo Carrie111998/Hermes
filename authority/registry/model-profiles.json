@@ -128,25 +128,6 @@
       "supports_images": true,
       "routing_role": "multimodal-only"
     },
-    "ollama/qwen3-vl:2b": {
-      "vendor_family": "local",
-      "supported_reasoning": [
-        "off"
-      ],
-      "thinking_map": {
-        "off": "off",
-        "low": "off",
-        "medium": "off",
-        "high": "off",
-        "deep": "off"
-      },
-      "context_window": 262144,
-      "supports_tools": false,
-      "supports_images": true,
-      "supports_vision": true,
-      "routing_role": "local-only",
-      "capability_source": "Local Ollama verification: text and vision; 262144 context"
-    },
     "fal/flux-2-pro": {
       "vendor_family": "fal",
       "supported_reasoning": [],

@@ -19,7 +19,7 @@ Use exactly this schema:
   "taskType": "simple|analysis|file_or_code|architecture|investment|legal|financial|multimodal|other",
   "level": "L0|L1|L2|L3",
   "risk": "low|medium|high",
-  "workflow": "direct|standard|controlled-execution|expert-reviewed|multimodal|local_deterministic|local_visual_extraction",
+  "workflow": "direct|standard|controlled-execution|expert-reviewed|multimodal",
   "requiresWrite": false,
   "requiresPlanning": false,
   "requiresReview": false,
@@ -39,11 +39,6 @@ Classification principles:
   irreversible, or critical architecture judgment.
 - Use `controlled-execution` when files, code, data, or commands must be changed.
 - Use `multimodal` when image, screenshot, chart, or scan metadata is present.
-- Select `local_deterministic` only when the user explicitly requests that local
-  workflow; never infer it as a cheaper fallback for an ordinary L0 task.
-- Select `local_visual_extraction` only when the user explicitly requests that
-  local workflow and an image/path is present; never insert it into the default
-  cloud multimodal chain.
 - Use `expert-reviewed` for L3.
 - Prefer conservative escalation when meaningful risk or ambiguity exists.
 - Do not select or mention OpenCode, Kimi, Moonshot, Claude, or Anthropic.

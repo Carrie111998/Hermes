@@ -19,11 +19,11 @@ diff, a benchmark run, and a review decision.
 - `semantic-router-prompt.md` — classifier contract.
 - `manifest.json` — source snapshot, hashes, version, and promotion state.
 
-Specialized local workflows are opt-in. A user can select one with a first-line
-`workflow: local_deterministic` or `workflow: local_visual_extraction` directive;
-the semantic router may return the same registry keys only for an explicit local
-request. They resolve to `ollama/qwen3-vl:2b` and are isolated from the default
-cloud multimodal chain.
+Specialized workflows are opt-in. A user can select one with a first-line
+`workflow: file-edit` directive; the semantic router may return the same
+registry key only for an explicit request. They resolve to the standard
+cloud chain (fast-economy contract) and are isolated from the default
+multimodal routing.
 
 The portable, runtime-neutral migration contract is kept separately at
 `../goose-migration/PORTABLE_CONTRACT.md`. It is the material to export when Goose becomes

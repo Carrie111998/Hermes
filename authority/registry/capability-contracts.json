@@ -2,16 +2,6 @@
   "schema_version": "1.0",
   "description": "Capability contracts declare what a task needs (quality floor, context, tools, modality, reasoning intent) without naming any model or vendor.",
   "contracts": {
-    "local-deterministic": {
-      "quality": "deterministic",
-      "modality": [
-        "text",
-        "image"
-      ],
-      "tools": "none",
-      "context_class": "short",
-      "reasoning_intent": "off"
-    },
     "fast-economy": {
       "quality": "economy",
       "modality": [

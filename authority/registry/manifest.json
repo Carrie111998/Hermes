@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hermes-workflow-registry/1.0",
-  "registryVersion": "2026-08-22.15",
+  "registryVersion": "2026-08-22.17",
   "owner": "hermes-production",
   "sourceRuntime": "migrated-design",
   "sourceDescription": "Hermes-native workflow control: route levels are independent from execution roles; L3 workflows choose worker or worker-pro per step; top-level responder is blocked from direct project execution on coordinated workflows.",
@@ -17,31 +17,31 @@
   "files": [
     {
       "path": "capability-contracts.json",
-      "sha256": "5321964e1233ee767606b6dd0e4e07e669bca12cb7c3946bfc2198aaeca4abd8"
+      "sha256": "52318beba2fe6fbfb2c9a7fe40dff10ea676a0e2f44ba9fecb61694680d93691"
     },
     {
       "path": "execution-roles.json",
-      "sha256": "78337d269f9d774f59df9315618c74ab0b003ebea65dc54aeaff005306410827"
+      "sha256": "7831c2178d992bd4942081f08532975c9c8942d5deeeabbe90a70dab0c0535f2"
     },
     {
       "path": "model-policies.json",
-      "sha256": "6dbf00b622460bee0f7df5975e3d7d2d0f5d5ffb174e08d58b3060b1953ff7bd"
+      "sha256": "0d9a3a94b80f3c5372dc6d27f32a93c494949e93d69938e939b5c0b860106913"
     },
     {
       "path": "model-profiles.json",
-      "sha256": "7df975cf8c77b76d34200956051371912991c644167471f9e4c7ef348cd06e47"
+      "sha256": "a1992a754a78a94d145672db1d8c712f453141e2d05b777d17917742141c0d5f"
     },
     {
       "path": "route-policy.json",
-      "sha256": "c47fdda7091fa1fa8ccb5594bd7ec4df2e37ca76c705880d1cf46c888e9685d6"
+      "sha256": "8129574878f88c508fdd05a7b9e7cd900e0411678127b547695ffbea2475c230"
     },
     {
       "path": "semantic-router-prompt.md",
-      "sha256": "fef82a11d03396d7072ab0432dcff764ac29adedb98c429e3dcb090fc8c2069e"
+      "sha256": "8fc6f46034b5891526b8573d4484cab9e0472d7701ced9bbc3e9274a0b08262a"
     },
     {
       "path": "workflow-templates.json",
-      "sha256": "ed2e8ec891962aae3d3cdab1f27ab4ca90534f574121aa41753377f66436e176"
+      "sha256": "6308817c85276343fcda2e6fe049ae9a8cfb26f4c1e7ae8584e39fcd3cd28f0d"
     }
   ],
   "governance": {

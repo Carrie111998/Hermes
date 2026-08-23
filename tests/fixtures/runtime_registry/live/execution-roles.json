@@ -44,18 +44,6 @@
       "dispatch": "subagent",
       "model_policy": "independent-review",
       "read_only": true
-    },
-    "local-worker": {
-      "responsibility": "local deterministic text",
-      "tools": "none",
-      "dispatch": "local",
-      "model_policy": "local-deterministic"
-    },
-    "local-extractor": {
-      "responsibility": "local visual extraction",
-      "tools": "none",
-      "dispatch": "local",
-      "model_policy": "local-deterministic"
     }
   }
 }

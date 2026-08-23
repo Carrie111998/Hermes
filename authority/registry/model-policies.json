@@ -16,11 +16,6 @@
       ],
       "router_failure_action": "fast_gate_conservative"
     },
-    "local-deterministic": {
-      "primary": "ollama/qwen3-vl:2b",
-      "soft_failover": [],
-      "hard_failover": []
-    },
     "fast-economy": {
       "primary_pool": [
         "minimax-cn/MiniMax-M3"
