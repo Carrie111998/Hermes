@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+from gateway.session import build_session_key
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
 # (plugin_adapter_buzz) so it cannot collide with other plugin adapters
@@ -30,6 +32,10 @@ SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
 SELF_NPUB = "npub1nl2u0wnd8mezfknc74q7pl9ec58h9nrrakce4tnk434qgaxl4psqe5twr6"
 OTHER_PUBKEY = "a" * 64
 CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
+ROOT_A = "1" * 64
+ROOT_B = "2" * 64
+REPLY_A = "3" * 64
+NESTED_REPLY_A = "4" * 64
 # Real DM conversation as materialized by a hosted relay: `dms list` returns
 # [] for it (#68871) while `channels list` shows it as name "DM", empty
 # description, indistinguishable from a channel except via message p-tags.
@@ -45,6 +51,7 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES",
 )
 
 
@@ -261,9 +268,11 @@ class TestMentionGating:
 
 
 def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
-                  created_at=1000, kind=9, p=None, reply_to=None):
+                  created_at=1000, kind=9, p=None, root=None, reply_to=None):
     """Event with the tag shapes observed on a live relay (h/p/e tags)."""
     tags = [["h", channel]]
+    if root:
+        tags.append(["e", root, "", "root"])
     if reply_to:
         tags.append(["e", reply_to, "", "reply"])
     if p:
@@ -276,6 +285,256 @@ def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
         "kind": kind,
         "tags": tags,
     }
+
+
+class _FakeSessionStore:
+    """Small SessionStore contract for adapter observation tests."""
+
+    def __init__(self):
+        self.config = SimpleNamespace(
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        self.entries = {}
+        self.messages = []
+
+    def add_source(self, source, session_id="buzz-thread-session"):
+        key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.group_sessions_per_user,
+            thread_sessions_per_user=self.config.thread_sessions_per_user,
+        )
+        entry = SimpleNamespace(session_id=session_id)
+        self.entries[key] = entry
+        return entry
+
+    def lookup_by_session_key(self, session_key):
+        return self.entries.get(session_key)
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
+class TestThreadSessions:
+
+    @staticmethod
+    def _adapter(*, observe=True):
+        adapter = _make_adapter(
+            {"observe_unmentioned_thread_messages": observe}
+        )
+        adapter._allowed_pubkeys = {OTHER_PUBKEY}
+        adapter._user_names[OTHER_PUBKEY] = "Alice Example"
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        adapter.handle_message = AsyncMock()
+        adapter._message_handler = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_root_and_nested_replies_share_one_thread_source(self):
+        adapter = self._adapter()
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(ROOT_A, CHANNEL, content="@Chip start work"),
+        )
+        root_event = adapter.handle_message.await_args.args[0]
+        assert root_event.source.chat_id == CHANNEL
+        assert root_event.source.chat_type == "thread"
+        assert root_event.source.thread_id == ROOT_A
+        assert root_event.source.parent_chat_id == CHANNEL
+        assert root_event.source.message_id == ROOT_A
+
+        adapter.handle_message.reset_mock()
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                NESTED_REPLY_A,
+                CHANNEL,
+                content="@Chip continue",
+                root=ROOT_A,
+                reply_to=REPLY_A,
+            ),
+        )
+        nested_event = adapter.handle_message.await_args.args[0]
+        assert nested_event.source.chat_type == "thread"
+        assert nested_event.source.thread_id == ROOT_A
+        assert nested_event.source.message_id == NESTED_REPLY_A
+
+        root_key = build_session_key(root_event.source)
+        nested_key = build_session_key(nested_event.source)
+        assert nested_key == root_key
+
+    @pytest.mark.asyncio
+    async def test_two_roots_by_same_human_use_distinct_sessions(self):
+        adapter = self._adapter()
+
+        for event_id in (ROOT_A, ROOT_B):
+            await adapter._handle_event(
+                CHANNEL,
+                adapter._channel_state[CHANNEL],
+                _tagged_event(event_id, CHANNEL, content="@Chip start work"),
+            )
+
+        first, second = [call.args[0] for call in adapter.handle_message.await_args_list]
+        assert first.source.user_id == second.source.user_id == OTHER_PUBKEY
+        assert build_session_key(first.source) != build_session_key(second.source)
+
+    @pytest.mark.asyncio
+    async def test_two_humans_in_one_root_share_the_thread_session(self):
+        adapter = self._adapter()
+        second_pubkey = "b" * 64
+        adapter._allowed_pubkeys.add(second_pubkey)
+        adapter._user_names[second_pubkey] = "Bob Example"
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(ROOT_A, CHANNEL, content="@Chip start work"),
+        )
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                NESTED_REPLY_A,
+                CHANNEL,
+                content="@Chip I am taking over",
+                pubkey=second_pubkey,
+                root=ROOT_A,
+                reply_to=REPLY_A,
+            ),
+        )
+
+        first, second = [call.args[0] for call in adapter.handle_message.await_args_list]
+        assert first.source.user_id != second.source.user_id
+        assert build_session_key(first.source) == build_session_key(second.source)
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_reply_is_observed_without_dispatch_then_reused(self):
+        adapter = self._adapter()
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        source = adapter.build_source(
+            chat_id=CHANNEL,
+            chat_name="pilot",
+            chat_type="thread",
+            user_id=OTHER_PUBKEY,
+            user_name="Alice Example",
+            thread_id=ROOT_A,
+            parent_chat_id=CHANNEL,
+            message_id=ROOT_A,
+        )
+        store.add_source(source)
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(REPLY_A, CHANNEL, content="the launch date is Tuesday", reply_to=ROOT_A),
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert len(store.messages) == 1
+        session_id, message, skip_db = store.messages[0]
+        assert session_id == "buzz-thread-session"
+        assert skip_db is False
+        assert message == {
+            "role": "user",
+            "content": f"[Alice Example|{OTHER_PUBKEY}]\nthe launch date is Tuesday",
+            "timestamp": message["timestamp"],
+            "observed": True,
+            "message_id": REPLY_A,
+        }
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                NESTED_REPLY_A,
+                CHANNEL,
+                content="@Chip what is the launch date?",
+                root=ROOT_A,
+                reply_to=REPLY_A,
+            ),
+        )
+        triggered = adapter.handle_message.await_args.args[0]
+        assert build_session_key(triggered.source) in store.entries
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_top_level_or_unknown_thread_is_not_observed(self):
+        adapter = self._adapter()
+        store = _FakeSessionStore()
+        adapter._session_store = store
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(ROOT_A, CHANNEL, content="ordinary top-level chatter"),
+        )
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(REPLY_A, CHANNEL, content="ordinary reply", reply_to=ROOT_B),
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert store.messages == []
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_reply_cannot_enter_observed_context(self):
+        adapter = self._adapter()
+        adapter._allowed_pubkeys = {"b" * 64}
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        store.add_source(
+            adapter.build_source(
+                chat_id=CHANNEL,
+                chat_type="thread",
+                user_id=OTHER_PUBKEY,
+                thread_id=ROOT_A,
+                parent_chat_id=CHANNEL,
+                message_id=ROOT_A,
+            )
+        )
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(REPLY_A, CHANNEL, content="poisoned context", reply_to=ROOT_A),
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert store.messages == []
+
+    @pytest.mark.asyncio
+    async def test_gateway_authorization_revocation_blocks_observation(self):
+        adapter = self._adapter()
+        adapter.set_authorization_check(lambda *_args: False)
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        store.add_source(
+            adapter.build_source(
+                chat_id=CHANNEL,
+                chat_type="thread",
+                user_id=OTHER_PUBKEY,
+                thread_id=ROOT_A,
+                parent_chat_id=CHANNEL,
+                message_id=ROOT_A,
+            )
+        )
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(REPLY_A, CHANNEL, content="revoked context", reply_to=ROOT_A),
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert store.messages == []
 
 
 class TestDmClassification:
@@ -490,6 +749,12 @@ class TestEnvEnablement:
     def test_returns_none_when_unconfigured(self):
         assert _env_enablement() is None
 
+    def test_observation_setting_loads_from_config(self):
+        adapter = _make_adapter(
+            {"observe_unmentioned_thread_messages": "true"}
+        )
+        assert adapter.observe_unmentioned_thread_messages is True
+
 
 class TestBuzzPluginRegistration:
 
@@ -536,5 +801,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
-

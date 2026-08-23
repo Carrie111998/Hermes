@@ -25,11 +25,13 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            observe_unmentioned_thread_messages: false
+                                      # store authorized replies in known agent threads
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -44,7 +46,7 @@ import re
 import shutil
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -88,6 +90,7 @@ from gateway.config import Platform
 # returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
 # dispatched to the agent.
 _CHAT_KIND = 9
+_NOSTR_EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
@@ -391,6 +394,21 @@ class BuzzAdapter(BasePlatformAdapter):
         else:
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
+
+        # Store authorized, unmentioned replies as context in an already-known
+        # Buzz thread without waking the agent. Top-level channel chatter and
+        # replies in threads the agent has never joined remain ignored.
+        _observe_raw = os.getenv("BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES")
+        if _observe_raw is None:
+            _observe_cfg = extra.get(
+                "observe_unmentioned_thread_messages",
+                extra.get("observe_unmentioned_group_messages", False),
+            )
+        else:
+            _observe_cfg = _observe_raw
+        self.observe_unmentioned_thread_messages = (
+            str(_observe_cfg).strip().lower() in ("true", "1", "yes", "on")
+        )
 
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
@@ -1030,16 +1048,48 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
+        # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
+        # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
+        # Authorization must precede passive observation so an unauthorized
+        # participant cannot poison a shared thread transcript.
+        if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
+            return
+
+        root_id: Optional[str] = None
+        reply_to_id: Optional[str] = None
+        if not is_dm:
+            root_id, reply_to_id = self._thread_ids_from_event(event)
+
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
         if not is_dm and self.require_mention and not self._is_mentioned(content):
-            return
-
-        # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
-        # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
-        if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
-            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
+            callback_authorized = self._is_sender_authorized(
+                pubkey,
+                "thread" if root_id else "group",
+                channel_id,
+            )
+            observation_authorized = callback_authorized is not False and (
+                pubkey in self._allowed_pubkeys
+                if self._allowed_pubkeys
+                else callback_authorized is True
+            )
+            if (
+                self.observe_unmentioned_thread_messages
+                and root_id
+                and reply_to_id
+                and observation_authorized
+            ):
+                self._observe_unmentioned_thread_message(
+                    text=content.strip(),
+                    chat_id=channel_id,
+                    user_id=pubkey,
+                    user_name=await self._resolve_user_name(pubkey),
+                    message_id=event_id,
+                    created_at=created_at,
+                    root_id=root_id,
+                )
             return
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
@@ -1051,12 +1101,130 @@ class BuzzAdapter(BasePlatformAdapter):
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
-            chat_type="dm" if is_dm else "group",
+            chat_type="dm" if is_dm else ("thread" if root_id else "group"),
             user_id=pubkey,
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=root_id,
+            parent_chat_id=channel_id if root_id else None,
         )
+
+    @staticmethod
+    def _thread_ids_from_event(event: dict) -> Tuple[Optional[str], Optional[str]]:
+        """Return ``(root_id, reply_to_id)`` from a Buzz Nostr chat event.
+
+        Buzz follows NIP-10 for nested replies: a direct reply to a root often
+        has only an ``e`` tag marked ``reply``; a nested reply has both a
+        ``root`` tag and an immediate ``reply`` tag. A top-level message is its
+        own prospective thread root. Invalid IDs are ignored rather than used
+        in persistent session keys.
+        """
+        event_id = str(event.get("id") or "").lower()
+        if not _NOSTR_EVENT_ID_RE.fullmatch(event_id):
+            return None, None
+
+        root_id: Optional[str] = None
+        reply_to_id: Optional[str] = None
+        tags = event.get("tags")
+        if isinstance(tags, list):
+            for tag in tags:
+                if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "e":
+                    continue
+                target = str(tag[1] or "").lower()
+                if not _NOSTR_EVENT_ID_RE.fullmatch(target):
+                    continue
+                marker = str(tag[3] or "").lower() if len(tag) > 3 else ""
+                if marker == "root" and root_id is None:
+                    root_id = target
+                elif marker == "reply" and reply_to_id is None:
+                    reply_to_id = target
+
+        # A direct reply commonly carries only ["e", root, "", "reply"].
+        # For top-level events, the event itself becomes the stable root.
+        return root_id or reply_to_id or event_id, reply_to_id
+
+    def _thread_session_key(self, source) -> Optional[str]:
+        """Build the exact SessionStore key for a Buzz thread source."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return None
+        try:
+            from gateway.session import build_session_key
+
+            store_cfg = getattr(store, "config", None)
+            return build_session_key(
+                source,
+                group_sessions_per_user=getattr(
+                    store_cfg, "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=getattr(
+                    store_cfg, "thread_sessions_per_user", False
+                ),
+                profile=getattr(source, "profile", None),
+            )
+        except Exception:
+            logger.debug("Buzz: failed to build thread session key", exc_info=True)
+            return None
+
+    def _observe_unmentioned_thread_message(
+        self,
+        *,
+        text: str,
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+        message_id: str,
+        created_at: int,
+        root_id: str,
+    ) -> bool:
+        """Append context to a known Buzz thread without invoking the agent."""
+        store = getattr(self, "_session_store", None)
+        if not store or not hasattr(store, "lookup_by_session_key"):
+            return False
+        try:
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_name=self._channel_names.get(chat_id, chat_id),
+                chat_type="thread",
+                user_id=user_id,
+                user_name=user_name,
+                thread_id=root_id,
+                parent_chat_id=chat_id,
+                message_id=message_id,
+            )
+            session_key = self._thread_session_key(source)
+            session_entry = (
+                store.lookup_by_session_key(session_key) if session_key else None
+            )
+            if not session_entry:
+                return False
+            timestamp = (
+                datetime.fromtimestamp(created_at, tz=timezone.utc)
+                if created_at
+                else datetime.now(tz=timezone.utc)
+            )
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": f"[{user_name or user_id}|{user_id}]\n{text}",
+                    "timestamp": timestamp.isoformat(),
+                    "observed": True,
+                    "message_id": message_id,
+                },
+            )
+            logger.info(
+                "Buzz: authorized thread reply observed without dispatch: "
+                "channel=%s root=%s from=%s",
+                chat_id,
+                root_id[:12],
+                user_id[:12],
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Buzz: failed to observe thread reply: %s", exc)
+            return False
 
     # ── DM classification (issue #68871) ──────────────────────────────────
     #
@@ -1219,6 +1387,8 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,6 +1400,9 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            message_id=message_id,
         )
 
         event = MessageEvent(
@@ -1316,6 +1489,13 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    if (
+        "observe_unmentioned_thread_messages" in extra
+        and not os.getenv("BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES")
+    ):
+        os.environ["BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES"] = str(
+            extra["observe_unmentioned_thread_messages"]
+        ).lower()
     return None
 
 
@@ -1345,6 +1525,11 @@ def _env_enablement() -> Optional[dict]:
     cli_path = os.getenv("BUZZ_CLI_PATH", "").strip()
     if cli_path:
         seed["cli_path"] = cli_path
+    observe = os.getenv("BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES", "").strip()
+    if observe:
+        seed["observe_unmentioned_thread_messages"] = observe.lower() in {
+            "true", "1", "yes", "on"
+        }
     # Home channel for deliver=buzz cron jobs; defaults to the first watched
     # channel so env-only setups get a sensible target without extra config.
     home = os.getenv("BUZZ_HOME_CHANNEL", "").strip() or (seed.get("channels") or [""])[0]
