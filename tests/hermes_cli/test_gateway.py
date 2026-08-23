@@ -17,6 +17,80 @@ import hermes_cli.gateway as gateway
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+def _run_gateway_start_with_port_probe(
+    monkeypatch, capsys, occupied, host="127.0.0.1"
+):
+    import socket
+
+    api_config = SimpleNamespace(
+        enabled=True,
+        extra={"host": host, "port": 8642},
+    )
+    monkeypatch.setattr(
+        gateway,
+        "load_gateway_config",
+        lambda: SimpleNamespace(platforms={"api_server": api_config}),
+    )
+    probe_calls = []
+
+    def probe(address, timeout):
+        probe_calls.append((address, timeout))
+        if occupied:
+            return SimpleNamespace(close=lambda: None)
+        raise OSError("refused")
+
+    monkeypatch.setattr(socket, "create_connection", probe)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "testprof"
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_dispatch_via_service_manager_if_s6",
+        lambda action: False,
+    )
+    monkeypatch.setattr(gateway, "is_termux", lambda: False)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    starts = []
+    monkeypatch.setattr(
+        gateway,
+        "systemd_start",
+        lambda system=False: starts.append(system),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(gateway_command="start", system=False, all=False)
+    )
+    return capsys.readouterr().out, starts, probe_calls
+
+
+def test_gateway_start_warns_when_api_server_port_is_occupied(monkeypatch, capsys):
+    output, starts, _ = _run_gateway_start_with_port_probe(monkeypatch, capsys, True)
+
+    assert "testprof" in output
+    assert "127.0.0.1" in output
+    assert "8642" in output
+    assert "hermes --profile testprof gateway stop" in output
+    assert "hermes --profile testprof gateway restart" in output
+    assert starts == [False]
+
+
+def test_gateway_start_does_not_warn_when_api_server_port_is_free(monkeypatch, capsys):
+    output, starts, _ = _run_gateway_start_with_port_probe(monkeypatch, capsys, False)
+
+    assert "port" not in output.lower()
+    assert starts == [False]
+
+
+def test_gateway_start_skips_non_loopback_host_probe(monkeypatch, capsys):
+    output, starts, probe_calls = _run_gateway_start_with_port_probe(
+        monkeypatch, capsys, True, host="gateway.example.com"
+    )
+
+    assert probe_calls == []
+    assert "port" not in output.lower()
+    assert starts == [False]
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
