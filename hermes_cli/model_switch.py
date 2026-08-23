@@ -2401,13 +2401,13 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
 
     def _fetch_one(slug: str) -> None:
         try:
-            models = cached_provider_model_ids(slug, force_refresh=True)
-            # cached_provider_model_ids already persists the result, but in a
-            # non-locked read-modify-write.  Re-persist via the thread-safe
-            # path to guarantee no lost writes under concurrency.
-            if models:
-                from hermes_cli.models import update_provider_cache_entry
-                update_provider_cache_entry(slug, models)
+            # cached_provider_model_ids persists a successful fetch itself,
+            # under the shared cache write lock, so there is nothing to
+            # re-persist here.  Writing the return value back again would
+            # also re-stamp a *stale* one: when the forced live fetch fails
+            # this returns the old catalog untouched, and saving that with a
+            # fresh timestamp would hide its age for another full TTL.
+            cached_provider_model_ids(slug, force_refresh=True)
         except Exception:
             pass  # best-effort; picker falls back to curated list
 
