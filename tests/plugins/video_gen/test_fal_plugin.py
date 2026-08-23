@@ -161,9 +161,12 @@ class TestFamilyRouting:
         fake.submit = _submit  # type: ignore
         monkeypatch.setitem(sys.modules, "fal_client", fake)
 
-        # Reset the lazy global so it picks up our stub
+        # Point the lazy global straight at our stub, bypassing
+        # _load_fal_client()'s real lazy_deps.ensure() check — that check
+        # inspects installed package metadata, not sys.modules, so it
+        # ignores this stub and can attempt a real pip install.
         from plugins.video_gen import fal as fal_plugin
-        fal_plugin._fal_client = None
+        fal_plugin._fal_client = fake
         # Also reset the managed client cache
         fal_plugin._managed_fal_video_client = None
         fal_plugin._managed_fal_video_client_config = None
@@ -507,8 +510,10 @@ class TestUpscalePass:
         fake.submit = _submit  # type: ignore
         monkeypatch.setitem(sys.modules, "fal_client", fake)
 
+        # See TestFamilyRouting.with_fake_fal above for why this points
+        # straight at the stub instead of resetting to None.
         from plugins.video_gen import fal as fal_plugin
-        fal_plugin._fal_client = None
+        fal_plugin._fal_client = fake
         fal_plugin._managed_fal_video_client = None
         fal_plugin._managed_fal_video_client_config = None
 
