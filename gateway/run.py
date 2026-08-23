@@ -30451,6 +30451,37 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
+    """Return True when ``--replace`` must refuse to signal ``existing_pid``.
+
+    The PID file is HERMES_HOME-scoped, but a poisoned/stale record (e.g. one
+    cloned into a new profile by an older ``create_profile``, #89315) can point
+    at another profile's LIVE gateway. Killing it starts the cross-profile
+    SIGTERM restart loop the duplicate-instance guard was never meant to allow.
+    When the live process's readable command line identifies it as belonging to
+    a different profile than ours (this HERMES_HOME), replacement is refused.
+    Probe failures return False so same-home replaces keep their existing
+    identity-checked behavior.
+    """
+    try:
+        from gateway.status import (
+            _get_process_hermes_home,
+            _read_process_cmdline,
+            _command_line_belongs_to_profile,
+        )
+        live_cmdline = _read_process_cmdline(existing_pid)
+        if not live_cmdline:
+            return False
+        return not _command_line_belongs_to_profile(
+            live_cmdline, _get_process_hermes_home()
+        )
+    except Exception:
+        logger.debug(
+            "cross-profile --replace guard probe failed", exc_info=True
+        )
+        return False
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -30497,6 +30528,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
+            if _replace_target_belongs_to_other_profile(existing_pid):
+                from gateway.status import _get_process_hermes_home
+
+                logger.error(
+                    "Refusing --replace: PID %d belongs to a different "
+                    "profile's gateway (HERMES_HOME %s). Remove the stale "
+                    "PID record or stop the owning profile explicitly.",
+                    existing_pid,
+                    _get_process_hermes_home(),
+                )
+                return False
             existing_start_time = get_process_start_time(existing_pid)
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",

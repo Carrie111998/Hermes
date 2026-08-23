@@ -1209,6 +1209,16 @@ def create_profile(
         for subdir in _PROFILE_DIRS:
             (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
 
+        if source_dir is not None and clone_config:
+            # Runtime files must never survive a clone (#89315). The desktop's
+            # "new profile" flow uses clone_config, so a poisoned source-side
+            # gateway.pid / gateway_state.json / processes.json previously rode
+            # along: a later --replace in the new profile read the inherited
+            # record and SIGTERMed another profile's live gateway, feeding the
+            # cross-profile restart loop. Same strip contract as clone_all.
+            for stale in _CLONE_ALL_STRIP:
+                (profile_dir / stale).unlink(missing_ok=True)
+
         # Clone config files from source
         if source_dir is not None:
             for filename in _CLONE_CONFIG_FILES:
