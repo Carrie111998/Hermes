@@ -9,6 +9,7 @@ on:
       - .github/harden-process-edge-authority.py
       - .github/finalize-process-edge-authority.py.gz.b64
       - .github/workflows/publish-process-edge-authority.yml
+      - tests/security/test_process_edge_authority_materializer_transport.py
   workflow_dispatch:
 
 permissions:
