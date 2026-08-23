@@ -154,16 +154,185 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
+# Windows reports process-startup and crash failures as NTSTATUS values cast to
+# unsigned ints. Delivered bare, "Script exited with code 3221225794" tells an
+# operator nothing -- Diego, 2026-08-23, on exactly that message from
+# desktop-asar-guard-watch. Decode the ones that actually occur here so the
+# notification names the failure instead of its integer.
+_NTSTATUS_EXIT_CODES = {
+    0xC0000005: ("STATUS_ACCESS_VIOLATION",
+                 "the process crashed on a bad memory access"),
+    0xC0000017: ("STATUS_NO_MEMORY",
+                 "the process could not get memory - check commit charge and "
+                 "the pagefile cap"),
+    0xC000001D: ("STATUS_ILLEGAL_INSTRUCTION",
+                 "the process executed an illegal instruction"),
+    0xC0000094: ("STATUS_INTEGER_DIVIDE_BY_ZERO",
+                 "integer divide by zero"),
+    0xC00000FD: ("STATUS_STACK_OVERFLOW",
+                 "the process ran out of stack (runaway recursion)"),
+    0xC0000135: ("STATUS_DLL_NOT_FOUND",
+                 "a DLL the process needs was missing"),
+    0xC000013A: ("STATUS_CONTROL_C_EXIT",
+                 "the process was interrupted (Ctrl-C or console close)"),
+    0xC0000142: ("STATUS_DLL_INIT_FAILED",
+                 "the process could not initialize - usually desktop-heap or "
+                 "session exhaustion under load, or a broken DLL"),
+    0xC0000374: ("STATUS_HEAP_CORRUPTION",
+                 "the process aborted on heap corruption"),
+    0xC0000409: ("STATUS_STACK_BUFFER_OVERRUN",
+                 "the process fail-fasted on a stack buffer overrun"),
+}
+
+
+def describe_exit_code(code: object) -> str:
+    """Return a human suffix for a process exit code, or '' when ordinary.
+
+    Designed to be appended unconditionally: ordinary small exit codes (0, 1,
+    2, ...) and unrecognised values return the empty string, so callers never
+    need to branch.
+    """
+    try:
+        rc = int(code)
+    except (TypeError, ValueError):
+        return ""
+    if rc < 0:                       # negative signal-style codes
+        rc &= 0xFFFFFFFF
+    if rc <= 0xFFFF:                 # ordinary exit status - nothing to decode
+        return ""
+    known = _NTSTATUS_EXIT_CODES.get(rc)
+    if known is not None:
+        name, meaning = known
+        return f" (0x{rc:08X} {name} - {meaning})"
+    if 0xC0000000 <= rc <= 0xCFFFFFFF:
+        return f" (0x{rc:08X} - a Windows NTSTATUS failure code)"
+    return ""
+
+
+# Dots that already open a formatted notification header. A body starting with
+# one was formatted upstream; wrapping it again would stack two headers on one
+# message.
+_ALREADY_HEADED_PREFIXES = (
+    "\U0001F534", "\U0001F7E0", "\U0001F7E1", "\U0001F7E2",
+)
+
+
+def _format_cron_delivery(
+    job: dict,
+    event_type_name: str,
+    payload: dict,
+    body: str,
+    fallback: str,
+    verdict_state: str | None = None,
+) -> str:
+    """Wrap a cron chat delivery in the standard notification header.
+
+    Built from the SAME Event / verdict / formatting objects the event-bus
+    notifier uses, so a message delivered to the job's own topic is
+    indistinguishable in shape from the line the alerts topic gets for the
+    same run -- header dot, outcome word, type icon, source, UTC stamp,
+    separator. Before 2026-08-23 these deliveries were bare strings
+    ("WARNING unknown-cursor: ...", "Cron job 'x' failed: ...") and read as a
+    different system from the rest of the feed (Diego, 2026-08-23: "doesn't
+    follow the format, with RAG indicator etc").
+
+    Returns ``fallback`` unchanged if the events package cannot be imported or
+    anything in the formatting path raises: a delivery must never be lost to a
+    presentation problem.
+    """
+    if not (body or "").strip():
+        return fallback
+    if body.lstrip().startswith(_ALREADY_HEADED_PREFIXES):
+        return body
+    try:
+        from events.schema import Event, EventType
+        from events.outcomes import evaluate_outcome
+        from events.formatting import format_event_message
+
+        event_type = getattr(EventType, event_type_name)
+        event = Event.create(
+            event_type,
+            source=str(job.get("name") or job.get("id") or "cron"),
+            payload=payload,
+            job_id=job.get("id"),
+        )
+        verdict = evaluate_outcome(event)
+        if verdict_state is not None:
+            from dataclasses import replace as _replace
+            from events.outcomes import OutcomeState
+
+            verdict = _replace(verdict, state=OutcomeState(verdict_state))
+        return format_event_message(event, body, verdict=verdict)
+    except Exception as exc:
+        logger.debug(
+            "Job '%s': could not format %s delivery header (%s) - "
+            "delivering unformatted",
+            job.get("id", "?"), event_type_name, exc,
+        )
+        return fallback
+
+
+# A leading WARNING/ERROR/FAILED token on any line of a script job's stdout.
+# Anchored at line start so prose mentioning the word ("no warnings found")
+# does not turn a clean run amber.
+_CRON_OUTPUT_WARNING_RE = re.compile(
+    r"^[\s\-*]*(WARNING|WARN|ERROR|FAILED|CRITICAL)\b", re.MULTILINE
+)
+
+
+def _format_cron_output_for_delivery(job: dict, output: str) -> str:
+    """Header-wrap a SCRIPT job's successful output for chat delivery.
+
+    Script jobs are operational (retention sweeps, guards, drift watches) and
+    their stdout lands in ops topics beside event-bus notifications, so they
+    get the same header. Agent jobs are deliberately excluded: their final
+    response is prose written for a human reader, not a status line.
+    """
+    if not job.get("script"):
+        return output
+    text = (output or "").strip()
+    if not text:
+        return output
+    # A run that exits 0 while printing WARNING/ERROR lines is not green. The
+    # dot is the only thing an operator reads when scanning the topic, so let
+    # the output decide it: completed-with-warnings shows amber DEGRADED.
+    state = "degraded" if _CRON_OUTPUT_WARNING_RE.search(text) else None
+    return _format_cron_delivery(
+        job,
+        "CRON_COMPLETED",
+        {"output_summary": text, "exit_code": 0},
+        text,
+        fallback=output,
+        verdict_state=state,
+    )
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
-    """Return a compact one-line failure message for chat delivery.
+    """Return the failure message delivered to the job's chat target.
 
     Full details stay in the cron output directory and the logs. Chat should
     show the operator what broke without dumping provider JSON, retry noise, or
     stack traces into the delivery channel.
+
+    Since 2026-08-23 the compact reason travels under the standard notification
+    header (see _format_cron_delivery) instead of a bare "Cron 'x' failed:"
+    line, which carried no RAG indicator and did not match the CRON_FAILED
+    message the alerts topic gets for the same run. The bare line remains the
+    fallback when formatting is unavailable.
     """
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    def _delivered(reason: str) -> str:
+        return _format_cron_delivery(
+            job,
+            "CRON_FAILED",
+            {"error": reason, "job_name": job_name},
+            f"Error: {reason}",
+            fallback=f"⚠️ Cron '{job_name}' failed: {reason}",
+        )
+
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
@@ -172,16 +341,14 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "weekly usage limit"
         elif "quota" in lower:
             reason = "quota limit"
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            "Fallback chain was exhausted or unavailable. "
+        return _delivered(
+            f"provider {reason}. Fallback chain was exhausted or unavailable. "
             "Full details saved in cron output."
         )
 
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            "Fallback chain was exhausted or unavailable. "
+        return _delivered(
+            "provider timeout. Fallback chain was exhausted or unavailable. "
             "Full details saved in cron output."
         )
 
@@ -189,9 +356,8 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
     # not trip a misleading auth message.
     if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
-            "Full details saved in cron output."
+        return _delivered(
+            "provider authentication error. Full details saved in cron output."
         )
 
     # Strip common exception wrappers and collapse provider payloads. Bound
@@ -204,7 +370,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 180:
         cleaned = cleaned[:177].rstrip() + "..."
-    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    return _delivered(cleaned)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -3711,7 +3877,10 @@ def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:
             stderr = "[REDACTED - redaction failed]"
 
         if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+            parts = [
+                f"Script exited with code {result.returncode}"
+                f"{describe_exit_code(result.returncode)}"
+            ]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -5892,7 +6061,11 @@ def _run_one_job_admitted(
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            deliver_content = (
+                _format_cron_output_for_delivery(job, final_response)
+                if success
+                else _summarize_cron_failure_for_delivery(job, error)
+            )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -6417,7 +6590,15 @@ def _tick_admitted(
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                # Same formatting as run_one_job's delivery. This path used
+                # to build its own bare "Cron job 'x' failed:" string, which
+                # both skipped the compact-reason summarizer (dumping raw
+                # tracebacks into chat) and carried no notification header.
+                deliver_content = (
+                    _format_cron_output_for_delivery(job, final_response)
+                    if success
+                    else _summarize_cron_failure_for_delivery(job, error)
+                )
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
