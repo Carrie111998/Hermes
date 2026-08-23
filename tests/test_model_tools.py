@@ -15,6 +15,24 @@ from model_tools import (
 
 
 # =========================================================================
+# get_tool_definitions
+# =========================================================================
+
+class TestGetToolDefinitions:
+    def test_readonly_catalog_does_not_replace_session_snapshot(self, monkeypatch):
+        import model_tools
+
+        monkeypatch.setattr(model_tools, "_last_resolved_tool_names", ["session_tool"])
+        model_tools.get_tool_definitions(
+            enabled_toolsets=[],
+            quiet_mode=True,
+            update_last_resolved=False,
+        )
+
+        assert model_tools._last_resolved_tool_names == ["session_tool"]
+
+
+# =========================================================================
 # handle_function_call
 # =========================================================================
 

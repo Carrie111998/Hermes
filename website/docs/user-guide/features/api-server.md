@@ -560,9 +560,9 @@ curl -N -X POST http://localhost:8642/api/sessions/$ID/chat/stream \
   -d '{"input": "what files changed in the last hour?"}'
 ```
 
-## Skills and toolsets discovery
+## Skills and tools discovery
 
-`GET /v1/skills` and `GET /v1/toolsets` let external clients enumerate the agent's capabilities deterministically over REST instead of asking the model. Both are read-only and gated by `API_SERVER_KEY`.
+`GET /v1/skills`, `GET /v1/tools`, and `GET /v1/toolsets` let external clients enumerate the agent's capabilities deterministically over REST instead of asking the model. All are read-only and gated by `API_SERVER_KEY`.
 
 ```bash
 curl http://localhost:8642/v1/skills \
@@ -573,9 +573,15 @@ curl http://localhost:8642/v1/toolsets \
   -H "Authorization: Bearer $API_SERVER_KEY"
 # → [{"name": "core", "label": "...", "description": "...", "enabled": true,
 #     "configured": true, "tools": ["read_file", "write_file", ...]}, ...]
+
+curl 'http://localhost:8642/v1/tools?platform=api_server' \
+  -H "Authorization: Bearer $API_SERVER_KEY"
+# → {"platform": "api_server", "data": [{"name": "read_file", "parameters": {...},
+#     "provenance": {"source": "configurable", "toolset": "file",
+#       "source_server": null, "added_below_explicit_config": false}}, ...]}
 ```
 
-`/v1/skills` returns the same metadata the skills hub uses internally. `/v1/toolsets` returns toolsets resolved for the `api_server` platform with the concrete `tools` list each one expands to. Both are advertised under `endpoints.*` in `/v1/capabilities`.
+`/v1/skills` returns the same metadata the skills hub uses internally. `/v1/tools` resolves the complete available catalog for `api_server` by default; pass `platform=<name>` to audit another configured platform. Each entry includes its full function schema and provenance (`configurable`, `mcp`, `recently_shipped`, or `default_injected`), the MCP server when applicable, and whether the toolset was added below the platform's explicit configuration layer. `/v1/toolsets` remains the configuration-oriented view of toolsets and the concrete tool names each one expands to. All three are advertised under `endpoints.*` in `/v1/capabilities`.
 
 ## Long-term memory scoping (`X-Hermes-Session-Key`)
 

@@ -2201,6 +2201,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
+            ("GET", "/v1/tools", self._handle_tools),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
@@ -3372,6 +3373,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
+                "tools": {"method": "GET", "path": "/v1/tools"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -4110,6 +4112,122 @@ class APIServerAdapter(BasePlatformAdapter):
             "platform": "api_server",
             "data": data,
         })
+
+    async def _handle_tools(self, request: "web.Request") -> "web.Response":
+        """GET /v1/tools — enumerate the complete callable tool catalog.
+
+        Unlike ``/v1/toolsets``, this resolves the same platform toolsets and
+        per-tool availability checks used when constructing an agent. The raw
+        pre-tool-search catalog is returned because every entry remains
+        callable through tool search even when it is not sent eagerly.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.platforms import PLATFORMS
+
+            config = load_config()
+            platform = str(request.query.get("platform") or "api_server").strip()
+            configured_platforms = set((config.get("platform_toolsets") or {}).keys())
+            known_platforms = set(PLATFORMS) | configured_platforms
+            if not platform or platform not in known_platforms:
+                return web.json_response(
+                    _openai_error(
+                        f"Unknown platform: {platform or '<empty>'}",
+                        code="invalid_platform",
+                    ),
+                    status=400,
+                )
+
+            data, enabled_toolsets, explicit_config_present = await asyncio.to_thread(
+                self._model_tool_catalog,
+                config,
+                platform,
+            )
+        except Exception:
+            logger.exception("GET /v1/tools failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate tools", err_type="server_error"),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "list",
+            "platform": platform,
+            "explicit_config_present": explicit_config_present,
+            "enabled_toolsets": enabled_toolsets,
+            "data": data,
+        })
+
+    @staticmethod
+    def _model_tool_catalog(
+        config: Dict[str, Any],
+        platform: str,
+    ) -> tuple[List[Dict[str, Any]], List[str], bool]:
+        """Resolve model-callable schemas and their enablement provenance."""
+        from hermes_cli.tools_config import (
+            _RECENTLY_SHIPPED_TOOLSETS,
+            _get_platform_tools,
+        )
+        from model_tools import get_tool_definitions
+        from tools.registry import registry
+
+        enabled = _get_platform_tools(config, platform)
+        definitions = get_tool_definitions(
+            enabled_toolsets=sorted(enabled),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            update_last_resolved=False,
+        )
+
+        configured = (config.get("platform_toolsets") or {}).get(platform)
+        explicit_config_present = isinstance(configured, list)
+        explicit_names = {str(name) for name in configured} if explicit_config_present else set()
+        aliases = registry.get_registered_toolset_aliases()
+        explicit_canonical = {aliases.get(name, name) for name in explicit_names}
+
+        requested_by_canonical: Dict[str, List[str]] = {}
+        for name in sorted(enabled):
+            requested_by_canonical.setdefault(aliases.get(name, name), []).append(name)
+
+        data: List[Dict[str, Any]] = []
+        for definition in definitions:
+            schema = definition.get("function") or {}
+            name = schema.get("name")
+            entry = registry.get_entry(name) if name else None
+            canonical_toolset = entry.toolset if entry else None
+            requested_toolsets = requested_by_canonical.get(canonical_toolset, [])
+            explicitly_enabled = bool(
+                canonical_toolset in explicit_canonical
+                or explicit_names.intersection(requested_toolsets)
+            )
+
+            source_server = None
+            if canonical_toolset and canonical_toolset.startswith("mcp-"):
+                source = "mcp"
+                source_server = canonical_toolset[len("mcp-"):]
+            elif explicitly_enabled:
+                source = "configurable"
+            elif canonical_toolset in _RECENTLY_SHIPPED_TOOLSETS:
+                source = "recently_shipped"
+            else:
+                source = "default_injected"
+
+            row = dict(schema)
+            row["provenance"] = {
+                "source": source,
+                "toolset": canonical_toolset,
+                "requested_toolsets": requested_toolsets,
+                "source_server": source_server,
+                "added_below_explicit_config": not explicitly_enabled,
+            }
+            data.append(row)
+
+        data.sort(key=lambda item: str(item.get("name") or ""))
+        return data, sorted(enabled), explicit_config_present
 
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API

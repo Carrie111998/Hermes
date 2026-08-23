@@ -311,6 +311,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/model/options", adapter._handle_model_options)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
+    app.router.add_get("/v1/tools", adapter._handle_tools)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -875,6 +876,7 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
+            assert data["endpoints"]["tools"] == {"method": "GET", "path": "/v1/tools"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
 
@@ -953,6 +955,98 @@ class TestToolsetsEndpoint:
             call.kwargs["features"] is feature_snapshot
             for call in has_keys.call_args_list
         )
+
+
+class TestToolsEndpoint:
+    @pytest.mark.asyncio
+    async def test_tools_returns_platform_catalog_with_provenance(self, adapter):
+        config = {
+            "platform_toolsets": {
+                "api_server": ["file", "audit"],
+                "telegram": ["file"],
+            }
+        }
+        schemas = [
+            {"type": "function", "function": {"name": "read_file", "parameters": {}}},
+            {"type": "function", "function": {"name": "mcp__audit__inspect", "parameters": {}}},
+            {"type": "function", "function": {"name": "bfl_flux", "parameters": {}}},
+            {"type": "function", "function": {"name": "kanban_show", "parameters": {}}},
+        ]
+        entries = {
+            "read_file": types.SimpleNamespace(toolset="file"),
+            "mcp__audit__inspect": types.SimpleNamespace(toolset="mcp-audit"),
+            "bfl_flux": types.SimpleNamespace(toolset="bfl"),
+            "kanban_show": types.SimpleNamespace(toolset="kanban"),
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"file", "audit", "bfl", "kanban"},
+        ), patch(
+            "model_tools.get_tool_definitions",
+            return_value=schemas,
+        ) as get_definitions, patch(
+            "tools.registry.registry.get_registered_toolset_aliases",
+            return_value={"audit": "mcp-audit"},
+        ), patch(
+            "tools.registry.registry.get_entry",
+            side_effect=entries.get,
+        ), patch(
+            "hermes_cli.tools_config._RECENTLY_SHIPPED_TOOLSETS",
+            frozenset({"bfl"}),
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/tools?platform=api_server")
+                payload = await resp.json()
+
+        assert resp.status == 200
+        assert payload["platform"] == "api_server"
+        assert payload["explicit_config_present"] is True
+        assert payload["enabled_toolsets"] == ["audit", "bfl", "file", "kanban"]
+        by_name = {tool["name"]: tool for tool in payload["data"]}
+        assert by_name["read_file"]["provenance"] == {
+            "source": "configurable",
+            "toolset": "file",
+            "requested_toolsets": ["file"],
+            "source_server": None,
+            "added_below_explicit_config": False,
+        }
+        assert by_name["mcp__audit__inspect"]["provenance"]["source"] == "mcp"
+        assert by_name["mcp__audit__inspect"]["provenance"]["source_server"] == "audit"
+        assert by_name["mcp__audit__inspect"]["provenance"]["added_below_explicit_config"] is False
+        assert by_name["bfl_flux"]["provenance"]["source"] == "recently_shipped"
+        assert by_name["bfl_flux"]["provenance"]["added_below_explicit_config"] is True
+        assert by_name["kanban_show"]["provenance"]["source"] == "default_injected"
+        get_definitions.assert_called_once_with(
+            enabled_toolsets=["audit", "bfl", "file", "kanban"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            update_last_resolved=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_tools_rejects_unknown_platform(self, adapter):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"platform_toolsets": {"api_server": ["file"]}},
+        ), patch.object(adapter, "_model_tool_catalog") as catalog:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/tools?platform=not-a-platform")
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "invalid_platform"
+        catalog.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tools_requires_api_key_when_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/tools")
+
+        assert resp.status == 401
 
 
 # ---------------------------------------------------------------------------
