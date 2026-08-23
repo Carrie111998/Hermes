@@ -44,6 +44,12 @@ MIN_INTERVAL_SECONDS = 60
 # How often drivers poll for due heartbeats. Not user-facing.
 POLL_SECONDS = 5.0
 
+# Import time of this module — a proxy for "this process started". A
+# persisted claim older than this timestamp was made by a previous process
+# that died between claiming a tick and confirming/abandoning it, so the
+# claim can never be resolved and must be treated as a missed delivery.
+_PROCESS_START_TS = time.time()
+
 HEARTBEAT_PROMPT_TEMPLATE = (
     "[Heartbeat — recurring instruction, fires every {interval}]\n"
     "{prompt}\n\n"
@@ -99,7 +105,18 @@ def format_interval(seconds: int) -> str:
 
 @dataclass
 class HeartbeatState:
-    """Serializable per-session heartbeat."""
+    """Serializable per-session heartbeat.
+
+    Firing is split into three phases so the persisted audit trail never
+    claims a delivery that did not happen (issue #92837):
+
+    - ``due_prompt()`` *claims* a due tick (``claimed_at``) without
+      counting a fire.
+    - ``confirm_delivery()`` records the fire *only* after the prompt was
+      actually handed to a live input path / consumed by a turn.
+    - ``abandon_claim()`` counts the claim as missed and leaves the tick
+      due so the next poll retries.
+    """
 
     prompt: str
     interval_seconds: int
@@ -107,6 +124,14 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
+    # Set while a due tick is claimed but its delivery is unconfirmed.
+    claimed_at: Optional[float] = None
+    # When the last confirmed delivery actually happened (turn enqueued /
+    # consumed), as opposed to when it was merely claimed.
+    last_delivered_at: float = 0.0
+    # Claims that were never confirmed delivered (dropped handoff, vanished
+    # staged prompt, crash between claim and confirm).
+    missed_count: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -121,6 +146,11 @@ class HeartbeatState:
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
             fire_count=int(data.get("fire_count", 0) or 0),
+            claimed_at=(
+                float(data["claimed_at"]) if data.get("claimed_at") is not None else None
+            ),
+            last_delivered_at=float(data.get("last_delivered_at", 0.0) or 0.0),
+            missed_count=int(data.get("missed_count", 0) or 0),
         )
 
     def is_due(self, now: Optional[float] = None) -> bool:
@@ -204,8 +234,17 @@ class HeartbeatManager:
 
     Drivers (CLI thread / gateway task) call :meth:`due_prompt` on a poll
     cadence while the session is idle; a non-None return is the user-role
-    message to inject. Firing is recorded immediately so a slow turn can't
-    double-fire.
+    message to inject.
+
+    A non-None return only *claims* the tick (``claimed_at``); it does not
+    count a fire. The driver MUST call :meth:`confirm_delivery` once the
+    prompt is actually handed to a live input path (CLI input queue) or
+    consumed by a turn (gateway pending-slot drain), or
+    :meth:`abandon_claim` when the handoff fails. This keeps the persisted
+    ``fire_count``/``last_fired_at`` truthful: a claimed-but-undelivered
+    tick is reported as missed instead of silently counted as fired
+    (#92837). The in-flight claim also prevents overlapping polls from
+    double-claiming the same tick, so no backlog can pile up.
     """
 
     def __init__(self, session_id: str):
@@ -228,6 +267,8 @@ class HeartbeatManager:
             return "No heartbeat. Set one with /heartbeat every <interval> <prompt>."
         every = format_interval(s.interval_seconds)
         fired = f", fired {s.fire_count}×" if s.fire_count else ""
+        if s.missed_count:
+            fired += f", missed {s.missed_count}×"
         if s.status == "active":
             anchor = s.last_fired_at or s.created_at
             next_in = max(0, int(anchor + s.interval_seconds - time.time()))
@@ -259,6 +300,9 @@ class HeartbeatManager:
         if not self._state:
             return None
         self._state.status = "paused"
+        # Drop any in-flight claim: a paused heartbeat must not deliver,
+        # and the claimed prompt will not be confirmed.
+        self._state.claimed_at = None
         save_heartbeat(self.session_id, self._state)
         return self._state
 
@@ -268,6 +312,7 @@ class HeartbeatManager:
         self._state.status = "active"
         # Re-anchor so resuming doesn't instantly fire a stale tick.
         self._state.last_fired_at = time.time()
+        self._state.claimed_at = None
         save_heartbeat(self.session_id, self._state)
         return self._state
 
@@ -279,23 +324,94 @@ class HeartbeatManager:
         self._state = None
         return True
 
-    # --- driver entry point --------------------------------------------
+    # --- driver entry points --------------------------------------------
 
     def due_prompt(self, now: Optional[float] = None) -> Optional[str]:
         """Return the injection prompt if the heartbeat is due, else None.
 
-        Records the fire immediately (before the turn runs) so overlapping
-        polls or a long turn can never double-fire the same tick. Missed
-        ticks coalesce into one — the anchor resets to NOW, not to the
-        theoretical schedule.
+        A non-None return only *claims* the tick — ``fire_count`` and
+        ``last_fired_at`` are deliberately NOT advanced here. The driver
+        must call :meth:`confirm_delivery` once the prompt is accepted into
+        a live input path (or consumed by a turn), or :meth:`abandon_claim`
+        when the handoff fails.
+
+        While a claim is in flight (claimed but unconfirmed), further polls
+        return None so overlapping polls can never double-claim the same
+        tick, and missed intervals coalesce into one delivery instead of a
+        backlog. A claim left behind by a previous process (crash between
+        claim and handoff) is resolved here: it is logged as a missed
+        delivery and cleared, so the tick can be re-claimed on the next
+        poll instead of stalling forever.
         """
         s = self._state
         if s is None or not s.is_due(now):
             return None
-        s.last_fired_at = now if now is not None else time.time()
-        s.fire_count += 1
+        now = now if now is not None else time.time()
+        if s.claimed_at is not None:
+            if s.claimed_at < _PROCESS_START_TS:
+                # The claiming process died before confirming/abandoning.
+                # The tick never became a turn — count it missed, surface
+                # the loss, and let the next poll re-claim the still-due
+                # tick instead of silently stalling.
+                logger.warning(
+                    "HeartbeatManager: session %s heartbeat tick was claimed at %.0f "
+                    "but never confirmed delivered (previous process died mid-handoff); "
+                    "counting as missed and keeping the tick due",
+                    self.session_id,
+                    s.claimed_at,
+                )
+                s.missed_count += 1
+                s.claimed_at = None
+                save_heartbeat(self.session_id, s)
+            # In-flight claim from this process: the driver has not resolved
+            # it yet — never claim the same tick twice.
+            return None
+        s.claimed_at = now
         save_heartbeat(self.session_id, s)
         return s.render_prompt()
+
+    def confirm_delivery(self, now: Optional[float] = None) -> bool:
+        """Record the fire for the in-flight claim after real delivery.
+
+        The ONLY place ``fire_count`` and ``last_fired_at`` advance. Call
+        this after the claimed prompt was handed to a live input path (CLI
+        input queue) or consumed by a turn (gateway pending-slot drain).
+        Returns True when a claim was pending; False when there was nothing
+        to confirm (e.g. the claim was already abandoned, or the heartbeat
+        was paused in between — in which case the delivery is ignored).
+        """
+        s = self._state
+        if s is None or s.claimed_at is None:
+            return False
+        ts = now if now is not None else time.time()
+        s.last_fired_at = s.claimed_at
+        s.fire_count += 1
+        s.last_delivered_at = ts
+        s.claimed_at = None
+        save_heartbeat(self.session_id, s)
+        return True
+
+    def abandon_claim(self, reason: str = "") -> bool:
+        """Give up on the in-flight claim and count it as a missed delivery.
+
+        The fire counters are untouched, so the persisted audit trail
+        reports the truth: the tick was due, was handed off, but never
+        became a turn. The tick stays due and is re-claimed on the next
+        poll. Returns True when a claim was pending.
+        """
+        s = self._state
+        if s is None or s.claimed_at is None:
+            return False
+        s.missed_count += 1
+        s.claimed_at = None
+        save_heartbeat(self.session_id, s)
+        logger.warning(
+            "HeartbeatManager: session %s heartbeat tick claimed but never became "
+            "a turn%s; counting as missed and keeping the tick due",
+            self.session_id,
+            f": {reason}" if reason else "",
+        )
+        return True
 
 
 def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:

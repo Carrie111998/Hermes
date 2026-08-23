@@ -12652,7 +12652,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            try:
+                                self._pending_input.put(prompt)
+                            except Exception as exc:
+                                mgr.abandon_claim(f"input queue handoff failed: {exc}")
+                                continue
+                            # The input queue is the live REPL loop's
+                            # acceptance boundary: once queued, the prompt
+                            # WILL become a turn. Only now is the tick
+                            # truthfully fired.
+                            mgr.confirm_delivery()
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
