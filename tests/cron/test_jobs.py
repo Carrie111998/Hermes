@@ -1247,6 +1247,74 @@ class TestJobsJsonUtf8Bom:
 
 
 
+class TestIdKeyedJobsStore:
+    """load_jobs()/list_jobs() must accept an ID-keyed jobs map, not just a
+    list — some stores are written as {"jobs": {"<id>": {...}, ...}}.
+
+    Regression for the ValueError from dict(job) treating a bare string key
+    as a two-item pair (see issue #92935).
+    """
+
+    def test_load_jobs_accepts_id_keyed_map(self, tmp_cron_dir):
+        import json
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        payload = {
+            "jobs": {
+                "cron1234abcd": {
+                    "id": "cron1234abcd",
+                    "name": "Example job",
+                    "enabled": True,
+                    "prompt": "do the thing",
+                    "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                },
+                "cron5678efgh": {
+                    "id": "cron5678efgh",
+                    "name": "Second job",
+                    "enabled": True,
+                    "prompt": "do another thing",
+                    "schedule": {"kind": "interval", "minutes": 15, "display": "every 15m"},
+                },
+            },
+            "updated_at": "2026-08-23T10:10:12+08:00",
+        }
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_jobs()
+        assert isinstance(loaded, list)
+        assert {j["id"] for j in loaded} == {"cron1234abcd", "cron5678efgh"}
+        by_id = {j["id"]: j for j in loaded}
+        assert by_id["cron1234abcd"]["name"] == "Example job"
+        assert by_id["cron1234abcd"]["prompt"] == "do the thing"
+        assert by_id["cron5678efgh"]["schedule"]["minutes"] == 15
+
+    def test_list_jobs_accepts_id_keyed_map(self, tmp_cron_dir):
+        """The cronjob(action="list") / `hermes cron list` path, not just
+        load_jobs() directly — this is what actually raised in the report."""
+        import json
+        from cron.jobs import JOBS_FILE, list_jobs
+
+        payload = {
+            "jobs": {
+                "cronaaaa1111": {
+                    "id": "cronaaaa1111",
+                    "name": "Listable job",
+                    "enabled": True,
+                    "prompt": "list me",
+                    "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
+                }
+            },
+            "updated_at": "2026-08-23T10:10:12+08:00",
+        }
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+        jobs = list_jobs(include_disabled=True)
+        assert [j["id"] for j in jobs] == ["cronaaaa1111"]
+        assert jobs[0]["name"] == "Listable job"
+
+
 class TestAdvanceNextRuns:
     """Tests for advance_next_runs() — the batched due-set advance.
 
