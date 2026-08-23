@@ -243,17 +243,18 @@ def test_format_heartbeat_route_inherited():
 
 
 def test_format_heartbeat_route_configured(monkeypatch):
-    from hermes_cli import heartbeat as hb_mod
+    from hermes_cli import config as cfg_mod
 
     monkeypatch.setattr(
-        hb_mod, "load_config_readonly",
+        cfg_mod, "load_config_readonly",
         lambda: {"heartbeat": {
             "provider": "openrouter",
             "model": "google/gemini-3-flash-preview",
             "reasoning_effort": "low",
         }},
     )
-    result = hb_mod.format_heartbeat_route()
+    from hermes_cli.heartbeat import format_heartbeat_route
+    result = format_heartbeat_route()
     assert "provider=openrouter" in result
     assert "model=google/gemini-3-flash-preview" in result
     assert "reasoning=low" in result
@@ -261,13 +262,13 @@ def test_format_heartbeat_route_configured(monkeypatch):
 
 def test_status_line_shows_route_when_configured(monkeypatch):
     """status_line() includes route hint when heartbeat config is set."""
-    from hermes_cli import heartbeat as hb_mod
+    from hermes_cli import config as cfg_mod
 
     monkeypatch.setattr(
-        hb_mod, "load_config_readonly",
+        cfg_mod, "load_config_readonly",
         lambda: {"heartbeat": {"model": "gpt-4o-mini"}},
     )
-    mgr = hb_mod.HeartbeatManager(session_id="hb-route-sid")
+    mgr = HeartbeatManager(session_id="hb-route-sid")
     mgr.set("check CI", 600)
     status = mgr.status_line()
     assert "route:" in status
