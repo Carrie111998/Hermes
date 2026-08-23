@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone
@@ -197,9 +198,19 @@ def finalize_update_receipt(
         # Stable pointer for the dashboard/desktop: latest receipt.
         latest = directory / "latest.json"
         try:
-            latest.write_text(
-                json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
-            )
+            # Atomic: a reader either sees the previous pointer or this one,
+            # never a half-written file.
+            fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".latest-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(receipt.data, indent=2, default=str))
+                os.replace(tmp, latest)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except OSError as exc:
             # A stale pointer is worse than none: the Desktop reads this file
             # as "the durable success signal" and would report the PREVIOUS
@@ -276,33 +287,61 @@ def _prune_old_receipts(directory: Path) -> None:
         pass
 
 
+def _newest_receipt_path(directory: Path) -> Optional[Path]:
+    """The most recent timestamped receipt, or None.
+
+    Ordered by mtime rather than filename: the name carries a pid suffix
+    (``update_<stamp>_<pid>.json``), so two runs inside the same second sort
+    by process id, and a future naming change would silently reorder them.
+    The name breaks mtime ties so the result stays deterministic.
+    """
+    candidates = [p for p in directory.glob("*.json") if p.name != "latest.json"]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
+
+
 def read_latest_receipt() -> Optional[dict[str, Any]]:
-    """Read the most recent update receipt, or None. Never raises."""
-    directory = _receipt_dir()
+    """Read the most recent update receipt, or None. Never raises.
+
+    The pointer is an optimization over the receipts, not the record: when
+    it is missing or unreadable the newest timestamped receipt answers
+    instead.
+
+    Only the newest one. An unreadable newest receipt yields None — "we do
+    not know" — never a predecessor: reporting an older run as the current
+    one is the staleness this module exists to prevent, and it reads the
+    same to a caller whether it comes from the pointer or from the scan.
+    """
     try:
-        path = directory / "latest.json"
-        if path.is_file():
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                return payload
-    except Exception as exc:  # noqa: BLE001 - fall through to the scan
-        logger.debug("latest-receipt pointer unreadable (%s); scanning", exc)
-    # The pointer is an optimization, not the record. Receipt filenames are
-    # timestamped, so the newest file is the run that actually happened —
-    # reachable even when the pointer was never written or was dropped.
-    try:
-        candidates = sorted(
-            (p for p in directory.glob("*.json") if p.name != "latest.json"),
-            key=lambda p: p.name,
-            reverse=True,
-        )
-        for candidate in candidates:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                return payload
-    except Exception as exc:  # noqa: BLE001 - reader never raises
-        logger.debug("Could not scan update receipts: %s", exc)
-    return None
+        directory = _receipt_dir()
+        try:
+            pointer = directory / "latest.json"
+            if pointer.is_file():
+                payload = json.loads(pointer.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    return payload
+                logger.warning(
+                    "Latest-receipt pointer %s is not a receipt object; "
+                    "falling back to the newest receipt", pointer,
+                )
+        except Exception as exc:  # noqa: BLE001 - fall through to the scan
+            logger.warning(
+                "Latest-receipt pointer unreadable (%s); falling back to the "
+                "newest receipt", exc,
+            )
+
+        newest = _newest_receipt_path(directory)
+        if newest is None:
+            return None
+        payload = json.loads(newest.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+        logger.warning("Newest update receipt %s is not a receipt object", newest)
+        return None
+    except Exception as exc:  # noqa: BLE001 - contract: never raises
+        logger.warning("Could not read the latest update receipt: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
