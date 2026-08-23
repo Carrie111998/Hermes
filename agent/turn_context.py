@@ -1385,8 +1385,12 @@ def build_turn_context(
     # turn N sends must be what turn N+1 replays") is preserved by the exact
     # mechanism that already carries memory context.
     budget_hint = ""
+    try:
+        from agent.budget_hint import DEFAULT_BUDGET_HINT_THRESHOLD
+    except ImportError:  # pragma: no cover - defensive for partial installs
+        DEFAULT_BUDGET_HINT_THRESHOLD = 0.70
     _budget_threshold = float(
-        getattr(agent, "_budget_hint_threshold", 0.0) or 0.0
+        getattr(agent, "_budget_hint_threshold", DEFAULT_BUDGET_HINT_THRESHOLD) or 0.0
     )
     if _budget_threshold > 0:
         try:
@@ -1395,6 +1399,11 @@ def build_turn_context(
             _ctx_len = getattr(
                 getattr(agent, "context_compressor", None), "context_length", None
             )
+            # Semantic note: context_length is the compressor's effective cap,
+            # not necessarily the provider's true window. If the provider
+            # window is larger, "~N tokens remain" understates headroom —
+            # intentionally conservative, so the model never overfills a
+            # window the compressor would shrink anyway.
             if isinstance(_ctx_len, int) and _ctx_len > 0 and messages:
                 _used_tokens = estimate_messages_tokens_rough(messages)
                 if _used_tokens >= 0:

@@ -2080,11 +2080,15 @@ def init_agent(
     # hint entirely (the default is 0.70: hint only fires above 70% usage, so
     # low-usage conversations keep a byte-stable prompt prefix).
     try:
+        from agent.budget_hint import DEFAULT_BUDGET_HINT_THRESHOLD
+    except ImportError:  # pragma: no cover - defensive for partial installs
+        DEFAULT_BUDGET_HINT_THRESHOLD = 0.70
+    try:
         _budget_hint_threshold = float(
-            _compression_cfg.get("budget_hint_threshold", 0.70)
+            _compression_cfg.get("budget_hint_threshold", DEFAULT_BUDGET_HINT_THRESHOLD)
         )
     except (TypeError, ValueError):
-        _budget_hint_threshold = 0.70
+        _budget_hint_threshold = DEFAULT_BUDGET_HINT_THRESHOLD
     agent._budget_hint_threshold = max(0.0, _budget_hint_threshold)
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the

@@ -29,8 +29,17 @@ from typing import Optional
 _BUDGET_HINT_TEMPLATE = (
     "[Context budget: ~{pct}% of the context window is in use "
     "(~{remaining:,} tokens remain). Keep the response focused so it fits "
-    "before forced compression or truncation.]"
+    "before forced compression or truncation — oldest turns get compressed "
+    "first.]"
 )
+
+# Default fraction of the window at which the hint fires. Mirrored in
+# cli-config.yaml.example (compression.budget_hint_threshold). Centralized
+# here so every code path that reads the threshold — including turn-context
+# builds that never passed through init_agent's config wiring (older
+# serialized agents, alternate constructors) — falls back to the SAME
+# documented default instead of silently disabling the feature.
+DEFAULT_BUDGET_HINT_THRESHOLD = 0.70
 
 
 def build_budget_hint(

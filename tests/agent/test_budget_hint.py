@@ -8,7 +8,12 @@ lossy compression.
 
 from __future__ import annotations
 
-from agent.budget_hint import build_budget_hint
+import types
+from unittest.mock import patch
+
+import pytest
+
+from agent.budget_hint import DEFAULT_BUDGET_HINT_THRESHOLD, build_budget_hint
 
 
 class TestBuildBudgetHint:
@@ -49,6 +54,165 @@ class TestBuildBudgetHint:
         assert hint is not None
         assert "Context budget" in hint
         assert "tokens" in hint
+
+    def test_default_threshold_constant_matches_documented_default(self):
+        # The centralized default must mirror cli-config.yaml.example
+        # (compression.budget_hint_threshold: 0.70) — turn-context builds
+        # that never pass through init_agent fall back to it, and a 0.0
+        # fallback would silently disable the hint for them.
+        assert DEFAULT_BUDGET_HINT_THRESHOLD == 0.70
+
+
+# ---------------------------------------------------------------------------
+# build_turn_context wiring — the getattr-default seam (review #91974)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTodoStore:
+    def has_items(self):
+        return True
+
+
+class _FakeGuardrails:
+    def reset_for_turn(self):
+        pass
+
+
+class _FakeAgent:
+    """Minimal stand-in covering only what build_turn_context touches.
+
+    Deliberately does NOT set ``_budget_hint_threshold`` — the point of the
+    regression test is that the getattr default (DEFAULT_BUDGET_HINT_THRESHOLD,
+    0.70) kicks in instead of a 0.0 fallback that would silently disable the
+    hint for agents built outside init_agent (older serialized agents,
+    alternate constructors).
+    """
+
+    def __init__(self):
+        self.session_id = "sess-1"
+        self.model = "test/model"
+        self.provider = "openrouter"
+        self.base_url = "https://openrouter.ai/api/v1"
+        self.api_key = "sk-x"
+        self.api_mode = "chat_completions"
+        self.platform = "cli"
+        self.quiet_mode = True
+        self.max_iterations = 90
+        self.tools = []
+        self.valid_tool_names = set()
+        self._skip_mcp_refresh = True
+        self.compression_enabled = False
+        self.context_compressor = types.SimpleNamespace(
+            protect_first_n=2, protect_last_n=2, context_length=100_000
+        )
+        self._cached_system_prompt = "SYSTEM"
+        self._memory_store = None
+        self._memory_manager = None
+        self._memory_nudge_interval = 0
+        self._turns_since_memory = 0
+        self._user_turn_count = 0
+        self._todo_store = _FakeTodoStore()
+        self._tool_guardrails = _FakeGuardrails()
+        self._compression_warning = None
+        self._interrupt_requested = False
+        self._memory_write_origin = "assistant_tool"
+        self._stream_context_scrubber = None
+        self._stream_think_scrubber = None
+
+    def _ensure_db_session(self):
+        pass
+
+    def _restore_primary_runtime(self):
+        pass
+
+    def _cleanup_dead_connections(self):
+        return False
+
+    def _emit_status(self, _msg):
+        pass
+
+    def _replay_compression_warning(self):
+        pass
+
+    def _hydrate_todo_store(self, *_a, **_k):
+        pass
+
+    def _safe_print(self, *_a, **_k):
+        pass
+
+    def _persist_session(self, messages, _history=None):
+        pass
+
+
+def _build(agent, **overrides):
+    from agent.turn_context import build_turn_context
+
+    kwargs = dict(
+        agent=agent,
+        user_message="hello",
+        system_message=None,
+        conversation_history=None,
+        task_id=None,
+        stream_callback=None,
+        persist_user_message=None,
+        restore_or_build_system_prompt=lambda *a, **k: None,
+        install_safe_stdio=lambda: None,
+        sanitize_surrogates=lambda s: s,
+        summarize_user_message_for_log=lambda s: s,
+        set_session_context=lambda _sid: None,
+        set_current_write_origin=lambda _o: None,
+        ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
+    )
+    kwargs.update(overrides)
+    return build_turn_context(**kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _stub_runtime_main():
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+        yield
+
+
+class TestBuildTurnContextBudgetHintWiring:
+    """The hint must reach TurnContext.budget_hint through build_turn_context.
+
+    Regression for the Enough1122 review on #91974: the getattr default for
+    ``_budget_hint_threshold`` used to be 0.0 (disabled), contradicting the
+    documented 0.70 default. Any code path that builds a turn context without
+    passing through init_agent's config wiring silently lost the feature.
+    """
+
+    def test_default_threshold_applies_without_attribute(self):
+        agent = _FakeAgent()
+        assert not hasattr(agent, "_budget_hint_threshold")
+        with patch(
+            "agent.turn_context.estimate_messages_tokens_rough",
+            return_value=90_000,  # 90% > 0.70 default → hint fires
+        ):
+            ctx = _build(agent)
+        assert ctx.budget_hint, "hint must fire via the 0.70 default threshold"
+        assert "90%" in ctx.budget_hint
+
+    def test_explicit_attribute_overrides_default(self):
+        agent = _FakeAgent()
+        agent._budget_hint_threshold = 0.50  # explicit wiring wins
+        with patch(
+            "agent.turn_context.estimate_messages_tokens_rough",
+            return_value=60_000,  # 60% > 0.50 override, but < 0.70 default
+        ):
+            ctx = _build(agent)
+        assert ctx.budget_hint, "explicit threshold must win over the default"
+        assert "60%" in ctx.budget_hint
+
+    def test_zero_threshold_disables_hint(self):
+        agent = _FakeAgent()
+        agent._budget_hint_threshold = 0.0  # explicit opt-out
+        with patch(
+            "agent.turn_context.estimate_messages_tokens_rough",
+            return_value=90_000,
+        ):
+            ctx = _build(agent)
+        assert ctx.budget_hint == ""
 
 
 class TestComposeUserApiContentBudgetHint:
