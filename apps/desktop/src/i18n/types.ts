@@ -955,6 +955,8 @@ export interface Translations {
         description: string
       }
       loading: string
+      accountsLoadFailed: string
+      noAccounts: string
     }
     sessions: {
       loading: string

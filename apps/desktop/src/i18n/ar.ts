@@ -917,7 +917,9 @@ export const ar = defineLocale({
         title: 'نقطة نهاية محلية',
         description: 'استخدم خادما محليا أو نقطة نهاية متوافقة مع OpenAI لهذا المزود.'
       },
-      loading: 'جار تحميل المزودين...'
+      loading: 'جار تحميل المزودين...',
+      accountsLoadFailed: 'تعذر تحميل الحسابات.',
+      noAccounts: 'لا توجد حسابات متاحة.'
     },
     sessions: {
       loading: 'جار تحميل الجلسات المؤرشفة...',

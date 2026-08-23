@@ -1298,7 +1298,9 @@ export const zh: Translations = {
         title: '本地 / 自定义端点',
         description: '将 Hermes 指向任意 OpenAI 兼容端点（Zyphra、vLLM、llama.cpp、Ollama 等）。'
       },
-      loading: '正在加载提供方...'
+      loading: '正在加载提供方...',
+      accountsLoadFailed: '无法加载账户。',
+      noAccounts: '没有可用的账户。'
     },
     sessions: {
       loading: '正在加载已归档会话…',

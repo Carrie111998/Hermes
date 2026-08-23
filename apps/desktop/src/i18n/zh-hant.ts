@@ -986,7 +986,9 @@ export const zhHant = defineLocale({
         title: '本地 / 自訂端點',
         description: '將 Hermes 指向任意 OpenAI 相容端點（Zyphra、vLLM、llama.cpp、Ollama 等）。'
       },
-      loading: '正在載入提供方...'
+      loading: '正在載入提供方...',
+      accountsLoadFailed: '無法載入帳戶。',
+      noAccounts: '沒有可用的帳戶。'
     },
     sessions: {
       loading: '正在載入已封存工作階段…',

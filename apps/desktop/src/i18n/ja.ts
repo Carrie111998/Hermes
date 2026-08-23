@@ -1020,7 +1020,9 @@ export const ja = defineLocale({
         title: 'ローカル / カスタムエンドポイント',
         description: 'OpenAI 互換のエンドポイント（Zyphra、vLLM、llama.cpp、Ollama など）を指定します。'
       },
-      loading: 'プロバイダーを読み込み中...'
+      loading: 'プロバイダーを読み込み中...',
+      accountsLoadFailed: 'アカウントを読み込めませんでした。',
+      noAccounts: '利用可能なアカウントがありません。'
     },
     sessions: {
       loading: 'アーカイブ済みセッションを読み込み中…',

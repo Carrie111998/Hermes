@@ -12,7 +12,9 @@ import {
   providerTitle,
   sortProviders
 } from '@/components/onboarding'
+import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
+import { ErrorState } from '@/components/ui/error-state'
 import { RowButton } from '@/components/ui/row-button'
 import { SearchField } from '@/components/ui/search-field'
 import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
@@ -29,7 +31,7 @@ import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
 import { CustomEndpointsSettings } from './custom-endpoints-settings'
 import { SettingsCategoryHeading, useEnvCredentials } from './env-credentials'
 import { providerGroup, providerMeta, providerPriority } from './helpers'
-import { SettingsContent, SettingsSkeleton } from './primitives'
+import { EmptyState, SettingsContent, SettingsSkeleton } from './primitives'
 
 // The embedded terminal (and thus the "run disconnect command" path) only
 // exists in the Electron desktop shell, not the web dashboard.
@@ -342,6 +344,10 @@ export function ProvidersSettings({
   const { t } = useI18n()
   const { rowProps, vars } = useEnvCredentials()
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
+  // Accounts has its own loading/error/ready state, distinct from an
+  // authoritative empty catalog — a failed or in-flight fetch must never be
+  // mistaken for "no accounts", or the pane silently misrepresents itself.
+  const [oauthStatus, setOauthStatus] = useState<'error' | 'loading' | 'ready'>('loading')
   const [openProvider, setOpenProvider] = useState<null | string>(null)
   const [disconnecting, setDisconnecting] = useState<null | string>(null)
   // Free-text filter for the API-keys view (provider name / env-var key / desc).
@@ -357,27 +363,40 @@ export function ProvidersSettings({
     setOauthProviders(providers)
   }, [])
 
-  useEffect(() => {
+  // Guard against the past: an onboardingActive toggle can fire this twice in
+  // quick succession, and a stale response must never overwrite newer intent.
+  const loadOAuthProviders = useCallback(() => {
     let cancelled = false
 
-    void (async () => {
-      if (onboardingActive) {
-        return
-      }
+    setOauthStatus('loading')
 
+    void (async () => {
       try {
         const { providers } = await listOAuthProviders()
 
         if (!cancelled) {
           setOauthProviders(providers)
+          setOauthStatus('ready')
         }
       } catch {
-        // Ignore — the OAuth panel just won't render.
+        if (!cancelled) {
+          setOauthStatus('error')
+        }
       }
     })()
 
-    return () => void (cancelled = true)
-  }, [onboardingActive])
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (onboardingActive) {
+      return
+    }
+
+    return loadOAuthProviders()
+  }, [loadOAuthProviders, onboardingActive])
 
   // External (CLI-managed) providers can't be cleared via the API by design —
   // Hermes never deletes creds another tool owns behind a silent API call.
@@ -447,14 +466,9 @@ export function ProvidersSettings({
     return <SettingsSkeleton search sections={[{ rows: 6 }]} />
   }
 
-  const hasOauth = oauthProviders.length > 0
-  // The sidebar subnav owns the Accounts/API-keys split now; with no OAuth
-  // providers there's nothing for the "Accounts" view to show, so fall to keys.
-  const showApiKeys = view === 'keys' || (!hasOauth && view !== 'custom-endpoints')
-
   const keyGroups = buildProviderKeyGroups(vars)
 
-  if (showApiKeys) {
+  if (view === 'keys') {
     const q = normalize(keyQuery)
 
     const visibleGroups = q
@@ -505,6 +519,32 @@ export function ProvidersSettings({
 
   if (view === 'custom-endpoints') {
     return <CustomEndpointsSettings onConfigSaved={onConfigSaved} onMainModelChanged={onMainModelChanged} />
+  }
+
+  // view === 'accounts'. A failed or in-flight fetch is its own state — it
+  // must never silently fall through to the keys catalog (see #92629).
+  if (oauthStatus === 'loading') {
+    return <PageLoader className="min-h-48" label={t.settings.providers.loading} />
+  }
+
+  if (oauthStatus === 'error') {
+    return (
+      <SettingsContent>
+        <ErrorState title={t.settings.providers.accountsLoadFailed}>
+          <Button onClick={() => loadOAuthProviders()} type="button" variant="secondary">
+            {t.common.retry}
+          </Button>
+        </ErrorState>
+      </SettingsContent>
+    )
+  }
+
+  if (oauthProviders.length === 0) {
+    return (
+      <SettingsContent>
+        <EmptyState title={t.settings.providers.noAccounts} />
+      </SettingsContent>
+    )
   }
 
   return (

@@ -216,6 +216,58 @@ describe('ProvidersSettings', () => {
     expect(await screen.findByText('No providers match your search.')).toBeTruthy()
   })
 
+  it('shows an Accounts empty state when the OAuth catalog is empty, not the keys catalog', async () => {
+    // Regression for #92629: an empty OAuth array must not silently fall
+    // back to the API-keys pane while the sidebar still says Accounts.
+    listOAuthProviders.mockResolvedValue({ providers: [] })
+
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('No accounts available.')).toBeTruthy()
+    expect(screen.queryByText('Local / custom endpoint')).toBeNull()
+    expect(screen.queryByPlaceholderText('Search providers…')).toBeNull()
+  })
+
+  it('shows an Accounts error/retry state when listOAuthProviders rejects, not the keys catalog', async () => {
+    // Regression for #92629: a failed fetch was swallowed and read the same
+    // as "no OAuth providers", which also fell back to the keys catalog.
+    listOAuthProviders.mockRejectedValue(new Error('network down'))
+
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('Could not load accounts.')).toBeTruthy()
+    expect(screen.queryByText('Local / custom endpoint')).toBeNull()
+
+    listOAuthProviders.mockResolvedValue({ providers: [provider('nous', true)] })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    })
+
+    expect(await screen.findByText('Nous Portal')).toBeTruthy()
+  })
+
+  it('keeps the keys catalog on view="keys" even with a non-empty OAuth list', async () => {
+    getEnvVars.mockResolvedValue({
+      ACME_API_KEY: keyVar({ provider: 'acme', provider_label: 'Acme' })
+    })
+    listOAuthProviders.mockResolvedValue({ providers: [provider('nous', true)] })
+
+    const { ProvidersSettings } = await import('./providers-settings')
+    await act(async () => {
+      render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="keys" />)
+    })
+
+    expect(await screen.findByText('Local / custom endpoint')).toBeTruthy()
+    expect(screen.queryByText('Nous Portal')).toBeNull()
+  })
+
+  it('shows the OAuth picker on view="accounts" with a non-empty OAuth list, not the keys catalog', async () => {
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('Nous Portal')).toBeTruthy()
+    expect(screen.queryByText('Local / custom endpoint')).toBeNull()
+  })
+
   it('offers a Local / custom endpoint entry in the API-keys tab that opens the custom-endpoint flow', async () => {
     // Regression: the composer pill and the providers "have an API key"
     // affordance both dead-end on the env-var-driven key catalog, which never
