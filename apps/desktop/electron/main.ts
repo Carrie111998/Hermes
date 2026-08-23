@@ -30,6 +30,7 @@ import {
   systemPreferences
 } from 'electron'
 
+import { shouldForceAccessibilitySupport } from './accessibility-support'
 import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
@@ -15041,6 +15042,12 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  // Force Chromium's accessibility tree on for Windows UI Automation clients
+  // (dictation tools like Wispr Flow) that don't identify themselves as a
+  // screen reader, so Chromium never auto-detects them and the composer is
+  // otherwise exposed as nothing but the native window chrome (#92607).
+  app.setAccessibilitySupportEnabled(shouldForceAccessibilitySupport(process.platform))
+
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()
