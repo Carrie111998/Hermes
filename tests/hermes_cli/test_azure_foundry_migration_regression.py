@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 
-def test_migration_preserves_terra_entra_route_and_unrelated_configuration(
+def test_migration_preserves_entra_route_and_unrelated_configuration(
     monkeypatch, tmp_path
 ):
     """A schema version bump must retain the accepted routing semantics."""
@@ -20,7 +20,7 @@ def test_migration_preserves_terra_entra_route_and_unrelated_configuration(
                 "_config_version": 37,
                 "model": {
                     "provider": "azure-foundry",
-                    "default": "gpt-5.6-terra",
+                    "default": "deployment-a",
                     "auth_mode": "entra_id",
                     "base_url": "https://accepted.example.invalid/models/v1",
                     "api_mode": "codex_responses",
@@ -42,7 +42,7 @@ def test_migration_preserves_terra_entra_route_and_unrelated_configuration(
     assert migrated["_config_version"] == DEFAULT_CONFIG["_config_version"]
     assert migrated["model"] == {
         "provider": "azure-foundry",
-        "default": "gpt-5.6-terra",
+        "default": "deployment-a",
         "auth_mode": "entra_id",
         "base_url": "https://accepted.example.invalid/models/v1",
         "api_mode": "codex_responses",
