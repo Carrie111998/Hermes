@@ -68,6 +68,13 @@ _FILLER = r"(?:\w+\s+){0,8}"
 # whitespace/punctuation, never by filler words — so an attacker can't
 # plant a marker earlier in the sentence and bury a real directive after
 # it (e.g. "such as <filler filler> ignore all instructions").
+#
+# Only applied at ``scope="context"`` (see ``scan_for_threats``): "strict"
+# guards memory writes and skill installs, where an attacker who controls
+# the content could otherwise prefix any directive with a marker phrase
+# ("such as", "telling you to") to slip past the block.  Context-scope
+# false positives (doctrine files) are worth trading for; strict-scope
+# false negatives are not.
 _DESCRIPTIVE_FRAMING_SEPARATOR = r'[\s,;:\'"\-–—]{0,10}'
 _DESCRIPTIVE_FRAMING = re.compile(
     r'(?:when\s+you\s+encounter|describ\w*|defend\w*\s+against|examples?\s+of|'
@@ -271,7 +278,7 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     if patterns is None:
         raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
     for compiled, pid in patterns:
-        if pid in _DESCRIPTIVE_FRAMING_GUARDED:
+        if pid in _DESCRIPTIVE_FRAMING_GUARDED and scope == "context":
             for match in compiled.finditer(normalised):
                 window = normalised[max(0, match.start() - _DESCRIPTIVE_FRAMING_WINDOW):match.start()]
                 if not _DESCRIPTIVE_FRAMING.search(window):
