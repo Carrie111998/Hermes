@@ -9,6 +9,7 @@ from agent.bot_control_plane import (
     BotExecutionContext,
     BotPolicyReason,
     BotPolicyVerdict,
+    BotRoute,
     LegacyMessageAgentReason,
     LegacyMessageAgentState,
     RuntimeCapabilitySnapshot,
@@ -20,7 +21,7 @@ from agent.bot_control_plane import (
 
 
 def _address(profile_id="profile-123"):
-    return BotAddress("install-a", "gateway-a", "local", profile_id)
+    return BotAddress("install-a", profile_id)
 
 
 def _context(
@@ -30,6 +31,7 @@ def _context(
     grant_id="grant-7",
     runtime_id="runtime-9",
     epoch=3,
+    selected_route=None,
 ):
     return BotExecutionContext(
         address=_address(profile_id),
@@ -47,6 +49,7 @@ def _context(
         cancellation_scope_id="cancel-1",
         budget_id="budget-1",
         trace_id="trace-1",
+        selected_route=selected_route,
     )
 
 
@@ -73,20 +76,27 @@ def _snapshot(
     )
 
 
+def _legacy_state(*, protocol, schema, canonical, managed):
+    return LegacyMessageAgentState(
+        protocol_enabled=protocol,
+        schema_present=schema,
+        canonical_bot_chat=canonical,
+        managed_install=managed,
+    )
+
+
 class TestIdentityAndRuntimeProofs:
-    def test_address_keeps_four_independent_axes(self):
-        address = BotAddress(" install ", " gateway ", " local ", " profile ")
-        assert address.identity_tuple == ("install", "gateway", "local", "profile")
+    def test_address_keeps_durable_actor_axes(self):
+        address = BotAddress(" install ", " profile ")
+        assert address.identity_tuple == ("install", "profile")
 
     @pytest.mark.parametrize(
         "field_name",
-        ("install_id", "gateway_instance_id", "connection_id", "profile_id"),
+        ("install_id", "profile_id"),
     )
     def test_empty_address_axis_is_rejected(self, field_name):
         values = dict(
             install_id="install",
-            gateway_instance_id="gateway",
-            connection_id="local",
             profile_id="profile",
         )
         values[field_name] = " "
@@ -95,14 +105,38 @@ class TestIdentityAndRuntimeProofs:
 
     def test_non_string_identity_is_rejected(self):
         with pytest.raises(TypeError, match="profile_id"):
-            BotAddress("install", "gateway", "local", 7)  # type: ignore[arg-type]
+            BotAddress("install", 7)  # type: ignore[arg-type]
+
+    def test_route_is_explicitly_namespaced_and_optional(self):
+        route = BotRoute(" desktop-registry-1 ", " cloud ", " gateway-7 ")
+        assert route.route_tuple == (
+            "desktop-registry-1",
+            "cloud",
+            "gateway-7",
+        )
+        assert _context().selected_route is None
+        assert _context(selected_route=route).selected_route is route
+
+    @pytest.mark.parametrize("field_name", ("route_namespace_id", "connection_id"))
+    def test_unscoped_or_empty_route_is_rejected(self, field_name):
+        values = dict(route_namespace_id="desktop-1", connection_id="local")
+        values[field_name] = " "
+        with pytest.raises(ValueError, match=field_name):
+            BotRoute(**values)
+
+    def test_context_rejects_untyped_route(self):
+        with pytest.raises(TypeError, match="selected_route"):
+            _context(selected_route="local")  # type: ignore[arg-type]
 
     def test_proof_objects_are_immutable(self):
         address = _address()
+        route = BotRoute("desktop-1", "local")
         context = _context()
         snapshot = _snapshot()
         with pytest.raises(FrozenInstanceError):
             address.profile_id = "other"  # type: ignore[misc]
+        with pytest.raises(FrozenInstanceError):
+            route.connection_id = "other"  # type: ignore[misc]
         with pytest.raises(FrozenInstanceError):
             context.revocation_epoch = 9  # type: ignore[misc]
         with pytest.raises(FrozenInstanceError):
@@ -128,9 +162,7 @@ class TestIdentityAndRuntimeProofs:
                 _context(epoch=-1)
 
     def test_snapshot_normalizes_stable_capability_ids(self):
-        snapshot = _snapshot(
-            capabilities=("peer.message", BotCapability.NETWORK_READ)
-        )
+        snapshot = _snapshot(capabilities=("peer.message", BotCapability.NETWORK_READ))
         assert snapshot.allows("peer.message")
         assert snapshot.allows(BotCapability.NETWORK_READ)
 
@@ -157,18 +189,29 @@ class TestFailClosedPolicyEvaluation:
     @pytest.mark.parametrize(
         "address",
         (
-            BotAddress("other-install", "gateway-a", "local", "profile-123"),
-            BotAddress("install-a", "other-gateway", "local", "profile-123"),
-            BotAddress("install-a", "gateway-a", "remote", "profile-123"),
-            BotAddress("install-a", "gateway-a", "local", "other-profile"),
+            BotAddress("other-install", "profile-123"),
+            BotAddress("install-a", "other-profile"),
         ),
     )
-    def test_every_address_axis_is_authoritative(self, address):
+    def test_every_durable_address_axis_is_authoritative(self, address):
         snapshot = _snapshot()
         data = dict(snapshot.__dict__)
         data["address"] = address
         decision = self._decision(snapshot=RuntimeCapabilitySnapshot(**data))
         assert decision.reason is BotPolicyReason.ADDRESS_MISMATCH
+
+    @pytest.mark.parametrize(
+        "route",
+        (
+            None,
+            BotRoute("desktop-a", "local", "gateway-a"),
+            BotRoute("desktop-b", "remote", "gateway-b"),
+        ),
+    )
+    def test_route_selection_does_not_mint_actor_authority(self, route):
+        decision = self._decision(context=_context(selected_route=route))
+        assert decision.verdict is BotPolicyVerdict.ALLOW
+        assert decision.reason is BotPolicyReason.CAPABILITY_GRANTED
 
     @pytest.mark.parametrize(
         ("context", "snapshot", "reason"),
@@ -234,27 +277,52 @@ class TestLegacyMessageAgentMapping:
         ("state", "allowed", "reason"),
         (
             (
-                LegacyMessageAgentState(False, True, True, True),
+                _legacy_state(
+                    protocol=False,
+                    schema=True,
+                    canonical=True,
+                    managed=True,
+                ),
                 False,
                 LegacyMessageAgentReason.PROTOCOL_DISABLED,
             ),
             (
-                LegacyMessageAgentState(True, True, False, False),
+                _legacy_state(
+                    protocol=True,
+                    schema=True,
+                    canonical=False,
+                    managed=False,
+                ),
                 True,
                 LegacyMessageAgentReason.SCHEMA_ALREADY_PRESENT,
             ),
             (
-                LegacyMessageAgentState(True, False, False, True),
+                _legacy_state(
+                    protocol=True,
+                    schema=False,
+                    canonical=False,
+                    managed=True,
+                ),
                 False,
                 LegacyMessageAgentReason.NOT_CANONICAL_BOT_CHAT,
             ),
             (
-                LegacyMessageAgentState(True, False, True, False),
+                _legacy_state(
+                    protocol=True,
+                    schema=False,
+                    canonical=True,
+                    managed=False,
+                ),
                 False,
                 LegacyMessageAgentReason.UNMANAGED_INSTALL,
             ),
             (
-                LegacyMessageAgentState(True, False, True, True),
+                _legacy_state(
+                    protocol=True,
+                    schema=False,
+                    canonical=True,
+                    managed=True,
+                ),
                 True,
                 LegacyMessageAgentReason.LEGACY_GATE_ALLOW,
             ),
@@ -269,25 +337,38 @@ class TestLegacyMessageAgentMapping:
         ("state", "allowed", "reason"),
         (
             (
-                LegacyMessageAgentState(False, False, True, True),
+                _legacy_state(
+                    protocol=False,
+                    schema=False,
+                    canonical=True,
+                    managed=True,
+                ),
                 True,
                 LegacyMessageAgentReason.LEGACY_GATE_ALLOW,
             ),
             (
-                LegacyMessageAgentState(True, True, False, True),
+                _legacy_state(
+                    protocol=True,
+                    schema=True,
+                    canonical=False,
+                    managed=True,
+                ),
                 False,
                 LegacyMessageAgentReason.NOT_CANONICAL_BOT_CHAT,
             ),
             (
-                LegacyMessageAgentState(True, True, True, False),
+                _legacy_state(
+                    protocol=True,
+                    schema=True,
+                    canonical=True,
+                    managed=False,
+                ),
                 False,
                 LegacyMessageAgentReason.UNMANAGED_INSTALL,
             ),
         ),
     )
-    def test_dispatch_mapping_preserves_current_asymmetry(
-        self, state, allowed, reason
-    ):
+    def test_dispatch_mapping_preserves_current_asymmetry(self, state, allowed, reason):
         decision = legacy_message_agent_dispatch_decision(state)
         assert decision.allowed is allowed
         assert decision.reason is reason

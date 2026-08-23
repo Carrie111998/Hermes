@@ -90,20 +90,13 @@ class LegacyMessageAgentReason(str, Enum):
 
 @dataclass(frozen=True)
 class BotAddress:
-    """One exact source-qualified Bot Mode profile instance."""
+    """One durable Bot Mode actor; aliases and routes never authorize."""
 
     install_id: str
-    gateway_instance_id: str
-    connection_id: str
     profile_id: str
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "install_id",
-            "gateway_instance_id",
-            "connection_id",
-            "profile_id",
-        ):
+        for field_name in ("install_id", "profile_id"):
             object.__setattr__(
                 self,
                 field_name,
@@ -111,12 +104,37 @@ class BotAddress:
             )
 
     @property
-    def identity_tuple(self) -> Tuple[str, str, str, str]:
+    def identity_tuple(self) -> Tuple[str, str]:
+        return (self.install_id, self.profile_id)
+
+
+@dataclass(frozen=True)
+class BotRoute:
+    """A non-authoritative selector inside one namespaced route table."""
+
+    route_namespace_id: str
+    connection_id: str
+    gateway_instance_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("route_namespace_id", "connection_id"):
+            object.__setattr__(
+                self,
+                field_name,
+                _required_str(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "gateway_instance_id",
+            _optional_str(self.gateway_instance_id, "gateway_instance_id"),
+        )
+
+    @property
+    def route_tuple(self) -> Tuple[str, str, Optional[str]]:
         return (
-            self.install_id,
-            self.gateway_instance_id,
+            self.route_namespace_id,
             self.connection_id,
-            self.profile_id,
+            self.gateway_instance_id,
         )
 
 
@@ -253,6 +271,7 @@ class BotExecutionContext:
     cancellation_scope_id: str
     budget_id: str
     trace_id: str
+    selected_route: Optional[BotRoute] = None
     revocation_epoch: int = 0
     hop_count: int = 0
     source_chat_id: Optional[str] = None
@@ -265,6 +284,10 @@ class BotExecutionContext:
     def __post_init__(self) -> None:
         if not isinstance(self.address, BotAddress):
             raise TypeError("address must be a BotAddress")
+        if self.selected_route is not None and not isinstance(
+            self.selected_route, BotRoute
+        ):
+            raise TypeError("selected_route must be a BotRoute or None")
         for field_name in (
             "profile_config_revision",
             "session_id",
@@ -324,7 +347,9 @@ class BotPolicyDecision:
         object.__setattr__(
             self, "decision_id", _required_str(self.decision_id, "decision_id")
         )
-        object.__setattr__(self, "operation", _required_str(self.operation, "operation"))
+        object.__setattr__(
+            self, "operation", _required_str(self.operation, "operation")
+        )
         if not isinstance(self.verdict, BotPolicyVerdict):
             raise TypeError("verdict must be a BotPolicyVerdict")
         if not isinstance(self.reason, BotPolicyReason):
@@ -335,12 +360,10 @@ class BotPolicyDecision:
         for entry in self.constraints:
             if not isinstance(entry, tuple) or len(entry) != 2:
                 raise TypeError("constraints must contain (key, value) tuples")
-            normalized.append(
-                (
-                    _required_str(entry[0], "constraint key"),
-                    _required_str(entry[1], "constraint value"),
-                )
-            )
+            normalized.append((
+                _required_str(entry[0], "constraint key"),
+                _required_str(entry[1], "constraint value"),
+            ))
         object.__setattr__(self, "constraints", tuple(normalized))
 
     @property
@@ -401,7 +424,9 @@ class LegacyAuthorityDecision:
     reason: LegacyMessageAgentReason
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "operation", _required_str(self.operation, "operation"))
+        object.__setattr__(
+            self, "operation", _required_str(self.operation, "operation")
+        )
         _strict_bool(self.allowed, "allowed")
         if not isinstance(self.reason, LegacyMessageAgentReason):
             raise TypeError("reason must be a LegacyMessageAgentReason")
@@ -552,6 +577,7 @@ __all__ = [
     "BotAddress",
     "BotCapability",
     "BotExecutionContext",
+    "BotRoute",
     "BotPolicyDecision",
     "BotPolicyReason",
     "BotPolicyVerdict",

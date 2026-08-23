@@ -4,7 +4,9 @@
 
 Foundation contract. The first implementation is shadow-only: it does not
 change runtime authorization, delivery, cancellation, provider selection, or
-Desktop behavior.
+Desktop behavior. The contract is intentionally split between durable actor
+identity and non-authoritative route selection; current Desktop connection IDs
+cannot mint actor authority.
 
 Tracking issue: #91911.
 
@@ -28,12 +30,27 @@ cancellation, and remote trust-boundary drift.
 ### `BotAddress`
 
 ```text
-(install_id, gateway_instance_id, connection_id, profile_id)
+(install_id, profile_id)
 ```
 
 Profile names and handles remain editable aliases. Durable room membership,
 sessions, notifications, routines, mutations, cancellation targets, delivery
-events, and audit records should converge on this exact address.
+events, and audit records should converge on this actor identity plus the
+relevant generation proof.
+
+### `BotRoute`
+
+```text
+(route_namespace_id, connection_id, optional gateway_instance_id)
+```
+
+A route selects where an operation should travel inside one named route table.
+It does not identify or authorize the actor. Current Desktop `connection_id`
+values are local to a Desktop registry; different Desktops may assign different
+IDs to the same gateway, and non-Desktop ingress may have no Desktop route at
+all. `route_namespace_id` prevents an unscoped connection coordinate from being
+mistaken for a global identity. Gateway ingress leaves `selected_route` empty
+unless a real namespaced route proof exists.
 
 ### `BotExecutionContext`
 
@@ -45,6 +62,7 @@ profile_config_revision
 session_id / session_key / turn_id / task_id
 authenticated_principal
 source platform / user / chat / thread
+optional selected BotRoute
 runtime_snapshot_id
 capability_grant_id / revocation_epoch
 cancellation_scope_id
@@ -95,8 +113,10 @@ content may request an operation; it cannot manufacture a grant.
 
 A content-free result records the decision ID, operation, verdict, reason,
 required capability, and bounded constraints. The evaluator fails closed on
-exact BotAddress, profile-revision, grant, revocation-epoch,
-runtime-snapshot, or capability mismatch.
+exact durable BotAddress, profile-revision, grant, revocation-epoch,
+runtime-snapshot, or capability mismatch. It deliberately does not compare
+`selected_route`: a client route coordinate cannot grant actor authority. A
+delivery boundary may constrain a route separately after actor authorization.
 
 ### `ShadowPolicyComparison`
 
@@ -131,16 +151,37 @@ Dispatch (`message_agent_tool`):
 3. the protocol toggle and schema presence are not consulted.
 
 Parity tests import the current implementation and prove the typed mapping
-tracks those semantics. A later boundary-migration PR must select one canonical
-contract and delete the superseded gate in the same change.
+tracks those semantics. They also pin the post-#92784 managed-install behavior:
+a legacy SOUL protocol heading suppresses duplicate prompt text but does not
+remove `message_agent`. Gate-adjacent comments point contributors to the typed
+mapping while the current source remains authoritative. A later
+boundary-migration PR must select one canonical contract and delete the
+superseded gate in the same change.
+
+## Phase 2 entry criteria
+
+Current production state can supply an install ID and profile-name/session
+coordinates, but it cannot yet supply every canonical proof required by this
+contract. In particular, it lacks a stable opaque profile ID with explicit
+rename/clone/import semantics, a server-owned gateway runtime generation, and
+the grant/revocation/runtime/cancellation IDs. Desktop relay roster rows are a
+cached selection projection, not authenticated identity.
+
+Phase 2 must first establish those server-owned producers. It can then bind one
+context after authentication and current profile resolution at gateway/session
+ingress, compare one consuming boundary in shadow, record only bounded
+content-free mismatch evidence, and keep the legacy result effective. It must
+not substitute profile names, Desktop connection IDs, user/chat IDs, task IDs,
+or hashes of ambient runtime tuples for missing proof IDs.
 
 ## Rollout
 
 1. **Foundation:** immutable proof objects, pure fail-closed evaluation, exact
    legacy mapping, and parity tests. No production call sites.
-2. **Authenticated shadow construction:** build context at gateway ingress,
-   derive one effective snapshot, and emit bounded content-free mismatch
-   evidence while legacy remains authoritative.
+2. **Authenticated shadow construction:** establish stable server-owned actor
+   and generation IDs, build context at gateway ingress, derive one effective
+   snapshot, and emit bounded content-free mismatch evidence while legacy
+   remains authoritative.
 3. **Boundary migration:** migrate `message_agent`, tool/MCP injection, profile
    mutation, group interruption, peer delivery, completion ownership, and
    destructive/file/network operations one at a time.
@@ -157,11 +198,16 @@ contract and delete the superseded gate in the same change.
 Preserve existing contributor ownership and compose it onto this spine:
 
 - #91802 — structured `message_agent`;
+- #92784 — one structured local/peer/cross-connection delivery path;
+- #90198 and #92731 — current connection/profile owner routing;
 - #90329 — source-qualified cross-connection room identity;
 - #89455 — effective toolset/MCP runtime truth;
 - #90954 — completion-loss evidence and immediate stopgap;
-- #91889 — visible group interruption and late-reply fencing;
+- #91889 — closed unmerged; group interruption and late-reply fencing still
+  need an active owner;
 - #91862 — authenticated Bot roster/read model;
+- #92857 — bounded relay/DM artifact hygiene, not durable settlement;
+- #92861 — bounded in-process completion linger, not restart durability;
 - #88819 — peer credential redirect boundary;
 - #91832 — permanent configuration refusal; and
 - #73923 — shared delivery-ledger substrate.
@@ -184,5 +230,5 @@ The completed class must prove:
 ## Non-goals of this PR
 
 No production wiring, transport rewrite, durable inbox schema, Desktop change,
-approval UI, provider/catalog behavior change, profile-ID migration, or switch
+approval UI, provider/catalog behavior change, stable-ID migration, or switch
 away from legacy authority.
