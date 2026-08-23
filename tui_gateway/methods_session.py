@@ -3426,6 +3426,11 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
     if accepted:
+        # A typed correction is also "none of these" for a clarify gate.  Do
+        # this server-side after the steer is parked so a renderer reconnect or
+        # stale client store cannot leave the accepted text waiting behind the
+        # question until clarify_timeout expires.
+        _release_pending_clarify_for_session(str(params.get("session_id") or ""))
         # Record the correction on the live turn exactly like session.redirect
         # does. Without this, a resume/reconnect while the turn is running
         # rebuilds the transcript from the inflight snapshot and the steered
@@ -3470,6 +3475,9 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
+        # Keep redirect equivalent to steer for a turn parked inside clarify:
+        # the accepted correction must release the gate it is queued behind.
+        _release_pending_clarify_for_session(str(params.get("session_id") or ""))
         with session["history_lock"]:
             _record_inflight_correction(session, text)
             # #84417: purge server-queue self-duplicates of the live original
