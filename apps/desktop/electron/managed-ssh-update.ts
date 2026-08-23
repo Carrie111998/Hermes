@@ -170,11 +170,26 @@ function managedSshRecoveryScopes(
   scopes: Iterable<{ key: string; primary?: boolean; profile: string }>,
   registryPrefix: string
 ): ManagedSshRecoveryScope[] {
-  return [...scopes].map(scope => ({
-    key: String(scope.key),
-    kind: scope.primary ? 'primary' : String(scope.key).startsWith(registryPrefix) ? 'registry' : 'legacy',
-    profile: String(scope.profile || 'default')
-  }))
+  const unique = new Map<string, ManagedSshRecoveryScope>()
+
+  for (const scope of scopes) {
+    const key = String(scope.key)
+    const existing = unique.get(key)
+    const next = {
+      key,
+      kind: scope.primary ? 'primary' : key.startsWith(registryPrefix) ? 'registry' : 'legacy',
+      profile: String(scope.profile || 'default')
+    } as ManagedSshRecoveryScope
+
+    // update-all can collect a primary scope through both the legacy and
+    // registry indexes. Restore it once, with primary taking precedence, so a
+    // single connection is never drained/restarted twice in one transaction.
+    if (!existing || next.kind === 'primary') {
+      unique.set(key, next)
+    }
+  }
+
+  return [...unique.values()]
 }
 
 function posixChildPath(home: string, name: string): string {

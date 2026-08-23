@@ -6,6 +6,7 @@ import {
   backendCommandMatches,
   type BackendIdentity,
   type BackendOwnershipEntry,
+  type BackendOwnershipStore,
   createBackendOwnership,
   createBackendShutdownCoordinator,
   parseBackendOwnership
@@ -51,7 +52,7 @@ function deferred() {
   return { promise, resolve }
 }
 
-function createOwnership(store = memoryStore(), overrides: Partial<Parameters<typeof createBackendOwnership>[0]> = {}) {
+function createOwnership(store: BackendOwnershipStore = memoryStore(), overrides: Partial<Parameters<typeof createBackendOwnership>[0]> = {}) {
   return createBackendOwnership({
     matchesIdentity: async () => true,
     // Unknown parent (no record / legacy) preserves the pre-parent behaviour.
@@ -160,6 +161,54 @@ test('concurrent claims merge both children without a read-await-write lost upda
 
   assert.equal(await compacted, 1)
   assert.deepEqual(parseBackendOwnership(store.value()), [first, second])
+})
+
+test('ownership mutations use the store transaction boundary so separate interpreters cannot clobber rows', async () => {
+  let contents = stored([])
+  let transactions = 0
+  const store = {
+    read: () => contents,
+    write: (next: string) => {
+      contents = next
+    },
+    transaction: <T>(operation: () => T): T => {
+      transactions += 1
+      return operation()
+    }
+  }
+  const first = createOwnership(store)
+  const second = createOwnership(store)
+
+  await Promise.all([
+    first.claim(ownershipEntry({ pid: 80, nonce: 'first' })),
+    second.claim(ownershipEntry({ pid: 81, nonce: 'second' }))
+  ])
+
+  assert.ok(transactions >= 2)
+  assert.deepEqual(parseBackendOwnership(contents), [
+    ownershipEntry({ pid: 80, nonce: 'first' }),
+    ownershipEntry({ pid: 81, nonce: 'second' })
+  ])
+})
+
+test('an ownership read error is quarantined and never treated as an empty roster', async () => {
+  let quarantined = 0
+  let writes = 0
+  const ownership = createOwnership({
+    read: () => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+    },
+    write: () => {
+      writes += 1
+    },
+    quarantine: () => {
+      quarantined += 1
+    }
+  })
+
+  assert.deepEqual(await ownership.reapOrphans(), [])
+  assert.equal(quarantined, 1)
+  assert.equal(writes, 0)
 })
 
 test('incomplete claims and persisted records are rejected', async () => {

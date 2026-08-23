@@ -193,6 +193,46 @@ async function helper(ssh, runtime, operation, args = [], stdinData?) {
   return parsed
 }
 
+function atomicWindowsSpawnCommand(runtime) {
+  const argv = [runtime.python, '-m', 'hermes_cli.windows_ssh_runtime', 'spawn']
+  const script = [
+    '$ErrorActionPreference="Stop"',
+    `$home=${psLiteral(runtime.hermesHome)}`,
+    '$installRoot=$home',
+    '$parent=Split-Path -Parent $home',
+    'if((Split-Path -Leaf $parent) -ieq "profiles"){$installRoot=Split-Path -Parent $parent}',
+    '$marker=Join-Path $installRoot ".hermes-update-in-progress"',
+    '$mutexPath=$marker+".mutex"',
+    '$mutex=[IO.File]::Open($mutexPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)',
+    'try{',
+    '  $mutex.Lock(0,1)',
+    '  if([IO.File]::Exists($marker)){throw "remote update marker is present"}',
+    `  & ${argv.map(psLiteral).join(' ')}`,
+    '  if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}',
+    '  if([IO.File]::Exists($marker)){throw "remote update marker claimed during backend spawn"}',
+    '}finally{try{$mutex.Unlock(0,1)}catch{};$mutex.Dispose()}'
+  ].join(';')
+  return powerShellCommand(script)
+}
+
+async function atomicWindowsSpawn(ssh, runtime, stdinData) {
+  const output = await ssh.exec(atomicWindowsSpawnCommand(runtime), { stdinData })
+  const lines = String(output || '')
+    .replace(/^\uFEFF/, '')
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+  const parsed = JSON.parse(lines[lines.length - 1] || 'null')
+
+  if (parsed?.error) {
+    const error: any = new Error(parsed.error)
+    error.kind = parsed.kind || 'remote-helper-error'
+    throw error
+  }
+
+  return parsed
+}
+
 function fingerprintToken(token) {
   return crypto
     .createHash('sha256')
@@ -509,11 +549,9 @@ async function connectWindowsRemote(deps) {
 
   try {
     await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
-    spawned = await helper(
+    spawned = await atomicWindowsSpawn(
       ssh,
       runtime,
-      'spawn',
-      [],
       JSON.stringify({ ownershipId, spawnNonce, profile, hermesPath: runtime.hermesPath })
     )
   } catch (error) {
@@ -597,6 +635,7 @@ function buildWindowsInteractiveCommand(remoteCwd = '') {
 
 export {
   assertWindowsRemoteInstallUpdateClear,
+  atomicWindowsSpawnCommand,
   buildWindowsInteractiveCommand,
   connectWindowsRemote,
   detectRemotePlatform,

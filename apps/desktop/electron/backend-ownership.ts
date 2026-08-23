@@ -16,6 +16,8 @@ export interface BackendOwnershipEntry extends BackendIdentity {
 export interface BackendOwnershipStore {
   read: () => string | null
   write: (contents: string) => void
+  /** Serialize every read/merge/write mutation across Electron interpreters. */
+  transaction?: <T>(operation: () => T) => T
   /** Move an unreadable ownership file aside (e.g. rename to `.corrupt`) so
    *  its contents survive for inspection instead of being rewritten away.
    *  Optional: stores that can't quarantine simply skip the sweep. */
@@ -159,9 +161,35 @@ export function serializeBackendOwnership(entries: BackendOwnershipEntry[]): str
  * cleanup before reporting failure to the caller.
  */
 export function createBackendOwnership(deps: BackendOwnershipDeps) {
-  const readDetailed = () => parseBackendOwnershipDetailed(deps.store.read())
+  const readDetailed = (): {
+    corrupt: boolean
+    unavailable: boolean
+    entries: BackendOwnershipEntry[]
+  } => {
+    try {
+      const parsed = parseBackendOwnershipDetailed(deps.store.read())
+      return { ...parsed, unavailable: false }
+    } catch {
+      // A read failure is not an empty roster. Callers that are allowed to
+      // continue must quarantine the file and preserve all live processes.
+      return { corrupt: false, unavailable: true, entries: [] }
+    }
+  }
   const read = () => readDetailed().entries
+  const readForMutation = () => {
+    const snapshot = readDetailed()
+    if (snapshot.corrupt || snapshot.unavailable) {
+      try {
+        deps.store.quarantine?.()
+      } catch {
+        // Preserve the original failure; never continue with an empty roster.
+      }
+      throw new Error('Backend ownership store is unreadable or corrupt; mutation refused.')
+    }
+    return snapshot.entries
+  }
   const write = (entries: BackendOwnershipEntry[]) => deps.store.write(serializeBackendOwnership(entries))
+  const transaction = <T>(operation: () => T): T => deps.store.transaction ? deps.store.transaction(operation) : operation()
 
   const inspectBatch = async (
     entries: readonly BackendOwnershipEntry[],
@@ -221,7 +249,7 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
   const compactStaleEntries = async (): Promise<number> => {
     const snapshot = readDetailed()
 
-    if (snapshot.corrupt || !snapshot.entries.length) {
+    if (snapshot.corrupt || snapshot.unavailable || !snapshot.entries.length) {
       return 0
     }
 
@@ -235,19 +263,23 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
     // The snapshot probe awaits. Merge confirmed-stale removals into a fresh
     // roster so concurrent claims survive and concurrent releases are not
     // resurrected. Exact identity matching protects PID reuse.
-    const current = readDetailed()
+    const compacted = transaction(() => {
+      const current = readDetailed()
 
-    if (current.corrupt) {
-      return 0
-    }
+      if (current.corrupt || current.unavailable) {
+        return 0
+      }
 
-    const next = current.entries.filter(entry => !stale.some(candidate => identitiesMatch(candidate, entry)))
+      const next = current.entries.filter(entry => !stale.some(candidate => identitiesMatch(candidate, entry)))
 
-    if (next.length !== current.entries.length) {
-      write(next)
-    }
+      if (next.length !== current.entries.length) {
+        write(next)
+      }
 
-    return current.entries.length - next.length
+      return current.entries.length - next.length
+    })
+
+    return compacted
   }
 
   const compactStale = (): Promise<number> => {
@@ -293,9 +325,11 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         // roster then overwrite one another. Persist this exact identity
         // first; bounded maintenance, when needed, runs after the write and
         // fresh-merges only confirmed-stale removals.
-        const entries = read().filter(candidate => candidate.pid !== entry.pid)
-        const next = [...entries, entry]
-        write(next)
+        transaction(() => {
+          const entries = readForMutation().filter(candidate => candidate.pid !== entry.pid)
+          const next = [...entries, entry]
+          write(next)
+        })
 
         // Prune on every write (#92875), but never put the cold Windows
         // process-table snapshot on the claim's critical path. The
@@ -325,22 +359,24 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         throw new Error('Cannot release a backend without a complete process identity.')
       }
 
-      const entries = read()
-      const next = entries.filter(entry => !identitiesMatch(entry, identity))
+      transaction(() => {
+        const entries = readForMutation()
+        const next = entries.filter(entry => !identitiesMatch(entry, identity))
 
-      if (next.length !== entries.length) {
-        write(next)
-      }
+        if (next.length !== entries.length) {
+          write(next)
+        }
+      })
     },
 
     async reapOrphans(): Promise<number[]> {
-      const { corrupt, entries } = readDetailed()
+      const { corrupt, unavailable, entries } = readDetailed()
 
       // An unreadable ownership file yields zero parsed entries — rewriting
       // survivors ([]) here would DESTROY the only record of any backends the
       // corrupt file described, guaranteeing they leak forever (#89298).
       // Preserve the evidence for inspection and skip the sweep.
-      if (corrupt) {
+      if (corrupt || unavailable) {
         try {
           deps.store.quarantine?.()
         } catch {
@@ -390,25 +426,30 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
       // meanwhile must survive, and an entry released meanwhile must not be
       // resurrected. Exact pid+start+nonce+profile matching also protects a
       // newly reused PID from an old snapshot's removal decision.
-      const current = readDetailed()
+      transaction(() => {
+        const current = readDetailed()
 
-      if (current.corrupt) {
-        try {
-          deps.store.quarantine?.()
-        } catch {
-          // Preserve rather than overwrite concurrent unreadable evidence.
+        if (current.corrupt || current.unavailable) {
+          try {
+            deps.store.quarantine?.()
+          } catch {
+            // Preserve rather than overwrite concurrent unreadable evidence.
+          }
+
+          return
         }
 
-        return reaped
-      }
-
-      write(current.entries.filter(entry => !removed.some(candidate => identitiesMatch(candidate, entry))))
+        write(current.entries.filter(entry => !removed.some(candidate => identitiesMatch(candidate, entry))))
+      })
 
       return reaped
     },
 
     clear(): void {
-      write([])
+      transaction(() => {
+        readForMutation()
+        write([])
+      })
     }
   }
 }

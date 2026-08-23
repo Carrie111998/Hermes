@@ -10,12 +10,14 @@ export interface BackendProcessSnapshot {
   command: string | null
   pid: number
   startMarkers: ReadonlySet<string>
+  state: 'present' | 'absent' | 'unknown'
 }
 
 interface WindowsProcessRow {
   command?: unknown
   milliseconds?: unknown
   pid?: unknown
+  state?: unknown
   ticks?: unknown
 }
 
@@ -37,15 +39,24 @@ export function windowsProcessSnapshotScript(pids: readonly number[]): string {
   const processIds = unique.join(', ')
 
   return [
-    `$processes = @(Get-Process -Id @(${processIds}) -ErrorAction SilentlyContinue)`,
+    `$requested = @(${processIds})`,
+    '$processes = @{}',
+    '$unknown = @{}',
+    '$requested | ForEach-Object { try { $processes[[int]$_] = Get-Process -Id $_ -ErrorAction Stop } catch { $unknown[[int]$_] = $true } }',
     `$rows = @(Get-CimInstance Win32_Process -Filter '${filter}' -ErrorAction Stop)`,
     '$commands = @{}',
+    '$rowsByPid = @{}',
+    '$rows | ForEach-Object { $rowsByPid[[int]$_.ProcessId] = $true }',
     '$rows | ForEach-Object { $commands[[int]$_.ProcessId] = [string]$_.CommandLine }',
-    '$items = @($processes | ForEach-Object {',
-    '  $ticks = $_.StartTime.ToUniversalTime().Ticks',
-    '  $pid = [int]$_.Id',
+    '$items = @($requested | ForEach-Object {',
+    '  $pid = [int]$_',
+    '  if($unknown.ContainsKey($pid) -and $rowsByPid.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="unknown"; command=$null; ticks=$null; milliseconds=$null }; return }',
+    '  if(-not $processes.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="absent"; command=$null; ticks=$null; milliseconds=$null }; return }',
+    '  $process = $processes[$pid]',
+    '  $ticks = $process.StartTime.ToUniversalTime().Ticks',
     '  [PSCustomObject]@{',
     '    pid = $pid',
+    '    state = "present"',
     '    ticks = [string]$ticks',
     `    milliseconds = [string][math]::Floor(([decimal]$ticks - ${WINDOWS_EPOCH_TICKS}) / 10000)`,
     '    command = if ($commands.ContainsKey($pid)) { [string]$commands[$pid] } else { $null }',
@@ -81,6 +92,7 @@ export function parseWindowsProcessSnapshot(stdout: unknown): Map<number, Backen
     const ticks = String(row.ticks ?? '')
     const milliseconds = String(row.milliseconds ?? '')
     const startMarkers = new Set<string>()
+    const state = row.state === 'unknown' || row.state === 'absent' ? row.state : 'present'
 
     if (/^\d+$/.test(ticks)) {
       startMarkers.add(`win:${ticks}`)
@@ -93,7 +105,8 @@ export function parseWindowsProcessSnapshot(stdout: unknown): Map<number, Backen
     snapshots.set(pid, {
       command: typeof row.command === 'string' && row.command.trim() ? row.command : null,
       pid,
-      startMarkers
+      startMarkers,
+      state
     })
   }
 
@@ -113,7 +126,11 @@ export function inspectBackendOwnershipSnapshot(
     const process = snapshots.get(entry.pid)
     let identityMatches: boolean | undefined
 
-    if (!process || !process.startMarkers.has(entry.startMarker)) {
+    if (!process || process.state === 'absent') {
+      identityMatches = false
+    } else if (process.state === 'unknown') {
+      identityMatches = undefined
+    } else if (!process.startMarkers.has(entry.startMarker)) {
       identityMatches = false
     } else if (process.command === null) {
       identityMatches = undefined
@@ -127,7 +144,7 @@ export function inspectBackendOwnershipSnapshot(
 
     if (Number.isInteger(parentPid) && parentPid > 0 && entry.parentStartMarker) {
       const parent = snapshots.get(parentPid)
-      parentMatches = parent ? parent.startMarkers.has(entry.parentStartMarker) : false
+      parentMatches = !parent || parent.state === 'absent' ? false : parent.state === 'unknown' ? undefined : parent.startMarkers.has(entry.parentStartMarker)
     }
 
     return { identityMatches, parentMatches }

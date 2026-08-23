@@ -5,6 +5,7 @@ import { test } from 'vitest'
 
 import {
   assertWindowsRemoteInstallUpdateClear,
+  atomicWindowsSpawnCommand,
   buildWindowsInteractiveCommand,
   connectWindowsRemote,
   detectRemotePlatform,
@@ -18,6 +19,21 @@ import {
 } from './windows-remote-lifecycle'
 
 const ownershipId = '0123456789abcdef0123456789abcdef'
+
+test('Windows spawn holds the update mutex across marker check and helper spawn', () => {
+  const command = atomicWindowsSpawnCommand({
+    hermesHome: 'C:\\Users\\andre\\.hermes',
+    python: 'C:\\Users\\andre\\.hermes\\python.exe'
+  })
+
+  const encoded = command.match(/-EncodedCommand\s+([^\s]+)$/)?.[1]
+  const script = encoded ? Buffer.from(encoded, 'base64').toString('utf16le') : ''
+  assert.match(script, /\.hermes-update-in-progress/)
+  assert.match(script, /\$mutexPath=\$marker\+"\.mutex"/)
+  assert.match(script, /\.Lock\(0,1\)/)
+  assert.match(script, /windows_ssh_runtime.*spawn/)
+  assert.match(script, /remote update marker is present/)
+})
 
 function sshWith(exec) {
   return { exec }

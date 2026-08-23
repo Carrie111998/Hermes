@@ -233,6 +233,20 @@ test('durable recovery preserves every same-profile primary, registry, and legac
   ])
 })
 
+test('update-all deduplicates the same recovery scope and keeps primary precedence', () => {
+  assert.deepEqual(
+    managedSshRecoveryScopes(
+      [
+        { key: 'conn:homelab::default', profile: 'default' },
+        { key: 'conn:homelab::default', profile: 'default', primary: true },
+        { key: 'conn:homelab::default', profile: 'default' }
+      ],
+      'conn:homelab::'
+    ),
+    [{ key: 'conn:homelab::default', kind: 'primary', profile: 'default' }]
+  )
+})
+
 test('POSIX managed launcher is detached, correlation-scoped, and never publishes handoff exit 75', () => {
   const command = buildPosixManagedUpdateLaunch(
     {

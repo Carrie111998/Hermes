@@ -3187,6 +3187,45 @@ function writeBackendOwnership(contents) {
   }
 }
 
+// Ownership is shared by every Electron interpreter for this userData tree.
+// Atomic rename protects individual writes, but not read/merge/write: two
+// interpreters can still overwrite each other's claims. Hold a sidecar lock
+// across the complete synchronous transaction. A timeout fails closed rather
+// than bypassing quarantine or silently dropping another process's row.
+function withBackendOwnershipLock(operation) {
+  const lockPath = `${DESKTOP_BACKEND_OWNERSHIP_PATH}.lock`
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true })
+  const deadline = Date.now() + 30_000
+  let fd: number
+
+  for (;;) {
+    try {
+      fd = fs.openSync(lockPath, 'wx', 0o600)
+      fs.writeFileSync(fd, `${process.pid}\\n`, { encoding: 'utf8' })
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST' || Date.now() >= deadline) {
+        throw error
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+    }
+  }
+
+  try {
+    return operation()
+  } finally {
+    try {
+      fs.closeSync(fd)
+    } finally {
+      try {
+        fs.unlinkSync(lockPath)
+      } catch {
+        void 0
+      }
+    }
+  }
+}
+
 function execText(command, args, { timeout = 3000 } = {}) {
   return new Promise<string>((resolve, reject) => {
     execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', timeout }), (error, stdout) => {
@@ -3376,11 +3415,15 @@ const backendOwnership = createBackendOwnership({
     read: () => {
       try {
         return fs.readFileSync(DESKTOP_BACKEND_OWNERSHIP_PATH, 'utf8')
-      } catch {
-        return null
+      } catch (error) {
+        if (error?.code === 'ENOENT') {
+          return null
+        }
+        throw error
       }
     },
     write: writeBackendOwnership,
+    transaction: withBackendOwnershipLock,
     // A corrupt ownership file is moved aside instead of being rewritten
     // away by the reap sweep — its records are the only pointer to any
     // still-running backends it described (#89298).

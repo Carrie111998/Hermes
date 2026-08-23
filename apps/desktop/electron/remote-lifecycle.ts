@@ -367,6 +367,12 @@ function assertSafeRemoteHome(home) {
   return value.replace(/\/+$/, '')
 }
 
+function remoteInstallRoot(home) {
+  const value = assertSafeRemoteHome(home)
+  const profile = value.match(/^(.*)\/profiles\/[^/]+$/)
+  return profile ? profile[1] : value
+}
+
 async function readLockfile(ssh, ownershipId) {
   const lpath = lockfilePath(ownershipId)
   let raw
@@ -594,29 +600,31 @@ async function pidIsOurDashboard(
 
 // Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
-  if (
-    pidAlive &&
-    lock &&
-    (await pidIsOurDashboard(
-      ssh,
-      lock.pid,
-      lock.spawnNonce,
-      lock.hermesPath,
-      lock.hermesHome,
-      ownershipId,
-      lock.profile
-    ))
-  ) {
+  if (pidAlive && lock) {
     try {
-      const result = (
-        await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
-        )
-      ).trim()
+      // Keep the inexpensive preflight for diagnostics, but never trust it as
+      // the authority for SIGTERM: the command below re-proves identity in the
+      // same remote shell immediately before signaling.
+      const preflightOwned = await pidIsOurDashboard(
+        ssh,
+        lock.pid,
+        lock.spawnNonce,
+        lock.hermesPath,
+        lock.hermesHome,
+        ownershipId,
+        lock.profile
+      )
 
-      void result
+      if (preflightOwned) {
+        const command = lock.creationTime
+          ? buildOwnedTerminationCommand(lock, ownershipId)
+          : buildOwnedStaleTerminationCommand(lock, ownershipId)
+        const result = String(await ssh.exec(command)).trim()
+
+        if (!['TERMINATED', 'ALREADY_STOPPED', 'REFUSED'].includes(result)) {
+          throw new Error(`remote stale cleanup returned ${result || 'no result'}`)
+        }
+      }
     } catch (cause) {
       const error: any = new Error('Could not terminate the stale SSH backend.')
       error.kind = 'transient-transport-error'
@@ -636,6 +644,34 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   }
 
   await removeLockfile(ssh, ownershipId)
+}
+
+function buildOwnedStaleTerminationCommand(lock, ownershipId) {
+  const pid = Number(lock.pid)
+  const expectedPath = shq(expandRemotePath(lock.hermesPath))
+  const expectedHome = lock.hermesHome ? shq(expandRemotePath(lock.hermesHome)) : "''"
+  const expectedToken = shq(expandRemotePath(spawnTokenPath(ownershipId, lock.spawnNonce)))
+  const nonce = shq(lock.spawnNonce)
+  const profile = shq(lock.profile || '')
+  const command = `$(ps -ww -o command= -p ${pid} 2>/dev/null || true)`
+  const executableMatch = lock.hermesHome
+    ? `case "$cmd" in *"$path"*|*"$home"*) ;; *) printf REFUSED; exit 0;; esac; `
+    : `case "$cmd" in *"$path"*) ;; *) printf REFUSED; exit 0;; esac; `
+  const identity =
+    `cmd=${command}; ` +
+    `path=${expectedPath}; home=${expectedHome}; token=${expectedToken}; nonce=${nonce}; profile=${profile}; ` +
+    executableMatch +
+    `case "$cmd" in *" serve"*|*" serve "*) ;; *) printf REFUSED; exit 0;; esac; ` +
+    `case "$cmd" in *"--ssh-owner-nonce $nonce"*) ;; *) printf REFUSED; exit 0;; esac; ` +
+    `case "$cmd" in *"--ssh-session-token-file $token"*) ;; *) printf REFUSED; exit 0;; esac; ` +
+    `[ -n "$profile" ] && case "$cmd" in *"--profile $profile"*) ;; *) printf REFUSED; exit 0;; esac; `
+
+  // Legacy records do not have creationTime. Re-read argv immediately before
+  // signaling in this same shell command; never use the earlier probe's PID
+  // verdict as authority for the kill.
+  return `${identity} kill ${pid} && ` +
+    `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
+    `i=$((i+1)); [ "$i" -ge 50 ] && printf TIMEOUT && exit 0; sleep 0.1; done; printf TERMINATED`
 }
 
 function lockMatchesManagedUpdateScope(lock, expected) {
@@ -859,14 +895,26 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const tokenArg = tokenFilePath ? ` --ssh-session-token-file ${expandRemotePath(tokenFilePath)}` : ''
   const ownerArg = opts.spawnNonce ? ` --ssh-owner-nonce ${validateSpawnNonce(opts.spawnNonce)}` : ''
   const subCmd = `serve --isolated --host 127.0.0.1 --port 0${tokenArg}${ownerArg}`
+  const marker = expandRemotePath(`${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress`)
+  // The marker probe and process creation must be one remote command. The
+  // second probe runs after the child is created but before publishing its PID;
+  // if an updater claimed the marker during the spawn window, kill the child
+  // and refuse the launch instead of leaving a backend inside a mutating tree.
+  const markerClear =
+    `marker_clear() { if [ ! -e ${marker} ]; then return 0; fi; ` +
+    `if [ ! -r ${marker} ]; then return 1; fi; ` +
+    `owner=$(IFS= read -r owner < ${marker} && printf '%s' "$owner"); ` +
+    `case "$owner" in ''|*[!0-9]*) return 1;; esac; if kill -0 "$owner" 2>/dev/null; then return 1; fi; return 0; }`
 
   const dashCmd =
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
     `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
 
   return (
+    `${markerClear}; marker_clear || exit 75; ` +
     `mkdir -p "$(dirname ${logPath})" && ` +
-    `"$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}`
+    `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
+    `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; echo "$child"`
   )
 }
 
@@ -921,7 +969,7 @@ async function scrapeReadyPort(ssh, logPath, { timeoutMs = DEFAULT_READY_TIMEOUT
 
 async function spawnRemoteDashboard(
   ssh,
-  { hermesPath, profile, token, ownershipId, assertInstallClear = async () => {} }
+  { hermesPath, profile, token, ownershipId, hermesHome = '~/.hermes', assertInstallClear = async () => {} }
 ) {
   if (!(await remoteSupportsSshOwnership(ssh, hermesPath))) {
     const err: any = new Error(
@@ -985,7 +1033,7 @@ async function spawnRemoteDashboard(
     // Close the marker race after the token-file write and immediately before
     // process creation. The caller's probe imports no changing checkout code.
     await assertInstallClear()
-    out = await ssh.exec(buildSpawnCommand(hermesPath, profile, { spawnNonce, tokenFilePath, logPath }))
+    out = await ssh.exec(buildSpawnCommand(hermesPath, profile, { spawnNonce, tokenFilePath, logPath, hermesHome }))
   } catch (error) {
     try {
       await ssh.exec(`rm -f ${expandRemotePath(tokenFilePath)}`)
@@ -1224,6 +1272,7 @@ async function connect(deps) {
     profile,
     token: spawnToken,
     ownershipId,
+    hermesHome,
     assertInstallClear: () => assertRemoteInstallUpdateClear(ssh, hermesHome)
   })
 

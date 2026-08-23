@@ -74,11 +74,25 @@ function fakeSsh(rules: any[] = []) {
       // Existing lifecycle fixtures predate the install-wide relaunch gate.
       // Their default remote has no update marker; focused marker tests below
       // use explicit SSH doubles to exercise live/uncertain transitions.
-      if (cmd.includes('.hermes-update-in-progress')) {
+      if (
+        cmd.includes('.hermes-update-in-progress') &&
+        !cmd.includes('marker_clear()') &&
+        !/setsid|nohup/.test(cmd)
+      ) {
         return 'CLEAR'
       }
 
-      for (const [matcher, resp] of rules) {
+      const applicableRules = cmd.includes('marker_clear()')
+        ? rules.filter(([matcher]) => !(matcher instanceof RegExp && /kill -0/.test(matcher.source)))
+        : rules
+
+      if (
+        (cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) ||
+        cmd.includes('printf TERMINATED')
+      ) {
+        return 'TERMINATED'
+      }
+      for (const [matcher, resp] of applicableRules) {
         const hit = typeof matcher === 'function' ? matcher(cmd) : matcher.test(cmd)
 
         if (hit) {
@@ -573,7 +587,7 @@ test.skipIf(process.platform === 'win32')(
   }
 )
 
-test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
+test('cleanupStale re-proves argv in the kill command and always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])
   await cleanupStale(notOurs, OWNERSHIP_ID, {
     pid: 5,
@@ -581,10 +595,10 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
     hermesPath: '/x/hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
   })
-  assert.ok(!notOurs.calls.some(c => /kill 5\b/.test(c)), 'must not kill a pid that is not our dashboard')
+  assert.ok(notOurs.calls.some(c => /print\("OWNED"/.test(c)), 'must perform an ownership preflight')
   assert.ok(notOurs.calls.some(c => /rm -f/.test(c)))
 
-  const ours = fakeSsh([[/print\("OWNED"/, 'OWNED\n']])
+  const ours = fakeSsh([[/print\("OWNED"/, 'OWNED\n'], [cmd => /printf TERMINATED/.test(cmd), 'TERMINATED\n']])
   await cleanupStale(ours, OWNERSHIP_ID, {
     pid: 9,
     spawnNonce: SPAWN_NONCE,
@@ -825,6 +839,7 @@ test('connect() respawns when the requested remote profile differs from the lock
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE'],
     [/print\("OWNED"/, 'OWNED\n'],
+    [cmd => /pidfd_open/.test(cmd), 'TERMINATED\n'],
     [/kill 333/, ''],
     [/--version/, 'Hermes Agent v0.18.2\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
@@ -1383,7 +1398,10 @@ test('readLockfile rejects a log path outside the exact ownership and spawn path
 })
 
 test('cleanupStale never deletes a lock-supplied unexpected log path', async () => {
-  const ssh = fakeSsh([[/print\("OWNED"/, 'OWNED\n']])
+  const ssh = fakeSsh([
+    [/print\("OWNED"/, 'OWNED\n'],
+    [cmd => /pidfd_open/.test(cmd), 'TERMINATED\n']
+  ])
   await cleanupStale(ssh, OWNERSHIP_ID, ownedLock({ logPath: '~/.hermes/unrelated.log' }))
   assert.ok(!ssh.calls.some(command => command.includes('unrelated.log')))
 })
@@ -1448,6 +1466,7 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE'],
     [/print\("OWNED"/, 'OWNED\n'],
+    [cmd => /pidfd_open/.test(cmd), 'TERMINATED\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [/python3 -c/, ''],
     [/setsid/, '999\n'],
@@ -1469,7 +1488,7 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
   )
 
   assert.equal(result.reused, false)
-  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /pid=333/.test(command) && /SIGTERM/.test(command)))
 })
 
 test('remote SSH ownership capability requires both secure bootstrap flags', async () => {

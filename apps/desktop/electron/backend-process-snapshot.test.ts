@@ -22,7 +22,8 @@ function entry(overrides: Partial<BackendOwnershipEntry> = {}): BackendOwnership
 test('Windows snapshot script uses one shell and matching Get-Process start markers', () => {
   const script = windowsProcessSnapshotScript([42, 43, 42, -1, Number.NaN])
 
-  assert.match(script, /Get-Process -Id @\(42, 43\)/)
+  assert.match(script, /\$requested = @\(42, 43\)/)
+  assert.match(script, /Get-Process -Id \$_ -ErrorAction Stop/)
   assert.equal((script.match(/Get-Process/g) || []).length, 1)
   assert.match(script, /Get-CimInstance Win32_Process -Filter 'ProcessId = 42 OR ProcessId = 43'/)
   assert.equal((script.match(/Get-CimInstance/g) || []).length, 1)
@@ -73,6 +74,20 @@ test('snapshot inspection distinguishes live parents, stale PIDs, PID reuse, and
     { identityMatches: false, parentMatches: undefined },
     { identityMatches: false, parentMatches: undefined },
     { identityMatches: undefined, parentMatches: undefined }
+  ])
+})
+
+test('snapshot inspection treats process-table errors as unknown rather than stale', () => {
+  const snapshots = parseWindowsProcessSnapshot(
+    JSON.stringify([
+      { pid: 42, state: 'unknown' },
+      { pid: 43, state: 'absent' }
+    ])
+  )
+
+  assert.deepEqual(inspectBackendOwnershipSnapshot([entry(), entry({ pid: 43 })], snapshots), [
+    { identityMatches: undefined, parentMatches: undefined },
+    { identityMatches: false, parentMatches: undefined }
   ])
 })
 
