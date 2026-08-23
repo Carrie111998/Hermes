@@ -10442,7 +10442,13 @@ def _emit_terminal_turn_error(
         except Exception:
             error_surface = None
     with session["history_lock"]:
-        _fail_inflight_turn(session, error, error_surface=error_surface)
+        # Keep the legacy two-argument call when no descriptor is available;
+        # besides avoiding needless kwargs, this preserves compatibility with
+        # integrations that provide the older callback shape.
+        if error_surface is None:
+            _fail_inflight_turn(session, error)
+        else:
+            _fail_inflight_turn(session, error, error_surface=error_surface)
         turn = session.get("inflight_turn") or {}
         message = str(turn.get("error") or "turn failed")
         partial = str(turn.get("assistant") or "")
