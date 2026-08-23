@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import sys
 import tempfile
 import time
@@ -131,10 +132,59 @@ def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
     return _fallback_socket_path(home), _pointer_path(home)
 
 
+def _is_trustworthy_socket(candidate: Path) -> bool:
+    """True when *candidate* is a socket this user owns, with no group/other access.
+
+    The module's trust model is that filesystem ACLs are the auth boundary.
+    That holds for ``$HERMES_HOME/gateway.sock`` — the home directory is the
+    user's. It does NOT hold for the temp-dir fallback: on Linux
+    ``tempfile.gettempdir()`` is usually the shared, world-writable ``/tmp``,
+    and the filename is ``hermes-gw-<sha256(home)[:16]>.sock`` — unsalted, so
+    anyone who can guess the home path can compute it and bind there first.
+    A client that connects to whatever exists would then take its answers
+    from that process, and ``identify``/``status`` are exactly the answers
+    the updater and the fleet-version matrix act on.
+
+    The server already binds under ``umask(0o177)`` and chmods 0600, so a
+    genuine socket always passes. This is the client half of the same
+    property: refuse anything we do not own, or that anyone else can reach.
+
+    Windows named pipes live in a per-user namespace and carry no st_uid;
+    this check is POSIX-only by design.
+    """
+    if _IS_WINDOWS:
+        return True
+    try:
+        info = os.stat(candidate)
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(info.st_mode):
+        logger.debug("Control socket %s is not a socket; ignoring", candidate)
+        return False
+    if info.st_uid != os.geteuid():
+        logger.warning(
+            "Ignoring control socket %s: owned by uid %d, not %d",
+            candidate, info.st_uid, os.geteuid(),
+        )
+        return False
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        logger.warning(
+            "Ignoring control socket %s: mode %o allows group/other access",
+            candidate, stat.S_IMODE(info.st_mode),
+        )
+        return False
+    return True
+
+
 def resolve_client_socket_path(home: Path) -> Optional[Path]:
-    """Where a client should connect for ``home``, or None when nothing exists."""
+    """Where a client should connect for ``home``, or None when nothing exists.
+
+    A candidate that fails :func:`_is_trustworthy_socket` is treated as
+    absent, which drops the caller onto the existing state-file/scan
+    fallback — the same path taken when no gateway is running.
+    """
     direct = _default_socket_path(home)
-    if direct.exists():
+    if direct.exists() and _is_trustworthy_socket(direct):
         return direct
     pointer = _pointer_path(home)
     try:
@@ -142,7 +192,7 @@ def resolve_client_socket_path(home: Path) -> Optional[Path]:
             target = pointer.read_text(encoding="utf-8").strip()
             if target:
                 candidate = Path(target)
-                if candidate.exists():
+                if candidate.exists() and _is_trustworthy_socket(candidate):
                     return candidate
     except OSError:
         pass
