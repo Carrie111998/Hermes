@@ -14326,6 +14326,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             result = transcribe_recording(wav_path, model=self._voice_stt_model())
             transcript = (result.get("transcript") or "").strip() if result.get("success") else ""
             if transcript:
+                # Defensive: reject literal null/None/undefined transcripts
+                # from misbehaving STT pipelines (e.g. command-type
+                # providers whose jq pipeline produces "null" when the
+                # upstream API returns an error envelope with no .text).
+                # Without this, the chat surface would render "[Null]" and
+                # the model would try to act on an empty utterance.
+                if transcript.lower() in {"null", "none", "undefined", "nan"}:
+                    logger.warning(
+                        "voice barge: STT returned non-content placeholder %r; "
+                        "treating as transcription failure.",
+                        transcript,
+                    )
+                    _cprint(f"\n{_DIM}Transcription produced no usable text "
+                            f"(STT returned {transcript!r}).{_RST}")
+                    return
+
                 from tools.voice_mode import is_voice_stop_phrase
                 if is_voice_stop_phrase(transcript):
                     _cprint(f"\n{_DIM}Stop phrase detected — ending voice chat.{_RST}")
@@ -14603,23 +14619,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"{_DIM}Wake word is not running.{_RST}")
 
     def _on_wake_word(self):
-        """Fired after the detector hears the wake phrase."""
+        """Fired after the detector hears the wake phrase.
+
+        New (Aug 2026) — instead of pause-then-open-second-mic, the detector's
+        mic stream stays open and is reused to capture the user's command
+        utterance. This eliminates the macOS CoreAudio AUHAL handle-release
+        race that produced empty transcripts and stranded the wake listener.
+        """
         if getattr(self, "_should_exit", False):
             return
         # Ignore wake while a turn is in flight or the mic is already in use.
         if self._agent_running or self._voice_recording or getattr(self, "_voice_processing", False):
             return
-
-        # Release the mic so STT can capture the command utterance.
-        try:
-            from tools.wake_word import pause_listening
-            if not pause_listening(owner=self):
-                self._wake_word_active = False
-                return
-        except Exception as e:
-            logger.debug("wake word pause failed: %s", e)
-            return
-        self._wake_suspended = True
 
         # Multi-profile routing: the CLI is a single-profile process, so a
         # phrase enrolled by ANOTHER profile can't be routed here — print the
@@ -14634,7 +14645,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if _match[1] != _active_profile_name():
                 _cprint(f"\n{_DIM}Wake phrase for profile '{_match[1]}' — "
                         f"run: hermes -p {_match[1]}{_RST}")
-                self._wake_suspended = True  # watchdog resumes the listener
+                # No capture was armed; wake listener is still live.
                 return
 
         _cprint(f"\n{_ACCENT}✦ Wake word detected — listening...{_RST}")
@@ -14650,16 +14661,154 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as e:
                 logger.debug("wake word new_session failed: %s", e)
 
-        # Single-utterance capture (not continuous) via the voice pipeline;
-        # VAD auto-stop transcribes and queues the transcript for process_loop.
+        # Arm post-wake capture on the SAME mic stream the detector is
+        # already using. No close/reopen → no CoreAudio AUHAL race, no
+        # "transcribing came back with nothing" because the stream stays
+        # healthy. The wake engine is paused for the duration of capture
+        # and resumes automatically when capture ends. Watchdog state is
+        # left alone — there's nothing to resume because we never paused.
+        # Mark _voice_processing so the wake detector's callback-dispatch
+        # gating doesn't immediately re-fire on residual wake phonemes.
         with self._voice_lock:
-            self._voice_mode = True
-        self._voice_continuous = False
+            self._voice_processing = True
         try:
-            self._voice_start_recording()
+            from tools.wake_word import start_post_wake_capture
+            armed = start_post_wake_capture(
+                on_done=self._on_post_wake_audio_done,
+                owner=self,
+            )
+            if not armed:
+                # Detector isn't running — fall back to opening a fresh mic.
+                # This path is hit if the listener died between fire and
+                # callback dispatch (rare; usually a permission event).
+                logger.warning("wake word: post-wake capture arm failed — falling back to /voice on")
+                with self._voice_lock:
+                    self._voice_processing = False
+                self._voice_continuous = False
+                try:
+                    self._voice_start_recording()
+                except Exception as e:
+                    _cprint(f"{_DIM}Wake capture failed: {e}{_RST}")
         except Exception as e:
-            _cprint(f"{_DIM}Wake capture failed: {e}{_RST}")
-            # Leave _wake_suspended set; the watchdog resumes once idle.
+            with self._voice_lock:
+                self._voice_processing = False
+            logger.warning("wake word: post-wake capture arm error: %s", e)
+
+    def _on_post_wake_audio_done(self, audio: "Any", sample_rate: int) -> None:
+        """Called by the wake detector's capture-done thread when the user's
+        utterance ends (silence detected, max duration reached, or stream
+        error). Writes a WAV and routes it through the same transcription
+        pipeline as a manual /voice session.
+        """
+        try:
+            from tools.voice_mode import transcribe_recording, SAMPLE_RATE, SAMPLE_WIDTH, CHANNELS, is_voice_stop_phrase
+            import wave
+            import os
+
+            # Mark processing up front so the watchdog won't try to do
+            # anything weird while we're transcribing.
+            with self._voice_lock:
+                self._voice_processing = True
+
+            submitted = False
+            transcription_failed = False
+            wav_path = None
+            try:
+                # Empty capture (silence, no speech detected).
+                if audio is None or len(audio) == 0:
+                    _cprint(f"{_DIM}No speech detected.{_RST}")
+                    return
+
+                # Determine audio length and write WAV. Audio is int16 mono
+                # at sample_rate (16 kHz from the wake engine).
+                duration_sec = len(audio) / float(sample_rate)
+                if duration_sec < 0.2:
+                    _cprint(f"{_DIM}Wake capture too short (%.2fs).{_RST}" % duration_sec)
+                    return
+
+                os.makedirs(os.path.expanduser("~/.hermes/tmp"), exist_ok=True)
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                wav_path = os.path.join(
+                    os.path.expanduser("~/.hermes/tmp"),
+                    f"wake_capture_{timestamp}.wav",
+                )
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(SAMPLE_WIDTH)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(audio.tobytes())
+
+                logger.info(
+                    "wake word: captured %.2fs of audio at %d Hz -> %s",
+                    duration_sec, sample_rate, wav_path,
+                )
+                _cprint(f"{_DIM}Transcribing...{_RST}")
+
+                stt_model = self._voice_stt_model()
+                result = transcribe_recording(wav_path, model=stt_model)
+
+                if result.get("success") and result.get("transcript", "").strip():
+                    transcript = result["transcript"].strip()
+
+                    # Defensive: some STT pipelines (notably command-type
+                    # providers using jq) emit the literal string "null",
+                    # "None", or "undefined" when the upstream API returns
+                    # an error envelope with no .text field. Don't queue
+                    # those as user input — the chat surface would render
+                    # them as "[Null]" and the model would try to act on
+                    # an empty/nonsense utterance. Drop with a hint instead.
+                    if transcript.lower() in {"null", "none", "undefined", "nan", ""}:
+                        logger.warning(
+                            "wake word: STT returned non-content placeholder %r; "
+                            "treating as transcription failure. Underlying API "
+                            "likely returned an error envelope — check provider logs.",
+                            transcript,
+                        )
+                        _cprint(f"\n{_DIM}Transcription produced no usable text "
+                                f"(STT returned {transcript!r}). Check your STT "
+                                f"provider's response for errors.{_RST}")
+                        transcription_failed = True
+                        return
+
+                    if is_voice_stop_phrase(transcript):
+                        _cprint(f"{_DIM}Stop phrase detected — ending voice chat.{_RST}")
+                        self._disable_voice_mode()
+                        return
+                    self._attached_images.clear()
+                    if hasattr(self, '_app') and self._app:
+                        try:
+                            self._app.invalidate()
+                        except Exception:
+                            pass
+                    self._pending_input.put(_VoiceInputMessage(transcript))
+                    submitted = True
+                elif result.get("success"):
+                    _cprint(f"{_DIM}No speech detected.{_RST}")
+                else:
+                    error = result.get("error", "Unknown error")
+                    _cprint(f"\n{_DIM}Transcription failed: {error}{_RST}")
+                    transcription_failed = True
+            except Exception as e:
+                _cprint(f"\n{_DIM}Voice processing error: {e}{_RST}")
+                logger.exception("post-wake audio processing error")
+                transcription_failed = wav_path is not None
+            finally:
+                with self._voice_lock:
+                    self._voice_processing = False
+                if hasattr(self, '_app') and self._app:
+                    try:
+                        self._app.invalidate()
+                    except Exception:
+                        pass
+                try:
+                    if wav_path and os.path.isfile(wav_path) and not transcription_failed:
+                        os.unlink(wav_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("post-wake callback outer error: %s", e)
+            with self._voice_lock:
+                self._voice_processing = False
 
     def _start_wake_watchdog(self):
         """Resume the paused detector when the CLI returns to a stable idle."""
