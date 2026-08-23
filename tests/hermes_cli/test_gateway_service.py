@@ -262,6 +262,50 @@ class TestGeneratedSystemdUnits:
 
         assert "SoftResourceLimits" not in plist
 
+    def test_launchd_plist_excludes_ephemeral_path_entries(self, monkeypatch, tmp_path):
+        """#8125: transient/session-specific PATH entries must not be baked into
+        the persistent launchd plist.  They drift across shells and can cause
+        false stale-definition detection."""
+        import tempfile
+
+        ephemeral = str(Path(tempfile.gettempdir()) / "hermes-e2e-test" / "bin")
+        stable = "/opt/homebrew/bin"
+        monkeypatch.setenv("PATH", f"{ephemeral}:{stable}")
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert ephemeral not in plist
+        # Stable entries must survive.
+        assert stable in plist
+
+
+class TestIsEphemeralPathEntry:
+    """Unit tests for _is_ephemeral_path_entry()."""
+
+    def test_tmp_root(self):
+        assert gateway_cli._is_ephemeral_path_entry("/tmp/some-tool") is True
+
+    def test_private_var_folders(self):
+        # On macOS, the user temp dir lives under /private/var/folders/…/T.
+        # A path under that dir must be detected as ephemeral.
+        import tempfile
+
+        ephemeral = str(Path(tempfile.gettempdir()) / "some-tool")
+        assert gateway_cli._is_ephemeral_path_entry(ephemeral) is True
+
+    def test_stable_homebrew(self):
+        assert gateway_cli._is_ephemeral_path_entry("/opt/homebrew/bin") is False
+
+    def test_stable_local_bin(self):
+        assert gateway_cli._is_ephemeral_path_entry("/Users/alice/.local/bin") is False
+
+    def test_empty_string(self):
+        assert gateway_cli._is_ephemeral_path_entry("") is False
+
+    def test_opt_tmpfs_not_false_positive(self):
+        """A path like /opt/tmpfs-mounted/bin must NOT be flagged — it is not
+        under the system temp directory, even though it contains 'tmp'."""
+        assert gateway_cli._is_ephemeral_path_entry("/opt/tmpfs-mounted/bin") is False
 
 
 class TestGatewayStopCleanup:

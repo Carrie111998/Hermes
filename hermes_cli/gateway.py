@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -3330,6 +3331,38 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _is_ephemeral_path_entry(entry: str) -> bool:
+    """Return True if *entry* is a transient/session-specific PATH directory.
+
+    Ephemeral entries — temp directories, tool-specific session shims — should
+    never be baked into a persistent service definition.  They drift across
+    shells and can cause false stale-definition detection (#8125).
+    """
+    if not entry:
+        return False
+    try:
+        resolved = Path(entry).resolve()
+        return resolved.is_relative_to(_EPHEMERAL_PATH_ROOTS[0]) or (
+            len(_EPHEMERAL_PATH_ROOTS) > 1
+            and resolved.is_relative_to(_EPHEMERAL_PATH_ROOTS[1])
+        )
+    except (OSError, ValueError):
+        return False
+
+
+# Canonical temp directories resolved once at import time.  On macOS the
+# system temp is ``/private/tmp`` (``/tmp`` is a symlink) and the user temp
+# is ``/private/var/folders/…/T``.  On Linux both collapse to ``/tmp``.
+# Checking both roots avoids false-positives on paths like
+# ``/opt/tmpfs-mounted/bin`` while still catching ``/tmp/…`` and
+# ``/private/var/folders/…/T/…`` (#8125).
+_EPHEMERAL_PATH_ROOTS = tuple(
+    dict.fromkeys(
+        [Path("/tmp").resolve(), Path(tempfile.gettempdir()).resolve()]
+    )
+)
+
+
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
@@ -4806,7 +4839,12 @@ def generate_launchd_plist() -> str:
     _append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(
         dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+            priority_dirs
+            + [
+                p
+                for p in os.environ.get("PATH", "").split(":")
+                if p and not _is_ephemeral_path_entry(p)
+            ]
         )
     )
 
