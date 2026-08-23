@@ -189,35 +189,42 @@ describe('desktop locale coverage', () => {
       ).toEqual([])
     })
 
-    it(`${id} uses every named parameter its function entries declare`, () => {
+    it(`${id} does not drop parameters that English function entries use`, () => {
       const authored = leafEntries(authoredEntries(id))
-      const ignored: string[] = []
+      const dropped: string[] = []
       const unparsed: string[] = []
 
-      for (const [key, localeValue] of authored) {
-        if (typeof localeValue !== 'function' || typeof ENGLISH_ENTRIES.get(key) !== 'function') {
+      for (const [key, englishValue] of ENGLISH_ENTRIES) {
+        const localeValue = authored.get(key)
+
+        if (typeof englishValue !== 'function' || typeof localeValue !== 'function') {
           continue
         }
 
-        const parsed = parseArrow(localeValue as (...args: never[]) => string)
+        const englishArrow = parseArrow(englishValue as (...args: never[]) => string)
+        const localeArrow = parseArrow(localeValue as (...args: never[]) => string)
 
-        if (!parsed) {
+        if (!englishArrow || !localeArrow) {
           unparsed.push(key)
           continue
         }
 
-        // Leading underscore is the established intentional-unused convention.
-        const dead = parsed.params.filter(param => !param.startsWith('_') && !referenced(parsed.body, param))
+        const comparableParams = Math.min(englishArrow.params.length, localeArrow.params.length)
 
-        if (dead.length) {
-          ignored.push(`${key} [${dead.join(', ')}]`)
+        for (let index = 0; index < comparableParams; index += 1) {
+          const englishParam = englishArrow.params[index]
+          const localeParam = localeArrow.params[index]
+
+          if (referenced(englishArrow.body, englishParam) && !referenced(localeArrow.body, localeParam)) {
+            dropped.push(`${key} [${localeParam} ← ${englishParam}]`)
+          }
         }
       }
 
       expect(unparsed, `${id} has function entries the structural guard could not parse`).toEqual([])
       expect(
-        ignored,
-        `${id} declares parameters it never uses, so caller data can be dropped from the translation`
+        dropped,
+        `${id} drops caller data that the English source entry actually renders`
       ).toEqual([])
     })
 
