@@ -1921,20 +1921,25 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         self._liveness_task = asyncio.create_task(self._liveness_loop())
 
-    def _read_websocket_health(self, client: Any) -> tuple[bool, str]:
-        """Return current Discord Gateway health without making a REST request."""
+    def _read_websocket_health(self, client: Any) -> tuple[bool, str, dict]:
+        """Return current Discord Gateway health without making a REST request.
+
+        Returns (healthy, reason, details) where details contains ``latency``
+        and ``ack_age`` when available (None when not probed yet).
+        """
+        details: dict = {"latency": None, "ack_age": None}
         try:
             ready = bool(client.is_ready())
         except Exception:
-            return False, "not_ready"
+            return False, "not_ready", details
         if not ready:
-            return False, "not_ready"
+            return False, "not_ready", details
 
         try:
             if client.is_closed():
-                return False, "client_closed"
+                return False, "client_closed", details
         except Exception:
-            return False, "client_closed"
+            return False, "client_closed", details
 
         websocket = getattr(client, "ws", None)
         try:
@@ -1945,24 +1950,26 @@ class DiscordAdapter(BasePlatformAdapter):
             # A transport object that cannot report its open state is not a
             # usable event stream. Treat it as unhealthy rather than letting
             # the periodic liveness task crash silently.
-            return False, "socket_state_unavailable"
+            return False, "socket_state_unavailable", details
         if not socket_open:
-            return False, "socket_closed"
+            return False, "socket_closed", details
 
         keep_alive = getattr(websocket, "_keep_alive", None)
         last_ack = getattr(keep_alive, "_last_ack", None)
         if not isinstance(last_ack, (int, float)):
-            return False, "ack_unavailable"
+            return False, "ack_unavailable", details
         ack_age = time.perf_counter() - last_ack
+        details["ack_age"] = round(ack_age, 3)
         if not math.isfinite(ack_age) or ack_age > self._heartbeat_ack_max_age_seconds:
-            return False, "ack_stale"
+            return False, "ack_stale", details
 
         latency = getattr(client, "latency", None)
         if not isinstance(latency, (int, float)) or not math.isfinite(latency):
-            return False, "latency_non_finite"
+            return False, "latency_non_finite", details
+        details["latency"] = round(latency, 3)
         if latency > self._max_latency_seconds:
-            return False, "latency_exceeded"
-        return True, "healthy"
+            return False, "latency_exceeded", details
+        return True, "healthy", details
 
     async def _liveness_loop(self) -> None:
         """Force a reconnect after repeated unhealthy Discord Gateway samples."""
@@ -1978,13 +1985,35 @@ class DiscordAdapter(BasePlatformAdapter):
             if not self._running or client is None or self._disconnecting:
                 return
             try:
-                healthy, reason = self._read_websocket_health(client)
+                healthy, reason, details = self._read_websocket_health(client)
             except Exception:
                 # Health sampling must fail closed: an unexpected discord.py
                 # attribute change cannot be allowed to kill this watchdog
                 # task and leave an apparently-running adapter unrecovered.
                 healthy = False
                 reason = "health_check_error"
+                details = {}
+            # Persist live health data so gateway_state.json reflects the
+            # most recent probe outcome for external monitoring.
+            try:
+                from gateway.status import write_platform_live_health
+
+                health_record: dict = {
+                    "websocket_state": reason,
+                    "healthy": healthy,
+                    "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+                if details.get("latency") is not None:
+                    health_record["latency"] = details["latency"]
+                if details.get("ack_age") is not None:
+                    health_record["ack_age"] = details["ack_age"]
+                write_platform_live_health("discord", health_record)
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to persist liveness health record",
+                    self.name,
+                    exc_info=True,
+                )
             if healthy:
                 failures = 0
                 continue
