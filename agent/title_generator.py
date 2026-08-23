@@ -270,9 +270,10 @@ def derive_title(user_message: str) -> Optional[str]:
 def _extract_title_text(content: str) -> str:
     """Pull the title out of a model response.
 
-    The JSON schema makes the object shape the expected case, but not every
-    provider honors ``response_format``; fall back through a loose JSON scan
-    and finally to first-line prose so a non-compliant provider still titles.
+    No ``response_format`` is sent anymore (see module docstring), so the
+    shape is free-form: try a strict JSON object first, fall back through a
+    loose JSON scan, and finally to first-line prose so any provider still
+    titles.
     """
     if not content:
         return ""
