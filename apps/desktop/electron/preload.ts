@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
+  // Content-free evidence consumed read-only by Hermes Pet. The renderer sends
+  // only the exact stored session identity and owning profile.
+  recordPetSessionViewed: payload => ipcRenderer.invoke('hermes:pet:session-viewed', payload),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
   // getGatewayWsUrl, minted against that connection's backend.

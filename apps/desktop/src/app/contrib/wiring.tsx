@@ -150,6 +150,7 @@ import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
+import { resolvePetSessionViewPayload } from './pet-session-view'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
 
@@ -855,6 +856,59 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef,
     sessions
   })
+
+  // Hermes Pet receives only content-free evidence that the exact stored
+  // session key is selected, loaded, profile-matched, visible, and frontmost
+  // in Desktop. A backgrounded valid route leaves the previous evidence in
+  // place; invalid or profile-mismatched state clears `current` fail-closed.
+  useEffect(() => {
+    const publishPetSessionView = () => {
+      const payload = resolvePetSessionViewPayload({
+        activeGatewayProfile,
+        activeSessionId,
+        currentView,
+        documentVisible: document.visibilityState === 'visible',
+        profileReady: boot.phase === 'renderer.ready',
+        routedSessionId,
+        resumeExhaustedSessionId,
+        resumeFailedSessionId,
+        runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef.current,
+        selectedStoredSessionId,
+        sessions,
+        windowFocused: typeof document.hasFocus === 'function' && document.hasFocus()
+      })
+
+      if (payload == null) {
+        return
+      }
+
+      const result = window.hermesDesktop?.recordPetSessionViewed?.(payload)
+
+      if (result) {
+        void result.catch(() => undefined)
+      }
+    }
+
+    publishPetSessionView()
+    window.addEventListener('focus', publishPetSessionView)
+    document.addEventListener('visibilitychange', publishPetSessionView)
+
+    return () => {
+      window.removeEventListener('focus', publishPetSessionView)
+      document.removeEventListener('visibilitychange', publishPetSessionView)
+    }
+  }, [
+    activeGatewayProfile,
+    activeSessionId,
+    boot.phase,
+    currentView,
+    resumeExhaustedSessionId,
+    resumeFailedSessionId,
+    routedSessionId,
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    sessions
+  ])
 
   // Pin/unpin the selected session (statusbar keybind + chat header) — pinned
   // on the durable lineage-root id so it survives auto-compression.
