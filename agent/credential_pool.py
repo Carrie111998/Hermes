@@ -2405,6 +2405,45 @@ class CredentialPool:
             return entry
 
 
+def _incoming_token_is_a_rotation(
+    existing: PooledCredential, provider: str, payload: Dict[str, Any]
+) -> bool:
+    """True when *payload* carries a genuinely different secret than *existing*.
+
+    Owned entries persist their secret, so a direct comparison answers this.
+    Borrowed ones (env vars, external CLIs) do not: ``to_dict`` runs them
+    through :func:`sanitize_borrowed_credential_payload`, which strips the raw
+    value and leaves a non-reversible ``secret_fingerprint`` behind for exactly
+    this comparison. Comparing the incoming token against their stored — always
+    empty — ``access_token`` reported a rotation on every single
+    :func:`load_pool` call, which cleared the exhaustion state below and
+    re-persisted the pool each time: a 429 cooldown never survived a reload,
+    and the resulting ``auth.json`` rewrite invalidated every provider's cached
+    model list (its fingerprint folds in that file's mtime).
+
+    An absent secret on both sides is "nothing to compare", not a rotation.
+
+    This relies on both fingerprints being derived from the same field:
+    ``_credential_secret_fingerprint`` prefers ``agent_key`` over
+    ``access_token``, and today only the owned nous ``device_code`` entry
+    carries an ``agent_key`` — which takes the direct-comparison branch above.
+    A borrowed payload growing an ``agent_key`` would fingerprint a different
+    field than the stored entry did and read as a rotation on every load again.
+    """
+    incoming = payload.get("access_token")
+    if incoming is None:
+        return False
+    if existing.access_token:
+        return incoming != existing.access_token
+    stored_fingerprint = existing.extra.get("secret_fingerprint")
+    incoming_fingerprint = sanitize_borrowed_credential_payload(
+        payload, provider
+    ).get("secret_fingerprint")
+    if not stored_fingerprint or not incoming_fingerprint:
+        return False
+    return stored_fingerprint != incoming_fingerprint
+
+
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
     matching_indices = []
     for idx, entry in enumerate(entries):
@@ -2427,11 +2466,7 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
-    token_changed = (
-        "access_token" in payload
-        and payload["access_token"] is not None
-        and payload["access_token"] != existing.access_token
-    )
+    token_changed = _incoming_token_is_a_rotation(existing, provider, payload)
     for key, value in payload.items():
         if key in {"id", "priority"} or value is None:
             continue
