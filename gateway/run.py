@@ -5856,6 +5856,26 @@ class TurnRunner:
         # rides the same show path (it's emitted as a success notice, not a
         # clear). The clear callback is a no-op: a sent platform message
         # can't be cleanly retracted, and the band already fired once.
+        #
+        # Per-turn policy stamp. The agent may be a CACHED instance shared
+        # across the profiles a multiplexed gateway serves. Its
+        # ``_credits_notices_enabled_cache`` is only computed once, on first
+        # use, so a session that first ran under a profile with
+        # ``display.credits_notices=true`` would keep that stale value after
+        # routing to a profile where it is false (and the reverse). Re-resolve
+        # the ACTIVE profile's policy from this turn's already profile-scoped
+        # ``user_config`` and stamp it here, before the provider runs, so a
+        # reused agent cannot leak another profile's setting. Fail-open True
+        # on any config error, matching ``AIAgent._credits_notices_enabled``.
+        _credits_notices_enabled = True
+        try:
+            _credits_display = (ctx.user_config or {}).get("display")
+            if isinstance(_credits_display, dict) and "credits_notices" in _credits_display:
+                _credits_notices_enabled = bool(_credits_display.get("credits_notices"))
+        except Exception:
+            _credits_notices_enabled = True
+        agent._credits_notices_enabled_cache = _credits_notices_enabled
+
         def _notice_callback_sync(notice) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
                 return
@@ -5873,7 +5893,10 @@ class TurnRunner:
                 log_message="notice_callback delivery scheduling error",
             )
 
-        agent.notice_callback = _notice_callback_sync
+        # Only wire the notice rail when the active profile wants notices; a
+        # profile that disabled ``display.credits_notices`` must not deliver
+        # them even via a reused agent's callback.
+        agent.notice_callback = _notice_callback_sync if _credits_notices_enabled else None
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
