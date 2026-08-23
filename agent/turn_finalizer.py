@@ -608,9 +608,17 @@ def finalize_turn(
                     _pre_transform_response = final_response
                     final_response = _hook_result
                     _response_transformed = True
-                    break  # First non-empty string wins
+                    break
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    try:
+        from agent.credential_pool import consume_pending_seat_notice
+
+        if final_response:
+            final_response = consume_pending_seat_notice(agent, final_response)
+    except Exception:
+        pass
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

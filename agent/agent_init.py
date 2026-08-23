@@ -1534,6 +1534,14 @@ def init_agent(
     # the failure to its source entry.
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
+    try:
+        from agent.credential_pool import apply_session_seat_notice
+
+        _pool = getattr(agent, "_credential_pool", None)
+        _entry = _pool.current() if _pool is not None else None
+        apply_session_seat_notice(agent, _entry, reused=False)
+    except Exception:
+        pass
     
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection
