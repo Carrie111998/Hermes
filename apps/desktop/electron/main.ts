@@ -187,6 +187,7 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import { buildLocalMediaResponse } from './media-range'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -1246,13 +1247,10 @@ protocol.registerSchemesAsPrivileged([
 function registerMediaProtocol() {
   const handler = createMediaProtocolHandler({
     ensureRemoteBearer: baseUrl => ensureNativeAccessToken(baseUrl).catch(() => null),
+    // Answer local files ourselves: Electron's file:// loader ignores `Range` and returns the
+    // whole body as 200 without Accept-Ranges, which makes <video> unseekable (seekable=[0,0]).
     fetchLocal: (resolvedPath, headers, method) =>
-      electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
-        bypassCustomProtocolHandlers: true,
-        credentials: 'omit',
-        headers,
-        method
-      }),
+      buildLocalMediaResponse(resolvedPath, { method, rangeHeader: headers.get('range') }),
     fetchRemote: (url, headers, method) =>
       electronNet.fetch(url, {
         bypassCustomProtocolHandlers: true,
