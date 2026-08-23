@@ -391,12 +391,12 @@ def _stale_grant_refusal(
     """Rewrite consent-family refusals into the one actionable blocker.
 
     When the config now carries ``computer_use.grant_existing_profile`` but
-    the backend was created before it existed, the running driver can never
-    honor the grant: it was launched without ``--grant existing-profile``
-    and no amount of accepting Chrome consent prompts will change that. The
-    only correct action is binding a fresh session, and the refusal says so
-    exactly once instead of looping between a successful config write and a
-    repeating driver refusal (#93068).
+    the running driver was launched before it existed, that runtime can
+    never honor the grant: it was launched without ``--grant
+    existing-profile`` and no amount of accepting Chrome consent prompts
+    will change that. The only correct action is binding a fresh session,
+    and the refusal says so exactly once instead of looping between a
+    successful config write and a repeating driver refusal (#93068).
     """
     if bound_grant or not granted_now or not _is_consent_refusal(payload):
         return payload
@@ -1807,6 +1807,10 @@ class _CuaDriverSession:
         # receives it. Select and own a private endpoint so an existing
         # default daemon cannot reject or silently miss the requested grant.
         self._owned_standard_runtime_socket: Optional[str] = None
+        # The existing-profile grant baked into THIS runtime's launch args,
+        # re-read by start() at every launch (lazy first start and each
+        # post-reset relaunch). None = this session has never launched.
+        self._grant_existing_profile_at_launch: Optional[bool] = None
         self._transport_generation = 0
         self._transport_reset_callback: Optional[Any] = None
 
@@ -1850,9 +1854,14 @@ class _CuaDriverSession:
                 child_env = self._embedded_daemon.child_env()
             else:
                 command, args = _resolve_mcp_invocation(driver_cmd)
+                # Bake the grant start() recorded for this exact launch —
+                # never re-read config here, or the bake could diverge from
+                # the snapshot refusal rewriting compares against (#93068).
                 args, owned_socket = _standard_runtime_launch_args(
                     args,
-                    grant_existing_profile=_cua_grant_existing_profile(),
+                    grant_existing_profile=bool(
+                        self._grant_existing_profile_at_launch
+                    ),
                     platform=sys.platform,
                     socket_path=self._owned_standard_runtime_socket,
                 )
@@ -1965,6 +1974,13 @@ class _CuaDriverSession:
         with self._lock:
             if self._started:
                 return
+            # Re-read the existing-profile grant at THIS launch. The runtime
+            # honors only what is baked into its launch args, and every
+            # launch — the lazy first one and each post-reset relaunch —
+            # passes through here. The snapshot therefore always describes
+            # the runtime in flight, never a bind-time value the user may
+            # have changed since (#93068).
+            self._grant_existing_profile_at_launch = _cua_grant_existing_profile()
             # A previous transport may have died without taking down its
             # private app daemon. Stop that exact endpoint before relaunching
             # with --grant; grants cannot modify an already-running runtime.
@@ -2827,12 +2843,15 @@ class CuaDriverBackend(ComputerUseBackend):
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
         # The existing-profile grant is handed to the driver at launch
-        # (`--grant existing-profile`) and is immutable for the life of this
-        # backend. Remember what was in effect at bind time so a mid-session
-        # `hermes config set computer_use.grant_existing_profile true` that
-        # cannot reach the running driver is detected and reported instead of
-        # looping on consent refusals (#93068).
-        self._grant_existing_profile_at_bind = _cua_grant_existing_profile()
+        # (`--grant existing-profile`) and is immutable for the life of that
+        # runtime. The grant is NOT snapshotted here: the runtime launches
+        # lazily (first driver call) and re-launches on transport resets,
+        # and each launch re-reads the config in _CuaDriverSession.start()
+        # (recorded as `_grant_existing_profile_at_launch`). Reading it at
+        # bind time would drift from the launch args in both windows and
+        # misreport a mid-session `hermes config set` as "restart the
+        # session" even when the launched runtime already has the grant
+        # (#93068).
         if permission_mode == "unrestricted":
             # Carry the manifest into unrestricted too. It is optional here
             # (unlike bounded), but when the user declared one it still caps
@@ -4049,20 +4068,33 @@ class CuaDriverBackend(ComputerUseBackend):
 
         * a mid-session ``hermes config set computer_use.grant_existing_profile
           true`` writes a value the running driver can never see (the grant is
-          baked into the launch args at bind time), so consent refusals loop
+          baked into the launch args at launch time), so consent refusals loop
           forever unless the refusal states the rebind action; and
         * driver guidance naming ``browser-harness mac-approve`` recommends a
           helper that is not on the user's PATH, so the passthrough says where
           it lives.
+
+        The launch-grant comparison reads ``_grant_existing_profile_at_launch``
+        — recorded by ``_CuaDriverSession.start()`` at every launch — so the
+        rewrite fires only when the runtime in flight demonstrably launched
+        without the grant. Before any launch (lazy-start window) and after a
+        relaunch that baked the grant (transfer-reset window), the refusal
+        passes through untouched.
         """
         payload = _annotate_browser_harness_hint(payload)
-        bound_grant = bool(getattr(self, "_grant_existing_profile_at_bind", False))
+        session = getattr(self, "_session", None)
+        bound_grant = getattr(session, "_grant_existing_profile_at_launch", None)
+        if bound_grant is None:
+            # This backend's runtime has not launched yet; the (re)launch
+            # re-reads the grant at start(), so a stale-grant verdict would
+            # be premature. Host-side refusals pass through as-is.
+            return payload
         try:
             granted_now = _cua_grant_existing_profile()
         except Exception:
             granted_now = False
         return _stale_grant_refusal(
-            payload, bound_grant=bound_grant, granted_now=granted_now
+            payload, bound_grant=bool(bound_grant), granted_now=granted_now
         )
 
     def typed_browser_state(self, **kwargs: Any) -> Dict[str, Any]:
