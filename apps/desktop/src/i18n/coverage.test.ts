@@ -19,7 +19,9 @@ import type { Locale, Translations } from './types'
  * This is an exact count rather than a loose ceiling. Translating more strings
  * therefore requires lowering the baseline in the same change instead of
  * silently creating regression headroom. If a locale deliberately defers new
- * strings, update the baseline in that commit and explain why.
+ * strings, update the baseline in that commit and explain why. This does not
+ * replace human review of the missing-key set, but it prevents accumulated
+ * numerical slack from hiding a later regression.
  */
 const EXPECTED_UNTRANSLATED: Record<Locale, number> = {
   en: 0,
