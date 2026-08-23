@@ -81,6 +81,24 @@ def _truly_empty_response():
     )
 
 
+def _native_network_error_response():
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="",
+                reasoning=None,
+                reasoning_content=None,
+                reasoning_details=None,
+                tool_calls=None,
+            ),
+            finish_reason="stop",
+            model_extra={"native_finish_reason": "network_error"},
+        )],
+        usage=None,
+        model="test-model",
+    )
+
+
 def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch):
     """After the full ladder is exhausted on reasoning-only responses, the
     delivered text is the labeled excerpt — not a bare '(empty)' — while the
@@ -159,3 +177,24 @@ def test_reasoning_never_promoted_before_ladder_exhaustion(tmp_path, monkeypatch
 
     assert result["final_response"] == "42."
     assert "only internal reasoning" not in result["final_response"]
+
+
+def test_native_network_error_surfaces_without_empty_retries(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls = 0
+
+    def _respond(api_kwargs):
+        nonlocal calls
+        calls += 1
+        return _native_network_error_response()
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _respond)
+    monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 0)
+
+    result = agent.run_conversation("hello?")
+
+    assert calls == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "provider_response_error(network_error)"
+    assert "network_error" in result["final_response"]
+    assert "(empty)" not in result["final_response"]

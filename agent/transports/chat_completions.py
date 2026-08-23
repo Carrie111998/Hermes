@@ -28,6 +28,14 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+PROVIDER_FAILURE_FINISH_REASONS = frozenset({
+    "error",
+    "network_error",
+    "server_error",
+    "upstream_error",
+})
+
+
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
     """Return the stable system/developer prefix used for cache routing.
 
@@ -892,6 +900,23 @@ class ChatCompletionsTransport(ProviderTransport):
         if isinstance(_fr, int):
             _fr = str(_fr)
         finish_reason = _fr or "stop"
+        native_finish_reason = getattr(choice, "native_finish_reason", None)
+        if native_finish_reason is None and hasattr(choice, "model_extra"):
+            choice_extra = getattr(choice, "model_extra", None) or {}
+            if isinstance(choice_extra, dict):
+                native_finish_reason = choice_extra.get("native_finish_reason")
+        if isinstance(native_finish_reason, str):
+            native_finish_reason = native_finish_reason.strip().lower()
+            if (
+                finish_reason == "stop"
+                and native_finish_reason in PROVIDER_FAILURE_FINISH_REASONS
+            ):
+                # Aggregators can project an upstream failure as a successful
+                # OpenAI-compatible stop. Preserve the stronger native signal
+                # so the loop does not retry it as an unexplained empty answer.
+                finish_reason = native_finish_reason
+        else:
+            native_finish_reason = None
 
         tool_calls = None
         message_tool_calls = getattr(msg, "tool_calls", None)
@@ -959,6 +984,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 reasoning_content = model_extra["reasoning_content"]
 
         provider_data: Dict[str, Any] = {}
+        if native_finish_reason is not None:
+            provider_data["native_finish_reason"] = native_finish_reason
         if reasoning_content is not None:
             provider_data["reasoning_content"] = reasoning_content
         rd = getattr(msg, "reasoning_details", None)

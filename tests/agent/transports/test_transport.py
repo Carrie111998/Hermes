@@ -168,3 +168,41 @@ class TestAnthropicTransport:
         assert system is not None
         # Messages should only have user
         assert len(msgs) >= 1
+
+
+class TestChatCompletionsTransport:
+    def test_native_network_error_overrides_clean_public_stop(self):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=None),
+                finish_reason="stop",
+                model_extra={"native_finish_reason": "network_error"},
+            )],
+            usage=None,
+        )
+
+        normalized = ChatCompletionsTransport().normalize_response(response)
+
+        assert normalized.finish_reason == "network_error"
+        assert normalized.provider_data == {
+            "native_finish_reason": "network_error",
+        }
+
+    def test_native_stop_does_not_change_public_finish_reason(self):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="done", tool_calls=None),
+                finish_reason="stop",
+                model_extra={"native_finish_reason": "stop"},
+            )],
+            usage=None,
+        )
+
+        normalized = ChatCompletionsTransport().normalize_response(response)
+
+        assert normalized.finish_reason == "stop"
+        assert normalized.content == "done"

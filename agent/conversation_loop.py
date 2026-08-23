@@ -92,6 +92,7 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
+from agent.transports.chat_completions import PROVIDER_FAILURE_FINISH_REASONS
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -3505,6 +3506,98 @@ def run_conversation(
                             force=True,
                         )
                         finish_reason = "length"
+
+                # Some OpenAI-compatible aggregators expose an upstream
+                # transport failure only as ``native_finish_reason`` while
+                # projecting the public finish reason as a clean ``stop``.
+                # The chat-completions transport promotes that signal. When
+                # the response has no usable payload, do not route it through
+                # the generic empty-response retries: the provider already
+                # told us the unchanged request failed upstream.
+                if finish_reason in PROVIDER_FAILURE_FINISH_REASONS:
+                    _provider_error_content = (
+                        getattr(assistant_message, "content", None) or ""
+                    )
+                    _provider_error_tools = bool(
+                        getattr(assistant_message, "tool_calls", None)
+                    )
+                    _provider_error_reasoning = (
+                        agent._extract_reasoning(assistant_message) or ""
+                    )
+                    if (
+                        not str(_provider_error_content).strip()
+                        and not _provider_error_tools
+                        and not str(_provider_error_reasoning).strip()
+                    ):
+                        _provider_error_detail = (
+                            f"upstream provider ended the request with "
+                            f"{finish_reason} before returning content or tool calls"
+                        )
+                        agent._invoke_api_request_error_hook(
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            api_call_count=api_call_count,
+                            api_start_time=api_start_time,
+                            api_kwargs=api_kwargs,
+                            error_type="ProviderResponseError",
+                            error_message=_provider_error_detail,
+                            status_code=None,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                            retryable=True,
+                            reason=FailoverReason.server_error.value,
+                        )
+
+                        if agent._has_pending_fallback():
+                            agent._buffer_status(
+                                f"⚠️ Upstream provider returned {finish_reason} — "
+                                "trying fallback..."
+                            )
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt
+                            )
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
+
+                        if thinking_spinner:
+                            thinking_spinner.stop("")
+                            thinking_spinner = None
+                        if agent.thinking_callback:
+                            agent.thinking_callback("")
+                        agent._flush_status_buffer()
+                        agent._emit_status(
+                            f"❌ Upstream provider returned {finish_reason} "
+                            "without a response"
+                        )
+                        _provider_error_response = (
+                            "⚠️ The upstream provider could not complete this "
+                            f"request ({finish_reason}). It returned no content "
+                            "or tool calls. Try again or switch models."
+                        )
+                        append_message(messages, {
+                            "role": "assistant",
+                            "content": _provider_error_response,
+                        })
+                        agent._cleanup_task_resources(effective_task_id)
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _provider_error_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _provider_error_detail,
+                            "failure_reason": FailoverReason.server_error.value,
+                            "failure_retryable": True,
+                            "turn_exit_reason": (
+                                f"provider_response_error({finish_reason})"
+                            ),
+                        }
 
                 # ── Content-policy refusal (HTTP 200) ──────────────────
                 # The model — or the provider's safety system — returned a
