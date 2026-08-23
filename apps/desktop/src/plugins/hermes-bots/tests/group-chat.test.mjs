@@ -8,7 +8,7 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
-function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false } = {}) {
+function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false, omitAssistantOnCalls = [] } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => {
@@ -170,7 +170,9 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             title: session.title
           })
           const reply = turnScript(session.profile, params.text, calls.length, session)
-          session.messages.push({ role: 'assistant', content: reply })
+          if (!omitAssistantOnCalls.includes(calls.length)) {
+            session.messages.push({ role: 'assistant', content: reply })
+          }
           return {}
         }
         if (method === 'clarify.respond') {
@@ -311,6 +313,56 @@ test('failed member turn is a pass, not a room error', async () => {
 
   const log = roomLog(gc, 'Flaky')
   assert.equal(log.length, 1) // just the user message; no error entries
+})
+
+test('a user-only failed member session is rotated before the next group turn', async () => {
+  let attempt = 0
+  const gc = load(() => {
+    attempt += 1
+    if (attempt === 1) {
+      throw new Error('provider failed after persisting the user prompt')
+    }
+    return '(pass)'
+  })
+  const member = [{ name: 'research', title: '' }]
+
+  gc.sendToGroupChat('Retry', member, 'first')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().Retry || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  gc.sendToGroupChat('Retry', member, 'second')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().Retry || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  assert.equal(gc.sessions.size, 2, 'the poisoned user-only session must not be resumed')
+  for (const session of gc.sessions.values()) {
+    for (let i = 1; i < session.messages.length; i++) {
+      assert.notEqual(session.messages[i - 1].role, session.messages[i].role, 'stored roles must alternate')
+    }
+  }
+})
+
+test('a non-throwing user-only turn ignores old assistants and rotates before retry', async () => {
+  const gc = load(() => '(pass)', { omitAssistantOnCalls: [2] })
+  const member = [{ name: 'research', title: '' }]
+
+  gc.sendToGroupChat('History', member, 'healthy first turn')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().History || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  gc.sendToGroupChat('History', member, 'provider stores only this user turn')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().History || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  assert.equal(gc.$groupChats.get().History.sessions.research, true, 'user-only completion poisons the session')
+
+  gc.sendToGroupChat('History', member, 'retry on a fresh session')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().History || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(gc.sessions.size, 2, 'retry rotates instead of resuming the user-terminated session')
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {
@@ -1399,6 +1451,33 @@ test('stranded harvest: a timed-out turn whose reply landed late posts into the 
   assert.equal(log[0].from.name, 'research')
   assert.match(log[0].text, /delivered late/)
   assert.equal(gc.$groupChats.get().Late.stranded.research, undefined, 'marker consumed')
+})
+
+test('stranded harvest ignores old assistants and poisons a completed user-only session', async () => {
+  const gc = load(() => '(pass)')
+
+  gc.updateGroupChat('LateFail', room => {
+    room.stranded = { research: 2 }
+    room.sessions = { research: 'sid-research' }
+    return room
+  })
+  gc.sessions.set('sid-research', {
+    stored: 'sid-research',
+    runtime: 'rt-research',
+    profile: 'research',
+    title: 'Group: LateFail',
+    messages: [
+      { role: 'user', content: 'healthy prior prompt' },
+      { role: 'assistant', content: 'healthy prior reply must not be redelivered' },
+      { role: 'user', content: 'timed-out prompt that later ended without an assistant' }
+    ]
+  })
+
+  await gc.harvestStrandedGroupReply('LateFail', { name: 'research', title: '' })
+
+  assert.equal(roomLog(gc, 'LateFail').length, 0, 'an old assistant is never reposted as the stranded result')
+  assert.equal(gc.$groupChats.get().LateFail.stranded.research, undefined, 'completed marker is consumed')
+  assert.equal(gc.$groupChats.get().LateFail.sessions.research, true, 'user-only stranded completion poisons the session')
 })
 
 test('stranded + still busy: the round loop never re-submits into a member whose harvest just confirmed they are still running', async () => {
