@@ -1,43 +1,32 @@
-name: PR 91079 publish final transactional Windows package tree
+name: PR 91079 assemble immutable final tree
 
 on:
-  push:
-    branches:
-      - fix/windows-desktop-pack-transaction
-    paths:
-      - '.github/workflows/pr91079-materialize-patch.yml'
-  workflow_dispatch:
+  pull_request:
+    types: [reopened]
 
 permissions:
-  contents: write
-
-concurrency:
-  group: pr91079-final-publication
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  publish:
-    if: github.repository == 'andrexibiza/hermes-agent'
+  assemble:
+    if: github.event.pull_request.number == 91079 && github.event.pull_request.head.repo.full_name == 'andrexibiza/hermes-agent'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: fix/windows-desktop-pack-transaction
+          repository: andrexibiza/hermes-agent
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-
-      - name: Assert the exact staging object
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "df2a3b6bb2db9b817a855ea8bb479a077a8c7e78"
-          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".github/workflows/pr91079-materialize-patch.yml"
 
       - name: Materialize the reviewed Python rollback composition
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          git merge-base --is-ancestor db32f7bb0864f5944c6ed9f505d0b979bedc8f2f HEAD
           python - <<'PY'
           from pathlib import Path
+
           p = Path('hermes_cli/main.py')
           s = p.read_text(encoding='utf-8')
           a = s.index('def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n')
@@ -104,7 +93,7 @@ jobs:
           test "$(sha256sum hermes_cli/main.py | awk '{print $1}')" = "1070cb0d9ec3f9e5772abde631efb3ad682c212accb96eb5f7967d4181031e0c"
           cp hermes_cli/main.py /tmp/pr91079-main.py
 
-      - name: Recompose the implementation on exact upstream main
+      - name: Recompose on exact upstream main
         shell: bash
         run: |
           set -euo pipefail
@@ -125,7 +114,7 @@ jobs:
           replacements = (
               (
                   '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs",',
-                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
+                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
               ),
               (
                   '    "check:test:desktop:all": "npm run test:desktop:all",',
@@ -166,9 +155,9 @@ jobs:
           git reset --soft "$base"
           git config user.name "Andrex Ibiza, MBA"
           git config user.email "andrexibiza@gmail.com"
-          git commit -m "fix(desktop): make Windows package replacement fully transactional (#91079)" -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire the temporary materializer, and recompose the thirteen-file package transaction on exact upstream main 530028c213ae9eed5d7f1a826451e0edf24a11d2. Preserve current-main package-script changes while binding build, test, and beforePack authority to the recovery implementation."
+          git commit -m "fix(desktop): make Windows package replacement fully transactional (#91079)" -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire the temporary materializer, and recompose the package transaction on exact upstream main 530028c213ae9eed5d7f1a826451e0edf24a11d2. Preserve current-main package-script changes while binding build, test, and beforePack authority to the recovery implementation."
 
-      - name: Verify the final one-commit tree
+      - name: Verify and export the final object
         shell: bash
         run: |
           set -euo pipefail
@@ -205,8 +194,23 @@ jobs:
             esac
           done < /tmp/actual-paths
 
-      - name: Publish and retire the temporary authority
-        shell: bash
-        run: |
-          set -euo pipefail
-          git push origin HEAD:fix/windows-desktop-pack-transaction --force-with-lease=fix/windows-desktop-pack-transaction:${GITHUB_SHA}
+          mkdir -p /tmp/pr91079-final
+          git archive --format=tar.gz --output=/tmp/pr91079-final/final-tree.tar.gz HEAD
+          git format-patch --stdout "$base"..HEAD > /tmp/pr91079-final/final.patch
+          {
+            echo "source_pr_head=${{ github.event.pull_request.head.sha }}"
+            echo "base=$(git rev-parse HEAD^)"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "tree=$(git rev-parse HEAD^{tree})"
+            echo "main_py_sha256=$(git show HEAD:hermes_cli/main.py | sha256sum | awk '{print $1}')"
+            echo "changed_paths_begin"
+            cat /tmp/actual-paths
+            echo "changed_paths_end"
+          } > /tmp/pr91079-final/manifest.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr91079-final-tree
+          path: /tmp/pr91079-final
+          retention-days: 7
+          if-no-files-found: error
