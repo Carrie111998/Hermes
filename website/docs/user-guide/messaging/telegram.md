@@ -527,6 +527,19 @@ tail -f ~/.hermes/logs/gateway.log | grep -iE "telegram|cache"
 
 You should see a `[Telegram] Cached user voice at /home/<user>/.hermes/cache/audio/...` line and **no** "too large" rejection. Combined with `stt.enabled: false` (above), the path to the original audio file then lands in the agent's inbound message for downstream processing.
 
+## Inbound files and mixed attachments
+
+Telegram only creates an album (`media_group_id`) when the client sends several items of the **same type** in one send — typically photos, or sometimes videos. Sequential PDFs, HTML files, or a document plus a screenshot arrive as independent updates.
+
+Hermes already debounced rapid photos into one turn. The same short same-session window now applies to documents and videos:
+
+- several PDFs or HTML files sent back-to-back become one agent turn with every cached path;
+- a PDF plus a screenshot in that window also merge;
+- a real Telegram album still uses `media_group_id` and is unchanged;
+- voice and audio notes are **not** held in this window (they go through STT immediately).
+
+The window is `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` (default `0.8`). In groups with `require_mention: true`, each file still has to pass the mention/reply gate on its own update — this coalesce does not invent a mention.
+
 ## Group Chat Usage
 
 Hermes Agent works in Telegram group chats with a few considerations:

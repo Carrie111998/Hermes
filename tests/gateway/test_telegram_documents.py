@@ -2,7 +2,7 @@
 Tests for Telegram document handling in gateway/platforms/telegram.py.
 
 Covers: document type detection, download/cache flow, size limits,
-        text injection, error handling.
+        text injection, error handling, same-session document bursts.
 
 Note: python-telegram-bot may not be installed in the test environment.
 We mock the telegram module at import time to avoid collection errors.
@@ -115,7 +115,14 @@ def adapter():
     # document-routing tests need to bypass the new gate so messages from fake
     # senders reach handle_message.
     a._is_callback_user_authorized = lambda user_id, **_kw: True
+    # Keep burst tests fast; production default remains 0.8s.
+    a._media_batch_delay_seconds = 0.05
     return a
+
+
+async def _await_media_flush(adapter):
+    """Wait for the same-session media-burst debounce to flush."""
+    await asyncio.sleep(adapter._media_batch_delay_seconds + 0.05)
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +150,7 @@ class TestDocumentTypeDetection:
         msg = _make_message(document=doc)
         update = _make_update(msg)
         await adapter._handle_media_message(update, MagicMock())
+        await _await_media_flush(adapter)
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.DOCUMENT
 
@@ -172,6 +180,7 @@ class TestDocumentDownloadBlock:
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
+        await _await_media_flush(adapter)
         event = adapter.handle_message.call_args[0][0]
         assert "Hello from a text file" in event.text
         assert "[Content of notes.txt]" in event.text
@@ -188,6 +197,7 @@ class TestDocumentDownloadBlock:
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
+        await _await_media_flush(adapter)
         event = adapter.handle_message.call_args[0][0]
         assert "# Title" in event.text
 
@@ -203,6 +213,7 @@ class TestDocumentDownloadBlock:
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
+        await _await_media_flush(adapter)
         event = adapter.handle_message.call_args[0][0]
         assert "file text" in event.text
         assert "Please summarize" in event.text
@@ -221,6 +232,7 @@ class TestDocumentDownloadBlock:
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
+        await _await_media_flush(adapter)
         event = adapter.handle_message.call_args[0][0]
         # File should be cached
         assert len(event.media_urls) == 1
@@ -288,6 +300,7 @@ class TestVideoDownloadBlock:
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
+        await _await_media_flush(adapter)
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.VIDEO
         assert len(event.media_urls) == 1
@@ -312,13 +325,107 @@ class TestMediaGroups:
             await adapter._handle_media_message(_make_update(msg1), MagicMock())
             await adapter._handle_media_message(_make_update(msg2), MagicMock())
             assert adapter.handle_message.await_count == 0
-            await asyncio.sleep(adapter.MEDIA_GROUP_WAIT_SECONDS + 0.05)
+            await _await_media_flush(adapter)
 
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "two images"
         assert event.media_urls == ["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]
         assert len(event.media_types) == 2
+
+
+# ---------------------------------------------------------------------------
+# TestDocumentBursts — sequential PDFs/HTML are not Telegram albums
+# ---------------------------------------------------------------------------
+
+class TestDocumentBursts:
+    @pytest.mark.asyncio
+    async def test_sequential_pdfs_coalesce_into_one_turn(self, adapter):
+        pdf_a = _make_document(file_name="a.pdf", mime_type="application/pdf", file_size=64)
+        pdf_b = _make_document(file_name="b.pdf", mime_type="application/pdf", file_size=64)
+        pdf_c = _make_document(file_name="c.pdf", mime_type="application/pdf", file_size=64)
+
+        await adapter._handle_media_message(_make_update(_make_message(document=pdf_a)), MagicMock())
+        await adapter._handle_media_message(_make_update(_make_message(document=pdf_b)), MagicMock())
+        await adapter._handle_media_message(
+            _make_update(_make_message(document=pdf_c, caption="compare these")),
+            MagicMock(),
+        )
+        assert adapter.handle_message.await_count == 0
+
+        await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 3
+        assert all(url.endswith(".pdf") or "pdf" in url.lower() or os.path.exists(url) for url in event.media_urls)
+        assert "compare these" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_pdf_and_html_coalesce(self, adapter):
+        pdf = _make_document(file_name="paper.pdf", mime_type="application/pdf", file_size=32)
+        html = _make_document(
+            file_name="notes.html",
+            mime_type="text/html",
+            file_size=20,
+            file_obj=_make_file_obj(b"<p>hello</p>"),
+        )
+
+        await adapter._handle_media_message(_make_update(_make_message(document=pdf)), MagicMock())
+        await adapter._handle_media_message(_make_update(_make_message(document=html)), MagicMock())
+        assert adapter.handle_message.await_count == 0
+
+        await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert len(event.media_urls) == 2
+        assert "<p>hello</p>" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_pdf_and_photo_share_the_same_burst_window(self, adapter):
+        pdf = _make_document(file_name="scan.pdf", mime_type="application/pdf", file_size=32)
+        photo = _make_photo(_make_file_obj(b"jpeg-bytes"))
+        photo_msg = _make_message(photo=[photo], caption="see also")
+
+        await adapter._handle_media_message(_make_update(_make_message(document=pdf)), MagicMock())
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/scan.jpg",
+        ):
+            await adapter._handle_media_message(_make_update(photo_msg), MagicMock())
+            assert adapter.handle_message.await_count == 0
+            await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert len(event.media_urls) == 2
+        assert "/tmp/scan.jpg" in event.media_urls
+        assert "see also" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_voice_note_is_not_held_in_the_document_window(self, adapter):
+        pdf = _make_document(file_name="notes.pdf", mime_type="application/pdf", file_size=32)
+        await adapter._handle_media_message(_make_update(_make_message(document=pdf)), MagicMock())
+        assert adapter.handle_message.await_count == 0
+
+        voice_msg = _make_message()
+        voice_msg.voice = MagicMock()
+        voice_msg.voice.file_size = 80
+        voice_msg.voice.get_file = AsyncMock(return_value=_make_file_obj(b"ogg-bytes"))
+        await adapter._handle_media_message(_make_update(voice_msg), MagicMock())
+
+        # Voice dispatches immediately; the PDF is still sitting in the burst buffer.
+        assert adapter.handle_message.await_count == 1
+        voice_event = adapter.handle_message.await_args.args[0]
+        assert voice_event.message_type == MessageType.VOICE
+
+        await _await_media_flush(adapter)
+        assert adapter.handle_message.await_count == 2
+        pdf_event = adapter.handle_message.await_args_list[1].args[0]
+        assert pdf_event.message_type == MessageType.DOCUMENT
+        assert len(pdf_event.media_urls) == 1
 
 
 # ---------------------------------------------------------------------------

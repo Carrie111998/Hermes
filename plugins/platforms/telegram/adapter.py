@@ -9828,7 +9828,12 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
-        """Return a batching key for Telegram photos/albums."""
+        """Return a batching key for Telegram albums and same-session media bursts.
+
+        Photos, videos, and documents without a ``media_group_id`` share the
+        ``media-burst`` key so a rapid PDF + screenshot send becomes one turn.
+        Voice/audio stay on the immediate path — they need STT, not this window.
+        """
         from gateway.session import build_session_key
         session_key = build_session_key(
             event.source,
@@ -9839,7 +9844,7 @@ class TelegramAdapter(BasePlatformAdapter):
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             return f"{session_key}:album:{media_group_id}"
-        return f"{session_key}:photo-burst"
+        return f"{session_key}:media-burst"
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
         """Send a buffered photo burst/album as a single MessageEvent."""
@@ -9854,7 +9859,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._hold_inbound_event(event, where="photo-flush")
                 event = None
                 return
-            logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
+            logger.info(
+                "[Telegram] Flushing media batch %s with %d attachment(s)",
+                batch_key,
+                len(event.media_urls),
+            )
             await self.handle_message(event)
             event = None
         except asyncio.CancelledError:
@@ -10109,7 +10118,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
+                    await self._dispatch_cached_media_event(msg, event)
                     return
 
                 # NOTE: image-document handling is performed earlier in this
@@ -10179,9 +10188,27 @@ class TelegramAdapter(BasePlatformAdapter):
                     display_name=getattr(doc, "file_name", None) or None,
                 )
 
+        await self._dispatch_cached_media_event(msg, event)
+
+    async def _dispatch_cached_media_event(self, msg: Message, event: MessageEvent) -> None:
+        """Send a cached inbound media event, coalescing document/photo/video bursts.
+
+        Telegram only sets ``media_group_id`` for same-type albums. Sequential
+        PDFs, HTML files, or a PDF plus a screenshot arrive as independent
+        updates. Photos already used a short debounce; documents now share that
+        same-session window so the agent sees one logical turn.
+        """
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
+            return
+
+        if event.media_urls and event.message_type in {
+            MessageType.DOCUMENT,
+            MessageType.PHOTO,
+            MessageType.VIDEO,
+        }:
+            self._enqueue_photo_event(self._photo_batch_key(event, msg), event)
             return
 
         await self.handle_message(event)
