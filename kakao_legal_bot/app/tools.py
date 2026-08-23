@@ -1,0 +1,378 @@
+"""The tools 모아 can call while answering.
+
+Retrieval tools return text formatted for a prompt, not JSON — the model
+reads them, and every wasted brace is a wasted token. The two action tools
+(``request_document_draft`` / ``escalate_to_lawyer``) do not perform the
+action inline; they record an intent on the turn so the pipeline can run
+the slow part after the client already has an answer in the room.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from .lawapi.client import LawApiClient, LawApiError
+from .lawapi.models import LawDoc
+from .llm import ToolSpec
+from .rag.store import RagStore
+
+log = logging.getLogger(__name__)
+
+MAX_TOOL_CHARS = 6000
+
+
+@dataclass
+class DraftRequest:
+    kind: str
+    title: str
+    instructions: str
+
+
+@dataclass
+class Escalation:
+    reason: str
+    summary: str
+
+
+@dataclass
+class TurnState:
+    """Side effects and citations collected while answering one message."""
+
+    citations: list[str] = field(default_factory=list)
+    draft_request: DraftRequest | None = None
+    escalation: Escalation | None = None
+
+    def cite(self, text: str) -> None:
+        if text and text not in self.citations:
+            self.citations.append(text)
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= MAX_TOOL_CHARS else text[:MAX_TOOL_CHARS] + "\n…(이하 생략)"
+
+
+def _format_docs(docs: list[LawDoc], state: TurnState, max_body: int = 800) -> str:
+    if not docs:
+        return "검색 결과가 없습니다. 다른 검색어로 다시 시도하거나, 조문을 인용하지 말고 답변하세요."
+    blocks = []
+    for doc in docs:
+        state.cite(doc.citation)
+        blocks.append(doc.to_prompt_block(max_body=max_body))
+    return _clip("\n\n".join(blocks))
+
+
+def build_tools(
+    *,
+    state: TurnState,
+    rag: RagStore | None,
+    law: LawApiClient | None,
+    rag_top_k: int = 6,
+    embed_query: Any = None,
+) -> list[ToolSpec]:
+    tools: list[ToolSpec] = []
+
+    # ── local corpus ─────────────────────────────────────────────────────
+    if rag is not None:
+        async def search_local_docs(arguments: dict[str, Any]) -> str:
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                return "query 가 비어 있습니다."
+            top_k = int(arguments.get("top_k") or rag_top_k)
+            if embed_query is not None:
+                vector = await embed_query(query)
+                hits = await asyncio.to_thread(rag.search_with_embedding, query, vector, top_k)
+            else:
+                hits = await asyncio.to_thread(rag.search, query, top_k)
+            if not hits:
+                return "로컬 자료에서 관련 내용을 찾지 못했습니다."
+            blocks = []
+            for hit in hits:
+                state.cite(hit.citation)
+                blocks.append(f"■ {hit.citation}\n  {hit.text.strip()}")
+            return _clip("\n\n".join(blocks))
+
+        tools.append(
+            ToolSpec(
+                name="search_local_docs",
+                description=(
+                    "사무실 로컬 자료(주석서·법률서적·내부 서면 등)를 검색한다. "
+                    "일반적인 법리 설명이나 실무 관행이 필요할 때 가장 먼저 쓴다."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "검색어. 핵심 법률 키워드 위주로."},
+                        "top_k": {"type": "integer", "description": "가져올 문단 수 (기본 6)"},
+                    },
+                    "required": ["query"],
+                },
+                handler=search_local_docs,
+            )
+        )
+
+    if law is None:
+        return tools
+
+    # ── 국가법령정보 ──────────────────────────────────────────────────────
+    async def search_law(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            return "query 가 비어 있습니다."
+        try:
+            docs = await law.search_law(query, display=int(arguments.get("limit") or 5))
+        except LawApiError as exc:
+            return f"법령 검색 실패: {exc}"
+        return _format_docs(docs, state)
+
+    async def get_law_text(arguments: dict[str, Any]) -> str:
+        law_id = str(arguments.get("law_id") or "").strip()
+        if not law_id:
+            return "law_id 가 필요합니다. 먼저 search_law 로 법령일련번호를 찾으세요."
+        try:
+            doc = await law.get_law(law_id=law_id)
+        except LawApiError as exc:
+            return f"법령 본문 조회 실패: {exc}"
+        if doc is None:
+            return "해당 법령을 찾지 못했습니다."
+        state.cite(doc.citation)
+        return _clip(doc.to_prompt_block(max_body=4000))
+
+    async def search_precedent(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        court = str(arguments.get("court") or "").strip()
+        case_no = str(arguments.get("case_no") or "").strip()
+        if not query and not case_no:
+            return "query 또는 case_no 가 필요합니다."
+        try:
+            docs = await law.search_precedent(
+                query, court=court, case_no=case_no, display=int(arguments.get("limit") or 5)
+            )
+        except LawApiError as exc:
+            return f"판례 검색 실패: {exc}"
+        if not docs:
+            return "판례 검색 결과가 없습니다."
+        lines = ["검색된 판례 목록입니다. 본문이 필요하면 get_precedent 로 판례일련번호를 조회하세요.\n"]
+        for doc in docs:
+            state.cite(doc.citation)
+            lines.append(f"■ {doc.citation}\n  판례일련번호: {doc.doc_id}")
+        return _clip("\n".join(lines))
+
+    async def get_precedent(arguments: dict[str, Any]) -> str:
+        prec_id = str(arguments.get("prec_id") or "").strip()
+        if not prec_id:
+            return "prec_id(판례일련번호)가 필요합니다."
+        try:
+            doc = await law.get_precedent(prec_id)
+        except LawApiError as exc:
+            return f"판례 본문 조회 실패: {exc}"
+        if doc is None:
+            return "해당 판례를 찾지 못했습니다."
+        state.cite(doc.citation)
+        return _clip(doc.to_prompt_block(max_body=5000))
+
+    async def search_ordinance(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        try:
+            docs = await law.search_ordinance(query, display=int(arguments.get("limit") or 5))
+        except LawApiError as exc:
+            return f"자치법규 검색 실패: {exc}"
+        return _format_docs(docs, state)
+
+    async def search_admin_rule(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        try:
+            docs = await law.search_admin_rule(query, display=int(arguments.get("limit") or 5))
+        except LawApiError as exc:
+            return f"행정규칙 검색 실패: {exc}"
+        return _format_docs(docs, state)
+
+    async def search_forms(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        try:
+            docs = await law.search_forms(query, display=int(arguments.get("limit") or 5))
+        except LawApiError as exc:
+            return f"별표·서식 검색 실패: {exc}"
+        return _format_docs(docs, state, max_body=300)
+
+    async def search_constitutional(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        limit = int(arguments.get("limit") or 5)
+        errors = []
+        try:
+            docs = await law.search_constitutional_decision(query, display=limit)
+            if docs:
+                return _format_docs(docs, state)
+        except LawApiError as exc:
+            errors.append(str(exc))
+        # law.go.kr's 헌재결정례 target is patchy; the data.go.kr 헌재
+        # service covers the same ground with a different key.
+        try:
+            docs = await law.cc_precedents(rows=limit, **({"query": query} if query else {}))
+            if docs:
+                return _format_docs(docs, state)
+        except LawApiError as exc:
+            errors.append(str(exc))
+        return "헌재 결정례를 찾지 못했습니다. " + (" / ".join(errors) if errors else "")
+
+    tools.extend(
+        [
+            ToolSpec(
+                name="search_law",
+                description="국가법령정보센터에서 현행 법령을 검색한다. 조문 근거가 필요한 질문이면 반드시 먼저 호출한다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "법령명 또는 키워드 (예: 주택임대차보호법)"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["query"],
+                },
+                handler=search_law,
+            ),
+            ToolSpec(
+                name="get_law_text",
+                description="법령 본문을 조회한다. search_law 결과의 법령일련번호(id)를 넣는다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"law_id": {"type": "string"}},
+                    "required": ["law_id"],
+                },
+                handler=get_law_text,
+            ),
+            ToolSpec(
+                name="search_precedent",
+                description="대법원·각급 법원 판례 목록을 검색한다. 사건번호를 알면 case_no 로 바로 찾는다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "사건명 또는 쟁점 키워드"},
+                        "court": {"type": "string", "description": "법원명 (예: 대법원)"},
+                        "case_no": {"type": "string", "description": "사건번호 (예: 2018다255648)"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+                handler=search_precedent,
+            ),
+            ToolSpec(
+                name="get_precedent",
+                description="판례 본문(판시사항·판결요지·이유)을 조회한다. search_precedent 의 판례일련번호를 넣는다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"prec_id": {"type": "string"}},
+                    "required": ["prec_id"],
+                },
+                handler=get_precedent,
+            ),
+            ToolSpec(
+                name="search_ordinance",
+                description="지방자치단체 조례·규칙(자치법규)을 검색한다. 지역이 걸린 질문에 쓴다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["query"],
+                },
+                handler=search_ordinance,
+            ),
+            ToolSpec(
+                name="search_admin_rule",
+                description="행정규칙(훈령·예규·고시)을 검색한다. 인허가·행정처분 기준을 확인할 때 쓴다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["query"],
+                },
+                handler=search_admin_rule,
+            ),
+            ToolSpec(
+                name="search_legal_forms",
+                description="법령 별표·서식을 검색한다. 신청서·별지 서식이 필요한 질문에 쓴다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["query"],
+                },
+                handler=search_forms,
+            ),
+            ToolSpec(
+                name="search_constitutional_decision",
+                description="헌법재판소 결정례를 검색한다. 위헌·헌법소원 쟁점에 쓴다.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["query"],
+                },
+                handler=search_constitutional,
+            ),
+        ]
+    )
+    return tools
+
+
+def build_action_tools(state: TurnState) -> list[ToolSpec]:
+    """Draft + escalation. Recorded now, executed after the reply is sent."""
+
+    async def request_document_draft(arguments: dict[str, Any]) -> str:
+        state.draft_request = DraftRequest(
+            kind=str(arguments.get("kind") or "general"),
+            title=str(arguments.get("title") or "법률문서 초안"),
+            instructions=str(arguments.get("instructions") or ""),
+        )
+        return (
+            "초안 작성 요청이 접수되었습니다. 상담자에게 '변호사 검토 후 이메일로 보내드린다'고 "
+            "안내하고, 이메일 주소를 아직 받지 않았다면 이메일 주소를 물어보세요."
+        )
+
+    async def escalate_to_lawyer(arguments: dict[str, Any]) -> str:
+        state.escalation = Escalation(
+            reason=str(arguments.get("reason") or ""),
+            summary=str(arguments.get("summary") or ""),
+        )
+        return (
+            "변호사에게 전달되었습니다. 상담자에게 담당 변호사가 직접 확인 후 답변드린다고 "
+            "안내하되, 지금 답할 수 있는 일반적인 설명은 함께 해주세요."
+        )
+
+    return [
+        ToolSpec(
+            name="request_document_draft",
+            description=(
+                "내용증명·합의서·답변서·고소장 등 법률문서 초안 작성을 요청한다. "
+                "초안은 담당 변호사 검토 후 상담자 이메일로 발송된다."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "문서 종류 (내용증명 / 합의서 / 답변서 / 고소장 / 내용정리 등)",
+                    },
+                    "title": {"type": "string", "description": "문서 제목"},
+                    "instructions": {
+                        "type": "string",
+                        "description": "초안에 반드시 들어가야 할 사실관계·청구내용·기한 등을 자세히.",
+                    },
+                },
+                "required": ["kind", "instructions"],
+            },
+            handler=request_document_draft,
+        ),
+        ToolSpec(
+            name="escalate_to_lawyer",
+            description=(
+                "담당 변호사에게 이 상담을 즉시 전달한다. 금액·기한이 걸린 판단, 형사 사건, "
+                "소송 전략, 상담자가 화가 나 있거나 급한 경우에 호출한다."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "왜 변호사가 필요한지 한 줄"},
+                    "summary": {"type": "string", "description": "변호사가 읽을 사실관계 요약"},
+                },
+                "required": ["reason"],
+            },
+            handler=escalate_to_lawyer,
+        ),
+    ]

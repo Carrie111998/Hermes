@@ -1,0 +1,12 @@
+# Runtime state — never commit conversation history or the RAG index.
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Client-confidential source material lives here; only the placeholder is tracked.
+corpus/*
+!corpus/.gitkeep
+!corpus/README.md
+
+.env

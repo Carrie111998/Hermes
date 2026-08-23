@@ -1,0 +1,218 @@
+"""The KakaoTalk 5-second rule, and everything the pipeline decides.
+
+The rule: a room must never sit silent while the model thinks. But a
+placeholder on *every* turn is noise, so a fast answer must skip it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from kakao_legal_bot.app.iris import IrisClient
+from kakao_legal_bot.app.pipeline import Pipeline
+from kakao_legal_bot.app.services import Services
+from kakao_legal_bot.app.tools import DraftRequest, Escalation
+
+from .conftest import FakeAgent, FakeSender, make_event
+
+
+def build(settings, db, agent) -> tuple[Services, FakeSender, Pipeline]:
+    sender = FakeSender()
+    services = Services(
+        settings=settings,
+        db=db,
+        iris=IrisClient(settings),
+        sender=sender,
+        agent=agent,
+        semaphore=asyncio.Semaphore(4),
+    )
+    return services, sender, Pipeline(services)
+
+
+@pytest.mark.asyncio
+async def test_fast_answer_sends_no_placeholder(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    _services, sender, pipeline = build(settings, db, FakeAgent("바로 답변", delay=0.0))
+
+    await pipeline.handle(make_event("전세금 질문이요"))
+
+    assert sender.texts == ["바로 답변"]
+
+
+@pytest.mark.asyncio
+async def test_slow_answer_gets_a_placeholder_first(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    # ACK_DEADLINE_MS is 100ms in the test settings.
+    _services, sender, pipeline = build(settings, db, FakeAgent("느린 답변", delay=0.4))
+
+    await pipeline.handle(make_event("복잡한 질문이요"))
+
+    assert len(sender.texts) == 2
+    assert sender.texts[0] == settings.ack_text
+    assert sender.texts[1] == "느린 답변"
+
+
+@pytest.mark.asyncio
+async def test_first_message_in_a_room_gets_the_intro(settings, db):
+    _services, sender, pipeline = build(settings, db, FakeAgent("답변"))
+
+    await pipeline.handle(make_event("안녕하세요", direct=True))
+
+    assert "모아입니다" in sender.texts[0]
+    assert sender.texts[-1] == "답변"
+    assert db.get_room("room-1")["intro_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_intro_is_sent_only_once(settings, db):
+    _services, sender, pipeline = build(settings, db, FakeAgent("답변"))
+
+    await pipeline.handle(make_event("첫 질문", direct=True, log_id="a"))
+    await pipeline.handle(make_event("둘째 질문", direct=True, log_id="b"))
+
+    assert sum("모아입니다" in text for text in sender.texts) == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_timeout_tells_the_client_and_the_lawyer(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    services, sender, pipeline = build(settings, db, FakeAgent("영원히", delay=30))
+    object.__setattr__(services.settings, "answer_timeout_s", 0.3)
+
+    await pipeline.handle(make_event("오래 걸리는 질문"))
+
+    assert any("시간이 예상보다 오래" in text for text in sender.texts)
+    assert sender.lawyer_notes
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_falls_back_and_notifies(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    _services, sender, pipeline = build(settings, db, FakeAgent(""))
+
+    await pipeline.handle(make_event("질문"))
+
+    assert any("답변을 만들지 못했습니다" in text for text in sender.texts)
+    assert sender.lawyer_notes
+
+
+@pytest.mark.asyncio
+async def test_ignored_message_costs_nothing(settings, db):
+    db.upsert_room("room-1", "상담방", "group")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    agent = FakeAgent("답변")
+    _services, sender, pipeline = build(settings, db, agent)
+
+    await pipeline.handle(make_event("둘이서 하는 얘기"))
+
+    assert agent.calls == []
+    assert sender.texts == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_message_is_stored_but_not_repeated_in_the_prompt(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    db.add_message("room-1", "user", "이전 질문")
+    db.add_message("room-1", "bot", "이전 답변")
+
+    captured: list[list] = []
+
+    class RecordingAgent(FakeAgent):
+        async def answer(self, question, history):
+            captured.append(list(history))
+            return await super().answer(question, history)
+
+    _services, _sender, pipeline = build(settings, db, RecordingAgent("답변"))
+    await pipeline.handle(make_event("새 질문"))
+
+    texts = [message.text for message in captured[0]]
+    assert texts == ["이전 질문", "이전 답변"]
+    assert "새 질문" in [m.text for m in db.recent_messages("room-1")]
+
+
+@pytest.mark.asyncio
+async def test_answers_are_logged_for_audit(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    agent = FakeAgent("답변", citations=["민법 제618조"], tools=["search_law"])
+    _services, _sender, pipeline = build(settings, db, agent)
+
+    await pipeline.handle(make_event("질문"))
+
+    rows = db._query("SELECT * FROM answers")
+    assert len(rows) == 1
+    assert "민법 제618조" in rows[0]["citations"]
+    assert "search_law" in rows[0]["tools_used"]
+    assert rows[0]["sender_key"] and rows[0]["sender_key"] != "uid-1"
+
+
+@pytest.mark.asyncio
+async def test_daily_cap_stops_answering(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    object.__setattr__(settings, "room_daily_cap", 1)
+    agent = FakeAgent("답변")
+    _services, sender, pipeline = build(settings, db, agent)
+
+    await pipeline.handle(make_event("첫 질문", log_id="a"))
+    await pipeline.handle(make_event("둘째 질문", log_id="b"))
+
+    assert agent.calls == ["첫 질문"]
+    assert "한도를 채웠습니다" in sender.texts[-1]
+
+
+@pytest.mark.asyncio
+async def test_cooldown_drops_a_burst(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    object.__setattr__(settings, "room_cooldown_s", 60.0)
+    agent = FakeAgent("답변")
+    _services, _sender, pipeline = build(settings, db, agent)
+
+    await pipeline.handle(make_event("연타1", log_id="a"))
+    await pipeline.handle(make_event("연타2", log_id="b"))
+
+    assert agent.calls == ["연타1"]
+
+
+@pytest.mark.asyncio
+async def test_escalation_reaches_the_lawyer(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    agent = FakeAgent("답변", escalation=Escalation(reason="형사사건", summary="폭행 사건 상담"))
+    _services, sender, pipeline = build(settings, db, agent)
+
+    await pipeline.handle(make_event("고소하고 싶어요"))
+    await asyncio.sleep(0.05)  # follow-ups run detached
+
+    assert any("변호사 확인 요청" in note for note in sender.lawyer_notes)
+
+
+@pytest.mark.asyncio
+async def test_draft_request_creates_a_pending_draft(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    agent = FakeAgent(
+        "초안 준비하겠습니다",
+        draft_request=DraftRequest(kind="내용증명", title="보증금 반환 청구", instructions="3천만원"),
+    )
+    _services, sender, pipeline = build(settings, db, agent)
+
+    await pipeline.handle(make_event("내용증명 써주세요"))
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if db.list_drafts("pending_review"):
+            break
+
+    drafts = db.list_drafts("pending_review")
+    assert len(drafts) == 1
+    assert drafts[0].kind == "내용증명"
+    assert drafts[0].body == "초안 본문"
+    assert any("새 초안" in note for note in sender.lawyer_notes)
