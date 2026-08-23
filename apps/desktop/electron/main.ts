@@ -211,6 +211,7 @@ import {
   electronProcessStartMarker,
   parentWatchdogEnv
 } from './parent-process-identity'
+import { resolvePickerStartPath } from './path-picker'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
 import {
   buildRegistryProfileRoutes,
@@ -14045,18 +14046,20 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
 
   let resolvedDefaultPath
 
-  if (options?.defaultPath) {
-    try {
+  try {
+    const requestedDefaultPath = resolvePickerStartPath(options, () => app.getPath('downloads'))
+
+    if (requestedDefaultPath) {
       // On a Windows host with a WSL backend the cwd may be a POSIX/WSL path;
       // bridge it to a UNC/drive form the native dialog can actually open.
       const bridged = IS_WINDOWS
-        ? resolvePickerDefaultPath(String(options.defaultPath), undefined, options?.profile)
-        : String(options.defaultPath)
+        ? resolvePickerDefaultPath(requestedDefaultPath, undefined, options?.profile)
+        : requestedDefaultPath
 
       resolvedDefaultPath = bridged ? path.resolve(bridged) : undefined
-    } catch {
-      resolvedDefaultPath = undefined
     }
+  } catch {
+    resolvedDefaultPath = undefined
   }
 
   const result = await dialog.showOpenDialog(mainWindow, {

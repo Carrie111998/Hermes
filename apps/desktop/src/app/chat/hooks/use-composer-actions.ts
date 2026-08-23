@@ -399,7 +399,8 @@ export function useComposerActions({
       const paths = await selectDesktopPaths({
         title: kind === 'file' ? 'Add files as context' : 'Add folders as context',
         defaultPath: currentCwd || undefined,
-        directories: kind === 'folder'
+        directories: kind === 'folder',
+        fallbackToDownloads: true
       })
 
       if (!paths?.length) {
@@ -540,6 +541,7 @@ export function useComposerActions({
     const paths = await selectDesktopPaths({
       title: copy.attachImages,
       defaultPath: currentCwd || undefined,
+      fallbackToDownloads: true,
       filters: [
         {
           name: t.composer.images,
