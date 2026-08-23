@@ -2647,10 +2647,12 @@ _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
-    The callback signature is ``cb(approval_data: dict) -> None`` where
+    The callback signature is ``cb(approval_data: dict) -> object`` where
     *approval_data* contains ``command``, ``description``, and
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
-    thread, must schedule the actual send on the event loop).
+    thread, must schedule the actual send on the event loop). Returning exactly
+    ``False`` reports that the transport rejected the write; legacy callbacks
+    that return ``None`` remain fire-and-forget.
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
@@ -4308,7 +4310,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
-        notify_cb(dict(entry.data))
+        delivered = notify_cb(dict(entry.data))
+        if delivered is False:
+            raise RuntimeError("approval transport rejected the event write")
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()

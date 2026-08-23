@@ -65,3 +65,13 @@ class TestTuiApprovalEmitRedaction:
 
         assert emitted["payload"]["choices"] == expected
 
+    def test_emit_approval_request_propagates_transport_rejection(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
+        monkeypatch.setattr(tui_server, "_emit", lambda *_args, **_kwargs: False)
+
+        delivered = tui_server._emit_approval_request(
+            "sess-1", {"command": "echo ok", "description": "x"}
+        )
+
+        assert delivered is False
