@@ -271,6 +271,7 @@ import {
   type RegistrySessionSource,
   spliceRegistrySessionRows
 } from './profile-session-routing'
+import { deadPidError, isPidAlive } from './process-liveness'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
@@ -3168,8 +3169,8 @@ function writeBackendOwnership(contents) {
 }
 
 // execText and processStartMarker moved to backend-claim.ts (#93608) so the
-// claim/probe policy is testable — including on Windows CI with real
-// PowerShell — without booting Electron. main.ts calls through the module.
+// claim/probe policy is testable - including on Windows CI with real
+// PowerShell - without booting Electron. main.ts calls through the module. (fix(desktop): reap dead backend-ownership entries without a cold PowerShell probe)
 
 async function backendCommandForPid(pid) {
   try {

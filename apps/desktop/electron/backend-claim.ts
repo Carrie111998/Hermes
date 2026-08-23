@@ -22,6 +22,7 @@ import fs from 'node:fs'
 
 import { electronProcessStartMarker } from './parent-process-identity'
 import { hiddenWindowsChildOptions } from './windows-child-options'
+import { deadPidError, isPidAlive } from './process-liveness'
 
 export function execText(command: string, args: string[], { timeout = 3000 } = {}): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -42,6 +43,18 @@ export function execText(command: string, args: string[], { timeout = 3000 } = {
  * `claimDecision` / `probeStartMarker`).
  */
 export async function processStartMarker(pid: number): Promise<string> {
+  // Native, sub-penny dead-PID gate. On Windows a dead backend PID otherwise
+  // costs multiple cold PowerShell spawns that exit non-zero and surface as a
+  // generic Error (code = exit code, not ESRCH), so the probe catch blocks keep
+  // the orphan alive and re-probe it on every launch. Throwing ESRCH here lets
+  // those catch blocks map the entry to `false`, which reapOrphans reaps.
+  // This is ONLY a "definitely dead" negative check: an alive PID (or one that
+  // merely isn't inspectable, e.g. EPERM) still falls through to the existing
+  // platform probe so start-marker/PID-reuse verification is never skipped.
+  if (!isPidAlive(pid)) {
+    throw deadPidError()
+  }
+
   if (process.platform === 'linux') {
     const stat = await fs.promises.readFile(`/proc/${pid}/stat`, 'utf8')
 
