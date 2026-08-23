@@ -13,9 +13,11 @@ def _isolated_cache(tmp_path, monkeypatch):
     yield
 
 
-def test_entry_without_ttl_never_expires():
-    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}])
-    assert sc.get_cached_entry("srv", "fp") is not None
+def test_entry_without_ttl_never_expires_when_legacy_is_explicit():
+    sc.write_cache_entry(
+        "srv", "fp", protocol_era="legacy", tools=[{"name": "t"}]
+    )
+    assert sc.get_cached_entry("srv", "fp", protocol_era="legacy") is not None
 
 
 def test_entry_within_ttl_served():
@@ -41,6 +43,21 @@ def test_ttl_rewrite_advances_written_at():
     # rewrite so written_at advances on every live reconfirmation.
     sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000)
     second = sc.get_cached_entry("srv", "fp")["written_at"]
+    assert second > first
+
+
+def test_hintless_legacy_rewrite_advances_validation_receipt(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(sc.time, "time", lambda: now)
+    sc.write_cache_entry(
+        "srv", "fp", protocol_era="legacy", tools=[{"name": "t"}]
+    )
+    first = sc.get_cached_entry("srv", "fp", protocol_era="legacy")["validated_at"]
+    now += 1.0
+    sc.write_cache_entry(
+        "srv", "fp", protocol_era="legacy", tools=[{"name": "t"}]
+    )
+    second = sc.get_cached_entry("srv", "fp", protocol_era="legacy")["validated_at"]
     assert second > first
 
 

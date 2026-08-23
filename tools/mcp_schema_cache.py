@@ -22,6 +22,7 @@ _CACHE_FILENAME = "mcp_schema_cache.json"
 _cache_lock = threading.Lock()
 CACHE_SCHEMA_EPOCH = 2
 MAX_TTL_MS = 24 * 60 * 60 * 1000
+AUTO_LEGACY_RECEIPT_MAX_AGE_MS = MAX_TTL_MS
 
 
 def _cache_path() -> Path:
@@ -152,6 +153,56 @@ def _entry_key(server_name: str, fingerprint: str, protocol_era: str) -> str:
     return f"{server_name}::{fingerprint}::{protocol_era}"
 
 
+def _numeric_timestamp(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if number >= 0 else None
+
+
+def _validation_timestamp(entry: dict) -> Optional[float]:
+    validated_at = _numeric_timestamp(entry.get("validated_at"))
+    if validated_at is not None:
+        return validated_at
+    return _numeric_timestamp(entry.get("written_at"))
+
+
+def _entry_is_fresh(
+    entry: dict,
+    era: str,
+    now: float,
+    *,
+    auto: bool,
+) -> bool:
+    ttl_ms = entry.get("ttl_ms")
+    if isinstance(ttl_ms, bool) or (
+        ttl_ms is not None and not isinstance(ttl_ms, (int, float))
+    ):
+        return False
+    if era == "modern":
+        if ttl_ms is None:
+            return False
+        validated_at = _validation_timestamp(entry)
+        if validated_at is None:
+            return False
+        effective_ttl = min(max(float(ttl_ms), 0.0), float(MAX_TTL_MS))
+        return (now - validated_at) * 1000.0 < effective_ttl
+    if ttl_ms is not None:
+        written_at = _numeric_timestamp(entry.get("written_at"))
+        if written_at is None:
+            return False
+        effective_ttl = min(max(float(ttl_ms), 0.0), float(MAX_TTL_MS))
+        return (now - written_at) * 1000.0 < effective_ttl
+    if not auto:
+        return True
+    validated_at = _validation_timestamp(entry)
+    if validated_at is None:
+        return False
+    return (
+        now - validated_at
+    ) * 1000.0 < float(AUTO_LEGACY_RECEIPT_MAX_AGE_MS)
+
+
 def _load_all() -> Dict[str, Any]:
     path = _cache_path()
     if not path.exists():
@@ -188,11 +239,15 @@ def get_cached_entry(
     the server instead of serving a stale manifest forever. Entries without
     a recorded TTL (pre-2026 servers) keep the old never-expires behavior.
     ``cacheScope`` is irrelevant here: this cache is per-user local disk,
-    which satisfies even ``private``.
+    which satisfies even ``private``. Auto lookup requires a recent validation
+    receipt for hintless legacy entries; explicit legacy lookup retains their
+    compatibility semantics.
     """
     eras = (protocol_era,) if protocol_era is not None else ("modern", "legacy")
+    now = time.time()
     with _cache_lock:
         data = _load_all()
+    candidates = []
     for era in eras:
         entry = data.get(_entry_key(server_name, fingerprint, era))
         if not isinstance(entry, dict):
@@ -208,22 +263,23 @@ def get_cached_entry(
         cache_scope = entry.get("cache_scope")
         if cache_scope is not None and cache_scope not in {"public", "private"}:
             continue
-        ttl_ms = entry.get("ttl_ms")
-        written_at = entry.get("written_at")
-        if era == "modern" and not (
-            isinstance(ttl_ms, (int, float))
-            and not isinstance(ttl_ms, bool)
-            and isinstance(written_at, (int, float))
+        if not _entry_is_fresh(
+            entry,
+            era,
+            now,
+            auto=protocol_era is None,
         ):
             continue
-        if isinstance(ttl_ms, (int, float)) and not isinstance(ttl_ms, bool):
-            effective_ttl = min(max(float(ttl_ms), 0.0), float(MAX_TTL_MS))
-            if not isinstance(written_at, (int, float)):
+        if protocol_era is None:
+            validated_at = _validation_timestamp(entry)
+            if validated_at is None:
                 continue
-            if (time.time() - written_at) * 1000.0 >= effective_ttl:
-                continue
-        return entry
-    return None
+            candidates.append((validated_at, era == "modern", entry))
+        else:
+            return entry
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
 
 
 def has_cached_entry(
@@ -263,6 +319,7 @@ def write_cache_entry(
     """
     if protocol_era not in {"modern", "legacy"}:
         raise ValueError(f"Unsupported MCP cache protocol era: {protocol_era!r}")
+    validated_at = time.time()
     entry = {
         "epoch": CACHE_SCHEMA_EPOCH,
         "fingerprint": fingerprint,
@@ -270,6 +327,7 @@ def write_cache_entry(
         "protocol_era": protocol_era,
         "tools": tools,
         "utility_tools": utility_tools or [],
+        "validated_at": validated_at,
     }
     valid_ttl = (
         isinstance(ttl_ms, (int, float))
@@ -280,7 +338,7 @@ def write_cache_entry(
         valid_ttl = True
     if valid_ttl:
         entry["ttl_ms"] = min(max(float(ttl_ms), 0.0), float(MAX_TTL_MS))
-        entry["written_at"] = time.time()
+        entry["written_at"] = validated_at
     if protocol_era == "modern" and cache_scope not in {"public", "private"}:
         cache_scope = "private"
     if cache_scope in {"public", "private"}:
@@ -288,14 +346,6 @@ def write_cache_entry(
     key = _entry_key(server_name, fingerprint, protocol_era)
     with _cache_lock:
         data = _load_all()
-        # Write-through fires on every registration (reconnects,
-        # list_changed refreshes); skip the load-all+rewrite churn when the
-        # entry is byte-identical to what is already on disk. TTL'd entries
-        # always rewrite: written_at must advance or the entry would expire
-        # at its ORIGINAL write time no matter how many live reconnects
-        # confirmed it since.
-        if "written_at" not in entry and data.get(key) == entry:
-            return
         data[key] = entry
         _save_all(data)
 

@@ -90,8 +90,8 @@ class TestCacheFileLocation:
         assert (path.stat().st_mode & 0o777) == 0o600
 
 
-class TestWriteSkip:
-    def test_identical_payload_skips_rewrite(self, monkeypatch, tmp_path):
+class TestWriteReceipt:
+    def test_identical_payload_rewrites_validation_receipt(self, monkeypatch, tmp_path):
         monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
         saves = []
         real_save = msc._save_all
@@ -104,12 +104,11 @@ class TestWriteSkip:
         tools = [{"name": "t1", "description": "d", "inputSchema": {}}]
         msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
         assert len(saves) == 1
-        # Identical payload (reconnect / list_changed refresh) → no rewrite.
         msc.write_cache_entry("srv", "fp1", tools=list(tools), utility_tools=[])
-        assert len(saves) == 1
+        assert len(saves) == 2
         # Changed payload → rewrite.
         msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
-        assert len(saves) == 2
+        assert len(saves) == 3
 
 
 class TestSecurityContextIdentity:
@@ -264,6 +263,8 @@ class TestProtocolEraFreshness:
         )
         modern = msc.get_cached_entry("srv", "fp", protocol_era="modern")
         legacy = msc.get_cached_entry("srv", "fp", protocol_era="legacy")
+        assert modern is not None
+        assert legacy is not None
         assert modern["tools"][0]["name"] == "modern"
         assert legacy["tools"][0]["name"] == "legacy"
         assert len(msc._load_all()) == 2
@@ -286,3 +287,58 @@ class TestProtocolEraFreshness:
             )
             is None
         )
+
+    def test_auto_hintless_legacy_receipt_expires(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        now = 1000.0
+        monkeypatch.setattr(msc.time, "time", lambda: now)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="legacy",
+            tools=[{"name": "legacy"}],
+        )
+        assert msc.get_cached_entry("srv", "fp") is not None
+
+        now += msc.MAX_TTL_MS / 1000.0 + 0.001
+        assert msc.get_cached_entry("srv", "fp") is None
+
+    def test_auto_selects_the_newest_valid_era_receipt(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        now = 2000.0
+        monkeypatch.setattr(msc.time, "time", lambda: now)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="modern",
+            tools=[{"name": "modern"}],
+            ttl_ms=60_000,
+        )
+        now += 1.0
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="legacy",
+            tools=[{"name": "legacy"}],
+        )
+
+        entry = msc.get_cached_entry("srv", "fp")
+        assert entry is not None
+        assert entry["protocol_era"] == "legacy"
+
+    def test_explicit_legacy_hintlessness_survives_the_auto_bound(
+        self, monkeypatch, tmp_path
+    ):
+        self._isolate(monkeypatch, tmp_path)
+        now = 3000.0
+        monkeypatch.setattr(msc.time, "time", lambda: now)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="legacy",
+            tools=[{"name": "legacy"}],
+        )
+
+        now += msc.MAX_TTL_MS / 1000.0 + 10.0
+        entry = msc.get_cached_entry("srv", "fp", protocol_era="legacy")
+        assert entry is not None
