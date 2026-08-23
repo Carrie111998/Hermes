@@ -521,17 +521,18 @@ class DirectAlias(NamedTuple):
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
 _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
-    # Ox Alpha is the OpenRouter stealth route. Keep the endpoint identity
-    # fixed while accepting the operator-facing compatibility spelling.
+    # Alpha is the native keyless OpenCode Zen route. Keep the separate
+    # OpenRouter stealth/ox-alpha model available only through its explicit
+    # provider/model identity; these operator aliases must never redirect it.
     "alpha-0": DirectAlias(
-        model="stealth/ox-alpha",
-        provider="openrouter",
-        base_url="https://openrouter.ai/api/v1",
+        model="x-preview-f-free",
+        provider="opencode-zen",
+        base_url="https://opencode.ai/zen/v1",
     ),
     "ox-alpha": DirectAlias(
-        model="stealth/ox-alpha",
-        provider="openrouter",
-        base_url="https://openrouter.ai/api/v1",
+        model="x-preview-f-free",
+        provider="opencode-zen",
+        base_url="https://opencode.ai/zen/v1",
     ),
 }
 
