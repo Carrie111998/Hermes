@@ -503,6 +503,62 @@ def _emit(agent: Any, text: str) -> None:
         pass
 
 
+def _lift_limits_active(agent: Any) -> bool:
+    """Whether autopilot limit-lifting is opted in (default OFF).
+
+    When True, long autonomous runs (and their delegated subagents) don't stall
+    on the iteration/tool-call cap. The goal quality-gate + no-progress detector
+    remain the real terminators. Opt-in via autopilot.lift_limits /
+    AUTOPILOT_LIFT_LIMITS. Only meaningful while autopilot is active.
+    """
+    val = getattr(agent, "_autopilot_lift_limits", None)
+    if val is not None:
+        return bool(val)
+    return os.environ.get("AUTOPILOT_LIFT_LIMITS", "").strip().lower() in _TRUTHY
+
+
+# Effectively-unbounded iteration cap used when lift_limits is on. Not literally
+# infinite so arithmetic/logging stay sane; far beyond any real run so the cap is
+# never the terminator (the goal gate + no-progress detector are).
+_LIFTED_ITER_CAP = 1_000_000
+
+
+def parent_lifts_subagent_cap(parent_agent: Any) -> Optional[int]:
+    """Resolve a lifted per-subagent iteration cap when the PARENT is in an
+    autopilot run with limit-lifting opted in, else None.
+
+    William's bug: subagents spawned via ``delegate_task`` during autopilot got
+    STUCK on ``delegation.max_iterations`` (the parent's own cap is already
+    lifted by ``keep_budget_ahead``, but the subagent's is not). When the parent
+    agent is in autopilot AND ``autopilot.lift_limits`` is on, this returns the
+    lifted cap ``delegate_task`` should use instead of the 50/250 config value:
+
+      * ``autopilot.subagent_max_iterations`` when set to a positive number, or
+      * ``_LIFTED_ITER_CAP`` (a very high default) when it is 0 (= "inherit
+        default, but lifted").
+
+    Returns None when autopilot is inactive on the parent OR lift_limits is off,
+    so ``delegate_task`` uses the ordinary config cap (today's exact behavior).
+    Never raises — a resolution failure degrades to None (no lift).
+    """
+    try:
+        if parent_agent is None:
+            return None
+        if not is_autopilot_active(parent_agent):
+            return None
+        if not _lift_limits_active(parent_agent):
+            return None
+        explicit = _cfg_int(
+            parent_agent, "_autopilot_subagent_max_iterations",
+            "AUTOPILOT_SUBAGENT_MAX_ITERATIONS", 0,
+        )
+        if explicit > 0:
+            return explicit
+        return _LIFTED_ITER_CAP
+    except Exception:  # noqa: BLE001 — never break delegation on a lift-resolve error
+        return None
+
+
 def keep_budget_ahead(agent: Any, headroom: int = 50) -> None:
     """Keep the iteration budget ahead of usage while autopilot is active.
 
@@ -518,6 +574,11 @@ def keep_budget_ahead(agent: Any, headroom: int = 50) -> None:
 
     Respects an explicit user continuation cap: once reached we stop extending so
     the run can wind down naturally.
+
+    When ``autopilot.lift_limits`` is opted in, the main cap is raised to an
+    effectively-unbounded value in one shot (rather than merely topped up by
+    ``headroom``) so a long run never re-touches the ceiling. The no-progress +
+    user-continuation-cap safeties above still apply unchanged.
     """
     if not is_autopilot_active(agent):
         return
@@ -527,7 +588,11 @@ def keep_budget_ahead(agent: Any, headroom: int = 50) -> None:
     budget = getattr(agent, "iteration_budget", None)
     used = getattr(budget, "used", 0) if budget is not None else 0
     current = max(int(getattr(agent, "_api_call_count", 0) or 0), int(used))
-    need = current + headroom
+    if _lift_limits_active(agent):
+        # Lift the main cap effectively-unbounded so long runs never stall on it.
+        need = max(current + headroom, _LIFTED_ITER_CAP)
+    else:
+        need = current + headroom
     try:
         if budget is not None and getattr(budget, "max_total", 0) < need:
             budget.max_total = need

@@ -3694,6 +3694,29 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
+    # ── Autopilot subagent cap-lift (opt-in via autopilot.lift_limits) ──────
+    # William's stuck-subagent bug: during a /autopilot run, delegated
+    # subagents get STUCK on delegation.max_iterations while the PARENT's own
+    # cap is already lifted (keep_budget_ahead). When the parent agent is in
+    # autopilot AND autopilot.lift_limits is on, raise the per-subagent cap to
+    # the lifted value (autopilot.subagent_max_iterations, or a very high
+    # default when 0) so delegated subagents don't stall. Fully guarded +
+    # OPT-IN: returns None when autopilot is inactive or lift_limits is off, so
+    # the config cap above stays authoritative (today's exact behavior).
+    try:
+        from agent.autopilot.driver import parent_lifts_subagent_cap
+
+        _lifted_iter = parent_lifts_subagent_cap(parent_agent)
+        if _lifted_iter and _lifted_iter > effective_max_iter:
+            logger.debug(
+                "delegate_task: autopilot lift_limits raising subagent "
+                "max_iterations %s -> %s",
+                effective_max_iter, _lifted_iter,
+            )
+            effective_max_iter = _lifted_iter
+    except Exception as _lift_exc:  # noqa: BLE001 — never break delegation on lift
+        logger.debug("delegate_task: subagent cap-lift check failed: %s", _lift_exc)
+
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system

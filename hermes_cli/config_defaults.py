@@ -2041,6 +2041,39 @@ DEFAULT_CONFIG = {
         # trail, companion to the turn-by-turn ADR). Written to the workspace + a
         # copy next to the project. Default ON; set false to disable.
         "ledger": True,
+        # Limit-lifting (opt-in). RECOMMENDED ON when using /autopilot: long
+        # autonomous runs AND their delegated subagents otherwise STALL on the
+        # iteration/tool-call cap (delegation.max_iterations) mid-goal. The goal
+        # quality-gate and the no-progress detector remain the REAL terminators,
+        # so lifting the numeric cap does not remove any safety — it just stops a
+        # run from dying on an arbitrary count. Default False = today's exact
+        # behavior (the config caps are authoritative).
+        "lift_limits": False,
+        # Per-subagent iteration cap used when lift_limits is True. 0 = inherit
+        # delegation.max_iterations but LIFTED to a very high value (~1,000,000)
+        # so delegated subagents spawned during autopilot don't get stuck on the
+        # default cap (the exact stuck-subagent case). Set a positive number to
+        # pin a specific lifted cap instead. Ignored entirely when lift_limits is
+        # False.
+        "subagent_max_iterations": 0,
+        # Session-recycle (opt-in). When a long autopilot run crosses a context-
+        # utilization threshold, spin a FRESH trimmed conversation seeded from the
+        # durable goal/contract + run ledger + ADR decisions + a verbatim
+        # transcript tail (or a CMX briefing when context.engine==cmx) INSTEAD of
+        # growing one conversation forever (which otherwise rides the compression
+        # threshold permanently). The seed is placed on the MESSAGE LIST as a
+        # role:user "resume" turn — never a system-prompt mutation — so the prompt
+        # cache prefix is preserved. The durable goal/ledger/ADR state is NOT
+        # dropped; only the in-memory conversational history is trimmed+reseeded.
+        # Fail-open: any error behaves exactly as today. Default OFF.
+        "session_recycle": {
+            "enabled": False,       # opt-in master switch for session-recycle
+            "threshold_pct": 75,    # recycle once context utilization crosses this % (0-100)
+            "seed": "auto",         # "auto" = CMX briefing when context.engine==cmx else cheap
+                                    # (ledger+adr+tail); "cheap" = force ledger+adr+tail;
+                                    # "cmx" = force CMX briefing (falls back to cheap if unavailable)
+            "tail_turns": 6,        # recent user/assistant turns carried verbatim into the fresh session
+        },
     },
 
 

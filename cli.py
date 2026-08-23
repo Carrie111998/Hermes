@@ -5408,6 +5408,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             os.environ.setdefault("AUTOPILOT_GOAL_DOCUMENT", "0")
         if _ap_cfg.get("ledger") is False:
             os.environ.setdefault("AUTOPILOT_LEDGER", "0")
+        # Limit-lifting (opt-in): lifts the main + subagent iteration caps so long
+        # autopilot runs and delegated subagents don't stall on the count.
+        if _ap_cfg.get("lift_limits"):
+            os.environ.setdefault("AUTOPILOT_LIFT_LIMITS", "1")
+        if _ap_cfg.get("subagent_max_iterations") not in (None, ""):
+            os.environ.setdefault(
+                "AUTOPILOT_SUBAGENT_MAX_ITERATIONS",
+                str(_ap_cfg.get("subagent_max_iterations")),
+            )
+        # Session-recycle (opt-in): recycle the session at a context-utilization
+        # threshold instead of growing one conversation forever.
+        _ap_rec = _ap_cfg.get("session_recycle") if isinstance(_ap_cfg.get("session_recycle"), dict) else {}
+        if _ap_rec.get("enabled"):
+            os.environ.setdefault("AUTOPILOT_SESSION_RECYCLE", "1")
+        if _ap_rec.get("threshold_pct") not in (None, ""):
+            os.environ.setdefault(
+                "AUTOPILOT_SESSION_RECYCLE_THRESHOLD_PCT",
+                str(_ap_rec.get("threshold_pct")),
+            )
+        if _ap_rec.get("seed"):
+            os.environ.setdefault("AUTOPILOT_SESSION_RECYCLE_SEED", str(_ap_rec.get("seed")))
+        if _ap_rec.get("tail_turns") not in (None, ""):
+            os.environ.setdefault(
+                "AUTOPILOT_SESSION_RECYCLE_TAIL_TURNS",
+                str(_ap_rec.get("tail_turns")),
+            )
         self._tool_callbacks_installed = False
         self._tirith_security_checked = False
         self._app = None  # prompt_toolkit Application (set in run())
