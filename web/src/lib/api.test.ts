@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api, fetchJSON } from "./api";
+import { api, fetchJSON, setManagementProfile } from "./api";
 
 const reloadMocks = vi.hoisted(() => ({
   attemptDashboardTokenReloadOnce: vi.fn(() => false),
@@ -114,6 +114,42 @@ describe("api.getModelOptions", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/model/options?profile=default&refresh=1&include_unconfigured=1",
       expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});
+
+describe("api memory provider config", () => {
+  afterEach(() => {
+    setManagementProfile("");
+  });
+
+  it("scopes reads to the dashboard's selected profile", async () => {
+    vi.stubGlobal("window", {});
+    setManagementProfile("caishenye");
+
+    const fetchMock = jsonFetchMock({ name: "hindsight", fields: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getMemoryProviderConfig("hindsight");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/memory/providers/hindsight/config?profile=caishenye",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("scopes saves to the dashboard's selected profile", async () => {
+    vi.stubGlobal("window", {});
+    setManagementProfile("caishenye");
+
+    const fetchMock = jsonFetchMock({ ok: true, active: "hindsight" });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.updateMemoryProviderConfig("hindsight", { bank_id: "god-of-fortune" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/memory/providers/hindsight/config?profile=caishenye",
+      expect.objectContaining({ credentials: "include", method: "PUT" }),
     );
   });
 });
