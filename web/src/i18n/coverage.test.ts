@@ -119,7 +119,7 @@ const NO_OPTIONAL_PLACEHOLDERS = new Set<string>();
 // call sites replace it with a literal "s" or an empty string, so translated
 // strings are correct to omit it. Keep the exemption tied to the exact keys so
 // a future data placeholder also named `{s}` cannot disappear unnoticed.
-const OPTIONAL_FORMATTING_PLACEHOLDERS: Partial<Record<string, ReadonlySet<string>>> = {
+const OPTIONAL_FORMATTING_PLACEHOLDERS: Readonly<Record<string, ReadonlySet<string>>> = {
   "config.fields": new Set(["s"]),
   "env.keysCount": new Set(["s"]),
   "env.customConfigured": new Set(["s"]),
