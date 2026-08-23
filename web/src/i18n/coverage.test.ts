@@ -43,7 +43,8 @@ const LOCALES: Record<Locale, Translations> = {
 };
 
 /**
- * Ceiling on the English strings each locale may leave untranslated.
+ * Exact baseline for the English strings each locale intentionally leaves
+ * untranslated today.
  *
  * Untranslated strings are invisible here by construction. Most of
  * `Translations` is optional (`?:`) so a locale can omit a key and still
@@ -51,14 +52,12 @@ const LOCALES: Record<Locale, Translations> = {
  * before anyone can look — so at runtime an untranslated key is
  * indistinguishable from a translated one. Nothing surfaces the gap.
  *
- * The numbers only ever go down. Translating more of a locale is free; lowering
- * its ceiling afterwards keeps the ratchet tight. *
- * A ceiling is deliberately a number and not a hard 100% gate. If a locale wants
- * to defer a feature's strings, raise its ceiling in the same commit and say why
- * — an honest gap is worth more than English text pasted in to go green, which
- * looks translated to every tool and to the user until someone reports it.
+ * This is an exact count rather than a loose ceiling. Translating more strings
+ * therefore requires lowering the baseline in the same change instead of
+ * silently creating regression headroom. If a locale deliberately defers new
+ * strings, update the baseline in that commit and explain why.
  */
-const MAX_UNTRANSLATED: Record<Locale, number> = {
+const EXPECTED_UNTRANSLATED: Record<Locale, number> = {
   en: 0,
   ar: 0,
   af: 79,
@@ -110,14 +109,19 @@ function leafEntries(value: unknown, prefix = "", out = new Map<string, unknown>
   return out;
 }
 
-/**
- * Data placeholders in a string. `{s}` is excluded: call sites replace it with a
- * literal English "s" for pluralization, so it is a formatting marker rather
- * than a value, and a locale is right to omit it.
- */
 function placeholders(value: string): string[] {
-  return [...new Set([...value.matchAll(/\{(\w+)\}/g)].map((match) => match[1]))].filter((token) => token !== "s");
+  return [...new Set([...value.matchAll(/\{(\w+)\}/g)].map((match) => match[1]))];
 }
+
+// These three English strings use `{s}` only as an English plural suffix. Their
+// call sites replace it with a literal "s" or an empty string, so translated
+// strings are correct to omit it. Keep the exemption tied to the exact keys so
+// a future data placeholder also named `{s}` cannot disappear unnoticed.
+const OPTIONAL_FORMATTING_PLACEHOLDERS: Partial<Record<string, ReadonlySet<string>>> = {
+  "config.fields": new Set(["s"]),
+  "env.keysCount": new Set(["s"]),
+  "env.customConfigured": new Set(["s"]),
+};
 
 const ENGLISH_KEYS = leafKeys(en);
 const ENGLISH_ENTRIES = leafEntries(en);
@@ -128,7 +132,7 @@ describe("web locale coverage", () => {
   });
 
   for (const locale of Object.keys(LOCALES) as Locale[]) {
-    it(`${locale} leaves at most ${MAX_UNTRANSLATED[locale]} strings untranslated`, () => {
+    it(`${locale} matches its untranslated-string baseline of ${EXPECTED_UNTRANSLATED[locale]}`, () => {
       const translations = LOCALES[locale];
       // The invariant this file rests on: measure what the locale **authored**,
       // never what it renders. `defineLocale` has already merged `ar` over `en`,
@@ -140,15 +144,17 @@ describe("web locale coverage", () => {
 
       expect(
         untranslated.length,
-        `${locale} is missing ${untranslated.length} of ${ENGLISH_KEYS.size} English strings, which will render in English. ` +
-          `Translate them in ${locale}.ts. First few: ${untranslated.slice(0, 8).join(", ")}`,
-      ).toBeLessThanOrEqual(MAX_UNTRANSLATED[locale]);
+        `${locale} is missing ${untranslated.length} of ${ENGLISH_KEYS.size} English strings; baseline is ` +
+          `${EXPECTED_UNTRANSLATED[locale]}. Translate new gaps, or update the baseline only for intentional debt ` +
+          `and explain why. First few: ${untranslated.slice(0, 8).join(", ")}`,
+      ).toBe(EXPECTED_UNTRANSLATED[locale]);
     });
 
     // Key presence is not enough. A translation that keeps the key but drops a
     // `{placeholder}` renders the literal token to the user, and counting keys
-    // cannot see it. A hard assertion, not a ceiling: every locale passes today.
-    it(`${locale} keeps every {placeholder} the English string interpolates`, () => {
+    // cannot see it. The only exemptions are exact key/token pairs used as
+    // English-only formatting markers.
+    it(`${locale} keeps every data {placeholder} the English string interpolates`, () => {
       const translations = LOCALES[locale];
       const authored = leafEntries(authoredStrings(translations) ?? translations);
       const broken: string[] = [];
@@ -160,7 +166,10 @@ describe("web locale coverage", () => {
           continue;
         }
 
-        const lost = placeholders(englishValue).filter((token) => !placeholders(localeValue).includes(token));
+        const optional = OPTIONAL_FORMATTING_PLACEHOLDERS[key] ?? new Set<string>();
+        const lost = placeholders(englishValue).filter(
+          (token) => !optional.has(token) && !placeholders(localeValue).includes(token),
+        );
 
         if (lost.length) {
           broken.push(`${key} lost {${lost.join("} {")}}`);
@@ -171,6 +180,30 @@ describe("web locale coverage", () => {
         broken,
         `${locale} drops placeholders these strings interpolate, so the value never reaches the user`,
       ).toEqual([]);
+    });
+
+    it(`${locale} keeps array-valued entries the same length as English`, () => {
+      const authored = leafEntries(authoredStrings(LOCALES[locale]) ?? LOCALES[locale]);
+      const mismatched: string[] = [];
+
+      for (const [key, englishValue] of ENGLISH_ENTRIES) {
+        if (!Array.isArray(englishValue)) {
+          continue;
+        }
+
+        const localeValue = authored.get(key);
+
+        if (!Array.isArray(localeValue)) {
+          mismatched.push(`${key} (en is an array, ${locale} is not)`);
+          continue;
+        }
+
+        if (englishValue.length !== localeValue.length) {
+          mismatched.push(`${key} (en has ${englishValue.length}, ${locale} has ${localeValue.length})`);
+        }
+      }
+
+      expect(mismatched, `${locale} changes the shape of these array-valued translation entries`).toEqual([]);
     });
 
     it(`${locale} defines no strings English has dropped`, () => {
