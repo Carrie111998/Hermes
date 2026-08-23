@@ -5236,6 +5236,7 @@ def _call_fallback_candidate_sync(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    auth_retry_extra_body = effective_extra_body
     try:
         return _validate_llm_response(
             _relay_sync_completion(
@@ -5247,6 +5248,38 @@ def _call_fallback_candidate_sync(
             task,
         )
     except Exception as fb_err:
+        # Fallback candidates get the same structured-output degradation as
+        # the primary path: a provider that rejects ``response_format``
+        # (DeepSeek: "This response_format type is unavailable now", vLLM
+        # gateways without xgrammar, strict Anthropic-wire gateways) gets one
+        # retry without the field. Before this rung the 400 escaped and
+        # aborted the whole auxiliary task — e.g. title generation timed out
+        # on the configured local endpoint, fell back to the main agent model
+        # on DeepSeek, and died on the json_schema field.
+        if _is_structured_output_rejection(fb_err):
+            retry_kwargs = _without_structured_output_format(fb_kwargs)
+            if retry_kwargs is not None:
+                logger.info(
+                    "Auxiliary %s: fallback candidate %s rejected the "
+                    "structured-output format field; retrying once without it "
+                    "(schema enforcement degrades to prompt compliance): %s",
+                    task or "call", fb_label, fb_err,
+                )
+                try:
+                    return _validate_llm_response(
+                        _relay_sync_completion(
+                            fb_client,
+                            retry_kwargs,
+                            provider=destination.provider,
+                            api_mode=destination.api_mode,
+                        ),
+                        task,
+                    )
+                except Exception as retry_err:
+                    if not _is_auth_error(retry_err):
+                        raise
+                    fb_err = retry_err
+                    auth_retry_extra_body = retry_kwargs.get("extra_body")
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(
@@ -5278,7 +5311,7 @@ def _call_fallback_candidate_sync(
                     retry_messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=retry_tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=auth_retry_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
                 try:
@@ -5342,6 +5375,7 @@ async def _call_fallback_candidate_async(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    auth_retry_extra_body = effective_extra_body
     try:
         return _validate_llm_response(
             await _relay_async_completion(
@@ -5353,6 +5387,32 @@ async def _call_fallback_candidate_async(
             task,
         )
     except Exception as fb_err:
+        # Structured-output degradation for fallback candidates, mirroring
+        # _call_fallback_candidate_sync (see its comment for the rationale).
+        if _is_structured_output_rejection(fb_err):
+            retry_kwargs = _without_structured_output_format(fb_kwargs)
+            if retry_kwargs is not None:
+                logger.info(
+                    "Auxiliary %s: fallback candidate %s rejected the "
+                    "structured-output format field; retrying once without it "
+                    "(schema enforcement degrades to prompt compliance): %s",
+                    task or "call", fb_label, fb_err,
+                )
+                try:
+                    return _validate_llm_response(
+                        await _relay_async_completion(
+                            fb_client,
+                            retry_kwargs,
+                            provider=destination.provider,
+                            api_mode=destination.api_mode,
+                        ),
+                        task,
+                    )
+                except Exception as retry_err:
+                    if not _is_auth_error(retry_err):
+                        raise
+                    fb_err = retry_err
+                    auth_retry_extra_body = retry_kwargs.get("extra_body")
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(
@@ -5385,7 +5445,7 @@ async def _call_fallback_candidate_async(
                     retry_messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=retry_tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=auth_retry_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
                 try:
