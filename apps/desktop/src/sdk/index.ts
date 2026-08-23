@@ -1169,6 +1169,11 @@ export {
 
 export { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
 export { type RouteContribution, ROUTES_AREA, SIDEBAR_NAV_AREA, type SidebarNavContribution } from '@/app/routes'
+export {
+  type ProjectPresentationGroup,
+  PROJECTS_PRESENTATION_AREA,
+  type ProjectsPresentationContribution
+} from '@/app/chat/sidebar/projects-presentation'
 /** THE full per-toolset config panel core Settings renders — provider picker,
  *  env vars / API keys, model catalog picker, and post-setup runners. Route-
  *  decoupled (the "manage keys" deep link is a no-op outside the router); pass

@@ -9,6 +9,7 @@ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { useContributions } from '@/contrib/react/use-contributions'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import {
   groupEntriesByRecency,
@@ -22,6 +23,7 @@ import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
+import { PROJECTS_PRESENTATION_AREA, presentProjects } from './projects-presentation'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -215,6 +217,9 @@ export function SidebarSessionsSection({
   card = false
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
+  // Subscribe so a runtime plugin re-registration immediately re-resolves the
+  // native Project overview instead of waiting for unrelated sidebar state.
+  useContributions(PROJECTS_PRESENTATION_AREA)
   const dividerLabels = t.sidebar.dateDivider
   const statusDividerLabels = t.sidebar.statusDivider
   const dotStates = useStore($sessionDotStateById)
@@ -404,6 +409,35 @@ export function SidebarSessionsSection({
   } else if (showEmptyState) {
     inner = emptyState
   } else if (projectOverview?.length) {
+    const presented = presentProjects(projectOverview)
+
+    if (presented) {
+      const nativeRow = (project: SidebarProjectTree) => (
+        <ProjectOverviewRow
+          activeProjectId={activeProjectId}
+          key={project.id}
+          onEnter={onEnterProject}
+          onNewSession={onNewSessionInWorkspace}
+          previewSessions={projectOverviewPreviews?.[project.id]}
+          project={project}
+          renderRows={renderRows}
+        />
+      )
+
+      inner = (
+        <>
+          {presented.groups.map(group => (
+            <div className="pb-1" key={group.id}>
+              <div className="px-2 pb-1 pt-1.5 text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
+                {group.label}
+              </div>
+              {!group.collapsed && group.projects.map(nativeRow)}
+            </div>
+          ))}
+          {presented.ungrouped.map(nativeRow)}
+        </>
+      )
+    } else {
     // The model is already ordered (Home leads; then the default sort groups
     // explicit-before-auto, with a manual drag-order winning when present).
     // Render in that order and make rows drag-to-reorder when a handler is
@@ -443,6 +477,7 @@ export function SidebarSessionsSection({
         )}
       </>
     )
+    }
   } else if (groups?.length) {
     // Profile/source groups never reorder; render them flat with static rows.
     inner = groups.map(group => (
