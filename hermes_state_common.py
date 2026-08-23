@@ -189,6 +189,20 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
+# A delegate/subagent execution transcript is never a gateway route owner
+# (#92859). ``delegate_tool`` creates these rows with ``source='subagent'``
+# and the durable ``model_config._delegate_from`` marker; either signal is
+# enough, because a row that already got hijacked has had its ``source``
+# overwritten with the platform name by ``record_gateway_session_peer``.
+# Interpolated (not bound) so it can be embedded in the peer-recovery
+# queries alongside the other f-string predicates in this module.
+_NOT_SUBAGENT_ROW_SQL = (
+    "(COALESCE({a}.source, '') != 'subagent'"
+    " AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from')"
+    " IS NULL)"
+)
+
+
 _RESET_END_REASONS = (
     "session_reset",
     # switch_session() never creates a child row, but pre-marker DBs can hold
