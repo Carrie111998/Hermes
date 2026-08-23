@@ -3155,6 +3155,70 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _profile_skill_names(profile: str) -> set[str]:
+    """Return the skills resolvable from a specific profile's catalog.
+
+    This deliberately scans the profile's own skill roots rather than the
+    process-global active profile.  Kanban rows are shared across profiles,
+    so validating against the caller's catalog would allow a task to refer to
+    a skill unavailable when its assigned worker starts.
+    """
+    from agent.skill_utils import (
+        is_excluded_skill_path,
+        parse_frontmatter,
+        skill_matches_platform,
+        iter_skill_index_files,
+    )
+    from hermes_cli.profiles import get_profile_dir
+
+    profile_home = get_profile_dir(profile)
+    skill_roots = [profile_home / "skills"]
+    disabled: set[str] = set()
+    config_path = profile_home / "config.yaml"
+    if config_path.is_file():
+        try:
+            import yaml
+
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            skills_config = config.get("skills", {})
+            disabled.update(str(name) for name in skills_config.get("disabled", []) or [])
+            platform_disabled = skills_config.get("platform_disabled", {}) or {}
+            if isinstance(platform_disabled, dict):
+                disabled.update(
+                    str(name)
+                    for name in platform_disabled.get(sys.platform, []) or []
+                )
+            configured = skills_config.get("external_dirs", [])
+            if isinstance(configured, str):
+                configured = [configured]
+            skill_roots.extend(
+                Path(os.path.expandvars(os.path.expanduser(str(root))))
+                for root in configured
+                if str(root).strip()
+            )
+        except Exception:
+            pass
+
+    names: set[str] = set()
+    for root in skill_roots:
+        if not root.is_dir():
+            continue
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            if is_excluded_skill_path(skill_md, root=root):
+                continue
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                )
+            except Exception:
+                continue
+            if skill_matches_platform(frontmatter):
+                name = str(frontmatter.get("name") or skill_md.parent.name).strip()
+                if name and name not in disabled:
+                    names.add(name)
+    return names
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3392,6 +3456,21 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+        if skills_list:
+            profile = assignee
+            if profile is None:
+                from hermes_cli.profiles import get_active_profile_name
+
+                profile = get_active_profile_name()
+            available_skills = _profile_skill_names(profile)
+            unavailable = [name for name in skills_list if name not in available_skills]
+            if unavailable:
+                raise ValueError(
+                    "Skill(s) "
+                    + ", ".join(repr(name) for name in unavailable)
+                    + f" are unavailable to assigned profile {profile!r}. "
+                    "Install or enable the skill in that profile before creating the task."
+                )
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
