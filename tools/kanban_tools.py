@@ -31,14 +31,17 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 from pathlib import Path
+
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import kanban_publication
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
+
+_publication_command = kanban_publication.command
 
 logger = logging.getLogger(__name__)
 
@@ -214,23 +217,6 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-_PUBLICATION_COMMAND_TIMEOUT_SECONDS = 15
-
-
-def _publication_command(args: list[str], repo: Path) -> tuple[bool, str]:
-    """Run a bounded publication-proof command without exposing stderr."""
-    try:
-        completed = subprocess.run(
-            args, cwd=str(repo), capture_output=True, text=True,
-            timeout=_PUBLICATION_COMMAND_TIMEOUT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False, "command unavailable or timed out"
-    if completed.returncode != 0:
-        return False, "command failed"
-    return True, completed.stdout.strip()
-
-
 def _publication_gate(
     task: Any,
     metadata: Optional[dict],
@@ -241,10 +227,7 @@ def _publication_gate(
     pr_number: Optional[int] = None,
 ) -> Optional[str]:
     """Prove a Forge implementation was published before completion."""
-    if (
-        os.environ.get("HERMES_PROFILE") != "forge"
-        or getattr(task, "assignee", None) != "forge"
-    ):
+    if task is None:
         return None
     # The task row is authoritative. Publication proof is deliberately passed
     # through explicit arguments; free-form metadata can never satisfy it or
@@ -253,66 +236,21 @@ def _publication_gate(
     required = policy if policy is not None else True
     if required is not True:
         return None
-    proof = {
-        "repo_path": repo_path,
-        "branch": branch,
-        "expected_base": expected_base,
-        "pr_number": pr_number,
-    }
-    missing = [key for key, value in proof.items() if value in (None, "")]
-    if missing:
-        return "publication proof rejected: missing explicit field(s): " + ", ".join(missing)
-    repo = Path(str(repo_path)).expanduser()
-    if not repo.is_dir():
+    if policy is None and getattr(task, "assignee", None) != "forge":
+        return None
+    if repo_path is None or branch is None or expected_base is None or pr_number is None:
+        return "publication proof rejected: missing explicit field(s)"
+    if not Path(str(repo_path)).expanduser().is_dir():
         return "publication proof rejected: repo_path is not an existing directory"
-    ok, root = _publication_command(["git", "rev-parse", "--show-toplevel"], repo)
-    if not ok or not root or Path(root).resolve() != repo.resolve():
-        return "publication proof rejected: repo_path is not the Git repository root"
-    ok, dirty = _publication_command(["git", "status", "--porcelain"], repo)
-    if not ok:
-        return "publication proof rejected: could not inspect Git status"
-    if dirty:
-        return "publication proof rejected: working tree is not clean"
-    ok, head = _publication_command(["git", "rev-parse", "HEAD"], repo)
-    if not ok or not head:
-        return "publication proof rejected: could not resolve local HEAD"
-    ok, checked_out_branch = _publication_command(
-        ["git", "symbolic-ref", "--short", "HEAD"], repo
-    )
-    expected_branch = str(branch)
-    if not ok or not checked_out_branch:
-        return "publication proof rejected: repository is detached"
-    if checked_out_branch != expected_branch:
-        return "publication proof rejected: checked-out branch does not match explicit branch"
-    ok, remote = _publication_command(
-        ["git", "ls-remote", "origin", f"refs/heads/{expected_branch}"], repo
-    )
-    remote_head = remote.split()[0] if ok and remote.split() else ""
-    if not ok or remote_head != head:
-        return "publication proof rejected: origin branch does not match local HEAD"
     try:
-        normalized_pr_number = str(int(str(pr_number)))
+        normalized_pr_number = int(pr_number)
     except (TypeError, ValueError):
         return "publication proof rejected: pr_number must be an integer"
-    ok, pr_json = _publication_command(
-        [
-            "gh", "pr", "view", normalized_pr_number,
-            "--json", "state,headRefOid,baseRefName",
-        ], repo
+    return kanban_publication.verify(
+        repo_path=str(repo_path), branch=str(branch),
+        expected_base=str(expected_base), pr_number=normalized_pr_number,
+        command_runner=_publication_command,
     )
-    if not ok:
-        return "publication proof rejected: GitHub PR was not found or could not be read"
-    try:
-        pr = json.loads(pr_json)
-    except (TypeError, json.JSONDecodeError):
-        return "publication proof rejected: GitHub returned invalid PR data"
-    if pr.get("state") != "OPEN":
-        return "publication proof rejected: GitHub PR is not open"
-    if pr.get("headRefOid") != head:
-        return "publication proof rejected: GitHub PR head does not match local HEAD"
-    if pr.get("baseRefName") != str(expected_base):
-        return "publication proof rejected: GitHub PR base does not match expected_base"
-    return None
 
 
 def _connect(board: Optional[str] = None):
@@ -860,19 +798,6 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            publication_rejection = _publication_gate(
-                task,
-                metadata,
-                repo_path=repo_path,
-                branch=branch,
-                expected_base=expected_base,
-                pr_number=pr_number,
-            )
-            if publication_rejection is not None:
-                return tool_error(
-                    publication_rejection
-                    + ". Task remains in-flight; fix the publication proof and retry."
-                )
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -891,6 +816,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
+                    repo_path=repo_path,
+                    branch=branch,
+                    expected_base=expected_base,
+                    pr_number=pr_number,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:

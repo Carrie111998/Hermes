@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kanban_publication
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -5377,6 +5378,10 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    repo_path: Optional[str] = None,
+    branch: Optional[str] = None,
+    expected_base: Optional[str] = None,
+    pr_number: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5416,6 +5421,27 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    task = get_task(conn, task_id)
+    policy = getattr(task, "publication_required", None) if task else None
+    requires_publication = policy is True or (
+        policy is None and getattr(task, "assignee", None) == "forge"
+    )
+    if requires_publication:
+        rejection = kanban_publication.verify(
+            repo_path=repo_path, branch=branch,
+            expected_base=expected_base, pr_number=pr_number,
+        ) if all(value is not None for value in (repo_path, branch, expected_base, pr_number)) else (
+            "publication proof rejected: missing explicit field(s): "
+            + ", ".join(name for name, value in {
+                "repo_path": repo_path, "branch": branch,
+                "expected_base": expected_base, "pr_number": pr_number,
+            }.items() if value in (None, ""))
+        )
+        if rejection:
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_blocked_publication", {"reason": rejection})
+            raise kanban_publication.PublicationProofError(rejection)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

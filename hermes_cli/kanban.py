@@ -601,8 +601,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Structured handoff summary for downstream tasks. "
                                  "Falls back to --result if omitted.")
     p_complete.add_argument("--metadata", default=None,
-                            help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
-                                 '"tests_run": 12}\'). Stored on the closing run.')
+                            help="JSON dict of structured facts. Stored on the closing run.")
+    p_complete.add_argument("--repo-path", default=None)
+    p_complete.add_argument("--branch", default=None)
+    p_complete.add_argument("--expected-base", default=None)
+    p_complete.add_argument("--pr-number", type=int, default=None)
 
     p_edit = sub.add_parser(
         "edit",
@@ -2296,13 +2299,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid, result=args.result, summary=summary,
+                    metadata=metadata,
+                    repo_path=getattr(args, "repo_path", None),
+                    branch=getattr(args, "branch", None),
+                    expected_base=getattr(args, "expected_base", None),
+                    pr_number=getattr(args, "pr_number", None),
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.kanban_publication.PublicationProofError as exc:
+                print(f"cannot complete {tid}: {exc}", file=sys.stderr)
+                failed.append(tid)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
