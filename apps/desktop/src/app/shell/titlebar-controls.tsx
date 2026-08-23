@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from 'react-router'
 
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
+import { $paneEffectivelyVisible } from '@/components/pane-shell/tree/narrow-overlay-state'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -16,9 +17,8 @@ import { cn } from '@/lib/utils'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
 import {
-  $fileBrowserOpen,
-  $panesFlipped,
   $sidebarOpen,
+  FILES_PANE_ID,
   toggleFileBrowserOpen,
   togglePanesFlipped,
   toggleSidebarOpen
@@ -132,8 +132,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const location = useLocation()
   const modHeld = useModifierHeld()
   const hapticsMuted = useStore($hapticsMuted)
-  const fileBrowserOpen = useStore($fileBrowserOpen)
-  const panesFlipped = useStore($panesFlipped)
+  const filesVisible = useStore($paneEffectivelyVisible(FILES_PANE_ID))
   const sidebarOpen = useStore($sidebarOpen)
   const unreadCount = useStore($unreadSessionCount)
   const unreadBadge = unreadCount > 0 ? unreadCount : undefined
@@ -151,26 +150,24 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     }
   }
 
-  // POSITIONAL toggles: each button shows/hides everything on its physical
-  // side of the main zone (the layout tree collapses the whole side), so they
-  // stay correct through flips and rearranges. $sidebarOpen ≙ left side,
-  // $fileBrowserOpen ≙ right side. Never an active highlight — plain
-  // show/hide affordances.
-  const leftEdge = { open: sidebarOpen, toggle: toggleSidebarOpen }
-  const rightEdge = { open: fileBrowserOpen, toggle: toggleFileBrowserOpen }
-  const leftLabel = leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar
-  const rightLabel = rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar
+  // Sessions remains a positional side toggle. Files is semantic: it follows
+  // the built-in Files pane through flips and rearranges and toggles only that
+  // pane. Neither control uses an active highlight — both are plain show/hide
+  // affordances.
+  const leftSidebar = { open: sidebarOpen, toggle: toggleSidebarOpen }
+  const leftSidebarLabel = leftSidebar.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar
+  const filesLabel = filesVisible ? t.titlebar.hideFiles : t.titlebar.showFiles
 
   const leftToolbarTools: TitlebarTool[] = [
     {
       actionId: 'view.toggleSidebar',
-      badge: panesFlipped ? undefined : unreadBadge,
+      badge: unreadBadge,
       icon: <TitlebarIcon name="layout-sidebar-left" />,
       id: 'sidebar',
-      label: `${leftLabel}${panesFlipped ? '' : unreadHint}`,
+      label: `${leftSidebarLabel}${unreadHint}`,
       onSelect: () => {
         triggerHaptic('tap')
-        leftEdge.toggle()
+        leftSidebar.toggle()
       }
     },
     {
@@ -186,15 +183,14 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     ...leftTools
   ]
 
-  const rightSidebarTool: TitlebarTool = {
+  const filesTool: TitlebarTool = {
     actionId: 'view.toggleRightSidebar',
-    badge: panesFlipped ? unreadBadge : undefined,
     icon: <TitlebarIcon name="layout-sidebar-right" />,
     id: 'right-sidebar',
-    label: `${rightLabel}${panesFlipped ? unreadHint : ''}`,
+    label: filesLabel,
     onSelect: () => {
       triggerHaptic('tap')
-      rightEdge.toggle()
+      toggleFileBrowserOpen()
     }
   }
 
@@ -309,7 +305,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
         {visibleSystemTools.map(tool => (
           <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
         ))}
-        <TitlebarToolButton navigate={navigate} tool={rightSidebarTool} />
+        <TitlebarToolButton navigate={navigate} tool={filesTool} />
       </div>
     </>
   )

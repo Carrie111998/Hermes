@@ -7,7 +7,7 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 
 import { PaneTab, PaneTabLabel, PaneTabStrip } from '@/components/ui/pane-tab'
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
@@ -18,6 +18,7 @@ import { cn } from '@/lib/utils'
 
 import { PANE_TOGGLE_REVEAL_EVENT } from '../..'
 import { allPaneIds, findGroupOfPane } from '../model'
+import { $narrowOverlayReveal, setNarrowOverlayReveal, updateNarrowOverlayReveal } from '../narrow-overlay-state'
 import { $hiddenTreePanes, $layoutTree, $narrowViewport } from '../store'
 
 import { paneChrome } from './track-model'
@@ -27,7 +28,7 @@ export function NarrowOverlays() {
   const tree = useStore($layoutTree)
   const panes = useContributions('panes')
   const hiddenPanes = useStore($hiddenTreePanes)
-  const [reveal, setReveal] = useState<{ id: string; pinned: boolean } | null>(null)
+  const reveal = useStore($narrowOverlayReveal)
 
   // Own an Escape layer only while something is revealed, so Escape closes the
   // overlay only when it's the top layer (never under a dialog / edit mode).
@@ -41,6 +42,19 @@ export function NarrowOverlays() {
     [panes, inTree, hiddenPanes]
   )
 
+  const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
+
+  // Fail closed during render, then retire stale authority after commit. The
+  // id guard makes this safe across StrictMode effect replay and a concurrent
+  // reveal transition.
+  useEffect(() => {
+    if (!narrow || !reveal || revealed) {
+      return
+    }
+
+    updateNarrowOverlayReveal(current => (current?.id === reveal.id ? null : current))
+  }, [narrow, reveal, revealed])
+
   const collapsiblesRef = useRef(collapsibles)
   collapsiblesRef.current = collapsibles
 
@@ -48,7 +62,7 @@ export function NarrowOverlays() {
   // REAL pane id — accept those via each contribution's revealAliases.
   useEffect(() => {
     if (!narrow) {
-      setReveal(null)
+      setNarrowOverlayReveal(null)
 
       return
     }
@@ -70,7 +84,7 @@ export function NarrowOverlays() {
       // `open`/`close` are explicit intents (programmatic reveal, titlebar show);
       // `toggle` (default) is the ⌘B/⌘G flip.
       const mode = detail?.mode ?? 'toggle'
-      setReveal(current => {
+      updateNarrowOverlayReveal(current => {
         if (mode === 'open') {
           return { id: match.id, pinned: true }
         }
@@ -89,7 +103,7 @@ export function NarrowOverlays() {
       }
 
       event.preventDefault()
-      setReveal(null)
+      setNarrowOverlayReveal(null)
     }
 
     window.addEventListener(PANE_TOGGLE_REVEAL_EVENT, onToggle)
@@ -98,6 +112,7 @@ export function NarrowOverlays() {
     return () => {
       window.removeEventListener(PANE_TOGGLE_REVEAL_EVENT, onToggle)
       window.removeEventListener('keydown', onKeyDown)
+      setNarrowOverlayReveal(null)
     }
   }, [narrow])
 
@@ -106,7 +121,6 @@ export function NarrowOverlays() {
   }
 
   const sideOf = (c: Contribution) => (paneChrome(c).placement === 'left' ? 'left' : 'right')
-  const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
   const sides = [...new Set(collapsibles.map(sideOf))]
 
   // The revealed pane's ZONE-mates that also left the grid (the sessions zone
@@ -136,7 +150,7 @@ export function NarrowOverlays() {
             const first = collapsibles.find(p => sideOf(p) === side)
 
             if (first) {
-              setReveal(current => (current?.pinned ? current : { id: first.id, pinned: false }))
+              updateNarrowOverlayReveal(current => (current?.pinned ? current : { id: first.id, pinned: false }))
             }
           }}
         />
@@ -154,7 +168,7 @@ export function NarrowOverlays() {
           // panes beneath it — a see-through overlay reads as text bleeding
           // through text. Contract: `[data-glass-opaque]` in styles.css.
           data-glass-opaque=""
-          onMouseLeave={() => setReveal(current => (current?.pinned ? current : null))}
+          onMouseLeave={() => updateNarrowOverlayReveal(current => (current?.pinned ? current : null))}
           // Match the pane's docked width (sessions ~237px, files its rail
           // width) instead of a fat fixed 20rem — capped for tiny screens.
           style={{ width: `min(${(revealed.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)` }}
@@ -172,7 +186,7 @@ export function NarrowOverlays() {
                   onPointerDown={event => {
                     if (event.button === 0) {
                       event.preventDefault()
-                      setReveal(current => ({ id: pane.id, pinned: current?.pinned ?? false }))
+                      updateNarrowOverlayReveal(current => ({ id: pane.id, pinned: current?.pinned ?? false }))
                     }
                   }}
                 >
