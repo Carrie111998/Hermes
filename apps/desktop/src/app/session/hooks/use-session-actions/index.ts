@@ -2226,9 +2226,9 @@ export function useSessionActions({
     },
     [
       activeSessionIdRef,
-      closeRuntimeForSessionBoundary,
       copy,
       navigate,
+      requestGateway,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionId,
       selectedStoredSessionIdRef,
