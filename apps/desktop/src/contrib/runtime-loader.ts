@@ -28,8 +28,8 @@
  * trust seam.
  */
 
-import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { isReadFileErrorResult } from '@/lib/desktop-fs'
+import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { notifyError } from '@/store/notifications'
 
 import { createPluginContext, type HermesPlugin } from './plugin'
@@ -395,7 +395,13 @@ async function scanDiskPlugins(): Promise<void> {
         await loadDiskPlugin(record)
 
         try {
-          record.watchId = (await desktop.watchPreviewFile(file)).id
+          const watch = await desktop.watchPreviewFile(file)
+
+          // Structured "folder gone" answer — nothing to watch; the poll still
+          // reconciles new folders and edits need a manual reload.
+          if (!isReadFileErrorResult(watch)) {
+            record.watchId = watch.id
+          }
         } catch {
           // Unwatchable — the poll still reconciles new folders; edits need a
           // manual "Reload desktop plugins".

@@ -2495,6 +2495,8 @@ export interface Translations {
     closePane: string
     loading: string
     unavailable: string
+    missingTitle: string
+    missingBody: (label: string) => string
     opening: string
     hide: string
     openPreview: string

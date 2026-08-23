@@ -2281,6 +2281,8 @@ export const ar = defineLocale({
     closePane: 'إغلاق جزء المعاينة',
     loading: 'جار تحميل المعاينة',
     unavailable: 'المعاينة غير متاحة',
+    missingTitle: 'الملف لم يعد موجودا',
+    missingBody: label => `تم حذف ${label} أو نقله، أو أُفرغ موقعه المؤقت. لن تتم استعادة علامة التبويب هذه عند الإطلاق التالي.`,
     opening: 'جار الفتح...',
     hide: 'إخفاء',
     openPreview: 'فتح المعاينة',

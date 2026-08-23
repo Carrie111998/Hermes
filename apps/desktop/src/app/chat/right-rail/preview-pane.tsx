@@ -10,7 +10,7 @@ import { openGuestContextMenu } from '@/app/context-menu/store'
 import { PanelEmpty } from '@/app/overlays/panel'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
-import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { isDesktopFsRemoteMode, isReadFileErrorResult } from '@/lib/desktop-fs'
 import { guardGuestPointers } from '@/lib/guest-pointer-guard'
 import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
 import { isRemoteGateway } from '@/lib/media'
@@ -659,6 +659,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     void window.hermesDesktop
       .watchPreviewFile(target.url)
       .then(watch => {
+        // The file was already gone when the watch was requested (a restored
+        // tab probing a deleted path): structured data, not a rejection. The
+        // read below surfaces the tombstone; nothing to watch.
+        if (isReadFileErrorResult(watch)) {
+          return
+        }
+
         if (!active) {
           void window.hermesDesktop?.stopPreviewFileWatch?.(watch.id)
 

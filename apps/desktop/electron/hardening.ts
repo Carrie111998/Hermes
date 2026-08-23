@@ -546,6 +546,19 @@ function isMissingFileError(error: unknown): boolean {
   return code === 'ENOENT' || code === 'ENOTDIR'
 }
 
+/** The structured "file is not on disk" IPC answer built from a caught read
+ *  error. Shared by every handler that converts expected absence into data
+ *  (preview text/image reads, attachment reads, file watches) so all of them
+ *  answer with the same shape. */
+function missingFileResult(requestedPath: unknown, error: unknown) {
+  return {
+    ok: false as const,
+    error: (error as NodeJS.ErrnoException).code || 'ENOENT',
+    message: error instanceof Error ? error.message : 'File does not exist.',
+    path: String(requestedPath ?? '')
+  }
+}
+
 export {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
@@ -557,6 +570,7 @@ export {
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret,
   isMissingFileError,
+  missingFileResult,
   readFileDataUrlForIpc,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,
