@@ -703,12 +703,12 @@ class ComputeHost:
                 return
             if route_name == "session.compress":
                 command = str(frame.get("command") or "")
-                focus_topic = command.removeprefix("/compress").strip()
+                compress_args = command.removeprefix("/compress").strip()
                 response = server._methods["session.compress"](
                     request_id,
                     {
                         "session_id": sid,
-                        **({"focus_topic": focus_topic} if focus_topic else {}),
+                        **({"args": compress_args} if compress_args else {}),
                     },
                 )
                 if "error" in response:
