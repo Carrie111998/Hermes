@@ -7,21 +7,9 @@ import { LOCALE_OPTIONS } from './languages'
 import type { Locale, Translations } from './types'
 
 /**
- * Exact baseline for the English strings each locale intentionally leaves
- * untranslated today.
- *
- * This exists because an untranslated string is otherwise invisible:
- * `defineLocale` merges every locale over `en`, so a key nobody translated
- * still renders — in English — and every field of `TranslationOverrides` is
- * optional, so `tsc` cannot flag it either. Nothing surfaces the gap until a
- * user reports it.
- *
- * This is an exact count rather than a loose ceiling. Translating more strings
- * therefore requires lowering the baseline in the same change instead of
- * silently creating regression headroom. If a locale deliberately defers new
- * strings, update the baseline in that commit and explain why. This does not
- * replace human review of the missing-key set, but it prevents accumulated
- * numerical slack from hiding a later regression.
+ * Exact baseline for English strings a locale intentionally leaves untranslated.
+ * Exact counts prevent improvements from silently creating regression headroom;
+ * update a baseline only when the intentional debt changes, and explain why.
  */
 const EXPECTED_UNTRANSLATED: Record<Locale, number> = {
   en: 0,
@@ -31,13 +19,7 @@ const EXPECTED_UNTRANSLATED: Record<Locale, number> = {
   'zh-hant': 598
 }
 
-/**
- * Exact baseline for keys a locale still defines that `en` no longer has.
- * These are dead strings: renamed or deleted upstream, left behind in the
- * translation. `tsc` catches most of them, but not under the
- * `Record<string, string>` members of `Translations` (the settings field copy),
- * which accept any key.
- */
+/** Exact baseline for locale keys that English no longer defines. */
 const EXPECTED_UNUSED: Record<Locale, number> = {
   en: 0,
   ar: 5,
@@ -64,15 +46,7 @@ function leafKeys(value: unknown, prefix = '', out = new Set<string>()): Set<str
 
 const ENGLISH_KEYS = leafKeys(en)
 
-/**
- * The invariant this whole file rests on: measure what the locale **authored**,
- * never what it renders. `TRANSLATIONS[locale]` has already been merged over
- * `en`, so comparing that to `en` reports full coverage for every locale and
- * catches nothing — which is exactly how the drift this guard exists for went
- * unnoticed. `authoredStrings` returns the pre-merge overrides; the fallback is
- * for a locale declared as a complete `Translations` literal, which authors its
- * keys directly and so is its own answer.
- */
+/** Measure what a locale authored, never the object already merged over English. */
 function authoredEntries(locale: Locale): Translations | TranslationOverrides {
   const translations = TRANSLATIONS[locale]
 
@@ -105,10 +79,9 @@ type ParsedArrow = {
 }
 
 /**
- * Parse an arrow function's parameter list from runtime source. This avoids
- * `Function.length`, which loses information after default/rest parameters.
- * Locale entries use simple identifier parameters; unsupported shapes fail the
- * guard instead of being silently skipped.
+ * Parse runtime arrow-function parameters instead of using `Function.length`,
+ * which loses information after default/rest parameters. Unsupported parameter
+ * shapes fail the guard instead of being silently skipped.
  */
 function parseArrow(fn: (...args: never[]) => string): ParsedArrow | null {
   const source = fn.toString()
@@ -137,11 +110,7 @@ function parseArrow(fn: (...args: never[]) => string): ParsedArrow | null {
   return { params, body: source.slice(arrow + 2) }
 }
 
-/**
- * Strip comments and literal text before checking parameter use. Template
- * interpolation bodies are retained, while raw template text is removed, so a
- * word that merely happens to equal a parameter name does not count as a use.
- */
+/** Strip comments/literal text while retaining `${...}` template expressions. */
 function searchableBody(body: string): string {
   const withoutCommentsAndStrings = body
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
@@ -150,8 +119,7 @@ function searchableBody(body: string): string {
     .replace(/"(?:\\.|[^"\\])*"/g, '""')
 
   return withoutCommentsAndStrings.replace(/`(?:\\.|[^`\\])*`/gs, template => {
-    const expressions = [...template.matchAll(/\$\{([^}]*)\}/g)].map(match => match[1])
-    return expressions.join(' ')
+    return [...template.matchAll(/\$\{([^}]*)\}/g)].map(match => match[1]).join(' ')
   })
 }
 
@@ -168,8 +136,7 @@ describe('desktop locale coverage', () => {
 
   for (const { id } of LOCALE_OPTIONS) {
     it(`${id} matches its untranslated-string baseline of ${EXPECTED_UNTRANSLATED[id]}`, () => {
-      const authored = authoredKeys(id)
-      const untranslated = [...ENGLISH_KEYS].filter(key => !authored.has(key))
+      const untranslated = [...ENGLISH_KEYS].filter(key => !authoredKeys(id).has(key))
 
       expect(
         untranslated.length,
@@ -189,8 +156,6 @@ describe('desktop locale coverage', () => {
       ).toBe(EXPECTED_UNUSED[id])
     })
 
-    // Key presence is not enough. A translated entry that keeps the key but
-    // changes a function's call shape can silently drop caller data.
     it(`${id} keeps the English parameter count on every function entry`, () => {
       const authored = leafEntries(authoredEntries(id))
       const mismatched: string[] = []
@@ -240,8 +205,7 @@ describe('desktop locale coverage', () => {
           continue
         }
 
-        // A leading underscore is the established way to declare a parameter
-        // intentionally unused — en.ts does it too (see generatePet.hatchRow).
+        // Leading underscore is the established intentional-unused convention.
         const dead = parsed.params.filter(param => !param.startsWith('_') && !referenced(parsed.body, param))
 
         if (dead.length) {
@@ -252,9 +216,7 @@ describe('desktop locale coverage', () => {
       expect(unparsed, `${id} has function entries the structural guard could not parse`).toEqual([])
       expect(
         ignored,
-        `${id} declares parameters it never uses, so caller data can be dropped from the translation. ` +
-          `Referencing a parameter in a condition counts — translating the word it selects is often better than ` +
-          `interpolating the English token.`
+        `${id} declares parameters it never uses, so caller data can be dropped from the translation`
       ).toEqual([])
     })
 
