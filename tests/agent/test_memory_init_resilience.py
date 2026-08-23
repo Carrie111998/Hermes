@@ -28,6 +28,18 @@ class TestCoercion:
             == expected
         )
 
+    @pytest.mark.parametrize("off", [0, -1, "0"])
+    def test_non_positive_values_pass_through_as_the_off_switch(self, off):
+        """Every consumer gates on `> 0`, so <=0 is how nudges are disabled.
+
+        Clamping these to the default would silently switch nudges back ON
+        for someone who deliberately turned them off.
+        """
+        assert (
+            _memory_int_setting({"nudge_interval": off}, "nudge_interval", 10)
+            == int(off)
+        )
+
     def test_an_absent_key_uses_the_default(self):
         assert _memory_int_setting({}, "nudge_interval", 10) == 10
 

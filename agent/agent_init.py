@@ -522,6 +522,11 @@ def _memory_int_setting(mem_config: dict, key: str, default: int) -> int:
     diagnosable instead of invisible. ``bool`` is rejected because it is an
     ``int`` subclass, and ``nudge_interval: true`` meaning "every turn" is
     not what anyone writes on purpose.
+
+    A valid non-positive value is passed through, not clamped: every consumer
+    gates on ``_memory_nudge_interval > 0`` (``agent/turn_context.py``), so
+    ``0`` — and any negative — is the documented way to turn nudges off. It is
+    the same value the review/curator agents set on themselves.
     """
     raw = mem_config.get(key, default)
     if isinstance(raw, bool) or not isinstance(raw, (int, str)):
