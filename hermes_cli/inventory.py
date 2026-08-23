@@ -193,6 +193,10 @@ def build_models_payload(
     """
     from hermes_cli.model_switch import list_authenticated_providers
 
+    # Provider-scoped exclusions must see the complete inventory before any
+    # picker cap is applied. Otherwise an allowed model after a run of excluded
+    # entries can disappear with the provider row.
+    base_max_models = None if ctx.excluded_models else max_models
     rows = list_authenticated_providers(
         current_provider=ctx.current_provider,
         current_base_url=ctx.current_base_url,
@@ -200,7 +204,7 @@ def build_models_payload(
         user_providers=ctx.user_providers,
         custom_providers=ctx.custom_providers,
         force_fresh_nous_tier=force_fresh_nous_tier,
-        max_models=max_models,
+        max_models=base_max_models,
         refresh=refresh,
         probe_custom_providers=probe_custom_providers,
         probe_current_custom_provider=probe_current_custom_provider,
@@ -272,8 +276,24 @@ def build_models_payload(
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
     if ctx.excluded_models:
         from hermes_cli.model_filters import filter_provider_rows
+        from hermes_cli.model_switch import _UNCAPPED_PICKER_PROVIDERS
 
         rows = filter_provider_rows(rows, ctx.excluded_models)
+        if max_models is not None:
+            capped_rows: list[dict] = []
+            for row in rows:
+                slug = str(row.get("slug") or "").lower()
+                models = list(row.get("models") or [])
+                if (
+                    slug in _UNCAPPED_PICKER_PROVIDERS
+                    or len(models) <= max_models
+                ):
+                    capped_rows.append(row)
+                    continue
+                capped_row = dict(row)
+                capped_row["models"] = models[:max_models]
+                capped_rows.append(capped_row)
+            rows = capped_rows
     if picker_hints:
         _apply_picker_hints(rows)
     if canonical_order:

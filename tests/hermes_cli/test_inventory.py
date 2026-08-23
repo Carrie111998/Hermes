@@ -148,6 +148,44 @@ def test_build_models_payload_filters_models_by_provider_scope():
     assert providers["meridian"]["models"] == ["claude-opus-4-8"]
 
 
+def test_build_models_payload_filters_before_picker_cap():
+    rows = [{
+        "slug": "together",
+        "name": "Together",
+        "models": [
+            "blocked/model-1",
+            "blocked/model-2",
+            "blocked/model-3",
+            "blocked/model-4",
+            "blocked/model-5",
+            "allowed/model-6",
+        ],
+        "total_models": 6,
+        "is_current": True,
+        "is_user_defined": False,
+        "source": "built-in",
+    }]
+    ctx = ConfigContext(
+        current_provider="together",
+        current_model="allowed/model-6",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        excluded_models={"together": ["blocked/*"]},
+    )
+
+    with _list_auth_returning(rows) as mock_list:
+        payload = build_models_payload(ctx, max_models=5)
+
+    assert mock_list.call_args.kwargs["max_models"] is None
+    together = next(
+        row for row in payload["providers"]
+        if row["slug"] == "together"
+    )
+    assert together["models"] == ["allowed/model-6"]
+    assert together["total_models"] == 1
+
+
 def test_cli_model_picker_forwards_force_refresh_to_probe_flags():
     """CLI /model picker must pass force_refresh to probe flags (#65652, #65650).
 
