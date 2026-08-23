@@ -2880,7 +2880,10 @@ def terminal_tool(
         # marker: gateway.run sets it at import time, so it leaks into every
         # process that merely imports gateway.run (hermes serve --isolated,
         # CLI, web server) which are NOT the gateway and must be able to
-        # restart it.
+        # restart it. A plain foreground `hermes gateway run` (env set, PID
+        # owned, no supervisor) now also PASSES this guard: intentional and
+        # harmless, since without a supervisor there is no KeepAlive to turn a
+        # self-restart into a respawn loop.
         from tools.process_registry import _is_supervised_gateway_process
 
         if _is_supervised_gateway_process():

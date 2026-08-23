@@ -1643,6 +1643,14 @@ class ProcessRegistry:
         duplicate (#8228).  The gateway/tui watchers do NOT use this — they
         check only ``is_completion_consumed`` so a read-only poll never
         suppresses their autonomous delivery turn (#10156).
+
+        Note: for a ``notify_on_complete`` task, ``wait()``/``read_log()``
+        deliberately do NOT mark the session consumed (see those methods), so a
+        pure-CLI caller that already obtained the result via ``wait()`` will
+        still drain the completion event on its next notification poll. That is
+        intentional — it is the user-facing delivery the flag promised — and a
+        deliberate reversal of #8228's suppression for the notify_on_complete
+        case only.
         """
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
