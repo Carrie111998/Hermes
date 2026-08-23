@@ -390,4 +390,10 @@ describe('preprocessMarkdown', () => {
 
     expect(output).toContain('\\sqrt[3]{8}')
   })
+
+  it('recognizes inline math whose closing $ is preceded by a literal backslash', () => {
+    // $a\$ — the backslash is literal content, not an escape of the closing $
+    const output = preprocessMarkdown('$a\\$')
+    expect(output).toContain('$a\\$')
+  })
 })
