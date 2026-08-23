@@ -136,15 +136,21 @@ function parseArrow(fn: (...args: never[]) => string): ParsedArrow | null {
 }
 
 /**
- * Strip comments and ordinary string literals before checking parameter use.
- * Template literals are retained because `${param}` is a real runtime use.
+ * Strip comments and literal text before checking parameter use. Template
+ * interpolation bodies are retained, while raw template text is removed, so a
+ * word that merely happens to equal a parameter name does not count as a use.
  */
 function searchableBody(body: string): string {
-  return body
+  const withoutCommentsAndStrings = body
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .replace(/\/\/[^\n\r]*/g, ' ')
     .replace(/'(?:\\.|[^'\\])*'/g, "''")
     .replace(/"(?:\\.|[^"\\])*"/g, '""')
+
+  return withoutCommentsAndStrings.replace(/`(?:\\.|[^`\\])*`/gs, template => {
+    const expressions = [...template.matchAll(/\$\{([^}]*)\}/g)].map(match => match[1])
+    return expressions.join(' ')
+  })
 }
 
 function referenced(body: string, param: string): boolean {
