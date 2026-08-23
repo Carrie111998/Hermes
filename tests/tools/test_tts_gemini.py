@@ -220,3 +220,84 @@ class TestGeminiInCheckRequirements:
             return_value={"provider": "gemini"},
         ), patch("builtins.__import__", side_effect=fake_import):
             assert check_tts_requirements() is True
+
+
+class TestGenerateVertexGeminiTts:
+    def test_vertex_ai_mode_uses_bearer_token_and_project_endpoint(
+        self, tmp_path, mock_gemini_response, fake_pcm_bytes
+    ):
+        from tools.tts_tool import _generate_gemini_tts
+
+        output_path = str(tmp_path / "test.wav")
+        config = {
+            "provider": "vertex",
+            "vertex": {
+                "project_id": "test-project-123",
+                "location": "global",
+                "model": "gemini-2.5-flash-preview-tts",
+                "voice": "Kore",
+            },
+        }
+
+        mock_creds = MagicMock()
+        mock_creds.token = "ya29.test-bearer-token"
+        mock_creds.project_id = "test-project-123"
+
+        with patch("google.auth.default", return_value=(mock_creds, "test-project-123")), \
+             patch("google.auth.transport.requests.Request"), \
+             patch("requests.post", return_value=mock_gemini_response) as mock_post:
+            result = _generate_gemini_tts("Hello Vertex", output_path, config, provider="vertex")
+
+        assert result == output_path
+        args, kwargs = mock_post.call_args
+        endpoint = args[0]
+        assert "aiplatform.googleapis.com" in endpoint
+        assert "projects/test-project-123" in endpoint
+        assert "gemini-2.5-flash-preview-tts:generateContent" in endpoint
+        assert kwargs["headers"]["Authorization"] == "Bearer ya29.test-bearer-token"
+        assert kwargs["params"] is None
+        payload = kwargs["json"]
+        assert payload["contents"][0]["role"] == "user"
+        assert payload["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "Kore"
+
+    def test_vertex_regional_location_endpoint(
+        self, tmp_path, mock_gemini_response
+    ):
+        from tools.tts_tool import _generate_gemini_tts
+
+        output_path = str(tmp_path / "test.wav")
+        config = {
+            "provider": "vertex",
+            "vertex": {
+                "project_id": "test-project-123",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash-preview-tts",
+                "voice": "Puck",
+            },
+        }
+
+        mock_creds = MagicMock()
+        mock_creds.token = "ya29.test-bearer-token"
+
+        with patch("google.auth.default", return_value=(mock_creds, "test-project-123")), \
+             patch("google.auth.transport.requests.Request"), \
+             patch("requests.post", return_value=mock_gemini_response) as mock_post:
+            _generate_gemini_tts("Hello Regional", output_path, config, provider="vertex")
+
+        endpoint = mock_post.call_args[0][0]
+        assert "us-central1-aiplatform.googleapis.com" in endpoint
+        assert "locations/us-central1" in endpoint
+
+    def test_vertex_missing_credentials_raises_error(self, tmp_path):
+        from tools.tts_tool import _generate_gemini_tts
+
+        output_path = str(tmp_path / "test.wav")
+        config = {
+            "provider": "vertex",
+            "vertex": {"project_id": "test-project"},
+        }
+
+        with patch("google.auth.default", side_effect=Exception("No ADC")):
+            with pytest.raises(ValueError, match="Vertex AI Gemini TTS authentication failed"):
+                _generate_gemini_tts("Hello", output_path, config, provider="vertex")
+
