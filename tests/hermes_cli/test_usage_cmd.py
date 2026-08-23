@@ -136,3 +136,17 @@ def test_auth_status_prints_usage_line(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "openai-codex: logged in" in out
     assert "usage: Session 12% left, resets in 1h 4m" in out
+
+
+def test_account_usage_payload_lists_ok_providers(monkeypatch):
+    from hermes_cli.usage_cmd import account_usage_payload
+
+    def fake_report(provider):
+        if provider == "openai-codex":
+            return {"provider": provider, "status": "ok", "windows": []}
+        return {"provider": provider, "status": "unavailable"}
+
+    monkeypatch.setattr("hermes_cli.usage_cmd.collect_usage_report", fake_report)
+    payload = account_usage_payload()
+    assert [row["provider"] for row in payload["providers"]] == ["openai-codex"]
+    assert payload["unsupported"][0]["provider"] == "xai-oauth"

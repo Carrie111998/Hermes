@@ -133,3 +133,21 @@ def usage_command(args) -> int:
             print(format_usage_text(report))
     print(format_usage_text(grok))
     return 0
+
+
+def account_usage_payload(provider: Optional[str] = None) -> dict[str, Any]:
+    """JSON payload for ``GET /api/account-usage`` and the desktop chip."""
+    requested = str(provider or "").strip()
+    if requested:
+        return collect_usage_report(requested)
+    official = [collect_usage_report(name) for name in OFFICIAL_USAGE_PROVIDERS]
+    return {
+        "providers": [row for row in official if row.get("status") == "ok"],
+        "unsupported": [
+            {
+                "provider": "xai-oauth",
+                "status": "unsupported",
+                "reason": UNSUPPORTED_USAGE_REASONS["xai-oauth"],
+            }
+        ],
+    }

@@ -2437,6 +2437,7 @@ export interface Translations {
       toggleTerminal: string
       toggleVersion: string
       toggleWorkspace: string
+      toggleQuota: string
       agents: string
       closeAgents: string
       openAgents: string

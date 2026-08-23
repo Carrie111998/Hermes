@@ -1567,7 +1567,7 @@ Show first-party subscription quota windows for signed-in OAuth providers.
 
 Official sources today: Codex (5h + weekly), Claude OAuth, OpenRouter credits, Nous Portal credits. Providers without a public quota API (including SuperGrok / `xai-oauth`) print `unsupported` instead of a guessed number. Failures are `unavailable` and do not change the exit code, except an unknown provider name exits `2`.
 
-`hermes auth status <provider>` and `hermes status --all` reuse the same snapshot for a one-line summary. This is the official remaining allowance, not the local token totals from `hermes insights` or `/usage` session stats.
+`hermes auth status <provider>` and `hermes status --all` reuse the same snapshot for a one-line summary. The desktop status bar shows the same remaining percents as a compact chip (`Codex 12% · Claude 61%`) via `GET /api/account-usage`. This is the official remaining allowance, not the local token totals from `hermes insights` or `/usage` session stats.
 
 ## `hermes claw`
 
