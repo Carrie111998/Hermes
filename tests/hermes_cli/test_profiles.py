@@ -1029,6 +1029,48 @@ class TestEdgeCases:
         assert cloned_config["model"] == "cloned"
         assert (target_dir / ".env").read_text().strip() == "SECRET=yes"
 
+    def test_clone_all_skips_root_owned_recovery_paths(self, profile_env):
+        """#91850: root-owned recovery paths must not abort a --clone-all.
+
+        `lost+found` (filesystem-created root:root 0700 on every ext
+        filesystem) and `portal-recovery` (root-owned recovery snapshots with
+        root:root 0640 files) previously hit PermissionError inside
+        shutil.copytree and aborted the entire profile clone, leaving a
+        partial directory. Both are excluded by name from the clone-all
+        ignore callback, so a --clone-all must neither fail on them nor copy
+        them into the new profile. We exercise the real copytree path
+        (clone_all=True) with unreadable dirs to prove the ignore filter —
+        not just the config-file clone path — drops them.
+        """
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
+
+        # Simulate the root-only source shape: contents written first, then
+        # the parent dirs locked down so copytree could never read inside.
+        lost = default_home / "lost+found"
+        lost.mkdir()
+        (lost / "inside").write_text("unreachable")
+        recovery = default_home / "portal-recovery" / "snapshots" / "last-ready"
+        recovery.mkdir(parents=True)
+        (recovery / "config.yaml").write_text("root:root 0640 in reality")
+        lost.chmod(0o000)
+        (default_home / "portal-recovery" / "snapshots").chmod(0o000)
+
+        try:
+            profile_dir = create_profile("luna", clone_all=True, no_alias=True)
+        finally:
+            # Restore modes so tmp_path cleanup can delete the tree.
+            lost.chmod(0o700)
+            (default_home / "portal-recovery" / "snapshots").chmod(0o700)
+
+        # The clone succeeded and carried the readable config…
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cloned_config["model"] == "test"
+        # …and neither root-owned path was copied.
+        assert not (profile_dir / "lost+found").exists()
+        assert not (profile_dir / "portal-recovery").exists()
+
 
 
 class TestProfilesToServe:
