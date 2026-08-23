@@ -928,7 +928,9 @@ export function ChatSidebar({
     // (e.g. Windows path-casing differences across profiles).
     const seen = new Set<string>()
     const deduped = sorted.filter(project => {
-      if (seen.has(project.id)) return false
+      if (seen.has(project.id)) {
+        return false
+      }
       seen.add(project.id)
       return true
     })
