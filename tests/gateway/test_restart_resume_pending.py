@@ -1274,6 +1274,43 @@ class TestRestoreHeartbeatWatches:
         with pytest.raises(asyncio.CancelledError):
             await task
 
+    @pytest.mark.asyncio
+    async def test_reconnect_prunes_stale_watch_not_reconfirmed_active(self):
+        """A watch registered before the platform dropped, then cleared while
+        it was down, must not survive the reconnect pass forever — only the
+        session re-confirmed active this round should remain registered.
+        """
+        runner, _adapter = make_restart_runner()
+        stale_entry = self._entry(
+            "agent:main:telegram:dm:hb-stale", "sid-stale", "hb-stale"
+        )
+        live_entry = self._entry(
+            "agent:main:telegram:dm:hb-live", "sid-live", "hb-live"
+        )
+        runner.session_store._entries = {
+            stale_entry.session_key: stale_entry,
+            live_entry.session_key: live_entry,
+        }
+        runner._register_heartbeat_watch(
+            stale_entry.session_key, stale_entry.origin, stale_entry.session_id
+        )
+
+        def _fake_load(session_id):
+            if session_id == "sid-live":
+                return MagicMock(status="active")
+            return None  # cleared while the adapter was down
+
+        with patch("hermes_cli.heartbeat.load_heartbeat", side_effect=_fake_load):
+            restored = runner._restore_heartbeat_watches(platform=Platform.TELEGRAM)
+
+        assert restored == 1
+        assert stale_entry.session_key not in runner._heartbeat_watch
+        assert live_entry.session_key in runner._heartbeat_watch
+        task = runner._heartbeat_poll_task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
     def test_no_adapter_defers_restore_to_reconnect(self):
         runner, _adapter = make_restart_runner()
         runner.adapters = {}

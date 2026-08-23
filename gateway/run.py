@@ -21583,6 +21583,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reschedule does, so a platform reconnecting after startup restores
         only its own sessions' watches. Idempotent: re-running just
         overwrites the same dict entries and no-ops the poller start.
+
+        A platform-scoped pass (reconnect) also prunes any watch already
+        registered for that platform but not re-confirmed active this
+        round — e.g. a heartbeat cleared while the adapter was down, whose
+        clear couldn't reach ``_unregister_heartbeat_watch``. The startup
+        pass (``platform=None``) skips this: the registry is empty then,
+        so there is nothing to prune.
         """
         from hermes_cli.heartbeat import load_heartbeat
 
@@ -21599,6 +21606,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         restored = 0
+        confirmed_keys = set()
         for entry in candidates:
             try:
                 state = load_heartbeat(entry.session_id)
@@ -21619,7 +21627,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
             self._register_heartbeat_watch(entry.session_key, entry.origin, entry.session_id)
+            confirmed_keys.add(entry.session_key)
             restored += 1
+
+        if platform is not None:
+            watch = getattr(self, "_heartbeat_watch", None) or {}
+            stale_keys = [
+                key
+                for key, (source, _sid) in watch.items()
+                if key not in confirmed_keys and getattr(source, "platform", None) == platform
+            ]
+            for key in stale_keys:
+                self._unregister_heartbeat_watch(key)
+            if stale_keys:
+                logger.info(
+                    "Pruned %d stale heartbeat watch(es) for platform %s", len(stale_keys), platform
+                )
+
         if restored:
             logger.info("Restored %d persisted heartbeat watch(es) after restart", restored)
         return restored
