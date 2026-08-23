@@ -23,6 +23,10 @@ API_PATH = (
     Path(__file__).resolve().parents[2]
     / "skills/productivity/google-workspace/scripts/google_api.py"
 )
+FORMATTING_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "skills/productivity/google-workspace/scripts/gmail_reply_formatting.py"
+)
 
 
 @pytest.fixture
@@ -54,6 +58,17 @@ def api_module(monkeypatch, tmp_path):
     module._gws_binary = lambda: "/usr/bin/gws"
     # Bypass authentication check — no real token file in CI.
     module._ensure_authenticated = lambda: None
+    return module
+
+
+@pytest.fixture
+def formatting_module():
+    spec = importlib.util.spec_from_file_location(
+        "gmail_reply_formatting_test", FORMATTING_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
     return module
 
 
@@ -233,6 +248,32 @@ def test_api_gmail_reply_trims_existing_plain_quote_chain(api_module):
 
     assert "> Immediate reply" in message.get_content()
     assert "Old chain" not in message.get_content()
+
+
+def test_html_sanitizer_closes_safe_ancestors_before_prior_quote(formatting_module):
+    value = (
+        "<div><table><tbody><tr><td>Current reply"
+        '<div id="divreplyfwdmsg">Older quoted chain</div>'
+        "</td></tr></tbody></table></div>"
+    )
+
+    assert formatting_module.sanitize_quoted_html(value) == (
+        "<div><table><tbody><tr><td>Current reply"
+        "</td></tr></tbody></table></div>"
+    )
+
+
+@pytest.mark.parametrize(
+    "prior_quote",
+    [
+        '<div id="divreplyfwdmsg">Outlook quoted chain</div>',
+        '<div class="protonmail_quote">ProtonMail quoted chain</div>',
+    ],
+)
+def test_html_to_text_uses_all_prior_quote_markers(formatting_module, prior_quote):
+    value = f"<p>Current reply</p>{prior_quote}"
+
+    assert formatting_module.html_to_text(value) == "Current reply"
 
 
 def test_api_gmail_reply_preserves_sanitized_html_by_default(api_module):

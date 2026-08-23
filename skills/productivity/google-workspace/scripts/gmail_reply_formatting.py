@@ -41,6 +41,16 @@ _QUOTE_CLASSES = {"gmail_extra", "gmail_quote", "moz-cite-prefix", "protonmail_q
 _QUOTE_IDS = {"appendonsend", "divreplyfwdmsg", "isforwardcontent"}
 
 
+def _is_prior_quote(tag: str, attrs: dict[str, str]) -> bool:
+    classes = set(attrs.get("class", "").lower().split())
+    return (
+        bool(classes & _QUOTE_CLASSES)
+        or attrs.get("id", "").lower() in _QUOTE_IDS
+        or "data-hermes-quote" in attrs
+        or (tag == "blockquote" and attrs.get("type", "").lower() == "cite")
+    )
+
+
 def _decode_body_data(data: str, charset: str = "utf-8") -> str:
     raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
     try:
@@ -124,21 +134,23 @@ class _SanitizingHTMLParser(HTMLParser):
         self.open_tags: list[tuple[str, bool]] = []
         self.stopped = False
 
+    def _close_open_safe_tags(self) -> None:
+        for tag, dropped in reversed(self.open_tags):
+            if not dropped and tag in _SAFE_TAGS and tag not in _VOID_TAGS:
+                self.output.append(f"</{tag}>")
+        self.open_tags.clear()
+        self.drop_depth = 0
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self.stopped:
             return
         tag = tag.lower()
         attrs_dict = {name.lower(): value or "" for name, value in attrs}
-        classes = set(attrs_dict.get("class", "").lower().split())
-        is_prior_quote = (
-            bool(classes & _QUOTE_CLASSES)
-            or attrs_dict.get("id", "").lower() in _QUOTE_IDS
-            or "data-hermes-quote" in attrs_dict
-            or (tag == "blockquote" and attrs_dict.get("type", "").lower() == "cite")
-        )
-        if is_prior_quote:
+        if _is_prior_quote(tag, attrs_dict):
+            self._close_open_safe_tags()
             self.stopped = True
-        dropped = self.drop_depth > 0 or tag in _DROP_CONTENT_TAGS or is_prior_quote
+            return
+        dropped = self.drop_depth > 0 or tag in _DROP_CONTENT_TAGS
         is_void = tag in _VOID_TAGS
         if not is_void:
             self.open_tags.append((tag, dropped))
@@ -222,9 +234,13 @@ class _HTMLToTextParser(HTMLParser):
         self.open_tags: list[tuple[str, bool]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
         attrs_dict = {name.lower(): value or "" for name, value in attrs}
-        classes = set(attrs_dict.get("class", "").lower().split())
-        dropped = self.drop_depth > 0 or tag in _DROP_CONTENT_TAGS or "gmail_quote" in classes
+        dropped = (
+            self.drop_depth > 0
+            or tag in _DROP_CONTENT_TAGS
+            or _is_prior_quote(tag, attrs_dict)
+        )
         is_void = tag in _VOID_TAGS
         if not is_void:
             self.open_tags.append((tag, dropped))
