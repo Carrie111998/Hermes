@@ -145,6 +145,11 @@ export interface Translations {
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
       remoteFailureHint: string
+      cloudDownTitle: string
+      cloudDownDescription: string
+      cloudDownHint: string
+      cloudDownCheckPortal: string
+      cloudDownDiscord: string
       hideRecentLogs: string
       showRecentLogs: string
       signedInTitle: string
@@ -243,6 +248,27 @@ export interface Translations {
     openBilling: string
     addCredits: string
     dismiss: string
+  }
+
+  sendDiagnostics: {
+    title: string
+    privacyNotice: string
+    upload: string
+    uploading: string
+    cancel: string
+    close: string
+    copyLink: string
+    uploadIdFallback: (id: string) => string
+    doneTitle: string
+    doneDescription: string
+    failedTitle: string
+    failedHint: string
+    handoffLead: string
+    links: {
+      discord: string
+      github: string
+      portal: string
+    }
   }
 
   titlebar: {
@@ -1509,6 +1535,34 @@ export interface Translations {
     switchConnectionFailed: (name: string) => string
     manageProfiles: string
     connectGateway: string
+    remoteOverride: {
+      menuItem: string
+      badge: (host: string) => string
+      title: (profile: string) => string
+      description: string
+      urlLabel: string
+      urlPlaceholder: string
+      urlInvalid: string
+      tokenLabel: string
+      tokenPlaceholder: string
+      tokenSavedHint: string
+      plainTextOptIn: string
+      collisionWarning: (label: string) => string
+      confirmTitle: string
+      confirmNote: (profile: string, host: string) => string
+      confirmBack: string
+      connect: string
+      connecting: string
+      disconnect: string
+      savedTitle: string
+      savedMessage: (profile: string, host: string) => string
+      removedTitle: string
+      removedMessage: (profile: string) => string
+      removeFailed: string
+      authFailedTitle: string
+      authFailedMessage: (profile: string, host: string) => string
+      updateToken: string
+    }
     actions: string
     color: string
     colorFor: string
@@ -2667,6 +2721,7 @@ export interface Translations {
       errorOpenLogsFailed: string
       errorOpenDesktopLogs: string
       errorCopyDiagnostics: string
+      errorSendDiagnostics: string
       filesChanged: (count: number) => string
       reviewChanges: string
       readAloudFailed: string

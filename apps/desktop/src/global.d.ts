@@ -207,6 +207,10 @@ declare global {
         set: (maxMb: number) => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>
       }
       readFileText: (filePath: string) => Promise<HermesReadFileTextResult>
+      /** Full-source read for runtime desktop plugins (readFileText truncates
+       *  at the 512 KiB preview cap). Absent on older shells — callers fall
+       *  back to readFileText and must reject a `truncated` result. */
+      readPluginSource?: (filePath: string) => Promise<HermesReadFileTextResult>
       selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
       /** Native save dialog; returns the chosen path or null on cancel. */
       selectSavePath?: (options?: {
@@ -879,6 +883,7 @@ export interface DesktopRosterAgent {
   connectionKind: DesktopConnectionKind
   connectionLabel: string
   profile: string
+  targetProfile?: string
   handle: string
 }
 
@@ -1000,6 +1005,8 @@ export interface DesktopCloudAgentSignInResult {
 export interface DesktopBootProgress {
   error: string | null
   fakeMode: boolean
+  /** True when the boot failure is a Nous Cloud agent that is down (HTTP 502/503/504). */
+  isCloudBackendDown?: boolean
   message: string
   phase: string
   progress: number
@@ -1011,6 +1018,8 @@ export interface DesktopBootProgress {
    */
   retryable?: boolean
   running: boolean
+  /** Structured HTTP status when the boot failure carried one (e.g. 503). */
+  statusCode?: number | null
   timestamp: number
 }
 

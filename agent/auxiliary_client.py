@@ -161,7 +161,11 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from agent.model_metadata import (
+    MINIMUM_CONTEXT_LENGTH,
+    get_model_context_length,
+    strip_codex_context_variant_suffix as _strip_codex_ctx_variant,
+)
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -674,11 +678,19 @@ def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = Non
     ``compression.codex_gpt55_autoraise`` config key.) The exact
     ``gpt-daybreak-blue-latest`` Codex slug is also a verified Sol-family
     alias and receives the same autoraise.
+
+    ``-900k`` large-context picker variants are explicitly EXCLUDED: the
+    85% autoraise exists to stop wasting a small 272K window, and a 900K
+    window doesn't have that problem — those sessions keep the user's
+    global ``compression.threshold`` (default 50%, ~450K).
     """
     prov = (provider or "").strip().lower()
     if prov != "openai-codex":
         return False
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    from agent.model_metadata import is_codex_context_variant
+    if is_codex_context_variant(bare):
+        return False
     return (
         bare == "gpt-5.4"
         or bare.startswith("gpt-5.4-")
@@ -1531,7 +1543,10 @@ class _CodexCompletionsAdapter:
         )
 
         resp_kwargs: Dict[str, Any] = {
-            "model": model,
+            # Strip the Hermes-side ``-900k`` large-context picker suffix —
+            # the Codex backend only knows the base slug (mirrors the main
+            # transport in agent/transports/codex.py::build_kwargs).
+            "model": _strip_codex_ctx_variant(model),
             "instructions": instructions,
             "input": input_items or [{"role": "user", "content": ""}],
             "store": False,
@@ -2830,8 +2845,15 @@ _paid_lane_warned: set = set()
 
 
 def _is_free_model(model: Optional[str]) -> bool:
-    """True when ``model`` is an OpenRouter free SKU (``:free`` suffix)."""
-    return bool(model) and str(model).strip().endswith(":free")
+    """True when ``model`` is a free SKU (``:free`` suffix or ``stealth/`` prefix).
+
+    Naming-convention trust: a paid model shipped under ``stealth/`` would
+    silently bypass both the free_only gate and the paid-lane warning.
+    """
+    if not model:
+        return False
+    normalized = str(model).strip()
+    return normalized.endswith(":free") or normalized.startswith("stealth/")
 
 
 def _aux_openrouter_settings() -> Tuple[bool, str]:
@@ -2853,7 +2875,8 @@ def _aux_openrouter_settings() -> Tuple[bool, str]:
 
 
 def _warn_paid_lane_once(model: str) -> None:
-    """Log a WARNING the first time a non-:free OpenRouter model is engaged."""
+    """Log a WARNING the first time a non-free (neither ``:free`` nor
+    ``stealth/``) OpenRouter model is engaged."""
     if model in _paid_lane_warned:
         return
     _paid_lane_warned.add(model)
