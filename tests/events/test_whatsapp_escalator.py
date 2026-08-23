@@ -113,6 +113,36 @@ class TestEscalationTier:
         assert EscalationTier.IMPORTANT.priority > EscalationTier.DIGEST.priority
 
 
+class TestAgentErrorClusterEligibility:
+    def _escalator(self, bus, quiet_config, queue_path):
+        return WhatsAppEscalator(
+            bus,
+            quiet_config_path=quiet_config,
+            queue_path=queue_path,
+            send_fn=lambda _message: True,
+        )
+
+    def test_synthetic_arm_errors_never_fill_the_cluster(self, bus, quiet_config, queue_path):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        synthetic = Event.create(
+            EventType.AGENT_ERROR,
+            "probe",
+            {"error": "ARM TEST", "synthetic": True},
+            tags=["arm-test", "verification-probe"],
+        )
+        assert not escalator.should_escalate(synthetic)
+        assert not escalator.should_escalate(synthetic)
+        assert not escalator.should_escalate(synthetic)
+        assert len(escalator._agent_error_times) == 0
+
+    def test_only_three_genuine_errors_trigger_cluster(self, bus, quiet_config, queue_path):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        real = Event.create(EventType.AGENT_ERROR, "worker", {"error": "boom"})
+        assert not escalator.should_escalate(real)
+        assert not escalator.should_escalate(real)
+        assert escalator.should_escalate(real)
+
+
 class TestQuietHoursConfigHardening:
     """Invalid quiet_hours.json must fail safe, not silently let WA through at 3am."""
 

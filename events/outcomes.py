@@ -213,8 +213,27 @@ _CRON_FAILURE_RE = re.compile(
     r"(?:\b(?:RED|FAILED|FAILURE|CRITICAL)\b"
     r"|\berrors?=[1-9]\d*\b"
     r"|\bfirst error\b"
-    r"|\brc=[1-9]\d*\b)"
+    r"|\brc=[1-9]\d*\b"
+    r"|\bexit(?:_code)?=(?:-[1-9]\d*|[1-9]\d*)\b)"
 )
+_CRON_HISTORICAL_INVENTORY_RE = re.compile(
+    r"\bby_state\s*=\s*\{[^{}]*\}",
+    re.IGNORECASE,
+)
+
+
+def legacy_cron_output_is_failure(output_summary: object, *, limit: int = 400) -> bool:
+    """Return whether legacy cron prose proves the current run failed.
+
+    Historical state inventories are context, not a verdict for this run. Strip
+    their flat JSON/Python-dict segment before applying the compatibility
+    markers; structured event fields remain authoritative elsewhere.
+    """
+    text = str(output_summary or "")[:limit]
+    current_run_text = _CRON_HISTORICAL_INVENTORY_RE.sub("", text)
+    return bool(_CRON_FAILURE_RE.search(current_run_text))
+
+
 
 
 def _normalized(value: Any) -> str:
@@ -406,7 +425,7 @@ def evaluate_outcome(event: Event) -> OutcomeVerdict:
 
     if event.event_type is EventType.CRON_COMPLETED:
         output_summary = str(payload.get("output_summary", ""))[:400]
-        if _CRON_FAILURE_RE.search(output_summary):
+        if legacy_cron_output_is_failure(output_summary):
             failed.append(
                 _evidence("legacy_cron_failure", "payload.output_summary", output_summary)
             )

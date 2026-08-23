@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from events.bus import EventBus
+from events.failure_eligibility import failure_cluster_eligible
 from events.noise_guards import RepeatGuard, is_sustained_resource_repeat
 from events.routing_policy import (
     WA_IMMEDIATE,
@@ -197,7 +198,10 @@ class WhatsAppEscalator(BaseSubscriber):
         window) is a real outage and escalates as URGENT.
         """
         if event.event_type == EventType.AGENT_ERROR:
-            return self._agent_error_cluster_triggered()
+            return (
+                failure_cluster_eligible(event)
+                and self._agent_error_cluster_triggered()
+            )
         return classify_tier(event) is not None
 
     def _agent_error_cluster_triggered(self) -> bool:
@@ -279,7 +283,10 @@ class WhatsAppEscalator(BaseSubscriber):
 
         route = policy_classify(event)
         if event.event_type == EventType.AGENT_ERROR:
-            if not self._agent_error_cluster_triggered():
+            if (
+                not failure_cluster_eligible(event)
+                or not self._agent_error_cluster_triggered()
+            ):
                 return
         elif route.wa_tier is None:
             return

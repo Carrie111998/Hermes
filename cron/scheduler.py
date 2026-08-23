@@ -1634,6 +1634,28 @@ def _claim_credits_iteration(firecrawl_state) -> bool:
     )
 
 
+_AGENT_ITERATION_UNPARSED = object()
+
+
+def _resolve_agent_iteration_workload(
+    final_response: str,
+) -> tuple[tuple, str | None]:
+    """Parse iteration evidence once and return any authoritative workload error."""
+    extracted = _extract_agent_iteration(final_response)
+    parsed, error_reason, _raw_block = extracted
+    if error_reason is not None or parsed is None:
+        return extracted, None
+
+    exit_code = (parsed.get("counters") or {}).get("exit_code")
+    if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
+        if exit_code != 0:
+            return (
+                extracted,
+                f"Workload reported exit_code={exit_code:g} in AGENT_ITERATION_JSON",
+            )
+    return extracted, None
+
+
 def _emit_agent_iteration_event(
     emitter,
     job: dict,
@@ -1641,6 +1663,7 @@ def _emit_agent_iteration_event(
     *,
     firecrawl_state=None,
     credits_only: bool = False,
+    extracted=_AGENT_ITERATION_UNPARSED,
 ) -> None:
     """Hook called from _process_job for ALL successful cron runs.
 
@@ -1670,7 +1693,9 @@ def _emit_agent_iteration_event(
         job_id = job.get("id") or ""
         job_name = job.get("name", "")
 
-        parsed, error_reason, raw_block = _extract_agent_iteration(final_response)
+        if extracted is _AGENT_ITERATION_UNPARSED:
+            extracted = _extract_agent_iteration(final_response)
+        parsed, error_reason, raw_block = extracted
 
         # Lazy import — kept inside the function to avoid bootstrapping
         # events.producers at scheduler import time (matches the
@@ -1826,14 +1851,17 @@ def _finalize_agent_iteration_event(
     *,
     success: bool,
     firecrawl_state,
+    extracted=_AGENT_ITERATION_UNPARSED,
+    workload_failed: bool = False,
 ) -> None:
     """Emit ordinary iteration evidence or one credits-gated Scout action."""
-    if success:
+    if success or workload_failed:
         _emit_agent_iteration_event(
             emitter,
             job,
             final_response,
             firecrawl_state=firecrawl_state,
+            extracted=extracted,
         )
     elif firecrawl_state and firecrawl_state.first_failure:
         _emit_agent_iteration_event(
@@ -5697,6 +5725,8 @@ def _run_one_job_admitted(
     firecrawl_token = None
     success = False
     final_response = ""
+    agent_iteration = _AGENT_ITERATION_UNPARSED
+    workload_failed = False
 
     # Same-job concurrency guard (Guard #3, 2026-04-30) — fork seam.
     # The built-in ticker enforces this inside ``tick``'s ``_process_job``;
@@ -5805,6 +5835,14 @@ def _run_one_job_admitted(
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        agent_iteration, workload_error = _resolve_agent_iteration_workload(
+            final_response or ""
+        )
+        if success and workload_error:
+            success = False
+            error = workload_error
+            workload_failed = True
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -5922,6 +5960,8 @@ def _run_one_job_admitted(
                     final_response or "",
                     success=success,
                     firecrawl_state=firecrawl_state,
+                    extracted=agent_iteration,
+                    workload_failed=workload_failed,
                 )
             finally:
                 _reset_scout_firecrawl_run(firecrawl_token)
@@ -6133,6 +6173,8 @@ def _tick_admitted(
             firecrawl_token = None
             success = False
             final_response = ""
+            agent_iteration = _AGENT_ITERATION_UNPARSED
+            workload_failed = False
 
             # Same-job concurrency guard (Guard #3, 2026-04-30) -----------
             # Reject a second fire while a prior fire for this job_id is
@@ -6287,6 +6329,13 @@ def _tick_admitted(
                     _deadline_box["firecrawl_state"] = firecrawl_state
                 success, output, final_response, error = run_job(job)
                 _job_duration = _time.monotonic() - _job_start
+                agent_iteration, workload_error = _resolve_agent_iteration_workload(
+                    final_response or ""
+                )
+                if success and workload_error:
+                    success = False
+                    error = workload_error
+                    workload_failed = True
 
                 # Persist the run transcript before choosing the normal or late
                 # terminal path. Output persistence can itself cross the soft
@@ -6493,6 +6542,8 @@ def _tick_admitted(
                                 final_response or "",
                                 success=success,
                                 firecrawl_state=firecrawl_state,
+                                extracted=agent_iteration,
+                                workload_failed=workload_failed,
                             )
                         elif firecrawl_state and firecrawl_state.first_failure:
                             # The deadline owner finalizes any credits already

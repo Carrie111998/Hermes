@@ -200,6 +200,46 @@ def test_cron_completed_legacy_failure_marker_is_compatibility_evidence():
     assert any(item.path == "payload.output_summary" for item in verdict.evidence)
 
 
+@pytest.mark.parametrize("marker", ["exit=1", "exit_code=2", "exit=-1", "exit_code=-9"])
+def test_cron_completed_nonzero_legacy_exit_is_failure(marker):
+    verdict = evaluate_outcome(
+        _event(
+            {"output_summary": f"worker finished {marker}"},
+            event_type=EventType.CRON_COMPLETED,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+@pytest.mark.parametrize("marker", ["exit=0", "exit_code=0"])
+def test_cron_completed_zero_legacy_exit_is_benign(marker):
+    verdict = evaluate_outcome(
+        _event(
+            {"output_summary": f"worker finished {marker}"},
+            event_type=EventType.CRON_COMPLETED,
+        )
+    )
+
+    assert verdict.state is OutcomeState.SUCCEEDED
+
+
+def test_cron_completed_historical_failed_inventory_is_not_current_failure():
+    verdict = evaluate_outcome(
+        _event(
+            {
+                "output_summary": (
+                    'considered=0 triaged=0 errors=0 '
+                    'by_state={"COMPLETED": 7, "FAILED": 1}'
+                )
+            },
+            event_type=EventType.CRON_COMPLETED,
+        )
+    )
+
+    assert verdict.state is OutcomeState.SUCCEEDED
+
+
 def test_failure_and_degradation_have_high_priority_floor():
     assert evaluate_outcome(_event({"exit_code": 1})).priority_floor is Priority.HIGH
     assert evaluate_outcome(_event({"status": "partial"})).priority_floor is Priority.HIGH

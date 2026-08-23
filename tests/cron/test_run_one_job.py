@@ -71,6 +71,26 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_tick_structured_nonzero_exit_marks_workload_failed(monkeypatch):
+    """The built-in ticker shares the structured workload failure verdict."""
+    response = (
+        '<AGENT_ITERATION_JSON>{"agent":"devflow","summary":"failed",'
+        '"counters":{"exit_code":2}}</AGENT_ITERATION_JSON>'
+    )
+    calls = _patch_pipeline(monkeypatch, final=response)
+    monkeypatch.setattr(
+        s,
+        "get_due_and_skipped_jobs",
+        lambda: ([{"id": "j-tick-failed", "name": "devflow-bridge"}], []),
+    )
+    monkeypatch.setattr(s, "advance_next_run", lambda _job_id: True)
+
+    s.tick(verbose=False, sync=True)
+
+    mark = [call for call in calls if call[0] == "mark"]
+    assert mark == [("mark", "j-tick-failed", False)]
+
+
 def test_run_one_job_silent_skips_delivery(monkeypatch):
     """A [SILENT] final response saves output + marks the run but does NOT
     deliver."""
@@ -103,6 +123,92 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert "deliver" in kinds  # failures always deliver
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_structured_nonzero_exit_overrides_green_model_turn_everywhere(monkeypatch):
+    """A green model turn cannot persist success when its workload reports exit 1."""
+    response = (
+        "workload wrapper returned\n"
+        "<AGENT_ITERATION_JSON>"
+        '{"agent":"devflow","summary":"workload failed",'
+        '"counters":{"exit_code":1},"reason":"error"}'
+        "</AGENT_ITERATION_JSON>"
+    )
+    job = {"id": "j-workload-failed", "name": "devflow-bridge"}
+    marks = []
+    executions = []
+
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda _job, *, defer_agent_teardown=None: (True, "raw output", response, None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_k: "/tmp/output")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda job_id, success, error=None, **_k: marks.append(
+            {"job_id": job_id, "success": success, "error": error}
+        ),
+    )
+    monkeypatch.setattr(
+        s,
+        "create_execution",
+        lambda *_a, **_k: {"id": "exec-workload-failed"},
+    )
+    monkeypatch.setattr(s, "mark_execution_running", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda execution_id, **kwargs: executions.append(
+            {"execution_id": execution_id, **kwargs}
+        ),
+    )
+
+    class Emitter:
+        def __init__(self):
+            from unittest.mock import MagicMock
+
+            self.bus = MagicMock()
+            self.completed = []
+
+        def on_job_started(self, **_kwargs):
+            return "started-event"
+
+        def on_job_completed(self, **kwargs):
+            self.completed.append(kwargs)
+
+    emitter = Emitter()
+    monkeypatch.setattr(s, "_get_event_emitter", lambda: emitter)
+    monkeypatch.setattr(
+        __import__("cron.jobs", fromlist=["load_jobs"]),
+        "load_jobs",
+        lambda: [{"id": job["id"], "consecutive_errors": 1}],
+    )
+
+    assert s.run_one_job(job) is True
+
+    assert marks == [{
+        "job_id": job["id"],
+        "success": False,
+        "error": "Workload reported exit_code=1 in AGENT_ITERATION_JSON",
+    }]
+    assert executions == [{
+        "execution_id": "exec-workload-failed",
+        "success": False,
+        "error": "Workload reported exit_code=1 in AGENT_ITERATION_JSON",
+    }]
+    assert len(emitter.completed) == 1
+    assert emitter.completed[0]["success"] is False
+    assert emitter.completed[0]["output_summary"] is None
+    assert emitter.completed[0]["error"] == marks[0]["error"]
+
+    from events.schema import EventType
+
+    iteration = emitter.bus.emit.call_args.kwargs
+    assert iteration["event_type"] == EventType.AGENT_ITERATION
+    assert iteration["payload"]["counters"]["exit_code"] == 1
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):

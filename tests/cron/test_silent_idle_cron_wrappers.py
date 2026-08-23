@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,14 @@ def _load(name):
         pytest.skip(f"script not present at {path}")
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    added = str(path.parent) not in sys.path
+    if added:
+        sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if added:
+            sys.path.remove(str(path.parent))
     return mod
 
 
@@ -55,6 +63,11 @@ class TestPostgresSync:
 
         monkeypatch.setattr(mod.subprocess, "run", _run)
         monkeypatch.setattr(mod.Path, "exists", lambda self: True)
+        monkeypatch.setattr(
+            mod,
+            "fetch_alias_snapshot",
+            lambda _directory: pathlib.Path("jobflow-alias-snapshot.json"),
+        )
         return calls
 
     def test_successful_tick_is_silent(self, mod, monkeypatch, capsys):
@@ -95,8 +108,8 @@ class TestJobflowApprovedRelease:
         canonical = tmp_path / "pipeline.json"
         canonical.write_text(json.dumps({"jobs": []}), encoding="utf-8")
         monkeypatch.setattr(m, "CANONICAL_PATH", canonical)
-        monkeypatch.setattr(m, "already_requested_ids", lambda dirs: set())
-        monkeypatch.setattr(m, "mirror_approved_ids", lambda p: set())
+        monkeypatch.setattr(m, "already_requested_ids", lambda *args, **kwargs: set())
+        monkeypatch.setattr(m, "mirror_approved_ids", lambda *args, **kwargs: set())
         monkeypatch.setattr(m, "research_pending_ids", lambda p: set())
         # argparse would otherwise consume pytest's own argv.
         monkeypatch.setattr("sys.argv", ["jobflow_approved_release.py"])

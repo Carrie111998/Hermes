@@ -39,7 +39,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Collection, Dict, Optional, Tuple
 
-from events.outcomes import OutcomeState, OutcomeVerdict, evaluate_outcome
+from events.outcomes import (
+    OutcomeState,
+    OutcomeVerdict,
+    evaluate_outcome,
+    legacy_cron_output_is_failure,
+)
 from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
 
@@ -334,15 +339,9 @@ STATUS_BLACKOUT_SELF_DEGRADED_REASONS = frozenset({
 
 HIGH_SCORE_WA_THRESHOLD = 9.0
 
-# cron_completed output that means "this run found trouble" even though the
-# process exited 0 — e.g. "NIGHTLY GATE: RED - pytest rc=2". Word-boundary,
-# case-sensitive for the shouty markers; errors=N / rc=N are exact forms.
-_CRON_ALERT_RE = re.compile(
-    r"(?:\b(?:RED|FAILED|FAILURE|CRITICAL)\b"
-    r"|\berrors?=[1-9]\d*\b"
-    r"|\bfirst error\b"
-    r"|\brc=[1-9]\d*\b)"
-)
+# Cron output that means "this run found trouble" even though it arrived as
+# cron_completed. The compatibility parser lives in outcomes so presentation
+# and routing cannot drift on historical inventory or exit-code syntax.
 _CRON_ALERT_SCAN_CHARS = 400
 
 # cron_completed output that ASKS DIEGO SOMETHING — "Reply ALL or...", a y/n
@@ -431,8 +430,10 @@ def _cap(priority: Priority, cap: Optional[Priority]) -> Priority:
 def cron_output_is_alert(output_summary: str) -> bool:
     """True iff a cron run's output text signals trouble (P9: content can
     outrank type)."""
-    text = str(output_summary or "")[:_CRON_ALERT_SCAN_CHARS]
-    return bool(_CRON_ALERT_RE.search(text))
+    return legacy_cron_output_is_failure(
+        output_summary,
+        limit=_CRON_ALERT_SCAN_CHARS,
+    )
 
 
 def cron_output_is_actionable(output_summary: str) -> bool:

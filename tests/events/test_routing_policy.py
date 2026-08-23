@@ -512,6 +512,17 @@ def test_cron_errors_count_upgrades():
     assert cron_output_is_alert("run done, errors=1 — first error: GET ...")
 
 
+@pytest.mark.parametrize("marker", ["exit=1", "exit_code=2"])
+def test_cron_nonzero_exit_upgrades(marker):
+    assert cron_output_is_alert(f"worker finished {marker}")
+
+
+def test_cron_historical_failed_inventory_does_not_upgrade():
+    assert not cron_output_is_alert(
+        'considered=0 triaged=0 errors=0 by_state={"COMPLETED": 7, "FAILED": 1}'
+    )
+
+
 def test_cron_benign_output_stays_trace():
     route = classify(make_event(EventType.CRON_COMPLETED, {
         "output_summary": "synced 42 rows, errors=0, all green",
