@@ -287,30 +287,39 @@ export function ConnectionsRegistrySection() {
     }
 
     const seq = ++probeSeq.current
+    // Staleness is covered by probeSeq, but not unmount: a probe resolving
+    // after the editor closes would still call setAuthProbe on an unmounted
+    // component. Harmless in React 18, still worth not doing.
+    let cancelled = false
 
     const timer = setTimeout(() => {
       window.hermesDesktop
         .probeConnectionConfig(editorUrl)
         .then(result => {
-          if (seq === probeSeq.current) {
+          if (!cancelled && seq === probeSeq.current) {
             setAuthProbe(result)
           }
         })
         .catch(() => {
-          if (seq === probeSeq.current) {
+          if (!cancelled && seq === probeSeq.current) {
             setAuthProbe(null)
           }
         })
     }, 400)
 
-    return () => clearTimeout(timer)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
   }, [editorUrl, editorWantsOauth])
 
   // The session is scoped to an origin, so pointing the editor at a different
-  // URL invalidates the "signed in" state this row is reporting.
+  // URL invalidates the "signed in" state this row is reporting. Flipping the
+  // auth mode invalidates it too: a saved row edited token -> oauth must not
+  // present a stale "Signed in" pill from an earlier oauth stint.
   useEffect(() => {
     setOauthConnected(false)
-  }, [editorUrl])
+  }, [editorUrl, editorWantsOauth])
 
   // Open the gateway's own login window and let the main process keep whatever
   // it mints (native PKCE bearer tokens, or the legacy session cookies). This
