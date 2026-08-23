@@ -1,0 +1,212 @@
+name: Publish reviewed Phase-G process-edge authority branch
+
+on:
+  push:
+    branches:
+      - security/process-edge-authority-broker
+    paths:
+      - .github/finalize-process-edge-authority.py.gz.b64
+      - .github/workflows/publish-process-edge-authority.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase-g-reviewed-product-publisher
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: f293e7206b4ddd66042329442c6afebc19a8808d
+  PRODUCT_BRANCH: phase-g-capability-bound-process-creation
+  FINALIZER_SHA256: f2b303f3c6648a7e8293229bd9cf4f4dad82df7d21e1bd46bca8ea0f5a746087
+
+jobs:
+  publish:
+    name: Materialize, self-review, test, and publish clean product
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout private transport branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify upstream base did not move
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+            refs/heads/main:refs/remotes/upstream/main
+          actual="$(git rev-parse refs/remotes/upstream/main)"
+          test "$actual" = "$BASE_SHA" || {
+            echo "::error::upstream main moved: expected $BASE_SHA, found $actual"
+            exit 1
+          }
+
+      - name: Reconstruct reviewed product on exact upstream main
+        run: |
+          set -euo pipefail
+          work=/tmp/phase-g-reviewed-product
+          rm -rf "$work"
+          git worktree add --detach "$work" "$BASE_SHA"
+          mkdir -p "$work/.github"
+          cp .github/materialize-process-edge-authority.py \
+            "$work/.github/materialize-process-edge-authority.py"
+          base64 --decode .github/finalize-process-edge-authority.py.gz.b64 \
+            | gzip --decompress > "$work/.github/finalize-process-edge-authority.py"
+          echo "$FINALIZER_SHA256  $work/.github/finalize-process-edge-authority.py" \
+            | sha256sum --check --strict -
+          python "$work/.github/materialize-process-edge-authority.py"
+          python "$work/.github/finalize-process-edge-authority.py"
+          rm -f \
+            "$work/.github/materialize-process-edge-authority.py" \
+            "$work/.github/finalize-process-edge-authority.py"
+
+          cd "$work"
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          expected = {
+              "agent/copilot_acp_client.py",
+              "agent/secret_sources/bitwarden.py",
+              "agent/secret_sources/command.py",
+              "agent/secret_sources/onepassword.py",
+              "agent/transports/codex_app_server.py",
+              "docs/design/process-edge-authority.md",
+              "hermes_cli/onepassword_secrets_cli.py",
+              "hermes_cli/pty_bridge.py",
+              "hermes_cli/secrets_cli.py",
+              "hermes_cli/win_pty_bridge.py",
+              "tests/security/test_child_process_authority_guard.py",
+              "tests/tools/test_child_process_authority.py",
+              "tools/checkpoint_manager.py",
+              "tools/child_process_authority.py",
+              "tools/environments/base.py",
+              "tools/environments/singularity.py",
+              "tui_gateway/host_supervisor.py",
+              "tui_gateway/methods_tools.py",
+          }
+          subprocess.run(["git", "add", "--", *sorted(expected)], check=True)
+          actual = set(
+              subprocess.check_output(
+                  ["git", "diff", "--cached", "--name-only"], text=True
+              ).splitlines()
+          )
+          untracked = set(
+              subprocess.check_output(
+                  ["git", "ls-files", "--others", "--exclude-standard"], text=True
+              ).splitlines()
+          )
+          if actual != expected:
+              raise SystemExit(
+                  f"product path mismatch: missing={sorted(expected - actual)} "
+                  f"extra={sorted(actual - expected)}"
+              )
+          if untracked:
+              raise SystemExit(f"unexpected untracked publication files: {sorted(untracked)}")
+          for path in expected:
+              if not Path(path).is_file():
+                  raise SystemExit(f"missing product file: {path}")
+          print(f"reviewed_product_files={len(expected)}")
+          PY
+          git diff --cached --check
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            /tmp/phase-g-reviewed-product/pyproject.toml
+            /tmp/phase-g-reviewed-product/uv.lock
+
+      - name: Install Python and development dependencies
+        working-directory: /tmp/phase-g-reviewed-product
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra dev
+
+      - name: Run Phase-G and adjacent regression suites
+        working-directory: /tmp/phase-g-reviewed-product
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/security/test_child_process_authority_guard.py \
+            tests/tools/test_child_process_authority.py \
+            tests/test_command_secret_source.py \
+            tests/agent/transports/test_codex_app_server_runtime.py \
+            tests/tui_gateway/test_compute_host.py \
+            tests/tools/test_base_environment.py
+
+      - name: Run lint and formatting gates
+        working-directory: /tmp/phase-g-reviewed-product
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mapfile -t py_files < <(git diff --cached --name-only -- '*.py')
+          ruff check "${py_files[@]}"
+          ruff format --check "${py_files[@]}"
+
+      - name: Commit and publish clean branch
+        id: publish
+        working-directory: /tmp/phase-g-reviewed-product
+        run: |
+          set -euo pipefail
+          git switch -C "$PRODUCT_BRANCH"
+          git config user.name "Andrex Ibiza"
+          git config user.email "84248988+andrexibiza@users.noreply.github.com"
+          git commit -m "feat(security): bind child processes to typed authority"
+          commit_sha="$(git rev-parse HEAD)"
+          git push origin HEAD:"refs/heads/$PRODUCT_BRANCH" \
+            --force-with-lease="refs/heads/$PRODUCT_BRANCH:$BASE_SHA"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Emit content-addressed publication receipt
+        working-directory: /tmp/phase-g-reviewed-product
+        env:
+          COMMIT_SHA: ${{ steps.publish.outputs.commit_sha }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          paths = subprocess.check_output(
+              ["git", "diff", "--name-only", os.environ["BASE_SHA"], "HEAD"],
+              text=True,
+          ).splitlines()
+          receipt = {
+              "base_sha": os.environ["BASE_SHA"],
+              "commit_sha": os.environ["COMMIT_SHA"],
+              "product_branch": os.environ["PRODUCT_BRANCH"],
+              "product_file_count": len(paths),
+              "files": {
+                  path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                  for path in paths
+              },
+              "verification": [
+                  "phase-g and adjacent pytest suites",
+                  "ruff check",
+                  "ruff format --check",
+                  "git diff --check",
+                  "exact product path assertion",
+              ],
+          }
+          Path("phase-g-publication-receipt.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(receipt, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase-g-publication-${{ steps.publish.outputs.commit_sha }}
+          path: /tmp/phase-g-reviewed-product/phase-g-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 7
