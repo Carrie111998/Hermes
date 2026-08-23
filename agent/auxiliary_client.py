@@ -5271,7 +5271,11 @@ async def _retry_same_provider_async(
     force_stream = _provider_requires_stream(
         effective_provider or resolved_provider,
         retry_base or resolved_base_url,
-    ) and not isinstance(retry_client, AsyncCodexAuxiliaryClient)
+    ) and not isinstance(retry_client, (
+        AsyncCodexAuxiliaryClient,
+        AsyncAnthropicAuxiliaryClient,
+        AsyncBedrockAuxiliaryClient,
+    ))
 
     async def _acreate(_kwargs: Dict[str, Any]) -> Any:
         if force_stream:
