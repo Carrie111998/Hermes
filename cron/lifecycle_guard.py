@@ -110,6 +110,68 @@ _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
 
 
+# Directory names that sit directly under a `Library` path component and
+# mark a FileProvider-backed subtree: `Mobile Documents` is iCloud Drive;
+# `CloudStorage` hosts every third-party FileProvider domain (Dropbox,
+# OneDrive, Google Drive, Box, ...) on modern macOS.
+_CLOUD_PLACEHOLDER_MARKERS = frozenset({"Mobile Documents", "CloudStorage"})
+
+
+def _is_cloud_placeholder_path(path: Path) -> bool:
+    """Return True for paths inside a macOS FileProvider-backed subtree.
+
+    ``O_NONBLOCK`` does not make regular-file reads non-blocking.  Opening an
+    evicted FileProvider placeholder below ``~/Library/Mobile Documents``
+    (iCloud Drive) or ``~/Library/CloudStorage`` (Dropbox / OneDrive /
+    Google Drive and other third-party providers) can therefore wait
+    indefinitely for hydration.  The lifecycle guard runs before a terminal
+    command's timeout starts, so it must identify this boundary from path
+    metadata and fail closed without opening the file.
+    """
+    parts = path.parts
+    return any(
+        parts[index - 1] == "Library" and part in _CLOUD_PLACEHOLDER_MARKERS
+        for index, part in enumerate(parts)
+        if index
+    )
+
+# Executables whose arguments are DATA, not commands: search patterns, SQL
+# statements, log filters. None of these can execute their argument text, so
+# a lifecycle-shaped string inside their arguments (a grep pattern hunting
+# for `systemctl restart hermes-gateway` in syslog, a SQL LIKE literal over a
+# restart-events table) is diagnostics, not a lifecycle command. Deliberately
+# conservative: no `awk` (system()), no `sed` (`s///e`), no `echo`/`printf`
+# (routinely piped into a shell), no `mysql` (`\\!` and `system` escapes).
+_DATA_SINK_EXECUTABLES = frozenset(
+    {"grep", "egrep", "fgrep", "rg", "ag", "ack", "journalctl", "sqlite3", "psql"}
+)
+# Argument shapes that can smuggle execution back INTO a data sink: command
+# and process substitution anywhere, sqlite3 dot-commands (`.shell ...`),
+# psql backslash escapes (`\! ...`). Any hit disables masking for the whole
+# segment — fail closed to the plain regex verdict.
+_UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
+# A data sink piped into a shell/interpreter can feed matched lines straight
+# to execution (`grep 'systemctl restart hermes-gateway' f | sh`); never mask
+# such a line.
+_PIPE_TO_INTERPRETER = re.compile(
+    r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
+)
+
+# Executable-image magic numbers: ELF, PE/COFF, Mach-O (universal + thin,
+# both endiannesses). A referenced file starting with one of these is a
+# compiled binary, never a shell script — don't read or scan it at all.
+_BINARY_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"MZ",
+    b"\xca\xfe\xba\xbe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+)
+_BINARY_SNIFF_BYTES = 4096
+
+
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
@@ -171,6 +233,102 @@ def contains_launchctl_submit_command(command: str) -> bool:
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
     return False
+
+
+def _mask_data_sink_arguments(text: str) -> str:
+    """Replace data-sink executables' arguments with a neutral placeholder.
+
+    The lifecycle regex is command-shaped, but it cannot tell an EXECUTED
+    ``systemctl restart hermes-gateway`` from the same characters appearing
+    as *data* — a grep/rg pattern, a journalctl filter, a SQL string literal
+    passed to sqlite3/psql. Those diagnostics commands were being rejected
+    (false positives blocking legitimate cron prompts), e.g.::
+
+        grep -c 'systemctl restart hermes-gateway' /var/log/syslog
+        sqlite3 db "SELECT msg FROM log WHERE msg LIKE '%systemctl restart hermes-gateway%'"
+
+    This masker shell-tokenizes each line and, for command segments whose
+    executable is a known data sink (``_DATA_SINK_EXECUTABLES``), replaces
+    every argument with ``arg``. The caller then re-runs the lifecycle regex
+    on the masked text: a match that survives masking sits OUTSIDE any data
+    argument and is a real command.
+
+    Strictly fail-closed: masking is skipped (leaving the original,
+    regex-matching text in place) whenever the line pipes into a shell or
+    interpreter, any argument carries an execution-capable marker
+    (substitution, sqlite3 ``.``-commands, psql ``\\!``), or the line cannot
+    be tokenized at all. Masking can therefore only ever ALLOW a command the
+    plain regex would have blocked — never block one it would have allowed —
+    so it runs solely as a second-pass exemption check.
+    """
+    lines_out: list[str] = []
+    changed = False
+    for line in text.splitlines() or [text]:
+        if _PIPE_TO_INTERPRETER.search(line):
+            lines_out.append(line)
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            tokens = list(lexer)
+        except ValueError:
+            lines_out.append(line)
+            continue
+
+        segments: list[list[str]] = []
+        current: list[str] = []
+        for token in tokens:
+            if token and set(token) <= _CONTROL_CHARS:
+                segments.append(current)
+                segments.append([token])
+                current = []
+                continue
+            current.append(token)
+        segments.append(current)
+
+        rebuilt: list[str] = []
+        for segment in segments:
+            if not segment:
+                continue
+            index = _command_token_index(segment)
+            if index is not None and Path(segment[index]).name in _DATA_SINK_EXECUTABLES:
+                arguments = segment[index + 1 :]
+                if not any(
+                    argument.startswith(".")
+                    or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
+                    for argument in arguments
+                ):
+                    changed = True
+                    rebuilt.extend(segment[: index + 1])
+                    rebuilt.extend("arg" for _ in arguments)
+                    continue
+            rebuilt.extend(segment)
+        lines_out.append(" ".join(rebuilt))
+    if not changed:
+        return text
+    return "\n".join(lines_out)
+
+
+def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
+    """Lifecycle-regex scan that exempts matches living inside data arguments.
+
+    Two-pass: the cheap regex first (the overwhelmingly common no-match case
+    pays nothing extra); on a raw match, re-scan with data-sink arguments
+    masked out. Only a match that survives masking — i.e. one in actual
+    command position — blocks.
+    """
+    if not contains_gateway_lifecycle_command(text):
+        return False
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
+
+
+def _direct_lifecycle_scan(command: str) -> bool:
+    """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+    return _lifecycle_command_scan_with_data_exemption(
+        command
+    ) or contains_launchctl_submit_command(command)
 
 
 def _expand_candidate_path(candidate: str) -> Optional[Path]:
@@ -294,7 +452,28 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+
+    This is the shared choke point for every local script read the guard
+    performs (the terminal walk in ``_contains_unsafe_gateway_action`` AND
+    the cron-script scan in ``_read_script_for_scanning``), so the
+    cloud-placeholder refusal lives here: a FileProvider path must never be
+    opened — not even to discover whether the file is hydrated — because an
+    evicted placeholder's ``open()`` can hang preflight indefinitely
+    (#88052). The lexical check covers direct cloud paths; the resolved
+    check covers local launchers that are symlinks into a cloud subtree.
+    """
+    if _is_cloud_placeholder_path(path):
+        return None, True
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte
+        # from a binary's decoded contents tokenized as a path — a
+        # guarded path must never crash the guard (#76762).
+        resolved = path
+    if _is_cloud_placeholder_path(resolved):
+        return None, True
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -308,11 +487,31 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
+            # Directories are not scripts. Docker Desktop writes
+            # ``fpath=(~/.docker/completions …)`` into ``~/.zshrc``; the
+            # walk then treats that dir as a referenced script and used
+            # to fail-closed, blocking ``source ~/.zshrc`` (#86753).
+            # Devices/sockets stay fail-closed.
+            if stat.S_ISDIR(metadata.st_mode):
+                return None, False
             return None, True
-        # Read a bounded chunk first — even for oversized files, the first
-        # chunk tells us if this is a binary (NUL bytes) that should be
-        # skipped as "nothing to scan" rather than failing closed (#76762).
-        data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
+        # Sniff a small prefix first: files that are clearly compiled
+        # binaries (executable magic, or NUL bytes in the head) are never
+        # shell scripts, so skip them WITHOUT reading the rest — reading a
+        # megabyte of machine code just to discard it wastes the guard's
+        # budget and (pre-#77703) fed decoded garbage into the recursion.
+        data = os.read(descriptor, _BINARY_SNIFF_BYTES)
+        if data.startswith(_BINARY_MAGIC_PREFIXES) or b"\x00" in data:
+            return None, False
+        # Read the remainder (bounded). Loop because os.read may return
+        # short for non-regular-file-backed descriptors.
+        while len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
+            chunk = os.read(
+                descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1 - len(data)
+            )
+            if not chunk:
+                break
+            data += chunk
     except OSError:
         return None, False
     finally:
@@ -364,9 +563,7 @@ def _contains_unsafe_gateway_action(
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
-    if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(
-        command
-    ):
+    if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
@@ -382,6 +579,14 @@ def _contains_unsafe_gateway_action(
             return True
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+        # Do not touch a FileProvider path even to discover whether the file
+        # is hydrated. The lexical check covers direct cloud paths; the
+        # resolved check below covers local launchers that are symlinks into
+        # a cloud subtree. _read_referenced_script repeats both checks as the
+        # shared choke point, so every caller stays covered even if this
+        # walk-level short-circuit is bypassed.
+        if _is_cloud_placeholder_path(script_path):
+            return True
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -389,6 +594,8 @@ def _contains_unsafe_gateway_action(
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
             resolved = script_path
+        if _is_cloud_placeholder_path(resolved):
+            return True
         if resolved in visited:
             continue
         visited.add(resolved)
@@ -458,9 +665,15 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             exc_info=True,
         )
         # Pure string scans of the top-level command — cannot raise.
-        return contains_gateway_lifecycle_command(
-            command
-        ) or contains_launchctl_submit_command(command)
+        try:
+            return _direct_lifecycle_scan(command)
+        except Exception:
+            # The data-argument masker tokenizes arbitrary text; if even
+            # that fails, fall to the raw regex + submit scan so the guard
+            # stays total.
+            return contains_gateway_lifecycle_command(
+                command
+            ) or contains_launchctl_submit_command(command)
 
 
 
@@ -533,6 +746,29 @@ def check_gateway_lifecycle(
     python_script = False
     if script:
         resolved_script = _resolve_script_path(script)
+        if resolved_script is not None:
+            try:
+                real_script = resolved_script.resolve(strict=False)
+            except (OSError, ValueError):
+                real_script = resolved_script
+            if _is_cloud_placeholder_path(resolved_script) or _is_cloud_placeholder_path(
+                real_script
+            ):
+                # Attribute the refusal correctly: the script is not known to
+                # contain a lifecycle command — it lives on a cloud-synced
+                # FileProvider path (iCloud Drive / ~/Library/CloudStorage)
+                # that the guard refuses to open because an evicted
+                # placeholder can hang preflight indefinitely (#88052).
+                # Fail closed with the real reason instead of implying a
+                # dangerous lifecycle command.
+                raise GatewayLifecycleBlocked(
+                    "Blocked: the cron script lives on a cloud-synced path "
+                    "(iCloud Drive / ~/Library/CloudStorage). Opening an "
+                    "evicted FileProvider placeholder can hang the guard's "
+                    "preflight scan indefinitely, so it is refused without "
+                    "being read. Move the script to a local, non-cloud path "
+                    "(e.g. ~/.hermes/scripts/) and recreate the job."
+                )
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
         script_text = _read_script_for_scanning(script)
         if script_text:
@@ -548,7 +784,7 @@ def check_gateway_lifecycle(
         # `hermes gateway restart` embedded in a .py script is still
         # blocked. Non-regular/oversized script files still fail closed
         # via the lifecycle-shaped sentinel in _read_script_for_scanning.
-        unsafe = contains_gateway_lifecycle_command(combined)
+        unsafe = _lifecycle_command_scan_with_data_exemption(combined)
     else:
         script_dir = _resolve_script_directory(script) if script else None
         unsafe = contains_gateway_lifecycle_command_or_referenced_script(
