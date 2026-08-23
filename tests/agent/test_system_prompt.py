@@ -533,3 +533,24 @@ class TestToolUseEnforcementSuppress:
         assert "batch independent tool calls" not in prompt
         assert "# Parallel tool calls" not in prompt
         assert "do not describe what you would do" not in prompt
+
+    def test_execution_guidance_gated_when_tools_suppressed(self):
+        """The execution-discipline block sits behind its own model-family
+        gate (gpt/codex/grok/…). When model.tools: false suppresses the tools
+        payload it must also be dropped — it instructs the model to lean on
+        tools that are no longer declared. This fixes a rebase gap where the
+        block still read agent.valid_tool_names instead of _effective_tools."""
+        # A model that matches EXECUTION_GUIDANCE_MODELS ("gpt") in auto mode.
+        suppressed = _make_agent(
+            valid_tool_names=["search"],
+            model="gpt-4o",
+            _suppress_tools=True,
+        )
+        assert "# Execution discipline" not in _stable_prompt(suppressed)
+
+        active = _make_agent(
+            valid_tool_names=["search"],
+            model="gpt-4o",
+            _suppress_tools=False,
+        )
+        assert "# Execution discipline" in _stable_prompt(active)

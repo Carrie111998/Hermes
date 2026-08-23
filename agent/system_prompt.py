@@ -521,7 +521,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     #   list  — custom model-name substrings to match
     # Resolved once at session start keyed on the (fixed) model name, so
     # the system prompt stays byte-stable for the life of the conversation.
-    if agent.valid_tool_names:
+    # Gated on the effective toolset so model.tools: false (which drops the
+    # tools payload) also drops this tool-oriented guidance (#79639).
+    if _effective_tools:
         _exec_guidance = getattr(agent, "_execution_guidance", "auto")
         _exec_inject = False
         if _exec_guidance is True or (isinstance(_exec_guidance, str) and _exec_guidance.lower() in {"true", "always", "yes", "on"}):
