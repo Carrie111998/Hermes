@@ -1136,7 +1136,8 @@ function handleSessionsGatewayTransition() {
 }
 
 /** Per-bot appearance + display meta, persisted via ctx.storage:
- *  { [botName]: { shape, color, title } } */
+ *  { [botName]: { shape, color, title } } for the active gateway. Remote
+ *  rows receive the equivalent source-qualified metadata from the roster. */
 const $botMeta = atom({})
 
 /** Freshness fence for the server-meta overlay: the last moment each bot's
@@ -3759,7 +3760,8 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
       remoteSource: true,
-      sourceScoped: true
+      sourceScoped: true,
+      ...(agent.profileMetadata ? { profileMetadata: agent.profileMetadata } : {})
     })
   }
 
@@ -4008,12 +4010,20 @@ function groupMemberKey(member) {
   return member?.remoteSource ? botRosterKey(member) : member?.name
 }
 
-// Bot metadata is scoped to the active gateway until the server exposes a
-// union of rich profile rows. Never paint that metadata onto a thin row from
-// another source: two `default` agents must not borrow each other's title,
-// pin, avatar, group, unread state, or canonical-chat pointer.
+// Bot metadata is scoped to the connection + profile. Remote rows carry a
+// credential-free metadata snapshot from their own source; never fall back to
+// the active source's name-keyed metadata for them, because two `default`
+// agents must not borrow each other's title, pin, avatar, group, unread state,
+// or canonical-chat pointer.
 function botRosterMeta(bot, metaByName) {
-  return bot?.remoteSource ? null : metaByName?.[bot?.name]
+  if (bot?.remoteSource) {
+    const source = bot.profileMetadata
+    const uiMeta = source?.ui_meta?.['hermes-bots']
+
+    return uiMeta && typeof uiMeta === 'object' ? uiMeta : null
+  }
+
+  return metaByName?.[bot?.name]
 }
 
 function showsHandle(name, meta, bot) {
@@ -4260,17 +4270,19 @@ async function prepareBotSource(bot) {
 }
 
 function displayName(bot, meta) {
-  // Only THIN rows from another source trade the friendly name for their
-  // connection label — the active gateway's own default must keep reading
-  // "Hermes". Annotated active rows carry sourceScoped too, and keying this
-  // off sourceScoped renamed the user's main agent to an IP-derived label
-  // (community report, Aug 17 2026).
-  if (bot?.remoteSource && (bot.name || '').trim().toLowerCase() === 'default' && bot.connectionLabel) {
-    return bot.connectionLabel
-  }
-
   if (meta?.title?.trim()) {
     return meta.title.trim()
+  }
+
+  // Remote rows use their source's profile display name when available. The
+  // connection label is only a disambiguating fallback for older gateways
+  // that do not return profile metadata.
+  if (typeof bot?.profileMetadata?.display_name === 'string' && bot.profileMetadata.display_name.trim()) {
+    return bot.profileMetadata.display_name.trim()
+  }
+
+  if (bot?.remoteSource && (bot.name || '').trim().toLowerCase() === 'default' && bot.connectionLabel) {
+    return bot.connectionLabel
   }
 
   // Core-profile display name (profile.yaml, set via `hermes profile rename

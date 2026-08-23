@@ -65,7 +65,10 @@ test('merge: local rows are annotated, remote rows appended with source tags', (
         connectionKind: 'remote',
         connectionLabel: 'Homelab',
         profile: 'research',
-        handle: 'research-homelab'
+        handle: 'research-homelab',
+        profileMetadata: {
+          ui_meta: { 'hermes-bots': { title: 'Remote Research', shape: 'blobatar::sun' } }
+        }
       },
       {
         connectionId: 'homelab',
@@ -91,6 +94,7 @@ test('merge: local rows are annotated, remote rows appended with source tags', (
   assert.equal(remoteRow.handle, 'research-homelab')
   assert.equal(remoteRow.connectionId, 'homelab')
   assert.equal(remoteRow.connectionLabel, 'Homelab')
+  assert.equal(remoteRow.profileMetadata.ui_meta['hermes-bots'].title, 'Remote Research')
 
   const coder = out.profiles.find(p => p.name === 'coder')
   assert.equal(coder.remoteSource, true)
@@ -226,20 +230,30 @@ test('merge: repeated refreshes stay idempotent and do not mutate gateway rows',
   assert.equal(rich.connectionId, undefined)
 })
 
-test('default rows use source identity without borrowing another source title', () => {
+test('default rows use source identity and retain source-qualified metadata', () => {
   const { __botRosterKey: key, __botRosterMeta: metaFor, __displayName: name } = runtime()
   const remote = {
     name: 'default',
     connectionId: 'personal',
     connectionLabel: 'Personal',
     remoteSource: true,
-    sourceScoped: true
+    sourceScoped: true,
+    profileMetadata: {
+      display_name: 'Remote default',
+      ui_meta: {
+        'hermes-bots': { title: 'Remote workspace', shape: 'blobatar::sun', color: '#8b5cf6' }
+      }
+    }
   }
-  const active = { ...remote, remoteSource: undefined }
+  const active = { ...remote, remoteSource: undefined, profileMetadata: undefined }
   const metadata = { default: { title: 'Active workspace' } }
 
-  assert.equal(metaFor(remote, metadata), null)
-  assert.equal(name(remote, metaFor(remote, metadata)), 'Personal')
+  assert.deepEqual(metaFor(remote, metadata), {
+    title: 'Remote workspace',
+    shape: 'blobatar::sun',
+    color: '#8b5cf6'
+  })
+  assert.equal(name(remote, metaFor(remote, metadata)), 'Remote workspace')
   assert.equal(key(remote), 'personal::default')
 
   // The ACTIVE gateway's own default is the user's main agent — annotation
