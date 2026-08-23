@@ -4683,6 +4683,32 @@ function botBackendProfileScope(route, fallbackProfile = 'default') {
 
 /** Gateway RPC on the bot's OWN source. Source-scoped rows always use the
  * explicit descriptor, including a registered local source. */
+/** The (connection, profile) route of the ACTIVE bot, or null when the
+ *  active gateway is the plain local/legacy one. Restored from 9b7ab9d65a:
+ *  the #90006 reconciliation merge (0404020f7b) dropped this definition
+ *  while keeping both call sites, so every roster fetch threw ReferenceError
+ *  and useRoster's retry masked it as a permanent "Waking up ..." spinner. */
+async function activeBotRoute() {
+  if (typeof host.profileRoutes !== 'function') {
+    return null
+  }
+
+  const profile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+  const connectionId = String(
+    host.state.connectionId?.get?.() ||
+    (typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : '') ||
+    'local'
+  ).trim() || 'local'
+  const routes = await host.profileRoutes()
+  const route = routes.find(candidate => candidate?.connectionId === connectionId && candidate?.profile === profile)
+
+  if (!route && typeof host.agents === 'function') {
+    throw new Error(`No route for active bot ${connectionId}::${profile}`)
+  }
+
+  return route || null
+}
+
 async function requestForBot(bot, method, params = {}) {
   const route = botConnectionRoute(bot)
 
