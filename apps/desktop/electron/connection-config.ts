@@ -701,11 +701,12 @@ function pathWithGlobalRemoteProfile(path, profile, opts: ProfileRouteOptions = 
 /**
  * Translate an explicit self-profile query from a Desktop routing alias to the
  * backend's own profile namespace (a managed SSH `remoteProfile` can map local
- * `mara` to remote `default`). Only a `?profile=` equal to the alias itself is
- * rewritten; cross-profile selectors (`all`, another concrete profile) and
- * unfiltered paths pass through untouched. Used by the v1 profile route above
- * and by the registry SSH branch of the `hermes:api` handler — both routes
- * reach a backend whose namespace is the remote profile, not the alias.
+ * `mara` to remote `default`). Only endpoint-declared profile-valued query
+ * params equal to the alias itself are rewritten; cross-profile selectors
+ * (`all`, another concrete profile) and unfiltered paths pass through
+ * untouched. Used by the v1 profile route above and by the registry SSH branch
+ * of the `hermes:api` handler — both routes reach a backend whose namespace is
+ * the remote profile, not the alias.
  */
 function translateSelfProfileQuery(path, profile, backendProfile) {
   const scopedProfile = connectionScopeKey(profile)
@@ -729,11 +730,26 @@ function translateSelfProfileQuery(path, profile, backendProfile) {
     return path
   }
 
-  if (connectionScopeKey(parsed.searchParams.get('profile')) !== scopedProfile) {
-    return path
+  const profileQueryKeys = ['profile']
+
+  if (parsed.pathname === '/api/profiles/sessions/sidebar') {
+    profileQueryKeys.push('recents_profile')
   }
 
-  parsed.searchParams.set('profile', backend)
+  let changed = false
+
+  for (const key of profileQueryKeys) {
+    if (connectionScopeKey(parsed.searchParams.get(key)) !== scopedProfile) {
+      continue
+    }
+
+    parsed.searchParams.set(key, backend)
+    changed = true
+  }
+
+  if (!changed) {
+    return path
+  }
 
   return `${parsed.pathname}${parsed.search}${parsed.hash}`
 }

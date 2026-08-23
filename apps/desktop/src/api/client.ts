@@ -97,7 +97,7 @@ export function connectionScoped(): { connectionId?: string } {
  *  to whatever remote gateway happened to be active. Those helpers call the
  *  bridge directly and own their routing end to end. */
 export function hermesApi<T>(request: HermesApiRequest): Promise<T> {
-  return window.hermesDesktop.api<T>({ ...connectionScoped(), ...request })
+  return window.hermesDesktop.api<T>({ ...connectionScoped(), ...profileScoped(), ...request })
 }
 
 // ── Capability scope: (connection, profile) routing for the Capabilities
