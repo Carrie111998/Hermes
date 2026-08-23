@@ -284,6 +284,35 @@ def test_s6_runtime_snapshot_reports_supervised_service(monkeypatch, tmp_path):
     assert snapshot.gateway_pids == (123,)
 
 
+def test_container_runtime_snapshot_prefers_installed_systemd_service(
+    monkeypatch, tmp_path
+):
+    unit_path = tmp_path / "hermes-gateway.service"
+    unit_path.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway, "is_linux", lambda: True)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.detect_service_manager", lambda: "none"
+    )
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(
+        gateway, "_probe_systemd_service_running", lambda system=False: (False, True)
+    )
+    monkeypatch.setattr(
+        gateway, "get_systemd_unit_path", lambda system=False: unit_path
+    )
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [123])
+
+    snapshot = gateway.get_gateway_runtime_snapshot()
+
+    assert snapshot.manager == "systemd (user)"
+    assert snapshot.service_installed is True
+    assert snapshot.service_running is True
+    assert snapshot.service_scope == "user"
+    assert snapshot.gateway_pids == (123,)
+
+
 
 
 

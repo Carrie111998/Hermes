@@ -259,6 +259,37 @@ class TestBackfillProfileEnvs:
 class TestDeleteProfile:
     """Tests for delete_profile()."""
 
+    def test_cleanup_gateway_service_uses_real_home_when_profile_home_is_active(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        profile_dir = real_home / ".hermes" / "profiles" / "sol"
+        profile_home = profile_dir / "home"
+        service_dir = real_home / ".config" / "systemd" / "user"
+        service_file = service_dir / "hermes-gateway-sol.service"
+        profile_home.mkdir(parents=True)
+        service_dir.mkdir(parents=True)
+        service_file.write_text("[Unit]\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.setattr("platform.system", lambda: "Linux")
+        calls = []
+        monkeypatch.setattr(
+            profiles.subprocess,
+            "run",
+            lambda args, **kwargs: calls.append(list(args))
+            or MagicMock(returncode=0),
+        )
+
+        profiles._cleanup_gateway_service("sol", profile_dir)
+
+        assert not service_file.exists()
+        assert ["systemctl", "--user", "disable", "hermes-gateway-sol"] in calls
+        assert ["systemctl", "--user", "stop", "hermes-gateway-sol"] in calls
+        assert ["systemctl", "--user", "daemon-reload"] in calls
+
 
     def test_rmtree_failure_raises(self, profile_env):
         profile_dir = create_profile("coder", no_alias=True)
