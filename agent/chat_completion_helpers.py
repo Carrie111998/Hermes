@@ -1822,16 +1822,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(
+    agent,
+    api_messages: list,
+    tools_for_api: list | None = None,
+    reasoning_config: dict | None = None,
+) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     from hermes_constants import resolve_auto_reasoning_config
 
     if tools_for_api is None:
         tools_for_api = agent.tools
-    reasoning_config = resolve_auto_reasoning_config(
-        agent.reasoning_config,
-        api_messages,
-    )
+    if reasoning_config is None:
+        reasoning_config = resolve_auto_reasoning_config(
+            agent.reasoning_config,
+            api_messages,
+        )
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -3015,7 +3021,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
+            codex_kwargs = agent._build_api_kwargs(
+                api_messages,
+                reasoning_config=summary_reasoning_config,
+            )
             codex_kwargs.pop("tools", None)
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
@@ -3130,7 +3139,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
+                codex_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    reasoning_config=summary_reasoning_config,
+                )
                 codex_kwargs.pop("tools", None)
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()

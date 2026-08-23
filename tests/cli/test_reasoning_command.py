@@ -103,6 +103,19 @@ class TestHandleReasoningCommand(unittest.TestCase):
         self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "high"})
         self.assertIsNone(stub.agent)
 
+    def test_builtin_reasoning_help_surfaces_include_auto(self):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        stub = self._make_cli(reasoning_config={"enabled": True, "effort": "medium"})
+        output = []
+        with patch("cli._cprint", side_effect=output.append):
+            CLICommandsMixin._handle_reasoning_command(stub, "/reasoning")
+            CLICommandsMixin._handle_reasoning_command(stub, "/reasoning turbo")
+
+        help_lines = [line for line in output if "Usage:" in line or "Valid levels:" in line]
+        self.assertEqual(len(help_lines), 2)
+        self.assertTrue(all("auto" in line for line in help_lines))
+
 
 
     def test_new_session_clears_session_reasoning_override(self):

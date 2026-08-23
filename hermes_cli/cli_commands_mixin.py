@@ -3506,7 +3506,7 @@ class CLICommandsMixin:
 
         Usage:
             /reasoning              Show current effort level and display state
-            /reasoning <level>      Set effort for this session only (none, minimal, low, medium, high, xhigh, max, ultra)
+            /reasoning <level>      Set effort for this session only (none, auto, minimal, low, medium, high, xhigh, max, ultra)
             /reasoning <level> --global  Persist reasoning effort to config.yaml
             /reasoning show|on      Show model thinking/reasoning in output
             /reasoning hide|off     Hide model thinking/reasoning from output
@@ -3529,7 +3529,7 @@ class CLICommandsMixin:
             full_state = "full" if getattr(self, "reasoning_full", False) else "clamped to 10 lines"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state} ({full_state}){_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp> [--global]{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|auto|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp> [--global]{_RST}")
             return
 
         arg = parts[1].strip().lower()
@@ -3580,7 +3580,7 @@ class CLICommandsMixin:
         parsed = _parse_reasoning_config(arg)
         if parsed is None:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh, max, ultra{_RST}")
+            _cprint(f"  {_DIM}Valid levels: none, auto, minimal, low, medium, high, xhigh, max, ultra{_RST}")
             _cprint(f"  {_DIM}Display:      show, hide{_RST}")
             _cprint(f"  {_DIM}Scope:        session-scoped by default, --global to persist{_RST}")
             return

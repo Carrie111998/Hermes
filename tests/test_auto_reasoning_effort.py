@@ -1,8 +1,16 @@
-from hermes_constants import parse_reasoning_effort, resolve_auto_reasoning_config
+from hermes_constants import (
+    VALID_REASONING_EFFORTS,
+    parse_reasoning_effort,
+    resolve_auto_reasoning_config,
+)
 
 
 def test_parse_reasoning_effort_accepts_auto_marker():
     assert parse_reasoning_effort("auto") == {"enabled": True, "effort": "auto"}
+
+
+def test_auto_policy_is_not_added_to_static_provider_effort_ladder():
+    assert "auto" not in VALID_REASONING_EFFORTS
 
 
 def test_auto_reasoning_uses_low_for_simple_status_question():

@@ -393,6 +393,9 @@ class TestSubcommands:
         assert "/skills" in SUBCOMMANDS
         assert "install" in SUBCOMMANDS["/skills"]
 
+    def test_reasoning_subcommands_include_auto(self):
+        assert "auto" in SUBCOMMANDS["/reasoning"]
+
 
     def test_commands_without_subcommands_not_in_dict(self):
         """Plain commands should not appear in SUBCOMMANDS."""

@@ -3625,7 +3625,12 @@ class GatewaySlashCommandsMixin:
                 "value": "none",
                 "label": t("gateway.reasoning.choice_none"),
                 "is_current": current_effort == "none",
-            }
+            },
+            {
+                "value": "auto",
+                "label": "auto",
+                "is_current": current_effort == "auto",
+            },
         ]
         for level in VALID_REASONING_EFFORTS:
             choices.append(

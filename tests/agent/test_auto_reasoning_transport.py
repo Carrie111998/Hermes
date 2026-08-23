@@ -108,3 +108,68 @@ def test_lmstudio_iteration_summary_uses_resolved_auto_reasoning_config():
 
     assert result == "SUMMARY"
     assert captured["reasoning_effort"] == "high"
+
+
+def _codex_summary_agent():
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="test-codex-key",
+        provider="openai-codex",
+        model="gpt-5.4",
+        base_url="https://chatgpt.com/backend-api/codex",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        reasoning_config={"enabled": True, "effort": "auto"},
+    )
+    agent._cached_system_prompt = "SYS"
+    return agent
+
+
+class _CodexSummaryTransport:
+    def __init__(self):
+        self.calls = []
+
+    def build_kwargs(self, **kwargs):
+        self.calls.append(kwargs)
+        return kwargs
+
+    def normalize_response(self, response):
+        return types.SimpleNamespace(content=response)
+
+
+def test_codex_iteration_summary_initial_call_preserves_pre_synthetic_auto_resolution():
+    agent = _codex_summary_agent()
+    transport = _CodexSummaryTransport()
+    messages = [{"role": "user", "content": "debug this production security incident"}]
+
+    with (
+        patch.object(agent, "_run_codex_stream", return_value="SUMMARY"),
+        patch.object(agent, "_get_transport", return_value=transport),
+    ):
+        result = handle_max_iterations(agent, messages, 5)
+
+    assert result == "SUMMARY"
+    assert [call["reasoning_config"] for call in transport.calls] == [
+        {"enabled": True, "effort": "high"}
+    ]
+
+
+def test_codex_iteration_summary_retry_preserves_pre_synthetic_auto_resolution():
+    agent = _codex_summary_agent()
+    transport = _CodexSummaryTransport()
+    responses = iter(["", "SUMMARY"])
+    messages = [{"role": "user", "content": "debug this production security incident"}]
+
+    with (
+        patch.object(agent, "_run_codex_stream", side_effect=lambda _kwargs: next(responses)),
+        patch.object(agent, "_get_transport", return_value=transport),
+    ):
+        result = handle_max_iterations(agent, messages, 5)
+
+    assert result == "SUMMARY"
+    assert [call["reasoning_config"] for call in transport.calls] == [
+        {"enabled": True, "effort": "high"},
+        {"enabled": True, "effort": "high"},
+    ]

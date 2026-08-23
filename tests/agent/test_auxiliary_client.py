@@ -465,6 +465,25 @@ class TestBuildCallKwargsMaxTokens:
         assert "max_tokens" not in kw3
 
 
+def test_moa_reference_resolves_auto_before_auxiliary_wire_projection():
+    """MoA advisor requests must never project the internal ``auto`` sentinel."""
+    kwargs = _build_call_kwargs(
+        provider="custom",
+        model="reasoning-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "debug this production security incident",
+            }
+        ],
+        reasoning_config={"enabled": True, "effort": "auto"},
+        task="moa_reference",
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+    assert "auto" not in repr(kwargs)
+
+
 
 
 class TestNousTagsScoping:

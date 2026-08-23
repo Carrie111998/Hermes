@@ -8585,6 +8585,13 @@ def _build_call_kwargs(
     task: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
+    # ``auto`` is an internal request policy, never a provider wire value.
+    # Resolve it here, at the shared auxiliary boundary, so direct auxiliary
+    # calls, MoA advisors, retries, and fallback routes all project the same
+    # concrete effort from the messages belonging to this request.
+    from hermes_constants import resolve_auto_reasoning_config
+
+    reasoning_config = resolve_auto_reasoning_config(reasoning_config, messages)
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
