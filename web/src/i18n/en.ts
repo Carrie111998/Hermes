@@ -2139,6 +2139,14 @@ export const en: Translations = {
     complete: 'Complete',
     archive: 'Archive',
     apply: 'Apply',
+    confirm: 'Confirm',
+    ok: 'OK',
+    bulkConfirmTitle: 'Apply bulk change',
+    confirmTitle: 'Confirm change',
+    common: {
+      confirm: 'Confirm',
+      delete: 'Delete'
+    },
     clear: 'Clear',
     createTask: 'Create task in this column',
     noTasks: '— no tasks —',

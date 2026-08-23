@@ -119,7 +119,7 @@ const baseProps = {
 
 describe('StatusRule session title', () => {
   it('pins the named session at the far-right edge instead of the cwd label', () => {
-    const element = StatusRule({
+    const element = StatusRuleView({
       ...baseProps,
       sessionTitle: 'weekly-digest'
     })
@@ -241,7 +241,7 @@ describe('StatusRule session count click target', () => {
       voiceTts: false
     })
 
-    const clickableSessionCount = findClickableWithText(element, '1 session')
+    const clickableSessionCount = findClickableWithText(element, '1 live session')
 
     expect(clickableSessionCount).not.toBeNull()
     clickableSessionCount!.props.onClick({ stopImmediatePropagation: vi.fn() })
@@ -406,7 +406,7 @@ describe('StatusRule credits notice render priority', () => {
 
 describe('StatusRule battery indicator', () => {
   it('renders the battery label with a battery glyph on AC-off', () => {
-    const element = StatusRule({
+    const element = StatusRuleView({
       ...baseProps,
       battery: { available: true, category: 'good', percent: 82, plugged: false }
     })
@@ -415,7 +415,7 @@ describe('StatusRule battery indicator', () => {
   })
 
   it('uses a bolt glyph while charging', () => {
-    const element = StatusRule({
+    const element = StatusRuleView({
       ...baseProps,
       battery: { available: true, category: 'good', percent: 82, plugged: true }
     })
@@ -424,7 +424,7 @@ describe('StatusRule battery indicator', () => {
   })
 
   it('colours the read-out by category (critical → theme statusCritical)', () => {
-    const element = StatusRule({
+    const element = StatusRuleView({
       ...baseProps,
       battery: { available: true, category: 'critical', percent: 7, plugged: false }
     })
@@ -434,14 +434,14 @@ describe('StatusRule battery indicator', () => {
   })
 
   it('omits the segment when battery is null', () => {
-    const element = StatusRule({ ...baseProps, battery: null })
+    const element = StatusRuleView({ ...baseProps, battery: null })
 
     expect(textContent(element)).not.toContain('%🔋')
     expect(textContent(element)).not.toContain('🔋')
   })
 
   it('omits the segment when no battery is available (desktop/server)', () => {
-    const element = StatusRule({
+    const element = StatusRuleView({
       ...baseProps,
       battery: { available: false, category: 'dim', percent: null, plugged: null }
     })

@@ -2600,7 +2600,9 @@ export interface DashboardFontResponse {
 export interface PluginManifestResponse {
   name: string;
   label: string;
+  labelKey?: string;
   description: string;
+  descriptionKey?: string;
   icon: string;
   version: string;
   tab: {

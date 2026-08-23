@@ -1,6 +1,6 @@
 import type { BillingBlock } from '@hermes/shared/billing'
 
-import { translate, type Locale } from '../i18n/index.js'
+import { type Locale, translate } from '../i18n/index.js'
 
 export interface BillingDialogCopy {
   cancelLabel: string

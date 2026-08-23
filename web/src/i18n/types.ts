@@ -1809,6 +1809,14 @@ export interface Translations {
     complete: string
     archive: string
     apply: string
+    confirm: string
+    ok: string
+    bulkConfirmTitle: string
+    confirmTitle: string
+    common: {
+      confirm: string
+      delete: string
+    }
     clear: string
     createTask: string
     noTasks: string

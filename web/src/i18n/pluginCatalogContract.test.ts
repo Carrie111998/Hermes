@@ -42,12 +42,12 @@ function resolvePath(root: unknown, path: string): unknown {
 
 describe("bundled Dashboard plugin localization contract", () => {
   it.each([
-    ["Kanban", KANBAN_BUNDLE, en.kanban, zh.kanban],
+    ["Kanban", KANBAN_BUNDLE, en.kanban, zh.kanban!],
     [
       "Achievements",
       ACHIEVEMENTS_BUNDLE,
       en.achievements,
-      zh.achievements,
+      zh.achievements!,
     ],
   ])(
     "keeps every %s translation call backed by English and Simplified Chinese",
@@ -84,8 +84,8 @@ describe("bundled Dashboard plugin localization contract", () => {
     ].sort();
 
     expect(Object.keys(en.achievements.definitions).sort()).toEqual(ids);
-    expect(Object.keys(zh.achievements.definitions).sort()).toEqual(ids);
+    expect(Object.keys(zh.achievements!.definitions!).sort()).toEqual(ids);
     expect(Object.keys(en.achievements.metrics).sort()).toEqual(metrics);
-    expect(Object.keys(zh.achievements.metrics).sort()).toEqual(metrics);
+    expect(Object.keys(zh.achievements!.metrics!).sort()).toEqual(metrics);
   });
 });

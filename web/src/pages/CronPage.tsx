@@ -1222,7 +1222,7 @@ export default function CronPage() {
                   {job.last_fire_error?.detail && (
                     <p className="text-xs text-destructive mt-1">
                       {format(t.cron.missedScheduledFire, {
-                        time: formatTime(job.last_fire_error.at ?? null),
+                        time: formatTime(job.last_fire_error.at ?? null, locale),
                       })}{" "}
                       {job.last_fire_error.detail}
                     </p>

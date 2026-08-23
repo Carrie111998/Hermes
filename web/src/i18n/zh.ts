@@ -1975,6 +1975,14 @@ export const zh: TranslationOverlay = {
     complete: '完成',
     archive: '归档',
     apply: '应用',
+    confirm: '确认',
+    ok: '确定',
+    bulkConfirmTitle: '应用批量更改',
+    confirmTitle: '确认更改',
+    common: {
+      confirm: '确认',
+      delete: '删除'
+    },
     clear: '清除',
     createTask: '在此列创建任务',
     noTasks: '— 无任务 —',

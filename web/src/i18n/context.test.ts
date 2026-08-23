@@ -163,8 +163,7 @@ describe('Dashboard i18n framework', () => {
       path: '/profile/config.yaml',
       size: 20
     })
-    const getConfig = vi
-      .spyOn(api, 'getConfig')
+    vi.spyOn(api, 'getConfig')
       .mockResolvedValueOnce({ display: {} })
       .mockResolvedValueOnce({ display: { language: 'zh-unknown' } })
 

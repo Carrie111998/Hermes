@@ -1,4 +1,4 @@
-import { translate, type Locale } from '../i18n/index.js'
+import { type Locale, translate } from '../i18n/index.js'
 import type { SubagentAggregate, SubagentNode, SubagentProgress } from '../types.js'
 
 const ROOT_KEY = '__root__'

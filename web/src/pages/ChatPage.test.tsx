@@ -120,8 +120,12 @@ vi.mock('@/i18n', () => ({
         modelToolsSheetTitle: 'Model'
       },
       chatSidebar: {
+        collapseSidePanelAria: 'Collapse chat side panel',
+        collapseSidePanelTitle: 'Collapse side panel',
         reconnecting: 'Chat is reconnecting.',
-        reconnectingCode: 'Chat connection interrupted (code {code}). Reconnecting…'
+        reconnectingCode: 'Chat connection interrupted (code {code}). Reconnecting…',
+        showSidePanelAria: 'Show chat side panel',
+        showSidePanelTitle: 'Show side panel (model + sessions)'
       }
     }
   })
