@@ -79,6 +79,7 @@ import {
   setMessages
 } from '@/store/session'
 import { requestForSessionProfile } from '@/store/session-request-router'
+import { $focusedStoredSessionId, sessionTileOwnerRoute, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
@@ -151,6 +152,7 @@ import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
+import { findStoredIdForRuntimeId, resolveRoutingSessionId } from './wiring-routing'
 
 // Overlay views the controller mounts over the shell — lazy, load on demand.
 // The workspace-route full-page views (skills/messaging/artifacts) are the
@@ -294,17 +296,65 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // When chrome stays on the launch backend (Bot Mode / all-profiles
   // navigation), session-owned RPCs still have to hit the session's backend.
+  //
+  // Route by the SESSION THIS RPC TARGETS first: a session-scoped RPC carries
+  // its target in params.session_id, and dispatching it by the WINDOW's
+  // focused tile instead sends a background bot's prompt.submit to whichever
+  // backend the focused pane happens to own — the bot then runs on the
+  // default backend (its store, its logs), or 4001s when default doesn't
+  // hold the session. params.session_id is a RUNTIME id while tile routes
+  // key on the STORED id, so translate via the tile map before resolving.
+  // Only when the RPC names no session (config reads, list refreshes, cron)
+  // does the focused-tile key apply — those are genuinely window-ambient.
+  //
+  // A bot chat is a persisted TILE that already records the EXACT owning route
+  // (connectionId + profile) it was opened with — the same authoritative owner
+  // Sessions mode reads off the session row. Prefer it. The canonical Bot Chat
+  // is hidden, so it never appears in $sessions and rememberedSessionProfile's
+  // row lookup misses and falls back to the ACTIVE profile — the Bot Mode
+  // "session not found" / hang. The tile route is per-session, survives
+  // relaunch, and needs no list membership, so it fixes an already-open chat
+  // too. Fall back to the list-derived profile only when no tile route exists.
   const requestGateway = useCallback(
     <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
-      const owner = rememberedSessionProfile(
-        $sessions.get(),
-        selectedStoredSessionIdRef.current,
-        $activeGatewayProfile.get()
-      )
+      // Route each RPC by the session IT targets, not by whatever tile is
+      // focused. `requestGateway` is one shared closure used for every session
+      // RPC in the window; keying the owner off $focusedStoredSessionId sent a
+      // NON-focused tile's RPC (any bot chat while another pane is active) to
+      // the focused tile's backend. That is the Bot Mode bug: a bot's
+      // prompt.submit carried its own session_id but ran on the default backend
+      // (served via ?profile= from the default's state.db), or 4001'd when the
+      // default backend didn't hold the runtime session.
+      //
+      // params.session_id is a RUNTIME id, while tiles and session rows key on
+      // the STORED id, so translate first (state cache, then a reverse scan of
+      // the stored->runtime map, then the persisted tile map — the same ladder
+      // use-session-tile-delegate uses, plus the tile rung that survives a
+      // reload when the state cache is cold). A miss on ALL rungs means the id
+      // is already a stored id (several RPCs pass stored ids directly), so use
+      // it as-is. Only an RPC with no session_id at all (ambient/config calls)
+      // keeps the focused-tile route.
+      const paramSessionId =
+        typeof params?.session_id === 'string' && params.session_id ? params.session_id : undefined
+
+      const routingSessionId = resolveRoutingSessionId({
+        focusedStoredSessionId: $focusedStoredSessionId.get(),
+        paramSessionId,
+        selectedStoredSessionId: selectedStoredSessionIdRef.current,
+        storedIdForRuntime: runtimeId =>
+          sessionStateByRuntimeIdRef.current.get(runtimeId)?.storedSessionId ??
+          findStoredIdForRuntimeId(runtimeIdByStoredSessionIdRef.current, runtimeId) ??
+          storedSessionIdForRuntimeId(runtimeId) ??
+          undefined
+      })
+
+      const owner =
+        (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
+        rememberedSessionProfile($sessions.get(), routingSessionId, $activeGatewayProfile.get())
 
       return requestForSessionProfile<T>(owner, ambientRequestGateway, method, params ?? {}, timeoutMs, signal)
     },
-    [ambientRequestGateway]
+    [ambientRequestGateway, runtimeIdByStoredSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef]
   )
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
