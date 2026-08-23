@@ -5610,6 +5610,49 @@ class BasePlatformAdapter(ABC):
             return self
         return live_adapter
 
+    def _begin_inflight_final_delivery(self) -> bool:
+        """Mark that a redeliverable final response is being sent right now.
+
+        The restart path waits for ``_active_work_count()`` to reach zero
+        before calling ``stop()`` (#77184), but a turn releases its running-
+        agent slot in ``_run_agent_inner``'s ``finally`` — *before* the final
+        response is handed to the platform. The restart wait therefore saw
+        zero active work while a send was still in flight, tore the process
+        down between ``mark_attempting`` and ``mark_delivered``, and the next
+        boot found an ``attempting`` row and redelivered an answer the user
+        had already received (visible as a "Recovered reply" duplicate).
+
+        Counting the send itself closes that window. Only obligation-backed
+        sends are counted: those are exactly the ones a restart could cause
+        to be redelivered. Ephemeral/command replies are not recorded in the
+        ledger, cannot be redelivered, and so must not hold up a restart.
+        """
+        try:
+            self._inflight_final_deliveries = (
+                getattr(self, "_inflight_final_deliveries", 0) + 1
+            )
+            return True
+        except Exception:
+            return False
+
+    def _end_inflight_final_delivery(self) -> None:
+        """Release a claim taken by ``_begin_inflight_final_delivery``.
+
+        Must run in a ``finally``: a leaked claim would keep the gateway
+        permanently "busy" and block both restart and scale-to-zero.
+        """
+        try:
+            self._inflight_final_deliveries = max(
+                0, getattr(self, "_inflight_final_deliveries", 0) - 1
+            )
+        except Exception:
+            pass
+
+    @property
+    def inflight_final_deliveries(self) -> int:
+        """Obligation-backed final sends currently in flight on this adapter."""
+        return getattr(self, "_inflight_final_deliveries", 0)
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -6689,32 +6732,51 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
-                    _record_delivery(result)
+                    # Hold the restart wait open across the send+settle window.
+                    # Without this the turn has already left _active_work_count
+                    # (released in _run_agent_inner's finally), so a concurrent
+                    # restart can stop the process after mark_attempting but
+                    # before mark_delivered — and the next boot redelivers a
+                    # reply the user already got.
+                    _delivery_claimed = False
                     if _obligation_id is not None:
-                        try:
-                            from gateway.delivery_ledger import (
-                                mark_delivered,
-                                mark_failed,
-                            )
-
-                            if getattr(result, "success", False):
-                                await asyncio.to_thread(mark_delivered, _obligation_id)
-                            else:
-                                await asyncio.to_thread(
+                        _delivery_claimed = (
+                            delivery_adapter._begin_inflight_final_delivery()
+                        )
+                    try:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                        _record_delivery(result)
+                        if _obligation_id is not None:
+                            try:
+                                from gateway.delivery_ledger import (
+                                    mark_delivered,
                                     mark_failed,
-                                    _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
                                 )
-                        except Exception:
-                            logger.debug(
-                                "delivery ledger update failed", exc_info=True
-                            )
+
+                                if getattr(result, "success", False):
+                                    await asyncio.to_thread(
+                                        mark_delivered, _obligation_id
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        mark_failed,
+                                        _obligation_id,
+                                        str(getattr(result, "error", "") or ""),
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "delivery ledger update failed", exc_info=True
+                                )
+                    finally:
+                        # Release in finally: a leaked claim would keep the
+                        # gateway permanently busy and block restart entirely.
+                        if _delivery_claimed:
+                            delivery_adapter._end_inflight_final_delivery()
 
                     # Schedule auto-deletion on the adapter that owns the new
                     # message ID, which may be the reconnect replacement.

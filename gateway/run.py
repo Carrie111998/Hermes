@@ -8602,7 +8602,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._inflight_final_delivery_count()
         )
+
+    def _inflight_final_delivery_count(self) -> int:
+        """Count obligation-backed final sends still in flight on adapters.
+
+        A turn releases its ``_running_agents`` slot in ``_run_agent_inner``'s
+        ``finally``, which runs BEFORE the final response is handed to the
+        platform adapter. Everything after that point — the send itself and
+        the ledger's ``mark_delivered`` — was invisible to
+        ``_active_work_count``.
+
+        The restart wait (#77184) therefore reported "active work drained"
+        while a reply was mid-flight, ``stop()`` ran, and the process was
+        replaced between ``mark_attempting`` and ``mark_delivered``. The next
+        boot swept the still-``attempting`` row and redelivered a reply the
+        user had already received, tagged "Recovered reply". Observed five
+        times across 2026-08-08 … 2026-08-23; in every case the drain-complete
+        log line preceded ``response ready`` by ~0.4-0.5s.
+
+        Only ledger-backed sends are counted, because only those can be
+        redelivered by the boot sweep. Best-effort per adapter: a platform
+        that predates the counter simply contributes 0.
+        """
+        total = 0
+        try:
+            for adapter in list(self.adapters.values()):
+                try:
+                    total += int(
+                        getattr(adapter, "inflight_final_deliveries", 0) or 0
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+        return total
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
