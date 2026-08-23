@@ -3931,6 +3931,28 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "error": f"MCP server '{server_name}' is not connected"
                 }, ensure_ascii=False)
 
+        # Resolve the gateway's per-chat session key *here*, on the agent's
+        # own task, where the HERMES_SESSION_KEY contextvar is current. `_call`
+        # below runs on the separate MCP event loop (see _run_on_mcp_loop at
+        # the bottom of this handler), so contextvars set on the agent's task
+        # are not visible inside it — closing over the value read now is the
+        # only way to get it there. See docs/superpowers/specs/
+        # 2026-08-22-spike2-caller-identity.md for the full mechanism.
+        #
+        # Fail open: this read happens before `_call()` is defined, i.e.
+        # outside the `try: result = _call_once()` block near the bottom of
+        # this handler that turns every other failure into the JSON error
+        # string callers expect. An uncaught ImportError here would escape
+        # as a raw exception instead. Degrading to no session key is exactly
+        # the CLI/cron behaviour already handled below (`meta=None`), so
+        # fail open rather than fail loud.
+        try:
+            from gateway.session_context import get_session_env
+
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
+        except ImportError:
+            session_key = ""
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -3940,7 +3962,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await server.session.call_tool(
+                        tool_name,
+                        arguments=args,
+                        meta={"hermes_session_key": session_key} if session_key else None,
+                    )
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
