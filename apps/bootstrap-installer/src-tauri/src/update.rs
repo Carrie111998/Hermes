@@ -134,6 +134,9 @@ fn install_lock_path(install_root: &Path) -> PathBuf {
 struct InstallLockGuard {
     path: PathBuf,
     file: File,
+    token: String,
+    started_at: u64,
+    released: bool,
 }
 
 impl InstallLockGuard {
@@ -159,20 +162,45 @@ impl InstallLockGuard {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let token = uuid::Uuid::new_v4().to_string();
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         writeln!(
             file,
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\nactive",
             std::process::id(),
             started_at,
-            uuid::Uuid::new_v4()
+            token
         )?;
         file.flush()?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            token,
+            started_at,
+            released: false,
+        })
     }
 
-    fn complete(&self) {
+    fn complete(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Err(err) = (|| -> std::io::Result<()> {
+            self.file.set_len(0)?;
+            self.file.seek(SeekFrom::Start(0))?;
+            writeln!(
+                self.file,
+                "{}\n{}\n{}\nreleased",
+                std::process::id(),
+                self.started_at,
+                self.token
+            )?;
+            self.file.flush()
+        })() {
+            tracing::debug!(path = ?self.path, %err, "could not mark installation lock released");
+        }
         if let Err(err) = FileExt::unlock(&self.file) {
             tracing::debug!(path = ?self.path, %err, "installation lock was already released");
         }
@@ -337,10 +365,9 @@ async fn run_update(app: AppHandle) -> Result<()> {
     let install_root = hermes_home.join("hermes-agent");
 
     // Atomic installation-scoped single flight. The compatibility marker below
-    // remains under HERMES_HOME for Electron startup gating, but it is not an
-    // atomic lock and profiles have different homes. `create_dir` is the sole
-    // winner decision shared with Python's mkdir contract.
-    let _install_lock = match InstallLockGuard::acquire(&install_root) {
+    // remains under HERMES_HOME for Electron startup gating. The advisory file
+    // lock is the sole installation-wide winner decision shared with Python.
+    let mut _install_lock = match InstallLockGuard::acquire(&install_root) {
         Ok(guard) => guard,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
             let msg = "Another Hermes update is already running for this installation. Wait for it to finish, then try again.";
@@ -1461,10 +1488,15 @@ mod tests {
             assert_eq!(lines[0].parse::<u32>().unwrap(), std::process::id());
             assert!(lines[1].parse::<u64>().is_ok());
             assert!(!lines[2].is_empty(), "metadata includes a unique owner token");
+            assert_eq!(lines[3], "active");
             drop(guard);
         }
 
         assert!(lock.is_file(), "normal release never unlinks the canonical file");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().lines().nth(3),
+            Some("released")
+        );
         let guard = InstallLockGuard::acquire(&root).expect("released OS lock is reacquirable");
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1483,6 +1515,32 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         drop(first);
         assert!(install_lock_path(&root).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_complete_then_old_drop_cannot_affect_fresh_guard() {
+        let dir = unique_tmp_dir("manual-complete-install-lock");
+        let root = dir.join("hermes-agent");
+        let mut old = InstallLockGuard::acquire(&root).expect("old guard acquires");
+        old.complete();
+        assert_eq!(
+            std::fs::read_to_string(install_lock_path(&root))
+                .unwrap()
+                .lines()
+                .nth(3),
+            Some("released")
+        );
+
+        let fresh = InstallLockGuard::acquire(&root).expect("fresh guard acquires");
+        old.complete();
+        drop(old);
+        let err = match InstallLockGuard::acquire(&root) {
+            Ok(_) => panic!("old drop must not unlock the fresh guard"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        drop(fresh);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

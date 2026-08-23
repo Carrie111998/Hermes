@@ -277,6 +277,8 @@ class UpdateLock:
             # lock hermetic unless the caller explicitly supplies install_root.
             self.install_path = self.path.parent / ".git" / INSTALL_LOCK_NAME
         self._install_file: BinaryIO | None = None
+        self._install_token: str | None = None
+        self._install_started_at: int | None = None
         self._install_inherited = False
         self.acquired = False
         self.holder: UpdateHolder | None = None
@@ -284,6 +286,8 @@ class UpdateLock:
     def _read_install_holder(self) -> UpdateHolder | None:
         try:
             lines = self.install_path.read_text(encoding="utf-8").splitlines()
+            if len(lines) > 3 and lines[3].strip().lower() == "released":
+                return None
             pid = int(lines[0].strip())
             started_at = float(lines[1].strip())
         except (OSError, IndexError, ValueError):
@@ -347,10 +351,15 @@ class UpdateLock:
             return False
 
         self._install_file = handle
+        self._install_token = uuid.uuid4().hex
+        self._install_started_at = int(time.time())
         try:
             handle.seek(0)
             handle.truncate()
-            handle.write(f"{os.getpid()}\n{int(time.time())}\n{uuid.uuid4().hex}\n".encode())
+            handle.write(
+                f"{os.getpid()}\n{self._install_started_at}\n"
+                f"{self._install_token}\nactive\n".encode()
+            )
             handle.flush()
         except OSError as exc:
             logger.warning("Could not write installation lock owner %s: %s", self.install_path, exc)
@@ -397,6 +406,23 @@ class UpdateLock:
         if handle is None:
             return
         self._install_file = None
+        token = self._install_token
+        started_at = self._install_started_at
+        self._install_token = None
+        self._install_started_at = None
+        if token is not None and started_at is not None:
+            try:
+                handle.seek(0)
+                current = handle.read().decode("utf-8", errors="replace").splitlines()
+                if len(current) > 2 and current[2].strip() == token:
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(
+                        f"{os.getpid()}\n{started_at}\n{token}\nreleased\n".encode()
+                    )
+                    handle.flush()
+            except OSError as exc:
+                logger.debug("Could not mark installation lock released: %s", exc)
         self._unlock_file(handle)
         try:
             handle.close()

@@ -130,7 +130,9 @@ def test_old_guard_double_release_cannot_affect_new_guard(tmp_path):
     install_root = tmp_path / "install"
     old = UpdateLock(marker_path=tmp_path / "old-marker", install_root=install_root)
     assert old.acquire()
+    assert install_lock_path(install_root).read_text(encoding="utf-8").splitlines()[3] == "active"
     old.release()
+    assert install_lock_path(install_root).read_text(encoding="utf-8").splitlines()[3] == "released"
     fresh = UpdateLock(marker_path=tmp_path / "fresh-marker", install_root=install_root)
     assert fresh.acquire()
 

@@ -121,6 +121,30 @@ test('PID parsing rejects a numeric prefix instead of accepting parseInt garbage
   assert.ok(fs.existsSync(lock))
 })
 
+test('released installation metadata never blocks while the old pid remains alive', () => {
+  const home = tmpHome('released-live-pid')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `${process.pid}\n${Math.floor(Date.now() / 1000)}\ntoken\nreleased\n`)
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: ALIVE }), null)
+})
+
+test('expired active metadata does not block after pid reuse', () => {
+  const home = tmpHome('expired-live-pid')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  const now = Date.now()
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(
+    lock,
+    `${process.pid}\n${Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 1_000) / 1000)}\ntoken\nactive\n`
+  )
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: ALIVE, now: () => now }), null)
+})
+
 test('absent marker => no live update', () => {
   const home = tmpHome('absent')
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
@@ -156,6 +180,13 @@ test('expired marker (past age ceiling) => no live update and pruned', () => {
 test('malformed marker => no live update and pruned', () => {
   const home = tmpHome('malformed')
   fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
+  assert.ok(!fs.existsSync(markerPath(home)))
+})
+
+test('compatibility marker rejects numeric-prefix pid garbage', () => {
+  const home = tmpHome('numeric-prefix-marker')
+  fs.writeFileSync(markerPath(home), `${process.pid}junk\n${Math.floor(Date.now() / 1000)}`)
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
   assert.ok(!fs.existsSync(markerPath(home)))
 })

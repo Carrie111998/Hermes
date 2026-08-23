@@ -30,6 +30,13 @@ import path from 'path'
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 export const INSTALL_LOCK_OWNER_WRITE_GRACE_MS = 5_000
 
+function parsePositiveSafeInteger(raw: unknown) {
+  const text = String(raw ?? '').trim()
+  if (!/^\d+$/.test(text)) return null
+  const value = Number(text)
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
 /**
  * Installation-scoped single-flight lock. Keep byte-for-byte path semantics
  * with hermes_cli.update_lock.install_lock_path and Rust install_lock_path.
@@ -111,10 +118,10 @@ export function readLiveUpdateMarker(
   }
 
   const [pidLine, startedLine] = String(raw).split('\n')
-  const pid = Number.parseInt((pidLine || '').trim(), 10)
-  const startedAt = Number.parseInt((startedLine || '').trim(), 10)
-  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
+  const pid = parsePositiveSafeInteger(pidLine)
+  const startedAt = parsePositiveSafeInteger(startedLine)
+  const ageMs = startedAt === null ? Infinity : now() - startedAt * 1000
+  const alive = pid !== null && isPidAlive(pid, kill)
 
   if (!alive || ageMs > maxAgeMs) {
     try {
@@ -221,14 +228,19 @@ export function updateHandoffConflict(
       let pid = 0
       let lockAgeMs = Infinity
       let hasStrictPid = false
+      let metadataAgeMs = Infinity
+      let state = ''
 
       try {
-        const [pidLine = ''] = fs.readFileSync(lock, 'utf8').split(/\r?\n/)
-        const trimmed = pidLine.trim()
-
-        hasStrictPid = /^\d+$/.test(trimmed)
-        pid = hasStrictPid ? Number(trimmed) : 0
-        hasStrictPid = hasStrictPid && Number.isSafeInteger(pid) && pid > 0
+        const [pidLine = '', startedLine = '', _token = '', stateLine = ''] = fs
+          .readFileSync(lock, 'utf8')
+          .split(/\r?\n/)
+        const parsedPid = parsePositiveSafeInteger(pidLine)
+        const startedAt = parsePositiveSafeInteger(startedLine)
+        hasStrictPid = parsedPid !== null
+        pid = parsedPid ?? 0
+        metadataAgeMs = startedAt === null ? Infinity : (opts.now || Date.now)() - startedAt * 1000
+        state = stateLine.trim().toLowerCase()
       } catch {
         // A writer may hold the advisory lock before its metadata is visible.
       }
@@ -239,10 +251,12 @@ export function updateHandoffConflict(
         // If the file vanished between exists/stat there is no advisory signal.
       }
 
+      if (state === 'released') return null
+
       const alive = hasStrictPid && isPidAlive(pid, opts.kill)
       const ownerWriteInProgress = !hasStrictPid && lockAgeMs <= INSTALL_LOCK_OWNER_WRITE_GRACE_MS
 
-      if (alive || ownerWriteInProgress) {
+      if ((alive && metadataAgeMs <= UPDATE_MARKER_MAX_AGE_MS) || ownerWriteInProgress) {
         return {
           pid,
           ageMs: lockAgeMs,
