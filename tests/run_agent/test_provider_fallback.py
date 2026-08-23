@@ -145,6 +145,37 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
+    def test_applies_inline_context_length_to_fallback_runtime(self):
+        fallback = {
+            "provider": "custom",
+            "model": "fallback-model",
+            "base_url": "https://fallback.example/v1",
+            "api_key": "test-key",
+            "context_length": 65_536,
+        }
+        agent = _make_agent(fallback_model=[fallback])
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(
+                        base_url="https://fallback.example/v1",
+                        api_key="test-key",
+                    ),
+                    "fallback-model",
+                ),
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=65_536,
+            ) as resolve_context,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._config_context_length == 65_536
+        assert resolve_context.call_args.kwargs["config_context_length"] == 65_536
+
 
     def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.
