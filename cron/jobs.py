@@ -1875,23 +1875,9 @@ def _validate_provider_model_pair(
             or _strip_vendor(model_lower) in models_stripped
             or _aliased_stripped in models_stripped
         ):
-            hint = cron_free_tier_alternate_hint(normalized_provider, normalized_model)
+            hint = cron_free_tier_alternate_hint(normalized_provider, normalized_model, cache)
             if hint:
-                # Only raise if the alternate provider actually serves the model
-                # (avoid false positives when the free relay doesn't list it).
-                _free_entry = cache.get("opencode-free", {})
-                if isinstance(_free_entry, dict) and not is_provider_cache_entry_stale(_free_entry):
-                    _free_models = _free_entry.get("models", [])
-                    _free_lower = [str(m or "").lower() for m in _free_models]
-                    _free_stripped = [_strip_vendor(m) for m in _free_models]
-                    _alias_free = resolve_cron_model_alias(model_lower)
-                    if (
-                        model_lower in _free_lower
-                        or _alias_free in _free_lower
-                        or _strip_vendor(model_lower) in _free_stripped
-                        or _strip_vendor(_alias_free) in _free_stripped
-                    ):
-                        raise ValueError(hint)
+                raise ValueError(hint)
             return
 
         # Not in this provider — search which providers DO serve it
@@ -1928,10 +1914,16 @@ def _validate_provider_model_pair(
             candidates_sorted = sorted(set(candidates))
             parts.append(f"Available on: {', '.join(candidates_sorted)}.")
             parts.append(f"Try: --provider {candidates_sorted[0]} --model {normalized_model}")
-            if provider_key == "opencode-go" and "opencode-free" in candidates_sorted:
-                parts.append("(opencode-free is keyless; opencode-go requires an API key)")
-            elif provider_key == "opencode-free" and "opencode-go" in candidates_sorted:
-                parts.append("(opencode-go requires an API key; opencode-free is keyless)")
+            # Provider-specific keyless-vs-API-key hint lives in models.py
+            # so cron/jobs.py stays generic.
+            try:
+                from hermes_cli.models import cron_candidate_hint
+
+                _hint = cron_candidate_hint(provider_key, candidates_sorted)
+                if _hint:
+                    parts.append(_hint)
+            except Exception:
+                pass
         else:
             parts.append(f"Provider '{normalized_provider}' serves {len(models)} models; none match '{normalized_model}'.")
         if close:

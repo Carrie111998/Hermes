@@ -3613,19 +3613,61 @@ def is_cron_free_tier_model(model_id: str) -> bool:
     )
 
 
-def cron_free_tier_alternate_hint(provider: str, model_id: str) -> str | None:
+def cron_free_tier_alternate_hint(provider: str, model_id: str, cache: dict | None = None) -> str | None:
     """Return a human hint when a free-tier model is pinned to the wrong relay.
 
     `opencode-go` (authenticated) → `opencode-free` (keyless) is the only
-    cross-wire we currently enforce; other providers are unaffected.
+    cross-wire we currently enforce; other providers are unaffected. When
+    `cache` is provided, the hint is only returned if the free relay actually
+    serves the model (and its entry isn't stale) — avoids false positives
+    when the free cache is cold or doesn't list the model.
     """
     prov = normalize_provider(provider)
     if prov == "opencode-go" and is_cron_free_tier_model(model_id):
+        if cache is not None:
+            free_entry = cache.get("opencode-free", {})
+            if not isinstance(free_entry, dict) or is_provider_cache_entry_stale(free_entry):
+                return None
+            # Check if the free relay actually lists the model (alias-aware, vendor-prefix stripped)
+            def _strip(m: str) -> str:
+                s = str(m or "").strip().lower()
+                return s.split("/")[-1] if "/" in s else s
+
+            lower = str(model_id or "").strip().lower()
+            alias = resolve_cron_model_alias(lower)
+            free_models = free_entry.get("models", [])
+            free_lower = [str(m or "").lower() for m in free_models]
+            free_stripped = [_strip(m) for m in free_models]
+            alias_stripped = _strip(alias)
+            if not (
+                lower in free_lower
+                or alias in free_lower
+                or _strip(lower) in free_stripped
+                or alias_stripped in free_stripped
+            ):
+                return None
         return (
             f"Model '{model_id}' is a free-tier model and must run via provider 'opencode-free' (keyless), "
             f"not '{provider}' (which sends an API key and will 401). "
             f"Try: --provider opencode-free --model {model_id}"
         )
+    return None
+
+
+def cron_candidate_hint(provider_key: str, candidates: list[str]) -> str | None:
+    """Return a keyless-vs-API-key hint for the candidate-provider suggestion.
+
+    Centralized here so cron/jobs.py doesn't hardcode provider names. When a
+    model is not on the requested provider but is available elsewhere, and the
+    candidate set spans the keyless/authenticated opencode relays, explain the
+    difference so the user picks the right one.
+    """
+    prov = normalize_provider(provider_key)
+    cand_set = {normalize_provider(c) for c in candidates}
+    if prov == "opencode-go" and "opencode-free" in cand_set:
+        return "(opencode-free is keyless; opencode-go requires an API key)"
+    if prov == "opencode-free" and "opencode-go" in cand_set:
+        return "(opencode-go requires an API key; opencode-free is keyless)"
     return None
 
 
