@@ -12471,6 +12471,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.set_session_archived(row["id"], True)
         return len(rows)
 
+    def list_stale_archive_candidates(
+        self, idle_days: float, *, exclude_pinned: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Return the rows :meth:`archive_stale_sessions` would sweep.
+
+        Same selection (idle on real recency, unarchived, lineage tips,
+        pin-guarded) but read-only — backs the ``sessions sweep --dry-run``
+        listing so an operator can preview the cutoff before anything is
+        hidden. Rows are ordered oldest-first and carry ``id, source, title,
+        model, started_at, last_active, ended_at, message_count``.
+        """
+        if idle_days is None or idle_days < 0:
+            return []
+        cutoff = time.time() - float(idle_days) * 86400.0
+        pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                SELECT s.id, s.source, s.title, s.model, s.started_at,
+                       {_sql_session_last_active("s")} AS last_active,
+                       s.ended_at, s.message_count
+                FROM sessions s
+                WHERE s.archived = 0
+                  AND COALESCE(s.end_reason, '') <> 'compression'
+                  {pin_clause}
+                  AND {_sql_session_last_active("s")} < ?
+                ORDER BY s.started_at ASC
+                """,
+                (cutoff,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def archive_stale_sessions(
         self, idle_days: float, *, exclude_pinned: bool = True
     ) -> int:
@@ -12496,26 +12528,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns the number of sessions archived. Never raises for an empty or
         non-positive ``idle_days`` — it simply archives nothing.
         """
-        if idle_days is None or idle_days < 0:
-            return 0
-        cutoff = time.time() - float(idle_days) * 86400.0
-        pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT s.id FROM sessions s
-                WHERE s.archived = 0
-                  AND COALESCE(s.end_reason, '') <> 'compression'
-                  {pin_clause}
-                  AND {_sql_session_last_active("s")} < ?
-                ORDER BY s.started_at ASC
-                """,
-                (cutoff,),
-            ).fetchall()
-        ids = [(r["id"] if isinstance(r, sqlite3.Row) else r[0]) for r in rows]
-        for sid in ids:
-            self.set_session_archived(sid, True)
-        return len(ids)
+        rows = self.list_stale_archive_candidates(
+            idle_days, exclude_pinned=exclude_pinned
+        )
+        for row in rows:
+            self.set_session_archived(row["id"], True)
+        return len(rows)
 
     def prune_sessions(
         self,

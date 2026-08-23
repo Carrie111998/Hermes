@@ -13609,6 +13609,43 @@ def main():
         "bare number of days, or ISO timestamp)",
     )
 
+    sessions_sweep = sessions_subparsers.add_parser(
+        "sweep",
+        help="Archive stale-open sessions prune can never reach (reversible)",
+        description=(
+            "Archive every session idle for --idle-days days, INCLUDING ones "
+            "that never ended (ended_at NULL) — the population `prune` and "
+            "`archive` structurally skip, left behind by hard kills, crashes, "
+            "or pre-v0.20.4 one-shot exits. Ages on real recency (freshest of "
+            "last activity, latest message, else start time). Reversible: "
+            "rows are hidden, not deleted. Pinned sessions are spared unless "
+            "--include-pinned; compression-lineage interiors are never "
+            "matched. Same selection as the config-gated sessions.auto_archive "
+            "startup hook, but with a preview and confirmation."
+        ),
+    )
+    sessions_sweep.add_argument(
+        "--idle-days",
+        type=float,
+        default=30.0,
+        help="Inactivity cutoff in days (default 30)",
+    )
+    sessions_sweep.add_argument(
+        "--include-pinned",
+        action="store_true",
+        help="Also archive pinned sessions (spared by default — pin is a keep flag)",
+    )
+    sessions_sweep.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the sessions that would be archived, then exit",
+    )
+    sessions_sweep.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip the confirmation prompt",
+    )
+
     sessions_subparsers.add_parser(
         "optimize",
         help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",

@@ -1056,6 +1056,81 @@ def cmd_sessions(args, sessions_parser=None):
                 "but fully recoverable (nothing was deleted)."
             )
 
+    elif action == "sweep":
+        # Stale-OPEN sweep: the one population prune/archive can never reach
+        # (their shared selector pins `ended_at IS NOT NULL`). Ages on real
+        # recency — the freshest of last_activity_at, latest message
+        # timestamp, else started_at — so rows left open by hard kills,
+        # crashes, or pre-fix one-shot exits are matched by inactivity, not
+        # by their (missing) end state. Archives (reversible), never deletes;
+        # pinned sessions and compression-lineage interiors are spared. This
+        # is the same selection the config-gated `sessions.auto_archive`
+        # startup hook applies, exposed with a preview + confirmation.
+        from hermes_cli.session_filters import format_epoch
+
+        idle_days = float(getattr(args, "idle_days", 30) or 30)
+        include_pinned = bool(getattr(args, "include_pinned", False))
+
+        candidates = db.list_stale_archive_candidates(
+            idle_days, exclude_pinned=not include_pinned
+        )
+
+        if not candidates:
+            print(
+                f"No unarchived sessions idle for {idle_days:g} day(s) "
+                "(pinned sessions are spared by default)."
+            )
+            return
+
+        _oldest = candidates[0].get("last_active")
+        _newest = candidates[-1].get("last_active")
+        _span = (
+            f"oldest activity {format_epoch(_oldest)}, "
+            f"newest activity {format_epoch(_newest)}"
+        )
+        _open_n = sum(1 for c in candidates if c.get("ended_at") is None)
+        _open_note = (
+            f" ({_open_n} of them never ended — invisible to prune/archive)"
+            if _open_n
+            else ""
+        )
+
+        shown = candidates if args.dry_run else candidates[:15]
+        print(
+            f"{len(candidates)} session(s) idle for {idle_days:g} day(s) "
+            f"({_span}){_open_note}:"
+        )
+        for s in shown:
+            title = (s.get("title") or "")[:36]
+            model = (s.get("model") or "-").split("/")[-1][:24]
+            state = "open" if s.get("ended_at") is None else "ended"
+            print(
+                f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
+                f"{s['source']:<10} {model:<24} {state:<6} "
+                f"{s['message_count']:>4} msgs  {title}"
+            )
+        if len(candidates) > len(shown):
+            print(f"  … and {len(candidates) - len(shown)} more")
+
+        if args.dry_run:
+            print("Dry run — nothing archived.")
+            return
+
+        if not args.yes:
+            if not _confirm_prompt(
+                f"Archive these {len(candidates)} session(s) ({_span})? [y/N] "
+            ):
+                print("Cancelled.")
+                return
+
+        count = db.archive_stale_sessions(
+            idle_days, exclude_pinned=not include_pinned
+        )
+        print(
+            f"Archived {count} session(s). They're hidden from listings "
+            "but fully recoverable (nothing was deleted)."
+        )
+
     elif action == "rename":
         resolved_session_id = db.resolve_session_id(args.session_id)
         if not resolved_session_id:
