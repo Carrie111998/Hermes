@@ -29,20 +29,44 @@ class TestDetectCodeSkew:
 
         monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def4567890123")
         skew = code_skew.detect_code_skew()
-        assert skew == ("abc1234567", "def4567890")
+        assert skew == ("main@abc1234567", "main@def4567890")
+
+    def test_branch_switch_is_visible_in_the_labels(self, monkeypatch):
+        # A checkout switched to another branch is a common skew cause; two
+        # bare shas wouldn't say so, so the ref has to survive into the label.
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
+        code_skew.record_boot_fingerprint()
+
+        monkeypatch.setattr(
+            code_skew, "_fingerprint", lambda: "git:refs/heads/hotfix:def4567890123"
+        )
+        assert code_skew.detect_code_skew() == ("main@abc1234567", "hotfix@def4567890")
 
 
 
 
 class TestShort:
-    def test_shortens_long_sha(self):
-        assert code_skew._short("git:refs/heads/main:abcdef0123456789") == "abcdef0123"
+    def test_shortens_long_sha_and_keeps_the_ref(self):
+        assert code_skew._short("git:refs/heads/main:abcdef0123456789") == "main@abcdef0123"
 
     def test_keeps_unresolved_marker(self):
-        assert code_skew._short("git:refs/heads/main:unresolved") == "unresolved"
+        assert code_skew._short("git:refs/heads/main:unresolved") == "main@unresolved"
 
     def test_passes_short_sha_through_untruncated(self):
-        assert code_skew._short("git:HEAD:abc1234") == "abc1234"
+        assert code_skew._short("git:HEAD:abc1234") == "HEAD@abc1234"
+
+    def test_keeps_nested_branch_names_whole(self):
+        # ``feature/x`` must not collapse to ``x`` — the prefix is the part
+        # that distinguishes it from an unrelated branch called ``x``.
+        assert (
+            code_skew._short("git:refs/heads/feature/x:0123456789abcdef")
+            == "feature/x@0123456789"
+        )
+
+    def test_non_fingerprint_is_returned_untouched(self):
+        # Anything that isn't ``<ref>:<sha>`` shaped is not a sha, so it must
+        # not be truncated as if it were one.
+        assert code_skew._short("weird-no-colon") == "weird-no-colon"
 
 
 class TestModelCommandEntryGuard:
@@ -91,9 +115,13 @@ class TestModelSwitchSkewGuard:
     def test_guard_message_names_revs_and_restart(self, monkeypatch):
         from gateway import slash_commands
 
-        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
+        monkeypatch.setattr(
+            code_skew, "detect_code_skew", lambda: ("main@abc1234567", "hotfix@def4567890")
+        )
         msg = slash_commands._model_switch_skew_guard()
         assert msg is not None
-        assert "abc1234567" in msg
-        assert "def4567890" in msg
+        # Both sides identified — this message is what a user pastes into a
+        # bug report, so it has to carry the evidence for the diagnosis.
+        assert "main@abc1234567" in msg
+        assert "hotfix@def4567890" in msg
         assert "hermes gateway restart" in msg

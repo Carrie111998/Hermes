@@ -46,11 +46,28 @@ def record_boot_fingerprint() -> None:
 
 
 def _short(fingerprint: str) -> str:
-    """Render a ``git:<ref>:<sha>`` fingerprint as a compact label."""
-    sha = fingerprint.rsplit(":", 1)[-1]
-    if sha and sha != "unresolved" and len(sha) > 10:
-        return sha[:10]
-    return sha or fingerprint
+    """Render a ``git:<ref>:<sha>`` fingerprint as a compact ``<ref>@<sha>`` label.
+
+    The ref is kept alongside the sha because a branch switch is a common cause
+    of skew and two bare shas don't reveal it. This label is what the guard puts
+    in front of the user, and it's the line they paste into a bug report, so it
+    should say both *what* is running and *where it came from*. Unresolvable
+    refs keep the ``unresolved`` marker rather than collapsing to an empty label.
+    """
+    body = fingerprint[4:] if fingerprint.startswith("git:") else fingerprint
+    ref, sep, sha = body.rpartition(":")
+    if not sep:
+        # Not a ``<ref>:<sha>`` shape — hand it back untouched rather than
+        # truncating something that isn't a sha.
+        return fingerprint
+    if sha != "unresolved" and len(sha) > 10:
+        sha = sha[:10]
+    ref_label = ref
+    for prefix in ("refs/heads/", "refs/remotes/", "refs/tags/"):
+        if ref_label.startswith(prefix):
+            ref_label = ref_label[len(prefix):]
+            break
+    return f"{ref_label}@{sha}" if ref_label else sha
 
 
 def detect_code_skew() -> tuple[str, str] | None:
