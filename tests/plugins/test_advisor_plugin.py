@@ -1,4 +1,4 @@
-"""Behavioral tests for the contrib advisor plugin."""
+"""Behavioral tests for the advisor plugin."""
 
 from __future__ import annotations
 
@@ -15,12 +15,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-IN_TREE_PLUGIN_DIR = ROOT / "plugins" / "advisor"
-PLUGIN_DIR = (
-    IN_TREE_PLUGIN_DIR
-    if IN_TREE_PLUGIN_DIR.exists()
-    else ROOT / "contrib" / "hermes-advisor-plugin"
-)
+PLUGIN_DIR = ROOT / "plugins" / "advisor"
 
 
 def _load_plugin(package_name: str = "_advisor_test_plugin"):
@@ -122,14 +117,25 @@ def test_silence_drops_persisted_held_advice(advisor):
     assert context.injected == []
 
 
+def test_tagged_advice_survives_stray_silence_phrase(advisor):
+    context = _Context([
+        "[NIT] Add a regression test — otherwise nothing to flag here."
+    ])
+    runtime = advisor.AdvisorRuntime(context)
+
+    _submit(runtime, "turn-1")
+
+    assert len(context.injected) == 1
+    assert "[NIT]" in context.injected[0][0]
+    assert "regression test" in context.injected[0][0]
+
+
 def test_held_advice_is_scoped_to_session(advisor):
-    context = _Context(
-        [
-            "[CONCERN] Session-specific issue",
-            "[CONCERN] Session-specific issue",
-            "[CONCERN] Session-specific issue",
-        ]
-    )
+    context = _Context([
+        "[CONCERN] Session-specific issue",
+        "[CONCERN] Session-specific issue",
+        "[CONCERN] Session-specific issue",
+    ])
     runtime = advisor.AdvisorRuntime(context)
 
     for session_id, turn_id in (
@@ -258,6 +264,48 @@ def test_transcript_includes_native_tool_calls_and_results(advisor):
     assert "`terminal` result: working tree clean" in transcript
 
 
+def test_transcript_tool_activity_is_scoped_to_current_turn(advisor):
+    transcript = advisor.AdvisorRuntime._format_history(
+        user_message="Fix again",
+        response="Done",
+        history=[
+            {"role": "user", "content": "Fix it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"old-command"}',
+                        }
+                    }
+                ],
+            },
+            {"role": "tool", "name": "terminal", "content": "old output"},
+            {"role": "user", "content": "Fix again"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"new-command"}',
+                        }
+                    }
+                ],
+            },
+            {"role": "tool", "name": "terminal", "content": "new output"},
+        ],
+    )
+
+    assert "new-command" in transcript
+    assert "new output" in transcript
+    assert "old-command" not in transcript
+    assert "old output" not in transcript
+
+
 def test_native_selector_updates_only_advisor_state(advisor):
     context = _Context()
     runtime = advisor.AdvisorRuntime(context)
@@ -276,6 +324,74 @@ def test_native_selector_updates_only_advisor_state(advisor):
     assert runtime.state.model == "review-model"
     assert runtime.state.provider == "review-provider"
     assert "review-model" in message
+
+
+def test_command_values_preserve_case(advisor):
+    runtime = advisor.AdvisorRuntime(_Context())
+
+    assert "MiMo-V2.5" in runtime.handle_command("model MiMo-V2.5")
+    assert runtime.state.model == "MiMo-V2.5"
+
+    assert "custom:OpenCode" in runtime.handle_command("provider custom:OpenCode")
+    assert runtime.state.provider == "custom:OpenCode"
+
+    assert "DeepSeek-V4" in runtime.handle_command("config model DeepSeek-V4")
+    assert runtime.state.model == "DeepSeek-V4"
+
+
+def test_test_command_preserves_note_case(advisor):
+    context = _Context()
+    runtime = advisor.AdvisorRuntime(context)
+
+    runtime.handle_command("test blocker Keep the HTTP Header casing")
+
+    assert context.injected
+    assert "Keep the HTTP Header casing" in context.injected[0][0]
+
+
+def test_provider_and_model_listings_use_picker_payload(advisor, monkeypatch):
+    from hermes_cli import inventory
+
+    build_calls = {}
+
+    def fake_build(_ctx, **kwargs):
+        build_calls.update(kwargs)
+        return {
+            "providers": [
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "is_current": True,
+                    "models": ["model-b", "model-a"],
+                    "total_models": 2,
+                },
+                {
+                    "slug": "custom:llama",
+                    "name": "llama",
+                    "is_current": False,
+                    "models": ["Llama-4"],
+                    "total_models": 1,
+                },
+            ]
+        }
+
+    context_data = SimpleNamespace(with_overrides=lambda **_kwargs: context_data)
+    monkeypatch.setattr(inventory, "load_picker_context", lambda: context_data)
+    monkeypatch.setattr(inventory, "build_models_payload", fake_build)
+
+    runtime = advisor.AdvisorRuntime(_Context())
+
+    providers = runtime.handle_command("providers")
+    assert "openrouter" in providers
+    assert "custom:llama" in providers
+    # A slash-command listing must not live-probe slow custom endpoints.
+    assert build_calls.get("probe_custom_providers") is False
+
+    models = runtime.handle_command("models custom:llama")
+    assert "Llama-4" in models
+
+    missing = runtime.handle_command("models no-such-provider")
+    assert "no-such-provider" in missing
 
 
 def test_import_does_not_require_posix_modules(monkeypatch):
@@ -318,7 +434,11 @@ def test_plugin_context_model_selection_uses_native_modal(monkeypatch):
         "hermes_cli.inventory.build_models_payload",
         lambda _context: {
             "providers": [
-                {"slug": "review-provider", "name": "Review", "models": ["review-model"]}
+                {
+                    "slug": "review-provider",
+                    "name": "Review",
+                    "models": ["review-model"],
+                }
             ]
         },
     )
@@ -372,7 +492,9 @@ def test_plugin_model_selection_dispatches_callback_without_primary_switch(monke
         _confirm_and_dispatch_model_selection=lambda selected, selected_callback: (
             dispatched.append((selected, selected_callback))
         ),
-        _confirm_and_apply_model_switch_result=lambda *_args: primary_applied.append(True),
+        _confirm_and_apply_model_switch_result=lambda *_args: primary_applied.append(
+            True
+        ),
     )
     cli._close_model_picker = cli_module.HermesCLI._close_model_picker.__get__(
         cli, type(cli)
