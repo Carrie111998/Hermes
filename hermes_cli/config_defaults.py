@@ -649,6 +649,13 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "threshold_tokens_by_model": {},  # per-model overrides for the cap above,
+                                      # keyed by a substring of the model id
+                                      # (longest case-insensitive match wins).
+                                      # Unlike the ratio overrides, an absolute
+                                      # per-model cap survives the sub-512K
+                                      # floor. Empty = threshold_tokens applies
+                                      # to every model.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
