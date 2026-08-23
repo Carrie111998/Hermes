@@ -1513,6 +1513,29 @@ def switch_model(
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
+            # explicit_provider may be a `model_aliases:` name rather than a
+            # real provider — the interactive picker surfaces alias rows with
+            # their alias name as the "provider" slug (#92763). Resolve the
+            # alias's own provider/base_url so selecting that row switches
+            # instead of erroring with "Unknown provider". The alias's model
+            # name is picked back up as `resolved_alias` a few lines down via
+            # resolve_alias()'s model-id reverse lookup, which also applies
+            # the alias's exact base_url/credentials further below.
+            _ensure_direct_aliases()
+            _direct_alias = DIRECT_ALIASES.get(explicit_provider.strip().lower())
+            if _direct_alias is not None:
+                pdef = resolve_provider_full(
+                    _direct_alias.provider,
+                    user_providers,
+                    custom_providers,
+                )
+                if pdef is None and _direct_alias.provider.strip().lower() == "custom":
+                    pdef = _bare_custom_provider_def(
+                        _direct_alias.base_url or current_base_url
+                    )
+                if pdef is not None and not new_model:
+                    new_model = _direct_alias.model
+        if pdef is None:
             _switch_err = (
                 f"Unknown provider '{explicit_provider}'. "
                 f"Check 'hermes model' for available providers, or define it "

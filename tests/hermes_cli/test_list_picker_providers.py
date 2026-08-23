@@ -196,6 +196,60 @@ def test_model_alias_shadowed_by_provider_row_is_not_duplicated(monkeypatch):
     assert matching[0]["models"] == ["already-here"]
 
 
+def test_model_alias_picker_row_selection_switches_model(monkeypatch):
+    """Selecting the alias row end-to-end must switch the model, not error (#92763).
+
+    Telegram/Discord treat a picker row's ``slug`` as a provider identifier:
+    they call back into ``switch_model(raw_input=<row's model>,
+    explicit_provider=<row's slug>)``. For an alias-only row that slug is the
+    alias *name* (e.g. "local"), not a registered provider, so this exercises
+    the actual selection callback rather than just the row's shape in the
+    picker list.
+    """
+    alias_cfg = {
+        "model_aliases": {
+            "local": {
+                "model": "qwen3-30b-a3b",
+                "provider": "custom",
+                "base_url": "http://localhost:8080/v1",
+            },
+        },
+    }
+    monkeypatch.setattr(model_switch, "list_authenticated_providers", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: alias_cfg)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: {
+            "accepted": True, "persist": True, "recognized": True, "message": None,
+        },
+    )
+    model_switch.DIRECT_ALIASES.clear()
+
+    rows = model_switch.list_picker_providers()
+    row = next(p for p in rows if p.get("slug") == "local")
+
+    # Mirrors plugins/platforms/{telegram,discord}/adapter.py's picker
+    # callback: model_id comes from the clicked row's models[idx], and
+    # provider_slug from the row's own slug.
+    model_id = row["models"][0]
+    provider_slug = row["slug"]
+
+    result = model_switch.switch_model(
+        raw_input=model_id,
+        current_provider="openrouter",
+        current_model="",
+        explicit_provider=provider_slug,
+        user_providers=None,
+        custom_providers=None,
+    )
+
+    assert result.success, result.error_message
+    assert result.new_model == "qwen3-30b-a3b"
+    assert result.target_provider == "custom"
+    assert result.base_url == "http://localhost:8080/v1"
+
 
 # ---------------------------------------------------------------------------
 # list_authenticated_providers: alias/canonical de-dup for Kimi (#49439)
