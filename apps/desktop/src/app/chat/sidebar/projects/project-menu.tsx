@@ -67,13 +67,21 @@ function useProjectActions({
   const claimedGroupId = grouping?.snapshot.groups.find(group => group.projectIds.includes(project.id))?.id ?? null
 
   const assignProject = async (groupId: string | null) => {
-    if (!grouping?.contribution.assignProject || groupPending || groupId === claimedGroupId) return
+    const assign = grouping?.contribution.assignProject
+    if (!assign || groupPending || (!project.isAuto && groupId === claimedGroupId)) return
     setGroupPending(true)
     try {
       const adopted = project.isAuto ? await materializeAutoProject(project) : null
       const projectId = project.isAuto ? adopted?.id : project.id
       if (!projectId) return
-      await grouping.contribution.assignProject(projectId, groupId)
+
+      // Provider writes are authoritative. Move the durable id first so a
+      // cleanup failure cannot silently ungroup the Project, then retire the
+      // legacy auto/path id. Ungrouped intentionally clears both identities.
+      await assign(projectId, groupId)
+      if (project.isAuto && projectId !== project.id) {
+        await assign(project.id, null)
+      }
     } catch (error) {
       notifyError(error, p.groupUpdateFailed)
     } finally {

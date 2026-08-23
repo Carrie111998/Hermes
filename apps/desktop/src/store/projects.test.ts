@@ -1,4 +1,5 @@
 import { atom } from 'nanostores'
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
@@ -455,9 +456,13 @@ describe('createProject', () => {
       primary_path: '/repo',
       slug: 'repo'
     }
+    let listCalls = 0
     const request = vi.fn(async (method: string) => {
       if (method === 'projects.create') return { project: created }
+      if (method === 'projects.get' || method === 'projects.update') return { project: created }
       if (method === 'projects.tree') return { active_id: null, projects: [], scoped_session_ids: [] }
+      listCalls += 1
+      if (listCalls === 1) return { active_id: null, projects: [], scoped_session_ids: [] }
       return { active_id: null, projects: [created], scoped_session_ids: [] }
     })
     activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
@@ -483,6 +488,113 @@ describe('createProject', () => {
       'projects.update',
       expect.objectContaining({ color: '#123456', id: 'p_stable' })
     )
+  })
+})
+
+describe('materializeAutoProject authority', () => {
+  const autoProject = {
+    color: null,
+    icon: null,
+    id: '/repo',
+    isAuto: true,
+    label: 'repo',
+    path: '/repo'
+  } as const
+  const listed = {
+    archived: false,
+    board_slug: null,
+    color: null,
+    created_at: 1,
+    description: null,
+    folders: [{ added_at: 1, is_primary: true, label: null, path: '/repo' }],
+    icon: null,
+    id: 'p_stable',
+    name: 'stale list name',
+    primary_path: '/repo',
+    slug: 'repo'
+  }
+  const authoritative = { ...listed, name: 'Authoritative' }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    setShowAllProfiles(false)
+    $projectsRpcAvailable.set(null)
+    $projects.set([])
+    $projectTree.set([])
+  })
+
+  it('resolves a stable row through authoritative list/get when the renderer cache is stale', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.list') return { active_id: null, projects: [listed] }
+      if (method === 'projects.get') return { project: authoritative }
+      throw new Error(`must not call ${method}`)
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await expect(materializeAutoProject(autoProject)).resolves.toEqual(authoritative)
+    expect(request.mock.calls).toEqual([
+      ['projects.list', { profile: 'default' }],
+      ['projects.get', { id: 'p_stable', profile: 'default' }]
+    ])
+  })
+
+  it('coalesces concurrent stale-cache materialization onto one authoritative row', async () => {
+    const listing = deferred<{ active_id: null; projects: (typeof listed)[] }>()
+    const request = vi.fn((method: string) => {
+      if (method === 'projects.list') return listing.promise
+      if (method === 'projects.get') return Promise.resolve({ project: authoritative })
+      throw new Error(`must not call ${method}`)
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    const first = materializeAutoProject(autoProject)
+    const second = materializeAutoProject(autoProject)
+    listing.resolve({ active_id: null, projects: [listed] })
+
+    await expect(Promise.all([first, second])).resolves.toEqual([authoritative, authoritative])
+    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(1)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.get')).toHaveLength(1)
+  })
+
+  it('reconciles one duplicate-primary create race through list/get instead of failing', async () => {
+    let listCalls = 0
+    const duplicate = new JsonRpcGatewayError(
+      "folder already belongs to project 'repo' (p_stable); switch to it instead of creating a duplicate",
+      { code: 5063 }
+    )
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.list') {
+        listCalls += 1
+        return { active_id: null, projects: listCalls === 1 ? [] : [listed] }
+      }
+      if (method === 'projects.create') throw duplicate
+      if (method === 'projects.get') return { project: authoritative }
+      throw new Error(`unexpected ${method}`)
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await expect(materializeAutoProject(autoProject)).resolves.toEqual(authoritative)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.create')).toHaveLength(1)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(2)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.get')).toHaveLength(1)
+  })
+
+  it('bounds duplicate-primary reconciliation and preserves the original rejection when no row appears', async () => {
+    const duplicate = new JsonRpcGatewayError(
+      "folder already belongs to project 'repo' (p_missing); switch to it instead of creating a duplicate",
+      { code: 5063 }
+    )
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.list') return { active_id: null, projects: [] }
+      if (method === 'projects.create') throw duplicate
+      throw new Error(`unexpected ${method}`)
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await expect(materializeAutoProject(autoProject)).rejects.toBe(duplicate)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.list')).toHaveLength(2)
+    expect(request.mock.calls.filter(([method]) => method === 'projects.create')).toHaveLength(1)
   })
 })
 

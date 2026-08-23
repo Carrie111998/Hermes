@@ -44,6 +44,7 @@ vi.mock('@/i18n', () => ({
           menuDelete: 'Delete',
           menuRename: 'Rename',
           menuSetActive: 'Set active',
+          groupUpdateFailed: 'Could not update Project group.',
           moveToGroup: 'Move to group',
           noColor: 'No color',
           removeFromSidebar: 'Remove from sidebar',
@@ -79,6 +80,10 @@ vi.mock('@/store/projects', () => ({
   setProjectAppearance: vi.fn().mockResolvedValue(false)
 }))
 
+vi.mock('@/store/notifications', () => ({
+  notifyError: vi.fn()
+}))
+
 const project = {
   color: null,
   icon: null,
@@ -91,6 +96,8 @@ const project = {
 const projectsStore = await import('@/store/projects')
 const materializeAutoProject = vi.mocked(projectsStore.materializeAutoProject)
 const setProjectAppearance = vi.mocked(projectsStore.setProjectAppearance)
+const notifications = await import('@/store/notifications')
+const notifyError = vi.mocked(notifications.notifyError)
 
 const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"]')
 
@@ -138,7 +145,15 @@ describe('ProjectMenu', () => {
     let snapshot = { groups: [{ id: 'cue', label: 'CUE++', projectIds: [] as string[] }] }
     const assignProject = vi.fn(async (projectId: string, groupId: string | null) => {
       snapshot = {
-        groups: [{ ...snapshot.groups[0], projectIds: groupId === 'cue' ? [projectId] : [] }]
+        groups: [
+          {
+            ...snapshot.groups[0],
+            projectIds: [
+              ...snapshot.groups[0].projectIds.filter(id => id !== projectId),
+              ...(groupId === 'cue' ? [projectId] : [])
+            ]
+          }
+        ]
       }
     })
     const contribution: ProjectsGroupingContribution = {
@@ -166,5 +181,92 @@ describe('ProjectMenu', () => {
 
     await waitFor(() => expect(setProjectAppearance).toHaveBeenCalledWith(adoptedProject, { color: null }))
     expect(snapshot.groups[0].projectIds).toEqual(['p_stable'])
+  }, 15000)
+
+  it('migrates legacy path-id membership to the stable Project even when the chosen group is unchanged', async () => {
+    const autoProject = { ...project, id: '/repo', isAuto: true }
+    const adoptedProject = { ...project, id: 'p_stable', isAuto: false }
+    let snapshot = { groups: [{ id: 'cue', label: 'CUE++', projectIds: ['/repo'] }] }
+    const assignProject = vi.fn(async (projectId: string, groupId: string | null) => {
+      snapshot = {
+        groups: snapshot.groups.map(group => ({
+          ...group,
+          projectIds: [...group.projectIds.filter(id => id !== projectId), ...(group.id === groupId ? [projectId] : [])]
+        }))
+      }
+    })
+    const contribution: ProjectsGroupingContribution = {
+      assignProject,
+      getSnapshot: () => snapshot,
+      subscribe: () => () => undefined
+    }
+    disposers.push(registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'groups' }))
+    materializeAutoProject.mockResolvedValue(adoptedProject as never)
+
+    render(<ProjectMenu isActive={false} project={autoProject} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+    fireEvent.pointerMove(await screen.findByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.pointerEnter(screen.getByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'CUE++' }))
+
+    await waitFor(() => expect(assignProject).toHaveBeenCalledTimes(2))
+    expect(assignProject.mock.calls).toEqual([
+      ['p_stable', 'cue'],
+      ['/repo', null]
+    ])
+    expect(snapshot.groups[0].projectIds).toEqual(['p_stable'])
+  }, 15000)
+
+  it('clears stable and legacy path ids when an auto Project is moved to Ungrouped', async () => {
+    const autoProject = { ...project, id: '/repo', isAuto: true }
+    const adoptedProject = { ...project, id: 'p_stable', isAuto: false }
+    const assignProject = vi.fn().mockResolvedValue(undefined)
+    const contribution: ProjectsGroupingContribution = {
+      assignProject,
+      getSnapshot: () => ({ groups: [{ id: 'cue', label: 'CUE++', projectIds: ['/repo'] }] }),
+      subscribe: () => () => undefined
+    }
+    disposers.push(registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'groups' }))
+    materializeAutoProject.mockResolvedValue(adoptedProject as never)
+
+    render(<ProjectMenu isActive={false} project={autoProject} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+    fireEvent.pointerMove(await screen.findByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.pointerEnter(screen.getByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Ungrouped' }))
+
+    await waitFor(() => expect(assignProject).toHaveBeenCalledTimes(2))
+    expect(assignProject.mock.calls).toEqual([
+      ['p_stable', null],
+      ['/repo', null]
+    ])
+  }, 15000)
+
+  it('leaves a provider partial migration visible and reports the failure without fabricating rollback state', async () => {
+    const autoProject = { ...project, id: '/repo', isAuto: true }
+    const adoptedProject = { ...project, id: 'p_stable', isAuto: false }
+    let snapshot = { groups: [{ id: 'cue', label: 'CUE++', projectIds: ['/repo'] }] }
+    const assignProject = vi.fn(async (projectId: string, groupId: string | null) => {
+      if (projectId === '/repo') throw new Error('transient id cleanup failed')
+      snapshot = {
+        groups: [{ ...snapshot.groups[0], projectIds: groupId === 'cue' ? ['/repo', projectId] : ['/repo'] }]
+      }
+    })
+    const contribution: ProjectsGroupingContribution = {
+      assignProject,
+      getSnapshot: () => snapshot,
+      subscribe: () => () => undefined
+    }
+    disposers.push(registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'groups' }))
+    materializeAutoProject.mockResolvedValue(adoptedProject as never)
+
+    render(<ProjectMenu isActive={false} project={autoProject} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+    fireEvent.pointerMove(await screen.findByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.pointerEnter(screen.getByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'CUE++' }))
+
+    await waitFor(() => expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Could not update Project group.'))
+    expect(snapshot.groups[0].projectIds).toEqual(['/repo', 'p_stable'])
   }, 15000)
 })

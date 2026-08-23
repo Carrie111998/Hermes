@@ -11,7 +11,7 @@ import { translateNow } from '@/i18n'
 import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRestEndpoint, isMissingRpcMethod } from '@/lib/gateway-rpc'
-import { isUnderPath } from '@/lib/path-compare'
+import { cleanPath, comparisonPath, isUnderPath } from '@/lib/path-compare'
 import { persistentAtom } from '@/lib/persisted'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
@@ -1006,6 +1006,145 @@ type AutoProjectIdentity = Pick<SidebarProjectTree, 'color' | 'icon' | 'id' | 'i
 
 const samePath = (left: string, right: string): boolean => isUnderPath(left, right) && isUnderPath(right, left)
 
+const materializingAutoProjects = new WeakMap<HermesGateway, Map<string, Promise<ProjectInfo | null>>>()
+
+function autoProjectMaterializationKey(profile: string, path: string): string {
+  return `${profile}\0${comparisonPath(cleanPath(path))}`
+}
+
+function findProjectByPath(projects: readonly ProjectInfo[], path: string): ProjectInfo | null {
+  return (
+    projects.find(
+      candidate =>
+        !candidate.archived &&
+        [candidate.primary_path, ...candidate.folders.map(folder => folder.path)].some(
+          candidatePath => candidatePath && samePath(candidatePath, path)
+        )
+    ) ?? null
+  )
+}
+
+function isDuplicatePrimaryProjectError(error: unknown): boolean {
+  const code = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
+  const message = error instanceof Error ? error.message : String(error)
+
+  return code === 5063 && /folder already belongs to project.+instead of creating a duplicate/i.test(message)
+}
+
+async function authoritativeProjectForPath(context: ActiveProjectsContext, path: string): Promise<ProjectInfo | null> {
+  const payload = await gatewayRequestOn<ProjectsPayload>(
+    context.gateway,
+    'projects.list',
+    projectParams({}, context.profile)
+  )
+  markProjectsRpcSuccess()
+  const listed = findProjectByPath(payload.projects ?? [], path)
+
+  if (!listed) return null
+
+  const { project } = await gatewayRequestOn<{ project: ProjectInfo | null }>(
+    context.gateway,
+    'projects.get',
+    projectParams({ id: listed.id }, context.profile)
+  )
+
+  return project && !project.archived && findProjectByPath([project], path) ? project : null
+}
+
+function cacheMaterializedProject(context: ActiveProjectsContext, project: ProjectInfo): void {
+  if (!stillOnProjectsContext(context)) return
+
+  const cached = $projects.get()
+  const index = cached.findIndex(candidate => candidate.id === project.id)
+  $projects.set(index === -1 ? [...cached, project] : cached.map((candidate, i) => (i === index ? project : candidate)))
+}
+
+async function createMaterializedProject(
+  context: ActiveProjectsContext,
+  project: AutoProjectIdentity
+): Promise<ProjectInfo | null> {
+  let response: { project: ProjectInfo | null }
+
+  try {
+    response = await gatewayRequestOn<{ project: ProjectInfo | null }>(
+      context.gateway,
+      'projects.create',
+      projectParams(
+        {
+          name: project.label,
+          folders: [project.path!],
+          primary_path: project.path!,
+          color: project.color || undefined,
+          icon: project.icon || undefined,
+          use: false
+        },
+        context.profile
+      )
+    )
+  } catch (error) {
+    if (isMissingRpcMethod(error)) {
+      $projectsRpcAvailable.set(false)
+      throw projectsStaleBackendError()
+    }
+
+    if (!isDuplicatePrimaryProjectError(error)) throw error
+
+    // Another renderer/process won the create race after our first list.
+    // Reconcile once; if the row still is not visible, preserve the original
+    // rejection instead of looping or disguising an inconsistent backend.
+    const raced = await authoritativeProjectForPath(context, project.path!)
+    if (!raced) throw error
+
+    return raced
+  }
+
+  markProjectsRpcSuccess()
+  return response.project
+}
+
+async function resolveMaterializedAutoProject(
+  context: ActiveProjectsContext,
+  project: AutoProjectIdentity
+): Promise<ProjectInfo | null> {
+  try {
+    const existing = await authoritativeProjectForPath(context, project.path!)
+    return existing ?? createMaterializedProject(context, project)
+  } catch (error) {
+    if (isMissingRpcMethod(error)) {
+      $projectsRpcAvailable.set(false)
+      throw projectsStaleBackendError()
+    }
+
+    throw error
+  }
+}
+
+async function patchMaterializedProject(
+  context: ActiveProjectsContext,
+  project: ProjectInfo,
+  patch: ProjectAppearancePatch
+): Promise<ProjectInfo> {
+  const response = await gatewayRequestOn<{ project: ProjectInfo }>(
+    context.gateway,
+    'projects.update',
+    projectParams(
+      {
+        id: project.id,
+        ...patch,
+        ...(patch.color === null && { color: '' }),
+        ...(patch.icon === null && { icon: '' })
+      },
+      context.profile
+    )
+  )
+
+  if (!response.project) {
+    throw new Error(`projects.update returned no project for ${project.id}`)
+  }
+
+  return response.project
+}
+
 // Any durable per-Project metadata must be written against a projects.db id,
 // never an auto-discovered repo's transient path id. Materialize once and hand
 // callers the authoritative row returned by the backend.
@@ -1014,32 +1153,37 @@ export async function materializeAutoProject(
   patch: ProjectAppearancePatch = {}
 ): Promise<ProjectInfo | null> {
   if (!project.isAuto || !project.path) return null
-  const projectPath = project.path
+  const context = await activeProjectsContext()
+  const key = autoProjectMaterializationKey(context.profile, project.path)
+  let pendingByPath = materializingAutoProjects.get(context.gateway)
 
-  const existing = $projects
-    .get()
-    .find(candidate =>
-      [candidate.primary_path, ...candidate.folders.map(folder => folder.path)].some(
-        path => path && samePath(path, projectPath)
-      )
-    )
-
-  if (existing) {
-    if (patch.color !== undefined || patch.icon !== undefined) {
-      await updateProject(existing.id, patch)
-    }
-
-    return existing
+  if (!pendingByPath) {
+    pendingByPath = new Map()
+    materializingAutoProjects.set(context.gateway, pendingByPath)
   }
 
-  return createProject({
-    name: project.label,
-    folders: [project.path],
-    primaryPath: project.path,
-    // Carry any already-set look so setting one field doesn't wipe the other.
-    color: (patch.color ?? project.color) || undefined,
-    icon: (patch.icon ?? project.icon) || undefined
-  })
+  let pending = pendingByPath.get(key)
+  if (!pending) {
+    pending = resolveMaterializedAutoProject(context, project).finally(() => {
+      pendingByPath?.delete(key)
+    })
+    pendingByPath.set(key, pending)
+  }
+
+  let materialized = await pending
+  if (!materialized) return null
+
+  cacheMaterializedProject(context, materialized)
+  if (stillOnProjectsContext(context)) {
+    setSidebarAgentsGrouped(true)
+  }
+
+  if (patch.color !== undefined || patch.icon !== undefined) {
+    materialized = await patchMaterializedProject(context, materialized, patch)
+    cacheMaterializedProject(context, materialized)
+  }
+
+  return materialized
 }
 
 // Appearance for an AUTO (inherited git-repo) project has no projects.db row to

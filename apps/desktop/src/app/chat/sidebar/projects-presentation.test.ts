@@ -158,4 +158,57 @@ describe('Projects grouping contribution', () => {
 
     expect(result.current?.snapshot.groups).toEqual([{ id: 'two', label: 'two', projectIds: ['a'] }])
   })
+
+  it.each([
+    ['opaque-token', 'opaque-token'],
+    [0, 0]
+  ])('retains a valid opaque snapshot revision %#', (revision, expected) => {
+    register({
+      getSnapshot: () => ({ groups: [], revision }),
+      subscribe: () => () => undefined
+    })
+
+    expect(resolveProjectsGrouping([])?.snapshot).toEqual({ groups: [], revision: expected })
+  })
+
+  it.each([true, null, {}, [], Number.NaN, Number.POSITIVE_INFINITY])(
+    'ignores a malformed snapshot revision %# without rejecting the provider',
+    revision => {
+      register({
+        getSnapshot: () => ({ groups: [{ id: 'one', label: 'One', projectIds: ['a'] }], revision }),
+        subscribe: () => () => undefined
+      })
+
+      expect(resolveProjectsGrouping([project('a')])?.snapshot).toEqual({
+        groups: [{ id: 'one', label: 'One', projectIds: ['a'] }]
+      })
+    }
+  )
+
+  it('publishes a new cache identity when only the provider revision changes', () => {
+    let revision: number | string = 1
+    let listener: (() => void) | undefined
+    const contribution: ProjectsGroupingContribution = {
+      getSnapshot: () => ({ groups: [{ id: 'one', label: 'One', projectIds: ['a'] }], revision }),
+      subscribe: onChange => {
+        listener = onChange
+        return () => undefined
+      }
+    }
+    register(contribution)
+
+    const { result } = renderHook(() => useActiveProjectsGrouping())
+    const initial = result.current?.snapshot
+
+    act(() => {
+      revision = 'capability-added'
+      listener?.()
+    })
+
+    expect(result.current?.snapshot).not.toBe(initial)
+    expect(result.current?.snapshot).toEqual({
+      groups: [{ id: 'one', label: 'One', projectIds: ['a'] }],
+      revision: 'capability-added'
+    })
+  })
 })

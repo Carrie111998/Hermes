@@ -16,6 +16,8 @@ export interface ProjectGroupDescriptor {
 
 export interface ProjectsGroupingSnapshot {
   readonly groups: readonly ProjectGroupDescriptor[]
+  /** Opaque provider state identity for capability changes not represented by groups. */
+  readonly revision?: number | string
 }
 
 export interface ProjectsGroupingContribution {
@@ -73,7 +75,10 @@ function sanitizeSnapshot(value: unknown): ProjectsGroupingSnapshot | null {
     })
   }
 
-  return { groups }
+  const revision = (value as { revision?: unknown }).revision
+  const validRevision = typeof revision === 'string' || (typeof revision === 'number' && Number.isFinite(revision))
+
+  return { groups, ...(validRevision && { revision }) }
 }
 
 function readValidProvider(): {
@@ -146,7 +151,12 @@ const NULL_SNAPSHOT = () => null
 
 function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingSnapshot): boolean {
   if (left === right) return true
-  if (!Array.isArray(left.groups) || !Array.isArray(right.groups) || left.groups.length !== right.groups.length) {
+  if (
+    left.revision !== right.revision ||
+    !Array.isArray(left.groups) ||
+    !Array.isArray(right.groups) ||
+    left.groups.length !== right.groups.length
+  ) {
     return false
   }
 
