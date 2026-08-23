@@ -115,8 +115,15 @@ NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
 MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
+SEND_FRAME_TIMEOUT_SECONDS = 3.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 3
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+
+# WeCom errcode: aibot websocket not subscribed (subscription-level failure,
+# NOT a plain send error — the WS may still be OPEN while the subscription is
+# dead). Must trigger reconnect + retry, otherwise replies are silently lost.
+WECOM_ERR_NOT_SUBSCRIBED = "846609"
 
 DEDUP_MAX_SIZE = 1000
 
@@ -309,6 +316,27 @@ class WeComAdapter(BasePlatformAdapter):
             await self._session.close()
         self._session = None
 
+    async def _invalidate_connection(self) -> None:
+        """Force-close a connection whose subscription the server invalidated.
+
+        Unlike disconnect(), this keeps the adapter running: _listen_loop
+        observes the closure and reconnects + resubscribes automatically.
+        Pending response futures are failed so no caller hangs on them.
+        """
+        self._fail_pending_responses(RuntimeError("WeCom subscription invalidated"))
+        try:
+            if self._ws and not self._ws.closed:
+                await self._ws.close(code=1012, message=b"subscription invalid")
+        except Exception as exc:
+            logger.warning("[%s] Invalidate-connection close failed: %s", self.name, exc)
+        # Give _listen_loop a moment to observe the closure and reconnect,
+        # then wait until the socket is usable again (bounded).
+        deadline = asyncio.get_running_loop().time() + CONNECT_TIMEOUT_SECONDS
+        while asyncio.get_running_loop().time() < deadline:
+            if self._ws and not self._ws.closed:
+                return
+            await asyncio.sleep(0.5)
+
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
         await self._cleanup_ws()
@@ -404,11 +432,18 @@ class WeComAdapter(BasePlatformAdapter):
                 raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:
-        """Send lightweight application-level pings."""
+        """Send lightweight application-level pings.
+
+        A heartbeat proves the connection is still healthy. Consecutive
+        failures mean the WS is wedged (locally OPEN but functionally dead),
+        so force-close it to let _listen_loop reconnect — do NOT stay silent.
+        """
+        consecutive_failures = 0
         try:
             while self._running:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 if not self._ws or self._ws.closed:
+                    consecutive_failures = 0
                     continue
                 try:
                     await self._send_json(
@@ -418,8 +453,28 @@ class WeComAdapter(BasePlatformAdapter):
                             "body": {},
                         }
                     )
+                    consecutive_failures = 0
                 except Exception as exc:
-                    logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
+                    consecutive_failures += 1
+                    logger.warning(
+                        "[%s] Heartbeat send failed (%d/%d): %s",
+                        self.name,
+                        consecutive_failures,
+                        HEARTBEAT_MAX_CONSECUTIVE_FAILURES,
+                        exc,
+                    )
+                    if consecutive_failures >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES:
+                        logger.warning(
+                            "[%s] Heartbeat failed %d times consecutively; force-closing wedged websocket to trigger reconnect",
+                            self.name,
+                            consecutive_failures,
+                        )
+                        try:
+                            if self._ws and not self._ws.closed:
+                                await self._ws.close(code=1011, message=b"heartbeat timeout")
+                        except Exception as close_exc:
+                            logger.warning("[%s] Force-close after heartbeat failures failed: %s", self.name, close_exc)
+                        break  # let _listen_loop observe the closure and reconnect
         except asyncio.CancelledError:
             pass
 
@@ -450,10 +505,16 @@ class WeComAdapter(BasePlatformAdapter):
             self._pending_responses.pop(req_id, None)
 
     async def _send_json(self, payload: Dict[str, Any]) -> None:
-        """Send a raw JSON frame over the active websocket."""
+        """Send a raw JSON frame over the active websocket.
+
+        Wrapped in a timeout: a wedged WS write must not hang the caller
+        forever (REQUEST_TIMEOUT_SECONDS only covers the response wait).
+        """
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
-        await self._ws.send_json(payload)
+        await asyncio.wait_for(
+            self._ws.send_json(payload), timeout=SEND_FRAME_TIMEOUT_SECONDS
+        )
 
     async def _send_request(self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
         """Send a JSON request and await the correlated response."""
@@ -1432,6 +1493,7 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
+        reply_req_id: Optional[str] = None
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
 
@@ -1452,12 +1514,72 @@ class WeComAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
-            logger.error("[%s] Send failed: %s", self.name, exc)
-            return SendResult(success=False, error=str(exc))
+            # The reply-markdown path raises RuntimeError (via
+            # _raise_for_wecom_error) instead of returning a response, so
+            # errcode 846609 can arrive here. Treat it exactly like the
+            # response-path case below: subscription died while the WS is
+            # still locally open — force reconnect + resubscribe, retry once.
+            if WECOM_ERR_NOT_SUBSCRIBED in str(exc):
+                logger.warning(
+                    "[%s] Send raised errcode %s (subscription dead while WS open); forcing reconnect and retrying once",
+                    self.name,
+                    WECOM_ERR_NOT_SUBSCRIBED,
+                )
+                await self._invalidate_connection()
+                try:
+                    if reply_req_id:
+                        response = await self._send_reply_markdown(reply_req_id, content)
+                    else:
+                        response = await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                            },
+                        )
+                except Exception as retry_exc:
+                    logger.error("[%s] Post-reconnect send retry failed: %s", self.name, retry_exc)
+                    return SendResult(success=False, error=str(exc))
+            else:
+                logger.error("[%s] Send failed: %s", self.name, exc)
+                return SendResult(success=False, error=str(exc))
 
         error = self._response_error(response)
         if error:
-            return SendResult(success=False, error=error)
+            if WECOM_ERR_NOT_SUBSCRIBED in error:
+                # Subscription-level failure: the server has invalidated this
+                # connection's subscription while the WS may still be locally
+                # OPEN. Treating it as a plain send error silently drops the
+                # message. Force-close the wedged socket so _listen_loop
+                # reconnects + resubscribes, then retry once on the fresh
+                # connection.
+                logger.warning(
+                    "[%s] Send hit errcode %s (subscription dead while WS open); forcing reconnect and retrying once",
+                    self.name,
+                    WECOM_ERR_NOT_SUBSCRIBED,
+                )
+                await self._invalidate_connection()
+                try:
+                    if reply_req_id:
+                        response = await self._send_reply_markdown(reply_req_id, content)
+                    else:
+                        response = await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                            },
+                        )
+                except Exception as retry_exc:
+                    logger.error("[%s] Post-reconnect send retry failed: %s", self.name, retry_exc)
+                    return SendResult(success=False, error=error)
+                error = self._response_error(response)
+                if error:
+                    return SendResult(success=False, error=error)
+            else:
+                return SendResult(success=False, error=error)
 
         return SendResult(
             success=True,
