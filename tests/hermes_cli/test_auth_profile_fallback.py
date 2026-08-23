@@ -288,3 +288,26 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_write_pool_tombstone_blocks_stale_snapshot_resurrection(classic_env):
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    removed = _pool_entry(id="removed-id", label="removed")
+    retained = _pool_entry(id="retained-id", label="retained", priority=1)
+    write_credential_pool("anthropic", [removed, retained])
+    stale_snapshot = read_credential_pool("anthropic")
+
+    write_credential_pool(
+        "anthropic",
+        [retained],
+        removed_ids={"removed-id"},
+    )
+    write_credential_pool("anthropic", stale_snapshot)
+
+    data = json.loads((classic_env / "auth.json").read_text())
+    final_ids = {
+        entry["id"] for entry in data["credential_pool"]["anthropic"]
+    }
+    assert final_ids == {"retained-id"}
+    assert data["credential_pool_removed_ids"]["anthropic"] == ["removed-id"]

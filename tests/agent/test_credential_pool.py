@@ -929,6 +929,37 @@ def test_write_credential_pool_preserves_known_provider_owned_oauth_state(tmp_pa
     assert persisted["agent_key"] == f"agent-{sentinel}"
 
 
+@pytest.mark.parametrize(
+    ("provider", "source"),
+    [
+        ("minimax-oauth", "oauth"),
+        ("nous", "device_code"),
+        ("openai-codex", "device_code"),
+        ("xai-oauth", "device_code"),
+    ],
+)
+def test_prune_stale_file_backed_singleton_entries(provider, source):
+    from agent.credential_pool import (
+        PooledCredential,
+        _prune_stale_seeded_entries,
+    )
+
+    entries = [
+        PooledCredential(
+            provider=provider,
+            id="stale-file-backed",
+            label="stale",
+            auth_type="oauth",
+            priority=0,
+            source=source,
+            access_token="stale-access-token",
+        )
+    ]
+
+    assert _prune_stale_seeded_entries(entries, set()) is True
+    assert entries == []
+
+
 
 def test_load_pool_prefers_dotenv_over_stale_os_environ(tmp_path, monkeypatch):
     """Regression for #18254: stale OPENROUTER_API_KEY in os.environ (inherited
