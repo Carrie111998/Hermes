@@ -4241,8 +4241,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
     ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
-    notify callback raised.  Persistence of an approved choice and building
-    the final tool-facing result dict remain the caller's responsibility.
+    notify callback raised or explicitly rejected the event write.  A truthy
+    write result confirms transport acceptance, not client receipt; a client
+    that accepts but never answers still follows the normal approval timeout.
+    Persistence of an approved choice and building the final tool-facing
+    result dict remain the caller's responsibility.
     """
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
@@ -4308,13 +4311,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
     )
 
-    # Notify the user (bridges sync agent thread → async gateway)
-    try:
-        delivered = notify_cb(dict(entry.data))
-        if delivered is False:
-            raise RuntimeError("approval transport rejected the event write")
-    except Exception as exc:
-        logger.warning("Gateway approval notify failed: %s", exc)
+    def _notify_failed(reason) -> dict:
+        logger.warning("Gateway approval notify failed: %s", reason)
         _drop_entry()
         _fire_approval_hook(
             "post_approval_response",
@@ -4327,6 +4325,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             choice="notify_failed",
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
+
+    # Notify the user (bridges sync agent thread → async gateway)
+    try:
+        delivered = notify_cb(dict(entry.data))
+    except Exception as exc:
+        return _notify_failed(exc)
+    if delivered is False:
+        return _notify_failed(
+            "approval transport rejected the event write"
+        )
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
