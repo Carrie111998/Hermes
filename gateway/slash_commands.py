@@ -1509,14 +1509,16 @@ class GatewaySlashCommandsMixin:
     async def _handle_extend_command(self, event: MessageEvent) -> str:
         """Handle ``/extend [minutes]`` — raise this turn's inactivity timeout.
 
-        Stores a monotonic deadline (time.time() + minutes*60), hard-capped so a
-        single command cannot pin a hung turn forever (#4815). The inactivity
-        watchdog reads it and extends the idle budget until the deadline.
+        Stores a monotonic deadline for the currently active turn, hard-capped
+        so a single command cannot pin a hung turn forever (#4815). The
+        inactivity watchdog reads it and will not reap that turn before it.
         """
         # Hard cap per call so an extension cannot pin a hung turn forever.
         _CAP = 3600.0
         source = event.source
         session_key = self._session_key_for_source(source)
+        if session_key not in self._running_agents:
+            return "No active agent turn to extend."
         raw = (event.get_command_args() or "").strip()
         try:
             minutes = float(raw) if raw else 30.0
@@ -1527,13 +1529,15 @@ class GatewaySlashCommandsMixin:
             )
         if minutes <= 0:
             # A non-positive value clears any prior extension.
-            self._inactivity_extend_deadlines.pop(session_key, None)
+            with self._inactivity_extend_lock():
+                self._inactivity_extend_deadlines.pop(session_key, None)
             return "Inactivity extension cleared for this session."
         minutes = min(minutes, _CAP / 60.0)
         deadline = time.monotonic() + minutes * 60.0
-        # Persist keyed by session so the watchdog can find it. The watch-
-        # dog also checks TurnContext; mirror there when a turn is live.
-        self._inactivity_extend_deadlines[session_key] = deadline
+        # Persist only for the running turn. The watchdog reads this map from a
+        # worker thread, so the map has one synchronization owner.
+        with self._inactivity_extend_lock():
+            self._inactivity_extend_deadlines[session_key] = deadline
         return (
             f"⏱️ Inactivity timeout extended by {int(minutes)} min for this "
             f"session (will not be reaped before then). Send /extend 0 to clear."

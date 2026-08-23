@@ -2806,13 +2806,23 @@ def _run_single_child(
             # exceeds the gateway inactivity timeout reaps its own parent (#4815).
             _heartbeat = getattr(parent_agent, "_touch_activity", None)
             _poll_interval = 5.0
-            _deadline = time.monotonic() + float(child_timeout or 0.0)
+            _deadline = (
+                None
+                if child_timeout is None
+                else time.monotonic() + float(child_timeout)
+            )
             while True:
-                _remaining = _deadline - time.monotonic()
-                if _remaining <= 0:
+                _remaining = None if _deadline is None else _deadline - time.monotonic()
+                if _remaining is not None and _remaining <= 0:
                     raise FuturesTimeoutError()
                 try:
-                    result = _child_future.result(timeout=min(_poll_interval, _remaining))
+                    result = _child_future.result(
+                        timeout=(
+                            _poll_interval
+                            if _remaining is None
+                            else min(_poll_interval, _remaining)
+                        )
+                    )
                     break
                 except FuturesTimeoutError:
                     # Not done yet — refresh the parent's activity clock so the

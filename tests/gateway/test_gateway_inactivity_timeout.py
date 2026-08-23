@@ -9,10 +9,13 @@ Tests cover:
 - Warning disabled when gateway_timeout_warning is 0
 """
 
+import asyncio
 import concurrent.futures
 import os
 import sys
+import threading
 import time
+import types
 from pathlib import Path
 
 
@@ -167,123 +170,6 @@ class TestStagedInactivityWarning:
         assert _inactivity_timeout
 
 
-class _ProviderGraceAgent(FakeAgent):
-    """Agent whose last_activity_desc marks it as waiting on a provider."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._activity_desc = "waiting for provider response (thinking)"
-        self._provenance = "waiting_for_provider_response"
-
-    def get_activity_summary(self):
-        s = super().get_activity_summary()
-        s["last_activity_desc"] = self._activity_desc
-        s["last_activity_provenance"] = self._provenance
-        return s
-
-
-class _DelegatingParentAgent(FakeAgent):
-    """Orchestrator parent whose activity clock is refreshed by a heartbeat
-    while a synchronous subagent runs (the _touch_activity poll loop)."""
-
-    def __init__(self, heartbeat_every=0.1, total_idle=1.2, **kwargs):
-        super().__init__(**kwargs)
-        self._heartbeat_every = heartbeat_every
-        self._total_idle = total_idle
-        self._last_touch = time.monotonic()
-        self._activity_desc = "delegating to subagent (child running)"
-
-    def _touch_activity(self, desc=None):
-        self._last_touch = time.monotonic()
-        if desc:
-            self._activity_desc = desc
-
-    def get_activity_summary(self):
-        # Simulate the parent being re-touched on each poll while the child runs.
-        now = time.monotonic()
-        # The delegate_tool heartbeat would call _touch_activity every
-        # _poll_interval; emulate the net effect: idle clock resets each beat.
-        return {
-            "last_activity_ts": now - 0.0,
-            "last_activity_desc": self._activity_desc,
-            "seconds_since_activity": 0.0,
-            "current_tool": None,
-            "api_call_count": 5,
-            "max_iterations": 90,
-        }
-
-
-class TestProviderGraceAndExtend:
-    """Tests for the provider-think grace and /extend deadline (Gap 3 + Gap 2)."""
-
-    def test_provider_grace_extends_effective_timeout(self):
-        """While waiting on a provider, the idle budget is _agent_timeout + grace."""
-        agent = _ProviderGraceAgent(activity_desc="waiting for provider response")
-        _agent_timeout = 1.0
-        _agent_provider_grace = 0.5
-        _POLL_INTERVAL = 0.05
-
-        # Drive the SAME threshold logic the watchdog uses, including the
-        # provider-grace branch added for #4815.
-        _inactivity_timeout = False
-        start = time.monotonic()
-        while True:
-            _act = agent.get_activity_summary()
-            _idle_secs = _act.get("seconds_since_activity", 0.0)
-            _effective_timeout = _agent_timeout
-            if _agent_provider_grace and _agent_timeout is not None:
-                _desc = _act.get("last_activity_desc") or ""
-                _prov = _act.get("last_activity_provenance") or ""
-                if ("waiting for provider response" in _desc
-                        or _prov == "waiting_for_provider_response"):
-                    _effective_timeout = _agent_timeout + _agent_provider_grace
-            if _idle_secs >= _effective_timeout:
-                _inactivity_timeout = True
-                break
-            if time.monotonic() - start > _agent_timeout + _agent_provider_grace + 0.5:
-                # Should not time out before grace expires.
-                break
-
-        assert _effective_timeout == 1.5
-        assert not _inactivity_timeout
-
-    def test_extend_deadline_overrides_timeout(self):
-        """A /extend deadline raises the effective timeout for the turn."""
-        agent = FakeAgent(activity_desc="tool_call", idle_seconds=2.0)
-        _agent_timeout = 1.0
-        # Simulated /extend N -> monotonic deadline in the future.
-        _ext_deadline = time.monotonic() + 60.0
-        _POLL_INTERVAL = 0.05
-
-        _act = agent.get_activity_summary()
-        _idle_secs = _act.get("seconds_since_activity", 0.0)
-        _effective_timeout = _agent_timeout
-        _ext_idle_budget = max(0.0, _ext_deadline - time.monotonic())
-        if _agent_timeout is None or _ext_idle_budget > _effective_timeout:
-            _effective_timeout = _ext_idle_budget
-
-        # idle is 2s but the extended budget is ~60s -> not timed out.
-        assert _idle_secs < _effective_timeout
-        assert _effective_timeout > 50.0
-
-    def test_delegating_parent_not_reaped(self):
-        """A delegating parent that heartbeats stays alive past the timeout."""
-        agent = _DelegatingParentAgent()
-        _agent_timeout = 0.5
-        _POLL_INTERVAL = 0.05
-        _inactivity_timeout = False
-        start = time.monotonic()
-        while True:
-            _act = agent.get_activity_summary()
-            _idle_secs = _act.get("seconds_since_activity", 0.0)
-            if _idle_secs >= _agent_timeout:
-                _inactivity_timeout = True
-                break
-            if time.monotonic() - start > _agent_timeout + 0.5:
-                break
-        assert not _inactivity_timeout
-
-
 class TestExtendCommandHandler:
     """Tests for /extend command parsing and storage (Gap 2)."""
 
@@ -292,6 +178,8 @@ class TestExtendCommandHandler:
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner._inactivity_extend_deadlines = {}
+        runner._inactivity_extend_deadlines_lock = threading.Lock()
+        runner._running_agents = {"session:c1": object()}
         # Minimal stand-ins so the handler runs without a full gateway.
         class _Source:
             platform = "cli"
@@ -309,10 +197,7 @@ class TestExtendCommandHandler:
         # Patch time.monotonic to a fixed clock for deterministic deadline.
         fixed = [1000.0]
         monkeypatch.setattr(time, "monotonic", lambda: fixed[0])
-        import asyncio
-        out = asyncio.get_event_loop().run_until_complete(
-            runner._handle_extend_command(_Event("30"))
-        )
+        out = asyncio.run(runner._handle_extend_command(_Event("30")))
         assert "extended by 30" in out
         assert runner._inactivity_extend_deadlines["session:c1"] == 1000.0 + 30 * 60
 
@@ -321,6 +206,8 @@ class TestExtendCommandHandler:
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner._inactivity_extend_deadlines = {"session:c1": 9999.0}
+        runner._inactivity_extend_deadlines_lock = threading.Lock()
+        runner._running_agents = {"session:c1": object()}
         class _Source:
             platform = "cli"
             chat_id = "c1"
@@ -333,12 +220,74 @@ class TestExtendCommandHandler:
             runner, "_session_key_for_source",
             lambda src: f"session:{src.chat_id}",
         )
-        import asyncio
-        out = asyncio.get_event_loop().run_until_complete(
-            runner._handle_extend_command(_Event())
-        )
+        out = asyncio.run(runner._handle_extend_command(_Event()))
         assert "cleared" in out
         assert "session:c1" not in runner._inactivity_extend_deadlines
+
+    def test_extend_rejects_when_no_turn_is_running(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._inactivity_extend_deadlines = {}
+        runner._inactivity_extend_deadlines_lock = threading.Lock()
+        runner._running_agents = {}
+        monkeypatch.setattr(runner, "_session_key_for_source", lambda _source: "session:c1")
+
+        class _Event:
+            source = object()
+
+            def get_command_args(self):
+                return "30"
+
+        out = asyncio.run(runner._handle_extend_command(_Event()))
+        assert out == "No active agent turn to extend."
+        assert runner._inactivity_extend_deadlines == {}
+
+    def test_busy_dispatch_reaches_extend_handler(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        called = []
+
+        async def _extend(event):
+            called.append(event)
+            return "extended"
+
+        monkeypatch.setattr(runner, "_handle_extend_command", _extend)
+        command = types.SimpleNamespace(
+            name="extend", busy_handler="extend", busy_policy="reject"
+        )
+        event = object()
+        out = asyncio.run(
+            runner._dispatch_busy_slash_command(event, command, "session:c1", object())
+        )
+        assert out == "extended"
+        assert called == [event]
+
+
+class TestGatewayInactivityPolicy:
+    def test_provider_grace_uses_the_shared_production_policy(self):
+        from gateway.run import _effective_gateway_inactivity_timeout
+
+        timeout = _effective_gateway_inactivity_timeout(
+            30.0,
+            {"last_activity_desc": "waiting for provider response (streaming)"},
+            provider_grace=300.0,
+        )
+        assert timeout == 330.0
+
+    def test_extend_is_an_absolute_no_reap_deadline(self):
+        from gateway.run import _effective_gateway_inactivity_timeout
+
+        # An already-idle turn must remain protected until the requested
+        # deadline; treating deadline-now as a fresh idle budget reaps it early.
+        timeout = _effective_gateway_inactivity_timeout(
+            30.0, {}, extend_deadline=120.0, now=100.0
+        )
+        assert timeout == float("inf")
+        assert _effective_gateway_inactivity_timeout(
+            30.0, {}, extend_deadline=120.0, now=120.0
+        ) == 30.0
 
 
 
