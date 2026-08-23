@@ -2121,8 +2121,11 @@ def _reap_orphaned_chromium_profiles():
     this exact ``--user-data-dir=<profile>`` on its command line, and (3) has
     been reparented to init (its real parent already exited).  A browser still
     owned by a live daemon keeps that daemon as its parent (PPID != 1) and is
-    never touched, so an in-use session is safe.  Idempotent; safe to call from
-    any context (cleanup-thread startup, atexit, on demand).
+    never touched, so an in-use session is safe.  Profile deletion additionally
+    requires a complete process-table scan: if any command line is unreadable,
+    no profile can be proven unreferenced and all are retained for a later
+    sweep.  Idempotent; safe to call from any context (cleanup-thread startup,
+    atexit, on demand).
     """
     import glob
     try:
@@ -2140,14 +2143,45 @@ def _reap_orphaned_chromium_profiles():
     wanted = {os.path.normpath(d): d for d in profile_dirs}
     procs_by_profile: dict[str, list] = {d: [] for d in profile_dirs}
     flag = "--user-data-dir="
-    for proc in psutil.process_iter(["pid", "name", "ppid", "cmdline"]):
-        for arg in (proc.info.get("cmdline") or []):
-            if not arg.startswith(flag):
+    inspection_ambiguous = False
+    try:
+        for proc in psutil.process_iter(["pid", "name", "ppid", "cmdline"]):
+            try:
+                cmdline = proc.info.get("cmdline")
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                # A vanished process cannot still reference a profile.  Any
+                # other read failure could conceal an exact --user-data-dir.
+                try:
+                    if not proc.is_running():
+                        continue
+                except psutil.NoSuchProcess:
+                    continue
+                except (psutil.AccessDenied, OSError):
+                    pass
+                inspection_ambiguous = True
                 continue
-            orig = wanted.get(os.path.normpath(arg[len(flag):]))
-            if orig is not None:
-                procs_by_profile[orig].append(proc)
-            break
+
+            # psutil uses None for attributes it could not read.  An empty
+            # list, by contrast, is a successfully-read command line with no
+            # arguments and cannot contain a profile reference.
+            if cmdline is None or not isinstance(cmdline, (list, tuple)) or \
+                    any(not isinstance(arg, str) for arg in cmdline):
+                inspection_ambiguous = True
+                continue
+
+            for arg in cmdline:
+                if not arg.startswith(flag):
+                    continue
+                orig = wanted.get(os.path.normpath(arg[len(flag):]))
+                if orig is not None:
+                    procs_by_profile[orig].append(proc)
+                break
+    except (psutil.Error, OSError) as exc:
+        # The iterator itself failed, so this was not a complete snapshot.
+        inspection_ambiguous = True
+        logger.warning(
+            "Retaining Chromium profile dirs: process scan incomplete (%s)",
+            exc)
 
     reaped = 0
     for profile_dir, procs in procs_by_profile.items():
@@ -2158,7 +2192,10 @@ def _reap_orphaned_chromium_profiles():
                     continue
                 name = (proc.info.get("name") or "").lower()
                 ppid = proc.info.get("ppid")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, OSError):
+                remaining_live += 1
                 continue
             # Fail closed unless this is clearly an ORPHANED Chromium: a
             # chromium-family executable reparented to init.  Anything else that
@@ -2177,8 +2214,14 @@ def _reap_orphaned_chromium_profiles():
 
         # Remove the profile dir only when nothing live still references it
         # (it was already dead, or we just reaped every referencing proc).
-        if remaining_live == 0:
+        if remaining_live == 0 and not inspection_ambiguous:
             shutil.rmtree(profile_dir, ignore_errors=True)
+
+    if inspection_ambiguous:
+        logger.warning(
+            "Retained %d Chromium profile dir(s): one or more process "
+            "command lines could not be inspected safely",
+            len(profile_dirs))
 
     if reaped:
         logger.info(

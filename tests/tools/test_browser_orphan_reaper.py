@@ -569,12 +569,16 @@ class TestPeriodicOrphanReap:
 class _FakeChromeProc:
     """Minimal stand-in for a psutil.Process yielded by process_iter(attrs=...)."""
 
-    def __init__(self, pid, name, ppid, cmdline, running=True):
+    def __init__(self, pid, name, ppid, cmdline, running=True,
+                 running_error=None):
         self.pid = pid
         self.info = {"pid": pid, "name": name, "ppid": ppid, "cmdline": cmdline}
         self._running = running
+        self._running_error = running_error
 
     def is_running(self):
+        if self._running_error is not None:
+            raise self._running_error
         return self._running
 
 
@@ -690,6 +694,52 @@ class TestReapOrphanedChromiumProfiles:
 
         assert killed == []          # the other browser is not ours
         assert not d.exists()        # our dir had no referencing proc → stale
+
+    @pytest.mark.parametrize("cmdline", [None, "not-a-command-line"])
+    def test_unreadable_or_unusable_cmdline_retains_profiles(
+        self, fake_tmpdir, cmdline
+    ):
+        """A process hidden by an incomplete psutil snapshot may reference any
+        profile, so stale-dir deletion must fail closed for the whole scan."""
+        from tools.browser_tool import _reap_orphaned_chromium_profiles
+
+        d = _make_profile_dir(fake_tmpdir)
+        ambiguous = _FakeChromeProc(
+            pid=4242, name=None, ppid=None, cmdline=cmdline
+        )
+
+        with patch("psutil.process_iter", return_value=[ambiguous]), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid") \
+                as terminate:
+            _reap_orphaned_chromium_profiles()
+
+        terminate.assert_not_called()
+        assert d.exists(), "ambiguous process inspection must retain the profile"
+
+    def test_access_denied_for_matched_process_retains_profile(
+        self, fake_tmpdir
+    ):
+        """If liveness becomes unreadable after matching the exact profile,
+        that process must still count as a possible live reference."""
+        import psutil
+        from tools.browser_tool import _reap_orphaned_chromium_profiles
+
+        d = _make_profile_dir(fake_tmpdir)
+        proc = _FakeChromeProc(
+            pid=4242,
+            name="chrome",
+            ppid=1,
+            cmdline=["chrome", f"--user-data-dir={d}"],
+            running_error=psutil.AccessDenied(pid=4242),
+        )
+
+        with patch("psutil.process_iter", return_value=[proc]), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid") \
+                as terminate:
+            _reap_orphaned_chromium_profiles()
+
+        terminate.assert_not_called()
+        assert d.exists(), "an unreadable matched process may still be live"
 
     def test_reaper_runs_profile_sweep_even_with_no_socket_dirs(self, fake_tmpdir):
         """Regression: the leak scenario has ZERO socket dirs (daemon already
