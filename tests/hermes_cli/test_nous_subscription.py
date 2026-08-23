@@ -206,6 +206,87 @@ def test_prompt_enable_tool_gateway_pool_offers_covered_tools_only(monkeypatch):
     assert "free" in captured["title"].lower() and "pool" in captured["title"].lower()
 
 
+def test_explicit_local_web_backend_not_prechecked(monkeypatch):
+    """#92647: an explicit keyless backend (web.backend: searxng) must not be
+    classified unconfigured — it used to be pre-checked, and accepting the
+    checklist overwrote the working local setup with the gateway default.
+    It belongs on the has_direct side (offered, unchecked) instead."""
+    monkeypatch.setattr(ns, "get_nous_portal_account_info", lambda **kw: _pool_account())
+    monkeypatch.setattr(
+        ns,
+        "_get_gateway_direct_credentials",
+        lambda: {"web": False, "image_gen": False, "video_gen": False, "tts": False, "browser": False},
+    )
+    captured = _capture_checklist(monkeypatch, selected_idx=[])
+
+    config = {
+        "model": {"provider": "nous"},
+        "web": {"backend": "searxng"},
+    }
+    ns.prompt_enable_tool_gateway(config)
+
+    blob = " ".join(captured["items"]).lower()
+    # Web still offered (the user may want the gateway), but as an explicit
+    # selection — not the credential label, and never pre-checked.
+    assert "firecrawl" in blob
+    web_label = next(i for i in captured["items"] if "Firecrawl" in i)
+    assert "keep your own backend" in web_label
+    web_idx = captured["items"].index(web_label)
+    assert web_idx not in captured["pre_selected"]
+
+
+def test_explicit_local_browser_provider_not_prechecked(monkeypatch):
+    """Same guard for browser.cloud_provider: a stored non-gateway provider
+    (self-hosted Camofox) is a deliberate non-Nous decision — unchecked."""
+    monkeypatch.setattr(ns, "get_nous_portal_account_info", lambda **kw: _pool_account())
+    monkeypatch.setattr(
+        ns,
+        "_get_gateway_direct_credentials",
+        lambda: {"web": False, "image_gen": False, "video_gen": False, "tts": False, "browser": False},
+    )
+    captured = _capture_checklist(monkeypatch, selected_idx=[])
+
+    config = {
+        "model": {"provider": "nous"},
+        "browser": {"cloud_provider": "camofox"},
+    }
+    ns.prompt_enable_tool_gateway(config)
+
+    browser_label = next(
+        i for i in captured["items"] if "Browser automation" in i
+    )
+    assert "keep your own backend" in browser_label
+    browser_idx = captured["items"].index(browser_label)
+    assert browser_idx not in captured["pre_selected"]
+
+
+def test_gateway_browser_provider_value_is_not_an_explicit_selection():
+    """cloud_provider='browser-use' is what apply_gateway_defaults writes —
+    it must NOT count as the user's own backend choice (it IS the gateway)."""
+    config = {"browser": {"cloud_provider": "browser-use"}}
+    assert "browser" not in ns._explicit_non_nous_selections(config)
+    # web.backend='nous' is the gateway-side value for web — same rule.
+    assert "web" not in ns._explicit_non_nous_selections({"web": {"backend": "nous"}})
+
+
+def test_no_selection_still_prechecked(monkeypatch):
+    """A tool with no credentials and no stored selection stays unconfigured
+    (pre-checked) — the new guard must not dampen the fresh-user offer."""
+    monkeypatch.setattr(ns, "get_nous_portal_account_info", lambda **kw: _pool_account())
+    monkeypatch.setattr(
+        ns,
+        "_get_gateway_direct_credentials",
+        lambda: {"web": False, "image_gen": False, "video_gen": False, "tts": False, "browser": False},
+    )
+    captured = _capture_checklist(monkeypatch, selected_idx=[])
+
+    config = {"model": {"provider": "nous"}}
+    ns.prompt_enable_tool_gateway(config)
+
+    # The first (unconfigured web) item remains pre-checked.
+    assert 0 in captured["pre_selected"]
+
+
 
 
 def test_apply_nous_managed_defaults_writes_video_gen_config(monkeypatch):

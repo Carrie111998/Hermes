@@ -1034,6 +1034,42 @@ _GATEWAY_DIRECT_LABELS = {
 
 _ALL_GATEWAY_KEYS = ("web", "image_gen", "video_gen", "tts", "stt", "browser")
 
+# cloud_provider values the Tool Gateway itself writes (apply_gateway_defaults).
+# An explicit cloud_provider equal to one of these is a gateway decision, not
+# the user's own backend selection.
+_GATEWAY_BROWSER_PROVIDER_VALUES = {"browser-use"}
+
+
+def _explicit_non_nous_selections(config: Dict[str, object]) -> set:
+    """Tool keys where the user deliberately selected a non-Nous backend.
+
+    Keyless-by-design backends (self-hosted SearXNG, a local Camofox, …) can
+    never prove themselves through credentials, so ``_uses_gateway`` is False
+    and ``_get_gateway_direct_credentials`` returns False for them — which
+    landed them in ``unconfigured`` and got them pre-checked by the Tool
+    Gateway checklist. Accepting the offer then overwrote the explicit
+    selection (``apply_gateway_defaults`` writes ``web.backend =
+    "firecrawl"`` / ``browser.cloud_provider = "browser-use"``), breaking
+    the user's working local setup (#92647). An explicit stored selection is
+    a deliberate non-gateway decision and must be treated like a direct
+    credential: offered unchecked, never pre-checked.
+    """
+    explicit: set = set()
+
+    web_cfg = config.get("web")
+    if isinstance(web_cfg, dict):
+        web_backend = str(web_cfg.get("backend") or "").strip().lower()
+        if web_backend and web_backend != "nous":
+            explicit.add("web")
+
+    browser_cfg = config.get("browser")
+    if isinstance(browser_cfg, dict) and "cloud_provider" in browser_cfg:
+        provider = str(browser_cfg.get("cloud_provider") or "").strip().lower()
+        if provider and provider not in _GATEWAY_BROWSER_PROVIDER_VALUES:
+            explicit.add("browser")
+
+    return explicit
+
 
 def get_gateway_eligible_tools(
     config: Optional[Dict[str, object]] = None,
@@ -1042,8 +1078,10 @@ def get_gateway_eligible_tools(
 ) -> tuple[list[str], list[str], list[str]]:
     """Return (unconfigured, has_direct, already_managed) tool key lists.
 
-    - unconfigured: tools with no direct credentials (easy switch)
-    - has_direct: tools where the user has their own API keys
+    - unconfigured: tools with no direct credentials and no explicit
+      non-Nous backend selection (easy switch, pre-checked)
+    - has_direct: tools where the user has their own API keys or their own
+      explicit backend selection (offered unchecked)
     - already_managed: tools already routed through the gateway
 
     All lists are empty when the user is not a paid Nous subscriber or
@@ -1085,6 +1123,7 @@ def get_gateway_eligible_tools(
     unconfigured: list[str] = []
     has_direct: list[str] = []
     already_managed: list[str] = []
+    explicit = _explicit_non_nous_selections(config)
     for key in _ALL_GATEWAY_KEYS:
         # Only offer tools the user's entitlement actually covers. For a free
         # tool pool that means image but not video; paid users are covered for
@@ -1095,7 +1134,7 @@ def get_gateway_eligible_tools(
             continue
         if opted_in.get(key):
             already_managed.append(key)
-        elif direct.get(key):
+        elif direct.get(key) or key in explicit:
             has_direct.append(key)
         else:
             unconfigured.append(key)
@@ -1220,14 +1259,21 @@ def prompt_enable_tool_gateway(
     source_label = "free tool pool" if pool_only else "Nous subscription"
 
     # Per-tool checklist: unconfigured tools first (pre-checked for new users),
-    # then tools where the user already has their own key (left unchecked so we
-    # don't override their own setup unless they ask).
+    # then tools where the user already has their own key or their own backend
+    # selection (left unchecked so we don't override their own setup unless
+    # they ask).
+    explicit = _explicit_non_nous_selections(config)
     offer_keys: list[str] = list(unconfigured) + list(has_direct)
     labels: list[str] = [_GATEWAY_TOOL_LABELS[k] for k in unconfigured]
-    labels += [
-        f"{_GATEWAY_TOOL_LABELS[k]} — keep using your {_GATEWAY_DIRECT_LABELS[k]}"
-        for k in has_direct
-    ]
+    for k in has_direct:
+        if k in explicit and not _get_gateway_direct_credentials().get(k):
+            # Keyless local backend — there is no credential label to cite,
+            # only the explicit selection itself.
+            labels.append(f"{_GATEWAY_TOOL_LABELS[k]} — keep your own backend")
+        else:
+            labels.append(
+                f"{_GATEWAY_TOOL_LABELS[k]} — keep using your {_GATEWAY_DIRECT_LABELS[k]}"
+            )
     pre_selected = list(range(len(unconfigured)))
 
     if pool_only:
