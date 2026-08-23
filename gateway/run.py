@@ -30457,15 +30457,22 @@ def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
     The PID file is HERMES_HOME-scoped, but a poisoned/stale record can point
     at another profile's LIVE gateway; signaling it starts the cross-profile
     SIGTERM restart loop this guard exists to prevent (#89315). This is a
-    destructive-action authority check, so it FAILS CLOSED:
+    destructive-action authority check, so ownership is decided by the
+    persisted identity record ALONE — exact ``_same_hermes_home`` equality —
+    and only while that record stays bound to the live target by exact PID +
+    start-time identity:
 
-    * readable live cmdline → decide by ``_command_line_belongs_to_profile``;
-    * unreadable cmdline → fall back to the persisted PID record's
-      ``hermes_home``, accepted only while the record stays bound to the live
-      target by PID + start-time identity;
-    * probe error or unprovable ownership → refuse.
+    * The authorizing record is whichever source produced the PID for this
+      destructive decision (PID file, gateway lock record, or runtime-status
+      fallback). A readable live argv carries no HERMES_HOME (it travels in
+      the environment), so it can never prove home ownership; it is used only
+      as an additional CONSISTENCY check — token-exact profile flags that
+      clearly contradict our home refuse the signal even when the record
+      agrees.
+    * Missing, legacy, conflicting, stale-bound, or unprovable identity →
+      refuse (fail closed).
 
-    A same-home target keeps replacing normally; every refusal path here only
+    Same-home targets keep replacing normally; every refusal path here only
     narrows what the legacy start_time check alone used to allow.
     """
     try:
@@ -30477,40 +30484,84 @@ def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
             _read_pid_record,
             _record_looks_like_gateway,
             _read_process_cmdline,
-            _command_line_belongs_to_profile,
             _same_hermes_home,
         )
 
         our_home = _get_process_hermes_home()
-        live_cmdline = _read_process_cmdline(existing_pid)
-        if live_cmdline:
-            return not _command_line_belongs_to_profile(live_cmdline, our_home)
 
-        # Unreadable cmdline (Windows handle limits, permission walls): fall
-        # back to the persisted record — but only as a BOUND claim. The record
-        # must still describe THIS pid with THIS live start time, otherwise it
-        # is stale/poisoned and proves nothing.
+        # ── Authorize from the persisted identity record ──────────────
+        # Bound claim: the record must describe THIS pid with THIS live
+        # start time, otherwise it is stale/poisoned and proves nothing.
         record = _read_pid_record(_get_pid_path())
         if not isinstance(record, dict) or not _record_looks_like_gateway(record):
+            logger.warning(
+                "Refusing --replace: no valid gateway pid record to prove "
+                "ownership of PID %s.",
+                existing_pid,
+            )
             return True
 
         record_pid = _pid_from_record(record)
         if record_pid != existing_pid:
+            logger.warning(
+                "Refusing --replace: pid record names %s, not target %s.",
+                record_pid, existing_pid,
+            )
             return True
 
         recorded_start = record.get("start_time")
         if not isinstance(recorded_start, int) or isinstance(recorded_start, bool):
             return True
         if _get_process_start_time(existing_pid) != recorded_start:
+            logger.warning(
+                "Refusing --replace: pid record start-time does not match "
+                "the live process %s (stale/PID-reuse record).",
+                existing_pid,
+            )
             return True
 
         recorded_home = record.get("hermes_home")
         if not isinstance(recorded_home, str) or not recorded_home.strip():
+            # Legacy record without hermes_home cannot prove ownership.
+            logger.warning(
+                "Refusing --replace: pid record predates hermes_home "
+                "stampings; ownership of PID %s unprovable.",
+                existing_pid,
+            )
             return True
 
-        return not _same_hermes_home(recorded_home, our_home)
+        if not _same_hermes_home(recorded_home, our_home):
+            logger.error(
+                "Refusing --replace: pid record belongs to a different "
+                "HERMES_HOME (%s, ours %s). Remove the stale PID record or "
+                "stop the owning profile explicitly.",
+                recorded_home,
+                our_home,
+            )
+            return True
+
+        # ── Readable-argv consistency check (never authority) ─────────
+        # An explicit profile flag / HERMES_HOME= on the argv that clearly
+        # contradicts our home refuses even though the record agreed; a bare
+        # or matching argv adds nothing either way.
+        try:
+            live_cmdline = _read_process_cmdline(existing_pid)
+        except Exception:
+            live_cmdline = None  # consistency probe failure → record decides
+        if live_cmdline and _looks_like_profile_conflict_from_cmdline(
+            live_cmdline, our_home
+        ):
+            logger.error(
+                "Refusing --replace: target PID %s command line explicitly "
+                "advertises a different profile than HERMES_HOME %s.",
+                existing_pid,
+                our_home,
+            )
+            return True
+
+        return False
     except Exception:
-        # Destructive action + unknown ownership => fail closed (#89315 review).
+        # Destructive action + unknown ownership => fail closed (#89315).
         logger.warning(
             "cross-profile --replace ownership probe failed for PID %s; "
             "refusing to signal",
@@ -30518,6 +30569,68 @@ def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
             exc_info=True,
         )
         return True
+
+
+def _looks_like_profile_conflict_from_cmdline(command: str, our_home) -> bool:
+    """Token-exact contradiction check between a target argv and our home.
+
+    Authority lives in the pid record; this only catches argv that EXPLICITLY
+    advertises a different profile than ours. Substring matching is not
+    identity: ``--profile timothy`` must NOT read as profile ``tim``. Returns
+    False whenever the argv does not clearly contradict our home.
+    """
+    from gateway.status import _profile_name_for_home
+
+    profile_name = _profile_name_for_home(our_home)
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    def _flag_value(flag: str) -> Optional[str]:
+        """Value of ``--flag X`` / ``--flag=X`` occurrences, token-exact."""
+        values = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == flag and i + 1 < len(tokens):
+                values.append(tokens[i + 1])
+                i += 2
+                continue
+            if tok.startswith(flag + "="):
+                values.append(tok[len(flag) + 1:])
+            i += 1
+        return values[-1] if values else None
+
+    def _env_home_value() -> Optional[str]:
+        """HERMES_HOME=<path> env-style assignment on the argv, token-exact."""
+        prefix = "HERMES_HOME="
+        for tok in reversed(tokens):
+            if tok.startswith(prefix):
+                return tok[len(prefix):]
+        return None
+
+    if profile_name is not None and profile_name != "default":
+        # Our home is a named profile: any explicit DIFFERENT named profile
+        # on the argv contradicts it. Bare argv stays consistent (legacy
+        # default-gateway argv never carried profile flags).
+        for flag in ("--profile", "-p"):
+            value = _flag_value(flag)
+            if value is not None and value != profile_name:
+                return True
+        home_value = _flag_value("--hermes-home") or _env_home_value()
+        if home_value is not None and os.path.normcase(os.path.normpath(home_value)) != os.path.normcase(os.path.normpath(str(our_home))):
+            return True
+        return False
+
+    # Our home is the default/root: ANY explicit named-profile flag on the
+    # argv contradicts it.
+    if _flag_value("--profile") is not None or _flag_value("-p") is not None:
+        return True
+    home_value = _flag_value("--hermes-home") or _env_home_value()
+    if home_value is not None and os.path.normcase(os.path.normpath(home_value)) != os.path.normcase(os.path.normpath(str(our_home))):
+        return True
+    return False
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
