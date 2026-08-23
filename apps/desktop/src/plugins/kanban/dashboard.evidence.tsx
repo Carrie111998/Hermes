@@ -7,9 +7,11 @@ const task = { assignee: 'canary-worker', attention: { reason: 'receipt', revisi
 const board = { assignees: ['canary-worker'], columns: [{ name: 'running', tasks: [task] }, { name: 'review', tasks: [{ ...task, id: 'task-review', status: 'review', title: 'Production review task' }] }], latest_event_id: 2, now: 1_800_000_000, tenants: [] }
 
 const fetchJSON = async (url: string) => {
-  if (url.includes('/config')) return { include_archived_by_default: false, lane_by_profile: false, render_markdown: true }
-  if (url.includes('/boards')) return { boards: [{ name: 'Default', slug: 'default' }], current: 'default' }
-  if (url.includes('/board')) return board
+  if (url.includes('/config')) {return { include_archived_by_default: false, lane_by_profile: false, render_markdown: true }}
+
+  if (url.includes('/boards')) {return { boards: [{ name: 'Default', slug: 'default' }], current: 'default' }}
+
+  if (url.includes('/board')) {return board}
   throw new Error(`Unexpected responsive evidence request: ${url}`)
 }
 

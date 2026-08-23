@@ -1,8 +1,11 @@
+// Evidence entrypoint intentionally mounts the production app stylesheet.
+// eslint-disable-next-line no-restricted-imports
+import '../../styles.css'
+import './kanban.css'
+
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createRoot } from 'react-dom/client'
 
-import '../../styles.css'
-import './kanban.css'
 import { bindApi } from './api'
 import { KanbanBoardPage } from './board'
 import { TaskDrawer } from './drawer'
@@ -12,12 +15,17 @@ const board = { assignees: ['canary-worker'], columns: [{ name: 'running', tasks
 const detail = { attachments: [], comments: [], events: [], links: { children: [], parents: [] }, runs: [], task }
 
 const rest = async <T,>(path: string): Promise<T> => {
-  if (path.startsWith('/tasks/task-safe/log')) return { content: '', exists: false, size_bytes: 0, truncated: false } as T
-  if (path.startsWith('/tasks/task-safe')) return detail as T
-  if (path.startsWith('/boards')) return { boards: [{ default_workspace_kind: 'scratch', slug: 'default' }], current: 'default' } as T
-  if (path.startsWith('/board')) return board as T
-  if (path.startsWith('/profiles')) return { profiles: [] } as T
-  if (path.startsWith('/projects')) return { projects: [] } as T
+  if (path.startsWith('/tasks/task-safe/log')) {return { content: '', exists: false, size_bytes: 0, truncated: false } as T}
+
+  if (path.startsWith('/tasks/task-safe')) {return detail as T}
+
+  if (path.startsWith('/boards')) {return { boards: [{ default_workspace_kind: 'scratch', slug: 'default' }], current: 'default' } as T}
+
+  if (path.startsWith('/board')) {return board as T}
+
+  if (path.startsWith('/profiles')) {return { profiles: [] } as T}
+
+  if (path.startsWith('/projects')) {return { projects: [] } as T}
   throw new Error(`Unexpected responsive evidence request: ${path}`)
 }
 

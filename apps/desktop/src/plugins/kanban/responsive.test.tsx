@@ -91,6 +91,7 @@ describe('production Kanban responsive containment', () => {
 
     it(`contains the production task drawer at ${width}px`, async () => {
       resizeWindow(width)
+
       const { container } = render(providers(
         <div className="relative h-screen w-full overflow-hidden">
           <TaskDrawer columns={['running', 'review']} id="task-safe" onClose={() => undefined} onOpen={() => undefined} />
