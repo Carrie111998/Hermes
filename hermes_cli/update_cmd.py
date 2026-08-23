@@ -1,1 +1,1 @@
-@file:/data/data/com.termux/files/home/.hermes/hermes-agent/.mcp-upload/_content_only.txt
+@file:hermes_cli/update_cmd.py
