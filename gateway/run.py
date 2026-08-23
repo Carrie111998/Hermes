@@ -19005,7 +19005,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return source
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
-        """Inner handler that runs under the _running_agents sentinel guard."""
+        """Inner handler that runs under the _running_agents sentinel guard.
+
+        Under multiplex + profile_routes, the primary platform adapter handles
+        ingress under the default HERMES_HOME. Session resolve, transcript
+        load, hygiene, and the agent run must all use the *routed* profile
+        home so reads and writes hit the same state.db. Without this,
+        ``load_transcript`` sees the default-home stub (often history=0/1)
+        while the agent later writes under the work profile — permanent
+        per-message amnesia on routed channels. Independent of slash-command
+        guild_id routing; normal free-response messages hit the same path.
+        """
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return await self._handle_message_with_agent_unscoped(
+                    event, source, _quick_key, run_generation,
+                )
+        return await self._handle_message_with_agent_unscoped(
+            event, source, _quick_key, run_generation,
+        )
+
+    async def _handle_message_with_agent_unscoped(
+        self, event, source, _quick_key: str, run_generation: int,
+    ):
+        """Agent-turn body. Caller installs routed profile scope when multiplexing."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
