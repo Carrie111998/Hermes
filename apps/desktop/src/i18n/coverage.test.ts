@@ -1,4 +1,3 @@
-import * as ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
 import { TRANSLATIONS } from './catalog'
@@ -99,62 +98,57 @@ function leafEntries(value: unknown, prefix = '', out = new Map<string, unknown>
 }
 
 type ParsedArrow = {
-  params: ts.ParameterDeclaration[]
-  body: ts.ConciseBody
-  sourceFile: ts.SourceFile
+  params: string[]
+  body: string
 }
 
-/** Parse the runtime source of a locale arrow function with TypeScript's AST. */
+/**
+ * Parse an arrow function's parameter list from runtime source. This avoids
+ * `Function.length`, which loses information after default/rest parameters.
+ * Locale entries use simple identifier parameters; unsupported shapes fail the
+ * guard instead of being silently skipped.
+ */
 function parseArrow(fn: (...args: never[]) => string): ParsedArrow | null {
-  const sourceFile = ts.createSourceFile(
-    'locale-entry.ts',
-    `const entry = ${fn.toString()}`,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TS
-  )
-  const statement = sourceFile.statements[0]
+  const source = fn.toString()
+  const arrow = source.indexOf('=>')
 
-  if (!statement || !ts.isVariableStatement(statement)) {
+  if (arrow < 0) {
     return null
   }
 
-  const initializer = statement.declarationList.declarations[0]?.initializer
+  let head = source.slice(0, arrow).trim()
 
-  if (!initializer || !ts.isArrowFunction(initializer)) {
+  if (head.startsWith('(') && head.endsWith(')')) {
+    head = head.slice(1, -1)
+  }
+
+  const params = head
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .map(part => part.replace(/^\.\.\./, '').split(/[:=]/)[0].trim())
+
+  if (params.some(param => !/^[$A-Z_a-z][$\w]*$/.test(param))) {
     return null
   }
 
-  return { params: [...initializer.parameters], body: initializer.body, sourceFile }
+  return { params, body: source.slice(arrow + 2) }
 }
 
-/** Whether an identifier is actually referenced in an arrow body. */
-function referencesIdentifier(root: ts.Node, name: string): boolean {
-  let found = false
+/**
+ * Strip comments and ordinary string literals before checking parameter use.
+ * Template literals are retained because `${param}` is a real runtime use.
+ */
+function searchableBody(body: string): string {
+  return body
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n\r]*/g, ' ')
+    .replace(/'(?:\\.|[^'\\])*'/g, "''")
+    .replace(/"(?:\\.|[^"\\])*"/g, '""')
+}
 
-  function visit(node: ts.Node): void {
-    if (found) {
-      return
-    }
-
-    if (ts.isIdentifier(node) && node.text === name) {
-      const parent = node.parent
-      const isPropertyName =
-        (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
-        (ts.isPropertyAssignment(parent) && parent.name === node) ||
-        (ts.isMethodDeclaration(parent) && parent.name === node)
-
-      if (!isPropertyName) {
-        found = true
-        return
-      }
-    }
-
-    ts.forEachChild(node, visit)
-  }
-
-  visit(root)
-  return found
+function referenced(body: string, param: string): boolean {
+  return new RegExp(`(^|[^A-Za-z0-9_$])${param}([^A-Za-z0-9_$]|$)`).test(searchableBody(body))
 }
 
 const ENGLISH_ENTRIES = leafEntries(en)
@@ -188,9 +182,7 @@ describe('desktop locale coverage', () => {
     })
 
     // Key presence is not enough. A translated entry that keeps the key but
-    // changes a function's call shape can silently drop caller data. Parse the
-    // actual runtime functions with TypeScript instead of relying on
-    // Function.length, which is lossy for default/rest parameters.
+    // changes a function's call shape can silently drop caller data.
     it(`${id} keeps the English parameter count on every function entry`, () => {
       const authored = leafEntries(authoredEntries(id))
       const mismatched: string[] = []
@@ -240,19 +232,12 @@ describe('desktop locale coverage', () => {
           continue
         }
 
-        for (const parameter of parsed.params) {
-          if (!ts.isIdentifier(parameter.name)) {
-            ignored.push(`${key} [unsupported binding: ${parameter.name.getText(parsed.sourceFile)}]`)
-            continue
-          }
+        // A leading underscore is the established way to declare a parameter
+        // intentionally unused — en.ts does it too (see generatePet.hatchRow).
+        const dead = parsed.params.filter(param => !param.startsWith('_') && !referenced(parsed.body, param))
 
-          const name = parameter.name.text
-
-          // A leading underscore is the established way to declare a parameter
-          // intentionally unused — en.ts does it too (see generatePet.hatchRow).
-          if (!name.startsWith('_') && !referencesIdentifier(parsed.body, name)) {
-            ignored.push(`${key} [${name}]`)
-          }
+        if (dead.length) {
+          ignored.push(`${key} [${dead.join(', ')}]`)
         }
       }
 
