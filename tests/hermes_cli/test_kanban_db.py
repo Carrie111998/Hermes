@@ -17,6 +17,9 @@ import pytest
 import hermes_state
 from hermes_cli import kanban_db as kb
 
+# Repo root (tests/hermes_cli/test_kanban_db.py -> up 3 levels).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -1614,3 +1617,173 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# D1 self-kill guard (t_57aac3e7, severity-critical)
+#
+# complete_task / block_task run IN-PROCESS inside the worker, so the
+# worker_pid they pass to _reap_task_orphans is os.getpid(). A blind
+# os.killpg(worker_pid) SIGTERMs the completing worker mid-completion. The
+# guard must let the completer survive while still reaping the worker's
+# direct children.
+# ---------------------------------------------------------------------------
+
+
+def test_reap_self_does_not_kill_completer_but_reaps_child(tmp_path):
+    """Completing in-process must not SIGTERM itself; its child must die."""
+    script = tmp_path / "worker.py"
+    child_pid_file = tmp_path / "child.pid"
+    done_marker = tmp_path / "done"
+    script.write_text(
+        "import os, sys, time\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, %r)\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "# Become a session leader (mirrors start_new_session=True workers),\n"
+        "# so our pgid == our pid and a blind killpg(self) would self-terminate.\n"
+        "os.setsid()\n"
+        "child = __import__('subprocess').Popen(['sleep', '30'])\n"
+        "Path(%r).write_text(str(child.pid))\n"
+        "time.sleep(0.4)\n"
+        "kb._reap_task_orphans(os.getpid())\n"
+        "Path(%r).write_text('alive')\n"
+        "print('SURVIVED')\n" % (str(REPO_ROOT), str(child_pid_file), str(done_marker)),
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=60,
+    )
+    # The completer must have survived its own reap (no SIGTERM self-kill).
+    assert proc.returncode == 0, f"completer died: rc={proc.returncode} err={proc.stderr}"
+    assert "SURVIVED" in proc.stdout
+    assert done_marker.exists(), "completer did not finish after reaping itself"
+    # The worker's direct child must have been reaped.
+    child_pid = int(child_pid_file.read_text())
+    time.sleep(0.6)
+    try:
+        os.kill(child_pid, 0)
+        child_alive = True
+    except ProcessLookupError:
+        child_alive = False
+    assert not child_alive, "worker's direct child was not reaped"
+
+
+def test_reap_self_no_child_returns_zero():
+    """Reaping ourselves with no children is a no-op that never throws."""
+    import signal as _sig
+    n = kb._reap_task_orphans(os.getpid())
+    assert isinstance(n, int)
+    assert n >= 0
+    # Sanity: the helper is present and callable.
+    assert callable(kb._kill_direct_children)
+    assert hasattr(_sig, "SIGTERM")
+
+
+# ---------------------------------------------------------------------------
+# D4 — container-aware reaper (_reap_container_task_processes)
+# ---------------------------------------------------------------------------
+# NOTE: this sandbox mounts /tmp noexec, so we cannot run a real fake ``docker``
+# shell script. Instead we mock ``subprocess.run`` at the Python level and assert
+# on the exact docker invocations the reaper issues. This exercises the
+# orchestration (ps -> probe -> TERM -> KILL, never stop/rm) which is what D4
+# guarantees; the live end-to-end container kill is covered by host-ops t_b00b5cc1.
+
+
+def _fake_docker_run(pids):
+    """Return ``(fake_run, calls)`` where ``fake_run`` emulates docker for one task.
+
+    - ``docker ps ...``          -> one container id.
+    - ``docker exec <cid> sh -c <probe>`` -> the orphan PIDs (always — the
+      processes are treated as stubborn so every probe sees them).
+    - ``docker exec <cid> sh -c 'kill -SIG ...'`` -> success, no output.
+
+    ``calls`` records ``(subcommand, script)`` for every invocation so tests can
+    assert ordering and that stop/rm were never issued.
+    """
+    cid = "fakecid123"
+    calls: list[tuple[str, str]] = []
+
+    def _run(args, *a, **k):
+        sub = args[1] if len(args) > 1 else ""
+        script = args[-1] if args else ""
+        calls.append((sub, script))
+        if sub == "ps":
+            return subprocess.CompletedProcess(args, 0, stdout=f"{cid}\n", stderr="")
+        if sub == "exec":
+            if "kill -TERM" in script or "kill -KILL" in script:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            # probe
+            return subprocess.CompletedProcess(
+                args, 0, stdout="\n".join(pids) + "\n", stderr="",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    return _run, calls
+
+
+def test_reap_container_kills_orphans_not_container(monkeypatch):
+    """Layer B signals the task's orphan PIDs (TERM then KILL) but never stops
+    or removes the shared container."""
+    fake_run, calls = _fake_docker_run(["4242", "4243"])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    n = kb._reap_container_task_processes("t_d4test", docker_exe="/usr/bin/docker")
+    assert n == 2, f"expected 2 orphans signalled, got {n}"
+    scripts = [s for _, s in calls]
+    joined = "\n".join(scripts)
+    assert "kill -TERM 4242 4243" in joined
+    assert "kill -KILL 4242 4243" in joined
+    # TERM must precede KILL.
+    term_idx = next(i for i, s in enumerate(scripts) if "kill -TERM" in s)
+    kill_idx = next(i for i, s in enumerate(scripts) if "kill -KILL" in s)
+    assert term_idx < kill_idx
+    # Only ps + exec were ever invoked — the container was NEVER stopped/removed.
+    subs = {sub for sub, _ in calls}
+    assert subs <= {"ps", "exec"}, f"unexpected docker subcommands: {subs}"
+    assert "stop" not in subs and "rm" not in subs
+
+
+def test_reap_container_no_docker_returns_zero():
+    """No docker binary -> best-effort no-op returning 0 (never throws)."""
+    n = kb._reap_container_task_processes("t_nodocker", docker_exe=None)
+    assert n == 0
+
+
+def test_reap_container_no_matching_container_returns_zero(monkeypatch):
+    """Docker present but no container carries the task label -> 0, no execs."""
+    calls: list[tuple[str, str]] = []
+
+    def _run(args, *a, **k):
+        sub = args[1] if len(args) > 1 else ""
+        calls.append((sub, args[-1] if args else ""))
+        # ps finds nothing
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    n = kb._reap_container_task_processes("t_nomatch", docker_exe="/usr/bin/docker")
+    assert n == 0
+    # No exec was issued because no container matched.
+    assert all(sub == "ps" for sub, _ in calls)
+
+
+def test_reap_task_processes_records_event(kanban_home, monkeypatch):
+    """The combined terminal-transition reap records a
+    ``reaped_container_processes`` event when Layer B kills something."""
+    fake_run, _calls = _fake_docker_run(["7777"])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # _reap_task_processes -> _reap_container_task_processes(task_id) with no
+    # docker_exe, so it resolves docker via find_docker(); point that at a fake.
+    import tools.environments.docker as dmod
+    monkeypatch.setattr(dmod, "find_docker", lambda: "/usr/bin/docker")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="d4-event", assignee="a")
+        result = kb._reap_task_processes(conn, tid)
+        assert result["container"] >= 1
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'reaped_container_processes'",
+            (tid,),
+        ).fetchone()
+        assert row is not None, "reaped_container_processes event not recorded"
+        import json as _json
+        payload = _json.loads(row["payload"])
+        assert payload.get("container", 0) >= 1

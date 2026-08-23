@@ -5179,6 +5179,12 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    # Terminal transition — reap the reclaimed worker's host tree + sandbox
+    # container processes (t_57aac3e7 D4). Best-effort, never throws.
+    try:
+        _reap_task_processes(conn, task_id, worker_pid=row["worker_pid"])
+    except Exception:
+        pass
     return True
 
 
@@ -5428,6 +5434,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    _complete_worker_pid: Optional[int] = None
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5435,10 +5442,11 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, worker_pid FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        _complete_worker_pid = int(prior["worker_pid"]) if prior and prior["worker_pid"] else None
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5577,6 +5585,15 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # Reap orphaned child processes of this task's worker (t_57aac3e7 fix 3).
+    # Workers run with start_new_session=True; their children (vitest, walk,
+    # etc.) stay alive as orphans after the worker exits. Kill the session
+    # group (host tree) AND the task's sandbox-container processes (Layer B).
+    # Must use the pre-clear worker_pid captured before the UPDATE.
+    try:
+        _reap_task_processes(conn, task_id, worker_pid=_complete_worker_pid)
+    except Exception:
+        pass
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -6283,13 +6300,15 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    _block_worker_pid: Optional[int] = None
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, worker_pid, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        _block_worker_pid = int(cur_row["worker_pid"]) if cur_row["worker_pid"] else None
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6460,6 +6479,12 @@ def block_task(
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
+    # Reap orphans after the status flip — same rationale as complete_task.
+    # Host tree (Layer A) + sandbox-container processes (Layer B).
+    try:
+        _reap_task_processes(conn, task_id, worker_pid=_block_worker_pid)
+    except Exception:
+        pass
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -8328,6 +8353,371 @@ def _worker_survived_termination(termination: dict) -> bool:
     )
 
 
+def _kill_direct_children(parent_pid: int, sig_module) -> int:
+    """SIGTERM then SIGKILL the *direct* children of ``parent_pid``.
+
+    Used by the D1 self-kill guard in :func:`_reap_task_orphans`. When the
+    completing process *is* the worker (``worker_pid == os.getpid()``), a
+    process-group kill would take the completer down with its children (the
+    worker is the session leader, so its pgid == its own pid). Instead we reap
+    only the worker's direct children, leaving the completer alive to finish
+    workspace cleanup + lifecycle hooks. Best-effort, never throws.
+    """
+    import time as _time
+
+    def _children() -> list:
+        found = []
+        if sys.platform == "linux":
+            try:
+                import pathlib as _pl
+                for proc_dir in _pl.Path("/proc").iterdir():
+                    if not proc_dir.name.isdigit():
+                        continue
+                    try:
+                        stat = (proc_dir / "stat").read_text(errors="replace")
+                        fields = stat.split()
+                        # field 4 (index 3) is ppid
+                        if int(fields[3]) == parent_pid:
+                            found.append(int(proc_dir.name))
+                    except (OSError, ValueError, IndexError):
+                        continue
+            except OSError:
+                pass
+        elif sys.platform == "darwin":
+            try:
+                import subprocess as _sp
+                r = _sp.run(
+                    ["pgrep", "-P", str(parent_pid)],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if r.returncode == 0:
+                    for line in r.stdout.strip().splitlines():
+                        try:
+                            found.append(int(line.strip()))
+                        except ValueError:
+                            continue
+            except Exception:
+                pass
+        # Never signal ourselves even if a scan misattributes us.
+        return [p for p in found if p != os.getpid()]
+
+    killed = 0
+    for _pid in _children():
+        try:
+            os.kill(_pid, sig_module.SIGTERM)
+            killed += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    _time.sleep(0.3)
+    for _pid in _children():
+        try:
+            os.kill(_pid, sig_module.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return killed
+
+
+def _reap_task_orphans(worker_pid: Optional[int]) -> int:
+    """Kill remaining child processes of a completed task's worker (t_57aac3e7 fix 3).
+
+    Workers are spawned with ``start_new_session=True``, so the worker is a
+    session leader (sid == pid) and every tool/process it spawned (vitest,
+    os.walk, etc.) belongs to that session's process group. When the worker
+    exits, those children are reparented to init but keep running as orphans
+    (the 6h os.walk + 9 vitest workers observed). Killing the process group
+    reaps them. Also sweeps direct children via ``/proc`` as a fallback for
+    platforms where pgrp != sid (macOS session quirks).
+
+    Returns the count of PIDs signalled. Best-effort, never throws — the
+    task's DB transition already succeeded; log loss is worse than a leaked
+    child but an exception here must not rollback the completion.
+    """
+    if not worker_pid or worker_pid <= 0:
+        return 0
+    import signal as _sig
+    killed = 0
+    # D1 self-kill guard (t_57aac3e7, severity-critical): complete_task /
+    # block_task run IN-PROCESS inside the worker (the kanban tool calls them
+    # directly), so worker_pid == os.getpid(). A blind os.killpg(worker_pid)
+    # would SIGTERM the completing worker mid-completion — its SIGTERM handler
+    # hard-exits, truncating workspace cleanup + lifecycle hooks after the DB
+    # write commits. Never kill our own process group. Also skip when the
+    # target shares the caller's session (a gateway completing on behalf of a
+    # same-session worker). In both cases we still reap the worker's direct
+    # children individually so orphans don't leak.
+    _is_self = (int(worker_pid) == os.getpid())
+    _same_session = False
+    try:
+        _caller_sid = os.getsid(0)  # type: ignore[attr-defined]
+        _target_sid = os.getsid(int(worker_pid))  # type: ignore[attr-defined]
+        _same_session = bool(_caller_sid) and _caller_sid == _target_sid
+    except (AttributeError, OSError, ProcessLookupError):
+        pass
+    if _is_self or _same_session:
+        return _kill_direct_children(int(worker_pid), _sig)
+    # 1) Process group kill — covers the common case (session leader).
+    try:
+        os.killpg(int(worker_pid), _sig.SIGTERM)  # type: ignore[attr-defined]
+        killed += 1
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        pass
+    # Small grace then SIGKILL for survivors.
+    import time as _time
+    _time.sleep(0.3)
+    try:
+        os.killpg(int(worker_pid), _sig.SIGKILL)  # type: ignore[attr-defined]
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        pass
+    # 2) Fallback: scan /proc for direct children reparented to 1 whose
+    # original ppid was this worker (Linux only, best-effort).
+    if sys.platform == "linux":
+        try:
+            import pathlib as _pl
+            for proc_dir in _pl.Path("/proc").iterdir():
+                if not proc_dir.name.isdigit():
+                    continue
+                pid = int(proc_dir.name)
+                if pid == int(worker_pid) or pid == os.getpid():
+                    continue
+                try:
+                    stat = (proc_dir / "stat").read_text(errors="replace")
+                    # stat field 4 is ppid
+                    ppid = int(stat.split()[3])
+                    if ppid == 1:
+                        # Check if this was a child of our worker by looking
+                        # at its session id (field 6: session).
+                        # If session == worker_pid, it was in our session.
+                        try:
+                            sid = int(stat.split()[5])
+                            if sid == int(worker_pid):
+                                os.kill(pid, _sig.SIGTERM)
+                                killed += 1
+                        except (IndexError, ValueError, OSError):
+                            pass
+                except (OSError, ValueError, IndexError):
+                    continue
+        except OSError:
+            pass
+        # Second pass SIGKILL
+        _time.sleep(0.2)
+        # (reuse scan — just SIGKILL the same set; cheap enough to rescan)
+        try:
+            import pathlib as _pl2
+            for proc_dir in _pl2.Path("/proc").iterdir():
+                if not proc_dir.name.isdigit():
+                    continue
+                pid = int(proc_dir.name)
+                if pid == int(worker_pid) or pid == os.getpid():
+                    continue
+                try:
+                    stat = (proc_dir / "stat").read_text(errors="replace")
+                    sid = int(stat.split()[5])
+                    if sid == int(worker_pid):
+                        try:
+                            os.kill(pid, _sig.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                except (OSError, ValueError, IndexError):
+                    continue
+        except OSError:
+            pass
+    # 3) macOS fallback: use pgrep to find session children
+    elif sys.platform == "darwin":
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["pgrep", "-s", str(int(worker_pid))],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().splitlines():
+                    try:
+                        pid = int(line.strip())
+                        if pid != int(worker_pid) and pid != os.getpid():
+                            os.kill(pid, _sig.SIGTERM)
+                            killed += 1
+                    except (ValueError, ProcessLookupError, PermissionError, OSError):
+                        continue
+                _time.sleep(0.3)
+                result2 = _sp.run(
+                    ["pgrep", "-s", str(int(worker_pid))],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if result2.returncode == 0 and result2.stdout.strip():
+                    for line in result2.stdout.strip().splitlines():
+                        try:
+                            pid = int(line.strip())
+                            if pid != int(worker_pid) and pid != os.getpid():
+                                os.kill(pid, _sig.SIGKILL)
+                        except (ValueError, ProcessLookupError, PermissionError, OSError):
+                            continue
+        except (OSError, _sp.SubprocessError, _sp.TimeoutExpired):
+            pass
+    return killed
+
+
+def _reap_container_task_processes(task_id: str, *, docker_exe: Optional[str] = None) -> int:
+    """Layer B (t_57aac3e7 D4): kill sandbox-container processes for a finished task.
+
+    Host-side ``os.killpg`` / ``/proc`` sweeps cannot see processes running
+    *inside* the profile's shared sandbox container (different PID namespace) —
+    that is exactly the incident class (a 6h ``os.walk`` + 9 vitest workers
+    living in the shared ``hermes-task-id=default`` container). This helper is
+    docker-native: it finds every container labeled ``hermes-agent=1`` whose
+    ``hermes-task-id`` is this task (or the shared ``default``), and inside each
+    kills exactly the processes whose **cwd** or **argv** references the
+    finished task's workspace path. SIGTERM, 0.5 s grace, SIGKILL survivors.
+
+    Shared profile containers are NEVER stopped — only per-task processes are
+    signalled, so sibling tasks sharing the same container are untouched.
+    Best-effort, never throws: any failure (no docker, no matching container,
+    exec error) logs at debug and returns whatever was reaped before the
+    failure. Returns the count of PIDs signalled.
+    """
+    import subprocess as _sp
+
+    # Workspace path the finished task's processes reference. Containers run
+    # with the host kanban-workspaces dir mounted at /workspace/kanban-workspaces.
+    ws = f"/workspace/kanban-workspaces/{task_id}"
+
+    try:
+        from tools.environments.docker import find_docker as _find_docker
+        _sanitize = None
+        try:
+            from tools.environments.docker import _sanitize_label_value as _sanitize
+        except Exception:
+            pass
+    except Exception:
+        _find_docker = None
+        _sanitize = None
+
+    docker = docker_exe or (_find_docker() if _find_docker else None)
+    if not docker:
+        return 0
+    label_val = _sanitize(task_id) if _sanitize else str(task_id)
+
+    def _list_containers(label_value: str) -> list[str]:
+        try:
+            r = _sp.run(
+                [docker, "ps", "-a",
+                 "--filter", "label=hermes-agent=1",
+                 "--filter", f"label=hermes-task-id={label_value}",
+                 "--format", "{{.ID}}"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, check=False, stdin=_sp.DEVNULL,
+            )
+        except (_sp.TimeoutExpired, OSError):
+            return []
+        if r.returncode != 0:
+            return []
+        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+    # Per-task container first, then the shared default container (the incident
+    # class). De-duped, order preserved.
+    seen: set[str] = set()
+    containers: list[str] = []
+    for lv in dict.fromkeys([label_val, "default"]):
+        for cid in _list_containers(lv):
+            if cid not in seen:
+                seen.add(cid)
+                containers.append(cid)
+    if not containers:
+        return 0
+
+    # Enumerate candidate PIDs by cwd OR argv referencing the workspace, then
+    # signal them individually (never pkill -f on the whole container — that
+    # would hit sibling tasks' processes). pgrep -f matches argv only, so we
+    # also scan /proc/<pid>/cwd for the cwd-only case (e.g. a bare `sleep`).
+    probe_script = (
+        "for d in /proc/[0-9]*; do "
+        "p=${d#/proc/}; "
+        "case \"$p\" in $$|$PPID) continue;; esac; "
+        "cwd=$(readlink $d/cwd 2>/dev/null); "
+        "cmd=$(tr '\\0' ' ' < $d/cmdline 2>/dev/null); "
+        "if case \"$cwd\" in *WS*) true;; *) false;; esac "
+        "|| case \"$cmd\" in *WS*) true;; *) false;; esac; then "
+        "echo $p; fi; done"
+    ).replace("WS", ws)
+
+    total = 0
+    for cid in containers:
+        def _pgrep() -> list[str]:
+            try:
+                r = _sp.run(
+                    [docker, "exec", cid, "sh", "-c", probe_script],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=20, check=False, stdin=_sp.DEVNULL,
+                )
+            except (_sp.TimeoutExpired, OSError):
+                return []
+            return [ln.strip() for ln in r.stdout.splitlines() if ln.strip().isdigit()]
+
+        def _kill(sig: str) -> None:
+            pids = _pgrep()
+            if not pids:
+                return
+            try:
+                _sp.run(
+                    [docker, "exec", cid, "sh", "-c",
+                     "kill -%s %s" % (sig, " ".join(pids))],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=20, check=False, stdin=_sp.DEVNULL,
+                )
+            except (_sp.TimeoutExpired, OSError):
+                pass
+
+        initial = _pgrep()
+        if not initial:
+            continue
+        total += len(initial)
+        _kill("TERM")
+        time.sleep(0.5)
+        _kill("KILL")
+    if total:
+        _log.info(
+            "Reaped %d container process(es) for task %s", total, task_id,
+        )
+    return total
+
+
+def _reap_task_processes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    worker_pid: Optional[int] = None,
+) -> dict[str, int]:
+    """Combined terminal-transition reap: host tree (Layer A) + sandbox (Layer B).
+
+    Called on EVERY terminal transition (complete, block, reclaim, timeout,
+    crash-detection). Layer A kills the worker's host-side process group /
+    direct children; Layer B kills the finished task's processes inside its
+    sandbox container(s). Both are best-effort and never throw. When anything
+    was reaped, a ``reaped_container_processes`` event is recorded on the task
+    (in its own write txn, so this is safe to call outside an open txn).
+    """
+    host_killed = 0
+    if worker_pid:
+        try:
+            host_killed = _reap_task_orphans(worker_pid)
+        except Exception:
+            pass
+    container_killed = 0
+    try:
+        container_killed = _reap_container_task_processes(task_id)
+    except Exception:
+        pass
+    if host_killed or container_killed:
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "reaped_container_processes",
+                    {"host": host_killed, "container": container_killed},
+                )
+        except Exception:
+            pass
+    return {"host": host_killed, "container": container_killed}
+
+
 def _defer_reclaim_for_live_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8537,6 +8927,13 @@ def enforce_max_runtime(
                     "retry_status": retry_status,
                 },
             )
+        # Terminal transition — reap the timed-out worker's host tree + sandbox
+        # container processes (t_57aac3e7 D4). An orphan left by a timed-out
+        # task is just as orphaned as one left by a completed one.
+        try:
+            _reap_task_processes(conn, tid, worker_pid=pid)
+        except Exception:
+            pass
     return timed_out
 
 
@@ -9146,6 +9543,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 board=_board,
                 **hook_fields,
             )
+    # Terminal transition — reap each reclaimed task's sandbox-container
+    # processes (t_57aac3e7 D4). The worker PID is already dead (that's how we
+    # detected it), so Layer A is a no-op; Layer B is what matters — a crashed
+    # worker's long-running children (os.walk, vitest) live on inside the shared
+    # container. Best-effort, never throws.
+    for _tid, _pid, *_rest in crash_details:
+        try:
+            _reap_task_processes(conn, _tid, worker_pid=_pid)
+        except Exception:
+            pass
+    for _tid in rate_limited:
+        try:
+            _reap_task_processes(conn, _tid)
+        except Exception:
+            pass
     return crashed
 
 
