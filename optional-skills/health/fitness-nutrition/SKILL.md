@@ -21,11 +21,11 @@ required_environment_variables:
     optional: true
 ---
 
-# Fitness & Nutrition
+# Fitness & Nutrition Skill
 
 Exercise and food-reference data plus offline calculators. Use this skill for
-lookups and mechanical calculations, not as a substitute for individualized
-medical advice, dietetic care, or a progressive training plan.
+lookups and mechanical calculations. It does not provide individualized medical
+advice, dietetic care, or progressive workout programming.
 
 **Data sources (all free, no pip dependencies):**
 
@@ -48,6 +48,36 @@ Trigger this skill when the user asks about:
 - Generic macro templates for cutting, bulking, or maintenance
 
 Do not use this as the primary skill for progressive workout programming, workout tracking, individualized meal planning, or medical nutrition. Route those tasks to the relevant planning, tracking, or clinical workflow, and use this skill only for the needed reference data or calculation.
+
+---
+
+## Prerequisites
+
+- `curl` and `python` available on PATH
+- For higher USDA FoodData Central rate limits, set the optional `USDA_API_KEY`
+  environment variable; `DEMO_KEY` works without signup
+
+## How to Run
+
+Run the helper scripts from the repository root, or use the read-only `curl`
+examples in Procedure for direct lookups. The offline calculators require only
+the Python standard library; network lookups require internet access.
+
+---
+
+## Quick Reference
+
+| Task | Source | Endpoint |
+|------|--------|----------|
+| Search exercises by name | wger | `python scripts/exercise_search.py "query"` (`name__search`, `language__code=en`) |
+| Exercise details | wger | `GET /api/v2/exerciseinfo/{id}/` |
+| Filter by muscle | wger | `GET /api/v2/exerciseinfo/?muscles={id}&language__code=en` |
+| Filter by equipment | wger | `GET /api/v2/exerciseinfo/?equipment={id}&language__code=en` |
+| List categories | wger | `GET /api/v2/exercisecategory/` |
+| List muscles | wger | `GET /api/v2/muscle/` |
+| Search foods | USDA | `GET /fdc/v1/foods/search?query=&dataType=Foundation,SR Legacy` |
+| Food details | USDA | `GET /fdc/v1/food/{fdcId}` |
+| BMI / TDEE / 1RM / macros | offline | `python scripts/body_calc.py` |
 
 ---
 
@@ -244,19 +274,3 @@ muscle groups, and equipment; an HTTP 200 with an unrelated unfiltered list is
 not a successful search.
 After nutrition lookup: confirm per-100g macros are returned with kcal, protein, fat, carbs.
 After calculators: sanity-check outputs (e.g. TDEE should be 1500-3500 for most adults).
-
----
-
-## Quick Reference
-
-| Task | Source | Endpoint |
-|------|--------|----------|
-| Search exercises by name | wger | `python scripts/exercise_search.py "query"` (`name__search`, `language__code=en`) |
-| Exercise details | wger | `GET /api/v2/exerciseinfo/{id}/` |
-| Filter by muscle | wger | `GET /api/v2/exerciseinfo/?muscles={id}&language__code=en` |
-| Filter by equipment | wger | `GET /api/v2/exerciseinfo/?equipment={id}&language__code=en` |
-| List categories | wger | `GET /api/v2/exercisecategory/` |
-| List muscles | wger | `GET /api/v2/muscle/` |
-| Search foods | USDA | `GET /fdc/v1/foods/search?query=&dataType=Foundation,SR Legacy` |
-| Food details | USDA | `GET /fdc/v1/food/{fdcId}` |
-| BMI / TDEE / 1RM / macros | offline | `python scripts/body_calc.py` |

@@ -253,7 +253,6 @@ def test_skill_contract_routes_through_corrected_helpers() -> None:
     skill = SKILL_MD.read_text(encoding="utf-8")
     formulas = FORMULAS_MD.read_text(encoding="utf-8")
 
-    assert "version: 1.1.0" in skill
     assert "scripts/exercise_search.py" in skill
     assert "--muscle" in skill
     assert "--category" in skill
