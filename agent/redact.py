@@ -481,8 +481,10 @@ _CONTROL_CHARS_RE = re.compile(
 # ``m`` defeats ``_PREFIX_RE``'s ``(?<![A-Za-z0-9_-])`` lookbehind in both the
 # shadow copy and the original (issue #81012). Stripping the complete SEQUENCE
 # instead of the bare byte restores alignment so the split-join pass fires.
-# Mirrors the CSI branch of tools/ansi_strip.py's _ANSI_ESCAPE_RE.
-_ANSI_CSI_SEQ_RE = re.compile(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
+# Mirrors the CSI branch of tools/ansi_strip.py's _ANSI_ESCAPE_RE, including
+# the 8-bit C1 form (``\x9b``) — a ``\x9b31m``-wrapped token glues its ``m``
+# exactly like the 7-bit shape, so both introducers must strip as a unit.
+_ANSI_CSI_SEQ_RE = re.compile(r"(?:\x1b\[|\x9b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
 
 # Union of every _PREFIX_PATTERNS body class — a control-stripped match may
 # only span original chars that are token-body or control chars (see
@@ -511,8 +513,8 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
     new match that crosses into a different line's unrelated text, e.g.
     ``EXA_API_KEY=*** is rejected).
     """
-    # Fast path: no control bytes? Nothing to join.
-    if _CONTROL_CHARS_RE.search(text) is None:
+    # Fast path: no control bytes and no 8-bit CSI introducer? Nothing to join.
+    if _CONTROL_CHARS_RE.search(text) is None and "\x9b" not in text:
         return text
 
     cleaned, keep, orig_idx = _strip_shadow(text)
@@ -553,34 +555,34 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
                     body = body[:clips - body_start]
                     if not body:
                         continue
-        # Live chars must be token-body chars, and a candidate whose stripped
-        # regions contain BOTH an orphan ESC (a bare \x1b that began no CSI)
-        # and a complete CSI sequence is refused: that combination marks
-        # mangled/truncated terminal output, where the live text sitting
-        # between the two regions is not provably part of one smuggled token,
-        # and the greedy shadow match bridges across it deleting arbitrary
-        # bytes (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
-        # NOT_TOKEN_TEXT; review finding on #81012). Each splitter alone stays
-        # bridgeable — bare-control splits are #77484's canonical shape,
-        # complete sequences #81012's — and MIXING non-ESC encodings (one CSI
-        # plus one zero-width/control split) remains fail-closed-masked:
-        # diversity of supported splitting encodings is not evidence that a
-        # candidate is unrelated prose.
-        has_orphan_esc = False
-        has_csi = False
+        # Live chars must be token-body chars. One combination is refused:
+        # an ORPHAN ESC (a bare \x1b that began no CSI) appearing BEFORE any
+        # complete CSI sequence in the span. That order marks mangled or
+        # truncated terminal output — the live text between the dangling
+        # escape and the next formed sequence is continuation-of-prose, not
+        # provably token material
+        # (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
+        # NOT_TOKEN_TEXT; review finding on #81012). Once a formed sequence
+        # has been seen, a later bare ESC reads as an ordinary in-token
+        # split like any other control, so the mirrored layout
+        # (``sk-aaaaa\x1b[31mbbbbb\x1bcccccccccc``) stays fully masked and no
+        # splitter combination can flip a candidate to raw emission: every
+        # non-refused candidate is replaced wholesale.
+        orphan_precedes_csi = False
+        seen_csi = False
         clean_join = True
         for k, c in enumerate(span):
             kd = keep[start_orig + k]
             if kd == 2:
-                has_csi = True
+                seen_csi = True
             elif kd:
-                if c == "\x1b":
-                    has_orphan_esc = True
+                if c == "\x1b" and not seen_csi:
+                    orphan_precedes_csi = True
             elif c not in _TOKEN_BODY_CHARS:
                 clean_join = False
                 break
         if (clean_join
-                and not (has_orphan_esc and has_csi)
+                and not (orphan_precedes_csi and seen_csi)
                 and (end_orig >= n or text[end_orig] != "=")):
             matches.append((start_orig, end_orig, mask_fn(body)))
     for start_orig, end_orig, replacement in reversed(matches):
@@ -599,8 +601,9 @@ def _strip_shadow(text: str):
       1 = bare control char (stripped individually), 2 = byte belonging to a
       complete ANSI CSI sequence (stripped as a unit). Any truthy value means
       strippable noise, preserving the historical contract; the KIND
-      distinction lets the join pass refuse candidates that mix an ORPHAN ESC
-      with a formed CSI sequence (see the gate in _mask_control_split_tokens).
+      distinction lets the join pass refuse candidates whose ORPHAN ESC
+      precedes a formed CSI sequence (see the gate in
+      _mask_control_split_tokens).
     - ``orig_idx`` maps each shadow index back to its index in ``text``.
 
     Stripping complete CSI sequences — not just the bare ``\\x1b`` byte — is
@@ -626,7 +629,7 @@ def _strip_shadow(text: str):
     i = 0
     ctrl = _CONTROL_CHARS_RE.match
     while i < len(text):
-        if text[i] == "\x1b":
+        if text[i] == "\x1b" or text[i] == "\x9b":
             m = rem(text, i)
             if m:
                 for j in range(i, m.end()):

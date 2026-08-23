@@ -287,6 +287,31 @@ class TestControlCharSplitTokens:
             assert "b" * 5 not in result
             assert tail_ch * 10 not in result
 
+    def test_orphan_esc_after_csi_still_masks(self):
+        # Follow-up review finding on #81012: adding a trailing orphan ESC to
+        # a mixed-encoding credential must NOT walk it through unmasked. An
+        # orphan ESC only refuses the join when it PRECEDES every complete
+        # CSI in the span; once a formed sequence has been seen, a later bare
+        # ESC is an ordinary in-token split.
+        text = "sk-" + "a" * 5 + "\x1b[31m" + "b" * 5 + "\x1b" + "c" * 10
+        result = redact_sensitive_text(text, force=True)
+        assert result != text
+        assert "a" * 5 not in result
+        assert "b" * 5 not in result
+        assert "c" * 10 not in result
+
+    def test_8bit_csi_wrapped_token_masked(self):
+        # Follow-up review finding on #81012: the ECMA-48 8-bit CSI form
+        # (\x9b … m — recognized by tools/ansi_strip.py) bypassed the shadow
+        # entirely because _CONTROL_CHARS_RE excludes C1 bytes. The glued
+        # terminator defeats the prefix lookbehind exactly like the 7-bit
+        # shape, so both introducers must strip as a unit.
+        body = "a" * 25
+        text = "\x9b31m" + f"sk-{body}" + "\x9b0m"
+        result = redact_sensitive_text(text, force=True)
+        assert body not in result
+        assert f"sk-{body}" not in result
+
 
 class TestEnvLookupPreserved:
     """Programmatic env var lookups must not be corrupted (issue #2852)."""
