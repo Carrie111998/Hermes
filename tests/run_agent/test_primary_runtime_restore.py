@@ -376,30 +376,30 @@ class TestRestorePrimaryRuntime:
 
     def test_restore_reloads_named_custom_pool_by_scoped_key(self):
         class _Entry:
-            provider = "custom:gemini-no-filter"
+            provider = "custom:gemini-display"
             id = "gemini-key"
             label = "gemini"
             runtime_api_key = "gemini-key"
             access_token = "gemini-key"
 
         primary_pool = MagicMock()
-        primary_pool.provider = "custom:gemini-no-filter"
+        primary_pool.provider = "custom:gemini-display"
         primary_pool.has_available.return_value = True
         primary_pool.select.return_value = _Entry()
 
         fallback_pool = MagicMock()
         fallback_pool.provider = "openrouter"
         agent = _make_agent(
-            provider="gemini-no-filter",
+            provider="custom:gemini-no-filter",
             base_url="https://generativelanguage.googleapis.com/v1beta",
         )
         agent._fallback_activated = True
         agent._credential_pool = fallback_pool
         agent._swap_credential = MagicMock()
         configured = [(
-            "gemini-no-filter",
+            "gemini-display",
             {
-                "name": "Gemini No Filter",
+                "name": "Gemini Display",
                 "provider_key": "gemini-no-filter",
                 "base_url": "https://generativelanguage.googleapis.com/v1beta",
             },
@@ -414,7 +414,7 @@ class TestRestorePrimaryRuntime:
 
         assert result is True
         assert agent._credential_pool is primary_pool
-        load_pool.assert_called_once_with("custom:gemini-no-filter")
+        load_pool.assert_called_once_with("custom:gemini-display")
         agent._swap_credential.assert_called_once_with(primary_pool.select.return_value)
 
     def test_restore_named_custom_pool_wrong_endpoint_fails_closed(self):

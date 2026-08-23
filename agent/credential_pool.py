@@ -603,12 +603,14 @@ def credential_pool_matches_provider(
                     if alias.startswith(CUSTOM_POOL_PREFIX):
                         aliases.add(alias[len(CUSTOM_POOL_PREFIX):])
             configured_url = str(entry.get("base_url") or "").strip().rstrip("/")
-            named_identity = _normalize_custom_pool_name(provider_norm)
-            pool_identity = f"{CUSTOM_POOL_PREFIX}{normalized_name}"
-            return (
-                (named_identity in aliases or provider_norm == pool_identity)
-                and runtime_url == configured_url
-            )
+            runtime_aliases = {_normalize_custom_pool_name(provider_norm)}
+            if provider_norm.startswith(CUSTOM_POOL_PREFIX):
+                runtime_aliases.add(
+                    _normalize_custom_pool_name(
+                        provider_norm[len(CUSTOM_POOL_PREFIX):]
+                    )
+                )
+            return bool(runtime_aliases & aliases) and runtime_url == configured_url
     except Exception:
         return False
     return False
@@ -627,19 +629,27 @@ def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -
         return ""
 
     try:
-        if provider_norm.startswith(CUSTOM_POOL_PREFIX):
-            candidate = provider_norm
+        if provider_norm == "custom":
+            candidate = get_custom_provider_pool_key(base_url)
+            if candidate and credential_pool_matches_provider(
+                candidate,
+                provider_norm,
+                base_url=base_url,
+            ):
+                return str(candidate).strip().lower()
         else:
-            candidate = get_custom_provider_pool_key(
-                base_url,
-                provider_name=None if provider_norm == "custom" else provider_norm,
-            )
-        if candidate and credential_pool_matches_provider(
-            candidate,
-            provider_norm,
-            base_url=base_url,
-        ):
-            return str(candidate).strip().lower()
+            # Named and exact custom runtimes are keyed by provider identity,
+            # while auth storage remains keyed by display name. Search the
+            # configured candidates by identity before considering endpoint;
+            # this prevents a sibling sharing the URL from lending its pool.
+            for normalized_name, _entry in _iter_custom_providers():
+                candidate = f"{CUSTOM_POOL_PREFIX}{normalized_name}"
+                if credential_pool_matches_provider(
+                    candidate,
+                    provider_norm,
+                    base_url=base_url,
+                ):
+                    return candidate
     except Exception:
         pass
     return provider_norm

@@ -32,9 +32,9 @@ def test_custom_pool_match_is_scoped_by_endpoint():
 def test_named_custom_pool_match_requires_configured_identity_and_endpoint():
     configured = [
         (
-            "gemini-no-filter",
+            "gemini-display",
             {
-                "name": "Gemini No Filter",
+                "name": "Gemini Display",
                 "provider_key": "gemini-no-filter",
                 "base_url": "https://generativelanguage.googleapis.com/v1beta/",
             },
@@ -42,27 +42,27 @@ def test_named_custom_pool_match_requires_configured_identity_and_endpoint():
     ]
     with patch("agent.credential_pool._iter_custom_providers", return_value=configured):
         assert credential_pool_matches_provider(
-            "custom:gemini-no-filter",
+            "custom:gemini-display",
             "gemini-no-filter",
             base_url="https://generativelanguage.googleapis.com/v1beta",
         )
         assert credential_pool_matches_provider(
-            "custom:gemini-no-filter",
+            "custom:gemini-display",
             "custom:gemini-no-filter",
             base_url="https://generativelanguage.googleapis.com/v1beta",
         )
         assert not credential_pool_matches_provider(
-            "custom:gemini-no-filter",
+            "custom:gemini-display",
             "gemini-no-filter",
             base_url="https://fallback.example/v1",
         )
         assert not credential_pool_matches_provider(
-            "custom:gemini-no-filter",
+            "custom:gemini-display",
             "custom:gemini-no-filter",
             base_url="https://fallback.example/v1",
         )
         assert not credential_pool_matches_provider(
-            "custom:gemini-no-filter",
+            "custom:gemini-display",
             "other-provider",
             base_url="https://generativelanguage.googleapis.com/v1beta",
         )
@@ -72,23 +72,31 @@ def test_runtime_pool_key_resolves_all_custom_runtime_identities():
     endpoint = "https://generativelanguage.googleapis.com/v1beta"
     configured = [
         (
-            "gemini-no-filter",
+            "sibling-display",
             {
-                "name": "Gemini No Filter",
+                "name": "Sibling Display",
+                "provider_key": "sibling-provider",
+                "base_url": endpoint,
+            },
+        ),
+        (
+            "gemini-display",
+            {
+                "name": "Gemini Display",
                 "provider_key": "gemini-no-filter",
                 "base_url": endpoint,
             },
         )
     ]
     with patch("agent.credential_pool._iter_custom_providers", return_value=configured):
-        assert resolve_runtime_pool_key("custom", endpoint) == "custom:gemini-no-filter"
+        assert resolve_runtime_pool_key("custom", endpoint) == "custom:sibling-display"
         assert (
             resolve_runtime_pool_key("gemini-no-filter", endpoint)
-            == "custom:gemini-no-filter"
+            == "custom:gemini-display"
         )
         assert (
             resolve_runtime_pool_key("custom:gemini-no-filter", endpoint)
-            == "custom:gemini-no-filter"
+            == "custom:gemini-display"
         )
         assert (
             resolve_runtime_pool_key(
