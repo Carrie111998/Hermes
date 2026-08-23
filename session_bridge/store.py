@@ -1581,8 +1581,11 @@ class SessionBridgeStore:
             or daily_limit < 1
         ):
             raise ValueError("daily_limit must be a positive integer")
-        if daily_limit > 25:
-            raise ValueError("daily_limit cannot exceed 25")
+        # Defense-in-depth against config typos; the emergency cost gate is
+        # the real spend bound. Raised from 25 on 2026-08-23: the old ceiling
+        # starved account-switch catch-up days.
+        if daily_limit > 100:
+            raise ValueError("daily_limit cannot exceed 100")
         if (
             not isinstance(max_attempts, int)
             or isinstance(max_attempts, bool)
