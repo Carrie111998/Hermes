@@ -5,7 +5,7 @@ import { $desktopBoot } from '@/store/boot'
 import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
 import { reconnectGateway } from '@/store/gateway-reconnect'
 import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
-import { $connection, $currentCwd, $gatewayState } from '@/store/session'
+import { $awaitingResponse, $busy, $connection, $currentCwd, $gatewayState } from '@/store/session'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
@@ -171,6 +171,8 @@ beforeEach(() => {
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
+  $busy.set(false)
+  $awaitingResponse.set(false)
   $desktopBoot.set({
     error: null,
     fakeMode: false,
@@ -207,6 +209,8 @@ afterEach(() => {
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
   window.localStorage.removeItem('hermes.desktop.workspace-cwd')
   $currentCwd.set('')
+  $busy.set(false)
+  $awaitingResponse.set(false)
 })
 
 // Let pending microtasks (awaits) AND the queued 0ms socket open/error fire.
@@ -392,6 +396,31 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+  })
+
+  it('FIX: a successful reconnect retires the focused composer busy latch (#93059)', async () => {
+    // Backend respawned mid-turn (auto-update, sleep/wake): the focused
+    // composer's draft latches never get their terminal busy:false, and Send
+    // silently no-ops behind the busy guard until restart (#93059).
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    // A turn was mid-flight when the backend went away.
+    act(() => {
+      $busy.set(true)
+      $awaitingResponse.set(true)
+    })
+
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+
+    // The respawned backend answers the next dial.
+    await advanceBackoff()
+
+    expect($gatewayState.get()).toBe('open')
+    expect($busy.get()).toBe(false)
+    expect($awaitingResponse.get()).toBe(false)
   })
 
   it('manual reconnect revalidates, re-resolves, re-mints, and re-dials the dropped socket', async () => {
