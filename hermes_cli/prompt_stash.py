@@ -228,7 +228,8 @@ class PromptStash:
             if not isinstance(wall_time, (int, float)):
                 continue
             # Convert wall clock → session monotonic offset.
-            monotonic_at = time.monotonic() - time.time() + wall_time
+            _clock = stash._clock
+            monotonic_at = _clock() - time.time() + wall_time
             entries.append(StashEntry(
                 text=text,
                 images=list(images),
@@ -351,11 +352,13 @@ def save_stash(stash: PromptStash, path: Path | None = None) -> None:
         path = Path(get_hermes_home()) / "stash.json"
 
     try:
+        import os as _os
+
         data = stash.to_dict()
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.chmod(0o600)
-        tmp.rename(path)
+        _os.replace(tmp, path)  # os.replace, not Path.rename — atomic on Windows
     except Exception:
         _log.exception("Failed to save prompt stash to %s", path)
 
@@ -374,7 +377,10 @@ def load_stash(path: Path | None = None) -> PromptStash:
         path = Path(get_hermes_home()) / "stash.json"
 
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return PromptStash.from_dict(data)
+    except FileNotFoundError:
+        return PromptStash()
     except Exception:
+        _log.warning("Corrupt or unreadable stash file %s — starting fresh", path)
         return PromptStash()
