@@ -167,7 +167,7 @@ describe("web locale coverage", () => {
       ).toEqual([]);
     });
 
-    it(`${locale} keeps array-valued entries the same length as English`, () => {
+    it(`${locale} keeps authored array-valued entries the same length as English`, () => {
       const authored = leafEntries(authoredStrings(LOCALES[locale]) ?? LOCALES[locale]);
       const mismatched: string[] = [];
 
@@ -177,6 +177,12 @@ describe("web locale coverage", () => {
         }
 
         const localeValue = authored.get(key);
+
+        // Missing keys belong to the coverage baseline above. Shape checks only
+        // apply once this locale actually authors the array-valued entry.
+        if (localeValue === undefined) {
+          continue;
+        }
 
         if (!Array.isArray(localeValue)) {
           mismatched.push(`${key} (en is an array, ${locale} is not)`);
