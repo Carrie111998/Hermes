@@ -638,6 +638,12 @@ _POLLING_ERROR_TASK_STUCK_TIMEOUT = 300.0
 # A generation is not healthy until the dedicated getUpdates request returns
 # successfully. This exceeds a normal long-poll cycle for healthy idle bots.
 _POLLING_PROGRESS_TIMEOUT = 60.0
+# Steady-state polling must keep completing getUpdates round trips. The general
+# Bot API pool can stay healthy while the dedicated long-poll pool wedges, and
+# pending_update_count is not guaranteed to expose that split immediately.
+# Two normal heartbeat intervals leaves ample room for healthy long polls while
+# bounding a silent steady-state stall.
+_POLLING_STALL_TIMEOUT = 180.0
 # Telegram transcodes an uploaded video before it answers sendVideo, so the
 # wait for the response is unrelated to how fast the bytes went out and can
 # outlast the 20s read timeout the rest of the Bot API is tuned for. Only
@@ -828,6 +834,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation: int = 0
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting: bool = False
+        self._polling_last_progress_at: Optional[float] = None
         self._polling_progress_verifier_task: Optional[asyncio.Task] = None
         self._polling_teardown_started: bool = False
         self._polling_error_callback_ref = None
@@ -2552,6 +2559,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
+        self._polling_last_progress_at = time.monotonic()
         self._send_path_degraded = True
         return self._polling_generation, self._polling_progress_event
 
@@ -2563,6 +2571,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if generation != self._polling_generation:
             return
+        self._polling_last_progress_at = time.monotonic()
         if not self._polling_progress_event.is_set():
             # The first confirmed getUpdates round-trip of this generation
             # resolves the "health pending getUpdates progress" line both
@@ -3194,6 +3203,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 # handle Telegram just reported before anything routes on it.
                 self._bot_identity_checked_at = time.monotonic()
                 self._note_bot_username(getattr(bot, "username", None))
+                last_progress = getattr(self, "_polling_last_progress_at", None)
+                if last_progress is not None:
+                    stalled_for = max(0.0, time.monotonic() - last_progress)
+                    if stalled_for >= _POLLING_STALL_TIMEOUT:
+                        self._schedule_polling_recovery(
+                            RuntimeError(
+                                "getUpdates stalled for %.0fs while the general "
+                                "Telegram API path remained healthy" % stalled_for
+                            ),
+                            reason="steady-state getUpdates progress watchdog",
+                        )
+                        continue
                 # get_me() succeeded — the general/send request path is healthy.
                 # That does NOT prove the getUpdates consumer is alive: PTB can
                 # report updater.running=True while the long-poll task is wedged,

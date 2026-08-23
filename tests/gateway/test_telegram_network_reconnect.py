@@ -538,6 +538,44 @@ async def test_heartbeat_loop_skips_reconnect_if_already_in_progress():
         pass
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_restarts_when_getupdates_progress_goes_stale(monkeypatch):
+    """A healthy general API path must not mask a wedged getUpdates pool."""
+    adapter = _make_adapter()
+    adapter._handle_polling_network_error = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.updater.running = True
+    mock_app.bot.get_me = AsyncMock(return_value=MagicMock())
+    mock_app.bot.get_webhook_info = AsyncMock(
+        return_value=MagicMock(pending_update_count=0)
+    )
+    adapter._app = mock_app
+
+    clock = [1000.0]
+    monkeypatch.setattr(tg_adapter.time, "monotonic", lambda: clock[0])
+    generation, _ = adapter._begin_polling_generation()
+    adapter._record_polling_progress(generation)
+    clock[0] += 200.0
+
+    sleep_calls = 0
+
+    async def fast_sleep(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise asyncio.CancelledError()
+
+    with patch("asyncio.sleep", side_effect=fast_sleep):
+        await adapter._polling_heartbeat_loop()
+    await asyncio.sleep(0)
+
+    adapter._handle_polling_network_error.assert_awaited_once()
+    error = adapter._handle_polling_network_error.await_args.args[0]
+    assert "getUpdates" in str(error)
+    assert "stalled" in str(error)
+
+
 async def _heartbeat_exception_case(exc, *, pending_probe=False):
     adapter = _make_adapter()
     reconnect_handler = AsyncMock()
