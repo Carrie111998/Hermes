@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -209,6 +211,107 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"{tid}. Use kanban_comment to hand off information to other "
             f"tasks, or kanban_create to spawn follow-up work."
         )
+    return None
+
+
+_PUBLICATION_COMMAND_TIMEOUT_SECONDS = 15
+
+
+def _publication_command(args: list[str], repo: Path) -> tuple[bool, str]:
+    """Run a bounded publication-proof command without exposing stderr."""
+    try:
+        completed = subprocess.run(
+            args, cwd=str(repo), capture_output=True, text=True,
+            timeout=_PUBLICATION_COMMAND_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "command unavailable or timed out"
+    if completed.returncode != 0:
+        return False, "command failed"
+    return True, completed.stdout.strip()
+
+
+def _publication_gate(
+    task: Any,
+    metadata: Optional[dict],
+    *,
+    repo_path: Optional[str] = None,
+    branch: Optional[str] = None,
+    expected_base: Optional[str] = None,
+    pr_number: Optional[int] = None,
+) -> Optional[str]:
+    """Prove a Forge implementation was published before completion."""
+    if (
+        os.environ.get("HERMES_PROFILE") != "forge"
+        or getattr(task, "assignee", None) != "forge"
+    ):
+        return None
+    # The task row is authoritative. Publication proof is deliberately passed
+    # through explicit arguments; free-form metadata can never satisfy it or
+    # opt out of a persisted policy.
+    policy = getattr(task, "publication_required", None)
+    required = policy if policy is not None else True
+    if required is not True:
+        return None
+    proof = {
+        "repo_path": repo_path,
+        "branch": branch,
+        "expected_base": expected_base,
+        "pr_number": pr_number,
+    }
+    missing = [key for key, value in proof.items() if value in (None, "")]
+    if missing:
+        return "publication proof rejected: missing explicit field(s): " + ", ".join(missing)
+    repo = Path(str(repo_path)).expanduser()
+    if not repo.is_dir():
+        return "publication proof rejected: repo_path is not an existing directory"
+    ok, root = _publication_command(["git", "rev-parse", "--show-toplevel"], repo)
+    if not ok or not root or Path(root).resolve() != repo.resolve():
+        return "publication proof rejected: repo_path is not the Git repository root"
+    ok, dirty = _publication_command(["git", "status", "--porcelain"], repo)
+    if not ok:
+        return "publication proof rejected: could not inspect Git status"
+    if dirty:
+        return "publication proof rejected: working tree is not clean"
+    ok, head = _publication_command(["git", "rev-parse", "HEAD"], repo)
+    if not ok or not head:
+        return "publication proof rejected: could not resolve local HEAD"
+    ok, checked_out_branch = _publication_command(
+        ["git", "symbolic-ref", "--short", "HEAD"], repo
+    )
+    expected_branch = str(branch)
+    if not ok or not checked_out_branch:
+        return "publication proof rejected: repository is detached"
+    if checked_out_branch != expected_branch:
+        return "publication proof rejected: checked-out branch does not match explicit branch"
+    ok, remote = _publication_command(
+        ["git", "ls-remote", "origin", f"refs/heads/{expected_branch}"], repo
+    )
+    remote_head = remote.split()[0] if ok and remote.split() else ""
+    if not ok or remote_head != head:
+        return "publication proof rejected: origin branch does not match local HEAD"
+    try:
+        normalized_pr_number = str(int(str(pr_number)))
+    except (TypeError, ValueError):
+        return "publication proof rejected: pr_number must be an integer"
+    ok, pr_json = _publication_command(
+        [
+            "gh", "pr", "view", normalized_pr_number,
+            "--json", "state,headRefOid,baseRefName",
+        ], repo
+    )
+    if not ok:
+        return "publication proof rejected: GitHub PR was not found or could not be read"
+    try:
+        pr = json.loads(pr_json)
+    except (TypeError, json.JSONDecodeError):
+        return "publication proof rejected: GitHub returned invalid PR data"
+    if pr.get("state") != "OPEN":
+        return "publication proof rejected: GitHub PR is not open"
+    if pr.get("headRefOid") != head:
+        return "publication proof rejected: GitHub PR head does not match local HEAD"
+    if pr.get("baseRefName") != str(expected_base):
+        return "publication proof rejected: GitHub PR base does not match expected_base"
     return None
 
 
@@ -549,6 +652,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "publication_required": t.publication_required,
                 }
 
             def _run_dict(r):
@@ -667,6 +771,10 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    repo_path = args.get("repo_path")
+    branch = args.get("branch")
+    expected_base = args.get("expected_base")
+    pr_number = args.get("pr_number")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -752,6 +860,19 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            publication_rejection = _publication_gate(
+                task,
+                metadata,
+                repo_path=repo_path,
+                branch=branch,
+                expected_base=expected_base,
+                pr_number=pr_number,
+            )
+            if publication_rejection is not None:
+                return tool_error(
+                    publication_rejection
+                    + ". Task remains in-flight; fix the publication proof and retry."
+                )
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -1409,6 +1530,9 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    publication_required = args.get("publication_required")
+    if publication_required is not None and not isinstance(publication_required, bool):
+        return tool_error("publication_required must be a boolean when provided")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1461,6 +1585,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                publication_required=publication_required,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1471,6 +1596,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                publication_required=new_task.publication_required if new_task else None,
             )
         finally:
             conn.close()
@@ -1797,13 +1923,21 @@ KANBAN_COMPLETE_SCHEMA = {
             },
             "metadata": {
                 "type": "object",
+                "additionalProperties": True,
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. Publication proof must be "
+                    "provided through the explicit repo_path, branch, expected_base, "
+                    "and pr_number arguments. Use publication_required=false for "
+                    "explicitly authorized NO COMMIT/PUSH/PR work."
                 ),
             },
+            "repo_path": {"type": "string", "description": "Explicit repository root for publication proof."},
+            "branch": {"type": "string", "description": "Explicit checked-out branch for publication proof."},
+            "expected_base": {"type": "string", "description": "Explicit expected pull-request base branch."},
+            "pr_number": {"type": "integer", "description": "Explicit open GitHub pull-request number."},
             "result": {
                 "type": "string",
                 "description": (
@@ -2282,6 +2416,10 @@ KANBAN_CREATE_SCHEMA = {
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
                 ),
+            },
+            "publication_required": {
+                "type": "boolean",
+                "description": "Persisted publication policy; omitted defaults true for Forge and false otherwise.",
             },
             "model": {
                 "type": "string",

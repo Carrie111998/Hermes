@@ -1141,6 +1141,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Nullable task policy. Legacy NULL rows resolve to Forge's default only
+    # at the publication gate; the stored value is never rewritten.
+    publication_required: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1237,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            publication_required=(
+                bool(row["publication_required"])
+                if "publication_required" in keys and row["publication_required"] is not None
+                else None
             ),
         )
 
@@ -1422,7 +1430,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- NULL preserves legacy semantics and is resolved by assignee at use time.
+    publication_required INTEGER DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2678,6 +2688,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "publication_required" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "publication_required", "publication_required INTEGER DEFAULT NULL"
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3183,6 +3197,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    publication_required: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3229,6 +3244,9 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    # New rows store the effective policy explicitly. Legacy rows retain NULL.
+    if publication_required is None:
+        publication_required = assignee == "forge"
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3497,8 +3515,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, publication_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3542,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        None if publication_required is None else int(publication_required),
                     ),
                 )
                 for pid in parents:
