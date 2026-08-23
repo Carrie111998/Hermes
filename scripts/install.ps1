@@ -145,6 +145,14 @@ try {
 
 $script:LongProfileRoot = $null
 
+# Which resolver produced the final paths ('kernel32' | 'com' | 'profile-root'
+# | 'skipped-long-path' | 'none'). Initialized so the report at the entry-point
+# dispatch never reads an unset variable -- under a caller's Set-StrictMode
+# (common in pwsh profiles; #93017) that read throws
+# "The variable '$script:LastResolver' cannot be retrieved because it has not
+# been set" and kills the whole install before any stage runs.
+$script:LastResolver = 'none'
+
 function Write-PathDiag {
     # Diagnostics for this block go to stderr, never stdout: the stage protocol
     # hands drivers a single line of JSON on stdout and a stray note would break
@@ -248,7 +256,10 @@ function ConvertTo-LongPath {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
     # Only 8.3 short names carry a tilde+digit ("~1"); skip every resolver for
     # ordinary long paths, which is the overwhelmingly common case.
-    if ($Path -notmatch '~\d') { return $Path }
+    if ($Path -notmatch '~\d') {
+        $script:LastResolver = 'skipped-long-path'
+        return $Path
+    }
 
     # 1. kernel32. Compiled on first use only, so a normal profile never pays
     #    the Add-Type cost (this file is re-entered once per install stage).
