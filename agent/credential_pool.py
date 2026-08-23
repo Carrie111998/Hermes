@@ -1397,6 +1397,7 @@ class CredentialPool:
         """Refresh one canonical PKCE generation without lock-order inversion."""
         result: Optional[PooledCredential] = None
         refresh_failed = False
+        removed = False
         with _auth_store_lock(
             timeout_seconds=self._single_use_refresh_lock_timeout()
         ):
@@ -1408,70 +1409,96 @@ class CredentialPool:
                 ),
                 None,
             )
-            stored = (
-                PooledCredential.from_dict("anthropic", persisted)
-                if isinstance(persisted, dict)
-                else entry
-            )
-            if (
-                stored.access_token != entry.access_token
-                or stored.refresh_token != entry.refresh_token
-            ):
-                result = stored
+            if not isinstance(persisted, dict):
+                # Another process explicitly removed this canonical identity.
+                # Never resurrect it from a stale process-local snapshot.
+                removed = True
             else:
-                try:
-                    from agent.anthropic_adapter import (
-                        _write_hermes_oauth_credentials,
-                        refresh_anthropic_oauth_pure,
-                    )
+                stored = PooledCredential.from_dict("anthropic", persisted)
+                if (
+                    stored.access_token != entry.access_token
+                    or stored.refresh_token != entry.refresh_token
+                ):
+                    result = stored
+                else:
+                    try:
+                        from agent.anthropic_adapter import (
+                            _write_hermes_oauth_credentials,
+                            refresh_anthropic_oauth_pure,
+                        )
 
-                    refreshed = refresh_anthropic_oauth_pure(
-                        stored.refresh_token, use_json=True
-                    )
-                    result = replace(
-                        stored,
-                        access_token=refreshed["access_token"],
-                        refresh_token=refreshed["refresh_token"],
-                        expires_at_ms=refreshed["expires_at_ms"],
-                        last_status=STATUS_OK,
-                        last_status_at=None,
-                        last_error_code=None,
-                        last_error_reason=None,
-                        last_error_message=None,
-                        last_error_reset_at=None,
-                    )
-                    _write_hermes_oauth_credentials(
-                        result.access_token,
-                        result.refresh_token or "",
-                        int(result.expires_at_ms or 0),
-                    )
-                    write_credential_pool(
-                        "anthropic",
-                        [result.to_dict()],
-                        authoritative_ids=[result.id],
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Credential refresh failed for anthropic/%s: %s",
-                        entry.id,
-                        exc,
-                    )
-                    # Re-check once before treating this generation as dead.
-                    winner = next(
-                        (
-                            payload
-                            for payload in read_credential_pool("anthropic")
-                            if isinstance(payload, dict)
-                            and payload.get("id") == entry.id
-                        ),
-                        None,
-                    )
-                    if isinstance(winner, dict):
-                        candidate = PooledCredential.from_dict("anthropic", winner)
-                        if candidate.refresh_token != entry.refresh_token:
-                            result = candidate
-                    refresh_failed = result is None
+                        refreshed = refresh_anthropic_oauth_pure(
+                            stored.refresh_token, use_json=True
+                        )
+                        result = replace(
+                            stored,
+                            access_token=refreshed["access_token"],
+                            refresh_token=refreshed["refresh_token"],
+                            expires_at_ms=refreshed["expires_at_ms"],
+                            last_status=STATUS_OK,
+                            last_status_at=None,
+                            last_error_code=None,
+                            last_error_reason=None,
+                            last_error_message=None,
+                            last_error_reset_at=None,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Credential refresh failed for anthropic/%s: %s",
+                            entry.id,
+                            exc,
+                        )
+                        # Re-check once before treating this generation as dead.
+                        winner = next(
+                            (
+                                payload
+                                for payload in read_credential_pool("anthropic")
+                                if isinstance(payload, dict)
+                                and payload.get("id") == entry.id
+                            ),
+                            None,
+                        )
+                        if isinstance(winner, dict):
+                            candidate = PooledCredential.from_dict(
+                                "anthropic", winner
+                            )
+                            if candidate.refresh_token != entry.refresh_token:
+                                result = candidate
+                        refresh_failed = result is None
+                    else:
+                        # Persistence errors must not turn a successful token
+                        # redemption into a false exhausted state. Commit the
+                        # canonical row first, then independently repair the
+                        # singleton; either store can heal the other on load.
+                        try:
+                            write_credential_pool(
+                                "anthropic",
+                                [result.to_dict()],
+                                authoritative_ids=[result.id],
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to persist refreshed Anthropic PKCE pool row: %s",
+                                exc,
+                            )
+                        try:
+                            _write_hermes_oauth_credentials(
+                                result.access_token,
+                                result.refresh_token or "",
+                                int(result.expires_at_ms or 0),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to persist refreshed Anthropic PKCE singleton: %s",
+                                exc,
+                            )
 
+        if removed:
+            with self._lock:
+                self._entries = [item for item in self._entries if item.id != entry.id]
+                if self._current_id == entry.id:
+                    self._current_id = None
+            return None
         if result is not None:
             self._replace_entry(entry, result)
             return result

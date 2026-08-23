@@ -140,6 +140,60 @@ def test_forced_refresh_releases_pool_lock_before_authority(monkeypatch):
     ]
 
 
+def test_removed_pkce_row_is_not_resurrected(monkeypatch):
+    entry = _pkce_entry()
+    pool = CredentialPool("anthropic", [entry])
+    pool._current_id = entry.id
+    refresh_calls = []
+    monkeypatch.setattr("agent.credential_pool.read_credential_pool", lambda _p: [])
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        lambda *_args, **_kwargs: refresh_calls.append(True),
+    )
+
+    assert pool._refresh_entry(entry, force=True) is None
+    assert pool.entries() == []
+    assert pool._current_id is None
+    assert refresh_calls == []
+
+
+def test_rotated_pkce_remains_usable_when_both_persistence_writes_fail(monkeypatch):
+    entry = _pkce_entry(access_token="old-access", refresh_token="old-refresh")
+    pool = CredentialPool("anthropic", [entry])
+    attempts = []
+    monkeypatch.setattr(
+        "agent.credential_pool.read_credential_pool", lambda _p: [entry.to_dict()]
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "expires_at_ms": 5_000,
+        },
+    )
+
+    def fail_pool(*_args, **_kwargs):
+        attempts.append("pool")
+        raise OSError("pool unavailable")
+
+    def fail_singleton(*_args, **_kwargs):
+        attempts.append("singleton")
+        raise OSError("singleton unavailable")
+
+    monkeypatch.setattr("agent.credential_pool.write_credential_pool", fail_pool)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._write_hermes_oauth_credentials", fail_singleton
+    )
+
+    updated = pool._refresh_entry(entry, force=True)
+
+    assert updated is not None
+    assert updated.refresh_token == "rotated-refresh"
+    assert updated.last_status == "ok"
+    assert attempts == ["pool", "singleton"]
+
+
 def test_terminal_refresh_failure_adopts_newer_canonical_row(monkeypatch):
     stale = _pkce_entry(
         access_token="stale-access",
