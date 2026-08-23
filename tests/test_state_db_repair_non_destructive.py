@@ -412,6 +412,147 @@ def test_actual_strategy_failure_still_consumes_one_attempt(tmp_path, monkeypatc
     assert ledger["failed_attempts"] == 1
 
 
+def test_environmental_strategy_failure_does_not_burn_repair_ledger(
+    tmp_path, monkeypatch
+):
+    """A disk-shaped error inside a strategy remains retriable."""
+    db = tmp_path / "state.db"
+    _make_repair_test_db(db)
+    monkeypatch.setattr(
+        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+    )
+
+    real_connect = hermes_state._connect_repair_durable
+    scratch_connects = 0
+
+    def fail_inside_strategy(path, **kwargs):
+        nonlocal scratch_connects
+        if Path(path).name.endswith(".repair-scratch"):
+            scratch_connects += 1
+            if scratch_connects >= 2:
+                raise sqlite3.OperationalError("database or disk is full")
+        return real_connect(path, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "_connect_repair_durable", fail_inside_strategy)
+
+    report = repair_state_db_schema(db, backup=False)
+
+    assert report["repaired"] is False
+    assert "database or disk is full" in report["error"]
+    assert not hermes_state._repair_ledger_path(db).exists()
+
+
+def test_staging_cleanup_failure_is_reported_without_burning_ledger(
+    tmp_path, monkeypatch
+):
+    """A failed staging cleanup must not disappear from the repair result."""
+    db = tmp_path / "state.db"
+    _make_repair_test_db(db)
+    monkeypatch.setattr(
+        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+    )
+
+    cleanup_calls = 0
+
+    def cleanup(_path):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        return None if cleanup_calls == 1 else "scratch is locked"
+
+    monkeypatch.setattr(hermes_state, "_unlink_db_triple", cleanup)
+    monkeypatch.setattr(
+        hermes_state,
+        "_copy_database_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database or disk is full")
+        ),
+    )
+
+    report = repair_state_db_schema(db, backup=False)
+
+    assert report["repaired"] is False
+    assert report["cleanup_error"] == "scratch is locked"
+    assert "cleanup" in report["error"]
+    assert not hermes_state._repair_ledger_path(db).exists()
+
+
+def test_successful_repair_can_report_pending_cleanup_without_false_abort(
+    tmp_path, monkeypatch
+):
+    """A healthy promoted DB remains usable when scratch cleanup is delayed."""
+    db = tmp_path / "state.db"
+    _make_repair_test_db(db)
+    health_results = iter(("forced-unhealthy", None))
+    monkeypatch.setattr(
+        hermes_state, "_db_opens_cleanly", lambda _path: next(health_results)
+    )
+
+    cleanup_calls = 0
+
+    def cleanup(_path):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        return None if cleanup_calls == 1 else "scratch is locked"
+
+    monkeypatch.setattr(hermes_state, "_unlink_db_triple", cleanup)
+
+    def successful_strategy(scratch_path, report):
+        with sqlite3.connect(str(scratch_path)) as conn:
+            conn.execute("INSERT INTO sessions (name) VALUES ('cleanup-pending')")
+        report["repaired"] = True
+        report["strategy"] = "cleanup_pending_test"
+        return report
+
+    monkeypatch.setattr(hermes_state, "_run_repair_strategies", successful_strategy)
+
+    first = repair_state_db_schema(db, backup=False)
+    second = repair_state_db_schema(db, backup=False)
+
+    assert first["repaired"] is True
+    assert first["cleanup_error"] == "scratch is locked"
+    assert second["repaired"] is True
+    assert second["strategy"] == "already_healthy_cleanup_pending"
+    assert second["cleanup_error"] == "scratch is locked"
+
+
+@pytest.mark.requires_wal
+def test_interrupted_wal_promotion_preserves_destination_and_sidecars(tmp_path, monkeypatch):
+    """A failed WAL promotion rolls back the destination generation."""
+    source = tmp_path / "source.db"
+    destination = tmp_path / "destination.db"
+    with sqlite3.connect(str(source)) as conn:
+        conn.execute("CREATE TABLE payloads (body BLOB)")
+        conn.executemany(
+            "INSERT INTO payloads VALUES (?)",
+            [(b"x" * PAGE_SIZE,) for _ in range(400)],
+        )
+        conn.commit()
+    live = sqlite3.connect(str(destination), isolation_level=None)
+    try:
+        live.execute("CREATE TABLE marker (value TEXT)")
+        assert live.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        live.execute("INSERT INTO marker VALUES ('original-wal')")
+        assert destination.with_name(destination.name + "-wal").exists()
+
+        ticks = iter((0.0, hermes_state._REPAIR_LOCK_TIMEOUT_SECONDS + 1.0))
+        monkeypatch.setattr(hermes_state.time, "monotonic", lambda: next(ticks))
+
+        with pytest.raises(TimeoutError):
+            hermes_state._copy_database_snapshot(
+                source,
+                destination,
+                destination_connection=live,
+            )
+    finally:
+        live.close()
+
+    with sqlite3.connect(str(destination)) as conn:
+        assert conn.execute("SELECT value FROM marker").fetchall() == [
+            ("original-wal",)
+        ]
+
+
 def test_repair_outcome_is_recorded_while_cross_process_lock_is_held(
     tmp_path, monkeypatch
 ):
@@ -847,7 +988,9 @@ def test_stale_scratch_is_removed_before_space_check(tmp_path, monkeypatch):
     assert not scratch.exists()
 
 
-def test_stale_scratch_cleanup_failure_aborts_before_probe(tmp_path, monkeypatch):
+def test_stale_scratch_cleanup_failure_aborts_after_unhealthy_probe(
+    tmp_path, monkeypatch
+):
     db = tmp_path / "state.db"
     _write_populated_db(db)
     probed = False
@@ -874,4 +1017,5 @@ def test_stale_scratch_cleanup_failure_aborts_before_probe(tmp_path, monkeypatch
 
     assert result["repaired"] is False
     assert "stale repair snapshot" in result["error"]
-    assert probed is False
+    assert result["cleanup_error"] == "scratch is locked"
+    assert probed is True

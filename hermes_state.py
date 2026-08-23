@@ -3072,6 +3072,23 @@ def _repair_state_db_schema_locked(
     scratch = db_path.with_name(f"{db_path.name}.repair-scratch")
     cleanup_error = _unlink_db_triple(scratch)
     if cleanup_error is not None:
+        # A previously promoted repair may have left only its disposable
+        # scratch artefact behind because Windows or a foreign holder delayed
+        # cleanup.  Do not let that artefact hide the fact that the canonical
+        # DB is already healthy: probe the live source before refusing a later
+        # invocation.  If it is still unhealthy, fail closed and surface both
+        # the health boundary and the cleanup blocker.
+        if _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "already_healthy_cleanup_pending"
+            report["cleanup_error"] = cleanup_error
+            report["error"] = (
+                "state.db is healthy but the previous repair snapshot could "
+                f"not be removed: {cleanup_error}"
+            )
+            logger.warning("state.db repair cleanup still pending: %s", cleanup_error)
+            return report
+        report["cleanup_error"] = cleanup_error
         report["error"] = (
             "could not remove a stale repair snapshot before probing state.db: "
             f"{cleanup_error}"
@@ -3140,17 +3157,24 @@ def _repair_state_db_schema_locked(
             if _repair_failure_consumes_attempt(exc):
                 report["_repair_attempted"] = True
             logger.error("state.db repair aborted: %s", report["error"])
-            _unlink_db_triple(scratch)
+            cleanup_error = _unlink_db_triple(scratch)
+            if cleanup_error is not None:
+                report["cleanup_error"] = cleanup_error
+                report["error"] += (
+                    "; repair snapshot cleanup also failed: "
+                    f"{cleanup_error}"
+                )
             return report
 
         try:
-            # This private marker is consumed by the outer wrapper. A strategy
-            # failure is a genuine repair outcome and consumes the persistent
-            # budget. A later promotion failure is classified separately:
-            # full disks, I/O, permission and lock failures are environmental
-            # aborts, not evidence that the strategy cannot repair this image.
-            report["_repair_attempted"] = True
+            # This private marker is consumed by the outer wrapper. The
+            # strategy runner explicitly marks deterministic corruption as a
+            # consuming attempt and environmental failures as retriable. Keep
+            # a compatibility fallback for injected strategy test doubles that
+            # predate the marker.
             _run_repair_strategies(scratch, report)
+            if "_repair_attempted" not in report:
+                report["_repair_attempted"] = True
             if report.get("repaired"):
                 try:
                     # Do not os.replace the live DB: Windows rejects
@@ -3198,6 +3222,16 @@ def _repair_state_db_schema_locked(
             # — or a later human — to mistake for the real thing.
             cleanup_error = _unlink_db_triple(scratch)
             if cleanup_error is not None:
+                report["cleanup_error"] = cleanup_error
+                previous_error = report.get("error")
+                cleanup_message = (
+                    "repair snapshot cleanup failed: " f"{cleanup_error}"
+                )
+                report["error"] = (
+                    f"{previous_error}; {cleanup_message}"
+                    if previous_error
+                    else cleanup_message
+                )
                 logger.warning(
                     "Could not remove state.db repair snapshot after repair: %s",
                     cleanup_error,
@@ -3228,6 +3262,32 @@ def _unlink_db_triple(path: Path) -> Optional[str]:
                 failures.append(f"{victim}: {exc}")
                 break
     return "; ".join(failures) or None
+
+
+def _record_strategy_failure(
+    report: Dict[str, Any], exc: sqlite3.DatabaseError, label: str
+) -> bool:
+    """Classify a strategy error and return whether later strategies may run.
+
+    SQLite uses ``DatabaseError`` for both deterministic corruption and
+    environmental failures such as ``SQLITE_FULL`` or a transient I/O/lock
+    condition.  The repair ledger must only consume the former.  Returning
+    ``False`` stops the ladder before it performs more writes against a
+    scratch database that the environment cannot safely complete.
+    """
+    if _repair_failure_consumes_attempt(exc):
+        report["_repair_attempted"] = True
+        logger.warning("state.db %s repair pass failed: %s", label, exc)
+        return True
+
+    report["_repair_attempted"] = False
+    report["error"] = str(exc)
+    logger.error(
+        "state.db %s repair pass aborted by an environmental failure: %s",
+        label,
+        exc,
+    )
+    return False
 
 
 def _run_repair_strategies(
@@ -3264,6 +3324,7 @@ def _run_repair_strategies(
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -3272,7 +3333,8 @@ def _run_repair_strategies(
             )
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
+        if not _record_strategy_failure(report, exc, "FTS in-place rebuild"):
+            return report
 
     # ── Strategy 0.5: rebuild stale B-tree indexes (#63386) ──
     # PRAGMA integrity_check can report "wrong # of entries in index" when a
@@ -3291,6 +3353,7 @@ def _run_repair_strategies(
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -3298,7 +3361,8 @@ def _run_repair_strategies(
             )
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db REINDEX pass failed: %s", exc)
+        if not _record_strategy_failure(report, exc, "REINDEX"):
+            return report
 
     # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
     try:
@@ -3322,6 +3386,7 @@ def _run_repair_strategies(
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -3330,7 +3395,8 @@ def _run_repair_strategies(
             )
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db dedup repair pass failed: %s", exc)
+        if not _record_strategy_failure(report, exc, "sqlite_master de-duplication"):
+            return report
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     #
@@ -3357,6 +3423,7 @@ def _run_repair_strategies(
             conn.close()
         reason = _db_opens_cleanly(db_path)
         if reason is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
             logger.warning(
@@ -3366,7 +3433,7 @@ def _run_repair_strategies(
             return report
         report["error"] = reason
     except sqlite3.DatabaseError as exc:
-        report["error"] = str(exc)
+        _record_strategy_failure(report, exc, "drop-FTS/VACUUM")
 
     # The "could not recover" log lives in the caller: it must name the user's
     # database, not the scratch copy these strategies were handed.
