@@ -40,15 +40,26 @@ import queue
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.secret_scope import get_secret
+from agent.secret_scope import (
+    build_profile_secret_scope,
+    get_secret,
+    reset_secret_scope,
+    set_secret_scope,
+)
 
 from agent.memory_provider import MemoryProvider, RecallStatus
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
@@ -742,6 +753,10 @@ class HindsightMemoryProvider(MemoryProvider):
     def __init__(self):
         self._config = None
         self._api_key = None
+        # Captured at construction time: under multiplexing the constructor
+        # runs inside the adapter's per-profile context, while the background
+        # threads spawned later do not (see _profile_scope).
+        self._profile_home = Path(get_hermes_home())
         self._api_url = _DEFAULT_API_URL
         self._bank_id = "hermes"
         self._budget = "mid"
@@ -1467,6 +1482,26 @@ class HindsightMemoryProvider(MemoryProvider):
                 return False
             time.sleep(self._RETAIN_OP_POLL_INTERVAL_S)
 
+    @contextmanager
+    def _profile_scope(self):
+        """Install this profile's secret scope + HERMES_HOME override.
+
+        Background threads (writer, daemon start, prefetch) are spawned raw,
+        without the constructing context's contextvars. Under multiplexing
+        ``get_secret`` fails closed on unscoped reads rather than risk
+        returning another profile's credential (#92608; same family as
+        #76574/#86402), so every background body re-installs the scope this
+        instance captured at construction — mirroring the gateway's thread
+        wrapping (gateway/run.py).
+        """
+        home_token = set_hermes_home_override(str(self._profile_home))
+        secret_token = set_secret_scope(build_profile_secret_scope(self._profile_home))
+        try:
+            yield
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
     def _writer_loop(self) -> None:
         """Drain the retain queue serially. Exits on sentinel.
 
@@ -1484,7 +1519,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 if job is _WRITER_SENTINEL:
                     return
                 try:
-                    job()
+                    with self._profile_scope():
+                        job()
                 except Exception as exc:
                     logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
             finally:
@@ -1776,6 +1812,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
 
             def _start_daemon():
+                with self._profile_scope():
+                    _start_daemon_scoped()
+
+            def _start_daemon_scoped():
                 import traceback
                 log_dir = get_hermes_home() / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
@@ -1963,13 +2003,14 @@ class HindsightMemoryProvider(MemoryProvider):
             # read-after-write signal), because async retain returns on
             # acceptance rather than durability. Runs on the background prefetch
             # thread, never the reply path, so it adds no response latency.
-            if self._prefetch_waits_for_retain:
-                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            recalled = self._do_recall(query)
-            if recalled.text:
-                with self._prefetch_lock:
-                    self._prefetch_result = recalled.text
-                    self._prefetch_count = recalled.count
+            with self._profile_scope():
+                if self._prefetch_waits_for_retain:
+                    self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+                recalled = self._do_recall(query)
+                if recalled.text:
+                    with self._prefetch_lock:
+                        self._prefetch_result = recalled.text
+                        self._prefetch_count = recalled.count
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()

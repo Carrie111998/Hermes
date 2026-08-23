@@ -1561,3 +1561,110 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         assert len(calls) == 1  # attempted exactly once, init still completed
         assert any("runtime installs are disabled" in r.getMessage()
                    for r in caplog.records)
+
+
+class TestBackgroundSecretScope:
+    """Background threads must re-install the captured profile scope (#92608).
+
+    Under multiplexing, get_secret fails closed on unscoped reads rather
+    than risk leaking another profile's credential. The writer/daemon/
+    prefetch threads are spawned raw (no contextvars propagation), so each
+    body wraps itself in _profile_scope using the home captured at
+    construction — same contract as gateway/run.py's thread wrapping.
+    """
+
+    @staticmethod
+    def _bare_provider(home):
+        provider = HindsightMemoryProvider.__new__(HindsightMemoryProvider)
+        provider._profile_home = home
+        provider._retain_queue = __import__("queue").Queue()
+        provider._shutting_down = __import__("threading").Event()
+        return provider
+
+    def test_writer_job_reads_profile_secret_and_resets_scope(self, tmp_path):
+        import queue as _queue
+        import threading as _threading
+
+        from agent.secret_scope import current_secret_scope
+        from plugins.memory.hindsight import (
+            _WRITER_SENTINEL,
+            get_secret as plugin_get_secret,
+        )
+
+        (tmp_path / ".env").write_text("HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8")
+        observed = {}
+
+        def job():
+            observed["scope"] = current_secret_scope()
+            observed["key"] = plugin_get_secret("HINDSIGHT_LLM_API_KEY", "MISSING")
+
+        provider = self._bare_provider(tmp_path)
+        provider._retain_queue = _queue.Queue()
+        provider._shutting_down = _threading.Event()
+        provider._retain_queue.put(job)
+        provider._retain_queue.put(_WRITER_SENTINEL)
+        provider._writer_loop()
+
+        assert observed["key"] == "scope-key"
+        assert observed["scope"] is not None
+        # Scope must not leak past the thread body.
+        assert current_secret_scope() is None
+
+    def test_writer_job_sees_captured_hermes_home(self, tmp_path, monkeypatch):
+        import queue as _queue
+        import threading as _threading
+
+        from hermes_constants import get_hermes_home as real_get_hermes_home
+        from plugins.memory.hindsight import _WRITER_SENTINEL
+
+        fake_process_home = tmp_path / "elsewhere"
+        monkeypatch.setenv("HERMES_HOME", str(fake_process_home))
+        observed = {}
+
+        def job():
+            observed["home"] = real_get_hermes_home()
+
+        provider = HindsightMemoryProvider.__new__(HindsightMemoryProvider)
+        provider._profile_home = tmp_path
+        provider._retain_queue = _queue.Queue()
+        provider._shutting_down = _threading.Event()
+        provider._retain_queue.put(job)
+        provider._retain_queue.put(_WRITER_SENTINEL)
+        provider._writer_loop()
+
+        assert observed["home"] == tmp_path
+
+    def test_unscoped_read_fails_closed_under_multiplex(self, monkeypatch):
+        from agent import secret_scope as secret_scope_module
+
+        monkeypatch.setattr(secret_scope_module, "_MULTIPLEX_ACTIVE", True)
+        with pytest.raises(secret_scope_module.UnscopedSecretError):
+            secret_scope_module.get_secret("HINDSIGHT_LLM_API_KEY", "")
+
+    def test_writer_job_survives_fail_closed_multiplex_guard(self, tmp_path, monkeypatch):
+        """The reported crash shape: multiplex on, key only in profile .env,
+        read from the raw writer thread — must succeed inside the scope."""
+        import queue as _queue
+        import threading as _threading
+
+        from agent import secret_scope as secret_scope_module
+        from plugins.memory.hindsight import _WRITER_SENTINEL
+
+        monkeypatch.setattr(secret_scope_module, "_MULTIPLEX_ACTIVE", True)
+        (tmp_path / ".env").write_text("HINDSIGHT_LLM_API_KEY=scope-key\n", encoding="utf-8")
+        observed = {}
+
+        def job():
+            observed["key"] = secret_scope_module.get_secret(
+                "HINDSIGHT_LLM_API_KEY", "MISSING"
+            )
+
+        provider = HindsightMemoryProvider.__new__(HindsightMemoryProvider)
+        provider._profile_home = tmp_path
+        provider._retain_queue = _queue.Queue()
+        provider._shutting_down = _threading.Event()
+        provider._retain_queue.put(job)
+        provider._retain_queue.put(_WRITER_SENTINEL)
+        provider._writer_loop()  # must not raise UnscopedSecretError
+
+        assert observed["key"] == "scope-key"
