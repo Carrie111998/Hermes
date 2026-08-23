@@ -253,6 +253,8 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
     monkeypatch.setattr(doctor_mod.importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
 
     fake_model_tools = types.SimpleNamespace(
@@ -1055,7 +1057,13 @@ class TestGitHubTokenCheck:
         call_log = []
         def mock_run(cmd, **kwargs):
             call_log.append(cmd)
-            if cmd[:2] == ["gh", "auth"]:
+            # Match the command used by Skills Hub and discard its secret
+            # stdout rather than depending on version-specific status JSON.
+            if cmd == ["gh", "auth", "token"]:
+                assert kwargs["stdout"] is subprocess.DEVNULL
+                assert kwargs["stderr"] is subprocess.DEVNULL
+                assert kwargs["stdin"] is subprocess.DEVNULL
+                assert kwargs["timeout"] == 10
                 result = types.SimpleNamespace(returncode=0, stdout="", stderr="")
             else:
                 result = types.SimpleNamespace(returncode=1, stdout="", stderr="")
