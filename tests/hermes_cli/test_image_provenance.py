@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.image_provenance import (
+    IMAGE_PROVENANCE_PATH,
     IMAGE_PROVENANCE_SCHEMA,
     read_image_provenance,
 )
@@ -45,6 +46,30 @@ def test_invalid_marker_path_argument_returns_invalid_type_error():
     assert provenance is not None
     assert provenance.valid is False
     assert provenance.error == "marker_presence_unreadable:TypeError"
+
+
+def test_file_not_found_during_marker_path_coercion_fails_closed(monkeypatch):
+    class _FileNotFoundDuringCoercion:
+        def __fspath__(self):
+            raise FileNotFoundError("coercion")
+
+    lstat_called = False
+    original_lstat = Path.lstat
+
+    def _record_lstat(path: Path):
+        nonlocal lstat_called
+        lstat_called = True
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", _record_lstat)
+
+    provenance = read_image_provenance(_FileNotFoundDuringCoercion())
+
+    assert provenance is not None
+    assert provenance.valid is False
+    assert provenance.error == "marker_presence_unreadable:FileNotFoundError"
+    assert provenance.marker_path == str(IMAGE_PROVENANCE_PATH)
+    assert lstat_called is False
 
 
 def test_valid_marker_exposes_baked_identity(tmp_path):

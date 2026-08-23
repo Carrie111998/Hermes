@@ -74,6 +74,10 @@ def read_image_provenance(
     path = IMAGE_PROVENANCE_PATH
     try:
         path = Path(marker_path) if marker_path is not None else path
+    except BaseException as exc:
+        return _invalid(path, f"marker_presence_unreadable:{type(exc).__name__}")
+
+    try:
         marker_stat = path.lstat()
     except FileNotFoundError:
         return None
