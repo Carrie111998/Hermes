@@ -754,16 +754,17 @@ def _filter_venv_launcher_stubs(pids: list[int]) -> list[int]:
 def _pid_hermes_home_matches(pid: int, expected_home: str) -> bool:
     """Return True when *pid*'s ``HERMES_HOME`` env var matches *expected_home*.
 
-    Best-effort: returns ``False`` if the process has exited, access is denied,
-    psutil is unavailable, or the env var cannot be read.  This is a post-filter
-    — the caller already has a candidate PID from argv-based matching.
+    Best-effort: returns ``True`` (fail-open) if psutil is unavailable, so the
+    argv-based match is trusted.  Returns ``False`` only when psutil can
+    positively read the env and it doesn't match, or the process has exited.
     """
     if pid <= 1:
         return False
     try:
         import psutil  # type: ignore
     except ImportError:
-        return False
+        # psutil unavailable — can't verify env; trust the argv-based match.
+        return True
     try:
         proc_env = psutil.Process(pid).environ() or {}
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):

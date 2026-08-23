@@ -116,6 +116,25 @@ class TestPidHermesHomeMatches:
         result = gateway._pid_hermes_home_matches(1, "/home/user/.hermes")
         assert result is False
 
+    def test_fails_open_when_psutil_unavailable(self, monkeypatch):
+        """Returns True (fail-open) when psutil cannot be imported."""
+        import hermes_cli.gateway as gateway
+
+        # Simulate psutil not installed by making the import raise
+        import builtins
+
+        _real_import = builtins.__import__
+
+        def _no_psutil(name, *args, **kwargs):
+            if name == "psutil":
+                raise ImportError("no psutil")
+            return _real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _no_psutil)
+
+        result = gateway._pid_hermes_home_matches(1234, "/home/user/.hermes")
+        assert result is True, "must fail open when psutil is unavailable"
+
 
 # =============================================================================
 # Tests for find_gateway_pids env-based post-filter
