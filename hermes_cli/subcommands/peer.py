@@ -116,6 +116,11 @@ def _find_bot_chat(base: str, key: str) -> str | None:
     existing chat and the caller's create fails with "Title already in use",
     permanently, for every agent that has one.
     """
+    # limit=200 with the API's most-recently-active ordering: an agent with
+    # more sessions than that could in principle page its Bot Chat out, but a
+    # Bot Chat that matters is by definition recently active, so it ranks in
+    # the first page. Revisit only if a fleet agent ever legitimately idles a
+    # canonical chat past 200 newer sessions.
     listing = _request(f"{base}/api/sessions?limit=200&include_hidden=1", key)
     for session in listing.get("data") or []:
         if isinstance(session, dict) and (session.get("title") or "").strip() == BOT_CHAT_TITLE:
