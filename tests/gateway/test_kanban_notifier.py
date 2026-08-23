@@ -81,6 +81,21 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_passive_notification_does_not_start_agent_turn(tmp_path, monkeypatch):
+    """The default notify edge sends text without injecting a user turn."""
+    db_path = tmp_path / "passive-notification.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _create_completed_subscription()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
+
+
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

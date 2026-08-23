@@ -597,7 +597,7 @@ The kanban board has two ways to handle a task you drop into the Triage column:
 
 **Manual** — `kanban.auto_decompose: false`. Triage tasks stay in triage until you act. Click the **⚗ Decompose** button on a card, run `hermes kanban decompose <id>` (or `--all`), or use `/kanban decompose <id>` from a chat. This matches the pre-decomposer behavior of the board, useful when you want full control over what runs when.
 
-**Important boundary:** Manual mode disables only the built-in Triage decomposer. It does not prevent a profile from calling `kanban_create`, and it does not disable creator-session wake-ups. With `kanban.auto_subscribe_on_create: true`, a task's terminal event resumes the originating agent with a synthetic status turn so it can inspect the handoff and decide whether genuinely new follow-up work is needed. Set `auto_subscribe_on_create: false` when task completion should remain passive. For provenance, built-in decomposer children use `created_by=auto-decomposer`; tasks created by a resumed profile carry that profile name instead.
+**Important boundary:** Manual mode disables only the built-in Triage decomposer. It does not prevent a profile from calling `kanban_create`. With `kanban.auto_subscribe_on_create: true`, the originating gateway receives passive terminal-event notifications by default, without adding synthetic turns to its conversation. Set `kanban.auto_subscribe_delivery_mode: notify+wake` when terminal events should explicitly resume the originating agent to inspect the handoff, or set `auto_subscribe_on_create: false` to disable automatic subscriptions entirely. For provenance, built-in decomposer children use `created_by=auto-decomposer`; tasks created by a resumed profile carry that profile name instead.
 
 Flip between the two modes from the **Orchestration: Auto/Manual** pill at the top of the kanban page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` — that's still available as a single-task spec rewrite when you don't want fan-out.
 
@@ -613,7 +613,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
-| `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
+| `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, subscribe the originating surface to terminal events. Set to `false` to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
+| `auto_subscribe_delivery_mode` | `"notify"` | Gateway auto-subscriptions are passive by default and do not consume agent turns. Set to `"notify+wake"` to send the update and resume the agent, or `"wake"` for a wake-only edge. TUI and stateless API delivery retain their transport-specific behavior. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 
 And the two auxiliary LLM slots:
@@ -889,7 +890,7 @@ bot> ✓ t_9fc1a3 completed by transcriber
 
 Subscriptions survive a task reaching `done` — completion is reversible (a reviewer or controller can reopen a done task), so the origin session keeps getting notified through reopen cycles. They auto-remove on `archived` (the irreversible end state). On boards that never archive, a GC sweep purges subscriptions for tasks that have sat in `done` with no new activity for `kanban.done_sub_retention_days` days (default 30; set 0 to disable), so stale rows don't accumulate forever. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
 
-A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
+A chat-originated auto-subscribe is created in `notify` mode by default: terminal events are delivered as passive operational updates and do not take an agent turn or enter the conversational transcript. Set `kanban.auto_subscribe_delivery_mode: notify+wake` when the destination agent should also take a real turn, read the board context, and reply in its own voice. See [Delivery modes](#delivery-modes) below.
 
 ### Output truncation in messaging
 

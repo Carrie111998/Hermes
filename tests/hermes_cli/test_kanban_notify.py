@@ -690,6 +690,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     assert len(subs) == 1
     assert subs[0]["chat_id"] == "chat1"
     assert subs[0]["thread_id"] == "20197"
+    assert subs[0]["delivery_mode"] == "notify"
     assert subs[0]["delivery_metadata"] == {
         "chat_type": "dm",
         "direct_messages_topic_id": "20197",
@@ -703,6 +704,41 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         assert kb.list_notify_subs(conn) == []
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_create_can_explicitly_opt_in_to_wake(kanban_home):
+    """Gateway slash creates honor the explicit active-wake policy."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_delivery_mode: notify+wake\n"
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    event = SimpleNamespace(
+        text='/kanban create "wake me" --assignee alice',
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_id="chat1",
+            chat_type="dm",
+            thread_id=None,
+            user_id="u1",
+        ),
+    )
+
+    with patch("gateway.run._hermes_home", kanban_home):
+        out = await GatewayRunner._handle_kanban_command(runner, event)
+    assert "subscribed" in out.lower()
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "notify+wake"
 
 
 @pytest.mark.parametrize(

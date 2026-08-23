@@ -541,8 +541,14 @@ class GatewaySlashCommandsMixin:
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
+                            from gateway.run import _load_gateway_config
+
                             conn = _kb.connect(board=requested_board)
                             try:
+                                delivery_mode = _kb.auto_subscribe_delivery_mode(
+                                    _load_gateway_config(),
+                                    platform=platform_str,
+                                )
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
@@ -551,9 +557,7 @@ class GatewaySlashCommandsMixin:
                                     user_id=user_id,
                                     user_id_alt=user_id_alt,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                    # Subscribing from chat: deliver the passive
-                                    # message and wake the destination agent.
-                                    delivery_mode="notify+wake",
+                                    delivery_mode=delivery_mode,
                                     delivery_metadata=delivery_metadata,
                                 )
                             finally:

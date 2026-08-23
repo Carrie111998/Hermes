@@ -868,7 +868,32 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
     assert s["user_id_alt"] == "alt-user-9"
     assert s["chat_type"] == "forum"
-    assert s["delivery_mode"] == "notify+wake"
+    assert s["delivery_mode"] == "notify"
+
+
+def test_create_gateway_session_can_opt_in_to_wake(monkeypatch, worker_env, tmp_path):
+    """Gateway auto-subscriptions wake only when policy explicitly opts in."""
+    from tools import kanban_tools as kt
+
+    home = tmp_path / "wake-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_delivery_mode: notify+wake\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+
+    out = kt._handle_create({
+        "title": "explicit wake policy",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "notify+wake"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

@@ -11382,6 +11382,36 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+def auto_subscribe_delivery_mode(
+    config: Mapping[str, Any] | None,
+    *,
+    platform: str,
+) -> Optional[str]:
+    """Resolve the policy for automatically-created notification edges.
+
+    Push-capable gateway subscriptions are passive by default: operational
+    events are delivered to the chat without becoming synthetic agent turns.
+    Operators that want the previous synthesis behavior can explicitly set
+    ``kanban.auto_subscribe_delivery_mode: notify+wake`` (or ``wake``).
+
+    ``None`` preserves the transport-specific database default for TUI and
+    api_server. The latter has no passive push channel, so its existing default
+    remains an active wake rather than creating an undeliverable subscription.
+    """
+    normalized_platform = str(platform or "").strip().lower()
+    if normalized_platform in {"tui", "api_server"}:
+        return None
+    kanban = config.get("kanban") if isinstance(config, Mapping) else None
+    configured = (
+        kanban.get("auto_subscribe_delivery_mode")
+        if isinstance(kanban, Mapping)
+        else None
+    )
+    if configured in _NOTIFY_DELIVERY_MODES:
+        return str(configured)
+    return "notify"
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,

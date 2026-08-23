@@ -1532,6 +1532,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     chat_id = ""
     try:
         from gateway.session_context import get_session_env
+        from hermes_cli import kanban_db as _kb
+
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:
@@ -1556,9 +1558,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 return False  # CLI / cron / test — no persistent channel
             platform = "tui"
             chat_id = session_key
-        is_gateway_session = platform != "tui"
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        delivery_mode = "notify+wake" if is_gateway_session else None
+        delivery_mode = _kb.auto_subscribe_delivery_mode(cfg, platform=platform)
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
@@ -1589,8 +1590,6 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             if message_id:
                 delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
-        # Lazy-import to keep the module-level dependency light
-        from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
