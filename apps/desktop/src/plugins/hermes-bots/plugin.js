@@ -6413,8 +6413,15 @@ async function ensureGroupChatSession(group, member) {
   const key = groupMemberKey(member)
   const known = room.sessions && room.sessions[key]
 
+  // `true` is a poison sentinel: the prior turn persisted a user prompt but
+  // produced no assistant reply. Resuming that session would append a second
+  // user role and violate the model/provider alternation contract. Skip both
+  // stored-id and title lookup once, create a fresh hidden plumbing session,
+  // then replace the sentinel with its real stored id below.
+  const resumeTargets = known === true ? [] : [known, title]
+
   // Try resuming what we know (stored sid first, then title lookup).
-  for (const target of [known, title]) {
+  for (const target of resumeTargets) {
     if (!target || target === true) {
       continue
     }
@@ -6461,6 +6468,18 @@ async function ensureGroupChatSession(group, member) {
   }
 
   return { runtime: created?.session_id || null, stored }
+}
+
+/** Mark a member's plumbing session unusable after a turn persisted a user
+ * message without a matching assistant message. The next turn rotates to a
+ * fresh hidden session instead of violating role alternation. */
+function invalidateGroupChatSession(group, member) {
+  const key = groupMemberKey(member)
+
+  updateGroupChat(group, room => {
+    room.sessions = { ...(room.sessions || {}), [key]: true }
+    return room
+  })
 }
 
 const GROUP_TURN_TIMEOUT_MS = 180000
@@ -6717,7 +6736,10 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
     const done = !busy && !awaitingUser
 
     if (messages.length > before && done) {
-      for (let i = messages.length - 1; i >= 0; i--) {
+      // Only this turn's suffix can satisfy this turn. Scanning older history
+      // can mistake a previous assistant reply for a failed user-only submit,
+      // repost stale text, and leave the session user-terminated.
+      for (let i = messages.length - 1; i >= before; i--) {
         const msg = messages[i]
 
         if (msg?.role === 'assistant') {
@@ -6739,6 +6761,7 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
       }
 
       recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
+      invalidateGroupChatSession(group, member)
 
       return null
     }
@@ -6816,7 +6839,10 @@ async function harvestStrandedGroupReply(group, member) {
     return
   }
 
-  for (let i = messages.length - 1; i >= 0; i--) {
+  // The stranded baseline is the exact message count before the timed-out
+  // submit. Older assistants belong to earlier turns and must never satisfy
+  // or be redelivered as this stranded result.
+  for (let i = messages.length - 1; i >= strandedBefore; i--) {
     const msg = messages[i]
 
     if (msg?.role === 'assistant') {
@@ -6844,6 +6870,11 @@ async function harvestStrandedGroupReply(group, member) {
       return
     }
   }
+
+  // The stranded turn completed with new persisted messages but no assistant
+  // response. Rotate before the next prompt rather than resuming a session
+  // whose last durable role is user.
+  invalidateGroupChatSession(group, member)
 }
 
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
@@ -6935,6 +6966,7 @@ async function runGroupChatRounds(group, members, thread) {
           reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
         } catch {
           recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+          invalidateGroupChatSession(group, member)
           reply = null // a failed turn is a pass, never a room error
         }
 
