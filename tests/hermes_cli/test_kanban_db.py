@@ -861,6 +861,45 @@ class TestSharedBoardPaths:
             assert key not in env
 
 
+    def test_dispatcher_spawn_enforces_github_effect_broker_marker(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setenv("AOS_GITHUB_EFFECT_BROKER_REQUIRED", "0")
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, _cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        task = kb.Task(
+            id="t_effect_guard",
+            title="guard remote effects",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        assert captured["env"]["AOS_GITHUB_EFFECT_BROKER_REQUIRED"] == "1"
+        assert os.environ["AOS_GITHUB_EFFECT_BROKER_REQUIRED"] == "0"
+
+
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
