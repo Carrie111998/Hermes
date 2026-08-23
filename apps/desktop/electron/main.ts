@@ -355,6 +355,7 @@ import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
+import { dirToRemember, nextPickerDefaultPath, readLastPickerDir, writeLastPickerDir } from './picker-state'
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -746,6 +747,7 @@ const DESKTOP_CONNECTIONS_REGISTRY_PATH = path.join(app.getPath('userData'), 'co
 const DESKTOP_INSTALLATION_PATH = path.join(app.getPath('userData'), 'desktop-installation.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
+const DESKTOP_PICKER_STATE_PATH = path.join(app.getPath('userData'), 'picker-state.json')
 const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backend-ownership.json')
 // active-profile.json records which Hermes profile the desktop launches its
 // local backend as. When set, startHermes() passes `hermes --profile <name>
@@ -14059,6 +14061,15 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
     }
   }
 
+  // #92925: when the caller has no opinion (no composer cwd — e.g. detached
+  // pickers), fall back to the directory the user last picked from. An
+  // explicit defaultPath wins: it expresses the current working context.
+  if (!resolvedDefaultPath) {
+    resolvedDefaultPath = nextPickerDefaultPath(undefined, readLastPickerDir(DESKTOP_PICKER_STATE_PATH), dir =>
+      directoryExists(dir)
+    )
+  }
+
   const result = await dialog.showOpenDialog(mainWindow, {
     title: options?.title || 'Add context',
     defaultPath: resolvedDefaultPath,
@@ -14068,6 +14079,12 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
 
   if (result.canceled) {
     return []
+  }
+
+  const toRemember = dirToRemember(result.filePaths)
+
+  if (toRemember) {
+    writeLastPickerDir(DESKTOP_PICKER_STATE_PATH, toRemember)
   }
 
   return result.filePaths
