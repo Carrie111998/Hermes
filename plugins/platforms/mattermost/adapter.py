@@ -1252,6 +1252,8 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+    if "reply_mode" in mattermost_cfg and not os.getenv("MATTERMOST_REPLY_MODE"):
+        os.environ["MATTERMOST_REPLY_MODE"] = str(mattermost_cfg["reply_mode"]).lower()
     frc = mattermost_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):

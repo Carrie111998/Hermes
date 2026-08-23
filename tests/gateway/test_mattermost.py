@@ -81,6 +81,15 @@ class TestMattermostConfigLoading:
         assert home.chat_id == "ch_abc123"
         assert home.name == "General"
 
+    def test_yaml_reply_mode_bridges_to_adapter_environment(self, monkeypatch):
+        """Configured thread replies must reach the adapter's env-based runtime."""
+        monkeypatch.delenv("MATTERMOST_REPLY_MODE", raising=False)
+
+        from plugins.platforms.mattermost.adapter import _apply_yaml_config
+        _apply_yaml_config({}, {"reply_mode": "thread"})
+
+        assert os.environ["MATTERMOST_REPLY_MODE"] == "thread"
+
 
 # ---------------------------------------------------------------------------
 # Adapter format / truncate
