@@ -3090,6 +3090,16 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    _call_role = (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    )
+                    agent._request_attribution_call_role = _call_role
+                    agent._request_attribution_retry_count = retry_count
+                    agent._request_attribution_stream_retry_count = 0
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,

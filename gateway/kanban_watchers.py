@@ -1268,6 +1268,20 @@ class GatewayKanbanWatchersMixin:
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+        require_admission_receipt = bool(
+            kanban_cfg.get("require_admission_receipt", False)
+        )
+        admission_receipt_path = (
+            str(kanban_cfg.get("admission_receipt_path") or "").strip() or None
+        )
+        github_receipt_dir = (
+            str(kanban_cfg.get("github_receipt_dir") or "").strip() or None
+        )
+        if require_admission_receipt:
+            logger.info(
+                "kanban dispatcher: evidence admission required (receipt=%s)",
+                admission_receipt_path or "<missing>",
+            )
 
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
@@ -1481,6 +1495,9 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    admission_receipt_path=admission_receipt_path,
+                    require_admission_receipt=require_admission_receipt,
+                    github_receipt_dir=github_receipt_dir,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

@@ -939,6 +939,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent.request_attribution import attach_request_attribution
+
+    api_kwargs = attach_request_attribution(
+        agent,
+        api_kwargs,
+        streaming=agent.api_mode == "codex_responses",
+    )
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -2857,6 +2864,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
+        from agent.request_attribution import attach_request_attribution
+
+        request = attach_request_attribution(
+            agent,
+            request,
+            call_role="iteration_summary",
+            retry_count=retry_count,
+            streaming=False,
+            action_id=summary_api_request_id,
+        )
 
         return relay_llm.execute_current(
             request,
@@ -2997,8 +3014,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
+            from agent.request_attribution import attach_request_attribution
+
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
+            codex_kwargs = attach_request_attribution(
+                agent,
+                codex_kwargs,
+                call_role="iteration_summary",
+                retry_count=0,
+                streaming=True,
+                action_id=summary_api_request_id,
+            )
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
@@ -3112,8 +3139,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
+                from agent.request_attribution import attach_request_attribution
+
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
+                codex_kwargs = attach_request_attribution(
+                    agent,
+                    codex_kwargs,
+                    call_role="iteration_summary",
+                    retry_count=1,
+                    streaming=True,
+                    action_id=summary_api_request_id,
+                )
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
@@ -3905,6 +3942,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_stream_response = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            from agent.request_attribution import attach_request_attribution
+
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -3918,6 +3957,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):
                 stream_kwargs["stream_options"] = {"include_usage": True}
+            stream_kwargs = attach_request_attribution(
+                agent,
+                stream_kwargs,
+                streaming=True,
+            )
             request_client = _set_request_client(
                 agent._create_request_openai_client(
                     reason="chat_completion_stream_request",
@@ -4504,7 +4548,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+            from agent.request_attribution import attach_request_attribution
+
             final_kwargs = dict(next_api_kwargs)
+            final_kwargs = attach_request_attribution(
+                agent,
+                final_kwargs,
+                streaming=True,
+            )
             sanitize_anthropic_kwargs(
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
@@ -4694,6 +4745,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                agent._request_attribution_stream_retry_count = _stream_attempt
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),

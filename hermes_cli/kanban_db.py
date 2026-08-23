@@ -122,7 +122,15 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency",
+    "needs_input",
+    "capability",
+    "transient",
+    "receipt_pending",
+}
+VALID_ADMISSION_CLASSES = {"hold", "cloud_priority", "local_only"}
+VALID_COMPLETION_CONTRACTS = {"standard", "github_effect_v1"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1141,6 +1149,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Admission is explicit and fail-closed. Legacy cards migrate to ``hold``;
+    # only freshly classified work may enter the autonomous dispatcher.
+    admission_class: str = "hold"
+    # Source-delivery tasks can require an independently read-back GitHub
+    # effect before ``done`` becomes reachable.
+    completion_contract: str = "standard"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1248,16 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            admission_class=(
+                row["admission_class"]
+                if "admission_class" in keys and row["admission_class"]
+                else "hold"
+            ),
+            completion_contract=(
+                row["completion_contract"]
+                if "completion_contract" in keys and row["completion_contract"]
+                else "standard"
             ),
         )
 
@@ -1422,7 +1446,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Autonomous dispatch is opt-in per card. Existing rows receive ``hold``
+    -- through the additive migration and therefore cannot be silently
+    -- re-admitted after an upgrade.
+    admission_class      TEXT NOT NULL DEFAULT 'hold',
+    -- ``github_effect_v1`` requires an exact, independently read-back GitHub
+    -- receipt before the task may transition to done.
+    completion_contract  TEXT NOT NULL DEFAULT 'standard'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1477,6 +1508,35 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- A completion attempt that could not yet satisfy its evidence contract.
+-- The workspace is deliberately retained; a later receipt submission can
+-- replay this exact proposal without asking the worker to reconstruct it.
+CREATE TABLE IF NOT EXISTS task_completion_proposals (
+    task_id         TEXT PRIMARY KEY,
+    result          TEXT,
+    summary         TEXT,
+    metadata        TEXT,
+    created_cards   TEXT,
+    expected_run_id INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+-- Receipt ids are globally unique within a board. Binding one receipt to one
+-- task makes reuse a deterministic rejection instead of a narrative check.
+CREATE TABLE IF NOT EXISTS github_action_receipts (
+    receipt_id   TEXT PRIMARY KEY,
+    task_id      TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    repository   TEXT NOT NULL,
+    branch       TEXT NOT NULL,
+    commit_sha   TEXT NOT NULL,
+    pr_url       TEXT,
+    verified_at  TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    recorded_at  INTEGER NOT NULL
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1522,6 +1582,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_github_receipts_task  ON github_action_receipts(task_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2679,6 +2740,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "admission_class" not in cols:
+        # Fail closed on upgrade: every pre-existing card is legacy inventory
+        # and remains held until an operator creates or explicitly classifies
+        # fresh work from current source truth.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "admission_class",
+            "admission_class TEXT NOT NULL DEFAULT 'hold'",
+        )
+
+    if "completion_contract" not in cols:
+        # Existing cards keep their historical completion semantics. Fresh
+        # source-delivery cards opt into github_effect_v1 explicitly.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "completion_contract",
+            "completion_contract TEXT NOT NULL DEFAULT 'standard'",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2693,6 +2775,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    index_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if {"status", "admission_class", "priority", "created_at"}.issubset(
+        index_columns
+    ):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_admission "
+            "ON tasks(status, admission_class, priority, created_at)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3183,6 +3275,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    admission_class: str = "hold",
+    completion_contract: str = "standard",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3228,6 +3322,17 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    admission_class = str(admission_class or "").strip().lower()
+    completion_contract = str(completion_contract or "").strip().lower()
+    if admission_class not in VALID_ADMISSION_CLASSES:
+        raise ValueError(
+            f"admission_class must be one of {sorted(VALID_ADMISSION_CLASSES)}"
+        )
+    if completion_contract not in VALID_COMPLETION_CONTRACTS:
+        raise ValueError(
+            "completion_contract must be one of "
+            f"{sorted(VALID_COMPLETION_CONTRACTS)}"
+        )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3497,8 +3602,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        admission_class, completion_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3630,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        admission_class,
+                        completion_contract,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3660,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "admission_class": admission_class,
+                        "completion_contract": completion_contract,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4469,6 +4579,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
+    task_row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task_row and task_row["block_kind"] == "receipt_pending":
+        return True
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
@@ -5349,6 +5464,168 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class GitHubReceiptPendingError(ValueError):
+    """Completion was retained but parked until valid GitHub proof arrives."""
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(
+            f"completion parked as receipt_pending for {task_id}: {reason}"
+        )
+
+
+def _load_completion_proposal(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM task_completion_proposals WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+
+    def decode(value: Any, fallback: Any) -> Any:
+        if not value:
+            return fallback
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "result": row["result"],
+        "summary": row["summary"],
+        "metadata": decode(row["metadata"], {}),
+        "created_cards": decode(row["created_cards"], []),
+        "expected_run_id": row["expected_run_id"],
+    }
+
+
+def _park_receipt_pending(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+    created_cards: Optional[Iterable[str]],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Persist the proposed completion without cleaning its workspace."""
+    now = int(time.time())
+    cards = [str(card) for card in (created_cards or ()) if str(card).strip()]
+    stored_metadata = dict(metadata or {})
+    stored_metadata.pop("_staged_artifacts", None)
+    # Invalid receipts may contain arbitrary extra keys. Retain the proposed
+    # handoff, but never persist an unvalidated payload as evidence; the
+    # reconciler supplies a fresh broker receipt on the next attempt.
+    stored_metadata.pop("github_action_receipt", None)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] not in {
+            "running", "ready", "blocked", "review"
+        }:
+            return False
+        if (
+            expected_run_id is not None
+            and (
+                row["current_run_id"] is None
+                or int(row["current_run_id"]) != int(expected_run_id)
+            )
+        ):
+            return False
+        conn.execute(
+            """
+            INSERT INTO task_completion_proposals
+                (task_id, result, summary, metadata, created_cards,
+                 expected_run_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                result = excluded.result,
+                summary = excluded.summary,
+                metadata = excluded.metadata,
+                created_cards = excluded.created_cards,
+                expected_run_id = excluded.expected_run_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task_id,
+                result,
+                summary,
+                json.dumps(stored_metadata, ensure_ascii=False),
+                json.dumps(cards, ensure_ascii=False),
+                int(expected_run_id) if expected_run_id is not None else None,
+                now,
+                now,
+            ),
+        )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="receipt_pending",
+            status="blocked",
+            summary=summary if summary is not None else result,
+            metadata={"receipt_error": reason},
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = 'receipt_pending'
+             WHERE id = ?
+            """,
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "completion_receipt_pending",
+            {"reason": reason, "proposal_retained": True},
+            run_id=run_id,
+        )
+    return True
+
+
+def _github_completion_receipt(
+    conn: sqlite3.Connection,
+    task_row: sqlite3.Row,
+    metadata: Optional[dict],
+) -> dict[str, Any]:
+    from hermes_cli.github_receipts import (
+        GitHubReceiptError,
+        git_expectations,
+        validate_github_receipt,
+    )
+
+    receipt = (metadata or {}).get("github_action_receipt")
+    expectations = git_expectations(task_row["workspace_path"])
+    expected_branch = task_row["branch_name"] or expectations["branch"]
+    try:
+        normalized = validate_github_receipt(
+            receipt,
+            task_id=task_row["id"],
+            expected_repository=expectations["repository"],
+            expected_branch=expected_branch,
+            expected_commit_sha=expectations["commit_sha"],
+            not_before_epoch=task_row["started_at"] or task_row["created_at"],
+        )
+    except GitHubReceiptError as exc:
+        raise GitHubReceiptPendingError(task_row["id"], exc.code) from exc
+    reused = conn.execute(
+        "SELECT task_id FROM github_action_receipts WHERE receipt_id = ?",
+        (normalized["receipt_id"],),
+    ).fetchone()
+    if reused is not None:
+        raise GitHubReceiptPendingError(task_row["id"], "reused_receipt")
+    return normalized
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5391,12 +5668,76 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    A task using ``github_effect_v1`` is gated before the done transition.
+    Missing or invalid evidence retains this exact completion proposal,
+    closes the worker run as ``receipt_pending``, keeps the workspace, and
+    raises :class:`GitHubReceiptPendingError`. A later valid broker receipt
+    replays the proposal once without rerunning the worker.
     """
     now = int(time.time())
+    task_row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task_row is None:
+        return False
+    if task_row["status"] not in {"running", "ready", "blocked", "review"}:
+        # Terminal tasks are idempotent no-ops. In particular, do not re-run
+        # receipt validation for a task that already consumed its one receipt.
+        return False
+    if expected_run_id is not None and (
+        task_row["current_run_id"] is None
+        or int(task_row["current_run_id"]) != int(expected_run_id)
+    ):
+        # Preserve the existing compare-and-swap contract: a stale worker can
+        # neither complete nor park a successor run's task.
+        return False
+
+    # A reconciler (or a second explicit complete call) only needs to provide
+    # the newly available receipt. The exact prior proposal supplies the
+    # result, summary, and structured handoff without rerunning the worker.
+    if task_row["block_kind"] == "receipt_pending":
+        proposal = _load_completion_proposal(conn, task_id)
+        if proposal is not None:
+            if result is None:
+                result = proposal["result"]
+            if summary is None:
+                summary = proposal["summary"]
+            proposal_metadata = dict(proposal["metadata"] or {})
+            proposal_metadata.update(dict(metadata or {}))
+            metadata = proposal_metadata
+            if created_cards is None:
+                created_cards = proposal["created_cards"]
+            # The original run closed when the proposal was parked. Receipt
+            # reconciliation is a new idempotent control-plane action and
+            # must not require the now-ended worker run id.
+            expected_run_id = None
+
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    github_receipt: Optional[dict[str, Any]] = None
+    if task_row["completion_contract"] == "github_effect_v1":
+        try:
+            github_receipt = _github_completion_receipt(conn, task_row, metadata)
+        except GitHubReceiptPendingError as exc:
+            parked = _park_receipt_pending(
+                conn,
+                task_id,
+                reason=exc.reason,
+                result=result,
+                summary=summary,
+                metadata=metadata,
+                created_cards=created_cards,
+                expected_run_id=expected_run_id,
+            )
+            if not parked:
+                return False
+            raise
+        metadata = dict(metadata or {})
+        metadata["github_action_receipt"] = github_receipt
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5476,6 +5817,27 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if github_receipt is not None:
+            conn.execute(
+                """
+                INSERT INTO github_action_receipts
+                    (receipt_id, task_id, action, repository, branch,
+                     commit_sha, pr_url, verified_at, payload, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    github_receipt["receipt_id"],
+                    task_id,
+                    github_receipt["action"],
+                    github_receipt["repository"],
+                    github_receipt["branch"],
+                    github_receipt["commit_sha"],
+                    github_receipt.get("pr_url"),
+                    github_receipt["verified_at"],
+                    json.dumps(github_receipt, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -5530,6 +5892,8 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if github_receipt is not None:
+            completed_payload["github_receipt_id"] = github_receipt["receipt_id"]
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -5548,6 +5912,9 @@ def complete_task(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
+        )
+        conn.execute(
+            "DELETE FROM task_completion_proposals WHERE task_id = ?", (task_id,)
         )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
@@ -5590,6 +5957,67 @@ def complete_task(
             summary=(summary if summary is not None else result),
         )
     return True
+
+
+def reconcile_github_completion_receipts(
+    conn: sqlite3.Connection,
+    receipt_dir: Optional[str],
+    *,
+    limit: int = 100,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Apply broker receipts to parked completion proposals exactly once.
+
+    Receipt files are retained as audit artifacts. Terminal task state and the
+    unique receipt-id table make repeated scans idempotent.
+    """
+    completed: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    if not receipt_dir:
+        return completed, rejected
+    root = Path(receipt_dir).expanduser()
+    if not root.is_dir():
+        return completed, rejected
+    pending = {
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'blocked' "
+            "AND block_kind = 'receipt_pending' "
+            "AND EXISTS (SELECT 1 FROM task_completion_proposals p "
+            "WHERE p.task_id = tasks.id)"
+        ).fetchall()
+    }
+    if not pending:
+        return completed, rejected
+    try:
+        candidates = sorted(
+            (path for path in root.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+        )[-max(int(limit), 1) :]
+    except OSError:
+        return completed, rejected
+    for path in candidates:
+        try:
+            if path.stat().st_size > 64 * 1024:
+                continue
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(receipt, dict):
+            continue
+        task_id = str(receipt.get("task_id") or "").strip()
+        if task_id not in pending:
+            continue
+        try:
+            if complete_task(
+                conn,
+                task_id,
+                metadata={"github_action_receipt": receipt},
+            ):
+                completed.append(task_id)
+                pending.discard(task_id)
+        except GitHubReceiptPendingError as exc:
+            rejected.append((task_id, exc.reason))
+    return completed, rejected
 
 
 # ---------------------------------------------------------------------------
@@ -8082,6 +8510,19 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    admission_blocked_reason: Optional[str] = None
+    """Fail-closed admission reason. No task, run, or workspace state was
+    changed when this is set."""
+    admission_receipt_id: Optional[str] = None
+    """Validated ``aos.dispatch_admission.v1`` receipt used for this tick."""
+    skipped_held: list[str] = field(default_factory=list)
+    """Ready cards excluded because their admission class is ``hold``."""
+    skipped_cloud_capped: list[str] = field(default_factory=list)
+    """Cloud-priority cards deferred by the receipt's cloud seat budget."""
+    receipts_completed: list[str] = field(default_factory=list)
+    """Receipt-pending cards completed by broker read-back reconciliation."""
+    receipts_rejected: list[tuple[str, str]] = field(default_factory=list)
+    """Broker receipt candidates rejected as ``(task_id, reason)``."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9738,6 +10179,24 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def count_running_tasks_by_admission(
+    conn: sqlite3.Connection, admission_class: str
+) -> int:
+    """Return running tasks in one explicit admission lane."""
+    if admission_class not in VALID_ADMISSION_CLASSES:
+        return 0
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'running' AND admission_class = ?",
+                (admission_class,),
+            ).fetchone()[0]
+        )
+    except Exception:
+        return 0
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
@@ -9783,6 +10242,40 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def count_running_tasks_by_admission_other_boards(
+    admission_class: str, board: Optional[str] = None
+) -> int:
+    """Count a running admission lane across every active board but one."""
+    if admission_class not in VALID_ADMISSION_CLASSES:
+        return 0
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return 0
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                total += count_running_tasks_by_admission(other, admission_class)
+            finally:
+                other.close()
+        except Exception:
+            continue
+    return total
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify current system memory pressure: ok/elevated/critical/unknown.
 
@@ -9819,6 +10312,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    admission_receipt_path: Optional[str] = None,
+    require_admission_receipt: bool = False,
+    github_receipt_dir: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9854,6 +10350,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            admission_receipt_path=admission_receipt_path,
+            require_admission_receipt=require_admission_receipt,
+            github_receipt_dir=github_receipt_dir,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9874,6 +10373,9 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                admission_receipt_path=admission_receipt_path,
+                require_admission_receipt=require_admission_receipt,
+                github_receipt_dir=github_receipt_dir,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9901,6 +10403,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    admission_receipt_path: Optional[str] = None,
+    require_admission_receipt: bool = False,
+    github_receipt_dir: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9937,11 +10442,41 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
+    result = DispatchResult()
+    admission = None
+    admission_capacity_full = False
+    if require_admission_receipt:
+        try:
+            from hermes_cli.dispatch_admission import (
+                DispatchAdmissionError,
+                load_dispatch_admission,
+            )
+
+            admission = load_dispatch_admission(
+                admission_receipt_path, maximum_workers=5
+            )
+        except DispatchAdmissionError as exc:
+            result.admission_blocked_reason = exc.code
+            return result
+        result.admission_receipt_id = admission.receipt_id
+        admission_capacity_full = (
+            admission.running_workers >= admission.max_workers
+        )
+        if max_in_progress is None or max_in_progress > admission.max_workers:
+            max_in_progress = admission.max_workers
+
+    # Receipt failures return above before any task/run/workspace mutation.
+    # A passing tick may now perform the normal reconciliation work.
+    if admission is not None and not dry_run:
+        (
+            result.receipts_completed,
+            result.receipts_rejected,
+        ) = reconcile_github_completion_receipts(conn, github_receipt_dir)
+    if admission_capacity_full:
+        result.admission_blocked_reason = "worker_capacity_full"
+        return result
     reap_worker_zombies()
 
-    result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10033,20 +10568,60 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    if admission is None:
+        ready_rows = conn.execute(
+            "SELECT id, assignee, admission_class FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    else:
+        placeholders = ",".join("?" for _ in admission.allowed_classes)
+        ready_rows = conn.execute(
+            "SELECT id, assignee, admission_class FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            f"AND admission_class IN ({placeholders}) "
+            "ORDER BY CASE admission_class "
+            "WHEN 'cloud_priority' THEN 0 ELSE 1 END, "
+            "priority DESC, created_at ASC",
+            tuple(sorted(admission.allowed_classes)),
+        ).fetchall()
+        result.skipped_held = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE status = 'ready' "
+                "AND claim_lock IS NULL AND admission_class = 'hold' "
+                "ORDER BY priority DESC, created_at ASC"
+            ).fetchall()
+        ]
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
     if review_dispatch_enabled():
-        review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
-        ).fetchall()
+        if admission is None:
+            review_rows = conn.execute(
+                "SELECT id, assignee, admission_class FROM tasks "
+                "WHERE status = 'review' AND claim_lock IS NULL "
+                "ORDER BY priority DESC, created_at ASC"
+            ).fetchall()
+        else:
+            placeholders = ",".join("?" for _ in admission.allowed_classes)
+            review_rows = conn.execute(
+                "SELECT id, assignee, admission_class FROM tasks "
+                "WHERE status = 'review' AND claim_lock IS NULL "
+                f"AND admission_class IN ({placeholders}) "
+                "ORDER BY CASE admission_class "
+                "WHEN 'cloud_priority' THEN 0 ELSE 1 END, "
+                "priority DESC, created_at ASC",
+                tuple(sorted(admission.allowed_classes)),
+            ).fetchall()
+            result.skipped_held.extend(
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM tasks WHERE status = 'review' "
+                    "AND claim_lock IS NULL AND admission_class = 'hold' "
+                    "ORDER BY priority DESC, created_at ASC"
+                ).fetchall()
+            )
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
@@ -10075,6 +10650,19 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
         ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
+    cloud_spawned = 0
+    cloud_budget = None
+    if admission is not None:
+        live_cloud_workers = count_running_tasks_by_admission(
+            conn, "cloud_priority"
+        ) + count_running_tasks_by_admission_other_boards(
+            "cloud_priority", board
+        )
+        cloud_budget = max(
+            admission.cloud_concurrency
+            - max(admission.running_cloud_workers, live_cloud_workers),
+            0,
+        )
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -10114,6 +10702,14 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        if (
+            admission is not None
+            and row["admission_class"] == "cloud_priority"
+            and cloud_budget is not None
+            and cloud_spawned >= cloud_budget
+        ):
+            result.skipped_cloud_capped.append(row["id"])
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -10218,6 +10814,8 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
+            if row["admission_class"] == "cloud_priority":
+                cloud_spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -10281,6 +10879,8 @@ def _dispatch_once_locked(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if claimed.admission_class == "cloud_priority":
+                cloud_spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
@@ -10319,6 +10919,14 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if (
+            admission is not None
+            and row["admission_class"] == "cloud_priority"
+            and cloud_budget is not None
+            and cloud_spawned >= cloud_budget
+        ):
+            result.skipped_cloud_capped.append(row["id"])
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -10349,6 +10957,8 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
+            if row["admission_class"] == "cloud_priority":
+                cloud_spawned += 1
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
@@ -10404,6 +11014,8 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if claimed.admission_class == "cloud_priority":
+                cloud_spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
@@ -10978,12 +11590,31 @@ def run_daemon(
             max_in_progress = resolve_max_in_progress(
                 configured_max_in_progress()
             )
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                kanban_cfg = (load_config_readonly() or {}).get("kanban", {})
+            except Exception:
+                kanban_cfg = {}
+            require_admission_receipt = bool(
+                kanban_cfg.get("require_admission_receipt", False)
+            )
+            admission_receipt_path = (
+                str(kanban_cfg.get("admission_receipt_path") or "").strip()
+                or None
+            )
+            github_receipt_dir = (
+                str(kanban_cfg.get("github_receipt_dir") or "").strip() or None
+            )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    admission_receipt_path=admission_receipt_path,
+                    require_admission_receipt=require_admission_receipt,
+                    github_receipt_dir=github_receipt_dir,
                 )
             if on_tick is not None:
                 try:
@@ -11047,6 +11678,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    lines.append(f"Admission class: {task.admission_class}")
+    lines.append(f"Completion contract: {task.completion_contract}")
+    if task.completion_contract == "github_effect_v1":
+        lines.append(
+            "Completion proof: provide a fresh aos.github_action_receipt.v1 "
+            "from the governed GitHub effect broker; the task cannot become "
+            "done without canonical exact-repository and exact-head readback."
+        )
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

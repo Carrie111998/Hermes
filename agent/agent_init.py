@@ -1774,6 +1774,32 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    _telemetry_cfg = _agent_cfg.get("telemetry", {})
+    _request_attribution_cfg = (
+        _telemetry_cfg.get("request_attribution", {})
+        if isinstance(_telemetry_cfg, dict)
+        else {}
+    )
+    agent._request_attribution_enabled = bool(
+        isinstance(_request_attribution_cfg, dict)
+        and _request_attribution_cfg.get("enabled", False)
+    )
+    _attribution_endpoints = (
+        _request_attribution_cfg.get("litellm_endpoints", [])
+        if isinstance(_request_attribution_cfg, dict)
+        else []
+    )
+    if isinstance(_attribution_endpoints, str):
+        _attribution_endpoints = [_attribution_endpoints]
+    agent._request_attribution_litellm_endpoints = tuple(
+        str(value).strip()
+        for value in (_attribution_endpoints or [])
+        if str(value).strip()
+    )
+    agent._request_attribution_call_role = "primary"
+    agent._request_attribution_retry_count = 0
+    agent._request_attribution_stream_retry_count = 0
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

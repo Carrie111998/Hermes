@@ -81,6 +81,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "admission_class": t.admission_class,
+        "completion_contract": t.completion_contract,
     }
 
 
@@ -399,6 +401,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument(
+        "--admission-class",
+        choices=sorted(kb.VALID_ADMISSION_CLASSES),
+        default="hold",
+        help="Autonomous admission lane (default: hold).",
+    )
+    p_create.add_argument(
+        "--completion-contract",
+        choices=sorted(kb.VALID_COMPLETION_CONTRACTS),
+        default="standard",
+        help="Evidence required before done (default: standard).",
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -600,6 +614,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--github-receipt",
+        default=None,
+        metavar="PATH",
+        help="Path to an aos.github_action_receipt.v1 JSON read-back receipt.",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -1586,6 +1606,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            admission_class=getattr(args, "admission_class", "hold"),
+            completion_contract=getattr(args, "completion_contract", "standard"),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2252,12 +2274,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    receipt_path = getattr(args, "github_receipt", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (summary or raw_meta or receipt_path):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
+            "kanban: --summary / --metadata / --github-receipt are per-task "
+            "and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
@@ -2272,6 +2296,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    if receipt_path:
+        try:
+            github_receipt = json.loads(
+                Path(receipt_path).expanduser().read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"kanban: --github-receipt: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(github_receipt, dict):
+            print("kanban: --github-receipt must contain a JSON object", file=sys.stderr)
+            return 2
+        metadata = dict(metadata or {})
+        metadata["github_action_receipt"] = github_receipt
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2292,13 +2329,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.GitHubReceiptPendingError as exc:
+                failed.append(tid)
+                print(
+                    f"completion for {tid} parked as receipt_pending: {exc.reason}",
+                    file=sys.stderr,
+                )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2653,11 +2699,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        require_admission_receipt = bool(
+            _kanban_cfg.get("require_admission_receipt", False)
+        )
+        admission_receipt_path = (
+            str(_kanban_cfg.get("admission_receipt_path") or "").strip() or None
+        )
+        github_receipt_dir = (
+            str(_kanban_cfg.get("github_receipt_dir") or "").strip() or None
+        )
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        require_admission_receipt = False
+        admission_receipt_path = None
+        github_receipt_dir = None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2667,6 +2725,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            admission_receipt_path=admission_receipt_path,
+            require_admission_receipt=require_admission_receipt,
+            github_receipt_dir=github_receipt_dir,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2687,9 +2748,22 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "admission_blocked_reason": res.admission_blocked_reason,
+            "admission_receipt_id": res.admission_receipt_id,
+            "skipped_held": res.skipped_held,
+            "skipped_cloud_capped": res.skipped_cloud_capped,
+            "receipts_completed": res.receipts_completed,
+            "receipts_rejected": [
+                {"task_id": task_id, "reason": reason}
+                for task_id, reason in res.receipts_rejected
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
+    if res.admission_blocked_reason:
+        print(f"Admission:    blocked ({res.admission_blocked_reason})")
+    elif res.admission_receipt_id:
+        print(f"Admission:    {res.admission_receipt_id}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
