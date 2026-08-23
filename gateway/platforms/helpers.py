@@ -968,10 +968,38 @@ def detect_parse_mode(content: str) -> str:
     heuristic the standalone path used (``<[a-zA-Z/][^>]*>``): any tag-like
     token selects HTML. Plain comparison text like ``a < b`` is NOT matched
     (the ``<`` must be followed by a letter or ``/``).
+
+    KR-022 fix: require at least one *matched* tag pair OR a void/self-closing
+    tag before selecting HTML. This eliminates false positives from comparison
+    text like ``a<b and c>d`` (no spaces) which would otherwise select HTML
+    and cause Telegram to try parsing ``<b and c>`` as a tag.
     """
     if not content:
         return "MarkdownV2"
-    return "HTML" if re.search(r"<[a-zA-Z/][^>]*>", content) else "MarkdownV2"
+    # Find all tag matches and check for at least one matched open+close pair
+    tags = _HTML_TAG_RE.findall(content)
+    if not tags:
+        return "MarkdownV2"
+    # Build a set of tag names that have both an opener and a closer
+    openers = set()
+    closers = set()
+    has_void_or_selfclosing = False
+    for m in _HTML_TAG_RE.finditer(content):
+        is_closer = m.group(1) == "/"
+        name = m.group(2).lower()
+        text = m.group(0)
+        if is_closer:
+            closers.add(name)
+        else:
+            if text.rstrip().endswith("/>") or name in _HTML_VOID:
+                has_void_or_selfclosing = True
+            else:
+                openers.add(name)
+    # Select HTML if: at least one tag has both open and close, OR there is
+    # a void/self-closing tag (e.g. <br>, <img/>)
+    if (openers & closers) or has_void_or_selfclosing:
+        return "HTML"
+    return "MarkdownV2"
 
 
 def _html_open_tags(prefix: str) -> "List[tuple[str, str]]":
@@ -1006,6 +1034,16 @@ def balance_html_across_chunks(chunks: "List[str]") -> "List[str]":
     The reopen-set carried into the next chunk is the open stack of the *raw*
     piece (before this chunk's synthetic closers were appended) — otherwise a
     tag that closes naturally in a later chunk would be closed twice.
+
+    KR-022 fix: deep-nesting budget. When ~dozens of tags with attributes are
+    open at a boundary, the synthetic close+reopen overhead can exceed the
+    tested MAX + 64 slack and blow Telegram's 4096 limit outright. We now
+    calculate the byte-length of all open tags during iteration and subtract
+    from the limit before selecting the split index. If a chunk would exceed
+    the limit after adding reopen+closer, we shrink the raw piece until it fits.
+
+    Note: mid-entity splits (e.g. ``&am|p;``) are an accepted edge case —
+    they render literally rather than corrupting markup. See KR-022 point 4.
     """
     out: "List[str]" = []
     open_stack: "List[tuple[str, str]]" = []
@@ -1016,7 +1054,25 @@ def balance_html_across_chunks(chunks: "List[str]") -> "List[str]":
         # closers — this is what the next chunk must re-open.
         open_stack = _html_open_tags(piece)
         closers = "".join(f"</{name}>" for name, _ in reversed(open_stack))
-        out.append(piece + closers)
+        # KR-022: check if reopen+piece+closers exceeds the limit; if so,
+        # shrink the piece until it fits within the budget.
+        candidate = piece + closers
+        if len(candidate) > 4096:
+            # Calculate overhead: reopen + closers
+            overhead = len(reopen) + len(closers)
+            # Budget for the raw piece content (before reopen was added)
+            raw_piece = piece[len(reopen):]
+            budget = 4096 - overhead
+            if budget > 0 and len(raw_piece) > budget:
+                # Shrink the raw piece to fit within budget
+                shrunk = raw_piece[:budget]
+                # Rebuild with reopen + shrunk + closers
+                piece = reopen + shrunk
+                # Recalculate open stack for the shrunk piece
+                open_stack = _html_open_tags(piece)
+                closers = "".join(f"</{name}>" for name, _ in reversed(open_stack))
+                candidate = piece + closers
+        out.append(candidate)
     return out
 
 

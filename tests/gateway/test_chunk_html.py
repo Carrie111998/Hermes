@@ -43,6 +43,8 @@ def test_detect_parse_mode_html():
     assert detect_parse_mode("<b>bold</b>") == "HTML"
     assert detect_parse_mode('see <a href="https://x">link</a>') == "HTML"
     assert detect_parse_mode("line one<br>line two") == "HTML"
+    # KR-022: matched pair required; unmatched opener alone is not enough
+    assert detect_parse_mode("use <b>bold</b> for emphasis") == "HTML"
 
 
 def test_detect_parse_mode_markdown():
@@ -50,6 +52,9 @@ def test_detect_parse_mode_markdown():
     assert detect_parse_mode("plain text, no tags") == "MarkdownV2"
     assert detect_parse_mode("") == "MarkdownV2"
     assert detect_parse_mode("a < b and c > d (math, not tags)") == "MarkdownV2"
+    # KR-022: comparison text without spaces must NOT select HTML
+    assert detect_parse_mode("if a<b and c>d then x") == "MarkdownV2"
+    assert detect_parse_mode("x<y>z") == "MarkdownV2"
 
 
 # ── chunk_html: the King's failing cases ─────────────────────────────────────
@@ -109,4 +114,21 @@ def test_emoji_heavy_respects_utf16_limit():
     chunks = chunk_html(html, max_length=MAX, len_fn=utf16_len)
     for c in chunks:
         assert utf16_len(c) <= MAX + 64
+        assert _tags_balanced(c)
+
+
+def test_deep_nesting_budget():
+    """KR-022: 40-deep nested <span>s must not blow the 4096 limit when the
+    synthetic close+reopen overhead is large. The chunker must shrink the raw
+    piece to fit within budget."""
+    # Build 40 nested spans with attributes (realistic overhead)
+    inner = "x" * 100  # small payload, deep nesting
+    for i in range(40):
+        inner = f'<span class="level-{i}" data-depth="{i}">{inner}</span>'
+    # Now wrap in a long body that forces a split
+    body = "word " * 2000  # ~10K chars
+    html = f"<b>{body}{inner}</b>"
+    chunks = chunk_html(html, max_length=MAX, len_fn=utf16_len)
+    for c in chunks:
+        assert utf16_len(c) <= MAX, f"chunk exceeds 4096: {utf16_len(c)}"
         assert _tags_balanced(c)
