@@ -4788,6 +4788,7 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
 _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
 _ACTION_IDS: Dict[str, str] = {}
+_ACTION_UPDATE_LOCKS: Dict[str, Any] = {}
 
 # A finished ``gateway-restart`` child does not mean the gateway is back: the
 # child exits as soon as it has handed the restart to the supervisor (or to the
@@ -4851,6 +4852,29 @@ def _record_completed_action(name: str, message: str, exit_code: int = 1) -> Non
     _ACTION_COMMANDS.pop(name, None)
     _ACTION_IDS.pop(name, None)
     _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": None}
+
+
+def _release_update_admission(name: str, lock: Any = None) -> None:
+    """Release a dashboard-held install marker after the child exits."""
+    owned = _ACTION_UPDATE_LOCKS.pop(name, None)
+    if owned is not None and (lock is None or owned is lock):
+        lock = owned
+    if lock is not None:
+        try:
+            lock.release()
+        except Exception:
+            _log.debug("Could not release dashboard update admission lock", exc_info=True)
+
+
+def _watch_update_admission(proc: Any, lock: Any) -> None:
+    try:
+        while True:
+            poll = getattr(proc, "poll", None)
+            if not callable(poll) or poll() is not None:
+                break
+            time.sleep(0.25)
+    finally:
+        _release_update_admission("hermes-update", lock)
 
 
 def _dashboard_spawn_executable() -> str:
@@ -5287,6 +5311,21 @@ async def update_hermes():
             "update_command": message,
         }
 
+    from hermes_cli.update_lock import UpdateLock, read_live_update
+
+    marker_holder = read_live_update()
+    if marker_holder is not None:
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "update_in_progress",
+            "holder_pid": marker_holder.pid,
+            "message": marker_holder.unavailable_reason
+            or "Another Hermes update already owns the install marker.",
+            "retryable": True,
+        }
+
     existing = _ACTION_PROCS.get("hermes-update")
     if existing is not None and existing.poll() is None:
         response = {
@@ -5299,6 +5338,21 @@ async def update_hermes():
         if action_id:
             response["action_id"] = action_id
         return response
+
+    admission = UpdateLock()
+    if not admission.acquire():
+        holder = admission.holder
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "update_admission_unavailable",
+            "holder_pid": holder.pid if holder is not None else None,
+            "message": holder.unavailable_reason
+            if holder is not None and holder.unavailable_reason
+            else "Could not establish the install-wide update marker.",
+            "retryable": True,
+        }
 
     action_id = secrets.token_hex(16)
     try:
@@ -5315,8 +5369,22 @@ async def update_hermes():
             },
         )
     except Exception as exc:
+        admission.release()
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
+
+    if callable(getattr(proc, "poll", None)):
+        _ACTION_UPDATE_LOCKS["hermes-update"] = admission
+        threading.Thread(
+            target=_watch_update_admission,
+            args=(proc, admission),
+            name="hermes-update-admission",
+            daemon=True,
+        ).start()
+    else:
+        # Test doubles and unusual launch wrappers do not expose liveness;
+        # never leave the install marker wedged in that case.
+        admission.release()
     return {
         "ok": True,
         "pid": proc.pid,
@@ -6052,6 +6120,8 @@ async def get_action_status(name: str, lines: int = 200):
             _ACTION_PROCS.pop(name, None)
             _ACTION_COMMANDS.pop(name, None)
             _ACTION_IDS.pop(name, None)
+            if name == "hermes-update":
+                _release_update_admission(name)
 
     response = {
         "name": name,
@@ -6106,6 +6176,9 @@ def _latest_update_receipt_summary() -> Optional[Dict[str, Any]]:
         if isinstance(refusal, dict):
             # Copy so a caller cannot mutate a module-cached receipt object.
             summary["refusal"] = dict(refusal)
+        persistence = receipt.get("persistence")
+        if isinstance(persistence, dict):
+            summary["persistence"] = dict(persistence)
         return summary
     except Exception:
         return None

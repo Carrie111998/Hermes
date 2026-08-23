@@ -235,6 +235,7 @@ def _create_verified_snapshot(project_root: Path) -> tuple[Path, Path]:
         _dependency_state,
         _dependency_states_match,
         _find_venv,
+        validate_no_reparse_topology,
     )
 
     project = Path(project_root).resolve(strict=True)
@@ -250,6 +251,7 @@ def _create_verified_snapshot(project_root: Path) -> tuple[Path, Path]:
     live_venv = live_venv.resolve(strict=True)
 
     base = _coordinator_base(project)
+    validate_no_reparse_topology(base)
     existed = base.exists()
     base = _ensure_real_directory(base, create=True)
     if not existed:

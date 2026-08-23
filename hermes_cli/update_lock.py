@@ -75,6 +75,7 @@ UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 # Keep comfortably below the shared readers' 20-minute stale ceiling. This is
 # public so the Rust updater can use the same cadence.
 UPDATE_MARKER_HEARTBEAT_SECONDS = 30
+MARKER_MUTEX_TIMEOUT_SECONDS = 2.0
 
 MARKER_NAME = ".hermes-update-in-progress"
 
@@ -279,18 +280,36 @@ class _MarkerMutex:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-            if sys.platform == "win32":
-                import msvcrt
+            deadline = time.monotonic() + MARKER_MUTEX_TIMEOUT_SECONDS
+            while True:
+                try:
+                    if sys.platform == "win32":
+                        import msvcrt
 
-                if os.fstat(self.fd).st_size == 0:
-                    _write_all(self.fd, b"\0")
-                os.lseek(self.fd, 0, os.SEEK_SET)
-                msvcrt.locking(self.fd, msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
+                        if os.fstat(self.fd).st_size == 0:
+                            _write_all(self.fd, b"\0")
+                        os.lseek(self.fd, 0, os.SEEK_SET)
+                        msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
 
-                fcntl.flock(self.fd, fcntl.LOCK_EX)
-            self.locked = True
+                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.locked = True
+                    break
+                except (BlockingIOError, OSError) as exc:
+                    if time.monotonic() >= deadline:
+                        raise UpdateLockUnavailable(
+                            f"timed out locking update marker mutex {self.path}"
+                        ) from exc
+                    time.sleep(0.05)
+        except UpdateLockUnavailable:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+            raise
         except OSError as exc:
             if self.fd is not None:
                 try:

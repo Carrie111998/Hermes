@@ -82,6 +82,67 @@ class RolloutExecutionError(RolloutError):
         self.result = result
 
 
+def validate_real_venv_root(path: Path, *, allow_missing: bool = False) -> bool:
+    """Require a project venv root to be a real directory, never a link.
+
+    This check intentionally uses ``lstat`` before any ``exists``/interpreter
+    lookup.  On Windows a junction or other reparse point can otherwise make
+    the optional-dependency probe execute an interpreter outside the install.
+    The same helper is used by checkpoint capture and live checkpoint
+    validation so those paths cannot disagree about the venv topology.
+    """
+    path = Path(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise CheckpointError(f"venv root is missing: {path}")
+    except OSError as exc:
+        raise CheckpointError(f"cannot inspect venv root {path}: {exc}") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & reparse_flag
+    ):
+        raise CheckpointError(
+            f"venv root must be a real directory, not a link or reparse point: {path}"
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CheckpointError(f"venv root is not a directory: {path}")
+    return True
+
+
+def validate_no_reparse_topology(path: Path) -> None:
+    """Reject links/reparse points in an existing state-path topology."""
+    path = Path(path)
+    absolute = Path(os.path.abspath(path))
+    existing: list[Path] = []
+    current = absolute
+    while True:
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            current = current.parent
+            if current == current.parent:
+                break
+            continue
+        except OSError as exc:
+            raise CheckpointError(f"cannot inspect state path {current}: {exc}") from exc
+        existing.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    for component in existing:
+        metadata = component.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0) & reparse_flag
+        ):
+            raise CheckpointError(
+                f"state path contains a link or reparse point: {component}"
+            )
+
+
 @dataclass(frozen=True)
 class RolloutConfig:
     """Normalized update rollout configuration.
@@ -231,7 +292,9 @@ def checkpoint_root(project_root: Path, base: Optional[Path] = None) -> Path:
         candidate = Path(get_default_hermes_root()) / CHECKPOINT_DIR_NAME
     else:
         candidate = Path(base)
-    candidate = candidate.expanduser().resolve(strict=False)
+    candidate = candidate.expanduser()
+    validate_no_reparse_topology(candidate)
+    candidate = candidate.resolve(strict=False)
     try:
         candidate.relative_to(project)
     except ValueError:
@@ -246,6 +309,7 @@ def checkpoint_root(project_root: Path, base: Optional[Path] = None) -> Path:
 def _dependency_state(venv: Path) -> dict[str, Any]:
     """Describe the copied environment without executing its interpreter."""
 
+    validate_real_venv_root(venv)
     total_bytes = 0
     file_count = 0
     directory_count = 0
@@ -328,24 +392,7 @@ def _dependency_state(venv: Path) -> dict[str, Any]:
 def _find_venv(project_root: Path) -> tuple[Path, str, bool]:
     for name in ("venv", ".venv"):
         candidate = project_root / name
-        try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            metadata = None
-        except OSError as exc:
-            raise CheckpointError(
-                f"cannot inspect rollout venv root {candidate}: {exc}"
-            ) from exc
-        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        if metadata is not None and (
-            stat.S_ISLNK(metadata.st_mode)
-            or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
-        ):
-            raise CheckpointError(
-                f"rollout venv root must be a real directory, not a link or "
-                f"reparse point: {candidate}"
-            )
-        if candidate.is_dir():
+        if validate_real_venv_root(candidate, allow_missing=True):
             return candidate, name, True
     # Absence is a dependency state too.  Restoring such a checkpoint removes
     # a venv created by the failed update.
@@ -381,7 +428,8 @@ def _checkpoint_id(sha: str, now: Optional[datetime] = None) -> str:
 
 
 def capture_rollout_relaunch_argv(plan: Any) -> None:
-    """Snapshot manual gateway argv while the planned PIDs are still live."""
+    """Snapshot redacted gateway argv while the planned PIDs are still live."""
+    from hermes_cli.process_identity import redact_argv
 
     for runtime in getattr(plan, "runtimes", None) or []:
         if getattr(runtime, "kind", "") != "gateway" or not getattr(
@@ -397,7 +445,7 @@ def capture_rollout_relaunch_argv(plan: Any) -> None:
 
             process = psutil.Process(int(runtime.pid))
             if not detail.get("argv"):
-                detail["argv"] = list(process.cmdline() or [])
+                detail["argv"] = redact_argv(list(process.cmdline() or []))
             if detail.get("start_time") is None:
                 detail["start_time"] = float(process.create_time())
         except Exception:
@@ -514,6 +562,8 @@ def create_checkpoint(
         runtime_profiles: list[str] = []
         checkpoint_plan = None
         if plan is not None:
+            from hermes_cli.process_identity import redact_argv
+
             runtime_profiles = sorted(
                 {
                     str(getattr(runtime, "profile", ""))
@@ -539,7 +589,9 @@ def create_checkpoint(
                     try:
                         import psutil
 
-                        detail["argv"] = list(psutil.Process(int(pid)).cmdline() or [])
+                        detail["argv"] = redact_argv(
+                            list(psutil.Process(int(pid)).cmdline() or [])
+                        )
                     except Exception:
                         pass
         metadata = {
@@ -646,7 +698,9 @@ def dependency_state_matches_checkpoint(
     live_exists = os.path.lexists(live_venv)
     if not bool(expected.get("venv_present")):
         return not live_exists
-    if not live_exists or not live_venv.is_dir() or live_venv.is_symlink():
+    try:
+        validate_real_venv_root(live_venv)
+    except CheckpointError:
         return False
     try:
         actual = _dependency_state(live_venv)

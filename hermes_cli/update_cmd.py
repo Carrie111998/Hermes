@@ -424,24 +424,10 @@ def _prepare_rollout_target_venv(
     if venv_name not in {"venv", ".venv"}:
         raise RuntimeError(f"checkpoint selected an invalid venv name: {venv_name!r}")
     target = Path(project_root) / venv_name
-    try:
-        metadata = target.lstat()
-    except FileNotFoundError:
-        metadata = None
-    except OSError as exc:
-        raise RuntimeError(
-            f"could not inspect rollout target venv {target}: {exc}"
-        ) from exc
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    if metadata is not None and (
-        stat.S_ISLNK(metadata.st_mode)
-        or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
-    ):
-        raise RuntimeError(
-            "rollout target venv must be a real directory, not a link or "
-            f"reparse point: {target}"
-        )
-    if not target.is_dir():
+    from hermes_cli.update_rollout import validate_real_venv_root
+
+    target_exists = validate_real_venv_root(target, allow_missing=True)
+    if not target_exists:
         env = dict(os.environ)
         env.pop("PYTHONHOME", None)
         env.pop("PYTHONPATH", None)
@@ -451,6 +437,7 @@ def _prepare_rollout_target_venv(
             env=env,
             check=True,
         )
+    validate_real_venv_root(target)
     interpreter = venv_python_path(target, windows=_m()._is_windows())
     if not interpreter.is_file():
         raise RuntimeError(f"rollout target venv has no interpreter: {interpreter}")
@@ -609,22 +596,39 @@ def _validate_critical_modules_import(
         "raise SystemExit(0)\n"
         % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
     )
+    from hermes_cli.update_rollout import validate_real_venv_root
+
     try:
         interpreter = sys.executable
-        try:
-            names = (venv_name,) if venv_name else ("venv", ".venv")
-            for name in names:
+        names = (venv_name,) if venv_name else ("venv", ".venv")
+        for name in names:
+            candidate = Path(root) / str(name)
+            try:
+                candidate_exists = validate_real_venv_root(
+                    candidate, allow_missing=True
+                )
+            except Exception as exc:
+                return False, str(candidate), str(exc)
+            if candidate_exists:
                 venv_python = venv_python_path(
-                    Path(root) / str(name), windows=_m()._is_windows()
+                    candidate, windows=_m()._is_windows()
                 )
                 if venv_python.exists():
                     interpreter = str(venv_python)
                     break
-        except Exception:
-            pass  # fall back to the running interpreter
+        probe_env = dict(os.environ)
+        source_root = Path(__file__).resolve().parent.parent
+        probe_paths = [str(Path(root)), str(source_root)]
+        inherited_paths = probe_env.get("PYTHONPATH", "")
+        if inherited_paths:
+            probe_paths.extend(
+                item for item in inherited_paths.split(os.pathsep) if item
+            )
+        probe_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(probe_paths))
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
+            env=probe_env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -5612,6 +5616,12 @@ def _venv_core_imports_healthy(
     a candidate reinstall before the canary gate.
     """
     venv_dir = Path(venv_dir) if venv_dir is not None else _m().PROJECT_ROOT / "venv"
+    try:
+        from hermes_cli.update_rollout import validate_real_venv_root
+
+        validate_real_venv_root(venv_dir, allow_missing=True)
+    except Exception as exc:
+        return False, str(exc)
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
     if not venv_python.exists():
         if fail_closed:
@@ -6538,6 +6548,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
 
     try:
         from gateway.status import terminate_pid
+        from hermes_cli.process_identity import redact_argv
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -6640,6 +6651,8 @@ def _pause_windows_gateways_for_update() -> dict | None:
         argv = None
         try:
             argv = _capture_gateway_argv(int(pid))
+            if isinstance(argv, (list, tuple)):
+                argv = redact_argv(argv)
         except Exception as exc:
             logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
         unmapped.append({"pid": int(pid), "argv": argv})

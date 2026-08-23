@@ -49,6 +49,21 @@ _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 # command; a module singleton lets the 7k-line updater record steps from
 # any depth without threading a handle through every helper.
 _current: Optional["UpdateReceipt"] = None
+_last_persistence_failure: Optional[dict[str, Any]] = None
+
+
+def last_persistence_failure() -> Optional[dict[str, Any]]:
+    """Return the most recent retryable receipt publication failure."""
+    return dict(_last_persistence_failure) if _last_persistence_failure else None
+
+
+def _safe_process_argv() -> list[str]:
+    try:
+        from hermes_cli.process_identity import redact_argv
+
+        return redact_argv(sys.argv)
+    except Exception:
+        return ["[REDACTED]"]
 
 
 def _utc_now_iso() -> str:
@@ -63,7 +78,7 @@ class UpdateReceipt:
             "schema": 1,
             "started_at": _utc_now_iso(),
             "finished_at": None,
-            "argv": list(sys.argv),
+            "argv": _safe_process_argv(),
             "pid": os.getpid(),
             "correlation_id": None,
             "origin": {},
@@ -151,8 +166,11 @@ class UpdateReceipt:
 
 def _receipt_dir() -> Path:
     from hermes_cli.config import get_hermes_home
+    from hermes_cli.update_rollout import validate_no_reparse_topology
 
-    return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
+    directory = get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
+    validate_no_reparse_topology(directory)
+    return directory
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -278,16 +296,15 @@ def record_update_context(correlation_id: str, **origin: Any) -> None:
 def finalize_update_receipt(
     outcome: str, fleet: list | None = None, stop_reason: str = ""
 ) -> Optional[Path]:
-    """Finalize + persist the receipt. Returns the written path or None.
+    """Finalize + persist the receipt, retaining it across failed publication.
 
-    ``outcome`` is one of ``success`` / ``partial`` / ``failed`` /
-    ``refused``. Exactly-once by construction: the module singleton is
-    popped first, so a second call (e.g. the command-boundary safety net
-    after an inner path already finalized) is a no-op returning None.
+    The retained receipt is the primary durable record.  The in-memory receipt
+    is only cleared after that no-replace publication succeeds; a failed
+    retained write remains retryable.  A latest-pointer failure is reported
+    separately because the retained record is already durable.
     """
-    global _current
+    global _current, _last_persistence_failure
     receipt = _current
-    _current = None
     if receipt is None:
         return None
     try:
@@ -308,13 +325,46 @@ def finalize_update_receipt(
             f"update_{stamp}_{os.getpid()}_{correlation_token}_"
             f"{uuid.uuid4().hex}.json"
         )
-        _atomic_create_json(path, receipt.data)
-        # Stable pointer for the dashboard/desktop: latest receipt.
-        latest = directory / "latest.json"
+        receipt.data["persistence"] = {
+            "retained_write": "success",
+        }
         try:
-            _atomic_write_json(latest, receipt.data)
-        except OSError:
-            pass
+            _atomic_create_json(path, receipt.data)
+        except Exception as exc:
+            _last_persistence_failure = {
+                "stage": "retained_write",
+                "retryable": True,
+                "error": str(exc),
+            }
+            receipt.data["persistence"] = {
+                "retained_write": "failed",
+                "retryable": True,
+                "error": str(exc),
+            }
+            logger.warning("Could not retain update receipt: %s", exc)
+            return None
+        # The primary record is now durable; exactly-once callers must not
+        # publish it again, even if the convenience pointer cannot be written.
+        _current = None
+        latest = directory / "latest.json"
+        latest_payload = dict(receipt.data)
+        latest_payload["persistence"] = {
+            "retained_write": "success",
+            "latest_pointer": "success",
+            "retryable": False,
+        }
+        try:
+            _atomic_write_json(latest, latest_payload)
+        except Exception as exc:
+            _last_persistence_failure = {
+                "stage": "latest_pointer",
+                "retryable": True,
+                "retained_path": str(path),
+                "error": str(exc),
+            }
+            logger.warning("Could not update latest receipt pointer: %s", exc)
+        else:
+            _last_persistence_failure = None
         _prune_old_receipts(directory)
         return path
     except Exception as exc:  # pragma: no cover - defensive
