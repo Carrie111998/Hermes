@@ -144,6 +144,24 @@ class TestUnknownToolDispatch:
         assert "error" in result
         assert "Unknown tool" in result["error"]
 
+    def test_aliased_tool_name_dispatches_to_canonical(self):
+        """A model-hallucinated alias (shell -> terminal) resolves at dispatch."""
+        reg = ToolRegistry()
+        reg.register(
+            name="terminal",
+            toolset="core",
+            schema=_make_schema("terminal"),
+            handler=_dummy_handler,
+        )
+        result = json.loads(reg.dispatch("shell", {}))
+        assert result == {"ok": True}
+
+    def test_unknown_alias_still_errors(self):
+        reg = ToolRegistry()
+        result = json.loads(reg.dispatch("shell", {}))
+        assert "error" in result
+        assert "Unknown tool" in result["error"]
+
 
 class TestToolErrorBounding:
     def test_short_message_unchanged(self):
