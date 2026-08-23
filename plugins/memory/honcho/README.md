@@ -215,7 +215,7 @@ Pick **[e]** at the prompt to set the three keys directly instead of going throu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `writeFrequency` | string/int | `"async"` | `"async"` (background), `"turn"` (sync per turn), `"session"` (batch on end), or integer N (every N turns) |
-| `saveMessages` | bool | `true` | Persist messages to Honcho API |
+| `saveMessages` | bool | `true` | Persist messages to Honcho API. When `false`, all automatic writes are skipped — raw turns (`sync_turn`), conclusion mirroring (`on_memory_write`), and session-end/shutdown flushes — while read and tools paths stay fully functional. |
 
 ### Session Resolution
 
@@ -316,7 +316,7 @@ The file is read on demand and cached against its **mtime**. A changed mtime rel
 
 - Routing applies to reads and writes alike: session creation, per-turn flushes, dialectic queries, context prefetch, conclusions, and peer cards all follow the mapped session into the project workspace.
 - Each routed session is stamped with its workspace, so a flush issued by a different manager instance (the gateway runs several) still lands in the right workspace.
-- Routed workspaces get their own Honcho client from `get_honcho_client_for_workspace()`, which shares the default singleton's OAuth contract — a rotated access token is picked up by routed workspaces exactly as it is by the default one.
+- A routed child manager holds a copy of the config with `workspace_id` set to the routed workspace, and acquires its client through the ordinary `get_honcho_client(config)`. Because clients are cached per identity and `workspace_id` is part of that identity, a routed workspace gets its own client while still sharing the one OAuth refresh path — a rotated access token is picked up exactly as it is for the default workspace.
 - `flush_all()` and `shutdown()` fan out to every routed workspace before draining the default one.
 
 ### Multi-Profile Pattern

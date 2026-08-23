@@ -6,6 +6,7 @@ import { ModelMenuCloseContext } from '@/app/shell/model-menu-panel'
 import { Button } from '@/components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { releaseTypingFocus } from '@/components/ui/keyboard-first'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
@@ -17,8 +18,11 @@ import { onComposerModelMenuRequest } from './focus'
 import { useComposerScope } from './scope'
 import type { ChatBarState } from './types'
 
+// `shrink` (not `shrink-0`) with a truncating label: the pill is the one
+// control in the row that can give width back continuously, so it absorbs the
+// squeeze between collapse stages instead of pushing Send past the edge.
 const PILL = cn(
-  'h-(--composer-control-size) max-w-40 shrink-0 gap-1 rounded-md px-2 text-xs font-normal',
+  'h-(--composer-control-size) min-w-0 max-w-40 shrink gap-1 rounded-md px-2 text-xs font-normal',
   'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
 )
 
@@ -143,8 +147,19 @@ export function ModelPill({
     )
   }
 
+  // Closing the menu ends its claim on the keyboard: Radix restores focus to
+  // this pill (a toolbar button), so without the release the Enter that
+  // committed a model also swallows whatever you type next.
+  const setMenuOpen = (next: boolean) => {
+    setOpen(next)
+
+    if (!next) {
+      releaseTypingFocus()
+    }
+  }
+
   return (
-    <DropdownMenu onOpenChange={setOpen} open={open}>
+    <DropdownMenu onOpenChange={setMenuOpen} open={open}>
       <Tip label={title} side="top">
         <DropdownMenuTrigger asChild>
           <Button aria-label={title} className={pillClass} disabled={disabled} type="button" variant="ghost">
@@ -153,7 +168,7 @@ export function ModelPill({
         </DropdownMenuTrigger>
       </Tip>
       <DropdownMenuContent align="end" className="w-64 p-0" side="top" sideOffset={8}>
-        <ModelMenuCloseContext.Provider value={() => setOpen(false)}>
+        <ModelMenuCloseContext.Provider value={() => setMenuOpen(false)}>
           {model.modelMenuContent}
         </ModelMenuCloseContext.Provider>
       </DropdownMenuContent>

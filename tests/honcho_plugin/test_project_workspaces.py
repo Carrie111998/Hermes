@@ -3,8 +3,8 @@
 Covers plugins/memory/honcho/session.py routing: terminal-segment pattern
 matching, per-workspace child managers, cross-instance write routing via the
 session workspace stamp, unmapped-key passthrough, malformed-mapping-file
-tolerance, and OAuth token rotation for routed workspaces
-(plugins/memory/honcho/client.py::get_honcho_client_for_workspace).
+tolerance, and the workspace-scoped client identity a routed child acquires
+through the shared, OAuth-refreshing get_honcho_client(config) seam.
 """
 
 import json
@@ -16,12 +16,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from hermes_constants import get_hermes_home
-from plugins.memory.honcho import client as honcho_client
-from plugins.memory.honcho.client import (
-    HonchoClientConfig,
-    get_honcho_client_for_workspace,
-    reset_honcho_client,
-)
+from plugins.memory.honcho.client import HonchoClientConfig, reset_honcho_client
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
@@ -56,26 +51,25 @@ def _write_project_map(payload) -> None:
 
 @contextmanager
 def _patched_clients(default_client=None, workspace_clients=None):
-    """Patch both client-acquisition seams the session manager uses.
+    """Patch the single client-acquisition seam the session manager uses.
 
-    ``get_honcho_client`` serves the default workspace; routed children
-    resolve through ``get_honcho_client_for_workspace`` on every access (that
-    is what keeps their OAuth Bearer fresh), so the fake mirrors it by
-    returning the same per-workspace object each time.
+    Default and routed managers both resolve through
+    ``get_honcho_client(config)``; what distinguishes a routed child is that
+    its config carries the routed ``workspace_id``. The fake dispatches on
+    exactly that field, so a test asserting a child never touches the default
+    client is really asserting the routing, not the mock wiring.
     """
     workspace_clients = workspace_clients if workspace_clients is not None else {}
+    default = default_client if default_client is not None else MagicMock()
 
-    def _for_workspace(workspace, config=None):
-        return workspace_clients[workspace]
+    def _acquire(config=None):
+        return workspace_clients.get(getattr(config, "workspace_id", None), default)
 
     with patch(
         "plugins.memory.honcho.session.get_honcho_client",
-        return_value=default_client if default_client is not None else MagicMock(),
-    ) as default_mock, patch(
-        "plugins.memory.honcho.session.get_honcho_client_for_workspace",
-        side_effect=_for_workspace,
-    ) as workspace_mock:
-        yield default_mock, workspace_mock
+        side_effect=_acquire,
+    ) as acquire_mock:
+        yield acquire_mock
 
 
 def _make_config() -> HonchoClientConfig:
@@ -211,10 +205,7 @@ class TestRoutedSessionCreation:
         project_client = MagicMock()
         mgr = _make_manager()
 
-        with _patched_clients(default_client, {"myproject": project_client}) as (
-            _default_mock,
-            workspace_mock,
-        ):
+        with _patched_clients(default_client, {"myproject": project_client}) as acquire:
             session = mgr.get_or_create("slack:group:C0EXAMPLE123")
 
         assert session.workspace == "myproject"
@@ -222,7 +213,7 @@ class TestRoutedSessionCreation:
         assert session.honcho_session_id == "slack"
         project_client.session.assert_called_once_with("slack")
         default_client.session.assert_not_called()
-        assert {c.args[0] for c in workspace_mock.call_args_list} == {"myproject"}
+        assert {c.args[0].workspace_id for c in acquire.call_args_list} == {"myproject"}
 
     def test_mapped_key_hits_child_cache_on_repeat_lookup(self):
         _write_project_map(_MAP)
@@ -242,24 +233,23 @@ class TestRoutedSessionCreation:
         project_client = MagicMock()
         mgr = _make_manager()
 
-        with _patched_clients(default_client, {"myproject": project_client}) as (
-            _default_mock,
-            workspace_mock,
-        ):
+        with _patched_clients(default_client, {"myproject": project_client}) as acquire:
             session = mgr.get_or_create("discord:999888777")
 
         assert session.workspace is None
         assert session.key == "discord:999888777"
         default_client.session.assert_called_once_with("discord-999888777")
         project_client.session.assert_not_called()
-        workspace_mock.assert_not_called()
+        assert all(
+            c.args[0].workspace_id != "myproject" for c in acquire.call_args_list
+        )
         assert mgr._project_managers == {}
 
     def test_child_resolves_its_own_workspace_on_every_access(self):
         # The honcho property re-acquires on every access so a long-lived
         # manager cannot outlive its access token. A routed child must
-        # re-acquire through the *workspace-aware* path, otherwise the default
-        # singleton would silently snap its writes back to the default
+        # re-acquire with its own workspace-scoped config, otherwise the
+        # default client would silently snap its writes back to the default
         # workspace.
         _write_project_map(_MAP)
         default_client = MagicMock()
@@ -267,158 +257,82 @@ class TestRoutedSessionCreation:
         mgr = _make_manager()
 
         child = mgr._project_manager("myproject")
-        with _patched_clients(default_client, {"myproject": project_client}) as (
-            _default_mock,
-            workspace_mock,
-        ):
+        with _patched_clients(default_client, {"myproject": project_client}) as acquire:
             assert child.honcho is project_client
             assert child.honcho is project_client
             assert mgr.honcho is default_client
 
-        # Both accesses went through the refreshing acquisition path, carrying
-        # the manager's config so the workspace client resolves the same host.
-        assert workspace_mock.call_count == 2
-        for call in workspace_mock.call_args_list:
-            assert call.args[0] == "myproject"
-            assert call.args[1] is mgr._config
+        # Every access went through the one refreshing acquisition path; the
+        # config passed is what selects the workspace, and the parent's own
+        # acquisition is unaffected by the child's.
+        assert acquire.call_count == 3
+        child_calls = [
+            c for c in acquire.call_args_list if c.args[0].workspace_id == "myproject"
+        ]
+        assert len(child_calls) == 2
+        assert all(c.args[0] is child._config for c in child_calls)
 
 
 # ---------------------------------------------------------------------------
-# OAuth token rotation for routed workspaces (reviewer regression)
+# Routed-child client identity (reviewer regression, #68567)
 # ---------------------------------------------------------------------------
 
 
-class _FakeHttp:
-    """Stand-in for the SDK's HTTP client (oauth.apply_token_to_client target)."""
+class TestRoutedChildClientIdentity:
+    """A routed child must acquire a client bound to its own workspace.
 
-    def __init__(self, api_key: str | None) -> None:
-        self.api_key = api_key
-
-
-class _FakeHonchoClient:
-    def __init__(self, workspace_id: str, api_key: str | None) -> None:
-        self.workspace_id = workspace_id
-        self._http = _FakeHttp(api_key)
-
-
-class _NoHttpHonchoClient:
-    """A client whose Bearer cannot be rotated in place (SDK shape change)."""
-
-    def __init__(self, workspace_id: str, api_key: str | None) -> None:
-        self.workspace_id = workspace_id
-
-
-@contextmanager
-def _fake_oauth(tokens, client_cls=_FakeHonchoClient):
-    """Drive the real client.py OAuth path with a scripted token sequence.
-
-    ``tokens`` is a list of ``(token, refreshed)`` pairs returned by successive
-    ``oauth.ensure_fresh_token`` calls (the last pair repeats). Clients are
-    built by a fake so no SDK/network work happens.
-    """
-    remaining = list(tokens)
-    built: list = []
-
-    def _ensure_fresh_token(path, host, raw=None, **kwargs):
-        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
-
-    def _build_client(config):
-        client = client_cls(config.workspace_id, config.api_key)
-        built.append(client)
-        return client, 30.0
-
-    with patch(
-        "plugins.memory.honcho.oauth.ensure_fresh_token",
-        side_effect=_ensure_fresh_token,
-    ), patch.object(honcho_client, "_build_client", side_effect=_build_client):
-        yield built
-
-
-class TestRoutedWorkspaceOAuthRotation:
-    """A routed workspace must pick up a refreshed OAuth credential.
-
-    Regression for the pinned-client bug: the child manager used to hold the
-    client it was constructed with forever, so an OAuth deployment kept
-    presenting the original bearer after the 1h access token expired.
+    The earlier revision of this PR carried a bespoke
+    ``get_honcho_client_for_workspace`` with its own cache, which pinned a
+    Bearer and so missed OAuth rotation (sweeper review, 2026-07-30). Upstream
+    now caches clients per identity with ``workspace_id`` in the cache key
+    (client.py::_client_cache_key), so routing only has to hand the child a
+    config carrying the routed workspace: refresh is then the same code path
+    the default workspace already uses. These tests pin that contract.
     """
 
-    def test_workspace_client_bearer_rotates_in_place(self):
-        with _fake_oauth([("token-initial", True), ("token-rotated", True)]) as built:
-            first = get_honcho_client_for_workspace("myproject", _make_config())
-            assert first.workspace_id == "myproject"
-            assert first._http.api_key == "token-initial"
-
-            second = get_honcho_client_for_workspace("myproject", _make_config())
-
-        # Same cached client (one client per workspace), fresh bearer on it.
-        assert second is first
-        assert len(built) == 1
-        assert second._http.api_key == "token-rotated"
-
-    def test_routed_child_manager_picks_up_refreshed_token(self):
-        # End-to-end through the session manager: the property that used to
-        # return a pinned client now resolves through the refreshing path.
+    def test_child_config_carries_routed_workspace(self):
         _write_project_map(_MAP)
         mgr = _make_manager()
         child = mgr._project_manager("myproject")
+        assert child._config.workspace_id == "myproject"
+        assert child._project_workspace == "myproject"
 
-        with _fake_oauth([("token-initial", True), ("token-rotated", True)]):
-            first = child.honcho
-            assert first._http.api_key == "token-initial"
-            second = child.honcho
+    def test_parent_config_is_not_mutated(self):
+        # replace() must copy: mutating the shared config in place would
+        # migrate the DEFAULT workspace onto the first routed project.
+        _write_project_map(_MAP)
+        mgr = _make_manager()
+        before = mgr._config.workspace_id
+        mgr._project_manager("myproject")
+        assert mgr._config.workspace_id == before
 
-        assert second is first
-        # Per-workspace correctness is preserved alongside the refresh.
-        assert second.workspace_id == "myproject"
-        assert second._http.api_key == "token-rotated"
+    def test_separate_workspaces_get_separate_configs(self):
+        _write_project_map(_MAP)
+        mgr = _make_manager()
+        a = mgr._project_manager("myproject")
+        b = mgr._project_manager("otherproject")
+        assert a._config is not b._config
+        assert {a._config.workspace_id, b._config.workspace_id} == {
+            "myproject",
+            "otherproject",
+        }
 
-    def test_rotation_fallback_rebuilds_only_the_workspace_client(self):
-        # When the SDK shape prevents in-place rotation, the *workspace* slot
-        # is reset and rebuilt with the fresh token. The default singleton
-        # must be left alone.
-        default_client = object()
-        honcho_client._honcho_client_slot.get(lambda: default_client)
+    def test_child_acquires_through_the_shared_refreshing_seam(self):
+        # Every access re-acquires (no pinned client), and it goes through
+        # get_honcho_client — the function that owns OAuth refresh — with the
+        # child's own workspace-scoped config.
+        _write_project_map(_MAP)
+        project_client = MagicMock()
+        mgr = _make_manager()
+        child = mgr._project_manager("myproject")
 
-        with _fake_oauth(
-            [("token-initial", True), ("token-rotated", True)],
-            client_cls=_NoHttpHonchoClient,
-        ) as built:
-            first = get_honcho_client_for_workspace("myproject", _make_config())
-            second = get_honcho_client_for_workspace("myproject", _make_config())
+        with _patched_clients(workspace_clients={"myproject": project_client}) as acquire:
+            assert child.honcho is project_client
+            assert child.honcho is project_client
 
-        assert second is not first
-        assert len(built) == 2
-        assert second.workspace_id == "myproject"
-        assert honcho_client._honcho_client_slot.peek() is default_client
-
-    def test_separate_workspaces_get_separate_clients(self):
-        with _fake_oauth([("token-initial", False)]) as built:
-            one = get_honcho_client_for_workspace("myproject", _make_config())
-            two = get_honcho_client_for_workspace("otherproject", _make_config())
-
-        assert one is not two
-        assert {c.workspace_id for c in built} == {"myproject", "otherproject"}
-
-    def test_empty_workspace_falls_back_to_default_singleton(self):
-        with _fake_oauth([("token-initial", False)]) as built:
-            default = honcho_client.get_honcho_client(_make_config())
-            resolved = get_honcho_client_for_workspace("", _make_config())
-
-        # No second client: unrouted traffic keeps sharing the one singleton.
-        assert resolved is default
-        assert len(built) == 1
-        assert resolved.workspace_id == "hermes"
-
-    def test_caller_config_workspace_is_not_mutated(self):
-        config = _make_config()
-        with _fake_oauth([("token-initial", True)]):
-            get_honcho_client_for_workspace("myproject", config)
-
-        # The session manager shares one config object across default and
-        # routed traffic; rebinding its workspace would break the default.
-        assert config.workspace_id == "hermes"
-
-
+        assert acquire.call_count == 2
+        for call in acquire.call_args_list:
+            assert call.args[0].workspace_id == "myproject"
 # ---------------------------------------------------------------------------
 # Write routing via the session workspace stamp
 # ---------------------------------------------------------------------------
@@ -486,11 +400,13 @@ class TestCrossInstanceWriteRouting:
         default_client = MagicMock()
         mgr = _make_manager()
 
-        with _patched_clients(default_client) as (_default_mock, workspace_mock):
+        with _patched_clients(default_client) as acquire:
             assert mgr._flush_session(session) is True
 
         default_client.session.assert_called_once_with("discord-999888777")
-        workspace_mock.assert_not_called()
+        assert all(
+            c.args[0].workspace_id != "myproject" for c in acquire.call_args_list
+        )
         assert mgr._project_managers == {}
 
     def test_flush_all_fans_out_to_project_children(self):
