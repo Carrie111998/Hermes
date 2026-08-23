@@ -2,7 +2,7 @@
 
 The controller is deliberately transport agnostic: callers reserve immediately
 before invoking the already-configured SDK client and reconcile immediately
-after it returns.  SQLite ``BEGIN IMMEDIATE`` transactions make the ledger
+after it returns. SQLite ``BEGIN IMMEDIATE`` transactions make the ledger
 shared by CLI, gateway and auxiliary worker processes without adding a proxy.
 """
 
@@ -66,20 +66,25 @@ def trusted_output_ceiling(request_class: str, requested: Any = None) -> int:
     except (TypeError, ValueError) as exc:
         raise AzureQuotaError("invalid_output_ceiling") from exc
     # Caller/prompt policy may narrow all the way down; only widening is
-    # forbidden.  ``floor`` documents the trusted title policy range rather
+    # forbidden. ``floor`` documents the trusted title policy range rather
     # than granting callers authority to inflate a smaller request.
     return max(0, min(value, cap))
 
 
 def quota_identity(base_url: str, deployment: str) -> tuple[str, str]:
-    """Return privacy-safe actual quota bucket and Terra/Luna queue identity."""
+    """Return privacy-safe quota-bucket and FIFO-queue identities.
+
+    Azure quota is deployment-scoped, so the deployment-derived digest is both
+    the accounting bucket and its queue owner. No deployment naming convention
+    is interpreted or persisted.
+    """
     host = (urlparse(str(base_url or "")).hostname or "").lower()
     dep = str(deployment or "").strip().lower()
     if not host or not dep:
         raise AzureQuotaError("missing_quota_identity")
     digest = hashlib.sha256(f"{host}\0{dep}".encode()).hexdigest()[:20]
-    queue = "luna" if "luna" in dep else "terra"
-    return f"azq_{digest}", queue
+    bucket = f"azq_{digest}"
+    return bucket, bucket
 
 
 def conservative_token_estimate(payload: Mapping[str, Any], output_ceiling: int) -> int:
