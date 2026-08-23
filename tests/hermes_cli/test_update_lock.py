@@ -64,7 +64,7 @@ def test_gitfile_install_lock_resolves_the_git_metadata_directory(tmp_path):
 
 
 def test_simultaneous_processes_have_exactly_one_install_lock_winner(tmp_path):
-    """Real processes contend through atomic mkdir; no read-then-write race."""
+    """Real processes contend through one advisory file lock."""
     install_root = tmp_path / "install"
     (install_root / ".git").mkdir(parents=True)
     gate = tmp_path / "go"
@@ -99,38 +99,97 @@ lock.release()
     assert sorted(stdout.strip() for stdout, _ in results) == ["lost", "won"]
 
 
-def test_dead_install_owner_is_reclaimed(tmp_path):
+def test_crashed_owner_leaves_file_but_os_releases_lock(tmp_path):
     install_root = tmp_path / "install"
     lock_path = install_lock_path(install_root)
-    lock_path.mkdir(parents=True)
-    (lock_path / "owner").write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+    worker = """
+import pathlib, sys
+from hermes_cli.update_lock import UpdateLock
+root = pathlib.Path(sys.argv[1])
+lock = UpdateLock(marker_path=root.parent / 'crashed-marker', install_root=root)
+assert lock.acquire()
+print('locked', flush=True)
+__import__('os')._exit(23)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", worker, str(install_root)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 23, proc
+    assert lock_path.is_file(), "the canonical lock inode is persistent"
 
     lock = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
     assert lock.acquire() is True
-    assert (lock_path / "owner").read_text(encoding="utf-8").splitlines()[0] == str(os.getpid())
+    assert lock_path.read_text(encoding="utf-8").splitlines()[0] == str(os.getpid())
     lock.release()
 
 
-def test_recent_ownerless_install_lock_is_not_stolen(tmp_path):
+def test_old_guard_double_release_cannot_affect_new_guard(tmp_path):
     install_root = tmp_path / "install"
-    lock_path = install_lock_path(install_root)
-    lock_path.mkdir(parents=True)
+    old = UpdateLock(marker_path=tmp_path / "old-marker", install_root=install_root)
+    assert old.acquire()
+    old.release()
+    fresh = UpdateLock(marker_path=tmp_path / "fresh-marker", install_root=install_root)
+    assert fresh.acquire()
 
-    contender = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
+    old.release()
+    contender = UpdateLock(marker_path=tmp_path / "third-marker", install_root=install_root)
     assert contender.acquire() is False
-    assert lock_path.exists()
+    assert install_lock_path(install_root).is_file()
+    fresh.release()
 
 
-def test_interrupted_owner_write_is_reclaimed_after_grace(tmp_path):
+def test_parent_handoff_inherits_without_unlocking_parent(tmp_path):
     install_root = tmp_path / "install"
-    lock_path = install_lock_path(install_root)
-    lock_path.mkdir(parents=True)
-    old = time.time() - 30
-    os.utime(lock_path, (old, old))
+    parent_code = """
+import pathlib, sys
+from hermes_cli.update_lock import UpdateLock
+root = pathlib.Path(sys.argv[1])
+parent = UpdateLock(marker_path=root.parent / 'parent-marker', install_root=root)
+assert parent.acquire()
+print('ready', flush=True)
+sys.stdin.read(1)
+parent.release()
+"""
+    child_code = """
+import pathlib, sys
+from hermes_cli.update_lock import UpdateLock
+root = pathlib.Path(sys.argv[1])
+guard = UpdateLock(marker_path=root.parent / sys.argv[2], install_root=root)
+print('won' if guard.acquire() else 'refused', flush=True)
+guard.release()
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code, str(install_root)],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert parent.stdout is not None
+    assert parent.stdout.readline().strip() == "ready"
+    env = dict(os.environ, **{HANDOFF_PID_ENV: str(parent.pid)})
+    inherited = subprocess.run(
+        [sys.executable, "-c", child_code, str(install_root), "child-marker"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert inherited.stdout.strip() == "won", inherited.stderr
 
-    lock = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
-    assert lock.acquire() is True
-    lock.release()
+    contender = subprocess.run(
+        [sys.executable, "-c", child_code, str(install_root), "contender-marker"],
+        capture_output=True,
+        text=True,
+    )
+    assert contender.stdout.strip() == "refused", contender.stderr
+    assert parent.stdin is not None
+    parent.stdin.write("x")
+    parent.stdin.flush()
+    assert parent.wait(timeout=10) == 0
 
 
 def test_compatibility_marker_ignores_context_local_profile_override(tmp_path, monkeypatch):
@@ -162,7 +221,7 @@ def test_git_autostash_cannot_remove_a_held_install_lock(tmp_path):
         text=True,
     )
 
-    assert lock.install_path.is_dir(), "git stash never traverses the git metadata directory"
+    assert lock.install_path.is_file(), "git stash never traverses the git metadata directory"
     contender = UpdateLock(marker_path=tmp_path / "other-marker", install_root=install_root)
     assert contender.acquire() is False
     lock.release()

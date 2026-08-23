@@ -219,46 +219,41 @@ export function updateHandoffConflict(
 
     if (fs.existsSync(lock)) {
       let pid = 0
-      let lockAgeMs = 0
+      let lockAgeMs = Infinity
+      let hasStrictPid = false
 
       try {
-        const [pidLine] = fs.readFileSync(path.join(lock, 'owner'), 'utf8').split('\n')
-        pid = Number.parseInt((pidLine || '').trim(), 10)
+        const [pidLine = ''] = fs.readFileSync(lock, 'utf8').split(/\r?\n/)
+        const trimmed = pidLine.trim()
+
+        hasStrictPid = /^\d+$/.test(trimmed)
+        pid = hasStrictPid ? Number(trimmed) : 0
+        hasStrictPid = hasStrictPid && Number.isSafeInteger(pid) && pid > 0
       } catch {
-        void 0
+        // A writer may hold the advisory lock before its metadata is visible.
       }
 
       try {
         lockAgeMs = (opts.now || Date.now)() - fs.statSync(lock).mtimeMs
       } catch {
-        lockAgeMs = Infinity
+        // If the file vanished between exists/stat there is no advisory signal.
       }
 
-      const hasOwner = Number.isInteger(pid) && pid > 0
-      const alive = hasOwner && isPidAlive(pid, opts.kill)
-      const ownerWriteInProgress = !hasOwner && lockAgeMs <= INSTALL_LOCK_OWNER_WRITE_GRACE_MS
+      const alive = hasStrictPid && isPidAlive(pid, opts.kill)
+      const ownerWriteInProgress = !hasStrictPid && lockAgeMs <= INSTALL_LOCK_OWNER_WRITE_GRACE_MS
 
-      if (!alive && !ownerWriteInProgress) {
-        try {
-          fs.rmSync(lock, { recursive: true, force: true })
-        } catch {
-          // Advisory cleanup only. If another updater won the race, the
-          // authoritative atomic Rust/Python acquisition will still refuse.
-        }
-
-        if (!fs.existsSync(lock)) {
-          return null
+      if (alive || ownerWriteInProgress) {
+        return {
+          pid,
+          ageMs: lockAgeMs,
+          message:
+            pid > 0
+              ? `An update is already running for this installation (PID ${pid}). Wait for it to finish, then try again.`
+              : 'An update is already running for this installation. Wait for it to finish, then try again.'
         }
       }
-
-      return {
-        pid,
-        ageMs: lockAgeMs,
-        message:
-          pid > 0
-            ? `An update is already running for this installation (PID ${pid}). Wait for it to finish, then try again.`
-            : 'An update is already running for this installation. Wait for it to finish, then try again.'
-      }
+      // The advisory lock held by Python/Rust is authoritative. Electron only
+      // interprets metadata as a pre-spawn hint and never deletes this inode.
     }
   }
 

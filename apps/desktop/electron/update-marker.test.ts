@@ -73,37 +73,52 @@ test('legacy handoff marker remains under HERMES_HOME', () => {
   assert.equal(markerPath(home), path.join(home, '.hermes-update-in-progress'))
 })
 
-test('dead installation lock owner self-heals', () => {
+test('dead installation lock owner does not conflict and file is never deleted', () => {
   const home = tmpHome('dead-install-lock')
   const installRoot = path.join(home, 'hermes-agent')
   const lock = installLockPath(installRoot)
-  fs.mkdirSync(lock, { recursive: true })
-  fs.writeFileSync(path.join(lock, 'owner'), `999999\n${Math.floor(Date.now() / 1000)}\n`)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `999999\n${Math.floor(Date.now() / 1000)}\ndead-token\n`)
 
   assert.equal(updateHandoffConflict(home, { installRoot, kill: DEAD }), null)
-  assert.ok(!fs.existsSync(lock))
+  assert.ok(fs.existsSync(lock), 'Electron never removes the canonical lock file')
 })
 
-test('fresh ownerless installation lock preserves the owner-write grace window', () => {
+test('fresh empty installation lock preserves the owner-write grace window', () => {
   const home = tmpHome('fresh-ownerless-lock')
   const installRoot = path.join(home, 'hermes-agent')
   const lock = installLockPath(installRoot)
-  fs.mkdirSync(lock, { recursive: true })
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, '')
 
   assert.ok(updateHandoffConflict(home, { installRoot }))
   assert.ok(fs.existsSync(lock))
 })
 
-test('interrupted owner write self-heals after the grace window', () => {
+test('stale malformed installation metadata does not conflict and is not deleted', () => {
   const home = tmpHome('stale-ownerless-lock')
   const installRoot = path.join(home, 'hermes-agent')
   const lock = installLockPath(installRoot)
-  fs.mkdirSync(lock, { recursive: true })
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, 'not-a-pid\n123\ntoken\n')
   const old = new Date(Date.now() - INSTALL_LOCK_OWNER_WRITE_GRACE_MS - 1_000)
   fs.utimesSync(lock, old, old)
 
   assert.equal(updateHandoffConflict(home, { installRoot }), null)
-  assert.ok(!fs.existsSync(lock))
+  assert.ok(fs.existsSync(lock))
+})
+
+test('PID parsing rejects a numeric prefix instead of accepting parseInt garbage', () => {
+  const home = tmpHome('strict-lock-pid')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `4242junk\n${Math.floor(Date.now() / 1000)}\ntoken\n`)
+  const old = new Date(Date.now() - INSTALL_LOCK_OWNER_WRITE_GRACE_MS - 1_000)
+  fs.utimesSync(lock, old, old)
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: ALIVE }), null)
+  assert.ok(fs.existsSync(lock))
 })
 
 test('absent marker => no live update', () => {
@@ -227,12 +242,12 @@ test('no marker => hand-off is not blocked', () => {
   assert.equal(updateHandoffConflict(home, { kill: ALIVE }), null)
 })
 
-test('atomic installation lock blocks hand-off even when another profile has no marker', () => {
+test('advisory installation lock metadata blocks hand-off even when another profile has no marker', () => {
   const home = tmpHome('conflict-install-lock')
   const installRoot = path.join(home, 'hermes-agent')
   const lock = installLockPath(installRoot)
-  fs.mkdirSync(lock, { recursive: true })
-  fs.writeFileSync(path.join(lock, 'owner'), `4242\n${Math.floor(Date.now() / 1000)}\n`)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `4242\n${Math.floor(Date.now() / 1000)}\nlive-token\n`)
 
   const conflict = updateHandoffConflict(home, { kill: ALIVE, installRoot })
   assert.ok(conflict)

@@ -18,15 +18,15 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 under a live interpreter and leaving the tree half-updated.
 
 The marker remains byte-compatible and profile-scoped for the Rust updater /
-Electron backend-start handoff.  Mutual exclusion is a separate, atomic,
-installation-scoped directory under Git metadata:
+Electron backend-start handoff. Mutual exclusion is a separate, persistent
+regular file under Git metadata, protected by an OS advisory lock:
 
     $HERMES_HOME/.hermes-update-in-progress     body: "<pid>\\n<started_at_unix>"
-    <git-dir>/hermes-update.lock/owner           body: "<pid>\\n<started_at_unix>"
+    <git-dir>/hermes-update.lock                 body: "<pid>\\n<started_at_unix>\\n<token>"
 
-Creating the lock directory is the single winner decision (``mkdir`` is atomic
-across processes).  Git never stashes its own metadata, so ``git stash
---include-untracked`` cannot remove the held lock midway through an update.
+The open file handle and its nonblocking exclusive OS lock are the single-winner
+decision. The file is never unlinked on release: retaining one canonical inode
+avoids pathname replacement races, and Git never stashes its own metadata.
 
 A marker only counts as a live update when its pid is alive AND it is younger
 than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
@@ -57,10 +57,11 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from hermes_constants import get_process_hermes_home
 
@@ -76,8 +77,7 @@ UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
 INSTALL_LOCK_NAME = "hermes-update.lock"
-INSTALL_LOCK_OWNER_NAME = "owner"
-INSTALL_LOCK_OWNER_WRITE_GRACE_SECONDS = 5
+
 
 # Set by an orchestrating updater (the Tauri `hermes-setup --update` flow) to
 # its own pid before spawning `hermes update` as a child stage. The parent
@@ -248,7 +248,7 @@ def describe_holder(holder: UpdateHolder) -> str:
 
 
 class UpdateLock:
-    """Context manager owning the shared update marker for this process.
+    """Context manager owning the install lock and compatibility marker.
 
     ``acquired`` is False when another live update already holds it — callers
     decide whether that's a hard refusal (CLI/dashboard) or a wait. Releasing
@@ -276,16 +276,14 @@ class UpdateLock:
             # Explicit marker paths are the test/embedding API. Keep their
             # lock hermetic unless the caller explicitly supplies install_root.
             self.install_path = self.path.parent / ".git" / INSTALL_LOCK_NAME
-        self._install_owned = False
+        self._install_file: BinaryIO | None = None
         self._install_inherited = False
         self.acquired = False
         self.holder: UpdateHolder | None = None
 
     def _read_install_holder(self) -> UpdateHolder | None:
         try:
-            lines = (self.install_path / INSTALL_LOCK_OWNER_NAME).read_text(
-                encoding="utf-8"
-            ).splitlines()
+            lines = self.install_path.read_text(encoding="utf-8").splitlines()
             pid = int(lines[0].strip())
             started_at = float(lines[1].strip())
         except (OSError, IndexError, ValueError):
@@ -294,74 +292,66 @@ class UpdateLock:
             return None
         return UpdateHolder(pid=pid, age_seconds=time.time() - started_at)
 
-    def _install_lock_is_stale(self) -> bool:
-        owner = self._read_install_holder()
-        if owner is not None:
-            self.holder = owner
-            return False
-        owner_path = self.install_path / INSTALL_LOCK_OWNER_NAME
+    @staticmethod
+    def _try_lock_file(handle: BinaryIO) -> bool:
         try:
-            pid_line = owner_path.read_text(encoding="utf-8").splitlines()[0]
-            pid = int(pid_line.strip())
-        except (OSError, IndexError, ValueError):
-            pid = None
-        if pid is not None:
-            # A parseable owner that is not live is a crashed updater, not an
-            # in-progress owner write, so it is immediately reclaimable.
-            return not _pid_alive(pid)
-        try:
-            age = time.time() - self.install_path.stat().st_mtime
-        except OSError:
-            return True
-        # mkdir wins atomically, then writes owner. Do not steal that fresh
-        # directory during the small owner-write window; an interrupted write
-        # becomes reclaimable after this bounded grace period.
-        return age > INSTALL_LOCK_OWNER_WRITE_GRACE_SECONDS
+            if os.name == "nt":
+                import msvcrt
 
-    def _reclaim_stale_install_lock(self) -> bool:
-        quarantine = self.install_path.with_name(
-            f"{self.install_path.name}.stale-{os.getpid()}-{time.time_ns()}"
-        )
-        try:
-            self.install_path.rename(quarantine)
-        except FileNotFoundError:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except OSError as exc:
-            logger.debug("Could not quarantine stale installation lock %s: %s", self.install_path, exc)
+        except (BlockingIOError, OSError):
             return False
-        shutil.rmtree(quarantine, ignore_errors=True)
-        return True
+
+    @staticmethod
+    def _unlock_file(handle: BinaryIO) -> None:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
 
     def _acquire_install_lock(self) -> bool:
-        self.install_path.parent.mkdir(parents=True, exist_ok=True)
-        for _attempt in range(4):
-            try:
-                self.install_path.mkdir()
-                break
-            except FileExistsError:
-                owner = self._read_install_holder()
-                if owner is not None and (
-                    owner.pid == _handoff_pid() or _is_ancestor_pid(owner.pid)
-                ):
-                    self._install_inherited = True
-                    return True
-                if not self._install_lock_is_stale():
-                    self.holder = owner or UpdateHolder(pid=-1, age_seconds=0)
-                    return False
-                if not self._reclaim_stale_install_lock():
-                    self.holder = UpdateHolder(pid=-1, age_seconds=0)
-                    return False
-            except OSError as exc:
-                logger.warning("Could not acquire installation lock %s: %s", self.install_path, exc)
-                return False
-        else:
+        try:
+            self.install_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = self.install_path.open("a+b", buffering=0)
+        except OSError as exc:
+            logger.warning("Could not open installation lock %s: %s", self.install_path, exc)
             return False
 
-        self._install_owned = True
+        if not self._try_lock_file(handle):
+            owner = self._read_install_holder()
+            handle.close()
+            if owner is not None and (
+                owner.pid == _handoff_pid() or _is_ancestor_pid(owner.pid)
+            ):
+                self._install_inherited = True
+                return True
+            self.holder = owner or UpdateHolder(pid=-1, age_seconds=0)
+            return False
+
+        self._install_file = handle
         try:
-            (self.install_path / INSTALL_LOCK_OWNER_NAME).write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n{int(time.time())}\n{uuid.uuid4().hex}\n".encode())
+            handle.flush()
         except OSError as exc:
             logger.warning("Could not write installation lock owner %s: %s", self.install_path, exc)
             self._release_install_lock()
@@ -403,15 +393,13 @@ class UpdateLock:
         return True
 
     def _release_install_lock(self) -> None:
-        if not self._install_owned:
+        handle = self._install_file
+        if handle is None:
             return
-        self._install_owned = False
+        self._install_file = None
+        self._unlock_file(handle)
         try:
-            (self.install_path / INSTALL_LOCK_OWNER_NAME).unlink()
-        except OSError:
-            pass
-        try:
-            self.install_path.rmdir()
+            handle.close()
         except OSError:
             pass
 
