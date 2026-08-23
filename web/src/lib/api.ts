@@ -383,13 +383,31 @@ export const api = {
       ),
     );
   },
-  getSessionMessages: (id: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionMessagesResponse>(
+  getSessionMessages: (
+    id: string,
+    profileOrOptions: string | SessionMessageQuery = {},
+    profile = getManagementProfile(),
+  ) => {
+    const options =
+      typeof profileOrOptions === "string" ? {} : profileOrOptions;
+    const resolvedProfile =
+      typeof profileOrOptions === "string" ? profileOrOptions : profile;
+    const params = new URLSearchParams();
+    params.set("limit", String(options.limit ?? 500));
+    params.set("order", options.order ?? "latest");
+    if (options.offset !== undefined) {
+      params.set("offset", String(options.offset));
+    }
+    if (options.includeCompacted !== undefined) {
+      params.set("include_compacted", String(options.includeCompacted));
+    }
+    return fetchJSON<SessionMessagesResponse>(
       appendProfileParam(
-        `/api/sessions/${encodeURIComponent(id)}/messages?limit=500&order=latest`,
-        profile,
+        `/api/sessions/${encodeURIComponent(id)}/messages?${params.toString()}`,
+        resolvedProfile,
       ),
-    ),
+    );
+  },
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionInfo>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
@@ -2056,6 +2074,13 @@ export interface SessionMessagesResponse {
     order: "latest" | "oldest";
     returned: number;
   };
+}
+
+export interface SessionMessageQuery {
+  includeCompacted?: boolean;
+  limit?: number;
+  offset?: number;
+  order?: "latest" | "oldest";
 }
 
 export interface LogsResponse {

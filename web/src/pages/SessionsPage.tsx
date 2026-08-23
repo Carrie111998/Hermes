@@ -480,7 +480,7 @@ function SessionRow({
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [messagePagination, setMessagePagination] = useState<
-    SessionMessagesResponse["pagination"] | null
+    NonNullable<SessionMessagesResponse["pagination"]> | null
   >(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -496,13 +496,13 @@ function SessionRow({
     api
       .getSessionMessages(session.id, {
         includeCompacted: true,
-        fromEnd: true,
+        order: "latest",
         limit: SESSION_MESSAGE_PAGE_SIZE,
       })
       .then((resp) => {
         if (!cancelled) {
           setMessages(resp.messages);
-          setMessagePagination(resp.pagination);
+          setMessagePagination(resp.pagination ?? null);
         }
       })
       .catch((err) => {
@@ -514,26 +514,24 @@ function SessionRow({
   }, [isExpanded, session.id, messages]);
 
   const loadEarlierMessages = async () => {
-    if (!messagePagination || messagePagination.offset <= 0 || loadingEarlier) {
+    if (!messagePagination || loadingEarlier) {
       return;
     }
     setLoadingEarlier(true);
     setError(null);
-    const limit = Math.min(
-      SESSION_MESSAGE_PAGE_SIZE,
-      messagePagination.offset,
-    );
-    const offset = messagePagination.offset - limit;
+    const limit = SESSION_MESSAGE_PAGE_SIZE;
+    const offset = messagePagination.offset + messagePagination.returned;
     try {
       const resp = await api.getSessionMessages(session.id, {
         includeCompacted: true,
+        order: "latest",
         limit,
         offset,
       });
       setMessages((current) =>
         current ? [...resp.messages, ...current] : resp.messages,
       );
-      setMessagePagination(resp.pagination);
+      setMessagePagination(resp.pagination ?? null);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -795,7 +793,8 @@ function SessionRow({
           )}
           {messages && messages.length > 0 && (
             <div className="flex flex-col gap-3">
-              {messagePagination && messagePagination.offset > 0 && (
+              {messagePagination &&
+                messagePagination.returned === messagePagination.limit && (
                 <Button
                   ghost
                   className="self-center"
@@ -805,7 +804,7 @@ function SessionRow({
                   {loadingEarlier ? (
                     <Spinner className="mr-2 text-sm" />
                   ) : null}
-                  Load earlier messages ({messagePagination.offset} remaining)
+                  Load earlier messages
                 </Button>
               )}
               <MessageList messages={messages} highlight={searchQuery} />

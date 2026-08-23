@@ -254,10 +254,10 @@ Browse and inspect all agent sessions. Each row shows the session title, source 
 
 Expanding a session requests the newest page of its complete transcript,
 including turns archived by context compaction. Rewound or undone messages
-remain hidden. The dashboard requests `include_compacted=true`, `from_end=true`,
+remain hidden. The dashboard requests `include_compacted=true`, `order=latest`,
 and `limit=500`; when a transcript exceeds that page size, **Load earlier
-messages** pages backward using the response's `pagination.total` and
-`pagination.offset` until the complete transcript is visible.
+messages** advances the `order=latest` offset until the complete transcript is
+visible.
 
 - **Filter** — **Chats / Automation / All** tabs scope the list: *Chats* (the default) shows human conversations and hides automation noise (cron, tool, API, ACP sessions); *Automation* shows only those; *All* shows everything. An exact-source dropdown narrows further to a single channel (e.g. only Telegram). Search respects the active filter.
 - **Search** — full-text search across all message content using FTS5. Results show highlighted snippets and auto-scroll to the first matching message when expanded.

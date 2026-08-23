@@ -127,7 +127,7 @@ describe("api.getSessionMessages", () => {
     await api.getSessionMessages("one", "worker");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/one/messages?profile=worker",
+      "/api/sessions/one/messages?limit=500&order=latest&profile=worker",
       expect.objectContaining({ credentials: "include" }),
     );
   });
@@ -139,12 +139,12 @@ describe("api.getSessionMessages", () => {
 
     await api.getSessionMessages(
       "session/one",
-      { includeCompacted: true, fromEnd: true, limit: 500 },
+      { includeCompacted: true, order: "latest", limit: 500 },
       "worker",
     );
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/session%2Fone/messages?include_compacted=true&from_end=true&limit=500&profile=worker",
+      "/api/sessions/session%2Fone/messages?limit=500&order=latest&include_compacted=true&profile=worker",
       expect.objectContaining({ credentials: "include" }),
     );
   });
@@ -156,12 +156,12 @@ describe("api.getSessionMessages", () => {
 
     await api.getSessionMessages(
       "one",
-      { includeCompacted: true, limit: 200, offset: 300 },
+      { includeCompacted: true, order: "latest", limit: 200, offset: 300 },
       "worker",
     );
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/one/messages?include_compacted=true&limit=200&offset=300&profile=worker",
+      "/api/sessions/one/messages?limit=200&order=latest&offset=300&include_compacted=true&profile=worker",
       expect.objectContaining({ credentials: "include" }),
     );
   });

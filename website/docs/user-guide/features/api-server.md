@@ -198,14 +198,14 @@ Delete a stored response.
 
 ### GET /api/sessions/\{session_id\}/messages
 
-Returns persisted session messages in insertion order. By default only active messages are visible, preserving the legacy response while keeping context-compacted and rewound rows hidden.
+Returns persisted session messages in chronological order. By default only active messages are visible, keeping context-compacted and rewound rows hidden.
 
 Query parameters:
 
-- `limit` — maximum messages to return (clamped to 500). Omit it for an unbounded response.
-- `offset` — zero-based offset from the start of the visible transcript.
+- `limit` — maximum messages to return (clamped to 500; defaults to 500).
+- `offset` — zero-based offset in the selected order.
+- `order` — `oldest` or `latest`. An omitted `limit` defaults to the latest page; explicit pagination defaults to `oldest` for compatibility.
 - `include_compacted` — when `true`, include compression-archived turns while still excluding rewound or undone rows.
-- `from_end` — when `true` and `limit` is present, ignore `offset` and select the newest page while preserving chronological order within the page.
 
 ```json
 {
@@ -214,14 +214,14 @@ Query parameters:
   "data": [{"id": 42, "role": "assistant", "content": "..."}],
   "pagination": {
     "limit": 100,
-    "offset": 240,
-    "returned": 100,
-    "total": 340
+    "offset": 0,
+    "order": "latest",
+    "returned": 100
   }
 }
 ```
 
-`pagination.total` counts messages under the requested visibility mode, so clients can page backward from a `from_end` response without accidentally exposing rewound history.
+With `order=latest`, increase `offset` by `pagination.returned` to page backward. Every page remains chronological, and `include_compacted=true` never exposes rewound history.
 
 ### GET /v1/models
 

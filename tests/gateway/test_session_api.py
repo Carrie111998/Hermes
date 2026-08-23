@@ -117,7 +117,7 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
 
 
 @pytest.mark.asyncio
-async def test_session_messages_pages_compacted_history_from_end(adapter, session_db):
+async def test_session_messages_pages_compacted_history_from_latest(adapter, session_db):
     session_db.create_session("long-chat", "api_server")
     session_db.append_message("long-chat", "user", "old")
     session_db.append_message("long-chat", "assistant", "old reply")
@@ -126,15 +126,26 @@ async def test_session_messages_pages_compacted_history_from_end(adapter, sessio
     )
     session_db.append_message("long-chat", "user", "recent")
     session_db.append_message("long-chat", "assistant", "recent reply")
+    rewound_id = session_db.append_message("long-chat", "user", "rewound")
+    session_db._conn.execute(
+        "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?", (rewound_id,)
+    )
+    session_db._conn.commit()
 
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
         response = await cli.get(
             "/api/sessions/long-chat/messages"
-            "?include_compacted=true&from_end=true&limit=2"
+            "?include_compacted=true&order=latest&limit=2"
         )
         assert response.status == 200
         payload = await response.json()
+        earlier_response = await cli.get(
+            "/api/sessions/long-chat/messages"
+            "?include_compacted=true&order=latest&limit=3&offset=2"
+        )
+        assert earlier_response.status == 200
+        earlier = await earlier_response.json()
 
     assert [message["content"] for message in payload["data"]] == [
         "recent",
@@ -142,10 +153,15 @@ async def test_session_messages_pages_compacted_history_from_end(adapter, sessio
     ]
     assert payload["pagination"] == {
         "limit": 2,
-        "offset": 3,
+        "offset": 0,
+        "order": "latest",
         "returned": 2,
-        "total": 5,
     }
+    assert [message["content"] for message in earlier["data"]] == [
+        "old",
+        "old reply",
+        "summary",
+    ]
 
 
 @pytest.mark.asyncio
