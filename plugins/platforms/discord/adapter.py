@@ -1151,6 +1151,7 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         self._liveness_task: Optional[asyncio.Task] = None
         self._liveness_notification_task: Optional[asyncio.Task] = None
+        self._last_persisted_health: Optional[dict] = None
         # True while disconnect() is intentionally closing discord.py. The
         # bot task's done callback uses this to distinguish an operator/service
         # shutdown from a runtime websocket crash.
@@ -2007,7 +2008,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     health_record["latency"] = details["latency"]
                 if details.get("ack_age") is not None:
                     health_record["ack_age"] = details["ack_age"]
-                write_platform_live_health("discord", health_record)
+                # Skip the write when the record is byte-identical to the
+                # last one persisted — avoids ~5,760 unnecessary atomic
+                # read-modify-write cycles per day when nothing changed.
+                if health_record != self._last_persisted_health:
+                    write_platform_live_health(self.platform.value, health_record)
+                    self._last_persisted_health = health_record
             except Exception:
                 logger.warning(
                     "[%s] Failed to persist liveness health record",
@@ -2192,11 +2198,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # Write a terminal health record so monitoring sees the adapter
         # as disconnected rather than stale-healthy.
         try:
-            write_platform_live_health("discord", {
+            write_platform_live_health(self.platform.value, {
                 "websocket_state": "disconnected",
                 "healthy": False,
                 "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             })
+            self._last_persisted_health = None
         except Exception:
             logger.warning(
                 "[%s] Failed to write terminal health record on disconnect",
