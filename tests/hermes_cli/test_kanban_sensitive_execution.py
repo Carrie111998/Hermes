@@ -118,6 +118,8 @@ def test_fixed_runner_uses_declared_argv_and_resources_only(monkeypatch, capsys)
 
     task = SimpleNamespace(sensitive_execution=True, sensitive_runner_id="fixed-v1", protected_resource_ids=["resource-a"])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+    monkeypatch.setenv("CANARY_PROVIDER_API_KEY", "not-a-real-credential")
+    monkeypatch.setenv("CANARY_GATEWAY_TOKEN", "not-a-real-credential")
     monkeypatch.setattr(kanban_sensitive, "assert_sensitive_worker_context", lambda: None)
     monkeypatch.setattr(kb, "connect_closing", lambda: contextlib.nullcontext(object()))
     monkeypatch.setattr(kb, "get_task", lambda _conn, _task_id: task)
@@ -139,7 +141,11 @@ def test_fixed_runner_uses_declared_argv_and_resources_only(monkeypatch, capsys)
     assert kanban_sensitive.run_sensitive_runner() == 0
     assert captured["argv"] == ["/fixed/runner", "fixed"]
     assert captured["kwargs"]["shell"] is False
-    assert json.loads(captured["kwargs"]["env"]["HERMES_KANBAN_SENSITIVE_RESOURCES"]) == {"resource-a": "/protected/exact"}
+    assert captured["kwargs"]["env"] == {
+        "HERMES_KANBAN_SENSITIVE_RESOURCES": json.dumps(
+            {"resource-a": "/protected/exact"}, sort_keys=True, separators=(",", ":")
+        )
+    }
     assert capsys.readouterr().out == "safe\n"
 
 

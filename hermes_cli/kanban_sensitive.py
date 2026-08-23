@@ -185,10 +185,13 @@ def run_sensitive_runner() -> int:
             raise RuntimeError("sensitive protected resource is not declared")
         granted[resource_id] = str(Path(raw_path))
 
-    child_env = dict(os.environ)
-    child_env["HERMES_KANBAN_SENSITIVE_RESOURCES"] = json.dumps(
-        granted, sort_keys=True, separators=(",", ":")
-    )
+    # The runner's executable and arguments are fixed in policy, so it needs
+    # no ambient process state. Pass only the task-scoped resource grant.
+    child_env = {
+        "HERMES_KANBAN_SENSITIVE_RESOURCES": json.dumps(
+            granted, sort_keys=True, separators=(",", ":")
+        )
+    }
     proc = subprocess.run(
         list(argv),
         stdin=subprocess.DEVNULL,
