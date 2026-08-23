@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -92,7 +93,9 @@ def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
     """
     uv_bin = _er._find_uv_binary()
     if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(root / "venv")}
+        from hermes_constants import project_venv_dir
+
+        env = {**os.environ, "VIRTUAL_ENV": str(project_venv_dir(root) or root / "venv")}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -102,16 +105,66 @@ def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
 
 def _venv_scripts_dir(root: Path) -> Path | None:
     """Project venv Scripts/bin dir, when present. stdlib-only."""
-    venv_dir = root / "venv"
-    if not venv_dir.is_dir():
-        return None
-    # hermes_constants is stdlib-only, so the canonical layout helper is safe
+    # hermes_constants is stdlib-only, so the canonical layout helpers are safe
     # to use from this corrupted-venv repair path (#76105: never open-code
     # the Scripts/bin split).
-    from hermes_constants import venv_bin_dir
+    from hermes_constants import project_venv_dir, venv_bin_dir
+
+    venv_dir = project_venv_dir(root)
+    if venv_dir is None:
+        return None
 
     scripts = venv_bin_dir(venv_dir, windows=_is_windows())
     return scripts if scripts.is_dir() else None
+
+
+def _sync_windows_cli_launchers(root: Path) -> list[Path]:
+    """Copy the venv's Hermes launchers into the dedicated PATH directory.
+
+    Windows installs expose ``<root>\\bin`` on PATH instead of the full
+    ``venv\\Scripts`` directory, which would shadow the user's Python.  Keep
+    that narrow PATH layout usable after an update by restoring launchers that
+    are missing from the dedicated directory.
+
+    ``hermes.exe`` is required; ``hermes-acp.exe`` is copied when available.
+    Existing files are left alone because ``bin\\hermes.exe`` may be the
+    executable currently running this process.
+    """
+    if not _is_windows():
+        return []
+
+    root = Path(root)
+    scripts_dir = _venv_scripts_dir(root)
+    if scripts_dir is None:
+        raise FileNotFoundError(
+            f"project venv executable directory not found under: {root}"
+        )
+    required_source = scripts_dir / "hermes.exe"
+    if not required_source.is_file():
+        raise FileNotFoundError(
+            f"required Hermes launcher not found: {required_source}"
+        )
+
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    copied: list[Path] = []
+    for name in ("hermes.exe", "hermes-acp.exe"):
+        source = scripts_dir / name
+        if not source.is_file():
+            continue
+        destination = bin_dir / name
+        if destination.exists():
+            continue
+        shutil.copy2(source, destination)
+        copied.append(destination)
+
+    required_destination = bin_dir / "hermes.exe"
+    if not required_destination.is_file():
+        raise FileNotFoundError(
+            f"Hermes launcher was not installed: {required_destination}"
+        )
+    return copied
 
 
 def _load_console_script_names(root: Path) -> list[str]:
@@ -132,13 +185,35 @@ def _load_console_script_names(root: Path) -> list[str]:
         return []
 
 
-def _quarantine_running_hermes_exe(scripts_dir: Path) -> list[tuple[Path, Path]]:
+class ShimQuarantineError(RuntimeError):
+    """A live shim could not be renamed aside — the venv is contended (#87331).
+
+    Raised BEFORE the install command runs. Callers (early-pass recovery,
+    core-marker recovery) catch it like any install failure: the
+    update-incomplete marker survives and a later launch retries once the
+    holder exits — the contended venv is never mutated.
+    """
+
+    def __init__(self, failed_shims: list[str]):
+        self.failed_shims = list(failed_shims)
+        super().__init__(
+            "could not quarantine live shim(s): " + ", ".join(self.failed_shims)
+        )
+
+
+def _quarantine_running_hermes_exe(
+    scripts_dir: Path, *, failed_out: list[str] | None = None
+) -> list[tuple[Path, Path]]:
     """Rename live hermes*.exe shims aside so the installer can rewrite them.
 
     Windows blocks REPLACE on a running .exe but allows RENAME. Best-effort:
     silently skips anything that cannot be renamed. Returns (original,
     quarantined) pairs. stdlib-only — the console-script set comes from
     pyproject ``[project.scripts]`` (fallback: the well-known trio).
+
+    ``failed_out``: when provided, names of shims that could not be renamed
+    are appended so the caller can refuse instead of mutating a contended
+    venv (#87331 fail-closed).
     """
     if not _is_windows():
         return []
@@ -158,7 +233,8 @@ def _quarantine_running_hermes_exe(scripts_dir: Path) -> list[tuple[Path, Path]]
             os.rename(shim, quarantined)
             moved.append((shim, quarantined))
         except OSError:
-            pass
+            if failed_out is not None:
+                failed_out.append(shim.name)
     return moved
 
 
@@ -176,11 +252,24 @@ def _restore_quarantined_exes(moved: list[tuple[Path, Path]]) -> None:
 def _run_install_cmd(cmd: list[str], *, env: dict | None, root: Path) -> None:
     """Run an install command with quarantine protection for venv shims.
 
+    Fail-closed (#87331): when any live shim cannot be renamed aside, the
+    venv is contended and the installer would die partway on the same locks
+    — raise :class:`ShimQuarantineError` WITHOUT running it. The caller's
+    marker-keeping failure handling turns that into "retry next launch".
+
     Raises CalledProcessError on install failure (callers implement the
     per-extra fallback ladder).
     """
     scripts_dir = _venv_scripts_dir(root) if _is_windows() else None
-    moved = _quarantine_running_hermes_exe(scripts_dir) if scripts_dir else []
+    failed: list[str] = []
+    moved = (
+        _quarantine_running_hermes_exe(scripts_dir, failed_out=failed)
+        if scripts_dir
+        else []
+    )
+    if failed:
+        _restore_quarantined_exes(moved)
+        raise ShimQuarantineError(failed)
     try:
         subprocess.run(cmd, cwd=root, check=True, env=env)
     finally:

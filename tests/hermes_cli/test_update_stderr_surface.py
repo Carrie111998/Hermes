@@ -1,4 +1,4 @@
-"""Tests for #85840 — surfacing installer stderr and correcting stage attribution.
+"""Tests for #85840 — surfacing installer stderr and correct stage attribution.
 
 Two bugs were reported:
 
@@ -8,30 +8,34 @@ Two bugs were reported:
    install stage (``uv pip install -e .[all]``).
 
 2. **Swallowed stderr**: ``_run_install_with_heartbeat`` called
-   ``subprocess.run(check=True)`` without ``capture_output``, so the
+   ``subprocess.run(check=True)`` without any capture, so the
    ``CalledProcessError`` carried no ``.stderr`` — the real failure cause
    (a locked ``.pyd``, a resolver conflict, a build error) was invisible in
    ``update.log``.
 
-This test suite verifies:
-- ``_run_install_with_heartbeat`` captures stderr (``e.stderr`` is populated).
-- The error handler in ``_cmd_update_impl`` prints the stderr tail.
-- The error message says "Update step failed", not "Git update failed".
+These tests exercise the REAL code paths (no re-implemented handler copies,
+per review point 2 on this PR):
+
+- ``hermes_cli.main._run_install_with_heartbeat`` captures stderr while
+  leaving installer stdout streaming (``stdout=None``, ``stderr=PIPE``).
+- ``hermes_cli.update_cmd._format_update_failure_stage`` classifies an
+  install failure as a dependency failure, not a git failure.
+- ``hermes_cli.update_cmd._print_called_process_error_tail`` surfaces the
+  captured output tail the handler prints on failure.
 """
 
 from __future__ import annotations
 
 import subprocess
-import sys
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hermes_cli import main as cli_main
+from hermes_cli import update_cmd
 
 
 # ---------------------------------------------------------------------------#
-# _run_install_with_heartbeat captures stderr
+# _run_install_with_heartbeat captures stderr, streams stdout
 # ---------------------------------------------------------------------------#
 
 
@@ -42,13 +46,7 @@ def test_heartbeat_captures_stderr_on_failure(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         assert kwargs.get("stderr") == subprocess.PIPE, (
-            "_run_install_with_heartbeat must pass stderr=PIPE to capture installer stderr"
-        )
-        assert kwargs.get("stdout") is None, (
-            "_run_install_with_heartbeat must leave stdout inherited (None) to preserve live progress"
-        )
-        assert kwargs.get("capture_output") is not True, (
-            "capture_output=True would buffer stdout and break ANSI progress bars"
+            "_run_install_with_heartbeat must pass stderr=subprocess.PIPE"
         )
         raise subprocess.CalledProcessError(
             returncode=2,
@@ -67,14 +65,19 @@ def test_heartbeat_captures_stderr_on_failure(monkeypatch):
     assert exc_info.value.stderr == fake_stderr
 
 
-def test_heartbeat_passes_capture_output_on_success(monkeypatch):
-    """On success, verify stderr capture is in place so that *if* it failed,
-    stderr would be available, without buffering stdout."""
+def test_heartbeat_leaves_installer_stdout_streaming(monkeypatch):
+    """stdout must stay uncaptured (live ANSI progress bars) while stderr is
+    a pipe. ``capture_output=True`` would buffer both streams and stall some
+    installers on a full pipe."""
 
     def fake_run(cmd, **kwargs):
+        assert kwargs.get("stdout") is None, (
+            "installer stdout must stream through (stdout=None)"
+        )
         assert kwargs.get("stderr") == subprocess.PIPE
-        assert kwargs.get("stdout") is None
-        assert kwargs.get("capture_output") is not True
+        assert not kwargs.get("capture_output"), (
+            "capture_output=True would buffer stdout too"
+        )
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
@@ -88,134 +91,109 @@ def test_heartbeat_passes_capture_output_on_success(monkeypatch):
 
 
 # ---------------------------------------------------------------------------#
-# Error handler logic: attribution + stderr surfacing
+# Stage attribution (real classifier, no simulated handlers)
 # ---------------------------------------------------------------------------#
-#
-# The real handler lives inside ``_cmd_update_impl``'s try/except.  We test
-# the exact code path in isolation by raising a CalledProcessError and
-# exercising the same conditional logic.
 
 
-def _simulate_windows_handler(e: subprocess.CalledProcessError, capsys):
-    """Re-implement the Windows except-branch from _cmd_update_impl."""
-    if sys.platform == "win32":
-        print(f"⚠ Update step failed: {e}")
-        if getattr(e, "stderr", None):
-            stderr_tail = str(e.stderr)[-2000:]
-            if stderr_tail.strip():
-                print("  Installer output (tail):")
-                for line in stderr_tail.strip().splitlines()[-20:]:
-                    print(f"    {line}")
-        print("→ Falling back to ZIP download...")
-
-
-def _simulate_linux_handler(e: subprocess.CalledProcessError, capsys):
-    """Re-implement the Linux except-branch from _cmd_update_impl."""
-    if sys.platform != "win32":
-        print(f"✗ Update failed: {e}")
-        if getattr(e, "stderr", None):
-            stderr_tail = str(e.stderr)[-2000:]
-            if stderr_tail.strip():
-                print("  Installer output (tail):")
-                for line in stderr_tail.strip().splitlines()[-20:]:
-                    print(f"    {line}")
-        sys.exit(1)
-
-
-def test_windows_handler_says_update_step_failed(capsys):
-    """The Windows handler must say 'Update step failed', not 'Git update
-    failed' (#85840 misattribution)."""
-    e = subprocess.CalledProcessError(
+def test_uv_install_failure_is_not_attributed_to_git():
+    """The exact #85840 symptom: a failed ``uv pip install`` after a
+    successful pull must not be reported as a git failure."""
+    exc = subprocess.CalledProcessError(
         returncode=2,
-        cmd=["uv", "pip", "install", "-e", ".[all]"],
+        cmd=[r"C:\venv\Scripts\uv.exe", "pip", "install", "-e", ".[all]"],
         stderr="error: os error 5 on _rust.pyd",
     )
-    with patch.object(sys, "platform", "win32"):
-        _simulate_windows_handler(e, capsys)
-
-    captured = capsys.readouterr()
-    assert "Update step failed" in captured.out
-    assert "Git update failed" not in captured.out
+    stage = update_cmd._format_update_failure_stage(exc)
+    assert stage == "Python dependency install failed"
+    assert "Git" not in stage
 
 
-def test_windows_handler_prints_stderr_tail(capsys):
-    """The Windows handler prints the last ~20 lines of installer stderr."""
-    e = subprocess.CalledProcessError(
+def test_git_pull_failure_is_attributed_to_git():
+    """A genuine git failure keeps the git attribution."""
+    exc = subprocess.CalledProcessError(returncode=1, cmd=["git", "pull"])
+    assert update_cmd._format_update_failure_stage(exc) == "Git update failed"
+
+
+# ---------------------------------------------------------------------------#
+# Output tail surfacing (the handler's real tail printer)
+# ---------------------------------------------------------------------------#
+
+
+def test_tail_printer_shows_stderr_lines(capsys):
+    """The handler's tail printer shows the captured installer stderr."""
+    exc = subprocess.CalledProcessError(
         returncode=2,
         cmd=["uv", "pip", "install"],
-        stderr="line1\nline2\nline3\nerror: os error 5",
+        stderr="line1\nline2\nerror: os error 5",
     )
-    with patch.object(sys, "platform", "win32"):
-        _simulate_windows_handler(e, capsys)
+    update_cmd._print_called_process_error_tail(exc)
 
     captured = capsys.readouterr()
-    assert "Installer output (tail):" in captured.out
+    assert "Last output:" in captured.out
     assert "os error 5" in captured.out
 
 
-def test_windows_handler_no_stderr_no_crash(capsys):
-    """When CalledProcessError has no stderr, the handler must not crash."""
-    e = subprocess.CalledProcessError(
-        returncode=1,
-        cmd=["git", "pull"],
-        stderr=None,
-    )
-    with patch.object(sys, "platform", "win32"):
-        _simulate_windows_handler(e, capsys)
+def test_tail_printer_falls_back_to_stdout(capsys):
+    """If only stdout was recorded, the tail printer uses it."""
+    exc = subprocess.CalledProcessError(returncode=1, cmd=["git", "pull"])
+    exc.stdout = "fatal: cannot lock ref"
+    exc.stderr = None
+    update_cmd._print_called_process_error_tail(exc)
 
     captured = capsys.readouterr()
-    assert "Update step failed" in captured.out
-    assert "Installer output (tail):" not in captured.out
+    assert "cannot lock ref" in captured.out
 
 
-def test_windows_handler_truncates_long_stderr(capsys):
-    """Stderr longer than 2000 chars is truncated to the last 2000."""
-    long_stderr = "x" * 5000 + "\nerror: os error 5"
-    e = subprocess.CalledProcessError(
-        returncode=2,
-        cmd=["uv", "pip", "install"],
-        stderr=long_stderr,
-    )
-    with patch.object(sys, "platform", "win32"):
-        _simulate_windows_handler(e, capsys)
+def test_tail_printer_no_output_prints_nothing(capsys):
+    """No captured output (the pre-fix #85840 state) must not crash nor emit
+    an empty 'Last output:' block."""
+    exc = subprocess.CalledProcessError(returncode=1, cmd=["git", "pull"])
+    update_cmd._print_called_process_error_tail(exc)
 
     captured = capsys.readouterr()
-    assert "os error 5" in captured.out
-    # The x's should be truncated (not all 5000 present in output)
-    assert captured.out.count("x") < 5000
+    assert captured.out == ""
 
 
-def test_windows_handler_caps_lines_at_20(capsys):
-    """The stderr tail shows at most 20 lines."""
+def test_tail_printer_caps_line_count(capsys):
+    """The tail shows at most the last ``limit`` non-blank lines."""
     many_lines = "\n".join(f"line {i}" for i in range(50))
-    e = subprocess.CalledProcessError(
-        returncode=2,
-        cmd=["uv", "pip", "install"],
-        stderr=many_lines,
+    exc = subprocess.CalledProcessError(
+        returncode=2, cmd=["uv", "pip", "install"], stderr=many_lines
     )
-    with patch.object(sys, "platform", "win32"):
-        _simulate_windows_handler(e, capsys)
+    update_cmd._print_called_process_error_tail(exc)
 
     captured = capsys.readouterr()
-    # Count indented lines that look like stderr output
     stderr_lines = [l for l in captured.out.splitlines() if l.startswith("    line ")]
-    assert len(stderr_lines) <= 20
-    assert "line 49" in captured.out  # last line is present
-    assert "line 0" not in captured.out  # first line is truncated
+    assert len(stderr_lines) <= 12
+    assert "line 49" in captured.out  # last line survives
+    assert "line 0" not in captured.out  # head truncated
 
 
-def test_linux_handler_prints_stderr_and_exits(capsys):
-    """On non-Windows, the handler also surfaces stderr before sys.exit(1)."""
-    e = subprocess.CalledProcessError(
-        returncode=1,
-        cmd=["uv", "pip", "install"],
-        stderr="resolver conflict",
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        with patch.object(sys, "platform", "linux"):
-            _simulate_linux_handler(e, capsys)
+# ---------------------------------------------------------------------------#
+# End-to-end glue: failure raised by the heartbeat runner flows into the
+# handler's real classification + tail printing
+# ---------------------------------------------------------------------------#
 
-    assert exc_info.value.code == 1
+
+def test_failed_install_surfaces_captured_stderr_through_handler(monkeypatch, capsys):
+    """Simulate the update-flow contract: the install raises with captured
+    stderr; the handler's real helpers attribute it correctly and print the
+    cause — the two #85840 fixes composed together."""
+    fake_stderr = "error: Failed to install requirements\n  os error 5"
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=2, cmd=cmd, stderr=fake_stderr
+        )
+
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        cli_main._run_install_with_heartbeat(["uv", "pip", "install", "-e", "."])
+
+    exc = exc_info.value
+    stage = update_cmd._format_update_failure_stage(exc)
+    assert stage != "Git update failed"
+
+    update_cmd._print_called_process_error_tail(exc)
     captured = capsys.readouterr()
-    assert "Update failed" in captured.out
-    assert "resolver conflict" in captured.out
+    assert "os error 5" in captured.out
