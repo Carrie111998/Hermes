@@ -96,6 +96,16 @@ _LANGFUSE_KEY_PREFIXES: Dict[str, str] = {
     "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-",
 }
 
+# Filler tokens pasted behind a correct-looking prefix. The prefix check
+# above passes `pk-lf-...` (the documented stub) and `pk-lf-your-key-here`
+# (copy-paste guides often keep the prefix), yet a real Langfuse key is
+# opaque base62 after the prefix — never dots or one of these words. Both
+# forms would otherwise fall back to the #23823 silent-failure mode (#92984).
+_LANGFUSE_PLACEHOLDER_TOKENS = frozenset({
+    "your-key", "your-key-here", "your-langfuse-key",
+    "test-key", "placeholder", "changeme",
+})
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
@@ -241,12 +251,15 @@ def _validate_langfuse_key(env_name: str, value: str) -> Optional[str]:
     expected = _LANGFUSE_KEY_PREFIXES.get(env_name, "")
     if not expected:
         return None
-    if value.startswith(expected):
-        return None
-    return (
-        f"{env_name}={_redact_key_preview(value)} "
-        f"(expected {expected!r} prefix)"
-    )
+    if not value.startswith(expected):
+        return (
+            f"{env_name}={_redact_key_preview(value)} "
+            f"(expected {expected!r} prefix)"
+        )
+    remainder = value[len(expected):].strip().lower()
+    if not remainder.strip(".") or remainder in _LANGFUSE_PLACEHOLDER_TOKENS:
+        return f"{env_name}={_redact_key_preview(value)} (placeholder value)"
+    return None
 
 
 def _get_langfuse() -> Optional[Langfuse]:

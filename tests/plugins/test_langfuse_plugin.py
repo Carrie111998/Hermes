@@ -503,6 +503,47 @@ class TestPlaceholderKeyDetection:
             "HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz"
         ) is None
 
+    # -- prefix-correct literal stubs (#92984) ------------------------------
+    # The documented stub `pk-lf-...` and guide leftovers like
+    # `pk-lf-your-key-here` carry the RIGHT prefix, so the prefix check
+    # above lets them through and the SDK drops every trace at flush time
+    # — the same silent failure #23823 fixed for wrong-prefix values.
+
+    def test_validate_langfuse_key_rejects_documented_stub_suffix(self, monkeypatch):
+        self._clear_env(monkeypatch)
+        plugin = self._fresh_plugin()
+        message = plugin._validate_langfuse_key(
+            "HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-..."
+        )
+        assert message is not None
+        assert "HERMES_LANGFUSE_PUBLIC_KEY" in message
+        assert "placeholder value" in message
+
+    def test_validate_langfuse_key_rejects_filler_after_correct_prefix(self, monkeypatch):
+        self._clear_env(monkeypatch)
+        plugin = self._fresh_plugin()
+        assert plugin._validate_langfuse_key(
+            "HERMES_LANGFUSE_SECRET_KEY", "sk-lf-your-key-here"
+        ) is not None
+        # A real opaque key with the same prefix stays accepted.
+        assert plugin._validate_langfuse_key(
+            "HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz"
+        ) is None
+
+    def test_stub_public_key_warns_and_skips_end_to_end(self, monkeypatch, caplog):
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-...")
+        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
+        plugin = self._fresh_plugin(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
+            assert plugin._get_langfuse() is None
+        assert "HERMES_LANGFUSE_PUBLIC_KEY" in caplog.text
+        assert "placeholder value" in caplog.text
+        # The valid secret value must NOT appear in the log.
+        assert "'sk-lf-" not in caplog.text
+        # Never constructed the SDK client — short-circuited before that.
+        assert _FakeLangfuse.instances == []
+
 
     # -- end-to-end _get_langfuse() behaviour --------------------------------
     # These tests pass `monkeypatch` to _fresh_plugin() so the helper can
