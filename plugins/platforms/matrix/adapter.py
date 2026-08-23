@@ -3501,13 +3501,22 @@ class MatrixAdapter(BasePlatformAdapter):
         # gateway prompt layer can render "[Replying to: \"<original>\"]".
         # Other adapters (Signal, Slack, Telegram) populate reply_to_text
         # from their quote payload; Matrix stores it inline as `> <@user:srv>
-        # <text>\n\n<actual reply>` and discards it after stripping.
+        # <text>\n\n<actual reply>` and discards it after stripping. Clients
+        # that send only the event reference (no inline fallback) are handled
+        # by fetching the replied-to event from the homeserver below.
         reply_to_text: Optional[str] = None
         reply_to_author_id: Optional[str] = None
         reply_to_author_name: Optional[str] = None
-        if reply_to and body.startswith("> "):
-            reply_to_text, reply_to_author_id = _extract_reply_fallback(body)
-            body = _strip_reply_fallback(body)
+        if reply_to:
+            if body.startswith("> "):
+                reply_to_text, reply_to_author_id = _extract_reply_fallback(body)
+                body = _strip_reply_fallback(body)
+            else:
+                # No inline fallback: reconstruct the quote from the
+                # homeserver so the agent can see what is being replied to.
+                reply_to_text, reply_to_author_id = await self._fetch_reply_event(
+                    room_id, reply_to
+                )
 
             # Resolve the replied-to author's display name when we have the
             # state_store available — falls back to the localpart otherwise.
@@ -3738,9 +3747,14 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to_text: Optional[str] = None
         reply_to_author_id: Optional[str] = None
         reply_to_author_name: Optional[str] = None
-        if reply_to and body.startswith("> "):
-            reply_to_text, reply_to_author_id = _extract_reply_fallback(body)
-            body = _strip_reply_fallback(body)
+        if reply_to:
+            if body.startswith("> "):
+                reply_to_text, reply_to_author_id = _extract_reply_fallback(body)
+                body = _strip_reply_fallback(body)
+            else:
+                reply_to_text, reply_to_author_id = await self._fetch_reply_event(
+                    room_id, reply_to
+                )
 
             if reply_to_author_id:
                 reply_to_author_name = await self._get_display_name(
@@ -4975,6 +4989,40 @@ class MatrixAdapter(BasePlatformAdapter):
         body = re.sub(r'[ \t]{2,}', ' ', body)
         body = re.sub(r'\s+([,.;:!?])', r'\1', body)
         return body.strip()
+
+    async def _fetch_reply_event(
+        self, room_id: str, event_id: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Fetch the replied-to event's body and sender from the homeserver.
+
+        Modern Matrix clients (Beeper, Element X, etc.) send a "rich reply"
+        that references the original event via ``m.relates_to.m.in_reply_to``
+        but omit the inline ``> quote`` fallback in ``body``. Without it,
+        ``reply_to_text`` stays empty and the agent cannot see what the user
+        is replying to. Fetch the event to reconstruct the quote. Any failure
+        resolves to ``(None, None)`` so reply handling degrades gracefully to
+        the old behaviour.
+        """
+        client = self._client
+        if client is None:
+            return None, None
+        try:
+            event = await client.get_event(room_id, event_id)
+        except Exception:
+            logger.debug(
+                "Matrix: get_event failed for reply %s", event_id, exc_info=True
+            )
+            return None, None
+        if event is None:
+            return None, None
+        content = getattr(event, "content", None)
+        if not isinstance(content, dict):
+            return None, None
+        quoted_text = content.get("body")
+        author_id = getattr(event, "sender", None)
+        if not quoted_text or not str(quoted_text).strip():
+            return None, None
+        return str(quoted_text), str(author_id) if author_id else None
 
     async def _get_display_name(self, room_id: str, user_id: str) -> str:
         """Get a user's display name in a room, falling back to user_id."""
