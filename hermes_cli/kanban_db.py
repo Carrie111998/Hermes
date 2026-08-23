@@ -8174,6 +8174,8 @@ def evaluate_dispatch_preflight(
 
     if not _parents_satisfied(conn, task.id):
         reasons.append("parents_not_done")
+    if lane == "review" and not task.candidate_sha:
+        reasons.append("candidate_sha_required")
 
     path = _preflight_workspace_path(task, board=board)
     evidence["resolved_probe_path"] = str(path) if path is not None else None
@@ -8237,14 +8239,17 @@ def evaluate_dispatch_preflight(
                     reasons.append("workspace_dirty")
                 if task.branch_name and not evidence.get("pre_materialization") and branch != task.branch_name:
                     reasons.append("branch_mismatch")
-                if task.candidate_sha:
-                    if head_sha != task.candidate_sha:
-                        reasons.append("candidate_sha_mismatch")
-                elif lane == "ready" and task.expected_base_sha:
-                    if head_sha != task.expected_base_sha:
+                if lane == "ready":
+                    if task.expected_base_sha and head_sha != task.expected_base_sha:
                         reasons.append("expected_base_mismatch")
-                elif lane == "review" and task.expected_base_sha:
-                    reasons.append("candidate_sha_required")
+                    elif (
+                        not task.expected_base_sha
+                        and task.candidate_sha
+                        and head_sha != task.candidate_sha
+                    ):
+                        reasons.append("candidate_sha_mismatch")
+                elif task.candidate_sha and head_sha != task.candidate_sha:
+                    reasons.append("candidate_sha_mismatch")
 
     # Raw workspace-path equality is the first lease fence. Common-dir+branch
     # catches aliases/symlinks and separate linked worktrees targeting one branch.

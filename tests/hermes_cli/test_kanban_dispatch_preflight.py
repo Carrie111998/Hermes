@@ -223,6 +223,38 @@ def test_dirty_wrong_branch_and_wrong_base_are_reported(conn, tmp_path: Path) ->
     assert verdict.evidence["git_common_dir"]
 
 
+def test_ready_lane_prefers_declared_base_when_candidate_is_also_recorded(
+    conn, tmp_path: Path,
+) -> None:
+    repo, head = _repo(tmp_path)
+    _tid, task = _task(
+        conn,
+        repo,
+        expected_base_sha=head,
+        candidate_sha="c" * 40,
+    )
+
+    verdict = _verdict(conn, task, lane="ready")
+
+    assert verdict.ok
+
+
+def test_review_lane_requires_candidate_even_without_a_base_contract(
+    conn, tmp_path: Path,
+) -> None:
+    repo, _head = _repo(tmp_path)
+    _tid, task = _task(
+        conn,
+        repo,
+        clean_workspace_policy="allow_dirty",
+    )
+
+    verdict = _verdict(conn, task, lane="review")
+
+    assert not verdict.ok
+    assert "candidate_sha_required" in verdict.reason_codes
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_candidate_lane_requires_exact_candidate_sha(
     conn, tmp_path: Path, lane: str,

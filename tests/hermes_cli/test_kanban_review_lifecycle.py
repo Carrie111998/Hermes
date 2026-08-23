@@ -21,7 +21,9 @@ down:
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -67,6 +69,42 @@ def _last_run(conn, tid):
         "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
         (tid,),
     ).fetchone()
+
+
+def _review_contract(tmp_path: Path) -> dict[str, Any]:
+    """Create the immutable Git identity required by dispatched review lanes."""
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "README.md").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=Test User",
+            "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false",
+            "commit", "-m", "candidate",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return {
+        "workspace_kind": "dir",
+        "workspace_path": str(repo),
+        "candidate_sha": candidate,
+        "clean_workspace_policy": "require_clean",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +421,10 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
     import hermes_cli.profiles as profmod
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="park", assignee="worker")
+        review_contract = _review_contract(kanban_home.parent)
+        tid = kb.create_task(
+            conn, title="park", assignee="worker", **review_contract
+        )
         kb.claim_task(conn, tid)
         kb.request_review(
             conn, tid, summary="done",
@@ -436,8 +477,11 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
     pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
 
     with kb.connect() as conn:
+        review_contract = _review_contract(kanban_home.parent)
         # Review-lane task with a fresh PR comment.
-        review_id = kb.create_task(conn, title="review me", assignee="reviewer")
+        review_id = kb.create_task(
+            conn, title="review me", assignee="reviewer", **review_contract
+        )
         claimed = kb.claim_task(conn, review_id)
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
@@ -494,11 +538,13 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         return None
 
     with kb.connect() as conn:
+        review_contract = _review_contract(kanban_home.parent)
         task_id = kb.create_task(
             conn,
             title="domain review",
             assignee="reviewer",
             skills=["domain-specific-review"],
+            **review_contract,
         )
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
@@ -542,13 +588,16 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
     )
 
     with kb.connect() as conn:
+        review_contract = _review_contract(kanban_home.parent)
         running_id = kb.create_task(conn, title="already running", assignee="builder")
         running = kb.claim_task(conn, running_id)
         assert running is not None
 
         review_ids: list[str] = []
         for title in ("review one", "review two"):
-            task_id = kb.create_task(conn, title=title, assignee="reviewer")
+            task_id = kb.create_task(
+                conn, title=title, assignee="reviewer", **review_contract
+            )
             implementation = kb.claim_task(conn, task_id)
             assert implementation is not None
             assert kb.request_review(

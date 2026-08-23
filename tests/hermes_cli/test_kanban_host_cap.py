@@ -16,6 +16,7 @@ Three gaps found in review of the original memory-guard PR:
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -210,8 +211,47 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 # ---------------------------------------------------------------------------
 
 
-def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
-    tid = kb.create_task(conn, title=title, assignee=assignee)
+def _park_in_review(
+    conn: sqlite3.Connection,
+    title: str,
+    assignee: str,
+    root: Path,
+) -> str:
+    repo = root / f"review-{title}"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "README.md").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=Test User",
+            "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false",
+            "commit", "-m", "candidate",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tid = kb.create_task(
+        conn,
+        title=title,
+        assignee=assignee,
+        workspace_kind="dir",
+        workspace_path=str(repo),
+        candidate_sha=candidate,
+        clean_workspace_policy="require_clean",
+    )
     _set_task_status(conn, tid, "review")
     return tid
 
@@ -229,7 +269,9 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
             kb.create_task(conn, title=title, assignee="alice")
-        review_id = _park_in_review(conn, "review-me", "reviewer")
+        review_id = _park_in_review(
+            conn, "review-me", "reviewer", kanban_home.parent
+        )
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -281,7 +323,9 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2"):
             kb.create_task(conn, title=title, assignee="alice")
-        _park_in_review(conn, "human-review", "some-human")
+        _park_in_review(
+            conn, "human-review", "some-human", kanban_home.parent
+        )
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -304,7 +348,9 @@ def test_review_budget_still_bounded_by_shared_cap(
     with kb.connect() as conn:
         kb.create_task(conn, title="ready-1", assignee="alice")
         for i in range(3):
-            _park_in_review(conn, f"review-{i}", "reviewer")
+            _park_in_review(
+                conn, f"review-{i}", "reviewer", kanban_home.parent
+            )
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
