@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -527,6 +528,27 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     finally:
         if _stateless_reset is not None:
             _stateless_reset()
+    if action == "run":
+        # Same one-shot exit class as #90879 (fixed for `hermes chat -q/-Q`
+        # in cli.py and `-z` in hermes_cli/oneshot.py): this CLI process
+        # exits as soon as this function returns, and the stateless
+        # declaration above makes the job's agent turn execute inline in
+        # THIS process — so a terminal(background=true,
+        # notify_on_complete=true) job dispatch (e.g. a Bot Mode handoff
+        # reply, or a plain long-running background command) still holds a
+        # stdout pipe owned by this dying process and is destroyed a few
+        # seconds later, its completion never delivered. Linger (bounded by
+        # terminal.oneshot_completion_wait_seconds) exactly like the other
+        # two one-shot exit paths. Cheap no-op when nothing is pending
+        # (including the rare case where the run above was dispatched to
+        # the gateway daemon's background worker instead of executing
+        # inline — that work lives in a different process's registry).
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.wait_for_pending_completions(None)
+        except Exception:
+            logging.debug("cron run background completion wait failed", exc_info=True)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
