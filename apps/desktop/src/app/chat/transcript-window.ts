@@ -20,13 +20,13 @@ import { messageStoreWeight } from '@/lib/render-weight'
 /**
  * One window page, in render-weight units.
  *
- * Two DOM pages (the `RENDER_BUDGET` of 1800 in `thread/list.tsx`). "Show
+ * Two DOM pages (the `RENDER_BUDGET` of 3600 in `thread/list.tsx`). "Show
  * earlier" spends the DOM budget first, so the user can page within the
  * already-materialized window before this asks the store for more. The
  * original crash shape (~231K tokens ≈ 2,260 units) remains bounded rather
  * than handing an unbounded transcript to the repository.
  */
-export const TRANSCRIPT_WINDOW_BUDGET = 3600
+export const TRANSCRIPT_WINDOW_BUDGET = 7200
 
 /**
  * Floor on messages kept regardless of weight. A transcript of enormous turns

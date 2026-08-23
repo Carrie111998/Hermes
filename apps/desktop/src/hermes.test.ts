@@ -457,18 +457,18 @@ describe('Hermes REST helpers', () => {
     })
   })
 
-  it('hydrates the latest transcript with a bounded tail page (360, latest, compacted rows included)', async () => {
+  it('hydrates the latest transcript with a bounded tail page (720, latest, compacted rows included)', async () => {
     api.mockResolvedValue({
       messages: [],
-      pagination: { limit: 360, offset: 0, order: 'latest', returned: 0 },
+      pagination: { limit: 720, offset: 0, order: 'latest', returned: 0 },
       session_id: 'session-1'
     })
 
     await getLatestSessionMessages('session-1', 'xiaoxuxu')
 
-    expect(LATEST_SESSION_MESSAGES_LIMIT).toBe(360)
+    expect(LATEST_SESSION_MESSAGES_LIMIT).toBe(720)
     expect(api).toHaveBeenCalledWith({
-      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=360&order=latest&include_compacted=true',
+      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=720&order=latest&include_compacted=true',
       profile: 'xiaoxuxu'
     })
   })
@@ -476,24 +476,24 @@ describe('Hermes REST helpers', () => {
   it('records tail truncation state under the requested and resolved session ids', async () => {
     $transcriptTailBySessionId.set({})
     api.mockResolvedValue({
-      messages: Array.from({ length: 360 }, (_, index) => ({ content: `m${index}`, id: index, role: 'user' })),
-      pagination: { limit: 360, offset: 0, order: 'latest', returned: 360 },
+      messages: Array.from({ length: 720 }, (_, index) => ({ content: `m${index}`, id: index, role: 'user' })),
+      pagination: { limit: 720, offset: 0, order: 'latest', returned: 720 },
       session_id: 'resolved-1'
     })
 
     await getLatestSessionMessages('prefix-1')
 
-    expect(transcriptTailState('prefix-1')).toMatchObject({ nextOffset: 360, possiblyTruncated: true })
-    expect(transcriptTailState('resolved-1')).toMatchObject({ nextOffset: 360, possiblyTruncated: true })
+    expect(transcriptTailState('prefix-1')).toMatchObject({ nextOffset: 720, possiblyTruncated: true })
+    expect(transcriptTailState('resolved-1')).toMatchObject({ nextOffset: 720, possiblyTruncated: true })
   })
 
   it('requests older pages backwards from the newest message', async () => {
     api.mockResolvedValue({ messages: [], session_id: 'session-1' })
 
-    await getOlderSessionMessages('session-1', 'xiaoxuxu', 720)
+    await getOlderSessionMessages('session-1', 'xiaoxuxu', 1440)
 
     expect(api).toHaveBeenCalledWith({
-      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=360&offset=720&order=latest&include_compacted=true',
+      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=720&offset=1440&order=latest&include_compacted=true',
       profile: 'xiaoxuxu'
     })
   })

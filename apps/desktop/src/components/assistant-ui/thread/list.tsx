@@ -57,13 +57,13 @@ export type MessageGroup = { id: string; weight: number } & (
 // a virtualizer — pure rendering, never touches scrollTop, so it can't fight
 // use-stick-to-bottom (the single scroll owner).
 //
-// 1800 units ≈ 30-60 agentic turns on measured real sessions (a tool-heavy turn
+// 3600 units ≈ 60-120 agentic turns on measured real sessions (a tool-heavy turn
 // prices at 30-90, a plain exchange at 5-10), giving long coding sessions about
-// three times the default visible history before pagination.
+// six times the default visible history before pagination.
 // What the DOM can hold is bounded above by the store window regardless
 // (TRANSCRIPT_WINDOW_BUDGET), so this cannot admit more than one window's
 // content.
-const RENDER_BUDGET = 1800
+const RENDER_BUDGET = 3600
 // Every mounted transcript list registers here (see the mount effect). The
 // budget above is sized for ONE full-height pane; a grid split shows several
 // panes at once, each a fraction of the screen — yet each was still mounting

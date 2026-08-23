@@ -375,7 +375,7 @@ export function getSessionMessages(
  * via `getOlderSessionMessages` when "Show earlier" exhausts the in-memory
  * store (see app/chat/transcript-backfill).
  */
-export const LATEST_SESSION_MESSAGES_LIMIT = 360
+export const LATEST_SESSION_MESSAGES_LIMIT = 720
 
 export function getLatestSessionMessages(id: string, profile?: ProfileScope): Promise<SessionMessagesResponse> {
   // includeCompacted: durable display history must include rows preserved by

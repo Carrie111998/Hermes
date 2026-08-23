@@ -51,8 +51,8 @@ describe('selectTranscriptWindow', () => {
     // two identically. Tiny messages are cheaper than tool results, so many
     // more of them survive the same budget. The fixture exceeds the enlarged
     // local history budget in both shapes.
-    const light = selectTranscriptWindow(transcript(2_000, 20))
-    const heavy = selectTranscriptWindow(transcript(2_000, RENDER_WEIGHT_CHARS * 40))
+    const light = selectTranscriptWindow(transcript(4_000, 20))
+    const heavy = selectTranscriptWindow(transcript(4_000, RENDER_WEIGHT_CHARS * 40))
 
     expect(light.messages.length).toBeGreaterThan(heavy.messages.length * 10)
   })
