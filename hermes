@@ -9,7 +9,9 @@ When the interpreter running this script has none of Hermes' dependencies
 installed — a bare uv-managed CPython, or a generated .desktop ``Exec=``
 whose interpreter escaped the install venv — it fails with an actionable
 diagnostic instead of a bare ``ModuleNotFoundError`` (#92882, #90292,
-#91504, #80439).
+#91504, #80439). An import failure for a ``hermes_cli.*`` module raised
+from inside the package itself is reported as an internal error, never as
+a missing dependency.
 """
 
 import sys
@@ -30,9 +32,58 @@ def _find_install_venv_python(checkout: Path) -> str | None:
     return None
 
 
-def _report_launcher_failure(missing: str) -> None:
-    """Print which interpreter ran, which module is missing, and the fix."""
+def _classify_import_failure(
+    exc: ModuleNotFoundError, pkg_dir: Path | None = None
+) -> tuple[str, bool]:
+    """Split a launcher import failure into (missing_module, is_internal_bug).
+
+    A missing third-party dependency (``yaml``, ``dotenv``, ...) is an
+    install problem and gets the venv fix. A ``ModuleNotFoundError`` for a
+    ``hermes_cli.*`` module raised from a file *inside* the package is the
+    package failing to import its own code — an internal bug that must not
+    be misreported as a missing dependency.
+    """
+    missing = getattr(exc, "name", "") or str(exc)
+    if not (missing == "hermes_cli" or missing.startswith("hermes_cli.")):
+        return missing, False
+    if pkg_dir is None:
+        pkg_dir = Path(__file__).resolve().parent / "hermes_cli"
+    pkg_dir = Path(pkg_dir).resolve()
+    tb = exc.__traceback__
+    frame = None
+    while tb is not None:
+        frame = tb.tb_frame
+        tb = tb.tb_next
+    if frame is None:
+        return missing, False
+    try:
+        origin = Path(frame.f_code.co_filename).resolve()
+    except OSError:
+        return missing, False
+    return missing, origin.is_relative_to(pkg_dir)
+
+
+def _report_launcher_failure(
+    missing: str, internal: bool = False, exc: BaseException | None = None
+) -> None:
+    """Print which interpreter ran, what failed, and the fix."""
     script = Path(__file__).resolve()
+    if internal:
+        lines = [
+            f"hermes: hermes_cli failed to import its own module '{missing}'.",
+            "  This is an internal error in the checkout, not an install problem.",
+            f"  running interpreter: {sys.executable}",
+            f"  missing module:      {missing}",
+            "  fix: the failing import lives inside hermes_cli itself; "
+            "inspect the traceback below for a typo'd or removed module, "
+            "or reinstall/refresh this checkout.",
+        ]
+        sys.stderr.write("\n".join(lines) + "\n")
+        if exc is not None:
+            import traceback
+
+            traceback.print_exception(exc, file=sys.stderr)
+        return
     lines = [
         "hermes: cannot start under this Python interpreter.",
         f"  running interpreter: {sys.executable}",
@@ -57,6 +108,7 @@ if __name__ == "__main__":
     try:
         from hermes_cli.main import main
     except ModuleNotFoundError as exc:
-        _report_launcher_failure(getattr(exc, "name", "") or str(exc))
+        missing, internal = _classify_import_failure(exc)
+        _report_launcher_failure(missing, internal=internal, exc=exc)
         sys.exit(1)
     main()
