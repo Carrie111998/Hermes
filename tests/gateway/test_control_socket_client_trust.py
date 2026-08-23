@@ -44,7 +44,7 @@ def shortdir():
     already exceeds sun_path — the very condition that makes production fall
     back to the temp dir. Bind somewhere short instead.
     """
-    d = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
+    d = Path(tempfile.mkdtemp(prefix="hgw-", dir=tempfile.gettempdir()))
     try:
         yield d
     finally:
@@ -88,7 +88,7 @@ class TestDirectPath:
 
     def test_a_regular_file_is_not_a_socket(self, home):
         f = home / "gateway.sock"
-        f.write_text("not a socket")
+        f.write_text("not a socket", encoding="utf-8")
         os.chmod(f, 0o600)
         assert resolve_client_socket_path(home) is None
 
@@ -134,3 +134,51 @@ class TestPredicate:
             assert stat.S_IMODE(os.stat(p).st_mode) & 0o077 == 0
         finally:
             srv.close()
+
+
+class TestPeerCredentials:
+    """Closes the stat-then-connect race the path check alone leaves open.
+
+    A socket can be swapped between the `stat` and the `connect`, so the
+    filesystem check is a filter, not a guarantee. `SO_PEERCRED` reports the
+    process actually on the other end.
+
+    Mocked rather than driven live: `SO_PEERCRED` is Linux-only, and that is
+    also the platform carrying the exposure — macOS gives each user a private
+    `gettempdir()`, so the shared-`/tmp` fallback never applies there.
+    """
+
+    def test_absent_support_reports_unknown_rather_than_failing(self, monkeypatch):
+        import socket as _socket
+
+        from gateway import control_socket as cs
+
+        monkeypatch.delattr(_socket, "SO_PEERCRED", raising=False)
+        assert cs._peer_euid(object()) is None
+
+    def test_the_peer_uid_is_unpacked(self, monkeypatch):
+        import socket as _socket
+        import struct as _struct
+
+        from gateway import control_socket as cs
+
+        monkeypatch.setattr(_socket, "SO_PEERCRED", 17, raising=False)
+
+        class _Sock:
+            def getsockopt(self, level, opt, size):
+                return _struct.pack("3i", 4242, 1000, 1000)
+
+        assert cs._peer_euid(_Sock()) == 1000
+
+    def test_a_refusing_kernel_is_not_an_error(self, monkeypatch):
+        import socket as _socket
+
+        from gateway import control_socket as cs
+
+        monkeypatch.setattr(_socket, "SO_PEERCRED", 17, raising=False)
+
+        class _Sock:
+            def getsockopt(self, *a):
+                raise OSError("not supported")
+
+        assert cs._peer_euid(_Sock()) is None

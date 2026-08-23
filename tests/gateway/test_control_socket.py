@@ -52,7 +52,7 @@ def test_short_home_binds_in_home(tmp_path: Path):
     import tempfile
 
     try:
-        short_root = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
+        short_root = Path(tempfile.mkdtemp(prefix="hgw-", dir=tempfile.gettempdir()))
     except OSError:
         pytest.skip("/tmp not writable on this host")
     try:
@@ -93,7 +93,7 @@ def test_client_resolution_prefers_direct_then_pointer():
     import socket as _socket
     import tempfile
 
-    scratch = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
+    scratch = Path(tempfile.mkdtemp(prefix="hgw-", dir=tempfile.gettempdir()))
     home = scratch / "h"
     home.mkdir()
     opened = []
@@ -110,7 +110,7 @@ def test_client_resolution_prefers_direct_then_pointer():
         assert resolve_client_socket_path(home) is None
 
         target = _bind(scratch / "elsewhere.sock")
-        (home / "gateway.sock.path").write_text(str(target))
+        (home / "gateway.sock.path").write_text(str(target), encoding="utf-8")
         assert resolve_client_socket_path(home) == target
 
         direct = _bind(home / "gateway.sock")

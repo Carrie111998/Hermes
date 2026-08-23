@@ -53,6 +53,7 @@ import logging
 import os
 import socket
 import stat
+import struct
 import sys
 import tempfile
 import time
@@ -144,6 +145,33 @@ def _current_euid() -> Optional[int]:
     return getter() if getter is not None else None
 
 
+def _peer_euid(sock: "socket.socket") -> Optional[int]:
+    """The connected peer's euid, where the platform reports it.
+
+    The path check is a filter, not a guarantee: a socket can be swapped
+    between the ``stat`` and the ``connect``. ``SO_PEERCRED`` answers for the
+    process actually on the other end, which closes that race regardless of
+    filesystem timing.
+
+    Linux-only in practice — and that is precisely the platform carrying the
+    exposure, because a shared ``/tmp`` is what makes the fallback path
+    reachable by another account at all (macOS hands each user a private
+    ``gettempdir()``). BSD/macOS report peer credentials through
+    ``LOCAL_PEERCRED`` with a different structure; returning None there
+    leaves the path check as the sole filter rather than guessing at a
+    layout.
+    """
+    opt = getattr(socket, "SO_PEERCRED", None)
+    if opt is None:
+        return None
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, opt, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", raw)
+        return uid
+    except (OSError, struct.error):
+        return None
+
+
 def _is_trustworthy_socket(candidate: Path) -> bool:
     """True when *candidate* is a socket this user owns, with no group/other access.
 
@@ -197,7 +225,7 @@ def resolve_client_socket_path(home: Path) -> Optional[Path]:
     fallback — the same path taken when no gateway is running.
     """
     direct = _default_socket_path(home)
-    if direct.exists() and _is_trustworthy_socket(direct):
+    if _is_trustworthy_socket(direct):
         return direct
     pointer = _pointer_path(home)
     try:
@@ -205,7 +233,7 @@ def resolve_client_socket_path(home: Path) -> Optional[Path]:
             target = pointer.read_text(encoding="utf-8").strip()
             if target:
                 candidate = Path(target)
-                if candidate.exists() and _is_trustworthy_socket(candidate):
+                if _is_trustworthy_socket(candidate):
                     return candidate
     except OSError:
         pass
@@ -546,6 +574,13 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
         try:
             sock.connect(str(path))
         except (ConnectionRefusedError, FileNotFoundError, OSError):
+            return None
+        peer, euid = _peer_euid(sock), _current_euid()
+        if peer is not None and euid is not None and peer != euid:
+            logger.warning(
+                "Refusing control socket %s: peer runs as uid %d, not %d",
+                path, peer, euid,
+            )
             return None
         sock.sendall(request)
         chunks: list[bytes] = []
