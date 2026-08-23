@@ -40,7 +40,7 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Execute assertion-guarded materializer transport
+      - name: Execute evidence-validated materializer transport
         run: |
           set -euo pipefail
           source .venv/bin/activate
@@ -52,8 +52,12 @@ jobs:
           status=$?
           set -e
           cat phase-g-transport.log
-          test "$status" -eq 1 || {
-            echo "::error::transport must terminate with pytest's assertion-failure status 1; got $status"
+          # The process must not pass normally, but no specific pytest status is
+          # authoritative. The exact JUnit sentinel, archive, and receipt checks
+          # below distinguish the intentional terminal failure from collection,
+          # configuration, no-test, skip, or xfail outcomes.
+          test "$status" -ne 0 || {
+            echo "::error::transport unexpectedly returned success; sentinel failure required"
             exit 1
           }
           test -s phase-g-product.tar.gz
