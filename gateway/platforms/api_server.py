@@ -8378,7 +8378,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Serve cached generated images over HTTP so API clients can fetch
             # them by URL instead of a server-local filesystem path.
+            # aiohttp >=3.9 raises ValueError from add_static() when the
+            # directory is missing, so create it first — a fresh install (or
+            # a fresh HERMES_HOME) has never generated an image.
             if IMAGE_CACHE_DIR:
+                IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 self._app.router.add_static("/images/", str(IMAGE_CACHE_DIR), show_index=False)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
