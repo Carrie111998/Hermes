@@ -16,7 +16,7 @@ Un signalement utile comprend :
 - Une description concise et une évaluation de la gravité.
 - Le composant affecté, identifié par chemin de fichier et plage de
   lignes (ex. `path/to/file.py:120-145`).
-- Les détails de l'environnement (`hermes version`, SHA du commit, OS,
+- Les détails de l'environnement (`hermes --version`, SHA du commit, OS,
   version de Python).
 - Une reproduction sur `main` ou la dernière release.
 - Une indication de la frontière de confiance du §2 qui est franchie.
