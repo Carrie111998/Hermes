@@ -3907,8 +3907,24 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
-            "accessibility.element_tokens", tool=tool
+        # Two ways to establish support, in order of reliability:
+        #
+        #   1. The live input schema accepts `element_token` (tools/list).
+        #   2. The driver advertises the #1961 capability token.
+        #
+        # (1) is authoritative and must be checked first. cua-driver 0.21.0
+        # stopped publishing per-tool capability sets entirely — every tool
+        # reports `[]` — while still accepting `element_token` in its schema.
+        # Gating on (2) alone therefore fails closed on 0.21.x: we send a bare
+        # `element_index`, and the driver refuses the call outright with
+        # `snapshot_id_required`. That breaks EVERY element-targeted click,
+        # forcing agents onto blind pixel coordinates. (2) is retained so
+        # older drivers that shipped the vocabulary keep working.
+        if not (
+            self._session.supports_input_property(tool, "element_token")
+            or self._session.supports_capability(
+                "accessibility.element_tokens", tool=tool
+            )
         ):
             return
         args["element_token"] = token
