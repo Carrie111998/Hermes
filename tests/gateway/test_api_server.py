@@ -1029,16 +1029,86 @@ class TestToolsEndpoint:
     async def test_tools_rejects_unknown_platform(self, adapter):
         with patch(
             "hermes_cli.config.load_config",
-            return_value={"platform_toolsets": {"api_server": ["file"]}},
+            return_value={
+                "platform_toolsets": {
+                    "api_server": ["file"],
+                    "stale-plugin": ["file"],
+                }
+            },
+        ), patch(
+            "hermes_cli.platforms.get_all_platforms",
+            return_value={"api_server": object()},
         ), patch.object(adapter, "_model_tool_catalog") as catalog:
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
-                resp = await cli.get("/v1/tools?platform=not-a-platform")
+                resp = await cli.get("/v1/tools?platform=stale-plugin")
                 payload = await resp.json()
 
         assert resp.status == 400
         assert payload["error"]["code"] == "invalid_platform"
         catalog.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tools_accepts_registered_plugin_without_explicit_config(self, adapter):
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        platform_registry.register(PlatformEntry(
+            name="plugin-chat",
+            label="Plugin Chat",
+            adapter_factory=lambda _config: None,
+            check_fn=lambda: True,
+        ))
+        try:
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"platform_toolsets": {"api_server": ["file"]}},
+            ), patch.object(
+                adapter,
+                "_model_tool_catalog",
+                return_value=([], ["messaging"], False),
+            ) as catalog:
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.get("/v1/tools?platform=plugin-chat")
+                    payload = await resp.json()
+        finally:
+            platform_registry.unregister("plugin-chat")
+
+        assert resp.status == 200
+        assert payload["platform"] == "plugin-chat"
+        assert payload["explicit_config_present"] is False
+        catalog.assert_called_once_with(
+            {"platform_toolsets": {"api_server": ["file"]}},
+            "plugin-chat",
+        )
+
+    def test_tool_catalog_does_not_report_bypass_without_explicit_config(self):
+        schema = {
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {}},
+        }
+        entry = types.SimpleNamespace(toolset="file")
+        with patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"file"},
+        ), patch(
+            "model_tools.get_tool_definitions",
+            return_value=[schema],
+        ), patch(
+            "tools.registry.registry.get_registered_toolset_aliases",
+            return_value={},
+        ), patch(
+            "tools.registry.registry.get_entry",
+            return_value=entry,
+        ):
+            data, enabled, explicit = APIServerAdapter._model_tool_catalog(
+                {"platform_toolsets": {"api_server": ["file"]}},
+                "plugin-chat",
+            )
+
+        assert enabled == ["file"]
+        assert explicit is False
+        assert data[0]["provenance"]["added_below_explicit_config"] is False
 
     @pytest.mark.asyncio
     async def test_tools_requires_api_key_when_configured(self, auth_adapter):

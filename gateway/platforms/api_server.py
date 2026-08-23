@@ -4127,12 +4127,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             from hermes_cli.config import load_config
-            from hermes_cli.platforms import PLATFORMS
+            from hermes_cli.platforms import get_all_platforms
 
             config = load_config()
             platform = str(request.query.get("platform") or "api_server").strip()
-            configured_platforms = set((config.get("platform_toolsets") or {}).keys())
-            known_platforms = set(PLATFORMS) | configured_platforms
+            known_platforms = set(get_all_platforms())
             if not platform or platform not in known_platforms:
                 return web.json_response(
                     _openai_error(
@@ -4222,7 +4221,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "toolset": canonical_toolset,
                 "requested_toolsets": requested_toolsets,
                 "source_server": source_server,
-                "added_below_explicit_config": not explicitly_enabled,
+                "added_below_explicit_config": (
+                    explicit_config_present and not explicitly_enabled
+                ),
             }
             data.append(row)
 
