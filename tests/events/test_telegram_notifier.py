@@ -453,6 +453,9 @@ class TestTelegramNotifier:
              "options": ["Internet", "Contacted by Recruiter"]},
         )
         body = notifier._format_payload(event)
+        # 2026-08-23: a block must read as an ask, not as pipeline progress —
+        # the action line leads so the message cannot be misread mid-scroll.
+        assert body.startswith("Action needed:")
         assert "Capital One" in body
         assert "1. Internet" in body
         assert "2. Contacted by Recruiter" in body

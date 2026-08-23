@@ -566,11 +566,20 @@ class TelegramNotifier(BaseSubscriber):
             # copied from verbatim. Lead with the question, then the choices as
             # a numbered list (events.formatting owns the list rendering so the
             # WhatsApp page and this cannot drift).
+            #
+            # 2026-08-23: opens with an explicit action line. 132 of these had
+            # delivered to jobflow_firehose reading like pipeline progress —
+            # Diego's complaint that "jobs are being input in ATS but nothing
+            # shows in Applying" traced to exactly this ambiguity: a block is
+            # not a submission attempt in flight, it is a question only a
+            # human can answer.
             from events.formatting import (
                 blocked_question_line,
                 blocked_question_options_block,
             )
             lines = [
+                "Action needed: answer this question to unblock the application.",
+                "",
                 f"Company: {p.get('company', '?')}",
                 f"Title: {p.get('title', '?')}",
                 f"Question: {blocked_question_line(p)}",
