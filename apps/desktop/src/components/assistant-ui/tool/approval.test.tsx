@@ -171,6 +171,11 @@ describe('PendingToolApproval', () => {
   // token, so without the attribute its text and Run/Reject controls wash out over
   // whatever sits behind the window — the one prompt a user must read correctly
   // before granting a command.
+  //
+  // The inline approval bar (InlineApprovalBar in approval.tsx) doesn't need this
+  // attribute: it renders directly in the chat transcript flow with no background
+  // of its own, so it never floats independently over window glass the way this
+  // fallback card does.
   it('marks the floating fallback as a glass-raised surface so it stays legible over window glass', () => {
     setRequest('rm /tmp/hermes_approval_test.txt')
     const { container } = render(<PendingApprovalFallback />)
