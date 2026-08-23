@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react'
+import { useMemo, useSyncExternalStore } from 'react'
 
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
@@ -19,6 +19,8 @@ export interface ProjectsGroupingSnapshot {
 }
 
 export interface ProjectsGroupingContribution {
+  /** Keep the returned reference stable until the provider state changes.
+   *  The host also reuses structurally equivalent snapshots defensively. */
   getSnapshot(): ProjectsGroupingSnapshot
   subscribe(listener: () => void): () => void
   createGroup?(name: string): Promise<void> | void
@@ -109,26 +111,63 @@ function resolveProjectsGroupingFrom(
 const EMPTY_SUBSCRIBE = () => () => undefined
 const NULL_SNAPSHOT = () => null
 
-export function useProjectsGrouping(projects: readonly SidebarProjectTree[]): PresentedProjectsGrouping | null {
+function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingSnapshot): boolean {
+  if (left === right) return true
+  if (!Array.isArray(left.groups) || !Array.isArray(right.groups) || left.groups.length !== right.groups.length) {
+    return false
+  }
+
+  const leftGroups = left.groups as readonly ProjectGroupDescriptor[]
+  const rightGroups = right.groups as readonly ProjectGroupDescriptor[]
+  return leftGroups.every((group, index) => {
+    const other = rightGroups[index]
+    if (!group || !other || !Array.isArray(group.projectIds) || !Array.isArray(other.projectIds)) return false
+
+    const projectIds = group.projectIds as readonly string[]
+    const otherProjectIds = other.projectIds as readonly string[]
+    return (
+      group.id === other.id &&
+      group.label === other.label &&
+      group.collapsed === other.collapsed &&
+      projectIds.length === otherProjectIds.length &&
+      projectIds.every((projectId, projectIndex) => projectId === otherProjectIds[projectIndex])
+    )
+  })
+}
+
+function createStoreAdapter(contribution: ProjectsGroupingContribution) {
+  let cachedSnapshot: ProjectsGroupingSnapshot | undefined
+
+  return {
+    getSnapshot: () => {
+      const snapshot = contribution.getSnapshot()
+      if (cachedSnapshot && snapshotsEqual(cachedSnapshot, snapshot)) return cachedSnapshot
+      cachedSnapshot = snapshot
+      return snapshot
+    },
+    subscribe: (listener: () => void) => contribution.subscribe(listener)
+  }
+}
+
+function useProjectsGroupingStore() {
   useContributions(PROJECTS_GROUPING_AREA)
   const active = readValidProvider()
+  const contribution = active?.contribution ?? null
+  const store = useMemo(() => (contribution ? createStoreAdapter(contribution) : null), [contribution])
   const snapshot = useSyncExternalStore(
-    active ? active.contribution.subscribe : EMPTY_SUBSCRIBE,
-    active ? active.contribution.getSnapshot : NULL_SNAPSHOT,
-    active ? active.contribution.getSnapshot : NULL_SNAPSHOT
+    store?.subscribe ?? EMPTY_SUBSCRIBE,
+    store?.getSnapshot ?? NULL_SNAPSHOT,
+    store?.getSnapshot ?? NULL_SNAPSHOT
   )
 
-  if (!active || !snapshot || !Array.isArray(snapshot.groups)) return null
-  return resolveProjectsGroupingFrom(active.contribution, snapshot, projects)
+  return contribution && snapshot && Array.isArray(snapshot.groups) ? { contribution, snapshot } : null
+}
+
+export function useProjectsGrouping(projects: readonly SidebarProjectTree[]): PresentedProjectsGrouping | null {
+  const active = useProjectsGroupingStore()
+  return active ? resolveProjectsGroupingFrom(active.contribution, active.snapshot, projects) : null
 }
 
 export function useActiveProjectsGrouping() {
-  useContributions(PROJECTS_GROUPING_AREA)
-  const active = readValidProvider()
-  const snapshot = useSyncExternalStore(
-    active ? active.contribution.subscribe : EMPTY_SUBSCRIBE,
-    active ? active.contribution.getSnapshot : NULL_SNAPSHOT,
-    active ? active.contribution.getSnapshot : NULL_SNAPSHOT
-  )
-  return active && snapshot && Array.isArray(snapshot.groups) ? { contribution: active.contribution, snapshot } : null
+  return useProjectsGroupingStore()
 }

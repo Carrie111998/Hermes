@@ -1,3 +1,4 @@
+import { act, renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { registry } from '@/contrib/registry'
@@ -6,7 +7,9 @@ import {
   type ProjectGroupDescriptor,
   PROJECTS_GROUPING_AREA,
   resolveProjectsGrouping,
-  type ProjectsGroupingContribution
+  type ProjectsGroupingContribution,
+  useActiveProjectsGrouping,
+  useProjectsGrouping
 } from './projects-presentation'
 import type { SidebarProjectTree } from './projects'
 
@@ -75,5 +78,66 @@ describe('Projects grouping contribution', () => {
 
     expect(resolveProjectsGrouping([project('a'), project('b')])?.groups[0].id).toBe('early')
     expect(getSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps class-provider receivers in both reactive hooks', () => {
+    class ClassProvider implements ProjectsGroupingContribution {
+      private listeners = new Set<() => void>()
+      private snapshot = { groups: [{ id: 'one', label: 'One', projectIds: ['a'] }] }
+
+      getSnapshot() {
+        return this.snapshot
+      }
+
+      subscribe(listener: () => void) {
+        this.listeners.add(listener)
+        return () => this.listeners.delete(listener)
+      }
+
+      update() {
+        this.snapshot = { groups: [{ id: 'two', label: 'Two', projectIds: ['b'] }] }
+        this.listeners.forEach(listener => listener())
+      }
+    }
+
+    const contribution = new ClassProvider()
+    register(contribution)
+
+    const { result } = renderHook(() => ({
+      active: useActiveProjectsGrouping(),
+      presented: useProjectsGrouping([project('a'), project('b')])
+    }))
+
+    expect(result.current.active?.snapshot.groups[0].id).toBe('one')
+    expect(result.current.presented?.groups[0].projects).toEqual([project('a')])
+
+    act(() => contribution.update())
+
+    expect(result.current.active?.snapshot.groups[0].id).toBe('two')
+    expect(result.current.presented?.groups[0].projects).toEqual([project('b')])
+  })
+
+  it('stabilizes fresh equivalent snapshots returned by a defensive provider adapter', () => {
+    let groupId = 'one'
+    let listener: (() => void) | undefined
+    const contribution: ProjectsGroupingContribution = {
+      getSnapshot: () => ({ groups: [{ id: groupId, label: groupId, projectIds: ['a'] }] }),
+      subscribe: onChange => {
+        listener = onChange
+        return () => undefined
+      }
+    }
+    register(contribution)
+
+    const { result } = renderHook(() => useActiveProjectsGrouping())
+
+    expect(result.current?.snapshot.groups).toEqual([{ id: 'one', label: 'one', projectIds: ['a'] }])
+
+    act(() => {
+      groupId = 'two'
+      listener?.()
+    })
+
+    expect(result.current?.snapshot.groups).toEqual([{ id: 'two', label: 'two', projectIds: ['a'] }])
   })
 })

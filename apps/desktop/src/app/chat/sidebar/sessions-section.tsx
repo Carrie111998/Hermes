@@ -433,11 +433,15 @@ export function SidebarSessionsSection({
                 className="flex w-full items-center gap-1 px-2 pb-1 pt-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)"
                 disabled={!presented.contribution.setGroupCollapsed}
                 onClick={() => {
-                  const setCollapsed = presented.contribution.setGroupCollapsed
-                  if (!setCollapsed) return
-                  void Promise.resolve(setCollapsed(group.id, !group.collapsed)).catch(error =>
-                    notifyError(error, t.sidebar.projects.groupUpdateFailed)
-                  )
+                  if (!presented.contribution.setGroupCollapsed) return
+                  const onError = (error: unknown) => notifyError(error, t.sidebar.projects.groupUpdateFailed)
+                  try {
+                    void Promise.resolve(presented.contribution.setGroupCollapsed(group.id, !group.collapsed)).catch(
+                      onError
+                    )
+                  } catch (error) {
+                    onError(error)
+                  }
                 }}
                 type="button"
               >
