@@ -2352,7 +2352,8 @@ class CredentialPool:
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            entry = self._current_unlocked()
+        return self._try_refresh_entry(entry)
 
     def try_refresh_matching(
         self,
@@ -2392,18 +2393,20 @@ class CredentialPool:
                     entry = self._current_unlocked() or self._select_unlocked(
                         refresh=False
                     )[0]
-            if entry is None:
-                return None
-            self._current_id = entry.id
-            return self._try_refresh_current_unlocked()
+            if entry is not None:
+                self._current_id = entry.id
+        return self._try_refresh_entry(entry)
 
-    def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
-        entry = self._current_unlocked()
+    def _try_refresh_entry(
+        self, entry: Optional[PooledCredential]
+    ) -> Optional[PooledCredential]:
+        """Force one refresh without holding the pool lock over I/O."""
         if entry is None:
             return None
         refreshed = self._refresh_entry(entry, force=True)
         if refreshed is not None:
-            self._current_id = refreshed.id
+            with self._lock:
+                self._current_id = refreshed.id
         return refreshed
 
     def reset_statuses(self) -> int:
@@ -3297,7 +3300,11 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    authority = _auth_store_lock() if provider == "anthropic" else nullcontext()
+    authority = (
+        _auth_store_lock(timeout_seconds=25.0)
+        if provider == "anthropic"
+        else nullcontext()
+    )
     with authority:
         return _load_pool_under_authority(provider)
 

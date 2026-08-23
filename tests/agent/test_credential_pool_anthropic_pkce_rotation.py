@@ -120,6 +120,26 @@ def test_pkce_refresh_persists_rotated_singleton(tmp_path, monkeypatch):
     }
 
 
+def test_forced_refresh_releases_pool_lock_before_authority(monkeypatch):
+    entry = _pkce_entry()
+    pool = CredentialPool("anthropic", [entry])
+    pool._current_id = entry.id
+    observations = []
+
+    def refresh(candidate, *, force):
+        observations.append((candidate.id, force, pool._lock._is_owned()))
+        return candidate
+
+    monkeypatch.setattr(pool, "_refresh_entry", refresh)
+
+    assert pool.try_refresh_current() is entry
+    assert pool.try_refresh_matching(credential_id=entry.id) is entry
+    assert observations == [
+        (entry.id, True, False),
+        (entry.id, True, False),
+    ]
+
+
 def test_terminal_refresh_failure_adopts_newer_canonical_row(monkeypatch):
     stale = _pkce_entry(
         access_token="stale-access",
