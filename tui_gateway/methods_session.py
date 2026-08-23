@@ -177,7 +177,55 @@ def _(rid, params: dict) -> dict:
             # their own source.
             deny = frozenset({"kanban", "tool"})
 
+            # ``title``: EXACT-title registry lookup, not a listing. The core
+            # UNIQUE title index means at most one session per db carries a
+            # given exact title, so callers that treat a title as an identity
+            # key (Bot Mode's canonical "Bot Chat" — Profile → Named Session)
+            # get a window-free O(1) answer instead of scanning a recency
+            # window that a busy profile can push the row out of. Hidden rows
+            # resolve (canonical chats are born hidden); archived rows and
+            # deny-listed sources do not; compression lineages resolve to the
+            # live tip (``resolved_id``), mirroring profiles.list's
+            # canonical_session resolver. Older clients never send this param;
+            # newer clients falling back to older gateways just get the normal
+            # windowed listing back (the param is ignored) and scan it.
+            title_lookup = str(params.get("title") or "").strip()
+            if title_lookup:
+                row = db.get_session_by_title(title_lookup)
+                if (
+                    not row
+                    or row.get("archived")
+                    or (row.get("source") or "").strip().lower() in deny
+                ):
+                    return _ok(rid, {"sessions": []})
+                try:
+                    tip = db.resolve_resume_session_id(row["id"]) or row["id"]
+                except Exception:
+                    tip = row["id"]
+                tip_row = (db.get_session(tip) or row) if tip != row["id"] else row
+                return _ok(
+                    rid,
+                    {
+                        "sessions": [
+                            {
+                                "id": row["id"],
+                                "resolved_id": tip,
+                                "title": row.get("title") or "",
+                                "preview": tip_row.get("preview") or "",
+                                "started_at": row.get("started_at") or 0,
+                                "message_count": tip_row.get("message_count") or 0,
+                                "source": row.get("source") or "",
+                            }
+                        ]
+                    },
+                )
+
             limit = int(params.get("limit", 200) or 200)
+            # ``include_hidden``: surfaces that OWN hidden sessions (the Bots
+            # pane's per-profile browser, plugin session pickers) need to list
+            # them; the flag stays off for the resume picker and every other
+            # global caller so `hidden` keeps meaning "not in shared lists".
+            include_hidden = is_truthy_value(params.get("include_hidden", False))
             # Over-fetch modestly so per-source filtering doesn't leave us
             # short; the compression-tip projection in ``list_sessions_rich``
             # can also merge rows.
@@ -189,6 +237,7 @@ def _(rid, params: dict) -> dict:
                     limit=fetch_limit,
                     order_by_last_active=True,
                     compact_rows=True,
+                    include_hidden=include_hidden,
                 )
                 if (s.get("source") or "").strip().lower() not in deny
             ][:limit]
@@ -358,6 +407,54 @@ def _(rid, params: dict) -> dict:
                 # streams the whole turn anyway and the row exists by upgrade time.
                 found = {}
             else:
+                # LIVE lazy session: session.create intentionally persists no
+                # state.db row until the first prompt (no "Untitled" litter),
+                # so a resume by the stored key or pending title lands here for
+                # every never-messaged session. Bot Mode hits it on every fresh
+                # non-default bot — the canonical Bot Chat is created lazily on
+                # the profile, the open/send then resumes it, and this hard 404
+                # ("session not found") killed messaging for exactly the bots
+                # that had never spoken. Match the in-memory registry by stored
+                # key or pending title, scoped to the SAME profile home this
+                # resume targets, and hand the caller the live record.
+                # (Nested per method_ctx rebinding — module helpers are
+                # invisible from installed handlers.)
+                def _find_live_unpersisted(needle: str, home) -> str:
+                    want_home = str(home) if home is not None else None
+                    for live_sid, record in list(_sessions.items()):
+                        if not isinstance(record, dict):
+                            continue
+                        if (record.get("profile_home") or None) != want_home:
+                            continue
+                        if (
+                            str(record.get("session_key") or "") == needle
+                            or (record.get("pending_title") or "") == needle
+                        ):
+                            return live_sid
+                    return ""
+
+                live_sid = _find_live_unpersisted(target, profile_home)
+                live = _sessions.get(live_sid) if live_sid else None
+                if live is not None:
+                    if owns_db:
+                        with contextlib.suppress(Exception):
+                            db.close()
+                    live["last_active"] = time.time()
+                    history = live.get("history") or []
+                    return _ok(
+                        rid,
+                        {
+                            "session_id": live_sid,
+                            "stored_session_id": str(live.get("session_key") or ""),
+                            "message_count": len(history),
+                            "messages": [] if omit_messages else _history_to_messages(history),
+                            "info": {
+                                "model": _resolve_model(),
+                                "lazy": True,
+                                "profile_name": profile or "",
+                            },
+                        },
+                    )
                 return _err(rid, 4007, "session not found")
 
         # Follow the compression-continuation chain to the live tip so a resume on
@@ -812,7 +909,14 @@ def _(rid, params: dict) -> dict:
                     # leaves the old leak, which is survivable; closing under a
                     # live session is the permanent "Cannot operate on a closed
                     # database" break this patch exists to avoid.
-                    _transfer_db_to_agent(agent, db)
+                    #
+                    # The transfer itself is gated on owns_db: with no
+                    # non-launch profile selected this path resolved db to the
+                    # SHARED launch handle (_get_db()), and transferring it
+                    # made session.close() tear down the process-wide
+                    # database under every unrelated session (#91610).
+                    if owns_db:
+                        _transfer_db_to_agent(agent, db)
                     owns_db = False
                 finally:
                     if init_home_token is not None:
@@ -1190,23 +1294,44 @@ def _(rid, params: dict) -> dict:
     owns it — for plugins that manage their own sessions and don't want them
     cluttering the shared recents list. Flips the whole compression chain as a
     unit in the DB layer.
+
+    Resolution is two-tier: a LIVE runtime session id first (which also
+    covers the not-yet-persisted draft via the ``pending_hidden`` deferral),
+    then a durable stored id/key against the target profile's state.db —
+    plugins reconciling sessions they own (e.g. Bot Mode's hide sweep) hold
+    stored ids for chats that aren't live right now, and the live-only
+    lookup silently failed those with 4001.
     """
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
     hidden = is_truthy_value(params.get("hidden", True))
-    with _session_db(session) as db:
+    session, err = _sess_nowait(params, rid)
+    if session is not None:
+        with _session_db(session) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5007)
+            key = session["session_key"]
+            try:
+                changed = db.set_session_hidden(key, hidden)
+                if not changed:
+                    # No row yet (write deferred to the first prompt): remember the
+                    # intent so _ensure_session_db_row is born hidden, mirroring the
+                    # pending_title deferral.
+                    session["pending_hidden"] = hidden
+                return _ok(rid, {"hidden": hidden, "session_key": key})
+            except Exception as e:
+                return _err(rid, 5007, str(e))
+    # Durable fallback: a stored session id (or key) in the requested
+    # profile's db. ``resolve_session_id`` follows key/title aliases the
+    # same way the REST pin/archive path does.
+    target = str(params.get("session_id") or "").strip()
+    with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5007)
-        key = session["session_key"]
         try:
-            changed = db.set_session_hidden(key, hidden)
-            if not changed:
-                # No row yet (write deferred to the first prompt): remember the
-                # intent so _ensure_session_db_row is born hidden, mirroring the
-                # pending_title deferral.
-                session["pending_hidden"] = hidden
-            return _ok(rid, {"hidden": hidden, "session_key": key})
+            resolved = db.resolve_session_id(target) if hasattr(db, "resolve_session_id") else target
+            if not resolved:
+                return err
+            db.set_session_hidden(resolved, hidden)
+            return _ok(rid, {"hidden": hidden, "session_key": resolved})
         except Exception as e:
             return _err(rid, 5007, str(e))
 
