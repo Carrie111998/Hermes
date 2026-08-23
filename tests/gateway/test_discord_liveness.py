@@ -299,3 +299,96 @@ async def test_disconnect_cancels_liveness_task(monkeypatch):
     await adapter.disconnect()
     assert task.done()
     assert adapter._liveness_task is None
+
+
+@pytest.mark.asyncio
+async def test_liveness_loop_persists_live_health_record(monkeypatch):
+    """The liveness loop must call write_platform_live_health after each probe."""
+    adapter = _make_adapter(monkeypatch, interval=0.005, threshold=1)
+
+    def factory(**kwargs):
+        return _LiveBot(
+            intents=kwargs["intents"],
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        )
+
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter.write_platform_live_health",
+        lambda platform, health: persisted.append(health),
+    )
+
+    await _connect(adapter, monkeypatch, factory)
+
+    # Wait for at least one persist call
+    await _wait_until(
+        lambda: len(persisted) >= 1,
+        "liveness loop did not persist health record",
+    )
+
+    record = persisted[0]
+    assert record["websocket_state"] == "healthy"
+    assert record["healthy"] is True
+    assert "checked_at" in record
+    assert "latency" in record
+    assert isinstance(record["latency"], float)
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_liveness_loop_persists_unhealthy_state(monkeypatch):
+    """When the WebSocket is unhealthy, the persisted record must reflect that."""
+    adapter = _make_adapter(monkeypatch, interval=0.005, threshold=1, max_ack_age=0.01)
+
+    def factory(**kwargs):
+        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
+        _set_websocket_health(bot, ack_age=3600)
+        return bot
+
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter.write_platform_live_health",
+        lambda platform, health: persisted.append(health),
+    )
+
+    handler = AsyncMock()
+    adapter.set_fatal_error_handler(handler)
+    await _connect(adapter, monkeypatch, factory)
+
+    await _wait_until(
+        lambda: len(persisted) >= 1,
+        "liveness loop did not persist unhealthy record",
+    )
+
+    record = persisted[0]
+    assert record["websocket_state"] == "ack_stale"
+    assert record["healthy"] is False
+    assert "checked_at" in record
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_writes_terminal_health_record(monkeypatch):
+    """disconnect() must write a terminal health record before tearing down."""
+    adapter = _make_adapter(monkeypatch, interval=60, threshold=3)
+
+    def factory(**kwargs):
+        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
+        bot.fetch_user = AsyncMock()
+        return bot
+
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter.write_platform_live_health",
+        lambda platform, health: persisted.append(health),
+    )
+
+    await _connect(adapter, monkeypatch, factory)
+    await adapter.disconnect()
+
+    # The terminal record should be the last one written
+    assert len(persisted) >= 1
+    terminal = persisted[-1]
+    assert terminal["websocket_state"] == "disconnected"
+    assert terminal["healthy"] is False
+    assert "checked_at" in terminal

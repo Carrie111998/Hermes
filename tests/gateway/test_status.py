@@ -365,6 +365,59 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_platform_live_health_persists_to_platform_record(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        health = {
+            "websocket_state": "healthy",
+            "healthy": True,
+            "checked_at": "2026-08-22T12:00:00+00:00",
+            "latency": 0.05,
+            "ack_age": 2.1,
+        }
+        status.write_platform_live_health("discord", health)
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["discord"]["live_health"] == health
+
+    def test_write_platform_live_health_preserved_across_lifecycle_transitions(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        # Write initial health
+        status.write_platform_live_health("discord", {
+            "websocket_state": "healthy",
+            "healthy": True,
+            "checked_at": "2026-08-22T12:00:00+00:00",
+        })
+
+        # Lifecycle transition that doesn't touch live_health
+        status.write_runtime_status(
+            platform="discord",
+            platform_state="connected",
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["discord"]["state"] == "connected"
+        assert payload["platforms"]["discord"]["live_health"]["websocket_state"] == "healthy"
+
+    def test_write_platform_live_health_overwrites_previous(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_platform_live_health("discord", {
+            "websocket_state": "healthy",
+            "healthy": True,
+            "checked_at": "2026-08-22T12:00:00+00:00",
+        })
+        status.write_platform_live_health("discord", {
+            "websocket_state": "ack_stale",
+            "healthy": False,
+            "checked_at": "2026-08-22T12:00:15+00:00",
+        })
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["discord"]["live_health"]["websocket_state"] == "ack_stale"
+        assert payload["platforms"]["discord"]["live_health"]["healthy"] is False
+
 
 class TestGetProcessStartTime:
     """Start-time fingerprint backing the PID-reuse guard (#43846 / #50468).
