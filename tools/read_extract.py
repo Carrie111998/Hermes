@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import xml.parsers.expat
 import zipfile
 from pathlib import Path
 from typing import Any, Optional
@@ -57,6 +58,12 @@ _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+# Precompiled regex that matches DOCTYPE or ENTITY declarations in an XML
+# prolog/Dtd. This is used to reject billion-laughs / XXE payloads before the
+# stdlib parser is invoked, without adding a hard dependency on defusedxml.
+_DTD_ENTITY_RE = re.compile(rb"<!\s*(DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
 class ExtractionError(Exception):
@@ -546,9 +553,47 @@ def _extract_notebook(path: str) -> str:
     return "\n".join(out).rstrip("\n") + "\n"
 
 
+def _parse_xml(data: bytes) -> ET.Element:
+    """Parse XML bytes, rejecting documents that declare a DTD or entity.
+
+    ``xml.etree.ElementTree`` does not safely handle internal/external
+    entity expansion by default (S314 / billion-laughs / XXE). We pre-screen
+    every payload for ``<!DOCTYPE ...>`` / ``<!ENTITY ...>`` declarations;
+    any match is confirmed by a short Expat pass that distinguishes real
+    declarations from the same substring appearing in escaped text or
+    comments. Documents without declarations use the normal parser.
+    """
+    if _DTD_ENTITY_RE.search(data):
+        _confirm_no_dtd_or_entity(data)
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError:
+        raise
+
+
+def _confirm_no_dtd_or_entity(data: bytes) -> None:
+    """Raise ``ET.ParseError`` if the data declares a DTD or entity."""
+    class _UnsafeXML(Exception):
+        pass
+
+    def _reject(*_args, **_kwargs):
+        raise _UnsafeXML()
+
+    parser = xml.parsers.expat.ParserCreate()
+    parser.StartDoctypeDeclHandler = _reject
+    parser.EntityDeclHandler = _reject
+    try:
+        parser.Parse(data, True)
+    except _UnsafeXML:
+        raise ET.ParseError("XML DTD/entity declarations are not supported")
+    except xml.parsers.expat.ExpatError:
+        # Let ElementTree surface the real parse-error details.
+        return
+
+
 def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
     try:
-        return ET.fromstring(zf.read(name))
+        return _parse_xml(zf.read(name))
     except KeyError as exc:
         raise ExtractionError(f"Missing {name}") from exc
     except ET.ParseError as exc:
@@ -618,7 +663,7 @@ def _shared_strings(zf: zipfile.ZipFile, names: set[str]) -> list[str]:
     if "xl/sharedStrings.xml" not in names:
         return []
     try:
-        root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+        root = _parse_xml(zf.read("xl/sharedStrings.xml"))
     except ET.ParseError:
         return []
     s = f"{{{_NS_S}}}"
@@ -639,7 +684,7 @@ def _workbook_rels(zf: zipfile.ZipFile, names: set[str]) -> dict[str, str]:
     if rels_path not in names:
         return {}
     try:
-        root = ET.fromstring(zf.read(rels_path))
+        root = _parse_xml(zf.read(rels_path))
     except ET.ParseError:
         return {}
     rel_tag = f"{{{_NS_PKG_REL}}}Relationship"
@@ -661,7 +706,7 @@ def _col_index(ref: str) -> int:
 
 
 def _sheet_rows(xml_bytes: bytes, shared: list[str]) -> list[list[str]]:
-    root = ET.fromstring(xml_bytes)
+    root = _parse_xml(xml_bytes)
     s = f"{{{_NS_S}}}"
     rows: list[list[str]] = []
     for row in root.iter(f"{s}row"):
