@@ -452,6 +452,11 @@ hermes_cli = ["observability/schemas/*.json", "data/*.json"]
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+# The autopilot deception-pattern dictionary ships beside its module so the
+# detector can load it at runtime (agent/autopilot/deception.py). Without this
+# the wheel carries the .py but not the .yaml and the detector falls back to an
+# empty dictionary.
+agent = ["autopilot/deception_patterns.yaml"]
 # Bundled plugin discovery reads these manifests at runtime. Keep them in
 # sealed wheels with the plugin Python modules; without this declaration the
 # wheel contains adapters but discovery finds zero bundled plugins.

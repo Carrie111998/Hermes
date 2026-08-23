@@ -5368,6 +5368,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Agent will be initialized on first use
         self.agent: Optional[Any] = None
+        # Autopilot (engine-enforced goal-chasing) session state. Seeded from the
+        # --autopilot flag / HERMES_AUTOPILOT env or config.autopilot; toggled
+        # live via /autopilot. Tuning knobs bridge config -> the env vars the
+        # driver (agent/autopilot) reads.
+        _ap_cfg = (self.config.get("autopilot") or {}) if isinstance(getattr(self, "config", None), dict) else {}
+        self._autopilot_on = (
+            os.environ.get("HERMES_AUTOPILOT", "").strip().lower() in ("1", "true", "yes", "on")
+            or bool(_ap_cfg.get("enabled", False))
+        )
+        self._autopilot_goal = ""
+        if self._autopilot_on:
+            os.environ.setdefault("HERMES_AUTOPILOT", "1")
+        if _ap_cfg.get("max_continuations") not in (None, ""):
+            os.environ.setdefault("AUTOPILOT_MAX_CONTINUATIONS", str(_ap_cfg.get("max_continuations")))
+        if _ap_cfg.get("no_progress_k") not in (None, ""):
+            os.environ.setdefault("AUTOPILOT_NO_PROGRESS_K", str(_ap_cfg.get("no_progress_k")))
+        if _ap_cfg.get("council_model"):
+            os.environ.setdefault("AUTOPILOT_COUNCIL_MODEL", str(_ap_cfg.get("council_model")))
+        if _ap_cfg.get("adr"):
+            os.environ.setdefault("HERMES_AUTOPILOT_ADR", "1")
+        elif _ap_cfg.get("adr") is False:
+            # Explicit opt-out must propagate: the live default is ON, so a config
+            # adr:false has to set the env to "0" or it would be silently ignored.
+            os.environ.setdefault("HERMES_AUTOPILOT_ADR", "0")
+        if _ap_cfg.get("adr_path"):
+            os.environ.setdefault("AUTOPILOT_ADR_PATH", str(_ap_cfg.get("adr_path")))
+        if _ap_cfg.get("adr_project_copy") is False:
+            os.environ.setdefault("AUTOPILOT_ADR_PROJECT_COPY", "0")
+        if _ap_cfg.get("adr_project_subdir"):
+            os.environ.setdefault("AUTOPILOT_ADR_PROJECT_SUBDIR", str(_ap_cfg.get("adr_project_subdir")))
+        if _ap_cfg.get("reinforce_every_n") not in (None, ""):
+            os.environ.setdefault("AUTOPILOT_REINFORCE_EVERY_N", str(_ap_cfg.get("reinforce_every_n")))
+        if _ap_cfg.get("refinement_churn_k") not in (None, ""):
+            os.environ.setdefault("AUTOPILOT_REFINEMENT_CHURN_K", str(_ap_cfg.get("refinement_churn_k")))
+        if _ap_cfg.get("synthesize_contract_floor") is False:
+            os.environ.setdefault("AUTOPILOT_SYNTH_CONTRACT_FLOOR", "0")
+        if _ap_cfg.get("goal_document") is False:
+            os.environ.setdefault("AUTOPILOT_GOAL_DOCUMENT", "0")
+        if _ap_cfg.get("ledger") is False:
+            os.environ.setdefault("AUTOPILOT_LEDGER", "0")
         self._tool_callbacks_installed = False
         self._tirith_security_checked = False
         self._app = None  # prompt_toolkit Application (set in run())
@@ -7112,6 +7152,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                if getattr(self, "_autopilot_on", False):
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-yolo", "🤖 AUTO"))
                 frags.append(("class:status-bar", " "))
             else:
                 percent = snapshot["context_percent"]
@@ -7152,6 +7195,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if getattr(self, "_autopilot_on", False):
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-yolo", "🤖 AUTO"))
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
@@ -7213,6 +7259,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if getattr(self, "_autopilot_on", False):
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-yolo", "🤖 AUTO"))
                     frags.append(("class:status-bar", " "))
 
             # Stash indicator (📌 N) — appended after all width tiers so the
@@ -12103,6 +12152,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_footer_command(cmd_original)
         elif canonical == "yolo":
             self._toggle_yolo()
+        elif canonical == "autopilot":
+            self._toggle_autopilot(cmd_original)
         elif canonical == "approvals":
             self._handle_approvals_command(cmd_original)
         elif canonical == "reasoning":
@@ -13094,6 +13145,144 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # field after the failure.
         session_key = getattr(self, "session_id", None) or "default"
         return is_session_yolo_enabled(session_key)
+
+    def _toggle_autopilot(self, cmd_original: str = ""):
+        """Toggle autopilot (engine-enforced goal-chasing).
+
+        When ON, the agent keeps working until an independent Hermes Council pass
+        confirms the goal is verifiably complete, and clarify questions are
+        auto-answered with the most-recommended choice. Enforcement (the engine
+        layer in ``agent/autopilot``) takes effect immediately; the cooperating
+        system-prompt note applies next session to preserve prompt caching.
+
+        Usage:
+            /autopilot                 toggle on/off
+            /autopilot on|off|status   explicit
+            /autopilot goal <text>     set the goal to chase (and enable)
+            /autopilot goal            show the current autopilot goal
+            /autopilot clear           clear the autopilot goal
+
+        The goal is set ONLY via the explicit ``goal`` subcommand. A bare
+        positional argument is no longer treated as a goal (that overload made
+        ``/autopilot off now`` silently ENABLE with goal "off now"). When no
+        autopilot goal is set, the engine falls back to the active standing
+        ``/goal`` for the session, then the current task.
+        """
+        from hermes_cli.colors import Colors as _Colors
+        parts = (cmd_original or "").strip().split(maxsplit=2)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        if sub in ("status", "?"):
+            state = "ON" if self._autopilot_on else "OFF"
+            extra = f" Goal: {self._autopilot_goal}" if self._autopilot_goal else ""
+            _cprint(f"  🤖 Autopilot is {state}.{extra}")
+            return
+
+        if sub == "clear":
+            self._autopilot_goal = ""
+            if self.agent is not None:
+                self.agent._autopilot_goal = ""
+            _cprint("  🎯 Autopilot goal cleared.")
+            return
+
+        if sub == "goal":
+            goal_text = parts[2].strip() if len(parts) > 2 else ""
+            if not goal_text:
+                if self._autopilot_goal:
+                    _cprint(f"  🎯 Autopilot goal: {self._autopilot_goal}")
+                    _cprint(f"  {_Colors.DIM}/autopilot clear to remove it.{_Colors.RESET}")
+                else:
+                    _cprint("  🎯 No autopilot goal set. Usage: /autopilot goal <text>")
+                return
+            if goal_text.lower() == "clear":
+                self._autopilot_goal = ""
+                if self.agent is not None:
+                    self.agent._autopilot_goal = ""
+                _cprint("  🎯 Autopilot goal cleared.")
+                return
+            self._autopilot_goal = goal_text
+            if self.agent is not None:
+                self.agent._autopilot_goal = goal_text
+            _cprint(f"  🎯 Autopilot goal: {goal_text}")
+            new_state = True
+        elif sub in ("on", "enable", "1", "true", "yes"):
+            new_state = True
+        elif sub in ("off", "disable", "0", "false", "no"):
+            new_state = False
+        elif sub == "":
+            new_state = not self._autopilot_on
+        else:
+            # Unknown argument: do NOT silently enable with a goal (the old
+            # footgun). Show usage and leave state unchanged.
+            _cprint(
+                f"  {_Colors.DIM}Usage: /autopilot [on|off|status|goal <text>|clear]"
+                f"{_Colors.RESET}"
+            )
+            return
+
+        self._autopilot_on = new_state
+        os.environ["HERMES_AUTOPILOT"] = "1" if new_state else ""
+        if self.agent is not None:
+            self.agent.autopilot_mode = new_state
+        if new_state:
+            _cprint(
+                f"  🤖 Autopilot {_Colors.BOLD}{_Colors.GREEN}ON{_Colors.RESET}"
+                " working until the goal is verified complete (Council-checked)."
+                " /autopilot to stop."
+            )
+            # Autopilot is otherwise reactive (it engages at the END of a running
+            # turn via the engine's continuation seam). If the user flips it on
+            # while the conversation is idle, kick one resume turn so it actually
+            # starts driving instead of waiting for the next manual message.
+            self._maybe_kick_autopilot()
+        else:
+            _cprint(
+                f"  🤖 Autopilot {_Colors.BOLD}{_Colors.RED}OFF{_Colors.RESET}"
+                " I'll deliver and stop normally."
+            )
+
+    def _maybe_kick_autopilot(self) -> None:
+        """Resume work when /autopilot is enabled while the session is idle.
+
+        Injects a single continuation turn onto ``_pending_input`` so the
+        engine's within-turn goal-chasing (see agent/autopilot) can drive the
+        existing work to completion. No-op while a turn is already running (the
+        engine handles that case), when there's nothing to resume, or when the
+        user already has input queued.
+        """
+        try:
+            if self.agent is None or getattr(self, "_agent_running", False):
+                return
+            pending = getattr(self, "_pending_input", None)
+            if pending is not None and not pending.empty():
+                return
+            goal = (getattr(self, "_autopilot_goal", "") or "").strip()
+            if not (self.conversation_history or []):
+                # Fresh session with no history yet. If an autopilot goal was set
+                # (e.g. `/autopilot goal <text>`), START it now by enqueuing the
+                # goal as the opening task: parity with how `/goal <text>` kicks
+                # a turn. Without this, `/autopilot goal <text>` on a cold session
+                # set the goal + enabled autopilot but nothing ran until the user
+                # manually sent a message (the "autopilot didn't work" report).
+                # Only ask for a task when there is no goal to start from either.
+                if goal:
+                    self._pending_input.put(goal)
+                    _cprint("  ↻ Autopilot: starting on goal…")
+                    return
+                _cprint(
+                    "  ↳ Send a task and I'll keep working until it's verifiably done."
+                )
+                return
+            # Seed the resume with THIS session's verbatim tail so autopilot
+            # continues the actual work-in-flight instead of inferring the
+            # project from the goal wording (which caused a cross-project
+            # derailment, see agent/autopilot/resume.py).
+            from agent.autopilot.resume import build_resume_kick
+            kick = build_resume_kick(goal, self.conversation_history or [])
+            self._pending_input.put(kick)
+            _cprint("  ↻ Autopilot: resuming work…")
+        except Exception as exc:  # noqa: BLE001 never break the toggle
+            logging.debug("autopilot kick failed: %s", exc)
 
     def _toggle_yolo(self):
         """Toggle YOLO mode — skip all dangerous command approval prompts.

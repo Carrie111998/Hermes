@@ -556,6 +556,13 @@ class CLIAgentSetupMixin:
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
+            # Overlay: apply session autopilot state to the (re)created agent
+            # so a /autopilot toggle survives model/route changes that rebuild
+            # the agent.
+            if getattr(self, "_autopilot_on", False):
+                self.agent.autopilot_mode = True
+            if getattr(self, "_autopilot_goal", ""):
+                self.agent._autopilot_goal = self._autopilot_goal
             # Hydrate credits notices at session OPEN (parity with the TUI), so a
             # depletion / usage-band warning shows before the first message. The
             # notice_callback is bound above → _on_notice renders the line. Idempotent

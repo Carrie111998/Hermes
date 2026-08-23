@@ -3191,6 +3191,13 @@ def cmd_chat(args):
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
+    # --autopilot: engine-enforced goal-chasing + system-prompt no-ask contract.
+    # Implies --yolo for unattended ergonomics (no point suppressing the model's
+    # questions if the bash sandbox still prompts). See agent/autopilot/.
+    if getattr(args, "autopilot", False):
+        os.environ["HERMES_AUTOPILOT"] = "1"
+        os.environ["HERMES_YOLO_MODE"] = "1"
+
     # --ignore-user-config: make load_cli_config() / load_config() skip the
     # user's ~/.hermes/config.yaml and return built-in defaults. Set BEFORE
     # importing cli (which runs `CLI_CONFIG = load_cli_config()` at module
@@ -11718,7 +11725,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "autopilot", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
@@ -11891,6 +11898,9 @@ def _prepare_agent_startup(args) -> None:
     # (#60328).
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "autopilot", False):
+        os.environ["HERMES_AUTOPILOT"] = "1"
+        os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
@@ -12051,6 +12061,9 @@ def _try_fast_chat_launch() -> bool:
         return False
 
     if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "autopilot", False):
+        os.environ["HERMES_AUTOPILOT"] = "1"
         os.environ["HERMES_YOLO_MODE"] = "1"
     _prepare_agent_startup(args)
 
@@ -12543,6 +12556,19 @@ def main():
 
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
+
+    # =========================================================================
+    # autopilot command, inspect/grow the deception dictionary
+    # =========================================================================
+    autopilot_parser = subparsers.add_parser(
+        "autopilot",
+        help="Autopilot maintenance: harvest the deception dictionary from ADR logs",
+        description="Inspect and grow the autopilot anti-deception dictionary. "
+        "`harvest-deceptions` mines the ADR decision logs for caught "
+        "deceptions and surfaces novel phrasings to promote.",
+    )
+    from hermes_cli.autopilot_cmd import register_cli as _register_autopilot_cli
+    _register_autopilot_cli(autopilot_parser)
 
     # =========================================================================
     # model command  (parser built in hermes_cli/subcommands/model.py)
