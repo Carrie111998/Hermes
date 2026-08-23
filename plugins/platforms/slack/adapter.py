@@ -18,6 +18,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
 import aiohttp
@@ -66,6 +67,36 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_slack_display_text(value: str) -> str:
+    """Normalize Slack fallback/rich text for duplicate detection.
+
+    Slack stores the same authored message in both ``text`` and Block Kit.
+    Formatting and link syntax differ between those representations, so a
+    literal containment check can append the full message twice to thread
+    context. This canonical form is comparison-only; user-visible text keeps
+    its original formatting.
+    """
+    value = re.sub(r"<(?:mailto:)?[^>|]+\|([^>]+)>", r"\1", value)
+    value = re.sub(r"<(https?://[^>]+)>", r"\1", value)
+    value = re.sub(r"[`*_~]", "", value)
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _slack_texts_equivalent(left: str, right: str) -> bool:
+    left_norm = _canonical_slack_display_text(left)
+    right_norm = _canonical_slack_display_text(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    length_ratio = min(len(left_norm), len(right_norm)) / max(
+        len(left_norm), len(right_norm)
+    )
+    return length_ratio >= 0.85 and SequenceMatcher(
+        None, left_norm, right_norm, autojunk=False
+    ).ratio() >= 0.94
 
 # User-Agent prefix for outbound Slack API calls so platform partners can
 # identify HermesAgent traffic — matching other Hermes outbound surfaces
@@ -7657,7 +7688,7 @@ class SlackAdapter(BasePlatformAdapter):
         extras: list[str] = []
         if blocks:
             rich_text = _extract_text_from_slack_blocks(blocks).strip()
-            if rich_text and rich_text not in msg_text:
+            if rich_text and not _slack_texts_equivalent(rich_text, msg_text):
                 extras.append(rich_text)
             for block in blocks:
                 block_type = (block or {}).get("type", "")
@@ -7665,7 +7696,14 @@ class SlackAdapter(BasePlatformAdapter):
                     text_obj = block.get("text") or {}
                     if isinstance(text_obj, dict):
                         section_text = (text_obj.get("text") or "").strip()
-                        if section_text and section_text not in msg_text and all(section_text not in e for e in extras):
+                        if (
+                            section_text
+                            and not _slack_texts_equivalent(section_text, msg_text)
+                            and all(
+                                not _slack_texts_equivalent(section_text, extra)
+                                for extra in extras
+                            )
+                        ):
                             extras.append(section_text)
         # Legacy ``attachments`` (Alertmanager, Grafana, PagerDuty, CI bots):
         # apps often post with an empty ``text`` and the real content in

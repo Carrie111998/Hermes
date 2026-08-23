@@ -4286,6 +4286,41 @@ class TestThreadImageContext:
         assert "[image: shelf.jpg]" in rendered
         assert "[file: specs.pdf (application/pdf)]" in rendered
 
+    def test_render_message_text_dedupes_plain_fallback_and_rich_blocks(self, adapter):
+        """Slack's text fallback and Block Kit copy must consume one context copy."""
+        msg = {
+            "text": (
+                "*Research done.* Personal cover: 1584 × 396 px. "
+                "See <https://www.linkedin.com/help/example|LinkedIn Help>. "
+                "Keep the lower-left clear and hand the verified brief to Nova."
+            ),
+            "blocks": [
+                {
+                    "type": "rich_text",
+                    "elements": [
+                        {
+                            "type": "rich_text_section",
+                            "elements": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Research done. Personal cover: 1584 × 396 px. "
+                                        "See LinkedIn Help. Keep the lower-left clear and "
+                                        "hand the verified brief to Nova."
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        rendered = adapter._render_message_text(msg)
+
+        assert rendered.count("Research done") == 1
+        assert rendered.count("Personal cover") == 1
+
 
     # -- integration: cold-start thread hydrate ----------------------------
 
