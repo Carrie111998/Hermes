@@ -2289,6 +2289,15 @@ def dispatch(
     try:
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            # Same progress bound the gateway/CLI/daemon ticks resolve, so a
+            # dashboard nudge cannot behave differently from a scheduled tick.
+            no_progress_timeout_seconds=(
+                kanban_db.resolve_no_progress_timeout_seconds(
+                    kanban_db.configured_kanban_setting(
+                        "no_progress_timeout_seconds"
+                    )
+                )
+            ),
         )
         # DispatchResult is a dataclass.
         try:
