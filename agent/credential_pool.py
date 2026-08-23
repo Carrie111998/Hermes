@@ -1351,7 +1351,14 @@ class CredentialPool:
                 self._mark_exhausted(entry, None)
             return None
 
-        # Codex, xAI, and Anthropic OAuth refresh tokens are single-use. The
+        # Hermes-managed PKCE grants need a cross-process refresh authority,
+        # but that authority must never nest the process-local pool lock. The
+        # dedicated path persists the canonical row while authoritative, then
+        # updates this pool only after releasing the file lock.
+        if self.provider == "anthropic" and entry.source == "hermes_pkce":
+            return self._refresh_hermes_pkce_entry(entry)
+
+        # Codex and xAI OAuth refresh tokens are single-use. The
         # sync→POST→write-back sequence below must run atomically across Hermes
         # processes: otherwise two processes can both adopt the same on-disk
         # token, both POST it, and the loser gets ``refresh_token_reused``.
@@ -1360,13 +1367,11 @@ class CredentialPool:
         # resolve_codex_runtime_credentials()).  When a waiter finally acquires
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
-        if self.provider in ("openai-codex", "xai-oauth", "anthropic"):
+        if self.provider in ("openai-codex", "xai-oauth"):
             sync_entry = (
                 self._sync_codex_entry_from_auth_store
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
-                if self.provider == "xai-oauth"
-                else self._sync_anthropic_entry_from_pool_store
             )
             with _auth_store_lock(
                 timeout_seconds=self._single_use_refresh_lock_timeout()
@@ -1385,6 +1390,94 @@ class CredentialPool:
                     return synced
                 return self._refresh_entry_impl(synced, force=force)
         return self._refresh_entry_impl(entry, force=force)
+
+    def _refresh_hermes_pkce_entry(
+        self, entry: PooledCredential
+    ) -> Optional[PooledCredential]:
+        """Refresh one canonical PKCE generation without lock-order inversion."""
+        result: Optional[PooledCredential] = None
+        refresh_failed = False
+        with _auth_store_lock(
+            timeout_seconds=self._single_use_refresh_lock_timeout()
+        ):
+            persisted = next(
+                (
+                    payload
+                    for payload in read_credential_pool("anthropic")
+                    if isinstance(payload, dict) and payload.get("id") == entry.id
+                ),
+                None,
+            )
+            stored = (
+                PooledCredential.from_dict("anthropic", persisted)
+                if isinstance(persisted, dict)
+                else entry
+            )
+            if (
+                stored.access_token != entry.access_token
+                or stored.refresh_token != entry.refresh_token
+            ):
+                result = stored
+            else:
+                try:
+                    from agent.anthropic_adapter import (
+                        _write_hermes_oauth_credentials,
+                        refresh_anthropic_oauth_pure,
+                    )
+
+                    refreshed = refresh_anthropic_oauth_pure(
+                        stored.refresh_token, use_json=True
+                    )
+                    result = replace(
+                        stored,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        expires_at_ms=refreshed["expires_at_ms"],
+                        last_status=STATUS_OK,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    _write_hermes_oauth_credentials(
+                        result.access_token,
+                        result.refresh_token or "",
+                        int(result.expires_at_ms or 0),
+                    )
+                    write_credential_pool(
+                        "anthropic",
+                        [result.to_dict()],
+                        authoritative_ids=[result.id],
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Credential refresh failed for anthropic/%s: %s",
+                        entry.id,
+                        exc,
+                    )
+                    # Re-check once before treating this generation as dead.
+                    winner = next(
+                        (
+                            payload
+                            for payload in read_credential_pool("anthropic")
+                            if isinstance(payload, dict)
+                            and payload.get("id") == entry.id
+                        ),
+                        None,
+                    )
+                    if isinstance(winner, dict):
+                        candidate = PooledCredential.from_dict("anthropic", winner)
+                        if candidate.refresh_token != entry.refresh_token:
+                            result = candidate
+                    refresh_failed = result is None
+
+        if result is not None:
+            self._replace_entry(entry, result)
+            return result
+        if refresh_failed:
+            self._mark_exhausted(entry, None)
+        return None
 
     def _single_use_refresh_lock_timeout(self) -> float:
         """Lock timeout for single-use-refresh-token providers.
