@@ -195,6 +195,40 @@ async def test_clarify_falls_back_when_prompt_exceeds_platform_limit(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_oversize_multi_select_clarify_keeps_multi_select_instructions():
+    from tools import clarify_gateway as cg
+
+    clarify_id = "cl-oversize-multi"
+    session_key = "sess:oversize-multi"
+    choices = ["A" * 800, "B" * 800]
+    cg.register(
+        clarify_id,
+        session_key,
+        "Q" * 500,
+        choices,
+        multi_select=True,
+    )
+    adapter, stub = _adapter(platform="discord", max_message_length=2000)
+    try:
+        result = await adapter.send_clarify(
+            "c1",
+            "Q" * 500,
+            choices,
+            clarify_id,
+            session_key,
+        )
+
+        assert result.success is True
+        delivered = "".join(
+            action["content"] for action in stub.sent if action["op"] == "send"
+        )
+        assert "Multiple selections allowed" in delivered
+        assert 'separated by commas or spaces (e.g. "1, 3")' in delivered
+    finally:
+        cg.clear_session(session_key)
+
+
+@pytest.mark.asyncio
 async def test_oversize_clarify_fallback_does_not_seal_open_slack_draft():
     adapter, stub = _adapter(
         platform="slack",

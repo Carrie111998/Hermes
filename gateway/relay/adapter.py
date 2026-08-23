@@ -2856,13 +2856,29 @@ class RelayAdapter(BasePlatformAdapter):
             len_fn = self.message_len_fn_for_chat(chat_id)
             max_length = self.max_message_length_for_chat(chat_id)
             if len_fn(prompt_text) > max_length:
-                from tools.clarify_gateway import mark_awaiting_text
+                from tools import clarify_gateway as _cg
 
-                fallback_text = (
-                    f"{prompt_text}\n\n"
-                    "Reply with the number, the option text, or your own answer."
-                )
-                mark_awaiting_text(clarify_id)
+                is_multi = False
+                try:
+                    with _cg._lock:
+                        entry = _cg._entries.get(clarify_id)
+                    is_multi = bool(
+                        entry and getattr(entry, "multi_select", False)
+                    )
+                except Exception:
+                    is_multi = False
+                if is_multi:
+                    response_hint = (
+                        "Multiple selections allowed — reply with the numbers "
+                        "separated by commas or spaces (e.g. \"1, 3\"), the option "
+                        "text, or your own answer."
+                    )
+                else:
+                    response_hint = (
+                        "Reply with the number, the option text, or your own answer."
+                    )
+                fallback_text = f"{prompt_text}\n\n{response_hint}"
+                _cg.mark_awaiting_text(clarify_id)
                 chunks = self.truncate_message(
                     fallback_text,
                     max_length,
