@@ -220,21 +220,15 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
 
 def _migrate_to_15(results: Dict[str, Any], quiet: bool) -> None:
     # ── Version 14 → 15: add explicit gateway interim-message gate ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    display = config.get("display", {})
-    if not isinstance(display, dict):
-        display = {}
-    if "interim_assistant_messages" not in display:
-        display["interim_assistant_messages"] = True
-        config["display"] = display
-        results["config_added"].append("display.interim_assistant_messages=true (default)")
-        _persist_migration(config)
-        if not quiet:
-            print("  ✓ Added display.interim_assistant_messages=true")
+    # Historical note: this step used to write display.interim_assistant_
+    # messages=true for installs that lacked the key. That value equals the
+    # current schema default, so _persist_migration's strip-defaults
+    # invariant removed it again immediately — the step reported "✓ Added"
+    # while nothing landed on disk, and the intended pin never existed.
+    # Read-time deep-merge already supplies True, so the correct action is
+    # no write at all; the step is kept so the ladder position and the
+    # version bump stay stable.
+    _ = results, quiet
 
 
 def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
