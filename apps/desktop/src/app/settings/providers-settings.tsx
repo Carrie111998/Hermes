@@ -23,6 +23,7 @@ import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
+import { $settingsScopeProfile } from '@/store/settings-scope'
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 
 import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
@@ -340,7 +341,14 @@ export function ProvidersSettings({
   view
 }: ProvidersSettingsProps) {
   const { t } = useI18n()
-  const { rowProps, vars } = useEnvCredentials()
+  // Scope provider-key reads/writes to the active (or "Applies to"-selected)
+  // profile, mirroring the Keys page — otherwise a bare useEnvCredentials()
+  // forwards null, which capabilityScoped/profileScoped route to the base
+  // profile's .env instead of the active one (#92662). $settingsScopeProfile
+  // resolves to a concrete key (override ?? active), so a non-default profile's
+  // keys land in that profile and single-profile users still target base.
+  const scopeProfile = useStore($settingsScopeProfile)
+  const { rowProps, vars } = useEnvCredentials(scopeProfile)
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
   const [openProvider, setOpenProvider] = useState<null | string>(null)
   const [disconnecting, setDisconnecting] = useState<null | string>(null)

@@ -16,7 +16,10 @@ const onboarding = atom({ manual: false })
 vi.mock('@/hermes', () => ({
   disconnectOAuthProvider: (providerId: string) => disconnectOAuthProvider(providerId),
   getEnvVars: () => getEnvVars(),
-  listOAuthProviders: () => listOAuthProviders()
+  listOAuthProviders: () => listOAuthProviders(),
+  // The page now scopes credentials via $settingsScopeProfile, which pulls in
+  // @/store/profile; its subscriber calls setApiRequestProfile at import time.
+  setApiRequestProfile: () => undefined
 }))
 
 vi.mock('@/store/onboarding', () => ({
