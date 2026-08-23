@@ -26,6 +26,11 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_policy import (
+    KanbanCreationDenied,
+    current_profile_principal,
+    require_creation_allowed,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1541,6 +1546,13 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
+        require_creation_allowed(
+            current_profile_principal(), operation="kanban create"
+        )
+    except KanbanCreationDenied as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
+    try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
     except argparse.ArgumentTypeError as exc:
@@ -1608,6 +1620,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    try:
+        require_creation_allowed(
+            current_profile_principal(), operation="kanban swarm"
+        )
+    except KanbanCreationDenied as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
@@ -2067,6 +2086,13 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
+    try:
+        require_creation_allowed(
+            current_profile_principal(), operation="kanban link"
+        )
+    except KanbanCreationDenied as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
     with kb.connect_closing() as conn:
         kb.link_tasks(conn, args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
