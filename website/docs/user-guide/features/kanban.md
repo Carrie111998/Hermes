@@ -609,12 +609,20 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 
 | Key | Default | Purpose |
 |---|---|---|
+| `can_create` | `true` | Profile-level permission shared by agent tools, direct CLI create/link, swarm creation, and decomposer fan-out. Set `false` on analysis-only experts. Configuration errors fail closed. |
+| `dashboard_create_policy` | `"authenticated"` | Independent human policy for dashboard create/link. `authenticated` allows a human admitted by dashboard auth; `disabled` rejects these writes. An expert profile cannot use the dashboard surface to reinterpret its own permission. |
 | `auto_decompose` | `true` | Dispatcher auto-runs the built-in decomposer for Triage tasks every tick. It does not gate profile-driven `kanban_create` calls or creator wake turns. |
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+
+Tool definitions are byte-stable for a conversation to preserve prompt
+caching. If `can_create` changes during an existing session, the cached schema
+may still display `kanban_create`/`kanban_link`; their handlers nevertheless
+re-evaluate the central policy and refuse the write. Start a new session to
+refresh visibility.
 
 And the two auxiliary LLM slots:
 
