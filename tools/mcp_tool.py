@@ -99,6 +99,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -4215,6 +4216,43 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+
+# Credential-bearing config digest per live server.  When a server's config
+# changes (e.g. rotated token, fixed typo in a header), the digest shifts and
+# ``register_mcp_servers`` tears down the stale session before reconnecting
+# with the new credentials (#92565).  Keyed by server name; a missing entry
+# means "no digest recorded" (pre-upgrade session, left alone).
+_server_config_digests: Dict[str, str] = {}
+
+
+def _connection_identity(config: dict) -> str:
+    """SHA-256 digest of the credential-bearing parts of an MCP server config.
+
+    Two configs that differ only in non-credential fields (e.g. ``timeout``,
+    ``tools``, ``enabled``) produce the **same** digest so the common path
+    pays no extra handshake.  Only the digest is ever stored or logged — never
+    the raw credential values.
+    """
+    payload = {
+        "url": config.get("url"),
+        "command": config.get("command"),
+        "args": [str(a) for a in (config.get("args") or [])],
+        # Header names are case-insensitive on the wire; values are not.
+        "headers": sorted(
+            (k.lower(), v) for k, v in (config.get("headers") or {}).items()
+        ),
+        # POSIX env var names are case-sensitive — do NOT lowercase.
+        "env": sorted(
+            (k, v) for k, v in (config.get("env") or {}).items()
+        ),
+        # identity_header is resolved at connect time and carries per-user
+        # credentials (e.g. profile-mode resolves to the active profile name).
+        "identity_header": config.get("identity_header"),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
@@ -7204,6 +7242,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
+        _server_config_digests[name] = _connection_identity(config)
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -7241,6 +7280,47 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []
+
+    # Detect servers whose credential-bearing config has changed since the
+    # session was opened (e.g. rotated token, fixed header typo).  These must
+    # be torn down and reconnected with the new credentials (#92565).  A
+    # server with no recorded digest (pre-upgrade) is left alone so that
+    # upgrading does not look like a fault.
+    stale_by_digest: List[MCPServerTask] = []
+    with _lock:
+        for name, cfg in servers.items():
+            if name not in _servers:
+                continue
+            old_digest = _server_config_digests.get(name)
+            if old_digest is None:
+                # Pre-upgrade session — seed the digest so future credential
+                # changes are detected, but don't tear down this session.
+                _server_config_digests[name] = _connection_identity(cfg)
+                continue
+            new_digest = _connection_identity(cfg)
+            if old_digest != new_digest:
+                logger.info(
+                    "MCP server '%s' config changed (digest %s → %s); "
+                    "scheduling reconnect with new credentials",
+                    name, old_digest, new_digest,
+                )
+                stale_by_digest.append(_servers.pop(name))
+                _server_config_digests.pop(name, None)
+                _server_connecting.discard(name)
+                _server_connect_errors.pop(name, None)
+                _clear_connect_failure(name)
+
+    # Shut down stale sessions outside the lock (async, needs the MCP loop).
+    if stale_by_digest:
+        _ensure_mcp_loop()
+        for srv in stale_by_digest:
+            try:
+                _run_on_mcp_loop(srv.shutdown(), timeout=10)
+            except Exception as exc:
+                logger.debug(
+                    "MCP server '%s' shutdown during config-change reap failed: %s",
+                    srv.name, exc,
+                )
 
     # Only attempt servers that aren't already connected (or currently
     # connecting) and are enabled.  Checking ``_server_connecting`` prevents
@@ -7948,6 +8028,7 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            _server_config_digests.clear()
             # Drop connect-retry cooldowns too: a full shutdown/restart
             # should re-attempt every server immediately, not honour a
             # stale per-server backoff from before the restart (#50394).
@@ -7976,6 +8057,7 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
+        _server_config_digests.clear()
 
     _stop_mcp_loop()
 

@@ -2921,3 +2921,259 @@ class TestRedirectHeaderStripper:
         asyncio.run(hook(response))
         assert next_request.headers["authorization"] == "Bearer x"
         assert next_request.headers["x-tenant"] == "t"
+
+
+# ---------------------------------------------------------------------------
+# Connection identity digest (#92565)
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionIdentity:
+    """Verify _connection_identity produces correct, stable digests."""
+
+    def test_same_config_same_digest(self):
+        """Identical configs produce identical digests."""
+        from tools.mcp_tool import _connection_identity
+
+        cfg = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer tok123"},
+        }
+        assert _connection_identity(cfg) == _connection_identity(cfg)
+
+    def test_different_credential_different_digest(self):
+        """Changed credentials produce a different digest."""
+        from tools.mcp_tool import _connection_identity
+
+        cfg_a = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer old_token"},
+        }
+        cfg_b = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer new_token"},
+        }
+        assert _connection_identity(cfg_a) != _connection_identity(cfg_b)
+
+    def test_different_env_different_digest(self):
+        """Changed env vars produce a different digest (stdio servers)."""
+        from tools.mcp_tool import _connection_identity
+
+        cfg_a = {"command": "npx", "args": ["-y", "srv"], "env": {"TOKEN": "old"}}
+        cfg_b = {"command": "npx", "args": ["-y", "srv"], "env": {"TOKEN": "new"}}
+        assert _connection_identity(cfg_a) != _connection_identity(cfg_b)
+
+    def test_non_credential_field_same_digest(self):
+        """Changing timeout/tools/enabled does NOT change the digest."""
+        from tools.mcp_tool import _connection_identity
+
+        cfg_a = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer tok"},
+            "timeout": 30,
+        }
+        cfg_b = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer tok"},
+            "timeout": 180,
+            "tools": {"include": ["foo"]},
+            "enabled": True,
+        }
+        assert _connection_identity(cfg_a) == _connection_identity(cfg_b)
+
+    def test_header_names_case_insensitive(self):
+        """Header name casing doesn't affect the digest."""
+        from tools.mcp_tool import _connection_identity
+
+        cfg_a = {"url": "https://x.com/mcp", "headers": {"Authorization": "Bearer t"}}
+        cfg_b = {"url": "https://x.com/mcp", "headers": {"authorization": "Bearer t"}}
+        assert _connection_identity(cfg_a) == _connection_identity(cfg_b)
+
+    def test_empty_headers_and_env(self):
+        """Configs with no headers/env still produce a valid digest."""
+        from tools.mcp_tool import _connection_identity
+
+        cfg = {"command": "npx", "args": ["-y", "srv"]}
+        digest = _connection_identity(cfg)
+        assert isinstance(digest, str)
+        assert len(digest) == 16
+
+
+class TestRegisterMcpServersCredentialChange:
+    """Verify register_mcp_servers reconnects on credential change (#92565)."""
+
+    def test_reconnects_when_config_digest_changes(self):
+        """A server whose credentials changed is shut down and reconnected."""
+        from tools.mcp_tool import (
+            register_mcp_servers, _servers, _server_config_digests,
+            _ensure_mcp_loop, _connection_identity,
+        )
+
+        old_config = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer old_token"},
+        }
+        new_config = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer new_token"},
+        }
+
+        # Simulate an existing live server with the old config.
+        old_server = _make_mock_server("example")
+        old_server._registered_tool_names = ["mcp__example__tool1"]
+        _servers["example"] = old_server
+        _server_config_digests["example"] = _connection_identity(old_config)
+
+        connect_calls = []
+
+        async def fake_register(name, cfg):
+            connect_calls.append(name)
+            server = _make_mock_server(name)
+            server._registered_tool_names = [f"mcp__{name}__tool1"]
+            _servers[name] = server
+            _server_config_digests[name] = _connection_identity(cfg)
+            return [f"mcp__{name}__tool1"]
+
+        try:
+            # _run_on_mcp_loop is a sync function that schedules a coroutine
+            # on the MCP loop and blocks.  Our mock must actually run it.
+            def fake_run_loop(coro_or_factory, timeout=30):
+                if asyncio.iscoroutine(coro_or_factory):
+                    asyncio.run(coro_or_factory)
+                elif callable(coro_or_factory):
+                    asyncio.run(coro_or_factory())
+
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
+                 patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run_loop):
+                _ensure_mcp_loop()
+                register_mcp_servers({"example": new_config})
+
+            # New connection should have been attempted (old server was
+            # removed from _servers by the digest-change detection, so the
+            # name-based filter treated it as a new server).
+            assert "example" in connect_calls
+            # The new server should have the new digest
+            assert _server_config_digests.get("example") == _connection_identity(new_config)
+        finally:
+            _servers.pop("example", None)
+            _server_config_digests.pop("example", None)
+
+    def test_no_reconnect_when_config_unchanged(self):
+        """A server whose config hasn't changed is left alone."""
+        from tools.mcp_tool import (
+            register_mcp_servers, _servers, _server_config_digests,
+            _connection_identity,
+        )
+
+        config = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer token"},
+        }
+
+        existing_server = _make_mock_server("example")
+        existing_server._registered_tool_names = ["mcp__example__tool1"]
+        _servers["example"] = existing_server
+        _server_config_digests["example"] = _connection_identity(config)
+
+        connect_calls = []
+
+        async def fake_register(name, cfg):
+            connect_calls.append(name)
+            return []
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=["mcp__example__tool1"]):
+                register_mcp_servers({"example": config})
+
+            # Should NOT have attempted to reconnect
+            assert connect_calls == []
+            # Server should still be the same object
+            assert _servers["example"] is existing_server
+        finally:
+            _servers.pop("example", None)
+            _server_config_digests.pop("example", None)
+
+    def test_no_reconnect_when_no_recorded_digest(self):
+        """A pre-upgrade server (no digest) is left alone but gets seeded."""
+        from tools.mcp_tool import (
+            register_mcp_servers, _servers, _server_config_digests,
+            _connection_identity,
+        )
+
+        old_config = {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer old"}}
+        new_config = {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer new"}}
+
+        existing_server = _make_mock_server("example")
+        existing_server._registered_tool_names = ["mcp__example__tool1"]
+        _servers["example"] = existing_server
+        # No digest recorded (pre-upgrade)
+        assert "example" not in _server_config_digests
+
+        shutdown_called = []
+
+        async def fake_shutdown(self):
+            shutdown_called.append(self.name)
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool.MCPServerTask.shutdown", fake_shutdown), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=["mcp__example__tool1"]):
+                register_mcp_servers({"example": new_config})
+
+            # Should NOT have shut down the pre-upgrade server
+            assert shutdown_called == []
+            assert _servers["example"] is existing_server
+            # But the digest should now be seeded for future change detection
+            assert _server_config_digests["example"] == _connection_identity(new_config)
+        finally:
+            _servers.pop("example", None)
+            _server_config_digests.pop("example", None)
+
+    def test_digest_stored_on_successful_registration(self):
+        """A newly registered server gets its config digest stored."""
+        from tools.mcp_tool import (
+            _discover_and_register_server, _servers, _server_config_digests,
+            _connection_identity, MCPServerTask,
+        )
+
+        config = {"command": "npx", "args": ["-y", "srv"]}
+
+        async def fake_connect(name, cfg):
+            server = MCPServerTask(name)
+            server.session = MagicMock()
+            server._tools = [_make_mcp_tool("tool1")]
+            return server
+
+        try:
+            with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+                 patch("tools.registry.registry", MagicMock()):
+                asyncio.run(_discover_and_register_server("srv", config))
+
+            assert "srv" in _server_config_digests
+            assert _server_config_digests["srv"] == _connection_identity(config)
+        finally:
+            _servers.pop("srv", None)
+            _server_config_digests.pop("srv", None)
+
+    def test_shutdown_clears_digests(self):
+        """shutdown_mcp_servers clears the digest map."""
+        from tools.mcp_tool import (
+            shutdown_mcp_servers, _servers, _server_config_digests,
+        )
+
+        _servers["x"] = _make_mock_server("x")
+        _server_config_digests["x"] = "abc123"
+
+        try:
+            with patch("tools.mcp_tool._mcp_loop", None), \
+                 patch("tools.mcp_tool._mcp_thread", None):
+                shutdown_mcp_servers()
+
+            assert _server_config_digests == {}
+        finally:
+            _servers.pop("x", None)
+            _server_config_digests.pop("x", None)
