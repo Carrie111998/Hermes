@@ -23,6 +23,24 @@ def _replace_once(path: Path, old: str, new: str) -> None:
     path.write_text(content.replace(old, new, 1), encoding="utf-8")
 
 
+def _is_ambient_environment_access(node: ast.AST) -> bool:
+    if isinstance(node, ast.Attribute):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+            and node.attr in {"environ", "environb"}
+        )
+    if isinstance(node, ast.Call):
+        func = node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+            and func.attr in {"getenv", "getenvb", "putenv", "unsetenv"}
+        )
+    return False
+
+
 def _assert_no_broker_adjacent_ambient_reads(path: Path) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     findings: list[str] = []
@@ -42,17 +60,11 @@ def _assert_no_broker_adjacent_ambient_reads(path: Path) -> None:
         if not calls_broker:
             continue
         for node in ast.walk(function):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Attribute)
-                and isinstance(func.value.value, ast.Name)
-                and func.value.value.id == "os"
-                and func.value.attr == "environ"
-            ):
-                findings.append(f"{function.name}:{node.lineno}: os.environ.{func.attr}")
+            if _is_ambient_environment_access(node):
+                findings.append(
+                    f"{function.name}:{getattr(node, 'lineno', '?')}: "
+                    "direct ambient environment access"
+                )
     if findings:
         raise RuntimeError(
             f"{path}: broker-adjacent ambient environment reads remain: {findings}"
@@ -111,15 +123,22 @@ def _find_escape_hatches(path: Path) -> list[str]:
     return isinstance(node, ast.Constant) and node.value is False
 
 
-def _is_os_environ_method(node: ast.Call) -> bool:
-    func = node.func
-    return (
-        isinstance(func, ast.Attribute)
-        and isinstance(func.value, ast.Attribute)
-        and isinstance(func.value.value, ast.Name)
-        and func.value.value.id == "os"
-        and func.value.attr == "environ"
-    )
+def _is_ambient_environment_access(node: ast.AST) -> bool:
+    if isinstance(node, ast.Attribute):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+            and node.attr in {"environ", "environb"}
+        )
+    if isinstance(node, ast.Call):
+        func = node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+            and func.attr in {"getenv", "getenvb", "putenv", "unsetenv"}
+        )
+    return False
 
 
 def _function_calls_child_env_broker(node: ast.AST) -> bool:
@@ -148,9 +167,10 @@ def _find_escape_hatches(path: Path) -> list[str]:
         if not _function_calls_child_env_broker(function):
             continue
         for node in ast.walk(function):
-            if isinstance(node, ast.Call) and _is_os_environ_method(node):
+            if _is_ambient_environment_access(node):
                 findings.append(
-                    f"{rel}:{node.lineno}: ambient os.environ read beside child-env broker"
+                    f"{rel}:{getattr(node, 'lineno', '?')}: "
+                    "direct ambient environment access beside child-env broker"
                 )
 
     for node in ast.walk(tree):
