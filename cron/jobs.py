@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+from difflib import get_close_matches
 import json
 import logging
 import shutil
@@ -1800,10 +1801,12 @@ def _validate_provider_model_pair(
       follow global config, so there is nothing to validate).
     * Custom ``base_url`` providers are skipped entirely.
     * ``no_agent`` jobs have no inference, so they are skipped.
-    * An empty or missing ``provider_models_cache.json`` is treated as
-      “don’t know — don’t block” (best-effort, never a hard gate on a cold
-      cache).  Only a non-empty entry for the requested provider can
-      produce a hard rejection.
+    * An empty, missing, or **stale** (beyond the SWR window)
+      ``provider_models_cache.json`` entry is treated as “don’t know —
+      don’t block” (warning, not hard reject) so a model removed weeks ago
+      doesn't permanently block job creation.
+    * Provider-specific quirks (aliases, free-tier markers) live in
+      ``hermes_cli.models`` so cron validation stays generic.
     * When the model is not in the requested provider, the error suggests
       the correct provider(s) and close name matches (difflib), so the
       caller can fix the command on the spot.
@@ -1817,22 +1820,24 @@ def _validate_provider_model_pair(
     if not normalized_provider or not normalized_model:
         return
     try:
-        from hermes_cli.models import _load_provider_models_cache, normalize_provider
+        from hermes_cli.models import (
+            _load_provider_models_cache,
+            normalize_provider,
+            cron_free_tier_alternate_hint,
+            is_provider_cache_entry_stale,
+            resolve_cron_model_alias,
+        )
 
         cache = _load_provider_models_cache()
         if not cache:
             return
         provider_key = normalize_provider(normalized_provider)
-        # Unknown provider → hard reject with suggestions
         if provider_key not in cache:
             known = sorted(cache.keys())
-            from difflib import get_close_matches
-
             close = get_close_matches(provider_key, known, n=3, cutoff=0.6)
             msg = f"Unknown provider '{normalized_provider}'."
             if close:
                 msg += f" Did you mean: {', '.join(close)}?"
-            # Show a short sample of known providers; full list is via `hermes model`
             sample = ", ".join(known[:8])
             if len(known) > 8:
                 sample += ", ..."
@@ -1840,6 +1845,16 @@ def _validate_provider_model_pair(
             raise ValueError(msg)
 
         entry = cache.get(provider_key, {})
+        # Stale entry (beyond SWR window) is treated as "don't know" — log
+        # a warning and don't block, so a weeks-old removal doesn't
+        # permanently prevent job creation until the next live refresh.
+        if is_provider_cache_entry_stale(entry):
+            logger.debug(
+                "Provider-model validation skipped: cache entry for '%s' is stale (at=%s)",
+                provider_key,
+                entry.get("at") if isinstance(entry, dict) else None,
+            )
+            return
         models = entry.get("models", []) if isinstance(entry, dict) else []
         if not models:
             return
@@ -1848,58 +1863,35 @@ def _validate_provider_model_pair(
             s = str(m or "").strip().lower()
             return s.split("/")[-1] if "/" in s else s
 
-        # Alias: ox-alpha-free is the same model as x-preview-f-free on the
-        # free relay (historical naming drift). Treat them as interchangeable
-        # so validation doesn't flip-flop based on which name the cache saw.
-        _alias_map = {
-            "ox-alpha-free": "x-preview-f-free",
-            "ox-alpha": "x-preview-f-free",
-            "x-preview-f-free": "ox-alpha-free",
-        }
-
         model_lower = normalized_model.lower()
         models_lower = [str(m or "").lower() for m in models]
         models_stripped = [_strip_vendor(m) for m in models]
-        # Also consider alias for the requested model
-        _aliased_model = _alias_map.get(model_lower, model_lower)
+        _aliased_model = resolve_cron_model_alias(model_lower)
         _aliased_stripped = _strip_vendor(_aliased_model)
 
-        # Direct hit (exact, case-insensitive, alias, or vendor-prefix stripped)
         if (
             model_lower in models_lower
             or _aliased_model in models_lower
             or _strip_vendor(model_lower) in models_stripped
             or _aliased_stripped in models_stripped
         ):
-            # Free-tier models must run via the keyless provider; the
-            # authenticated opencode-go relay 401s any bearer it doesn't
-            # recognize (see opencode-free plugin).  Even though the cache
-            # may list e.g. ox-alpha-free on both relays, running it via
-            # opencode-go will fail every tick with "provider authentication
-            # error" and spam the drift alert — the exact bug this guard
-            # exists to prevent.  Detect the cross-wire and suggest the
-            # correct provider.
-            _free_markers = ("-free", ":free", "x-preview")
-            _is_free_model = any(m in model_lower for m in _free_markers) or model_lower in (
-                "ox-alpha-free",
-                "ox-alpha",
-            )
-            if _is_free_model and provider_key == "opencode-go":
-                # Check if opencode-free actually serves this model
+            hint = cron_free_tier_alternate_hint(normalized_provider, normalized_model)
+            if hint:
+                # Only raise if the alternate provider actually serves the model
+                # (avoid false positives when the free relay doesn't list it).
                 _free_entry = cache.get("opencode-free", {})
-                _free_models = _free_entry.get("models", []) if isinstance(_free_entry, dict) else []
-                _free_lower = [str(m or "").lower() for m in _free_models]
-                _free_stripped = [_strip_vendor(m) for m in _free_models]
-                if (
-                    model_lower in _free_lower
-                    or _strip_vendor(model_lower) in _free_stripped
-                    or model_lower == "ox-alpha-free"
-                ):
-                    raise ValueError(
-                        f"Model '{normalized_model}' is a free-tier model and must run via provider 'opencode-free' (keyless), "
-                        f"not '{normalized_provider}' (which sends an API key and will 401). "
-                        f"Try: --provider opencode-free --model {normalized_model}"
-                    )
+                if isinstance(_free_entry, dict) and not is_provider_cache_entry_stale(_free_entry):
+                    _free_models = _free_entry.get("models", [])
+                    _free_lower = [str(m or "").lower() for m in _free_models]
+                    _free_stripped = [_strip_vendor(m) for m in _free_models]
+                    _alias_free = resolve_cron_model_alias(model_lower)
+                    if (
+                        model_lower in _free_lower
+                        or _alias_free in _free_lower
+                        or _strip_vendor(model_lower) in _free_stripped
+                        or _strip_vendor(_alias_free) in _free_stripped
+                    ):
+                        raise ValueError(hint)
             return
 
         # Not in this provider — search which providers DO serve it
@@ -1910,23 +1902,26 @@ def _validate_provider_model_pair(
             plist = ent.get("models", [])
             plist_lower = [str(m or "").lower() for m in plist]
             plist_stripped = [_strip_vendor(m) for m in plist]
-            if model_lower in plist_lower or _strip_vendor(model_lower) in plist_stripped:
+            # Also consider alias for candidate search
+            if (
+                model_lower in plist_lower
+                or _aliased_model in plist_lower
+                or _strip_vendor(model_lower) in plist_stripped
+                or _aliased_stripped in plist_stripped
+            ):
                 candidates.append(p)
-
-        from difflib import get_close_matches
 
         close = get_close_matches(normalized_model, models, n=3, cutoff=0.6)
         if not close:
-            # Try on stripped forms (handles vendor-prefixed cache entries)
+            # Try on stripped forms (handles vendor-prefixed cache entries).
+            # Build a reverse map that preserves the first original for each
+            # stripped name so duplicate stripped forms don't always map to the
+            # same first entry via .index().
+            _stripped_to_original: dict[str, str] = {}
+            for orig, stripped in zip(models, models_stripped):
+                _stripped_to_original.setdefault(stripped, orig)
             close_stripped = get_close_matches(_strip_vendor(normalized_model), models_stripped, n=3, cutoff=0.6)
-            # Map back to original model names
-            close = []
-            for c in close_stripped:
-                try:
-                    idx = models_stripped.index(c)
-                    close.append(models[idx])
-                except ValueError:
-                    pass
+            close = [_stripped_to_original[c] for c in close_stripped if c in _stripped_to_original]
 
         parts = [f"Model '{normalized_model}' is not available on provider '{normalized_provider}'."]
         if candidates:

@@ -3573,6 +3573,80 @@ def provider_label(provider: Optional[str]) -> str:
     return _PROVIDER_LABELS.get(normalized, original or "OpenRouter")
 
 
+# ---------------------------------------------------------------------------
+# Cron provider-model validation helpers
+# ---------------------------------------------------------------------------
+# Provider quirks that would otherwise rot in generic cron/jobs.py are
+# centralized here, next to the provider registry they describe. Cron
+# validation stays generic; provider-specific knowledge lives with the
+# provider catalog.
+
+_CRON_MODEL_ALIASES: dict[str, str] = {
+    "ox-alpha-free": "x-preview-f-free",
+    "ox-alpha": "x-preview-f-free",
+    "x-preview-f-free": "ox-alpha-free",
+}
+
+_CRON_FREE_TIER_MARKERS: tuple[str, ...] = ("-free", ":free", "x-preview")
+
+
+def resolve_cron_model_alias(model_id: str) -> str:
+    """Resolve a historical cron model alias to its canonical cache name.
+
+    `ox-alpha-free` and `x-preview-f-free` are the same relay model under
+    two names; the cache may list either. Treat them as interchangeable so
+    validation doesn't flip-flop based on which name was cached.
+    """
+    return _CRON_MODEL_ALIASES.get(str(model_id or "").strip().lower(), str(model_id or "").strip().lower())
+
+
+def is_cron_free_tier_model(model_id: str) -> bool:
+    """Return True if the model is a free-tier variant (keyless relay).
+
+    Free-tier models must run via the keyless `opencode-free` relay; the
+    authenticated `opencode-go` relay 401s any bearer it doesn't recognize.
+    """
+    lower = str(model_id or "").strip().lower()
+    return any(m in lower for m in _CRON_FREE_TIER_MARKERS) or lower in (
+        "ox-alpha-free",
+        "ox-alpha",
+    )
+
+
+def cron_free_tier_alternate_hint(provider: str, model_id: str) -> str | None:
+    """Return a human hint when a free-tier model is pinned to the wrong relay.
+
+    `opencode-go` (authenticated) → `opencode-free` (keyless) is the only
+    cross-wire we currently enforce; other providers are unaffected.
+    """
+    prov = normalize_provider(provider)
+    if prov == "opencode-go" and is_cron_free_tier_model(model_id):
+        return (
+            f"Model '{model_id}' is a free-tier model and must run via provider 'opencode-free' (keyless), "
+            f"not '{provider}' (which sends an API key and will 401). "
+            f"Try: --provider opencode-free --model {model_id}"
+        )
+    return None
+
+
+def is_provider_cache_entry_stale(entry: dict | None) -> bool:
+    """Return True if a provider_models_cache entry is beyond the SWR window.
+
+    Cron validation treats stale entries as \"don't know\" (warning, not hard
+    reject) so a model removed from the cache weeks ago doesn't permanently
+    block job creation until the next live refresh.
+    """
+    if not isinstance(entry, dict):
+        return True
+    at = entry.get("at")
+    if not isinstance(at, (int, float)):
+        return True
+    try:
+        return (time.time() - float(at)) >= _PROVIDER_MODELS_STALE_SERVE_MAX
+    except Exception:
+        return True
+
+
 # Models that support OpenAI Priority Processing (service_tier="priority").
 # See https://openai.com/api-priority-processing/ for the canonical list.
 #
