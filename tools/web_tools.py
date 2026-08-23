@@ -227,9 +227,14 @@ def _get_backend() -> str:
     stored backend name is returned as-is — no availability probe, no
     fallback — so the vendor path can raise its own honest error when the
     selection is broken. The credential/entitlement autodetect ladder runs
-    ONLY when no web selection has ever been stored.
+    ONLY when no web selection has ever been stored. The special value
+    ``"auto"`` (a common hand-edit meaning "pick for me"; never written by
+    the picker) counts as *no* stored name and selects the ladder too,
+    matching how the registry resolver already treats unknown names.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
+    if configured == "auto":
+        configured = ""
     if configured:
         # Strict: the stored selection is final, known name or not — an
         # unknown/typoed name surfaces as the vendor path's honest error
@@ -249,7 +254,15 @@ def _get_backend() -> str:
         # A web selection exists (e.g. use_gateway key or per-capability
         # backends) but the shared backend name is empty — keep the
         # firecrawl default rather than credential-laddering.
-        return "firecrawl"
+        #
+        # Exception: the shared name on disk is exactly "auto" (a
+        # hand-edited "pick for me", never written by the picker).
+        # read_selection() sees it and reports a selection, but the user
+        # asked for autodetection — run the full ladder instead of
+        # pinning firecrawl. Per-capability-only selections keep the
+        # firecrawl sentinel.
+        if str(_load_web_config().get("backend") or "").strip().lower() != "auto":
+            return "firecrawl"
 
     # Never-configured install — pick the highest-priority available
     # backend. Explicit user credentials (TAVILY_API_KEY etc.)
@@ -354,6 +367,11 @@ def _get_capability_backend(capability: str) -> str:
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+    if specific == "auto":
+        # Hand-edited "pick for me" — same meaning as unset (never written
+        # by the picker); fall through to the shared selection instead of
+        # surfacing a "no registered provider 'auto'" error.
+        specific = ""
     if specific:
         return specific
     return _get_backend()
@@ -1415,6 +1433,11 @@ def check_web_api_key() -> bool:
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
     # ``None.lower()`` would raise. Mirrors ``_get_backend``.
     configured = (_load_web_config().get("backend") or "").lower().strip()
+    if configured == "auto":
+        # Mirror _get_backend: "auto" is a hand-edited alias for "pick for
+        # me", not a provider name — treat it as unset so the readiness OR
+        # below reflects the backends the user actually has credentials for.
+        configured = ""
     if configured and _is_backend_available(configured):
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so
