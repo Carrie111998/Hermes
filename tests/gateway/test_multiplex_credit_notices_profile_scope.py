@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.credits_tracker import CreditsState
 from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
@@ -39,7 +40,13 @@ _SECONDARY_CONFIG = {"display": {"credits_notices": False}}
 class _StubAgent(AIAgent):
     """Minimal AIAgent stand-in: real ``_emit_credits_notices`` /
     ``_credits_notices_enabled`` (so the policy cache is genuinely consulted),
-    plus the handful of attributes ``run_sync`` reads after a turn."""
+    plus the handful of attributes ``run_sync`` reads after a turn.
+
+    ``run_conversation`` seeds a depleted-shaped ``CreditsState`` (as a real
+    response header capture would) before running the credits policy, and
+    ``_emit_notice`` records every policy emission — so the tests assert the
+    per-turn stamp actually GATES the notice rail, not just the cached flag.
+    """
 
     def __init__(self, **kwargs):
         self.model = kwargs.get("model", "")
@@ -57,6 +64,16 @@ class _StubAgent(AIAgent):
         self._credits_notices_enabled_cache = None
         self.notice_callback = None
         self.notice_clear_callback = None
+        self._emitted: List[Any] = []
+        # The test may inject a per-turn CreditsState to exercise a specific
+        # notice transition (e.g. depleted -> restored) on the reused agent.
+        self._next_credits_state: Optional[CreditsState] = None
+
+    def _emit_notice(self, notice) -> None:
+        # Record policy emissions, then delegate to the real emitter (which
+        # truthiness-gates on the bound notice_callback).
+        self._emitted.append(notice)
+        super()._emit_notice(notice)
 
     def run_conversation(
         self,
@@ -72,8 +89,16 @@ class _StubAgent(AIAgent):
         moa_config: Optional[dict] = None,
         **_kwargs,
     ):
-        # Simulate the post-provider-response path: the credits policy runs
-        # after each API response and is where the cached setting is read.
+        # Simulate the post-provider-response path: a credits state arrives
+        # from response headers, then the policy runs where the cached
+        # per-turn stamp is read.  Reset the emission ledger so each turn's
+        # assertions observe only that turn's policy run.
+        state = self._next_credits_state
+        if state is None:
+            # Default: a depleted-shaped capture that would normally emit.
+            state = CreditsState(paid_access=False)
+        self._credits_state = state
+        self._emitted.clear()
         self._emit_credits_notices()
         return {"final_response": "ok", "failed": False, "interrupted": False,
                 "completed": True, "messages": []}
@@ -175,6 +200,11 @@ class TestMultiplexCreditNoticesProfileScope:
         assert agent is not None
         assert agent._credits_notices_enabled_cache is True
         assert agent.notice_callback is not None
+        # The real credits policy ran this turn with a depleted-shaped state
+        # and the stamp was True, so the depleted notice reached the rail.
+        assert any(
+            getattr(n, "key", None) == "credits.depleted" for n in agent._emitted
+        ), "enabled profile must emit the depleted notice"
 
         # Turn 2 — routed to the secondary profile: disabled. The SAME cached
         # agent instance must be re-stamped to the active profile's policy.
@@ -184,14 +214,28 @@ class TestMultiplexCreditNoticesProfileScope:
         assert agent2 is agent, "the cached agent must be reused across turns"
         assert agent._credits_notices_enabled_cache is False
         assert agent.notice_callback is None
+        # Same depleted state was seeded, but the disabled stamp must gate the
+        # rail entirely — no emission, even though the agent was enabled a
+        # moment ago.
+        assert agent._emitted == [], (
+            "disabled profile must not emit credit notices on a reused agent"
+        )
 
-        # Turn 3 — back to root: enabled again, callback restored.
+        # Turn 3 — back to root: enabled again, callback restored. The
+        # depleted notice already latched in turn 1 (fired-once, no per-turn
+        # re-nag), so prove the rail is genuinely live again by flipping the
+        # next capture to paid_access=True: the latched depleted state must
+        # now emit the "✓ Credit access restored" notice on this reused agent.
+        agent._next_credits_state = CreditsState(paid_access=True)
         agent3 = _run_turn(
             runner, root_home, session_key, _ROOT_CONFIG, source
         )
         assert agent3 is agent
         assert agent._credits_notices_enabled_cache is True
         assert agent.notice_callback is not None
+        assert any(
+            getattr(n, "key", None) == "credits.restored" for n in agent._emitted
+        ), "re-enabled profile must drive a fresh notice transition on the reused agent"
 
         # No contamination: the policy exactly follows the alternating scope.
         assert agent._credits_notices_enabled_cache is True
@@ -220,3 +264,8 @@ class TestMultiplexCreditNoticesProfileScope:
         assert agent is not None
         assert agent._credits_notices_enabled_cache is True
         assert agent.notice_callback is not None
+        # Fail-open: with a depleted state seeded, the notice still reaches
+        # the rail rather than being silently suppressed on config error.
+        assert any(
+            getattr(n, "key", None) == "credits.depleted" for n in agent._emitted
+        ), "fail-open path must keep emitting on unreadable config"

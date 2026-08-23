@@ -5867,6 +5867,21 @@ class TurnRunner:
         # ``user_config`` and stamp it here, before the provider runs, so a
         # reused agent cannot leak another profile's setting. Fail-open True
         # on any config error, matching ``AIAgent._credits_notices_enabled``.
+        #
+        # Concurrency: this stamp needs no ``_agent_cache_lock`` because
+        # per-session turn serialization guarantees the cached agent is never
+        # mid-``run_conversation`` here. ``_handle_message`` claims the
+        # session slot (``turn.agent`` sentinel) synchronously before any
+        # await, and only releases it after ``run_sync`` — which runs this
+        # stamp, binds the callbacks below, and then calls
+        # ``run_conversation`` — completes; a second message for the same
+        # session is queued in the adapter's ``_pending_messages`` (Level 1)
+        # or rejected by the turn-lease (``TurnLeaseTimeoutError``, #64934),
+        # never started in parallel. The cached agent is keyed by
+        # ``session_key``, so this stamp + callback bind + provider run form
+        # one critical section per session_key. A lock here would guard only
+        # the assignment, not the provider run — dead weight and a false
+        # safety signal. See ``AIAgent.stamp_credits_notices_policy``.
         _credits_notices_enabled = True
         try:
             _credits_display = (ctx.user_config or {}).get("display")
@@ -5874,7 +5889,7 @@ class TurnRunner:
                 _credits_notices_enabled = bool(_credits_display.get("credits_notices"))
         except Exception:
             _credits_notices_enabled = True
-        agent._credits_notices_enabled_cache = _credits_notices_enabled
+        agent.stamp_credits_notices_policy(_credits_notices_enabled)
 
         def _notice_callback_sync(notice) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
