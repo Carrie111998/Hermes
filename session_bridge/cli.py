@@ -1004,6 +1004,10 @@ class ProductionBackend:
         self._claude_visibility_preflight_at: float | None = None
         self._claude_visibility_stop: threading.Event | None = None
         self._codex_client: RecoveringCodexAppServerClient | None = None
+        # Cached Codex source adapter for visibility discovery. The adapter
+        # holds the cross-call projection cache; rebuilding it per inventory
+        # call discarded that cache every continuous cycle (2026-08-23).
+        self._claude_visibility_codex_adapter: CodexSourceAdapter | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_registration_codex_client: CodexAppServerClient | None = None
         self._sidebar_executor: SidebarExecutor | None = None
@@ -1011,6 +1015,7 @@ class ProductionBackend:
 
     def close(self) -> None:
         provider_client, self._codex_client = self._codex_client, None
+        self._claude_visibility_codex_adapter = None
         sidebar_client, self._sidebar_codex_client = (
             self._sidebar_codex_client,
             None,
@@ -3199,13 +3204,16 @@ class ProductionBackend:
                 lambda: CodexAppServerClient(codex_bin=codex_command[0]),
                 cancel_event=self._claude_visibility_stop,
             )
-        codex = CodexSourceAdapter(
-            self._codex_client,
-            marker_secret=marker_secret,
-            trusted_origins=lambda: load_codex_characterization_origins(
-                marker_secret=marker_secret
-            ),
-        )
+        codex = self._claude_visibility_codex_adapter
+        if codex is None:
+            codex = CodexSourceAdapter(
+                self._codex_client,
+                marker_secret=marker_secret,
+                trusted_origins=lambda: load_codex_characterization_origins(
+                    marker_secret=marker_secret
+                ),
+            )
+            self._claude_visibility_codex_adapter = codex
         try:
             page = codex.list_claude_visibility_sources(
                 after=after,

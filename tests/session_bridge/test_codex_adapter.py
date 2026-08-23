@@ -3194,3 +3194,184 @@ def test_adapter_never_enumerates_or_mutates_rollout_files(
     adapter = CodexSourceAdapter(client, marker_secret=SECRET)
     assert adapter.list_inventory(archived=False) == []
     assert adapter.project_thread(_summary()).messages[0].content == "ok"
+
+
+def test_visibility_inventory_reuses_projection_across_calls_when_unchanged() -> None:
+    """An unchanged thread must not be re-read on a second inventory call.
+
+    Production reconstructs nothing between continuous cycles except the wall
+    clock, yet every cycle re-issued one thread/read per eligible unindexed
+    thread until the aggregate 30s discovery deadline expired and the whole
+    inventory degraded (2026-08-23 investigation: 52 serial reads, 29.14s of a
+    30s budget). The adapter therefore keeps a cross-call projection cache
+    keyed by native identity and validated against the summary revision.
+    """
+
+    def entry(native_id: str, updated: int) -> dict[str, object]:
+        return {
+            "id": native_id,
+            "name": native_id,
+            "preview": f"preview for {native_id}",
+            "cwd": f"C:/work/{native_id}",
+            "createdAt": updated - 10,
+            "updatedAt": updated,
+            "source": "vscode",
+        }
+
+    client = FakeInitializingClient({
+        "thread/list": [
+            {"data": [entry("steady", 300)]},
+            {"data": []},
+            {"data": [entry("steady", 300)]},
+            {"data": []},
+        ],
+        "thread/read": [
+            {
+                "thread": {
+                    **entry("steady", 300),
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "request",
+                                    "content": [
+                                        {"type": "text", "text": "Steady request"}
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        ],
+    })
+    adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    first = adapter.list_claude_visibility_sources(after=250, state_db_only=True)
+    second = adapter.list_claude_visibility_sources(after=250, state_db_only=True)
+
+    assert [source.projection.native_id for source in first] == ["steady"]
+    assert [source.projection for source in second] == [
+        source.projection for source in first
+    ]
+    # Second call re-lists the inventory but must not re-read the thread.
+    assert [call[0] for call in client.calls].count("thread/read") == 1
+
+
+def test_visibility_projection_cache_evicts_oldest_at_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cross-call cache must not grow without bound in a long-lived daemon.
+
+    The cap is a runaway-growth backstop sized far above any real inventory
+    window (2048 vs a few hundred threads); this test shrinks it to observe
+    the eviction policy directly rather than through read counts, which would
+    thrash when the cap is smaller than the working set.
+    """
+
+    def entry(native_id: str, updated: int) -> dict[str, object]:
+        return {
+            "id": native_id,
+            "name": native_id,
+            "preview": f"preview for {native_id}",
+            "cwd": f"C:/work/{native_id}",
+            "createdAt": updated - 10,
+            "updatedAt": updated,
+            "source": "vscode",
+        }
+
+    rows = [entry(name, 303 - index) for index, name in enumerate(("a", "b", "c", "d"))]
+    client = FakeInitializingClient({
+        "thread/list": [{"data": rows}, {"data": []}],
+        "thread/read": [{"thread": {**r, "turns": []}} for r in rows],
+    })
+    adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+    monkeypatch.setattr(
+        codex_adapter_module,
+        "_VISIBILITY_PROJECTION_CACHE_MAX_ENTRIES",
+        2,
+    )
+
+    sources = adapter.list_claude_visibility_sources(after=250, state_db_only=True)
+
+    assert [source.projection.native_id for source in sources] == [
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    assert list(adapter._visibility_projection_cache) == ["c", "d"]
+
+
+def test_visibility_inventory_cache_invalidated_by_summary_revision_change() -> None:
+    """A changed summary revision must force exactly one fresh read."""
+
+    def entry(native_id: str, updated: int) -> dict[str, object]:
+        return {
+            "id": native_id,
+            "name": native_id,
+            "preview": f"preview for {native_id}",
+            "cwd": f"C:/work/{native_id}",
+            "createdAt": updated - 10,
+            "updatedAt": updated,
+            "source": "vscode",
+        }
+
+    client = FakeInitializingClient({
+        "thread/list": [
+            {"data": [entry("moving", 300)]},
+            {"data": []},
+            {"data": [entry("moving", 400)]},
+            {"data": []},
+        ],
+        "thread/read": [
+            {
+                "thread": {
+                    **entry("moving", 300),
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "request-one",
+                                    "content": [
+                                        {"type": "text", "text": "First request"}
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            {
+                "thread": {
+                    **entry("moving", 400),
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "request-two",
+                                    "content": [
+                                        {"type": "text", "text": "Second request"}
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        ],
+    })
+    adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    first = adapter.list_claude_visibility_sources(after=250, state_db_only=True)
+    second = adapter.list_claude_visibility_sources(after=250, state_db_only=True)
+
+    assert first[0].projection.last_active == 300.0
+    assert second[0].projection.last_active == 400.0
+    assert [call[0] for call in client.calls].count("thread/read") == 2

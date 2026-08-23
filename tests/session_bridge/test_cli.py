@@ -5208,6 +5208,57 @@ def test_claude_visibility_inventory_passes_stop_to_codex_adapter(
     assert captured["stop"] is stop
 
 
+def test_claude_visibility_inventory_reuses_codex_adapter_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Codex adapter (and its projection cache) must outlive one cycle.
+
+    _claude_visibility_inventory used to construct a fresh CodexSourceAdapter
+    per call, discarding the cross-call visibility projection cache every
+    continuous cycle, so each cycle re-read every eligible unindexed thread
+    until the aggregate discovery deadline degraded the whole inventory
+    (2026-08-23 investigation).
+    """
+
+    config = BridgeConfig()
+    backend = ProductionBackend(config)
+    constructed: list[object] = []
+
+    class Adapter:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            constructed.append(self)
+
+        def list_claude_visibility_sources(self, **kwargs: object) -> tuple[()]:
+            return ()
+
+    class Store:
+        def list_claude_visibility_hermes_sources(
+            self, _after: float, _limit: int | None
+        ) -> tuple[()]:
+            return ()
+
+        def list_claude_visibility_codex_sources(
+            self, _after: float, _limit: int | None
+        ) -> tuple[()]:
+            return ()
+
+        def list_claude_visibility_source_ids(self) -> frozenset[str]:
+            return frozenset()
+
+    backend._codex_client = object()
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.CodexSourceAdapter", Adapter)
+
+    backend._claude_visibility_inventory(
+        150.0, marker_secret=b"m" * 32, state_db_only=True
+    )
+    backend._claude_visibility_inventory(
+        150.0, marker_secret=b"m" * 32, state_db_only=True
+    )
+
+    assert len(constructed) == 1
+
+
 def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

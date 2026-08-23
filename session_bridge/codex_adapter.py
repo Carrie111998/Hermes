@@ -513,6 +513,11 @@ class SidebarThreadVerifier:
 # exceed the fetch cost for the index to pay for itself.
 _INVENTORY_INDEX_TTL_SECONDS = 900.0
 
+# Cross-call visibility projection cache ceiling. Production's cursor-narrowed
+# window holds a few hundred threads; the cap bounds daemon memory without ever
+# evicting within a single inventory pass.
+_VISIBILITY_PROJECTION_CACHE_MAX_ENTRIES = 2048
+
 
 class CodexSourceAdapter:
     def __init__(
@@ -538,6 +543,16 @@ class CodexSourceAdapter:
         self._inventory_index_cache: dict[
             tuple[bool, tuple[str, ...] | None, bool],
             tuple[float, dict[str, CodexThreadSummary]],
+        ] = {}
+        # Cross-call projection cache for the visibility inventory: native_id
+        # -> (summary read, projection, reconciled summary). Keyed by exact
+        # summary equality (frozen dataclass incl. revision), so any inventory
+        # change forces a fresh thread/read. Without it every continuous cycle
+        # re-read each eligible unindexed thread until the aggregate discovery
+        # deadline expired and the whole cycle degraded (2026-08-23).
+        self._visibility_projection_cache: dict[
+            str,
+            tuple[CodexThreadSummary, SessionProjection, CodexThreadSummary],
         ] = {}
         if trusted_origins is None:
             self._trusted_origins_resolver: Callable[[], Mapping[str, str]] = dict
@@ -1130,23 +1145,45 @@ class CodexSourceAdapter:
                 projection = self._project_state_db_summary(summary)
                 reconciled = summary
             else:
-                try:
-                    projection, reconciled = self._read_sidebar_thread_details(
-                        summary, deadline=deadline, stop=stop
-                    )
-                except _CodexReadBudgetExceeded:
-                    if indexed_sources is not None:
-                        raise
-                    budget_exhausted = True
-                    projection = self._project_state_db_summary(summary)
-                    reconciled = summary
-                except TimeoutError:
-                    if indexed_sources is not None:
-                        raise
-                    if float(self._monotonic()) >= deadline:
+                cached_entry = self._visibility_projection_cache.get(summary.native_id)
+                if cached_entry is not None and cached_entry[0] == summary:
+                    _read_summary, projection, reconciled = cached_entry
+                else:
+                    try:
+                        projection, reconciled = self._read_sidebar_thread_details(
+                            summary, deadline=deadline, stop=stop
+                        )
+                    except _CodexReadBudgetExceeded:
+                        self._visibility_projection_cache.pop(
+                            summary.native_id, None
+                        )
+                        if indexed_sources is not None:
+                            raise
                         budget_exhausted = True
-                    projection = self._project_state_db_summary(summary)
-                    reconciled = summary
+                        projection = self._project_state_db_summary(summary)
+                        reconciled = summary
+                    except TimeoutError:
+                        self._visibility_projection_cache.pop(
+                            summary.native_id, None
+                        )
+                        if indexed_sources is not None:
+                            raise
+                        if float(self._monotonic()) >= deadline:
+                            budget_exhausted = True
+                        projection = self._project_state_db_summary(summary)
+                        reconciled = summary
+                    else:
+                        while len(self._visibility_projection_cache) >= (
+                            _VISIBILITY_PROJECTION_CACHE_MAX_ENTRIES
+                        ):
+                            self._visibility_projection_cache.pop(
+                                next(iter(self._visibility_projection_cache))
+                            )
+                        self._visibility_projection_cache[summary.native_id] = (
+                            summary,
+                            projection,
+                            reconciled,
+                        )
             if reconciled.source_kind is None:
                 raise ValueError("Codex thread source kind is missing")
             sources.append(
