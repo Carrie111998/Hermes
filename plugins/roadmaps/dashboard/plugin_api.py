@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import profiles as _profiles
 from hermes_cli.roadmaps_service import RoadmapsService, RoadmapsUnavailable
@@ -218,6 +218,7 @@ class _TodoBody(BaseModel):
 
 
 class _AttachBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     actor: str = Field(...)
     stored_session_id: str = Field(...)
     expected_version: int | None = None
@@ -503,8 +504,6 @@ def update_todo(roadmap_id: str, todo_id: str, profile: str, project_id: str, bo
 def attach_session(roadmap_id: str, profile: str, project_id: str, body: _AttachBody):
     try:
         p, project, rid = _scope_roadmap(profile, project_id, roadmap_id)
-        if "runtime_session_id" in body.model_fields_set and body.model_dump().get("runtime_session_id") is not None:
-            raise ValueError("runtime_session_id is not accepted")
         return _writer(p).attach_session(
             p, project, rid,
             _required(body.stored_session_id, "stored_session_id"),
