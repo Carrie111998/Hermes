@@ -774,7 +774,12 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        authoritative_ids: Optional[List[str]] = None,
+    ) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -782,6 +787,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                authoritative_ids=authoritative_ids,
             )
 
     def _is_terminal_auth_failure(
@@ -1382,19 +1388,20 @@ class CredentialPool:
     def _single_use_refresh_lock_timeout(self) -> float:
         """Lock timeout for single-use-refresh-token providers.
 
-        Covers the configured refresh POST timeout plus a margin so a slow
-        token endpoint cannot make the flock give up before the refresh
-        resolves.  Reads the provider's ``HERMES_*_REFRESH_TIMEOUT_SECONDS``
-        override.
+        Covers the refresh POST timeout plus a margin so a slow token endpoint
+        cannot make the flock give up before the refresh resolves. Codex and
+        xAI retain their existing timeout overrides; Anthropic uses its
+        adapter's 20-second request budget.
         """
-        env_var = (
-            "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS"
-            if self.provider == "openai-codex"
-            else "HERMES_XAI_REFRESH_TIMEOUT_SECONDS"
-            if self.provider == "xai-oauth"
-            else "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS"
-        )
-        refresh_timeout_seconds = auth_mod.env_float(env_var, 20)
+        if self.provider == "anthropic":
+            refresh_timeout_seconds = 20.0
+        else:
+            env_var = (
+                "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS"
+                if self.provider == "openai-codex"
+                else "HERMES_XAI_REFRESH_TIMEOUT_SECONDS"
+            )
+            refresh_timeout_seconds = auth_mod.env_float(env_var, 20)
         return max(
             float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS),
             float(refresh_timeout_seconds) + 5.0,
@@ -1783,7 +1790,7 @@ class CredentialPool:
             last_error_reset_at=None,
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        self._persist(authoritative_ids=[updated.id])
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.

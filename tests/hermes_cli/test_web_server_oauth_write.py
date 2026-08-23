@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 
 import pytest
 
@@ -83,3 +84,53 @@ def test_dashboard_oauth_write_reuses_file_seeded_pool_identity(
     assert len(pool.added) == 1
     assert pool.added[0].source == "hermes_pkce"
     assert pool.added[0].refresh_token == "refresh-token"
+
+
+def test_dashboard_oauth_write_holds_refresh_authority_across_both_stores(
+    oauth_file, monkeypatch
+):
+    authority_held = False
+    observed = []
+
+    @contextmanager
+    def recording_lock(*, timeout_seconds):
+        nonlocal authority_held
+        assert timeout_seconds >= 25
+        authority_held = True
+        try:
+            yield
+        finally:
+            authority_held = False
+
+    class RecordingPool(_DummyPool):
+        def remove_entry(self, entry_id):
+            assert authority_held
+            observed.append(("remove", entry_id))
+
+        def add_entry(self, entry):
+            assert authority_held
+            observed.append(("add", entry.refresh_token))
+
+    real_writer = __import__(
+        "agent.anthropic_adapter", fromlist=["_write_hermes_oauth_credentials"]
+    )._write_hermes_oauth_credentials
+
+    def recording_writer(*args):
+        assert authority_held
+        observed.append(("singleton", args[1]))
+        return real_writer(*args)
+
+    pool = RecordingPool()
+    monkeypatch.setattr("hermes_cli.auth._auth_store_lock", recording_lock)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._write_hermes_oauth_credentials", recording_writer
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: pool)
+
+    _save_anthropic_oauth_creds("access-token", "refresh-token", 123456)
+
+    assert observed == [
+        ("singleton", "refresh-token"),
+        ("add", "refresh-token"),
+    ]
+    assert authority_held is False

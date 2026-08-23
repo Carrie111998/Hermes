@@ -1670,6 +1670,40 @@ _POOL_STATUS_FIELDS = (
 )
 
 
+def _merge_disk_rotating_token_state(
+    entry: Dict[str, Any],
+    disk_entry: Optional[Dict[str, Any]],
+    provider_id: str,
+) -> Dict[str, Any]:
+    """Keep a newer canonical rotating grant over a stale process snapshot."""
+    if (
+        provider_id != "anthropic"
+        or not isinstance(disk_entry, dict)
+        or entry.get("source") != "hermes_pkce"
+        or disk_entry.get("source") != "hermes_pkce"
+    ):
+        return entry
+    token_fields = ("access_token", "refresh_token", "expires_at_ms")
+    if not any(entry.get(key) != disk_entry.get(key) for key in token_fields):
+        return entry
+    try:
+        incoming_expiry = int(entry.get("expires_at_ms") or 0)
+        disk_expiry = int(disk_entry.get("expires_at_ms") or 0)
+    except (TypeError, ValueError):
+        return entry
+    if disk_expiry < incoming_expiry:
+        return entry
+
+    merged = dict(entry)
+    for field in token_fields:
+        merged[field] = disk_entry.get(field)
+    # A status observed for the consumed generation must not poison the newer
+    # generation that another process already persisted.
+    for field in _POOL_STATUS_FIELDS:
+        merged[field] = disk_entry.get(field)
+    return merged
+
+
 def _merge_disk_cooldown_state(
     entry: Dict[str, Any],
     disk_entry: Optional[Dict[str, Any]],
@@ -1732,6 +1766,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    authoritative_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1749,9 +1784,12 @@ def write_credential_pool(
     snapshot cannot erase a cooldown/quarantine another process just wrote.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
-    merge does not resurrect them from the on-disk copy.
+    merge does not resurrect them from the on-disk copy. ``authoritative_ids``
+    identifies rows whose rotating token material was produced while this same
+    cross-process authority was held, so an equal-expiry rotation can commit.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
+    authoritative = {rid for rid in (authoritative_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
@@ -1775,14 +1813,19 @@ def write_credential_pool(
             for entry in sanitized_entries
             if isinstance(entry, dict) and entry.get("id")
         }
-        merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+        merged: List[Dict[str, Any]] = []
+        for entry in sanitized_entries:
+            if not isinstance(entry, dict):
+                merged.append(entry)
+                continue
+            disk_entry = existing_by_id.get(entry.get("id"))
+            if entry.get("id") not in authoritative:
+                entry = _merge_disk_rotating_token_state(
+                    entry, disk_entry, provider_id
+                )
+            merged.append(
+                _merge_disk_cooldown_state(entry, disk_entry, provider_id)
             )
-            if isinstance(entry, dict)
-            else entry
-            for entry in sanitized_entries
-        ]
         for disk_entry in existing_list:
             if not isinstance(disk_entry, dict):
                 continue

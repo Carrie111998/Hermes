@@ -11006,47 +11006,52 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
     the system in the same state as ``hermes auth add anthropic``.
     """
     from agent.anthropic_adapter import _write_hermes_oauth_credentials
+    from hermes_cli.auth import _auth_store_lock
 
-    _write_hermes_oauth_credentials(access_token, refresh_token, expires_at_ms)
-    # Best-effort credential-pool insert. Failure here doesn't invalidate
-    # the file write — pool registration only matters for the rotation
-    # strategy, not for runtime credential resolution.
-    try:
-        from agent.credential_pool import (
-            PooledCredential,
-            load_pool,
-            AUTH_TYPE_OAUTH,
-        )
-        import uuid
-        pool = load_pool("anthropic")
-        # The dashboard and singleton seeder both represent the one grant in
-        # .anthropic_oauth.json. Replace every legacy mirror with one canonical
-        # source so a rotating refresh token can only be consumed by one row.
-        existing = [
-            e
-            for e in pool.entries()
-            if getattr(e, "source", "")
-            in {"hermes_pkce", "manual:dashboard_pkce"}
-        ]
-        for e in existing:
-            try:
-                pool.remove_entry(getattr(e, "id", ""))
-            except Exception:
-                pass
-        entry = PooledCredential(
-            provider="anthropic",
-            id=uuid.uuid4().hex[:6],
-            label="dashboard PKCE",
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source="hermes_pkce",
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_at_ms=expires_at_ms,
-        )
-        pool.add_entry(entry)
-    except Exception as e:
-        _log.warning("anthropic pool add (dashboard) failed: %s", e)
+    # Refreshes use this same authority. Holding it across both stores prevents
+    # a refresh from interleaving between the singleton and canonical-row write.
+    with _auth_store_lock(timeout_seconds=25.0):
+        _write_hermes_oauth_credentials(access_token, refresh_token, expires_at_ms)
+        # Best-effort credential-pool insert. Failure here doesn't invalidate
+        # the file write — pool registration only matters for the rotation
+        # strategy, not for runtime credential resolution.
+        try:
+            from agent.credential_pool import (
+                AUTH_TYPE_OAUTH,
+                PooledCredential,
+                load_pool,
+            )
+            import uuid
+
+            pool = load_pool("anthropic")
+            # The dashboard and singleton seeder both represent the one grant in
+            # .anthropic_oauth.json. Replace every legacy mirror with one canonical
+            # source so a rotating refresh token can only be consumed by one row.
+            existing = [
+                e
+                for e in pool.entries()
+                if getattr(e, "source", "")
+                in {"hermes_pkce", "manual:dashboard_pkce"}
+            ]
+            for e in existing:
+                try:
+                    pool.remove_entry(getattr(e, "id", ""))
+                except Exception:
+                    pass
+            entry = PooledCredential(
+                provider="anthropic",
+                id=uuid.uuid4().hex[:6],
+                label="dashboard PKCE",
+                auth_type=AUTH_TYPE_OAUTH,
+                priority=0,
+                source="hermes_pkce",
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at_ms=expires_at_ms,
+            )
+            pool.add_entry(entry)
+        except Exception as e:
+            _log.warning("anthropic pool add (dashboard) failed: %s", e)
 
 
 def _start_anthropic_pkce(profile: Optional[str] = None) -> Dict[str, Any]:
