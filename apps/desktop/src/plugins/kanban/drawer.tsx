@@ -20,6 +20,9 @@ import {
   host,
   Loader,
   LogView,
+  Tabs,
+  TabsList,
+  TabsTrigger,
   Textarea,
   Tip,
   useMutation,
@@ -45,6 +48,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { type DrawerTab, drawerTabStats } from './drawer-layout'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -66,7 +70,6 @@ import {
   type KanbanText,
   lockedReason,
   ScrollFade,
-  Section,
   shortId,
   StatusMenu,
   useDefaultAssignee,
@@ -175,6 +178,18 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
       <span className="text-(--ui-text-quaternary)">{label}</span>
       <span className="min-w-0 truncate text-(--ui-text-secondary)">{children}</span>
     </>
+  )
+}
+
+function DrawerSection({ action, children, label }: { action?: ReactNode; children: ReactNode; label: string }) {
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="text-xs font-semibold text-(--ui-text-secondary)">{label}</h3>
+        {action}
+      </div>
+      {children}
+    </section>
   )
 }
 
@@ -361,7 +376,7 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
   const [draft, setDraft] = useState('')
 
   return (
-    <Section
+    <DrawerSection
       action={
         <Button
           aria-label={editing ? k.cancelEdit : k.editDescription}
@@ -401,7 +416,7 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
       ) : (
         <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
       )}
-    </Section>
+    </DrawerSection>
   )
 }
 
@@ -422,7 +437,7 @@ function AttachmentsSection({
   const fileRef = useRef<HTMLInputElement>(null)
 
   return (
-    <Section
+    <DrawerSection
       action={
         <>
           <input
@@ -464,7 +479,7 @@ function AttachmentsSection({
       ) : (
         <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noAttachments}</p>
       )}
-    </Section>
+    </DrawerSection>
   )
 }
 
@@ -493,7 +508,7 @@ function EstimateSection({ id }: { id: string }) {
   useEffect(() => setResult(null), [id])
 
   return (
-    <Section label={k.estimate}>
+    <DrawerSection label={k.estimate}>
       {result?.ok ? (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2 text-[0.8125rem]">
@@ -533,7 +548,7 @@ function EstimateSection({ id }: { id: string }) {
           </Tip>
         </div>
       )}
-    </Section>
+    </DrawerSection>
   )
 }
 
@@ -551,6 +566,7 @@ export function TaskDrawer({
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const [activeTab, setActiveTab] = useState<DrawerTab>('overview')
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
@@ -582,6 +598,8 @@ export function TaskDrawer({
 
     return () => window.removeEventListener('keydown', onKey)
   }, [id, onClose])
+
+  useEffect(() => setActiveTab('overview'), [id])
 
   const invalidate = () => {
     void qc.invalidateQueries({ queryKey: taskKey(slug, id!) })
@@ -673,6 +691,17 @@ export function TaskDrawer({
     moveMut.mutate(status)
   }
 
+  const currentSummary = task?.latest_summary && !isAdminSummary(task.latest_summary) ? task.latest_summary : null
+  const currentState = task?.result ?? currentSummary
+
+  const tabStats = drawerTabStats({
+    comments: detail?.comments.length ?? 0,
+    events: detail?.events.length ?? 0,
+    hasLog: !!(log?.exists && log.content),
+    running,
+    runs: detail?.runs.length ?? 0
+  })
+
   return (
     <div className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4">
       <header className="flex flex-col gap-2 px-4 pt-3.5 pb-3">
@@ -741,50 +770,79 @@ export function TaskDrawer({
           </div>
         </div>
         {task && (
-          <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true">
-            {task.title || task.id}
-          </h2>
+          <>
+            <h2 className="text-base leading-snug font-semibold text-foreground" data-selectable-text="true">
+              {task.title || task.id}
+            </h2>
+            <div className="flex min-w-0 items-center gap-1.5 text-[0.6875rem] text-(--ui-text-tertiary)">
+              {task.assignee && (
+                <>
+                  <Avatar name={task.assignee} size="1rem" />
+                  <span className="truncate">{task.assignee}</span>
+                </>
+              )}
+              {typeof task.priority === 'number' && (
+                <span>
+                  · {k.metaPriority} {task.priority}
+                </span>
+              )}
+              {ago(task.created_at) && <span className="ml-auto shrink-0">{ago(task.created_at)}</span>}
+            </div>
+          </>
         )}
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
+      {task && (
+        <Tabs className="gap-0" onValueChange={value => setActiveTab(value as DrawerTab)} value={activeTab}>
+          <TabsList aria-label={k.details} variant="line">
+            <TabsTrigger value="overview" variant="line">
+              {k.tabOverview}
+            </TabsTrigger>
+            <TabsTrigger value="timeline" variant="line">
+              {k.tabTimeline}
+              {tabStats.timelineCount > 0 && (
+                <span className="text-[0.625rem] font-normal text-(--ui-text-quaternary)">
+                  {tabStats.timelineCount}
+                </span>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="execution" variant="line">
+              {k.tabExecution}
+              {tabStats.executionLive ? (
+                <span aria-label={k.working} className="text-[0.625rem] text-(--ui-accent)">
+                  ●
+                </span>
+              ) : tabStats.executionCount > 0 ? (
+                <span className="text-[0.625rem] font-normal text-(--ui-text-quaternary)">
+                  {tabStats.executionCount}
+                </span>
+              ) : null}
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
+      )}
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4" data-selectable-text="true">
         {errorMessage ? (
           <ErrorState title={errorMessage} />
         ) : !detail || !task ? (
           <div className="grid h-32 place-items-center">
             <Loader type="lemniscate-bloom" />
           </div>
-        ) : (
-          <div className="flex flex-col gap-4 text-sm">
-            <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
-              <MetaRow label={k.assignee}>
-                <AssigneeMenu
-                  current={task.assignee}
-                  onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
-                />
-              </MetaRow>
-              {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
-              {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
-              {task.workspace_path && (
-                <MetaRow label={k.workspace}>
-                  {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
-                  {task.workspace_path}
-                </MetaRow>
-              )}
-              <MetaRow label={k.model}>
-                <ModelOverrideField
-                  onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
-                  value={{
-                    effort: task.reasoning_effort ?? '',
-                    model: task.model_override ?? '',
-                    provider: task.provider_override ?? ''
-                  }}
-                />
-              </MetaRow>
-              {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
-              {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
-              {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
-            </div>
+        ) : activeTab === 'overview' ? (
+          <div className="flex flex-col gap-5 text-sm">
+            {currentState && (
+              <DrawerSection label={k.currentState}>
+                <p className="whitespace-pre-wrap text-[0.8125rem] leading-relaxed text-(--ui-text-secondary)">
+                  {currentState}
+                </p>
+                {task.result && currentSummary && (
+                  <p className="whitespace-pre-wrap text-[0.75rem] leading-relaxed text-(--ui-text-tertiary)">
+                    {currentSummary}
+                  </p>
+                )}
+              </DrawerSection>
+            )}
 
             {task.status === 'ready' && !task.assignee && !defaultAssignee && (
               <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
@@ -793,29 +851,49 @@ export function TaskDrawer({
             )}
 
             {task.diagnostics && task.diagnostics.length > 0 && (
-              <Section label={k.diagnosticsN(task.diagnostics.length)}>
+              <DrawerSection label={k.diagnosticsN(task.diagnostics.length)}>
                 <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
-              </Section>
+              </DrawerSection>
             )}
 
             <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
 
+            <DrawerSection label={k.details}>
+              <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[0.71rem]">
+                <MetaRow label={k.assignee}>
+                  <AssigneeMenu
+                    current={task.assignee}
+                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+                  />
+                </MetaRow>
+                {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
+                {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
+                {task.workspace_path && (
+                  <MetaRow label={k.workspace}>
+                    {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
+                    {task.workspace_path}
+                  </MetaRow>
+                )}
+                <MetaRow label={k.model}>
+                  <ModelOverrideField
+                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                    value={{
+                      effort: task.reasoning_effort ?? '',
+                      model: task.model_override ?? '',
+                      provider: task.provider_override ?? ''
+                    }}
+                  />
+                </MetaRow>
+                {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
+                {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+              </div>
+            </DrawerSection>
+
             <EstimateSection id={task.id} />
 
-            {task.result && (
-              <Section label={k.result}>
-                <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.result}</p>
-              </Section>
-            )}
-
-            {task.latest_summary && !isAdminSummary(task.latest_summary) && (
-              <Section label={k.latestSummary}>
-                <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.latest_summary}</p>
-              </Section>
-            )}
-
             {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
-              <Section label={k.dependencies}>
+              <DrawerSection label={k.dependencies}>
                 {(['parents', 'children'] as const).map(side =>
                   detail.links[side].length > 0 ? (
                     <div className="flex flex-wrap items-center gap-1.5" key={side}>
@@ -835,114 +913,7 @@ export function TaskDrawer({
                     </div>
                   ) : null
                 )}
-              </Section>
-            )}
-
-            <Section
-              action={
-                <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
-                  <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
-                    <Codicon name="question" size="0.8rem" />
-                  </span>
-                </Tip>
-              }
-              label={k.comments(detail.comments.length)}
-            >
-              {detail.comments.length > 0 && (
-                <ul className="flex flex-col gap-2">
-                  {detail.comments.map(comment => (
-                    <li className="text-[0.75rem]" key={comment.id}>
-                      <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
-                      <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">
-                        {ago(comment.created_at)}
-                      </span>
-                      <p className="whitespace-pre-wrap text-(--ui-text-tertiary)">{comment.body}</p>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <CommentComposer
-                onRequeue={body => requeueMut.mutate(body)}
-                onSubmit={body => commentMut.mutate(body)}
-                pending={commentMut.isPending || requeueMut.isPending}
-                running={running}
-              />
-            </Section>
-
-            {detail.events.length > 0 && (
-              <Section label={k.activity(detail.events.length)}>
-                <ScrollFade deps={detail.events.length} max="7rem">
-                  <ul className="flex flex-col gap-1">
-                    {detail.events.map(event => {
-                      const { detail: extra, label } = eventText(event, k)
-
-                      return (
-                        <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
-                          <span className="shrink-0 text-(--ui-text-secondary)">{label}</span>
-                          {extra && (
-                            <span
-                              className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)"
-                              title={extra}
-                            >
-                              {extra}
-                            </span>
-                          )}
-                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </ScrollFade>
-              </Section>
-            )}
-
-            {detail.runs.length > 0 && (
-              <Section label={k.runs(detail.runs.length)}>
-                <ScrollFade max="11rem">
-                  <ul className="flex flex-col gap-1.5">
-                    {detail.runs.map(run => {
-                      const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
-
-                      return (
-                        <li className="flex flex-col gap-0.5 text-[0.71rem]" key={run.id}>
-                          <div className="flex items-center gap-2">
-                            <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
-                              {run.outcome ?? run.status}
-                            </Badge>
-                            {run.profile && <span className="text-(--ui-text-tertiary)">{run.profile}</span>}
-                            {duration(run.started_at, run.ended_at) && (
-                              <span className="text-(--ui-text-quaternary)">
-                                {duration(run.started_at, run.ended_at)}
-                              </span>
-                            )}
-                            <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
-                              {ago(run.ended_at ?? run.started_at)}
-                            </span>
-                          </div>
-                          {(run.error || run.summary) && (
-                            <p
-                              className={cn(
-                                'line-clamp-2 whitespace-pre-wrap',
-                                run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
-                              )}
-                            >
-                              {run.error ?? run.summary}
-                            </p>
-                          )}
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </ScrollFade>
-              </Section>
-            )}
-
-            {log?.exists && log.content && (
-              <Section label={log.truncated ? k.workerLogTail : k.workerLog}>
-                <ScrollFade deps={log.content.length} max="12rem">
-                  <LogView className="border-0 px-0">{log.content}</LogView>
-                </ScrollFade>
-              </Section>
+              </DrawerSection>
             )}
 
             <AttachmentsSection
@@ -951,8 +922,134 @@ export function TaskDrawer({
               pending={uploadMut.isPending}
             />
           </div>
+        ) : activeTab === 'timeline' ? (
+          <div className="flex flex-col gap-5 text-sm">
+            {tabStats.timelineCount === 0 && (
+              <p className="py-6 text-center text-xs text-(--ui-text-quaternary)">{k.noTimeline}</p>
+            )}
+
+            {detail.comments.length > 0 && (
+              <DrawerSection
+                action={
+                  <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
+                    <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
+                      <Codicon name="question" size="0.8rem" />
+                    </span>
+                  </Tip>
+                }
+                label={k.comments(detail.comments.length)}
+              >
+                <ul className="flex flex-col gap-3">
+                  {detail.comments.map(comment => (
+                    <li
+                      className="border-b border-(--ui-stroke-tertiary) pb-3 text-[0.75rem] last:border-0 last:pb-0"
+                      key={comment.id}
+                    >
+                      <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
+                      <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">
+                        {ago(comment.created_at)}
+                      </span>
+                      <p className="mt-1 whitespace-pre-wrap leading-relaxed text-(--ui-text-tertiary)">
+                        {comment.body}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              </DrawerSection>
+            )}
+
+            {detail.events.length > 0 && (
+              <DrawerSection label={k.activity(detail.events.length)}>
+                <ul className="relative ml-1 flex flex-col gap-3 border-l border-(--ui-stroke-tertiary) pl-4">
+                  {detail.events.map(event => {
+                    const { detail: extra, label } = eventText(event, k)
+
+                    return (
+                      <li
+                        className="relative text-[0.6875rem] before:absolute before:top-1.5 before:-left-[1.1875rem] before:size-1.5 before:rounded-full before:bg-(--ui-text-quaternary) before:ring-4 before:ring-(--ui-bg-elevated)"
+                        key={event.id}
+                      >
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-(--ui-text-secondary)">{label}</span>
+                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
+                        </div>
+                        {extra && <p className="mt-0.5 text-(--ui-text-quaternary)">{extra}</p>}
+                      </li>
+                    )
+                  })}
+                </ul>
+              </DrawerSection>
+            )}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-5 text-sm">
+            {detail.runs.length === 0 && !(log?.exists && log.content) && (
+              <p className="py-6 text-center text-xs text-(--ui-text-quaternary)">{k.noExecution}</p>
+            )}
+
+            {detail.runs.length > 0 && (
+              <DrawerSection label={k.runs(detail.runs.length)}>
+                <ul className="flex flex-col gap-3">
+                  {detail.runs.map(run => {
+                    const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
+
+                    return (
+                      <li
+                        className="flex flex-col gap-1 border-b border-(--ui-stroke-tertiary) pb-3 text-[0.71rem] last:border-0 last:pb-0"
+                        key={run.id}
+                      >
+                        <div className="flex items-center gap-2">
+                          <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
+                            {run.outcome ?? run.status}
+                          </Badge>
+                          {run.profile && <span className="text-(--ui-text-tertiary)">{run.profile}</span>}
+                          {duration(run.started_at, run.ended_at) && (
+                            <span className="text-(--ui-text-quaternary)">
+                              {duration(run.started_at, run.ended_at)}
+                            </span>
+                          )}
+                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
+                            {ago(run.ended_at ?? run.started_at)}
+                          </span>
+                        </div>
+                        {(run.error || run.summary) && (
+                          <p
+                            className={cn(
+                              'line-clamp-3 whitespace-pre-wrap leading-relaxed',
+                              run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
+                            )}
+                          >
+                            {run.error ?? run.summary}
+                          </p>
+                        )}
+                      </li>
+                    )
+                  })}
+                </ul>
+              </DrawerSection>
+            )}
+
+            {log?.exists && log.content && (
+              <DrawerSection label={log.truncated ? k.workerLogTail : k.workerLog}>
+                <ScrollFade deps={log.content.length} max="24rem">
+                  <LogView className="border-0 px-0">{log.content}</LogView>
+                </ScrollFade>
+              </DrawerSection>
+            )}
+          </div>
         )}
       </div>
+
+      {detail && task && (
+        <footer className="border-t border-(--ui-stroke-tertiary) px-3 py-2.5">
+          <CommentComposer
+            onRequeue={body => requeueMut.mutate(body)}
+            onSubmit={body => commentMut.mutate(body)}
+            pending={commentMut.isPending || requeueMut.isPending}
+            running={running}
+          />
+        </footer>
+      )}
     </div>
   )
 }
