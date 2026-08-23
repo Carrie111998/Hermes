@@ -47,11 +47,11 @@ def _ok_by_cell(rows):
     """Mirror of the index main() builds, so the helper can be tested alone."""
     from collections import defaultdict
 
-    idx = defaultdict(dict)
+    raw = defaultdict(lambda: defaultdict(list))
     for r in rows:
         if r.get("ok"):
-            idx[(r["model"], r["arm"])][(r["task"], r["rep"])] = r["total_tokens"]
-    return idx
+            raw[(r["model"], r["arm"])][(r["task"], r["rep"])].append(r["total_tokens"])
+    return report._cell_means(raw)
 
 
 # ── the defect this test exists for ───────────────────────────────────
@@ -165,3 +165,48 @@ def test_main_prints_pair_count_and_paired_delta(tmp_path, capsys):
     assert "-50%" in pr_line, pr_line
     assert "2/3" in pr_line, pr_line  # 2 paired cells out of the arm's 3 ok runs
     assert "+67%" not in out
+
+
+# ── duplicate records ─────────────────────────────────────────────────
+
+
+def test_a_duplicated_cell_is_averaged_not_overwritten():
+    """Two ok records for one (task, rep) can arrive from two results files.
+
+    Last-wins would let a duplicated line silently decide the delta. Averaging
+    matches what the per-arm columns already do, where every ok row counts.
+    """
+    rows = [
+        _row("m", "base", "t1", 0, True, 100),
+        _row("m", "base", "t1", 0, True, 200),   # same cell, duplicated
+        _row("m", "pr", "t1", 0, True, 75),
+    ]
+    idx = _ok_by_cell(rows)
+    assert idx[("m", "base")][("t1", 0)] == 150.0
+    pct, n_paired = report.paired_token_delta(idx, "m", "pr")
+    assert n_paired == 1
+    assert pct == pytest.approx(-50.0)
+
+
+def test_main_reports_the_duplicate_count(tmp_path, capsys):
+    rows = [
+        _row("m", "base", "t1", 0, True, 100),
+        _row("m", "base", "t1", 0, True, 200),
+        _row("m", "pr", "t1", 0, True, 75),
+    ]
+    p = tmp_path / "results.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    report.main([str(p)])
+    out = capsys.readouterr().out
+    assert "1 duplicate (task, rep) record" in out
+
+
+def test_no_duplicate_note_when_there_are_none(tmp_path, capsys):
+    rows = [
+        _row("m", "base", "t1", 0, True, 100),
+        _row("m", "pr", "t1", 0, True, 75),
+    ]
+    p = tmp_path / "results.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    report.main([str(p)])
+    assert "duplicate (task, rep)" not in capsys.readouterr().out

@@ -27,6 +27,21 @@ def _cell_key(r):
     return (r.get("task", "?"), r.get("rep"))
 
 
+def _cell_means(ok_by_cell):
+    """Collapse each cell's list of ok runs to its mean.
+
+    A cell is one (task, rep) of one arm and normally holds exactly one ok run.
+    It can hold more when several results.jsonl files are passed at once, or
+    when a resumed battery re-ran a cell. Overwriting on collision would make a
+    duplicated record silently decide the delta; averaging keeps the same
+    behaviour the per-arm columns already have, where every ok row counts.
+    """
+    return {
+        key: {cell: sum(vals) / len(vals) for cell, vals in cells.items()}
+        for key, cells in ok_by_cell.items()
+    }
+
+
 def paired_token_delta(ok_by_cell, model, arm, base_arm=BASE_ARM):
     """Return (pct, n_paired) for ``arm`` against ``base_arm`` on one model.
 
@@ -35,6 +50,8 @@ def paired_token_delta(ok_by_cell, model, arm, base_arm=BASE_ARM):
     """
     arm_cells = ok_by_cell.get((model, arm), {})
     base_cells = ok_by_cell.get((model, base_arm), {})
+    # Sorted for a stable order: means do not care, but the pair count and any
+    # future per-cell output should not shuffle between runs.
     shared = sorted(set(arm_cells) & set(base_cells), key=lambda k: (str(k[0]), str(k[1])))
     if not shared:
         return None, 0
@@ -61,13 +78,19 @@ def main(paths):
     for r in rows:
         cells[(r.get("model", "?"), r.get("arm", "?"))].append(r)
 
-    # (model, arm) -> {(task, rep): total_tokens} over ok runs only. Keyed by
-    # cell so the vs-base delta can be taken on the intersection.
-    ok_by_cell = defaultdict(dict)
+    # (model, arm) -> {(task, rep): [total_tokens, ...]} over ok runs only.
+    # Keyed by cell so the vs-base delta can be taken on the intersection; a
+    # list rather than a scalar so a duplicated record cannot silently replace
+    # the value the delta is computed from.
+    raw_by_cell = defaultdict(lambda: defaultdict(list))
     for (model, arm), rs in cells.items():
         for r in rs:
             if r.get("ok"):
-                ok_by_cell[(model, arm)][_cell_key(r)] = r.get("total_tokens", 0)
+                raw_by_cell[(model, arm)][_cell_key(r)].append(r.get("total_tokens", 0))
+    dupes = sum(
+        len(v) - 1 for cells_ in raw_by_cell.values() for v in cells_.values() if len(v) > 1
+    )
+    ok_by_cell = _cell_means(raw_by_cell)
 
     hdr = (
         f"{'model':<34} {'arm':<16} {'ok':>7} {'tok_mean':>9} {'tok_med':>8} "
@@ -97,6 +120,11 @@ def main(paths):
             f"{statistics.mean(walls) if walls else 0:>7.1f} {delta:>8} {pair:>6}"
         )
 
+    if dupes:
+        print(
+            f"\nNOTE: {dupes} duplicate (task, rep) record(s) across the inputs; "
+            "each cell's paired value is the mean of its ok runs."
+        )
     print(
         "\nNote: tok_mean/tok_med/calls/wall_s are per-arm means over that arm's\n"
         "own ok runs. 'vs base' is paired — it uses only the (task, rep) cells\n"
