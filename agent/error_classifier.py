@@ -909,6 +909,32 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # Strict Anthropic/OpenAI-compat proxies (Palantir Foundry LLM proxy,
+    # Mistral, ...) reject the ``reasoning_details`` field Hermes echoes back
+    # for multi-turn reasoning continuity: HTTP 400 with
+    # ``{unrecognizedProperty=reasoning_details}`` / "unrecognized field".
+    # Unlike the signature/frozen-block cases below this carries no
+    # "thinking" token, so it fell through to a non-retryable format_error
+    # and the turn hard-aborted (observed on opus subagents doing many
+    # tool-call steps: the prior step's reasoning_details rides into the
+    # next request and the strict proxy rejects the whole call). Same
+    # recovery applies — strip all reasoning_details and retry — so route
+    # it to the thinking_signature handler in conversation_loop.py.
+    if (
+        status_code == 400
+        and "reasoning_details" in error_msg
+        and (
+            "unrecognized" in error_msg
+            or "unknown" in error_msg
+            or "invalid" in error_msg
+        )
+    ):
+        return _result(
+            FailoverReason.thinking_signature,
+            retryable=True,
+            should_compress=False,
+        )
+
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
     # same recovery (strip all reasoning_details and retry without thinking
     # blocks — see the thinking_signature handler in conversation_loop.py):
