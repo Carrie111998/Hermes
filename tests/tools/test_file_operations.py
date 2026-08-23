@@ -314,6 +314,8 @@ class TestShellFileOpsHelpers:
                 return {"output": "hello", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
+            if "wc -l <" in command and "od " in command:
+                return {"output": "1\n0a\n", "returncode": 0}
             if command.startswith("wc -l"):
                 return {"output": "1\n", "returncode": 0}
             return {"output": "", "returncode": 0}
@@ -332,7 +334,9 @@ class TestShellFileOpsHelpers:
         )
         assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null | base64"
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt' | cut -b1-8001"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        assert commands[3].startswith("wc -l < '/c/Users/alice/notes.txt'")
+        assert "tail -c 1 '/c/Users/alice/notes.txt'" in commands[3]
+        assert "od -An -tx1" in commands[3]
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
