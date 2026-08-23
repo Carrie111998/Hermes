@@ -2070,6 +2070,10 @@ def fetch_openrouter_models(
 
     curated: list[tuple[str, str]] = []
     silent_default = get_preferred_silent_default_model("openrouter")
+    seen: set[str] = set()
+
+    # Always include the curated/default entries first so ordering is stable
+    # and the silent-default badge is preserved.
     for preferred_id in preferred_ids:
         live_item = live_by_id.get(preferred_id)
         if live_item is None:
@@ -2079,13 +2083,22 @@ def fetch_openrouter_models(
         # when the user selects them. Ported from Kilo-Org/kilocode#9068.
         if not _openrouter_model_supports_tools(live_item):
             continue
-        if preferred_id == silent_default:
-            # Keep the silent-default badge through the live refresh so the
-            # picker shows which model Hermes lands on when none is selected.
-            desc = "default"
-        else:
-            desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
+        desc = "default" if preferred_id == silent_default else ("free" if _openrouter_model_is_free(live_item.get("pricing")) else "")
         curated.append((preferred_id, desc))
+        seen.add(preferred_id)
+
+    # Append every remaining live model that supports tools, so the picker
+    # shows the full catalog instead of only the curated subset.
+    extra: list[tuple[str, str]] = []
+    for mid, item in live_by_id.items():
+        if mid in seen:
+            continue
+        if not _openrouter_model_supports_tools(item):
+            continue
+        desc = "free" if _openrouter_model_is_free(item.get("pricing")) else ""
+        extra.append((mid, desc))
+
+    curated.extend(sorted(extra))
 
     if not curated:
         return list(_openrouter_catalog_cache or fallback)
