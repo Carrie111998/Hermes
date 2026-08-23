@@ -443,7 +443,11 @@ interface ProjectTreePayload {
   scoped_session_ids: string[]
 }
 
-const PROJECT_TREE_PREVIEW_LIMIT = 3
+// Sessions per project the overview tree ships. 3 previews meant expanding a
+// project row showed a stub with no way to reach older conversations; the
+// backend's own session window is 2000 (projects.tree session_limit), so
+// request the full window and let the sidebar render it on expand.
+const PROJECT_TREE_SESSION_LIMIT = 2000
 // The all-profiles fan-out reads one database per profile, so it is allowed the
 // same headroom as the cross-profile session list rather than the interactive
 // default.
@@ -482,7 +486,7 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
     const res = await gatewayRequestOn<ProjectTreePayload>(
       gateway,
       'projects.tree',
-      projectParams({ preview_limit: PROJECT_TREE_PREVIEW_LIMIT }, profile)
+      projectParams({ preview_limit: PROJECT_TREE_SESSION_LIMIT }, profile)
     )
 
     if (generation !== projectTreeRefreshGeneration || !stillOnProjectsContext(context)) {
@@ -529,7 +533,7 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
 
   try {
     const res = await hermesApi<ProjectTreePayload>({
-      path: `/api/profiles/projects/tree?preview_limit=${PROJECT_TREE_PREVIEW_LIMIT}`,
+      path: `/api/profiles/projects/tree?preview_limit=${PROJECT_TREE_SESSION_LIMIT}`,
       timeoutMs: PROJECT_TREE_REQUEST_TIMEOUT_MS
     })
 
