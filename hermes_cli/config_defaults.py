@@ -3686,6 +3686,12 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # ── Behavioral analysis ──
+    "behavior": {
+        "enabled": False,
+        "model": None,
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 38,
 }
