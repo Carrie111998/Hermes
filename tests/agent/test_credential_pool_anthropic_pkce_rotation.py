@@ -195,6 +195,42 @@ def test_singleton_seed_collapses_legacy_dashboard_mirror(monkeypatch):
     assert written == [("rotated-access", "rotated-refresh", 3_000)]
 
 
+def test_load_pool_commits_equal_expiry_legacy_migration(tmp_path, monkeypatch):
+    from agent.anthropic_adapter import _write_hermes_oauth_credentials
+    from agent.credential_pool import load_pool, read_credential_pool, write_credential_pool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    canonical = _pkce_entry(
+        id="canonical",
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+        expires_at_ms=2_000,
+    )
+    legacy = _pkce_entry(
+        id="dashboard",
+        source="manual:dashboard_pkce",
+        access_token="winner-access",
+        refresh_token="winner-refresh",
+        expires_at_ms=2_000,
+    )
+    write_credential_pool(
+        "anthropic", [canonical.to_dict(), legacy.to_dict()]
+    )
+    _write_hermes_oauth_credentials("stale-access", "stale-refresh", 2_000)
+
+    first = load_pool("anthropic").entries()
+    second = load_pool("anthropic").entries()
+
+    assert len(first) == len(second) == 1
+    assert first[0].id == second[0].id == "canonical"
+    assert first[0].refresh_token == second[0].refresh_token == "winner-refresh"
+    persisted = read_credential_pool("anthropic")
+    assert len(persisted) == 1
+    assert persisted[0]["refresh_token"] == "winner-refresh"
+    singleton = json.loads((tmp_path / ".anthropic_oauth.json").read_text("utf-8"))
+    assert singleton["refreshToken"] == "winner-refresh"
+
+
 _CHILD_REFRESH = r"""
 import json
 import os

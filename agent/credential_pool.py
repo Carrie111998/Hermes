@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3296,6 +3297,13 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    authority = _auth_store_lock() if provider == "anthropic" else nullcontext()
+    with authority:
+        return _load_pool_under_authority(provider)
+
+
+def _load_pool_under_authority(provider: str) -> CredentialPool:
+    """Load and heal one pool while any required provider authority is held."""
     raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
@@ -3314,7 +3322,8 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             payload.get("access_token"),
             payload.get("auth_type", AUTH_TYPE_API_KEY),
-        ) != payload.get("auth_type", AUTH_TYPE_API_KEY)
+        )
+        != payload.get("auth_type", AUTH_TYPE_API_KEY)
         for payload in raw_entries
     )
     if raw_needs_auth_normalization:
@@ -3322,16 +3331,39 @@ def load_pool(provider: str) -> CredentialPool:
         # Keep that fallback read-only: only the store that owns these rows may
         # rewrite them. Loading the default/root profile will heal global rows.
         active_pool = _load_auth_store().get("credential_pool")
-        active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+        active_entries = (
+            active_pool.get(provider) if isinstance(active_pool, dict) else None
+        )
         raw_needs_auth_normalization = bool(active_entries)
 
+    authoritative_ids = set()
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
-        changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
+        changed = (
+            raw_needs_sanitization
+            or raw_needs_auth_normalization
+            or custom_changed
+        )
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
+        canonical_before = next(
+            (
+                entry
+                for entry in entries
+                if provider == "anthropic" and entry.source == "hermes_pkce"
+            ),
+            None,
+        )
+        had_legacy_pkce_mirror = canonical_before is not None and any(
+            entry.source == "manual:dashboard_pkce" for entry in entries
+        )
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+        if had_legacy_pkce_mirror and singleton_changed:
+            # The migration explicitly selected one generation while the same
+            # authority covered singleton repair. Let that winner cross the
+            # disk-boundary stale-writer guard, including on an expiry tie.
+            authoritative_ids.add(canonical_before.id)
         env_changed, env_sources = _seed_from_env(provider, entries)
         changed = (
             raw_needs_sanitization
@@ -3352,9 +3384,15 @@ def load_pool(provider: str) -> CredentialPool:
 
     if changed:
         new_ids = {entry.id for entry in entries}
+        write_kwargs = {"removed_ids": disk_ids - new_ids}
+        if authoritative_ids:
+            write_kwargs["authoritative_ids"] = authoritative_ids
         write_credential_pool(
             provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-            removed_ids=disk_ids - new_ids,
+            [
+                entry.to_dict()
+                for entry in sorted(entries, key=lambda item: item.priority)
+            ],
+            **write_kwargs,
         )
     return CredentialPool(provider, entries)
