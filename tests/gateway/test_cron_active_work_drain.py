@@ -50,8 +50,28 @@ class TestActiveCronJobCount:
         runner, _adapter = make_restart_runner()
         assert runner._active_cron_job_count() == 0
 
+    def test_probe_failure_is_counted_during_drain(self, monkeypatch):
+        runner, _adapter = make_restart_runner()
+
+        def broken_probe():
+            raise RuntimeError("scheduler unavailable")
+
+        monkeypatch.setattr("cron.scheduler.get_running_job_ids", broken_probe)
+        assert runner._active_cron_job_count(fail_closed=True) == 1
+
 
 class TestDrainWaitsForCronWork:
+
+    @pytest.mark.asyncio
+    async def test_drain_fails_closed_when_cron_probe_raises(self, monkeypatch):
+        runner, _adapter = make_restart_runner()
+
+        def broken_probe():
+            raise RuntimeError("scheduler unavailable")
+
+        monkeypatch.setattr("cron.scheduler.get_running_job_ids", broken_probe)
+        _snapshot, timed_out = await runner._drain_active_agents(0.0)
+        assert timed_out is True
 
     @pytest.mark.asyncio
     async def test_drain_waits_for_in_flight_cron_job(self):

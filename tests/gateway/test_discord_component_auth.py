@@ -14,7 +14,7 @@ handling, and fail-closed behavior so the parity cannot regress.
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -249,6 +249,100 @@ def test_view_empty_allowlists_allow_with_explicit_allow_all(monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
     view = ExecApprovalView(session_key="s", allowed_user_ids=set())
     assert view._check_auth(_interaction(99999)) is True
+
+
+def _approval_interaction(user_id=1):
+    class _Embed:
+        footer = {}
+
+        def set_footer(self, *, text):
+            self.footer = {"text": text}
+
+    return SimpleNamespace(
+        user=SimpleNamespace(id=user_id, display_name="Operator", roles=[]),
+        message=SimpleNamespace(embeds=[_Embed()]),
+        response=SimpleNamespace(
+            edit_message=AsyncMock(),
+            send_message=AsyncMock(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_public_button_rejects_unauthorized_click():
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"1"})
+    interaction = _approval_interaction(user_id=2)
+
+    with patch("tools.approval.resolve_gateway_approval") as resolve:
+        await view.allow_once(interaction, MagicMock())
+
+    resolve.assert_not_called()
+    assert view.resolved is False
+    interaction.response.send_message.assert_awaited_once()
+    assert "not authorized" in interaction.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_public_button_marks_stale_resolution_without_approval():
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"1"})
+    interaction = _approval_interaction()
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=0) as resolve:
+        await view.allow_once(interaction, MagicMock())
+
+    resolve.assert_called_once_with("s", "once")
+    assert view.resolved is True
+    interaction.response.edit_message.assert_awaited_once()
+    assert "expired" in interaction.message.embeds[0].footer["text"]
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_public_button_rejects_writer_failure(tmp_path):
+    view = UpdatePromptView(
+        session_key="s",
+        prompt_id="p",
+        correlation_id="corr",
+        control_home=str(tmp_path),
+        allowed_user_ids={"1"},
+    )
+    interaction = _approval_interaction()
+
+    with patch(
+        "gateway.update_prompt_response.write_update_confirmation_response",
+        return_value=False,
+    ) as writer:
+        await view.yes_btn(interaction, MagicMock())
+
+    writer.assert_called_once()
+    assert view.resolved is False
+    interaction.response.edit_message.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    assert "stale" in interaction.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_public_button_replay_is_inert(tmp_path):
+    view = UpdatePromptView(
+        session_key="s",
+        prompt_id="p",
+        correlation_id="corr",
+        control_home=str(tmp_path),
+        allowed_user_ids={"1"},
+    )
+    interaction = _approval_interaction()
+
+    with patch(
+        "gateway.update_prompt_response.write_update_confirmation_response",
+        return_value=True,
+    ) as writer:
+        await view.yes_btn(interaction, MagicMock())
+        await view.no_btn(interaction, MagicMock())
+
+    writer.assert_called_once()
+    assert view.resolved is True
+    assert interaction.response.edit_message.await_count == 1
+    assert interaction.response.send_message.await_count == 1
+    assert "already" in interaction.response.send_message.call_args.args[0].lower()
 
 
 # ---------------------------------------------------------------------------

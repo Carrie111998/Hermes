@@ -16,8 +16,8 @@ def _runner() -> GatewayRunner:
     runner, _adapter = make_restart_runner()
     # Keep these tests isolated from the process-global cron scheduler and
     # adapter implementations; each case controls only Kanban lifecycle work.
-    runner._active_cron_job_count = lambda: 0
-    runner._active_api_run_count = lambda: 0
+    runner._active_cron_job_count = lambda **_: 0
+    runner._active_api_run_count = lambda **_: 0
     return runner
 
 

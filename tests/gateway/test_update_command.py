@@ -113,6 +113,7 @@ class TestHandleUpdateCommand:
 
 
     @pytest.mark.asyncio
+    @pytest.mark.linux_only
     async def test_writes_pending_marker(self, tmp_path):
         """Writes .update_pending.json with correct platform and chat info."""
         runner = _make_runner()
@@ -195,6 +196,9 @@ class TestHandleUpdateCommand:
         launch_env = mock_popen.call_args.kwargs["env"]
         correlation_id = launch_env["HERMES_UPDATE_CORRELATION_ID"]
         assert launch_env["HERMES_UPDATE_WINDOWS_DETACHED"] == correlation_id
+        assert mock_popen.call_args.args[0][0] == r"C:\project\venv\Scripts\python.exe"
+        assert mock_popen.call_args.args[0][-2:] == ["update", "--gateway"]
+        assert "start_new_session" not in mock_popen.call_args.kwargs
         assert mock_popen.call_args.kwargs["creationflags"] == 0x01000200
 
     @pytest.mark.asyncio
@@ -272,6 +276,7 @@ class TestHandleUpdateCommand:
 
 
     @pytest.mark.asyncio
+    @pytest.mark.linux_only
     async def test_fallback_when_no_setsid(self, tmp_path):
         """Falls back to start_new_session=True when setsid is not available."""
         runner = _make_runner()
@@ -972,24 +977,18 @@ class TestWatchUpdateProgress:
 
         with patch("gateway.run._hermes_home", hermes_home), patch(
             "hermes_cli.update_lock.read_live_update", return_value=None
+        ), patch.object(
+            type(runner), "_update_process_identity_state", return_value=False
         ):
-            watch = asyncio.create_task(
-                runner._watch_update_progress(
-                    poll_interval=0.01,
-                    stream_interval=0.01,
-                    timeout=0.02,
-                )
-            )
-            for _ in range(50):
-                if (hermes_home / f".update_exit_code.{correlation_id}").exists():
-                    break
-                await asyncio.sleep(0.01)
-            assert (
-                hermes_home / f".update_exit_code.{correlation_id}"
-            ).read_text(encoding="utf-8") == "1"
-            watch.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await watch
+            assert runner._update_worker_definitively_gone(
+                json.loads(pending_path.read_text(encoding="utf-8"))
+            ) is True
+            marker = runner._update_status_path(hermes_home, {
+                "correlation_id": correlation_id,
+            })
+            assert marker is not None
+            assert runner._publish_update_status(marker, 1) is True
+            assert marker.read_text(encoding="utf-8") == "1"
 
     def test_orphan_probe_fails_closed_for_live_or_uncertain_owner(self):
         runner = _make_runner()

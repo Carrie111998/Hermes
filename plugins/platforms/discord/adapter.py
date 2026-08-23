@@ -36,6 +36,20 @@ from agent.display import ToolPreview
 
 logger = logging.getLogger(__name__)
 
+
+def _redact_discord_error_text(error: object) -> str:
+    """Redact secrets from Discord transport errors before they cross a boundary."""
+    text = str(error)
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text, force=True)
+    except Exception:
+        # Error handling must never expose the original exception when the
+        # redactor itself is unavailable or malformed.
+        return "<discord error redacted>"
+
+
 _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -3831,7 +3845,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
@@ -3889,7 +3903,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "[%s] Overflow split: first-chunk edit failed: %s",
                 self.name, e, exc_info=True,
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
         # Step 2 — send each remaining chunk threaded as a reply to the prior.
         continuation_ids: list[str] = []
@@ -7559,7 +7573,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
@@ -7603,7 +7617,7 @@ class DiscordAdapter(BasePlatformAdapter):
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     async def send_clarify(
         self,
@@ -7729,8 +7743,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
-            logger.warning("[%s] send_clarify failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+            logger.warning("[%s] send_clarify failed: %s", self.name, _redact_discord_error_text(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
@@ -7778,7 +7792,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._nonconversational_messages.mark_many([str(msg.id)])
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     async def send_model_picker(
         self,
@@ -7839,8 +7853,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
-            logger.warning("[%s] send_model_picker failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+            logger.warning("[%s] send_model_picker failed: %s", self.name, _redact_discord_error_text(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     async def send_choice_picker(
         self,
@@ -7887,8 +7901,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
-            logger.warning("[%s] send_choice_picker failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+            logger.warning("[%s] send_choice_picker failed: %s", self.name, _redact_discord_error_text(e))
+            return SendResult(success=False, error=_redact_discord_error_text(e))
 
     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
         """Return the parent channel ID for a Discord thread-like channel, if present."""

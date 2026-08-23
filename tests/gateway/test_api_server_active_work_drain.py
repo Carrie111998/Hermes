@@ -70,6 +70,28 @@ class TestActiveApiRunCount:
         runner.adapters = {}
         assert runner._active_api_run_count() == 0
 
+    def test_probe_failure_is_counted_during_drain(self):
+        runner, _adapter = make_restart_runner()
+        broken_adapter = SimpleNamespace(
+            active_agent_work_count=lambda: (_ for _ in ()).throw(
+                RuntimeError("api server unavailable")
+            )
+        )
+        runner.adapters = {Platform.API_SERVER: broken_adapter}
+        assert runner._active_api_run_count(fail_closed=True) == 1
+
+    @pytest.mark.asyncio
+    async def test_drain_fails_closed_when_api_probe_raises(self):
+        runner, _adapter = make_restart_runner()
+        broken_adapter = SimpleNamespace(
+            active_agent_work_count=lambda: (_ for _ in ()).throw(
+                RuntimeError("api server unavailable")
+            )
+        )
+        runner.adapters = {Platform.API_SERVER: broken_adapter}
+        _snapshot, timed_out = await runner._drain_active_agents(0.0)
+        assert timed_out is True
+
 
 class TestAPIServerAdapterWorkCount:
 

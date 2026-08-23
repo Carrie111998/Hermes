@@ -8655,7 +8655,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._kanban_auto_decompose_inflight_count()
         )
 
-    def _active_cron_job_count(self) -> int:
+    def _active_cron_job_count(self, *, fail_closed: bool = False) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
         own in-flight tracking (``cron.scheduler._running_job_ids``).
 
@@ -8666,16 +8666,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Without this, the shutdown drain is structurally blind to in-flight
         cron work: it can report ``active_at_start=0`` and proceed straight
         to killing tool subprocesses while a cron job's terminal command is
-        still running (#60432). Best-effort: returns 0 if the cron module
-        can't be imported (e.g. a minimal test double for this class).
+        still running (#60432).  Normal status reporting is best-effort;
+        ``fail_closed`` makes a probe failure count as one active unit during
+        shutdown so unknown work cannot be killed.
         """
         try:
             from cron.scheduler import get_running_job_ids
             return len(get_running_job_ids())
-        except Exception:
+        except Exception as exc:
+            if fail_closed:
+                logger.warning("Cron active-work probe failed during drain: %s", exc)
+                return 1
             return 0
 
-    def _active_api_run_count(self) -> int:
+    def _active_api_run_count(self, *, fail_closed: bool = False) -> int:
         """Count API-server work that is outside ``_running_agents``.
 
         The primary API server owns the sole HTTP listener. Secondary multiplex
@@ -8686,7 +8690,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
             helper = getattr(adapter, "active_agent_work_count", None)
             return max(0, int(helper())) if callable(helper) else 0
-        except Exception:
+        except Exception as exc:
+            if fail_closed:
+                logger.warning("API active-work probe failed during drain: %s", exc)
+                return 1
             return 0
 
     def _interrupt_api_server_runs(self, reason: str) -> int:
@@ -10745,8 +10752,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _counts() -> tuple[int, int, int, int, int, int]:
             return (
                 self._running_agent_count(),
-                self._active_cron_job_count(),
-                self._active_api_run_count(),
+                self._active_cron_job_count(fail_closed=True),
+                self._active_api_run_count(fail_closed=True),
                 self._active_kanban_worker_count(fail_closed=True),
                 self._kanban_dispatch_claim_inflight_count(),
                 self._kanban_auto_decompose_inflight_count(),

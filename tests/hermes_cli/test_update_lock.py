@@ -151,7 +151,7 @@ def test_desktop_handoff_claim_preserves_live_foreign_marker(marker, monkeypatch
     foreign_pid = os.getpid() + 20_000
     lease_at = int(time.time())
     foreign_payload = f"{foreign_pid}\n{lease_at}\n"
-    marker.write_text(foreign_payload, encoding="utf-8")
+    marker.write_bytes(foreign_payload.encode("utf-8"))
     monkeypatch.setattr(
         update_lock_mod,
         "_pid_alive",
@@ -167,14 +167,14 @@ def test_desktop_handoff_claim_preserves_live_foreign_marker(marker, monkeypatch
 
     assert reason is not None
     assert "live foreign pid" in reason
-    assert marker.read_text(encoding="utf-8") == foreign_payload
+    assert marker.read_bytes() == foreign_payload.encode("utf-8")
 
 
 def test_desktop_handoff_claim_cas_replaces_authorized_bridge(marker, monkeypatch):
     owner_pid = os.getpid() + 10_000
     desktop_pid = os.getpid()
     lease_at = int(time.time()) - 30
-    marker.write_text(f"{desktop_pid}\n{lease_at}\n", encoding="utf-8")
+    marker.write_bytes(f"{desktop_pid}\n{lease_at}\n".encode("utf-8"))
     monkeypatch.setattr(
         update_lock_mod,
         "_pid_alive",
@@ -240,7 +240,7 @@ def test_heartbeat_keeps_a_live_owner_past_the_fixed_age_ceiling(marker, monkeyp
     assert lock.acquire() is True
 
     ancient = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
-    marker.write_text(f"{os.getpid()}\n{ancient}\n", encoding="utf-8")
+    marker.write_bytes(f"{os.getpid()}\n{ancient}\n".encode("utf-8"))
 
     deadline = time.monotonic() + 2
     lease_at = ancient
@@ -262,10 +262,10 @@ def test_heartbeat_never_reclaims_a_marker_that_changed_owner(marker, monkeypatc
 
     foreign_pid = os.getpid() + 100_000
     foreign_payload = f"{foreign_pid}\n{int(time.time())}\n"
-    marker.write_text(foreign_payload, encoding="utf-8")
+    marker.write_bytes(foreign_payload.encode("utf-8"))
 
     assert lock.refresh_lease() is False
-    assert marker.read_text(encoding="utf-8") == foreign_payload
+    assert marker.read_bytes() == foreign_payload.encode("utf-8")
     lock.release()
     assert marker.exists(), "the former owner's release also leaves the new claim"
 
@@ -293,14 +293,14 @@ def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     lock = UpdateLock(path=marker)
     lock.acquire()
 
-    marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+    marker.write_bytes(f"{DEAD_PID}\n{int(time.time())}\n".encode("utf-8"))
     lock.release()
 
     assert marker.exists(), "the partner's marker is not ours to remove"
 
 
 def test_dead_owner_is_reclaimed_not_honored(marker):
-    marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+    marker.write_bytes(f"{DEAD_PID}\n{int(time.time())}\n".encode("utf-8"))
 
     lock = UpdateLock(path=marker)
     assert lock.acquire() is True
@@ -311,7 +311,7 @@ def test_live_owner_past_the_age_ceiling_is_never_stolen(marker, monkeypatch):
     """A wall-clock jump cannot admit a second checkout mutator."""
     monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda pid: True)
     long_ago = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
-    marker.write_text(f"{os.getpid()}\n{long_ago}\n", encoding="utf-8")
+    marker.write_bytes(f"{os.getpid()}\n{long_ago}\n".encode("utf-8"))
 
     lock = UpdateLock(path=marker)
     assert lock.acquire() is False
@@ -332,12 +332,12 @@ def test_malformed_markers_fail_closed_without_being_deleted(marker, body):
     lock = UpdateLock(path=marker)
     assert lock.acquire() is False
     assert lock.holder is not None and lock.holder.pid is None
-    assert marker.read_bytes().decode("utf-8") == body
+    assert marker.read_bytes() == body.encode("utf-8")
 
 
 @pytest.mark.parametrize("lease", ["not-a-time", "nan", "inf", "-inf", "-1", "1.5"])
 def test_malformed_lease_fails_closed_even_when_pid_is_live(marker, lease):
-    marker.write_text(f"{os.getpid()}\n{lease}\n", encoding="utf-8")
+    marker.write_bytes(f"{os.getpid()}\n{lease}\n".encode("utf-8"))
 
     observation = read_live_update(path=marker)
     assert observation is not None and observation.pid is None
@@ -348,12 +348,12 @@ def test_malformed_lease_fails_closed_even_when_pid_is_live(marker, lease):
 
 def test_live_pid_with_missing_lease_fails_closed(marker):
     body = str(os.getpid())
-    marker.write_text(body, encoding="utf-8")
+    marker.write_bytes(body.encode("utf-8"))
 
     observation = read_live_update(path=marker)
     assert observation is not None and observation.pid is None
     assert UpdateLock(path=marker).acquire() is False
-    assert marker.read_text(encoding="utf-8") == body
+    assert marker.read_bytes() == body.encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -377,7 +377,7 @@ def test_noncanonical_or_overflow_wire_payload_fails_closed(marker, body):
     observation = read_live_update(path=marker)
     assert observation is not None and observation.pid is None
     assert UpdateLock(path=marker).acquire() is False
-    assert marker.read_bytes().decode("utf-8") == body
+    assert marker.read_bytes() == body.encode("utf-8")
 
 
 def test_crlf_two_line_wire_payload_remains_compatible(marker):
@@ -398,7 +398,7 @@ def test_unreadable_existing_marker_fails_closed(marker):
 
 
 def test_stale_marker_is_removed_on_read(marker):
-    marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+    marker.write_bytes(f"{DEAD_PID}\n{int(time.time())}\n".encode("utf-8"))
 
     assert read_live_update(path=marker) is None
     assert not marker.exists(), "whoever notices a stale marker clears it"
@@ -408,14 +408,14 @@ def test_stale_cleanup_never_unlinks_a_new_owner(marker, monkeypatch):
     """CAS recheck closes the stale-read/new-heartbeat deletion race."""
     now = int(time.time())
     new_pid = os.getpid() + 100_000
-    marker.write_text(f"{DEAD_PID}\n{now}\n", encoding="utf-8")
+    marker.write_bytes(f"{DEAD_PID}\n{now}\n".encode("utf-8"))
     monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda pid: pid == new_pid)
 
     original_enter = update_lock_mod._MarkerMutex.__enter__
 
     def replace_before_cleanup(self):
         result = original_enter(self)
-        marker.write_text(f"{new_pid}\n{now}\n", encoding="utf-8")
+        marker.write_bytes(f"{new_pid}\n{now}\n".encode("utf-8"))
         return result
 
     monkeypatch.setattr(
@@ -491,7 +491,7 @@ def test_missing_marker_is_a_heartbeat_failure_not_an_ownership_handoff(marker):
 
 def test_takeover_fails_closed_when_marker_mutex_is_unavailable(marker, monkeypatch):
     body = f"{os.getpid()}\n{int(time.time())}\n"
-    marker.write_text(body, encoding="utf-8")
+    marker.write_bytes(body.encode("utf-8"))
     monkeypatch.setenv(COORDINATOR_TAKEOVER_PID_ENV, str(os.getpid()))
 
     def fail_mutex(self):
@@ -499,7 +499,7 @@ def test_takeover_fails_closed_when_marker_mutex_is_unavailable(marker, monkeypa
 
     monkeypatch.setattr(update_lock_mod._MarkerMutex, "__enter__", fail_mutex)
     assert UpdateLock(path=marker).take_over_handoff() is False
-    assert marker.read_text(encoding="utf-8") == body
+    assert marker.read_bytes() == body.encode("utf-8")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
@@ -570,7 +570,7 @@ class TestHandoffFromOrchestratingUpdater:
 
     def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
         # Stand in for the parent updater with our own (live) pid.
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{os.getpid()}\n{int(time.time())}\n".encode("utf-8"))
         monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
 
         lock = UpdateLock(path=marker)
@@ -586,14 +586,14 @@ class TestHandoffFromOrchestratingUpdater:
     ):
         monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda pid: True)
         parent_pid = os.getpid()
-        marker.write_text(f"{parent_pid}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{parent_pid}\n{int(time.time())}\n".encode("utf-8"))
         monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid))
 
         child_stage = UpdateLock(path=marker, heartbeat_seconds=0.01)
         assert child_stage.acquire() is True
         assert child_stage.acquired is False
         ancient = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
-        marker.write_text(f"{parent_pid}\n{ancient}\n", encoding="utf-8")
+        marker.write_bytes(f"{parent_pid}\n{ancient}\n".encode("utf-8"))
 
         deadline = time.monotonic() + 2
         lease_at = ancient
@@ -612,7 +612,7 @@ class TestHandoffFromOrchestratingUpdater:
         self, marker, monkeypatch
     ):
         """The env var alone must not bypass the lock."""
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{os.getpid()}\n{int(time.time())}\n".encode("utf-8"))
         monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid() + 1))
 
         lock = UpdateLock(path=marker)
@@ -627,7 +627,7 @@ class TestHandoffFromOrchestratingUpdater:
     def test_malformed_handoff_values_fall_back_to_refusal(
         self, marker, monkeypatch, value
     ):
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{os.getpid()}\n{int(time.time())}\n".encode("utf-8"))
         monkeypatch.setenv(HANDOFF_PID_ENV, value)
 
         assert UpdateLock(path=marker).acquire() is False
@@ -673,7 +673,7 @@ class TestCoordinatorTakeover:
     def test_takeover_env_grants_nothing_when_owner_does_not_match(
         self, marker, monkeypatch
     ):
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{os.getpid()}\n{int(time.time())}\n".encode("utf-8"))
         monkeypatch.setenv(COORDINATOR_TAKEOVER_PID_ENV, str(os.getpid() + 1))
 
         child = UpdateLock(path=marker)
@@ -685,11 +685,11 @@ class TestCoordinatorTakeover:
         self, marker, monkeypatch, value
     ):
         body = f"{os.getpid()}\n{int(time.time())}\n"
-        marker.write_text(body, encoding="utf-8")
+        marker.write_bytes(body.encode("utf-8"))
         monkeypatch.setenv(COORDINATOR_TAKEOVER_PID_ENV, value)
 
         assert UpdateLock(path=marker).take_over_handoff() is False
-        assert marker.read_text(encoding="utf-8") == body
+        assert marker.read_bytes() == body.encode("utf-8")
 
 
 class TestAncestryHandoff:
@@ -714,7 +714,7 @@ class TestAncestryHandoff:
         )
 
     def test_marker_owned_by_our_parent_process_is_our_orchestrator(self, marker):
-        marker.write_text(f"{os.getppid()}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{os.getppid()}\n{int(time.time())}\n".encode("utf-8"))
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True, "a live ancestor's claim is the one we run under"
@@ -726,7 +726,7 @@ class TestAncestryHandoff:
 
     def test_live_non_ancestor_holder_is_still_refused(self, marker):
         """Ancestry must not open the lock to unrelated concurrent updaters."""
-        marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_bytes(f"{DEAD_PID}\n{int(time.time())}\n".encode("utf-8"))
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is False

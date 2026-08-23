@@ -4,7 +4,7 @@ their payload into plain message content, since embeds don't render on some
 Discord clients (web/mobile)."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -65,5 +65,40 @@ async def test_clarify_with_choices_mirrors_question_into_content():
     assert "Hermes needs your input" in sent["content"]
     assert "Which environment should I deploy to?" in sent["content"]
     assert "Pick one below" in sent["content"]
+
+
+@pytest.mark.asyncio
+async def test_update_and_clarify_return_redacted_transport_errors():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("transport secret=do-not-leak")),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with patch(
+        "plugins.platforms.discord.adapter._redact_discord_error_text",
+        return_value="<safe transport error>",
+    ) as redact:
+        update_result = await adapter.send_update_prompt(
+            chat_id="555",
+            prompt="Continue update?",
+            session_key="discord:555",
+            prompt_id="p1",
+            correlation_id="c1",
+        )
+        clarify_result = await adapter.send_clarify(
+            chat_id="555",
+            question="Which environment?",
+            choices=["staging"],
+            clarify_id="cl1",
+            session_key="discord:555",
+        )
+
+    assert update_result.error == "<safe transport error>"
+    assert clarify_result.error == "<safe transport error>"
+    assert redact.call_count == 3
 
 

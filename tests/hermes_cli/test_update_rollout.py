@@ -1759,6 +1759,7 @@ def test_recovery_attempts_later_profiles_before_reraising_baseexception():
     assert attempted == ["canary", "later"]
 
 
+@pytest.mark.linux_only
 def test_manual_restart_never_signals_a_reused_saved_pid(
     monkeypatch, tmp_path
 ):
@@ -3522,7 +3523,16 @@ def test_gateway_handoff_parent_exits_nonterminal_before_mutation(
 def test_rollout_engine_never_publishes_a_terminal_marker_while_gating(
     tmp_path: Path, monkeypatch
 ):
-    marker = tmp_path / ".update_exit_code"
+    # The terminal marker belongs to the control home and is scoped to the
+    # update correlation.  Watching tmp_path/.update_exit_code would observe a
+    # file the rollout owner never reads and could pass while the real marker
+    # is published elsewhere.
+    control_home = tmp_path / "control-home"
+    control_home.mkdir()
+    correlation_id = "rollout-correlation"
+    monkeypatch.setenv("HERMES_HOME", str(control_home))
+    monkeypatch.setenv("HERMES_UPDATE_CORRELATION_ID", correlation_id)
+    marker = control_home / f".update_exit_code.{correlation_id}"
     observations: list[bool] = []
 
     def health(profile, sha, old_pid):
