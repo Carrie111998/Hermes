@@ -7,19 +7,22 @@ from ai_usage.contract import (
 def test_providers_grid_order_and_modes():
     keys = [p[0] for p in PROVIDERS]
     assert keys == [
-        "anthropic", "openai-codex", "kimi", "deepseek", "gemini", "xai",
-        "opencode-go",
+        "anthropic", "anthropic2", "openai-codex", "kimi", "deepseek", "gemini",
+        "xai", "opencode-go",
     ]
     modes = {p[0]: p[2] for p in PROVIDERS}
     assert modes["anthropic"] == "budget" and modes["kimi"] == "budget"
+    # Second Anthropic subscription (diegodearagaous@gmail.com) via its own
+    # ANTHROPIC2_OAUTH_TOKEN; same oauth usage endpoint, same window labels.
+    assert modes["anthropic2"] == "budget"
     assert modes["deepseek"] == "balance"  # pay-as-you-go outstanding-$
     assert modes["gemini"] == "spend"  # month-to-date estimated-$ from tokens
-    assert modes["xai"] == "tokens"
-    # OpenCode Go: flat $10/mo subscription, no usage API (issue #31084) and no
-    # per-token billing → tokens mode (rolling counts), like Grok. billing_provider
-    # is the literal "opencode-go", so the default [key] alias matches it and does
-    # NOT collide with the sibling opencode-zen provider.
-    assert modes["opencode-go"] == "tokens"
+    # Grok: grok.com web-session scrape over CDP (agent/grok_session.py);
+    # api.x.ai has no usage endpoint.
+    assert modes["xai"] == "budget"
+    # OpenCode Go: official GET /zen/go/v1/usage endpoint (Bearer
+    # OPENCODE_GO_API_KEY) -> rolling/weekly/monthly % windows, like Codex.
+    assert modes["opencode-go"] == "budget"
 
 
 def test_window_label_map_covers_both_providers():
@@ -29,6 +32,11 @@ def test_window_label_map_covers_both_providers():
     # Codex fetcher labels
     assert WINDOW_LABEL_TO_ID["Session"][0] == "5h"
     assert WINDOW_LABEL_TO_ID["Weekly"][0] == "wk"
+    # OpenCode Go fetcher labels
+    assert WINDOW_LABEL_TO_ID["Rolling"] == ("5h", "Rolling")
+    assert WINDOW_LABEL_TO_ID["Monthly"] == ("mo", "Monthly")
+    # Grok CDP scrape label
+    assert WINDOW_LABEL_TO_ID["Grok window"] == ("5h", "Grok")
 
 
 def test_token_windows_are_ordered_and_sized():

@@ -8,12 +8,13 @@ from datetime import datetime, timezone
 #         spend (month-to-date estimated-$ from token counts × rate card)}.
 PROVIDERS: list[tuple[str, str, str]] = [
     ("anthropic", "Claude", "budget"),
+    ("anthropic2", "Claude 2", "budget"),
     ("openai-codex", "Codex", "budget"),
     ("kimi", "Kimi K3", "budget"),
     ("deepseek", "DeepSeek", "balance"),
     ("gemini", "Gemini", "spend"),
-    ("xai", "Grok", "tokens"),
-    ("opencode-go", "OpenCode Go", "tokens"),
+    ("xai", "Grok", "budget"),
+    ("opencode-go", "OpenCode Go", "budget"),
 ]
 
 # Maps AccountUsageWindow.label (emitted by agent/account_usage.py fetchers)
@@ -27,6 +28,11 @@ WINDOW_LABEL_TO_ID: dict[str, tuple[str, str]] = {
     # Codex (_fetch_codex_account_usage)
     "Session": ("5h", "Session"),
     "Weekly": ("wk", "Weekly"),
+    # OpenCode Go (_fetch_opencode_go_account_usage)
+    "Rolling": ("5h", "Rolling"),
+    "Monthly": ("mo", "Monthly"),
+    # Grok (_fetch_grok_account_usage, via agent/grok_session.py CDP scrape)
+    "Grok window": ("5h", "Grok"),
 }
 
 # state.db billing_provider substrings that map to a canonical tokens-mode key.

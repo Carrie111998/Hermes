@@ -64,6 +64,8 @@ def budget_provider(
         bits.append(_bit("5h", "5h"))
     if "wk" in by_id:
         bits.append(_bit("wk", "wk"))
+    if "mo" in by_id:
+        bits.append(_bit("mo", "mo"))
 
     return {
         **base,

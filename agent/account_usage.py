@@ -867,20 +867,21 @@ def redeem_codex_reset_credit(
     )
 
 
-def _fetch_anthropic_account_usage(
-    *, timeout: float = _DEFAULT_USAGE_TIMEOUT
+def _fetch_anthropic_usage_with_token(
+    token: str,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
+    provider: str = "anthropic",
 ) -> Optional[AccountUsageSnapshot]:
+    """Query GET /api/oauth/usage with one explicit OAuth token.
+
+    Shared by ``_fetch_anthropic_account_usage`` (primary account via
+    ``resolve_anthropic_token()``) and ``_fetch_anthropic2_account_usage``
+    (second subscription via ``ANTHROPIC2_OAUTH_TOKEN``). ``claude
+    setup-token`` issues a long-lived ``sk-ant-oat01`` token per account;
+    ``_is_oauth_token`` accepts it and this endpoint works unchanged.
+    """
     httpx = _ensure_httpx()
-    token = (resolve_anthropic_token() or "").strip()
-    if not token:
-        return None
-    if not _is_oauth_token(token):
-        return AccountUsageSnapshot(
-            provider="anthropic",
-            source="oauth_usage_api",
-            fetched_at=_utc_now(),
-            unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.",
-        )
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -923,11 +924,144 @@ def _fetch_anthropic_account_usage(
                 f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}"
             )
     return AccountUsageSnapshot(
-        provider="anthropic",
+        provider=provider,
         source="oauth_usage_api",
         fetched_at=_utc_now(),
         windows=tuple(windows),
         details=tuple(details),
+    )
+
+
+def _fetch_anthropic_account_usage(
+    *, timeout: float = _DEFAULT_USAGE_TIMEOUT
+) -> Optional[AccountUsageSnapshot]:
+    token = (resolve_anthropic_token() or "").strip()
+    if not token:
+        return None
+    if not _is_oauth_token(token):
+        return AccountUsageSnapshot(
+            provider="anthropic",
+            source="oauth_usage_api",
+            fetched_at=_utc_now(),
+            unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.",
+        )
+    return _fetch_anthropic_usage_with_token(token, timeout=timeout)
+
+
+def _fetch_anthropic2_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
+) -> Optional[AccountUsageSnapshot]:
+    """Second Anthropic subscription (diegodearagaous@gmail.com).
+
+    Credential chain: explicit arg → ANTHROPIC2_OAUTH_TOKEN env (loaded from
+    profiles/main/.env by bin/ai_usage_collector_run.ps1). Unset → None, so
+    the row degrades to unconfigured rather than erroring every cycle.
+    """
+    token = str(api_key or os.environ.get("ANTHROPIC2_OAUTH_TOKEN", "") or "").strip()
+    if not token:
+        return None
+    if not _is_oauth_token(token):
+        return AccountUsageSnapshot(
+            provider="anthropic2",
+            source="oauth_usage_api",
+            fetched_at=_utc_now(),
+            unavailable_reason="ANTHROPIC2_OAUTH_TOKEN must be an OAuth/setup token (sk-ant-oat01...) from `claude setup-token`.",
+        )
+    return _fetch_anthropic_usage_with_token(token, timeout=timeout, provider="anthropic2")
+
+
+def _fetch_opencode_go_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
+) -> Optional[AccountUsageSnapshot]:
+    """OpenCode Go rolling/weekly/monthly % from GET /zen/go/v1/usage.
+
+    Undocumented but official endpoint (source of truth: oc-src
+    packages/console/app/src/routes/zen/go/v1/usage.ts). Live shape:
+      {"usage":{"rolling":{"status":"ok","percent":12,"resetsAt":"...Z"},
+                "weekly":{...}, "monthly":{...}}}
+    Cloudflare fronts opencode.ai and 1010s the default python UA; a plain
+    product UA passes.
+    """
+    key = str(api_key or os.environ.get("OPENCODE_GO_API_KEY", "") or "").strip()
+    if not key:
+        return None
+    url = (str(base_url or "").strip() or "https://opencode.ai").rstrip("/")
+    httpx = _ensure_httpx()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        # NOT httpx's default python UA -- Cloudflare 1010s it (verified live).
+        "User-Agent": "opencode/1.0",
+    }
+    with httpx.Client(timeout=timeout) as client:
+        response = client.get(f"{url}/zen/go/v1/usage", headers=headers)
+        response.raise_for_status()
+    payload = response.json() or {}
+    windows: list[AccountUsageWindow] = []
+    for name, label in (("rolling", "Rolling"), ("weekly", "Weekly"), ("monthly", "Monthly")):
+        entry = (payload.get("usage") or {}).get(name) or {}
+        percent = entry.get("percent")
+        if percent is None:
+            continue
+        windows.append(
+            AccountUsageWindow(
+                label=label,
+                used_percent=float(percent),
+                reset_at=_parse_dt(entry.get("resetsAt")),
+            )
+        )
+    return AccountUsageSnapshot(
+        provider="opencode-go",
+        source="usage_api",
+        fetched_at=_utc_now(),
+        windows=tuple(windows),
+    )
+
+
+def _fetch_grok_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
+) -> Optional[AccountUsageSnapshot]:
+    """Grok rate-limit window scraped from grok.com's own web session.
+
+    api.x.ai exposes no usage endpoint and the XAI_API_KEY on this box is
+    team_blocked, so the only automated source is the same POST /rest/
+    rate-limits call grok.com's web app makes -- which needs that tab's
+    session cookies. We therefore run the fetch INSIDE a logged-in grok.com
+    tab over CDP (:9222), so Chrome attaches its own cookies; nothing here
+    reads or decrypts cookie files. Not logged in / Chrome down -> None ->
+    the row shows no data instead of erroring every cycle.
+    """
+    try:
+        from agent.grok_session import fetch_grok_rate_limits
+    except ImportError:
+        return None
+    result = fetch_grok_rate_limits(base_url=base_url, timeout=timeout)
+    if not result:
+        return None
+    remaining, total, reset_at = result
+    if total <= 0:
+        return None
+    used_pct = max(0.0, min(100.0, 100.0 * (1.0 - float(remaining) / float(total))))
+    return AccountUsageSnapshot(
+        provider="xai",
+        source="web_scrape",
+        fetched_at=_utc_now(),
+        windows=(
+            AccountUsageWindow(
+                label="Grok window",
+                used_percent=used_pct,
+                reset_at=reset_at,
+            ),
+        ),
     )
 
 
@@ -1265,6 +1399,18 @@ def fetch_account_usage(
             )
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage(timeout=timeout)
+        if normalized == "anthropic2":
+            return _fetch_anthropic2_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
+        if normalized == "opencode-go":
+            return _fetch_opencode_go_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
+        if normalized == "xai":
+            return _fetch_grok_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(
                 base_url,

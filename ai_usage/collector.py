@@ -14,7 +14,6 @@ from typing import Callable, Optional
 from ai_usage.balance import balance_provider
 from ai_usage.budget import budget_provider
 from ai_usage.contract import PROVIDERS, iso
-from ai_usage.manual_snapshot import MANUAL_PROVIDER_KEYS, read_manual_snapshot
 from ai_usage.spend import spend_provider
 from ai_usage.tokensum import tokensum_provider
 
@@ -235,13 +234,11 @@ def collect(
     prev: Optional[dict],
     fetch_usage: Callable[..., object],
     now: Optional[datetime] = None,
-    manual_store_path: Optional[str] = None,
     deadline_seconds: Optional[float] = None,
     _monotonic: Callable[[], float] = time.monotonic,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
     started = _monotonic()
-    manual = read_manual_snapshot(manual_store_path, now) if manual_store_path else {}
     if deadline_seconds is None:
         deadline_seconds = _derive_deadline_seconds()
     deadline_seconds = max(0.0, float(deadline_seconds))
@@ -263,9 +260,7 @@ def collect(
             remaining = max(0.0, deadline - attempt_started)
 
             if remaining <= 0:
-                if key in MANUAL_PROVIDER_KEYS and key in manual:
-                    providers.append(dict(manual[key]))
-                elif mode in ("budget", "balance"):
+                if mode in ("budget", "balance"):
                     make = budget_provider if mode == "budget" else balance_provider
                     providers.append(
                         _carry_forward(prev, key)
@@ -277,11 +272,6 @@ def collect(
                         or _hermes_error_row(key, label, mode)
                     )
                 attempts.append(_diagnostic(key, "deadline_exhausted", 0.0, remaining))
-                continue
-
-            if key in MANUAL_PROVIDER_KEYS and key in manual:
-                providers.append(dict(manual[key]))
-                attempts.append(_diagnostic(key, "ok", _monotonic() - attempt_started, remaining))
                 continue
 
             if mode in ("budget", "balance"):

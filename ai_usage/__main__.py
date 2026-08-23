@@ -17,11 +17,6 @@ def main() -> int:
     out = Path(home) / "architecture-map" / "ai-tokens.json"
     # state.db lives at the ~/.hermes ROOT, never profile-scoped (see CLAUDE.md).
     db = os.environ.get("HERMES_STATE_DB") or os.path.join(home, ".hermes", "state.db")
-    manual_path = os.environ.get("HERMES_AI_USAGE_MANUAL_STORE") or os.path.join(
-        os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming"),
-        "laptop-monitor-tray",
-        "ai-usage-manual.json",
-    )
 
     prev = None
     if out.exists():
@@ -34,7 +29,6 @@ def main() -> int:
         db_path=db,
         prev=prev,
         fetch_usage=fetch_account_usage,
-        manual_store_path=manual_path,
     )
     write_atomic(out, data)
     print(f"wrote {out} ({len(data['providers'])} providers)")

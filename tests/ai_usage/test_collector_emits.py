@@ -117,7 +117,7 @@ def test_record_raising_does_not_break_collect(tmp_path, monkeypatch):
     by = {p["key"]: p for p in data["providers"]}
     assert by["anthropic"]["state"] == "ok"
     assert by["anthropic"]["windows"][0]["used_pct"] == 100.0
-    assert len(data["providers"]) == 7
+    assert len(data["providers"]) == 8
     assert "diagnostics" in data
 
 
