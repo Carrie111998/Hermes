@@ -103,7 +103,6 @@ class TurnContext:
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
 
-
     # --- lazy-imported callables captured from the outer body -------------
     AIAgent: Any = None
     resolve_display_setting: Any = None

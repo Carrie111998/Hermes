@@ -180,6 +180,7 @@ class TestExtendCommandHandler:
         runner._inactivity_extend_deadlines = {}
         runner._inactivity_extend_deadlines_lock = threading.Lock()
         runner._running_agents = {"session:c1": object()}
+        runner._session_run_generation = {"session:c1": 7}
         # Minimal stand-ins so the handler runs without a full gateway.
         class _Source:
             platform = "cli"
@@ -199,15 +200,18 @@ class TestExtendCommandHandler:
         monkeypatch.setattr(time, "monotonic", lambda: fixed[0])
         out = asyncio.run(runner._handle_extend_command(_Event("30")))
         assert "extended by 30" in out
-        assert runner._inactivity_extend_deadlines["session:c1"] == 1000.0 + 30 * 60
+        assert runner._inactivity_extend_deadlines["session:c1"] == (
+            7, 1000.0 + 30 * 60
+        )
 
     def test_extend_command_clears_with_zero(self, monkeypatch):
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
-        runner._inactivity_extend_deadlines = {"session:c1": 9999.0}
+        runner._inactivity_extend_deadlines = {"session:c1": (7, 9999.0)}
         runner._inactivity_extend_deadlines_lock = threading.Lock()
         runner._running_agents = {"session:c1": object()}
+        runner._session_run_generation = {"session:c1": 7}
         class _Source:
             platform = "cli"
             chat_id = "c1"
@@ -231,6 +235,7 @@ class TestExtendCommandHandler:
         runner._inactivity_extend_deadlines = {}
         runner._inactivity_extend_deadlines_lock = threading.Lock()
         runner._running_agents = {}
+        runner._session_run_generation = {}
         monkeypatch.setattr(runner, "_session_key_for_source", lambda _source: "session:c1")
 
         class _Event:
@@ -264,6 +269,70 @@ class TestExtendCommandHandler:
         assert out == "extended"
         assert called == [event]
 
+    def test_extend_rejects_non_finite_minutes_without_storing_state(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._inactivity_extend_deadlines = {}
+        runner._inactivity_extend_deadlines_lock = threading.Lock()
+        runner._running_agents = {"session:c1": object()}
+        runner._session_run_generation = {"session:c1": 7}
+        monkeypatch.setattr(runner, "_session_key_for_source", lambda _source: "session:c1")
+
+        class _Event:
+            source = object()
+
+            def __init__(self, value):
+                self.value = value
+
+            def get_command_args(self):
+                return self.value
+
+        for value in ("nan", "inf", "-inf"):
+            out = asyncio.run(runner._handle_extend_command(_Event(value)))
+            assert "finite number" in out
+            assert runner._inactivity_extend_deadlines == {}
+
+    def test_fractional_extend_reports_the_applied_duration(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._inactivity_extend_deadlines = {}
+        runner._inactivity_extend_deadlines_lock = threading.Lock()
+        runner._running_agents = {"session:c1": object()}
+        runner._session_run_generation = {"session:c1": 7}
+        monkeypatch.setattr(runner, "_session_key_for_source", lambda _source: "session:c1")
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+
+        class _Event:
+            source = object()
+
+            def get_command_args(self):
+                return "0.5"
+
+        out = asyncio.run(runner._handle_extend_command(_Event()))
+        assert "extended by 0.5 min" in out
+        assert runner._inactivity_extend_deadlines["session:c1"] == (7, 1030.0)
+
+    def test_extension_state_is_owned_by_one_turn_generation(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._inactivity_extend_deadlines = {}
+        runner._inactivity_extend_deadlines_lock = threading.Lock()
+
+        runner._set_inactivity_extension("session:c1", 7, 1200.0)
+        assert runner._get_inactivity_extension("session:c1", 7) == 1200.0
+        assert runner._get_inactivity_extension("session:c1", 8) is None
+        assert not runner._clear_inactivity_extension("session:c1", 8)
+        assert runner._get_inactivity_extension("session:c1", 7) == 1200.0
+
+        runner._set_inactivity_extension("session:c1", 8, 1800.0)
+        assert not runner._clear_inactivity_extension("session:c1", 7)
+        assert runner._get_inactivity_extension("session:c1", 8) == 1800.0
+        assert runner._clear_inactivity_extension("session:c1", 8)
+        assert runner._inactivity_extend_deadlines == {}
+
 
 class TestGatewayInactivityPolicy:
     def test_provider_grace_uses_the_shared_production_policy(self):
@@ -272,6 +341,16 @@ class TestGatewayInactivityPolicy:
         timeout = _effective_gateway_inactivity_timeout(
             30.0,
             {"last_activity_desc": "waiting for provider response (streaming)"},
+            provider_grace=300.0,
+        )
+        assert timeout == 330.0
+
+    def test_non_streaming_provider_description_uses_the_same_grace(self):
+        from gateway.run import _effective_gateway_inactivity_timeout
+
+        timeout = _effective_gateway_inactivity_timeout(
+            30.0,
+            {"last_activity_desc": "waiting for non-streaming API response"},
             provider_grace=300.0,
         )
         assert timeout == 330.0
@@ -288,11 +367,3 @@ class TestGatewayInactivityPolicy:
         assert _effective_gateway_inactivity_timeout(
             30.0, {}, extend_deadline=120.0, now=120.0
         ) == 30.0
-
-
-
-
-
-
-
-

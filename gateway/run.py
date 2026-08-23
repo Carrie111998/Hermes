@@ -3342,7 +3342,11 @@ def _effective_gateway_inactivity_timeout(
     if provider_grace:
         description = activity.get("last_activity_desc") or activity.get("description") or ""
         provenance = activity.get("last_activity_provenance") or activity.get("provenance") or ""
-        if "waiting for provider response" in description or provenance == "waiting_for_provider_response":
+        if (
+            "waiting for provider response" in description
+            or "waiting for non-streaming API response" in description
+            or provenance == "waiting_for_provider_response"
+        ):
             effective_timeout += provider_grace
     if extend_deadline is not None:
         current_time = time.monotonic() if now is None else now
@@ -6784,9 +6788,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._inactivity_extend_deadlines = {}
         return lock
 
+    def _set_inactivity_extension(
+        self, session_key: str, run_generation: int, deadline: float
+    ) -> None:
+        """Bind one /extend deadline to the exact turn generation that owns it."""
+        with self._inactivity_extend_lock():
+            self._inactivity_extend_deadlines[session_key] = (
+                int(run_generation),
+                float(deadline),
+            )
+
+    def _get_inactivity_extension(
+        self, session_key: str, run_generation: Optional[int]
+    ) -> Optional[float]:
+        """Return a deadline only to its owning turn generation."""
+        if run_generation is None:
+            return None
+        with self._inactivity_extend_lock():
+            entry = self._inactivity_extend_deadlines.get(session_key)
+        if not entry or int(entry[0]) != int(run_generation):
+            return None
+        return float(entry[1])
+
+    def _clear_inactivity_extension(
+        self, session_key: str, run_generation: Optional[int]
+    ) -> bool:
+        """Clear only the deadline owned by ``run_generation``."""
+        if run_generation is None:
+            return False
+        with self._inactivity_extend_lock():
+            entry = self._inactivity_extend_deadlines.get(session_key)
+            if not entry or int(entry[0]) != int(run_generation):
+                return False
+            self._inactivity_extend_deadlines.pop(session_key, None)
+        return True
+
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
-        self._inactivity_extend_deadlines: Dict[str, float] = {}
+        self._inactivity_extend_deadlines: Dict[str, tuple[int, float]] = {}
         self._inactivity_extend_deadlines_lock = threading.Lock()
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
@@ -28881,10 +28920,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             def _turn_extend_deadline() -> Optional[float]:
-                """Read this turn's session-scoped extension under its owner lock."""
-                extension_lock = self._inactivity_extend_lock()
-                with extension_lock:
-                    return self._inactivity_extend_deadlines.get(session_key)
+                return self._get_inactivity_extension(
+                    session_key, _turn_run_generation
+                )
 
             def _effective_timeout_for_turn(activity: dict) -> float:
                 return _effective_gateway_inactivity_timeout(
@@ -28895,12 +28933,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             def _clear_turn_extend_deadline() -> None:
-                # Do not erase an extension installed for a replacement turn
-                # after this worker was interrupted and its generation retired.
-                if not _turn_is_current():
-                    return
-                with self._inactivity_extend_lock():
-                    self._inactivity_extend_deadlines.pop(session_key, None)
+                self._clear_inactivity_extension(
+                    session_key, _turn_run_generation
+                )
 
             def _run_sync_with_timeout_lifecycle():
                 try:
@@ -29030,7 +29065,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _act = _agent_ref.get_activity_summary()
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
-                            pass
+                            _act = {}
                     # Staged warning: fire once before escalating to full timeout.
                     # While explicitly waiting on a provider response (non-streaming
                     # "thinking" gap), extend the idle budget by _agent_provider_grace

@@ -20,6 +20,7 @@ import dataclasses
 import hashlib
 import inspect
 import logging
+import math
 import os
 import re
 import shlex
@@ -1519,6 +1520,9 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
         if session_key not in self._running_agents:
             return "No active agent turn to extend."
+        run_generation = self._session_run_generation.get(session_key)
+        if not isinstance(run_generation, int):
+            return "No active agent turn to extend."
         raw = (event.get_command_args() or "").strip()
         try:
             minutes = float(raw) if raw else 30.0
@@ -1527,19 +1531,21 @@ class GatewaySlashCommandsMixin:
                 "Usage: /extend [minutes] — e.g. /extend 30 (max "
                 f"{int(_CAP // 60)} min per call)."
             )
+        if not math.isfinite(minutes):
+            return (
+                "Usage: /extend [minutes] — minutes must be a finite number "
+                f"up to {int(_CAP // 60)}."
+            )
         if minutes <= 0:
             # A non-positive value clears any prior extension.
-            with self._inactivity_extend_lock():
-                self._inactivity_extend_deadlines.pop(session_key, None)
+            self._clear_inactivity_extension(session_key, run_generation)
             return "Inactivity extension cleared for this session."
         minutes = min(minutes, _CAP / 60.0)
         deadline = time.monotonic() + minutes * 60.0
-        # Persist only for the running turn. The watchdog reads this map from a
-        # worker thread, so the map has one synchronization owner.
-        with self._inactivity_extend_lock():
-            self._inactivity_extend_deadlines[session_key] = deadline
+        self._set_inactivity_extension(session_key, run_generation, deadline)
+        rendered_minutes = f"{minutes:g}"
         return (
-            f"⏱️ Inactivity timeout extended by {int(minutes)} min for this "
+            f"⏱️ Inactivity timeout extended by {rendered_minutes} min for this "
             f"session (will not be reaped before then). Send /extend 0 to clear."
         )
 
