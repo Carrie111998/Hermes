@@ -1151,6 +1151,8 @@ def _normalize_anthropic_model_name(model: str) -> str:
       - Dot notation: claude-opus-4.7 → claude-opus-4-7
       - Short aliases: claude-opus-4.7 → claude-opus-4-7
       - Strips anthropic/ prefix if present
+      - Strips dated snapshot suffixes: claude-haiku-4-5-20251001 →
+        claude-haiku-4-5
     """
     name = model.lower().strip()
     if name.startswith("anthropic/"):
@@ -1158,6 +1160,13 @@ def _normalize_anthropic_model_name(model: str) -> str:
     # Normalize dots to dashes in version numbers (e.g. 4.7 → 4-7, 4.6 → 4-6)
     # But preserve the rest of the name structure
     name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
+    # Dated snapshot ids (claude-sonnet-4-5-20250929, claude-opus-4-1-…,
+    # …) are documented pinned aliases of the same SKU at the same price,
+    # but the pricing table keys the family alias — strip only the trailing
+    # snapshot date so the alias resolves (#92673). Mirrors the Bedrock
+    # normalizer: trailing forms only, never a mid-name continuation that
+    # could be a distinct SKU.
+    name = re.sub(r"-\d{8}$", "", name)
     return name
 
 

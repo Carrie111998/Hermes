@@ -212,6 +212,44 @@ def test_bedrock_versioned_inference_profile_resolves_to_bare_pricing():
         assert scoped.cache_write_cost_per_million == bare.cache_write_cost_per_million
 
 
+def test_anthropic_dated_snapshot_ids_price_as_family_alias():
+    """Dated Anthropic snapshot ids must price as their family alias (#92673).
+
+    The pricing table keys the family alias (``claude-haiku-4-5``), but the
+    4.5 generation shipped without dated keys — anyone running a pinned
+    snapshot id got ``cost_status='unknown'`` and zero spend. A dated suffix
+    is a documented pinned alias of the same SKU at the same price, so the
+    lookup must resolve it to the alias entry.
+    """
+    for alias, dated in (
+        ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+        ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+    ):
+        ref = get_pricing_entry(alias, provider="anthropic")
+        assert ref is not None, alias
+        entry = get_pricing_entry(dated, provider="anthropic")
+        assert entry is not None, dated
+        assert entry.input_cost_per_million == ref.input_cost_per_million, dated
+        assert entry.output_cost_per_million == ref.output_cost_per_million, dated
+        assert entry.cache_read_cost_per_million == ref.cache_read_cost_per_million, dated
+        assert entry.cache_write_cost_per_million == ref.cache_write_cost_per_million, dated
+
+
+def test_anthropic_dated_direct_keys_still_win_over_normalization():
+    """Generations with explicitly keyed dated rows keep resolving directly.
+
+    Older tables carry both forms (claude-opus-4-6 / -4-6-20250414); the
+    date-strip fallback in the normalizer must not change what those
+    resolve to — direct lookup fires before any normalization retry.
+    """
+    bare = get_pricing_entry("claude-opus-4-6", provider="anthropic")
+    dated = get_pricing_entry("claude-opus-4-6-20250414", provider="anthropic")
+    assert bare is not None
+    assert dated is not None
+    assert dated.input_cost_per_million == bare.input_cost_per_million
+    assert dated.output_cost_per_million == bare.output_cost_per_million
+
+
 
 
 
