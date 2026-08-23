@@ -2375,8 +2375,11 @@ DEFAULT_CONFIG = {
         # mode=off bypass — so a command can be surfaced to the user even
         # while approvals are otherwise bypassed. Claude Code-style
         # ask/allow/deny trio: deny blocks, command_allowlist auto-approves,
-        # ask prompts. Answering [a]lways persists per-rule. In cron /
-        # single-query (no human present) an ask match fails closed.
+        # ask prompts. Answering [a]lways persists per-rule: it stores the
+        # whole glob, so approving `ssh hostA` once with always allows every
+        # future command matching that same pattern ("ssh *" → all ssh).
+        # In cron / single-query (no human present) an ask match fails
+        # closed.
         # Example:
         #   ask:
         #     - "ssh *"

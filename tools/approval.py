@@ -681,7 +681,11 @@ def _match_user_ask_rule(command: str) -> str | None:
     """
     try:
         ask_patterns = _get_approval_config().get("ask") or []
-    except Exception:
+    except Exception as exc:
+        # Fail-open mirrors deny-rule semantics, but an operator's ask rule
+        # silently vanishing under yolo is worth one visible line.
+        logger.warning("approvals.ask rules unavailable (config load failed: %s); "
+                       "ask prompts are NOT enforced for this check", exc)
         return None
     if not ask_patterns:
         return None
