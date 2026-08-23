@@ -199,7 +199,7 @@ test.describe('large session resume', () => {
     // Known RED: a rapid warm resume rebuilds the transcript three times
     // (28 → 53 → 53 DOM additions) instead of the two-paint budget. Keep the
     // regression visible without making unrelated desktop work fail CI.
-    test.fixme(true, 'Fast warm resume has an unresolved third transcript rebuild')
+    test.fixme(true, 'Blocked on #93138: fast warm resume has an unresolved third transcript rebuild')
 
     fixture = await setupSeededDesktop()
     await waitForAppReady(fixture, 120_000)

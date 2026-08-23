@@ -28,6 +28,8 @@ export default defineConfig({
   /* Test files live under e2e/ so they never collide with the vitest suite
    * under src/ or the node:test files under electron/. */
   testDir: './e2e',
+  /* A stray `test.only` must never make CI report a partial green run. */
+  forbidOnly: !!process.env.CI,
   /* The desktop app can take a while to bootstrap on cold CI runners — 90 s
    * per test gives us headroom without masking real hangs. */
   timeout: 90_000,
