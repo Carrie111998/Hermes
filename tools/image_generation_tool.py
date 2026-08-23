@@ -1375,9 +1375,11 @@ def image_generate_tool(
             modality,
         )
 
+        from agent.image_gen_provider import _maybe_rewrite_image_url
+
         response_data = {
             "success": True,
-            "image": formatted_images[0]["url"] if formatted_images else None,
+            "image": _maybe_rewrite_image_url(formatted_images[0]["url"]) if formatted_images else None,
             "modality": modality,
             "upscaled": bool(formatted_images and formatted_images[0].get("upscaled")),
         }
