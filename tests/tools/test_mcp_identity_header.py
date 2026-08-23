@@ -172,6 +172,9 @@ def _drive_http(server, config):
         async def initialize(self):
             return None
 
+        async def discover(self):
+            return None
+
     async def _discover_tools(self):
         self._shutdown_event.set()
 

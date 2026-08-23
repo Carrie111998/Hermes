@@ -1571,6 +1571,14 @@ class TestCuaEnvironmentScrubbing:
         session = _CuaDriverSession(bridge)
 
         captured_env: Dict[str, str] = {}
+        captured_session = {}
+        captured_negotiation = {}
+
+        from tools.mcp_protocol import negotiate_protocol as negotiate_protocol_impl
+
+        async def capture_negotiation(*args, **kwargs):
+            captured_negotiation["session"] = args[0]
+            return await negotiate_protocol_impl(*args, **kwargs)
 
         async def drive_lifecycle():
             test_env = {
@@ -1578,6 +1586,8 @@ class TestCuaEnvironmentScrubbing:
                 "ANTHROPIC_API_KEY": "sk-ant-secret",  # blocked
                 "PATH": "/usr/bin:/bin",               # safe
                 "HOME": "/home/user",                  # safe
+                "USERPROFILE": r"C:\Users\test",
+                "LOCALAPPDATA": r"C:\Users\test\AppData\Local",
                 "SAFE_VAR": "allowed",                 # safe
             }
 
@@ -1594,7 +1604,9 @@ class TestCuaEnvironmentScrubbing:
                        return_value=("cua-driver", ["mcp"])), \
                  patch("mcp.StdioServerParameters", side_effect=capture_env), \
                  patch("mcp.client.stdio.stdio_client") as mock_stdio, \
-                 patch("mcp.ClientSession") as mock_session_class:
+                 patch("mcp.ClientSession") as mock_session_class, \
+                 patch("tools.mcp_protocol.negotiate_protocol",
+                       side_effect=capture_negotiation):
 
                 # stdio_client(params) is used as `async with`.
                 mock_stdio.return_value.__aenter__ = AsyncMock(
@@ -1604,6 +1616,9 @@ class TestCuaEnvironmentScrubbing:
                 # ClientSession(read, write) is used as `async with`.
                 fake_session = MagicMock()
                 fake_session.initialize = AsyncMock()
+                fake_session.discover = AsyncMock()
+                fake_session.protocol_version = "2026-07-28"
+                captured_session["value"] = fake_session
                 # tools/list yields nothing — keeps _populate_capabilities
                 # quiet without us needing to fully mock the response shape.
                 fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
@@ -1626,8 +1641,6 @@ class TestCuaEnvironmentScrubbing:
                 signal_task = asyncio.create_task(_signal_shutdown_when_ready())
                 try:
                     await session._lifecycle_coro()
-                except BaseException:
-                    pass  # mocks may raise; the env capture still landed
                 finally:
                     signal_task.cancel()
                     try:
@@ -1642,6 +1655,11 @@ class TestCuaEnvironmentScrubbing:
             "OPENAI_API_KEY should be stripped from cua-driver subprocess"
         assert "ANTHROPIC_API_KEY" not in captured_env, \
             "ANTHROPIC_API_KEY should be stripped from cua-driver subprocess"
+        assert session._setup_error is None, repr(session._setup_error)
+        assert captured_negotiation
+        assert captured_negotiation["session"] is captured_session["value"]
+        assert captured_session["value"].discover.await_count == 1
+        assert captured_session["value"].initialize.await_count == 0
         # At least one safe var must survive the scrub.
         assert "PATH" in captured_env or "SAFE_VAR" in captured_env, \
             "At least one safe environment variable should be preserved"
@@ -2317,7 +2335,7 @@ class TestStartupTimeoutPhaseDetail:
         session._ready_event = threading.Event()  # never set → timeout path
         session._setup_error = None
         session._shutdown_event = None
-        session._startup_phase = "mcp-initialize"
+        session._startup_phase = "mcp-negotiate"
         session._signal_shutdown_locked = lambda: None
 
         fake_bridge = MagicMock()
@@ -2346,7 +2364,7 @@ class TestStartupTimeoutPhaseDetail:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 msg = str(e)
-                assert "stuck in phase: mcp-initialize" in msg
+                assert "stuck in phase: mcp-negotiate" in msg
                 assert "computer-use doctor" in msg
 
 

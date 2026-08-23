@@ -1,6 +1,6 @@
 """Regression test for the stdio-MCP subprocess/FD leak (#59349).
 
-A stdio MCP server that never completes ``initialize`` (e.g. emits a
+A stdio MCP server that never completes modern ``server/discover`` (e.g. emits a
 non-JSON-RPC frame and then blocks on stdin) used to hang ``_run_stdio``
 forever on the background event loop: ``connect_timeout`` bounded only the
 *caller's* ``.result()`` wait, not the coroutine itself. Because the connect
@@ -8,12 +8,12 @@ never unwound, the cleanup ``finally`` in ``_run_stdio`` never ran, so the
 spawned child process and its stdio pipes / pidfd leaked on *every* discovery
 retry — unbounded, until the gateway hit EMFILE.
 
-The fix wraps ``session.initialize()`` in
-``asyncio.wait_for(..., timeout=connect_timeout)`` so a stalled handshake fails
+The fix bounds canonical protocol negotiation by ``connect_timeout`` so a
+stalled first flight fails
 instead of hanging, which lets the existing ``finally`` reap the child.
 
 This test drives the *real* ``_run_stdio`` with a fake transport whose
-``initialize()`` hangs, and asserts the connect is bounded by
+``discover()`` hangs, and asserts the connect is bounded by
 ``connect_timeout`` rather than blocking forever. It is fully hermetic — no real
 subprocess, no network (the drain-to-zero behaviour was additionally verified
 manually against the reporter's live repro).
@@ -31,9 +31,7 @@ pytest.importorskip("mcp")
 
 
 class _HangingSession:
-    """Stand-in ClientSession whose handshake never completes."""
-
-    async def initialize(self):
+    async def discover(self):
         await asyncio.sleep(3600)
 
 
@@ -56,14 +54,11 @@ def _fake_stdio_client(*_args, **_kwargs):
 
 
 def _fake_client_session(*_args, **_kwargs):
-    # `async with ClientSession(...) as session` -> a session that hangs.
     return _FakeAsyncCM(_HangingSession())
 
 
-class TestStdioInitializeTimeout:
-    def test_hanging_initialize_is_bounded_not_leaked(self):
-        """A stdio server that hangs at ``initialize`` must fail within
-        ``connect_timeout`` — not block ``_run_stdio`` forever (#59349)."""
+class TestStdioNegotiationTimeout:
+    def test_hanging_discover_is_bounded_not_leaked(self):
         from tools import mcp_tool
 
         server = mcp_tool.MCPServerTask("leak-guard")
@@ -88,7 +83,7 @@ class TestStdioInitializeTimeout:
 
         elapsed = asyncio.run(drive())
         assert elapsed < 2.0, (
-            f"_run_stdio blocked {elapsed:.1f}s on a hanging initialize() — the "
+            f"_run_stdio blocked {elapsed:.1f}s on a hanging discover() — the "
             f"connect_timeout ({config['connect_timeout']}s) bound was not applied; "
             f"the #59349 subprocess/FD leak has regressed."
         )

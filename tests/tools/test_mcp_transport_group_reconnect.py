@@ -64,6 +64,9 @@ class _FakeSession:
     async def initialize(self):
         return object()
 
+    async def discover(self):
+        return object()
+
 
 class _FakeSessionCM:
     async def __aenter__(self):

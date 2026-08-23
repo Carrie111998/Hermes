@@ -131,6 +131,9 @@ class TestHTTPClientCert:
             async def initialize(self):
                 return None
 
+            async def discover(self):
+                return None
+
         async def _discover_tools(self):
             self._shutdown_event.set()
 
@@ -206,6 +209,7 @@ def patch_sse_client():
         async def __aenter__(self):
             mock_session = MagicMock()
             mock_session.initialize = AsyncMock()
+            mock_session.discover = AsyncMock()
             return mock_session
 
         async def __aexit__(self, *a):

@@ -44,6 +44,116 @@ class TestPaginateFullList:
         assert calls["n"] == _MCP_LIST_MAX_PAGES
         assert len(items) == _MCP_LIST_MAX_PAGES
 
+    def test_same_ttl_on_every_modern_page(self):
+        metadata = {}
+        pages = [
+            SimpleNamespace(tools=[_tool("a")], nextCursor="next", ttlMs=100, cacheScope="private"),
+            SimpleNamespace(tools=[_tool("b")], ttlMs=100, cacheScope="private"),
+        ]
+        method = AsyncMock(side_effect=pages)
+        asyncio.run(
+            _paginate_full_list(
+                method,
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="modern",
+            )
+        )
+        assert metadata == {
+            "protocol_era": "modern",
+            "ttl_ms": 100.0,
+            "cache_scope": "private",
+            "metadata_complete": True,
+        }
+
+    def test_shortest_ttl_wins_across_pages(self):
+        metadata = {}
+        pages = [
+            SimpleNamespace(tools=[], nextCursor="next", ttlMs=500, cacheScope="private"),
+            SimpleNamespace(tools=[], ttlMs=25, cacheScope="private"),
+        ]
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(side_effect=pages),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="modern",
+            )
+        )
+        assert metadata["ttl_ms"] == 25.0
+
+    def test_zero_ttl_on_one_page_wins(self):
+        metadata = {}
+        pages = [
+            SimpleNamespace(tools=[], nextCursor="next", ttlMs=100, cacheScope="private"),
+            SimpleNamespace(tools=[], ttlMs=0, cacheScope="private"),
+        ]
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(side_effect=pages),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="modern",
+            )
+        )
+        assert metadata["ttl_ms"] == 0.0
+
+    def test_scope_disagreement_fails_closed_to_private(self):
+        metadata = {}
+        pages = [
+            SimpleNamespace(tools=[], nextCursor="next", ttlMs=100, cacheScope="public"),
+            SimpleNamespace(tools=[], ttlMs=100, cacheScope="private"),
+        ]
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(side_effect=pages),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="modern",
+            )
+        )
+        assert metadata["cache_scope"] == "private"
+        assert metadata["scope_conflict"] is True
+
+    def test_missing_modern_metadata_is_immediately_stale(self):
+        metadata = {}
+        pages = [
+            SimpleNamespace(tools=[], nextCursor="next", ttlMs=100, cacheScope="private"),
+            SimpleNamespace(tools=[]),
+        ]
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(side_effect=pages),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="modern",
+            )
+        )
+        assert metadata["ttl_ms"] == 0.0
+        assert metadata["cache_scope"] == "private"
+        assert metadata["metadata_complete"] is False
+
+    def test_legacy_missing_metadata_remains_hintless(self):
+        metadata = {}
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(return_value=SimpleNamespace(tools=[])),
+                "tools",
+                "srv",
+                cache_meta_out=metadata,
+                protocol_era="legacy",
+            )
+        )
+        assert metadata == {
+            "protocol_era": "legacy",
+            "metadata_complete": False,
+        }
+
 
 class TestDiscoveryUsesPagination:
     def test_discover_tools_drains_all_pages(self):

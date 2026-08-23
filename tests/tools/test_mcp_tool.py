@@ -572,7 +572,11 @@ class TestToolHandler:
             with self._patch_mcp_loop():
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "hello world"
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                allow_input_required=True,
+            )
         finally:
             _servers.pop("test_srv", None)
 
@@ -603,7 +607,11 @@ class TestToolHandler:
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "reconnected"
             reconnect.assert_called_once()
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                allow_input_required=True,
+            )
         finally:
             _servers.pop("test_srv", None)
 
@@ -864,6 +872,10 @@ class TestMCPServerTask:
         mock_tools = [_make_mcp_tool("echo")]
         mock_session = MagicMock()
         mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock(
+            return_value=SimpleNamespace(capabilities=None)
+        )
+        mock_session.protocol_version = "2026-07-28"
         mock_session.list_tools = AsyncMock(
             return_value=SimpleNamespace(tools=mock_tools)
         )
@@ -880,7 +892,8 @@ class TestMCPServerTask:
                 assert server.session is mock_session
                 assert len(server._tools) == 1
                 assert server._tools[0].name == "echo"
-                mock_session.initialize.assert_called_once()
+                mock_session.discover.assert_awaited_once()
+                mock_session.initialize.assert_not_awaited()
                 assert params.call_args.kwargs["cwd"] == "/plugin"
 
                 await server.shutdown()
@@ -893,6 +906,10 @@ class TestMCPServerTask:
 
         mock_session = MagicMock()
         mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock(
+            return_value=SimpleNamespace(capabilities=None)
+        )
+        mock_session.protocol_version = "2026-07-28"
         mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
         p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
 
@@ -1625,7 +1642,9 @@ class TestUtilityHandlers:
             assert result["messages"][0]["role"] == "assistant"
             assert "summary" in result["messages"][0]["content"].lower()
             mock_session.get_prompt.assert_called_once_with(
-                "summarize", arguments={"text": "hello"}
+                "summarize",
+                arguments={"text": "hello"},
+                allow_input_required=True,
             )
         finally:
             _servers.pop("srv", None)

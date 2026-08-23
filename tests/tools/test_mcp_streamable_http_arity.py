@@ -52,6 +52,9 @@ class _DummySession:
     async def initialize(self):
         return None
 
+    async def discover(self):
+        return None
+
 
 def _transport_yielding(*values):
     class _Ctx:
@@ -125,16 +128,7 @@ def test_the_session_streams_are_the_first_two_yielded():
     assert passed["args"][:2] == (read, write)
 
 
-def test_the_seeded_protocol_header_matches_the_handshake_the_client_sends():
-    """Header and body must agree about which revision this connection speaks.
-
-    `ClientSession.initialize()` sends `LATEST_HANDSHAKE_VERSION`; from
-    2026-07-28 onward `LATEST_PROTOCOL_VERSION` names a revision that replaced
-    the handshake with a per-request envelope. Seeding the header from the
-    latter advertised a revision the body does not speak, and a conforming
-    server answered `params._meta is missing the required envelope key(s)` --
-    observed against a live MCP endpoint, not hypothesised.
-    """
+def test_seeded_legacy_proof_header_matches_initialize_revision():
     from tools import mcp_tool
 
     try:
@@ -145,8 +139,7 @@ def test_the_seeded_protocol_header_matches_the_handshake_the_client_sends():
     assert mcp_tool.LATEST_HANDSHAKE_VERSION == sdk_handshake
 
 
-def test_the_seeded_header_is_the_handshake_version_on_the_wire():
-    """Asserted through the header dict `_run_http` actually builds."""
+def test_http_client_default_is_handshake_version_for_legacy_proof():
     from unittest.mock import patch as _patch
 
     from tools.mcp_tool import MCPServerTask, LATEST_HANDSHAKE_VERSION

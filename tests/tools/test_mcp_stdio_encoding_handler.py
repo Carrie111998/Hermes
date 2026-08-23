@@ -29,6 +29,7 @@ class TestStdioEncodingErrorHandler:
         """
         mock_session = MagicMock()
         mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock()
         mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
 
         mock_stdio_cm = MagicMock()
@@ -68,6 +69,7 @@ class TestStdioEncodingErrorHandler:
         """Verify that the default encoding (utf-8) is not overridden."""
         mock_session = MagicMock()
         mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock()
         mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
 
         mock_stdio_cm = MagicMock()

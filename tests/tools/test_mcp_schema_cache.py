@@ -110,3 +110,179 @@ class TestWriteSkip:
         # Changed payload → rewrite.
         msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
         assert len(saves) == 2
+
+
+class TestSecurityContextIdentity:
+    def test_partitions_protocol_headers_environment_auth_and_tls(self):
+        base = {"url": "https://mcp.example.test/rpc"}
+        variants = [
+            {"protocol": "legacy"},
+            {"headers": {"Authorization": "Bearer one"}},
+            {"env": {"MCP_TENANT": "one"}},
+            {"auth": "oauth", "oauth": {"issuer": "https://issuer-one.test"}},
+            {"ssl_verify": False},
+            {"client_cert": "cert-one.pem", "client_key": "key-one.pem"},
+        ]
+        baseline = msc.config_fingerprint(base)
+        assert all(
+            msc.config_fingerprint({**base, **variant}) != baseline
+            for variant in variants
+        )
+
+    def test_profile_identity_header_partitions_active_principal(self, monkeypatch):
+        import hermes_cli.profiles as profiles
+
+        config = {
+            "url": "https://mcp.example.test/rpc",
+            "identity_header": {
+                "name": "X-User-Id",
+                "value_from": "profile",
+            },
+        }
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "alice")
+        alice = msc.config_fingerprint(config)
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "bob")
+        assert msc.config_fingerprint(config) != alice
+
+    def test_epoch_partitions_all_entries(self, monkeypatch):
+        config = {"command": "mcp-server"}
+        current = msc.config_fingerprint(config)
+        monkeypatch.setattr(msc, "CACHE_SCHEMA_EPOCH", 999)
+        assert msc.config_fingerprint(config) != current
+
+    def test_oauth_credential_rotation_changes_partition(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = {
+            "url": "https://mcp.example.test/rpc",
+            "auth": "oauth",
+        }
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir()
+        token_path = token_dir / "srv.json"
+
+        missing = msc.config_fingerprint(config, server_name="srv")
+        token_path.write_text('{"access_token":"principal-a"}', encoding="utf-8")
+        principal_a = msc.config_fingerprint(config, server_name="srv")
+        token_path.write_text('{"access_token":"principal-b"}', encoding="utf-8")
+        principal_b = msc.config_fingerprint(config, server_name="srv")
+
+        assert len({missing, principal_a, principal_b}) == 3
+
+    def test_tls_file_rotation_changes_partition(self, tmp_path):
+        ca_bundle = tmp_path / "ca.pem"
+        ca_bundle.write_text("first trust anchor", encoding="utf-8")
+        config = {
+            "url": "https://mcp.example.test/rpc",
+            "ssl_verify": str(ca_bundle),
+        }
+        first = msc.config_fingerprint(config)
+        ca_bundle.write_text("replacement trust anchor material", encoding="utf-8")
+        assert msc.config_fingerprint(config) != first
+
+    def test_cache_file_never_contains_plaintext_identity_values(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        secret = "cache-identity-secret"
+        oauth_secret = "oauth-cache-identity-secret"
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir()
+        (token_dir / "srv.json").write_text(
+            f'{{"access_token":"{oauth_secret}"}}',
+            encoding="utf-8",
+        )
+        config = {
+            "url": "https://mcp.example.test/rpc",
+            "auth": "oauth",
+            "headers": {"Authorization": f"Bearer {secret}"},
+            "env": {"MCP_SECRET": secret},
+        }
+        fingerprint = msc.config_fingerprint(config, server_name="srv")
+        msc.write_cache_entry(
+            "srv",
+            fingerprint,
+            config_digest=msc.config_digest(config),
+            protocol_era="legacy",
+            tools=[],
+        )
+        payload = (tmp_path / "cache.json").read_text(encoding="utf-8")
+        assert secret not in payload
+        assert oauth_secret not in payload
+        assert f"Bearer {secret}" not in payload
+
+
+class TestProtocolEraFreshness:
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
+
+    def test_modern_zero_ttl_is_immediately_stale(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="modern",
+            tools=[{"name": "modern"}],
+            ttl_ms=0,
+        )
+        assert msc.get_cached_entry("srv", "fp", protocol_era="modern") is None
+
+    def test_modern_missing_ttl_fails_closed(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="modern",
+            tools=[{"name": "modern"}],
+        )
+        assert msc.get_cached_entry("srv", "fp", protocol_era="modern") is None
+
+    def test_legacy_hintlessness_remains_usable(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="legacy",
+            tools=[{"name": "legacy"}],
+        )
+        entry = msc.get_cached_entry("srv", "fp", protocol_era="legacy")
+        assert entry is not None
+        assert "ttl_ms" not in entry
+
+    def test_era_is_a_destructive_partition_boundary(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="modern",
+            tools=[{"name": "modern"}],
+            ttl_ms=60_000,
+        )
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            protocol_era="legacy",
+            tools=[{"name": "legacy"}],
+        )
+        modern = msc.get_cached_entry("srv", "fp", protocol_era="modern")
+        legacy = msc.get_cached_entry("srv", "fp", protocol_era="legacy")
+        assert modern["tools"][0]["name"] == "modern"
+        assert legacy["tools"][0]["name"] == "legacy"
+        assert len(msc._load_all()) == 2
+
+    def test_config_digest_mismatch_is_a_miss(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        msc.write_cache_entry(
+            "srv",
+            "fp",
+            config_digest="digest-a",
+            protocol_era="legacy",
+            tools=[],
+        )
+        assert (
+            msc.get_cached_entry(
+                "srv",
+                "fp",
+                config_digest="digest-b",
+                protocol_era="legacy",
+            )
+            is None
+        )
