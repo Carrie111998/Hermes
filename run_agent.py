@@ -4294,10 +4294,14 @@ class AIAgent:
         The messaging gateway re-stamps the ACTIVE profile's policy onto a
         possibly CACHED (reused) agent at the start of every turn, before the
         provider runs, so a multiplexed gateway cannot leak one profile's
-        setting into another profile's session.  This method is the sole owner
-        of the ``_credits_notices_enabled_cache`` write — gateway code must
-        never touch that field directly, keeping the cache private and giving
-        one place to evolve the policy logic.  Fail-open semantics (absent or
+        setting into another profile's session.  This method is the
+        gateway-facing encapsulation boundary for the
+        ``_credits_notices_enabled_cache`` write — gateway code must never
+        touch that field directly, keeping the cache private and giving one
+        place to evolve the policy logic.  (The internal
+        ``_credits_notices_enabled()`` read path also lazily initializes the
+        same cache; this method's ownership is scoped to gateway-facing
+        mutations.)  Fail-open semantics (absent or
         error-shaped config = enabled) are resolved by the caller from the
         turn's already profile-scoped ``user_config``; this method only
         records the resolved value.
