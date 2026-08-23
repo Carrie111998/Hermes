@@ -324,6 +324,25 @@ class TestProjectAndCompare:
         report = compare_history_to_api_messages(live, api, current_turn_user_idx=0)
         assert report.ok
 
+    def test_empty_wiped_tool_call_id_is_desync(self):
+        """A tool tool_call_id known in live but wiped to empty in api is a
+        desync (not silently matched), and reports a clear tool_call_id reason."""
+        live = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_x"}]},
+            {"role": "tool", "tool_call_id": "call_x", "content": "result"},
+            {"role": "assistant", "content": "done"},
+        ]
+        api = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_x"}]},
+            {"role": "tool", "tool_call_id": "", "content": "result"},  # wiped
+            {"role": "assistant", "content": "done"},
+        ]
+        report = compare_history_to_api_messages(live, api, current_turn_user_idx=0)
+        assert not report.ok
+        assert any("tool_call_id" in m for m in report.mismatches)
+
     def test_compression_summary_plus_tail_no_fp(self):
         """api = marked summary + last turn; live still full → ok (no FP)."""
         live = [

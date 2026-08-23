@@ -263,8 +263,13 @@ def _turns_compatible(
     if role == "tool":
         live_tcid = str(live_msg.get("tool_call_id") or "")
         act_tcid = str(act_msg.get("tool_call_id") or "")
+        # A live tool message must carry a tool_call_id — an empty one is
+        # itself a desync signal and would otherwise degrade into a confusing
+        # role-mismatch later.
+        if not live_tcid:
+            return False, "live tool message has empty/missing tool_call_id"
         # Empty/wiped act tool_call_id against a known live id is a desync.
-        if live_tcid and live_tcid != act_tcid:
+        if live_tcid != act_tcid:
             return False, f"tool_call_id mismatch (live={live_tcid!r} api={act_tcid!r})"
     return True, ""
 
