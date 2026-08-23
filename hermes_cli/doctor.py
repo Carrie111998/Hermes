@@ -1038,7 +1038,12 @@ def managed_scope_check() -> None:
 
 
 def _native_path_to_msys(path_str: str) -> str:
-    """Convert ``C:\\foo\\bar`` to the MSYS spelling ``/c/foo/bar``."""
+    """Convert ``C:\\foo\\bar`` to the MSYS spelling ``/c/foo/bar``.
+
+    UNC paths (``\\\\server\\share``) become ``//server/share`` — fine for
+    this module's use generating round-trip samples from PROJECT_ROOT, but
+    not a general-purpose converter.
+    """
     p = str(path_str).replace("\\", "/")
     if len(p) >= 2 and p[0].isalpha() and p[1] == ":":
         return f"/{p[0].lower()}{p[2:]}"
@@ -1115,7 +1120,8 @@ def _classify_git_interactive_risk(env, credential_helper=""):
     if helper_first.startswith("manager"):
         return "warn", (
             f"credential.helper '{helper_first}' may open an interactive UI "
-            f"that blocks background/gateway git operations. Fix: {fix_hint}"
+            f"that blocks background/gateway git operations (custom GUI "
+            f"helpers are not detected). Fix: {fix_hint}"
         )
     return "ok", f"non-interactive credential helper ({helper_first})"
 
@@ -1199,12 +1205,14 @@ def _check_windows_environment(issues, manual_issues):
             )
             helper_value = "\n".join((helper_result.stdout or "").split())
             level, detail = _classify_git_interactive_risk(os.environ, helper_value)
-        except Exception:
-            level, detail = "ok", ""
-        if level == "ok":
-            check_ok("Background git safety", (f"({detail})" if detail else ""))
+        except Exception as exc:
+            # absence of evidence is not evidence of safety — label it
+            check_info(f"could not query git credential.helper ({exc})")
         else:
-            check_warn("Spawned git may hang on a credential prompt", f"({detail})")
+            if level == "ok":
+                check_ok("Background git safety", (f"({detail})" if detail else ""))
+            else:
+                check_warn("Spawned git may hang on a credential prompt", f"({detail})")
 
     # 3. Bash/MSYS sanity — the shell the terminal toolchain expects exists
     #    and passes both path spellings through untouched.
