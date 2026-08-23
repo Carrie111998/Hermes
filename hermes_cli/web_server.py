@@ -19161,7 +19161,24 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            # Direct fd-1 write: the desktop's port-discovery watcher parses
+            # STDOUT only, and tui_gateway/server.py legitimately swaps
+            # sys.stdout -> sys.stderr at import for its JSON-RPC protocol.
+            # A plain print() would be rerouted to stderr, leaving the watcher
+            # empty -> 86% boot timeout while the line shows in desktop.log
+            # (which mirrors both streams). See debugging-hermes-desktop skill.
+            def _write_stdout_line(line: str) -> None:
+                payload = (line + "\n").encode("utf-8", "replace")
+                try:
+                    os.write(1, payload)          # bypasses sys.stdout reassignment
+                except OSError:
+                    try:
+                        sys.stdout.write(line + "\n")
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+
+            _write_stdout_line(f"{ready_token} port={actual_port}")
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
@@ -19169,7 +19186,7 @@ def start_server(
                 # block-buffered and can surface MINUTES after the flushed
                 # READY sentinel above, which reads as a slow boot in
                 # support bundles when the backend was actually up.
-                print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
+                _write_stdout_line(f"  Hermes backend listening on {host}:{actual_port}")
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
