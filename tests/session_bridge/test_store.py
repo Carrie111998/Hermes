@@ -14909,8 +14909,21 @@ def test_claude_visibility_store_rejects_daily_limit_above_hard_ceiling(
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
 
-    with pytest.raises(ValueError, match="cannot exceed 25"):
-        store.claim_claude_visibility_job(100.0, 60, 26, "0.50", "0.02")
+    with pytest.raises(ValueError, match="cannot exceed 100"):
+        store.claim_claude_visibility_job(100.0, 60, 101, "0.50", "0.02")
+
+
+def test_claude_visibility_store_accepts_raised_daily_limit(db: SessionDB) -> None:
+    # The hard ceiling is defense-in-depth against config typos; the emergency
+    # cost gate is the real spend bound. Operator-raised limits up to 100 must
+    # pass (2026-08-23: the default 25 starved account-switch catch-up days).
+    store = SessionBridgeStore(db, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    claim = store.claim_claude_visibility_job(100.0, 60, 50, "1.00", "0.02")
+
+    assert claim.status == "claimed"
 
 
 def test_claude_visibility_emergency_cost_gate_is_independent(db: SessionDB) -> None:
