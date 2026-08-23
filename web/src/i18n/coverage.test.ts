@@ -113,6 +113,8 @@ function placeholders(value: string): string[] {
   return [...new Set([...value.matchAll(/\{(\w+)\}/g)].map((match) => match[1]))];
 }
 
+const NO_OPTIONAL_PLACEHOLDERS = new Set<string>();
+
 // These three English strings use `{s}` only as an English plural suffix. Their
 // call sites replace it with a literal "s" or an empty string, so translated
 // strings are correct to omit it. Keep the exemption tied to the exact keys so
@@ -166,9 +168,10 @@ describe("web locale coverage", () => {
           continue;
         }
 
-        const optional = OPTIONAL_FORMATTING_PLACEHOLDERS[key] ?? new Set<string>();
+        const optional = OPTIONAL_FORMATTING_PLACEHOLDERS[key] ?? NO_OPTIONAL_PLACEHOLDERS;
+        const localePlaceholders = placeholders(localeValue);
         const lost = placeholders(englishValue).filter(
-          (token) => !optional.has(token) && !placeholders(localeValue).includes(token),
+          (token) => !optional.has(token) && !localePlaceholders.includes(token),
         );
 
         if (lost.length) {
