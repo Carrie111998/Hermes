@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -66,13 +67,58 @@ logger = logging.getLogger(__name__)
 _VALID_PAYLOAD_TYPES = frozenset({"text/markdown", "text/html"})
 _DEFAULT_PAYLOAD_TYPE = "text/markdown"
 
+# Job IDs already warned about an invalid payload_type (log once per process,
+# not once per run — a cron job fires on every tick).
+_payload_type_warned: set = set()
+
 
 def _extract_payload_type(job: dict) -> str:
     """Extract the declared payload_type from a cron job config, coercing invalid values to the default."""
     value = job.get("payload_type", _DEFAULT_PAYLOAD_TYPE)
     if value in _VALID_PAYLOAD_TYPES:
         return value
+    job_id = job.get("id", "?")
+    if job_id not in _payload_type_warned:
+        _payload_type_warned.add(job_id)
+        logger.warning(
+            "Job '%s': invalid payload_type %r (valid: %s) — coercing to %s. "
+            "Fix the job config; coercion may cause unexpected HTML-leak dead-lettering.",
+            job_id, value, sorted(_VALID_PAYLOAD_TYPES), _DEFAULT_PAYLOAD_TYPE,
+        )
     return _DEFAULT_PAYLOAD_TYPE
+
+
+# Dead-letter rotation: cap the append-only log so a persistently-leaking job
+# cannot grow it forever (#90844 review). Drop-oldest, keep newest records.
+_DEADLETTER_MAX_BYTES = 1_048_576  # 1 MiB
+_DEADLETTER_KEEP_FRACTION = 0.5  # after rotation, retain newest half
+
+
+def _rotate_deadletter(deadletter_path) -> None:
+    """Drop-oldest rotation for deadletter.jsonl once it exceeds the cap.
+
+    Keeps the newest ~half of records (whole JSON lines, never split). Cheap:
+    only runs when the file is over _DEADLETTER_MAX_BYTES, and dead-letter
+    writes are rare by design.
+    """
+    import os as _os
+
+    try:
+        size = _os.path.getsize(deadletter_path)
+    except OSError:
+        return
+    if size <= _DEADLETTER_MAX_BYTES:
+        return
+    with open(deadletter_path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    keep = max(1, int(len(lines) * _DEADLETTER_KEEP_FRACTION))
+    retained = lines[-keep:]
+    with open(deadletter_path, "w", encoding="utf-8") as fh:
+        fh.writelines(retained)
+    logger.warning(
+        "deadletter.jsonl exceeded %d bytes — rotated, dropped %d oldest record(s), kept %d",
+        _DEADLETTER_MAX_BYTES, len(lines) - len(retained), len(retained),
+    )
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -2587,10 +2633,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "job_id": job["id"],
                 "payload_type": _extract_payload_type(job),
                 "leak_tag": leak_tag,
-                "content": delivery_content,
+                # Diagnosis needs a preview + integrity check, not a second
+                # copy of every near-leak (which can carry sensitive data).
+                "content_preview": delivery_content[:500],
+                "content_sha256": hashlib.sha256(
+                    delivery_content.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "content_chars": len(delivery_content),
             }
             with open(deadletter_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record) + "\n")
+            # Bounded growth: drop-oldest rotation once the file exceeds the
+            # cap — an unlucky job must not grow this forever (#90844 review).
+            try:
+                _rotate_deadletter(deadletter_path)
+            except Exception as rot_err:
+                logger.warning(
+                    "Job '%s': dead-letter rotation failed: %s",
+                    job["id"], rot_err,
+                )
         except Exception as dl_err:
             logger.error(
                 "Job '%s': failed to write dead-letter record: %s",
