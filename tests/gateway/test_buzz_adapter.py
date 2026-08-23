@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -298,18 +299,26 @@ class _FakeSessionStore:
         self.entries = {}
         self.messages = []
 
-    def add_source(self, source, session_id="buzz-thread-session"):
-        key = build_session_key(
-            source,
-            group_sessions_per_user=self.config.group_sessions_per_user,
-            thread_sessions_per_user=self.config.thread_sessions_per_user,
-        )
+    def add_source(self, source, session_id="buzz-thread-session", *, profile=None):
+        key = self._generate_session_key(source, profile=profile)
         entry = SimpleNamespace(session_id=session_id)
         self.entries[key] = entry
         return entry
 
+    def _generate_session_key(self, source, *, profile=None):
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.group_sessions_per_user,
+            thread_sessions_per_user=self.config.thread_sessions_per_user,
+            profile=profile if profile is not None else source.profile,
+        )
+
     def lookup_by_session_key(self, session_key):
         return self.entries.get(session_key)
+
+    def get_or_create_session(self, source):
+        self.last_get_or_create_source = source
+        return self.entries[self._generate_session_key(source)]
 
     def append_to_transcript(self, session_id, message, skip_db=False):
         self.messages.append((session_id, message, skip_db))
@@ -449,6 +458,7 @@ class TestThreadSessions:
             "observed": True,
             "message_id": REPLY_A,
         }
+        assert store.last_get_or_create_source.thread_id == ROOT_A
 
         await adapter._handle_event(
             CHANNEL,
@@ -465,10 +475,129 @@ class TestThreadSessions:
         assert build_session_key(triggered.source) in store.entries
 
     @pytest.mark.asyncio
+    async def test_unmentioned_reply_uses_secondary_owner_profile_session(self):
+        adapter = self._adapter()
+        adapter.set_owner_profile("campaign")
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        source = adapter.build_source(
+            chat_id=CHANNEL,
+            chat_name="pilot",
+            chat_type="thread",
+            user_id=OTHER_PUBKEY,
+            user_name="Alice Example",
+            thread_id=ROOT_A,
+            parent_chat_id=CHANNEL,
+            message_id=ROOT_A,
+        )
+        store.add_source(source, profile="campaign")
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                REPLY_A,
+                CHANNEL,
+                content="secondary profile context",
+                reply_to=ROOT_A,
+            ),
+        )
+
+        assert len(store.messages) == 1
+        assert store.messages[0][1]["content"].endswith("secondary profile context")
+        assert store.last_get_or_create_source.profile == "campaign"
+
+    @pytest.mark.asyncio
+    async def test_callback_only_authorization_can_observe_known_thread(self):
+        adapter = self._adapter()
+        adapter._allowed_pubkeys = set()
+        adapter.set_authorization_check(lambda *_args: True)
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        store.add_source(
+            adapter.build_source(
+                chat_id=CHANNEL,
+                chat_type="thread",
+                user_id=OTHER_PUBKEY,
+                thread_id=ROOT_A,
+                parent_chat_id=CHANNEL,
+                message_id=ROOT_A,
+            )
+        )
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                REPLY_A,
+                CHANNEL,
+                content="callback-authorized context",
+                reply_to=ROOT_A,
+            ),
+        )
+
+        assert len(store.messages) == 1
+        assert store.messages[0][1]["content"].endswith(
+            "callback-authorized context"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejected_profile_route_cannot_observe_thread(self):
+        from gateway.profile_routing import ProfileRouteRejected
+
+        adapter = self._adapter()
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=MagicMock(
+                side_effect=ProfileRouteRejected("unserved")
+            )
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                REPLY_A,
+                CHANNEL,
+                content="unserved-profile context",
+                reply_to=ROOT_A,
+            ),
+        )
+
+        assert store.messages == []
+        assert not hasattr(store, "last_get_or_create_source")
+
+    @pytest.mark.asyncio
+    async def test_cross_owner_profile_route_cannot_observe_thread(self):
+        adapter = self._adapter()
+        adapter.set_owner_profile("campaign")
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=MagicMock(return_value="client-ops")
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(
+                REPLY_A,
+                CHANNEL,
+                content="wrong-profile context",
+                reply_to=ROOT_A,
+            ),
+        )
+
+        assert store.messages == []
+        assert not hasattr(store, "last_get_or_create_source")
+
+    @pytest.mark.asyncio
     async def test_unmentioned_top_level_or_unknown_thread_is_not_observed(self):
         adapter = self._adapter()
         store = _FakeSessionStore()
         adapter._session_store = store
+        adapter._resolve_user_name = AsyncMock(return_value="Alice Example")
 
         await adapter._handle_event(
             CHANNEL,
@@ -482,7 +611,23 @@ class TestThreadSessions:
         )
 
         adapter.handle_message.assert_not_awaited()
+        adapter._resolve_user_name.assert_not_awaited()
         assert store.messages == []
+
+    @pytest.mark.asyncio
+    async def test_disabled_observation_skips_authorization_callback(self):
+        adapter = self._adapter(observe=False)
+        authorize = MagicMock(return_value=True)
+        adapter.set_authorization_check(authorize)
+
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _tagged_event(REPLY_A, CHANNEL, content="ordinary reply", reply_to=ROOT_A),
+        )
+
+        authorize.assert_not_called()
+        adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unauthorized_reply_cannot_enter_observed_context(self):
@@ -698,6 +843,26 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+    @pytest.mark.asyncio
+    async def test_local_image_prefers_thread_root_over_nested_reply(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-image"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            reply_to=NESTED_REPLY_A,
+            metadata={"thread_id": ROOT_A},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == ROOT_A
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -772,6 +937,39 @@ class TestEnvEnablement:
             {"observe_unmentioned_thread_messages": "true"}
         )
         assert adapter.observe_unmentioned_thread_messages is True
+
+    def test_observation_setting_isolated_across_profile_scopes(self, monkeypatch):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES", "true")
+        ss.set_multiplex_active(True)
+        false_scope = ss.set_secret_scope(
+            {"BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES": "false"}
+        )
+        try:
+            disabled = _make_adapter()
+        finally:
+            ss.reset_secret_scope(false_scope)
+
+        true_scope = ss.set_secret_scope(
+            {"BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES": "true"}
+        )
+        try:
+            enabled = _make_adapter()
+        finally:
+            ss.reset_secret_scope(true_scope)
+            ss.set_multiplex_active(False)
+
+        assert disabled.observe_unmentioned_thread_messages is False
+        assert enabled.observe_unmentioned_thread_messages is True
+
+    def test_yaml_bridge_does_not_promote_observation_to_process_env(self):
+        _buzz_mod._apply_yaml_config(
+            {},
+            {"extra": {"observe_unmentioned_thread_messages": True}},
+        )
+
+        assert "BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES" not in os.environ
 
 
 class TestBuzzPluginRegistration:

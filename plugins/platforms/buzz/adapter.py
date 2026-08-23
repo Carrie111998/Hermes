@@ -398,7 +398,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # Store authorized, unmentioned replies as context in an already-known
         # Buzz thread without waking the agent. Top-level channel chatter and
         # replies in threads the agent has never joined remain ignored.
-        _observe_raw = os.getenv("BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES")
+        _observe_raw = _get_scoped_secret(
+            "BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES"
+        )
         if _observe_raw is None:
             _observe_cfg = extra.get(
                 "observe_unmentioned_thread_messages",
@@ -704,8 +706,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            reply_target = (metadata or {}).get("thread_id") or reply_to
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1070,31 +1073,30 @@ class BuzzAdapter(BasePlatformAdapter):
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
         if not is_dm and self.require_mention and not self._is_mentioned(content):
-            callback_authorized = self._is_sender_authorized(
-                pubkey,
-                "thread" if root_id else "group",
-                channel_id,
-            )
-            observation_authorized = callback_authorized is not False and (
-                pubkey in self._allowed_pubkeys
-                if self._allowed_pubkeys
-                else callback_authorized is True
-            )
             if (
                 self.observe_unmentioned_thread_messages
                 and root_id
                 and reply_to_id
-                and observation_authorized
             ):
-                self._observe_unmentioned_thread_message(
-                    text=content.strip(),
-                    chat_id=channel_id,
-                    user_id=pubkey,
-                    user_name=await self._resolve_user_name(pubkey),
-                    message_id=event_id,
-                    created_at=created_at,
-                    root_id=root_id,
+                callback_authorized = self._is_sender_authorized(
+                    pubkey,
+                    "thread",
+                    channel_id,
                 )
+                observation_authorized = callback_authorized is not False and (
+                    pubkey in self._allowed_pubkeys
+                    if self._allowed_pubkeys
+                    else callback_authorized is True
+                )
+                if observation_authorized:
+                    await self._observe_unmentioned_thread_message(
+                        text=content.strip(),
+                        chat_id=channel_id,
+                        user_id=pubkey,
+                        message_id=event_id,
+                        created_at=created_at,
+                        root_id=root_id,
+                    )
             return
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
@@ -1155,30 +1157,20 @@ class BuzzAdapter(BasePlatformAdapter):
         if not store:
             return None
         try:
-            from gateway.session import build_session_key
-
-            store_cfg = getattr(store, "config", None)
-            return build_session_key(
-                source,
-                group_sessions_per_user=getattr(
-                    store_cfg, "group_sessions_per_user", True
-                ),
-                thread_sessions_per_user=getattr(
-                    store_cfg, "thread_sessions_per_user", False
-                ),
-                profile=getattr(source, "profile", None),
-            )
+            key_builder = getattr(store, "_generate_session_key", None)
+            if not callable(key_builder):
+                return None
+            return key_builder(source)
         except Exception:
             logger.debug("Buzz: failed to build thread session key", exc_info=True)
             return None
 
-    def _observe_unmentioned_thread_message(
+    async def _observe_unmentioned_thread_message(
         self,
         *,
         text: str,
         chat_id: str,
         user_id: str,
-        user_name: str,
         message_id: str,
         created_at: int,
         root_id: str,
@@ -1193,17 +1185,40 @@ class BuzzAdapter(BasePlatformAdapter):
                 chat_name=self._channel_names.get(chat_id, chat_id),
                 chat_type="thread",
                 user_id=user_id,
-                user_name=user_name,
                 thread_id=root_id,
                 parent_chat_id=chat_id,
                 message_id=message_id,
             )
+            if getattr(source, "profile_route_rejected", False) is True:
+                logger.warning(
+                    "Buzz: refusing passive context for an unserved profile route"
+                )
+                return False
+
+            owner_profile = getattr(self, "_owner_profile", None)
+            routed_profile = getattr(source, "profile", None)
+            if routed_profile is not None and routed_profile != owner_profile:
+                logger.warning(
+                    "Buzz: refusing passive context routed to profile %r through "
+                    "adapter owner %r",
+                    routed_profile,
+                    owner_profile or "default",
+                )
+                return False
+            if routed_profile is None and owner_profile is not None:
+                source.profile = owner_profile
+
             session_key = self._thread_session_key(source)
-            session_entry = (
+            known_entry = (
                 store.lookup_by_session_key(session_key) if session_key else None
             )
-            if not session_entry:
+            if not known_entry:
                 return False
+            get_or_create = getattr(store, "get_or_create_session", None)
+            if not callable(get_or_create):
+                return False
+            session_entry = get_or_create(source)
+            user_name = await self._resolve_user_name(user_id)
             timestamp = (
                 datetime.fromtimestamp(created_at, tz=timezone.utc)
                 if created_at
@@ -1462,7 +1477,9 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     Slack/Telegram pattern.  Env vars win over YAML — every assignment is
     guarded by ``not os.getenv(...)`` so explicit env overrides survive a
     config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
-    it is never sourced from config.yaml here.
+    it is never sourced from config.yaml here. The passive-observation setting
+    also stays out of this process-global bridge because it is profile-local;
+    the adapter reads it directly from scoped env or its own ``extra`` block.
     """
     extra = buzz_cfg.get("extra", buzz_cfg) or {}
     if not isinstance(extra, dict):
@@ -1494,13 +1511,6 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
-    if (
-        "observe_unmentioned_thread_messages" in extra
-        and not os.getenv("BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES")
-    ):
-        os.environ["BUZZ_OBSERVE_UNMENTIONED_THREAD_MESSAGES"] = str(
-            extra["observe_unmentioned_thread_messages"]
-        ).lower()
     return None
 
 
