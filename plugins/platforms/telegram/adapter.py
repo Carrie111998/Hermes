@@ -5219,7 +5219,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
 
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
-        if not content or not content.strip():
+        # Also skip the agent's "(empty)" terminal sentinel (#92924): the
+        # gateway converts it to a friendly fallback on the normal delivery
+        # path, but direct callers (status bubbles, pushes, queued sends) can
+        # still hand us the raw placeholder — never render it to a user.
+        if not content or not content.strip() or (
+            isinstance(content, str) and content.strip() == "(empty)"
+        ):
             return SendResult(success=True, message_id=None)
         
         try:
