@@ -44,10 +44,16 @@ export function SettingsCategoryHeading({ count, icon: Icon, title }: CategoryHe
 // mutation handlers instead of duplicating the plumbing. An optional `profile`
 // targets another profile's env store (the shared settings "Applies to"
 // scope); undefined/null keeps the app-wide active profile.
-export function useEnvCredentials(profile: null | string = null): UseEnvCredentials {
+export function useEnvCredentials(profile?: null | string): UseEnvCredentials {
   const { t } = useI18n()
   const credentials = t.settings.credentials
   const toolsets = t.settings.toolsets
+  // profileScoped() only falls back to the app-wide active profile for
+  // `undefined` — a literal `null` forces the primary/base store instead
+  // (api/client.ts). Normalize here so a bare call (Providers) and a `null`
+  // "no override" scope (Keys) both follow the active profile as documented
+  // above, instead of always landing on base.
+  const scopedProfile = profile ?? undefined
   const [vars, setVars] = useState<Record<string, EnvVarInfo> | null>(null)
   const [edits, setEdits] = useState<Record<string, string>>({})
   const [revealed, setRevealed] = useState<Record<string, string>>({})
@@ -70,7 +76,7 @@ export function useEnvCredentials(profile: null | string = null): UseEnvCredenti
 
     void (async () => {
       try {
-        const next = await getEnvVars(profile)
+        const next = await getEnvVars(scopedProfile)
 
         if (!cancelled) {
           setVars(next)
@@ -82,7 +88,7 @@ export function useEnvCredentials(profile: null | string = null): UseEnvCredenti
 
     return () => void (cancelled = true)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload per target profile; copy is stable
-  }, [profile])
+  }, [scopedProfile])
 
   function patchVar(key: string, patch: Partial<Pick<EnvVarInfo, 'is_set' | 'redacted_value'>>) {
     setVars(c => (c ? { ...c, [key]: { ...c[key], ...patch } } : c))
@@ -103,7 +109,7 @@ export function useEnvCredentials(profile: null | string = null): UseEnvCredenti
     setSaving(key)
 
     try {
-      await setEnvVar(key, value, profile)
+      await setEnvVar(key, value, scopedProfile)
       patchVar(key, { is_set: true, redacted_value: redactedValue(value) })
       clearLocalState(key)
       notify({ kind: 'success', title: toolsets.savedTitle, message: toolsets.savedMessage(key) })
@@ -127,7 +133,7 @@ export function useEnvCredentials(profile: null | string = null): UseEnvCredenti
     setSaving(key)
 
     try {
-      await setEnvVar(key, trimmed, profile)
+      await setEnvVar(key, trimmed, scopedProfile)
       patchVar(key, { is_set: true, redacted_value: redactedValue(trimmed) })
       clearLocalState(key)
       notify({ kind: 'success', message: toolsets.savedMessage(key), title: toolsets.savedTitle })
@@ -150,7 +156,7 @@ export function useEnvCredentials(profile: null | string = null): UseEnvCredenti
     setSaving(key)
 
     try {
-      await deleteEnvVar(key, profile)
+      await deleteEnvVar(key, scopedProfile)
       patchVar(key, { is_set: false, redacted_value: null })
       clearLocalState(key)
       notify({ kind: 'success', title: toolsets.removedTitle, message: toolsets.removedMessage(key) })
@@ -169,7 +175,7 @@ export function useEnvCredentials(profile: null | string = null): UseEnvCredenti
     }
 
     try {
-      const result = await revealEnvVar(key, profile)
+      const result = await revealEnvVar(key, scopedProfile)
       setRevealed(c => ({ ...c, [key]: result.value }))
     } catch (err) {
       notifyError(err, toolsets.failedReveal(key))
