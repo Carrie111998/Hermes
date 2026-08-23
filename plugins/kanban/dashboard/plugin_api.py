@@ -603,6 +603,11 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
+    branch_name: Optional[str] = None
+    expected_base_sha: Optional[str] = None
+    candidate_sha: Optional[str] = None
+    clean_workspace_policy: str = "allow_dirty"
+    dispatchable: bool = True
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -633,6 +638,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
+            branch_name=payload.branch_name,
+            expected_base_sha=payload.expected_base_sha,
+            candidate_sha=payload.candidate_sha,
+            clean_workspace_policy=payload.clean_workspace_policy,
+            dispatchable=payload.dispatchable,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,

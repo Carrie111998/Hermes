@@ -133,6 +133,8 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_CLEAN_WORKSPACE_POLICIES = {"allow_dirty", "require_clean"}
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -344,6 +346,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.preflight_held,
         )):
             outcome = "idle"
         invoke_hook(
@@ -1146,6 +1149,10 @@ class Task:
     dispatch_hold_reason: Optional[str] = None
     dispatch_hold_at: Optional[int] = None
     dispatch_hold_by: Optional[str] = None
+    expected_base_sha: Optional[str] = None
+    candidate_sha: Optional[str] = None
+    clean_workspace_policy: str = "allow_dirty"
+    dispatchable: bool = True
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1248,6 +1255,22 @@ class Task:
             ),
             dispatch_hold_by=(
                 row["dispatch_hold_by"] if "dispatch_hold_by" in keys else None
+            ),
+            expected_base_sha=(
+                row["expected_base_sha"] if "expected_base_sha" in keys else None
+            ),
+            candidate_sha=(
+                row["candidate_sha"] if "candidate_sha" in keys else None
+            ),
+            clean_workspace_policy=(
+                row["clean_workspace_policy"]
+                if "clean_workspace_policy" in keys and row["clean_workspace_policy"]
+                else "allow_dirty"
+            ),
+            dispatchable=(
+                bool(row["dispatchable"])
+                if "dispatchable" in keys and row["dispatchable"] is not None
+                else True
             ),
         )
 
@@ -1441,7 +1464,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- release_dispatch_hold domain operation.
     dispatch_hold_reason TEXT,
     dispatch_hold_at     INTEGER,
-    dispatch_hold_by     TEXT
+    dispatch_hold_by     TEXT,
+    expected_base_sha    TEXT,
+    candidate_sha        TEXT,
+    clean_workspace_policy TEXT NOT NULL DEFAULT 'allow_dirty',
+    dispatchable         INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2710,6 +2737,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "dispatch_hold_by", "dispatch_hold_by TEXT"
         )
+    if "expected_base_sha" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "expected_base_sha", "expected_base_sha TEXT"
+        )
+    if "candidate_sha" not in cols:
+        _add_column_if_missing(conn, "tasks", "candidate_sha", "candidate_sha TEXT")
+    if "clean_workspace_policy" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "clean_workspace_policy",
+            "clean_workspace_policy TEXT NOT NULL DEFAULT 'allow_dirty'",
+        )
+    if "dispatchable" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dispatchable", "dispatchable INTEGER NOT NULL DEFAULT 1"
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3215,6 +3259,10 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    expected_base_sha: Optional[str] = None,
+    candidate_sha: Optional[str] = None,
+    clean_workspace_policy: str = "allow_dirty",
+    dispatchable: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3274,8 +3322,23 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
+    if branch_name and workspace_kind not in {"dir", "worktree"}:
+        raise ValueError("branch_name is only valid for dir/worktree workspaces")
+
+    def _canonical_sha(value: Optional[str], field_name: str) -> Optional[str]:
+        value = (str(value).strip() if value is not None else "") or None
+        if value is not None and not _FULL_GIT_SHA_RE.fullmatch(value):
+            raise ValueError(f"{field_name} must be exactly 40 hexadecimal characters")
+        return value.lower() if value else None
+
+    expected_base_sha = _canonical_sha(expected_base_sha, "expected_base_sha")
+    candidate_sha = _canonical_sha(candidate_sha, "candidate_sha")
+    clean_workspace_policy = str(clean_workspace_policy or "").strip()
+    if clean_workspace_policy not in VALID_CLEAN_WORKSPACE_POLICIES:
+        raise ValueError(
+            "clean_workspace_policy must be one of "
+            f"{sorted(VALID_CLEAN_WORKSPACE_POLICIES)}"
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3529,8 +3592,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        expected_base_sha, candidate_sha,
+                        clean_workspace_policy, dispatchable
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3556,6 +3621,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        expected_base_sha,
+                        candidate_sha,
+                        clean_workspace_policy,
+                        1 if dispatchable else 0,
                     ),
                 )
                 for pid in parents:
@@ -3584,6 +3653,10 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "expected_base_sha": expected_base_sha,
+                        "candidate_sha": candidate_sha,
+                        "clean_workspace_policy": clean_workspace_policy,
+                        "dispatchable": bool(dispatchable),
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4857,6 +4930,28 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _claim_workspace_lease_conflict(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Return a running task that already owns the same declared workspace."""
+    task = conn.execute(
+        "SELECT workspace_kind, workspace_path, branch_name, dispatchable "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not task or not bool(task["dispatchable"]):
+        return None
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE id != ? AND status = 'running' "
+        "AND current_run_id IS NOT NULL AND dispatchable = 1 AND ("
+        "(workspace_path IS NOT NULL AND workspace_path = ?) OR "
+        "(workspace_kind = 'worktree' AND ? IS NOT NULL AND branch_name = ?)"
+        ") LIMIT 1",
+        (task_id, task["workspace_path"], task["branch_name"], task["branch_name"]),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4878,6 +4973,15 @@ def claim_task(
             (task_id,),
         ).fetchone()
         if held:
+            return None
+        lease_owner = _claim_workspace_lease_conflict(conn, task_id)
+        if lease_owner:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"reason": "workspace_lease_conflict", "owner": lease_owner},
+            )
             return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -5008,6 +5112,15 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        lease_owner = _claim_workspace_lease_conflict(conn, task_id)
+        if lease_owner:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"reason": "workspace_lease_conflict", "owner": lease_owner},
+            )
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -7962,6 +8075,235 @@ def _git_current_branch(path: Path) -> Optional[str]:
     return branch or None
 
 
+def _git_text(path: Path, *args: str) -> Optional[str]:
+    """Run one read-only Git probe and return stripped stdout on success."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()
+
+
+@dataclass(frozen=True)
+class DispatchPreflightVerdict:
+    """Structured, audit-safe evidence for one pre-dispatch decision."""
+
+    ok: bool
+    reason_codes: tuple[str, ...]
+    evidence: dict[str, Any]
+
+    @property
+    def reason(self) -> str:
+        return ", ".join(self.reason_codes) or "ok"
+
+
+def _preflight_workspace_path(task: Task, *, board: Optional[str]) -> Optional[Path]:
+    if task.workspace_kind == "scratch":
+        return Path(task.workspace_path).expanduser() if task.workspace_path else None
+    if task.workspace_path:
+        return Path(task.workspace_path).expanduser()
+    if task.workspace_kind == "worktree":
+        board_slug = board if board else get_current_board()
+        try:
+            default = str(
+                read_board_metadata(board_slug).get("default_workdir") or ""
+            ).strip()
+        except Exception:
+            default = ""
+        if default:
+            return Path(default).expanduser()
+    return None
+
+
+def evaluate_dispatch_preflight(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    lane: str,
+    board: Optional[str] = None,
+    profile_exists_fn=None,
+) -> DispatchPreflightVerdict:
+    """Evaluate profile, workspace, Git identity, lease, and parent gates.
+
+    This function is side-effect free. Dispatch runs it before claim and again
+    after workspace resolution/claim so mutable filesystem identity cannot move
+    unnoticed between enumeration and child launch.
+    """
+    evidence: dict[str, Any] = {
+        "lane": lane,
+        "dispatchable": bool(task.dispatchable),
+        "assignee": task.assignee,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "expected_base_sha": task.expected_base_sha,
+        "candidate_sha": task.candidate_sha,
+        "clean_workspace_policy": task.clean_workspace_policy,
+    }
+    reasons: list[str] = []
+    if not task.dispatchable:
+        return DispatchPreflightVerdict(True, (), evidence)
+
+    if not task.assignee:
+        reasons.append("assignee_missing")
+    else:
+        if profile_exists_fn is None:
+            try:
+                from hermes_cli.profiles import profile_exists as profile_exists_fn
+            except Exception:
+                profile_exists_fn = None
+        if profile_exists_fn is None:
+            reasons.append("profile_lookup_failed")
+        else:
+            try:
+                exists = bool(profile_exists_fn(task.assignee))
+            except Exception:
+                reasons.append("profile_lookup_failed")
+            else:
+                if not exists:
+                    reasons.append("profile_missing")
+
+    if not _parents_satisfied(conn, task.id):
+        reasons.append("parents_not_done")
+
+    path = _preflight_workspace_path(task, board=board)
+    evidence["resolved_probe_path"] = str(path) if path is not None else None
+    if task.workspace_kind == "dir":
+        if path is None or not path.exists() or not path.is_dir():
+            reasons.append("workspace_missing")
+    elif task.workspace_kind == "worktree":
+        # A new worktree target may not exist yet; its nearest repository is
+        # the immutable creation anchor and is rechecked after materialization.
+        if path is None:
+            reasons.append("workspace_missing")
+        elif not path.exists():
+            anchor = _repo_root_for_worktree_target(path.parent)
+            if anchor is None:
+                reasons.append("git_repository_required")
+            else:
+                path = anchor
+                evidence["pre_materialization"] = True
+        elif (
+            _git_toplevel(path) == path.resolve(strict=False)
+            and not _is_linked_worktree_checkout(path)
+        ):
+            # A repository-root workspace_path is an anchor from which the
+            # task's dedicated linked worktree will be created after claim.
+            evidence["pre_materialization"] = True
+    elif task.workspace_kind == "scratch":
+        if task.workspace_path and (path is None or not path.exists()):
+            reasons.append("workspace_missing")
+    else:
+        reasons.append("workspace_kind_invalid")
+
+    git_contract = bool(
+        task.expected_base_sha
+        or task.candidate_sha
+        or task.branch_name
+        or task.clean_workspace_policy == "require_clean"
+        or task.workspace_kind == "worktree"
+    )
+    common_dir: Optional[Path] = None
+    if git_contract:
+        if path is None or not path.exists():
+            if "workspace_missing" not in reasons:
+                reasons.append("workspace_missing")
+        else:
+            common_dir = _git_common_dir(path)
+            head_sha = _git_text(path, "rev-parse", "HEAD")
+            branch = _git_current_branch(path)
+            status = _git_text(path, "status", "--porcelain", "--untracked-files=all")
+            evidence.update(
+                {
+                    "git_common_dir": str(common_dir) if common_dir else None,
+                    "head_sha": head_sha,
+                    "branch": branch,
+                    "dirty": bool(status) if status is not None else None,
+                }
+            )
+            if common_dir is None or head_sha is None:
+                reasons.append("git_repository_required")
+            else:
+                if task.clean_workspace_policy == "require_clean" and status:
+                    reasons.append("workspace_dirty")
+                if task.branch_name and not evidence.get("pre_materialization") and branch != task.branch_name:
+                    reasons.append("branch_mismatch")
+                if task.candidate_sha:
+                    if head_sha != task.candidate_sha:
+                        reasons.append("candidate_sha_mismatch")
+                elif lane == "ready" and task.expected_base_sha:
+                    if head_sha != task.expected_base_sha:
+                        reasons.append("expected_base_mismatch")
+                elif lane == "review" and task.expected_base_sha:
+                    reasons.append("candidate_sha_required")
+
+    # Raw workspace-path equality is the first lease fence. Common-dir+branch
+    # catches aliases/symlinks and separate linked worktrees targeting one branch.
+    running = conn.execute(
+        "SELECT * FROM tasks WHERE status = 'running' AND id != ? "
+        "AND current_run_id IS NOT NULL",
+        (task.id,),
+    ).fetchall()
+    conflicts: list[str] = []
+    task_path = path.resolve(strict=False) if path is not None else None
+    for row in running:
+        other = Task.from_row(row)
+        other_path = _preflight_workspace_path(other, board=board)
+        same_path = bool(
+            task_path is not None
+            and other_path is not None
+            and task_path == other_path.resolve(strict=False)
+        )
+        same_repo_branch = False
+        if common_dir is not None and other_path is not None and other_path.exists():
+            other_common = _git_common_dir(other_path)
+            other_branch = _git_current_branch(other_path)
+            wanted_branch = task.branch_name or evidence.get("branch")
+            same_repo_branch = bool(
+                other_common == common_dir
+                and wanted_branch
+                and other_branch == wanted_branch
+            )
+        if same_path or same_repo_branch:
+            conflicts.append(other.id)
+    if conflicts:
+        evidence["lease_conflicts"] = conflicts
+        reasons.append("workspace_lease_conflict")
+
+    return DispatchPreflightVerdict(not reasons, tuple(dict.fromkeys(reasons)), evidence)
+
+
+def _safe_dispatch_preflight(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    lane: str,
+    board: Optional[str],
+) -> DispatchPreflightVerdict:
+    """Fail closed when an unexpected probe error prevents a verdict."""
+    try:
+        return evaluate_dispatch_preflight(conn, task, lane=lane, board=board)
+    except Exception as exc:
+        return DispatchPreflightVerdict(
+            False,
+            ("preflight_internal_error",),
+            {
+                "lane": lane,
+                "task_id": task.id,
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
 def _is_linked_worktree_checkout(path: Path) -> bool:
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
@@ -8360,6 +8702,60 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    preflight_held: list[str] = field(default_factory=list)
+    """Tasks fenced by fail-closed dispatch preflight before child launch."""
+
+
+def _land_dispatch_preflight_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    verdict: DispatchPreflightVerdict,
+) -> bool:
+    """Atomically close any just-created run and durably hold the task."""
+    now = int(time.time())
+    reason = f"dispatch preflight failed: {verdict.reason}"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] in {"done", "archived"}:
+            return False
+        run_id = row["current_run_id"]
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET status = 'blocked', outcome = 'preflight_failed', "
+                "summary = ?, metadata = ?, error = ?, ended_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND ended_at IS NULL",
+                (
+                    reason,
+                    json.dumps(verdict.evidence, sort_keys=True),
+                    reason,
+                    now,
+                    run_id,
+                ),
+            )
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "dispatch_hold_reason = ?, dispatch_hold_at = ?, "
+            "dispatch_hold_by = 'dispatcher-preflight', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ?",
+            (reason, now, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_preflight_failed",
+            {
+                "reason_codes": list(verdict.reason_codes),
+                "evidence": verdict.evidence,
+                "landing": "blocked",
+            },
+            run_id=run_id,
+        )
+    return True
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -10438,6 +10834,23 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        preflight_task = get_task(conn, row["id"])
+        if preflight_task is None:
+            continue
+        if not preflight_task.dispatchable:
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        preflight = _safe_dispatch_preflight(
+            conn, preflight_task, lane="ready", board=board
+        )
+        if not preflight.ok:
+            if dry_run:
+                result.preflight_held.append(row["id"])
+            else:
+                claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+                if _land_dispatch_preflight_failure(conn, row["id"], preflight):
+                    result.preflight_held.append(row["id"])
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -10528,6 +10941,14 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        claimed = get_task(conn, claimed.id) or claimed
+        recheck = _safe_dispatch_preflight(
+            conn, claimed, lane="ready", board=board
+        )
+        if not recheck.ok:
+            if _land_dispatch_preflight_failure(conn, claimed.id, recheck):
+                result.preflight_held.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10602,6 +11023,23 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        preflight_task = get_task(conn, row["id"])
+        if preflight_task is None:
+            continue
+        if not preflight_task.dispatchable:
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        preflight = _safe_dispatch_preflight(
+            conn, preflight_task, lane="review", board=board
+        )
+        if not preflight.ok:
+            if dry_run:
+                result.preflight_held.append(row["id"])
+            else:
+                claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+                if _land_dispatch_preflight_failure(conn, row["id"], preflight):
+                    result.preflight_held.append(row["id"])
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
@@ -10655,6 +11093,14 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        claimed = get_task(conn, claimed.id) or claimed
+        recheck = _safe_dispatch_preflight(
+            conn, claimed, lane="review", board=board
+        )
+        if not recheck.ok:
+            if _land_dispatch_preflight_failure(conn, claimed.id, recheck):
+                result.preflight_held.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
@@ -11341,6 +11787,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.expected_base_sha:
+        lines.append(f"Expected base SHA: {task.expected_base_sha}")
+    if task.candidate_sha:
+        lines.append(f"Candidate SHA: {task.candidate_sha}")
+    if task.clean_workspace_policy != "allow_dirty":
+        lines.append(f"Workspace clean policy: {task.clean_workspace_policy}")
     lines.append("")
 
     if task.body and task.body.strip():

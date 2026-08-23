@@ -495,6 +495,11 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+        "expected_base_sha": task.expected_base_sha,
+        "candidate_sha": task.candidate_sha,
+        "clean_workspace_policy": task.clean_workspace_policy,
+        "dispatchable": task.dispatchable,
         "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -1388,6 +1393,15 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    branch_name = args.get("branch_name") or args.get("branch")
+    expected_base_sha = args.get("expected_base_sha")
+    candidate_sha = args.get("candidate_sha")
+    clean_workspace_policy = args.get("clean_workspace_policy") or "allow_dirty"
+    dispatchable, dispatchable_error = _parse_bool_arg(args, "dispatchable")
+    if dispatchable_error:
+        return tool_error(dispatchable_error)
+    if "dispatchable" not in args:
+        dispatchable = True
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1445,6 +1459,11 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                branch_name=branch_name,
+                expected_base_sha=expected_base_sha,
+                candidate_sha=candidate_sha,
+                clean_workspace_policy=clean_workspace_policy,
+                dispatchable=dispatchable,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
@@ -1471,6 +1490,13 @@ def _handle_create(args: dict, **kw) -> str:
                 status=new_task.status if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
+                branch_name=new_task.branch_name if new_task else None,
+                expected_base_sha=new_task.expected_base_sha if new_task else None,
+                candidate_sha=new_task.candidate_sha if new_task else None,
+                clean_workspace_policy=(
+                    new_task.clean_workspace_policy if new_task else None
+                ),
+                dispatchable=new_task.dispatchable if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
             )
@@ -2212,6 +2238,35 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "branch_name": {
+                "type": "string",
+                "description": "Exact branch required for dir/worktree dispatch.",
+            },
+            "expected_base_sha": {
+                "type": "string",
+                "description": (
+                    "Exact full 40-hex HEAD required for implementation dispatch. "
+                    "Abbreviated or malformed SHAs are rejected before persistence."
+                ),
+            },
+            "candidate_sha": {
+                "type": "string",
+                "description": (
+                    "Exact full 40-hex HEAD required for review/integration/release dispatch."
+                ),
+            },
+            "clean_workspace_policy": {
+                "type": "string",
+                "enum": ["allow_dirty", "require_clean"],
+                "description": "Whether dispatch requires an empty Git status.",
+            },
+            "dispatchable": {
+                "type": "boolean",
+                "description": (
+                    "Set false only for an explicitly human-pulled/control-plane lane. "
+                    "Missing Hermes profiles otherwise fail closed."
                 ),
             },
             "project": {

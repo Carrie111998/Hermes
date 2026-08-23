@@ -84,6 +84,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "dispatch_hold_reason": t.dispatch_hold_reason,
         "dispatch_hold_at": t.dispatch_hold_at,
         "dispatch_hold_by": t.dispatch_hold_by,
+        "expected_base_sha": t.expected_base_sha,
+        "candidate_sha": t.candidate_sha,
+        "clean_workspace_policy": t.clean_workspace_policy,
+        "dispatchable": t.dispatchable,
     }
 
 
@@ -340,7 +344,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
-                          help="Branch name for worktree tasks, e.g. wt/t6-wire")
+                          help="Exact branch for dir/worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--expected-base-sha", default=None,
+                          help="Exact 40-hex HEAD required for implementation dispatch")
+    p_create.add_argument("--candidate-sha", default=None,
+                          help="Exact 40-hex HEAD required for review/release dispatch")
+    p_create.add_argument(
+        "--clean-workspace-policy",
+        choices=sorted(kb.VALID_CLEAN_WORKSPACE_POLICIES),
+        default="allow_dirty",
+        help="Whether dispatch requires an empty Git status",
+    )
+    p_create.add_argument(
+        "--non-dispatchable",
+        action="store_true",
+        help="Explicit human/control-plane lane; dispatcher never spawns it",
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1573,8 +1592,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    if branch_name and ws_kind != "worktree":
-        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
+    if branch_name and ws_kind not in {"dir", "worktree"}:
+        print(
+            "kanban: --branch is only valid with --workspace dir/worktree",
+            file=sys.stderr,
+        )
         return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
@@ -1599,6 +1621,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            expected_base_sha=getattr(args, "expected_base_sha", None),
+            candidate_sha=getattr(args, "candidate_sha", None),
+            clean_workspace_policy=getattr(
+                args, "clean_workspace_policy", "allow_dirty"
+            ),
+            dispatchable=not bool(getattr(args, "non_dispatchable", False)),
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
