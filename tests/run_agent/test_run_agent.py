@@ -5827,9 +5827,18 @@ class TestAnthropicCredentialRefresh:
             assert agent._try_refresh_anthropic_client_credentials() is True
 
         old_client.close.assert_called_once()
-        rebuild.assert_called_once_with(
-            "sk-ant-oat01-fresh-token", "https://api.anthropic.com", timeout=None,
+        rebuild.assert_called_once()
+        args, kwargs = rebuild.call_args
+        assert args == (
+            agent._anthropic_api_key,
+            "https://api.anthropic.com",
         )
+        assert kwargs == {
+            "timeout": None,
+            "drop_context_1m_beta": False,
+            "session_id": agent.session_id,
+            "session_affinity": False,
+        }
         assert agent._anthropic_client is new_client
         assert agent._anthropic_api_key == "sk-ant-oat01-fresh-token"
 
