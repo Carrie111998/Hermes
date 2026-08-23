@@ -92,6 +92,97 @@ class TestLazyMcpRegistration:
 
         mock_run.assert_called_once()
 
+    def test_auto_lazy_expired_legacy_receipt_forces_live_connect(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.mcp_schema_cache as schema_cache
+
+        config = _lazy_config()
+        server_config = config["playwright"]
+        monkeypatch.setattr(
+            schema_cache, "_cache_path", lambda: tmp_path / "cache.json"
+        )
+        now = 10_000.0
+        monkeypatch.setattr(schema_cache.time, "time", lambda: now)
+        fingerprint = schema_cache.config_fingerprint(
+            server_config, server_name="playwright"
+        )
+        schema_cache.write_cache_entry(
+            "playwright",
+            fingerprint,
+            config_digest=schema_cache.config_digest(server_config),
+            protocol_era="legacy",
+            tools=[{"name": "old_tool"}],
+        )
+        now += schema_cache.AUTO_LEGACY_RECEIPT_MAX_AGE_MS / 1000.0 + 1.0
+
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._register_from_cache_sync") as mock_register, \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
+            mcp.register_mcp_servers(config)
+
+        mock_register.assert_not_called()
+        mock_run.assert_called_once()
+
+    def test_auto_lazy_registration_uses_newest_era_receipt(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.mcp_schema_cache as schema_cache
+        from tools.registry import registry
+
+        server_name = "cache_freshness"
+        server_config = {
+            "command": "npx",
+            "args": [],
+            "lazy": True,
+        }
+        monkeypatch.setattr(
+            schema_cache, "_cache_path", lambda: tmp_path / "cache.json"
+        )
+        now = 20_000.0
+        monkeypatch.setattr(schema_cache.time, "time", lambda: now)
+        fingerprint = schema_cache.config_fingerprint(
+            server_config, server_name=server_name
+        )
+        config_digest = schema_cache.config_digest(server_config)
+        schema_cache.write_cache_entry(
+            server_name,
+            fingerprint,
+            config_digest=config_digest,
+            protocol_era="legacy",
+            tools=[{"name": "old_tool"}],
+        )
+        now += 1.0
+        schema_cache.write_cache_entry(
+            server_name,
+            fingerprint,
+            config_digest=config_digest,
+            protocol_era="modern",
+            tools=[{"name": "new_tool"}],
+            ttl_ms=60_000,
+        )
+        entry = schema_cache.get_cached_entry(server_name, fingerprint)
+        assert entry is not None
+        assert entry["tools"][0]["name"] == "new_tool"
+
+        registered_names = mcp._register_from_cache_sync(
+            server_name, server_config, entry
+        )
+        model_visible_name = mcp.mcp_prefixed_tool_name(server_name, "new_tool")
+        stale_name = mcp.mcp_prefixed_tool_name(server_name, "old_tool")
+        try:
+            assert model_visible_name in registered_names
+            assert model_visible_name in mcp._existing_tool_names()
+            assert stale_name not in registered_names
+            assert registry.get_toolset_for_tool(model_visible_name) == (
+                f"mcp-{server_name}"
+            )
+        finally:
+            for name in registered_names:
+                registry.deregister(name)
+                mcp._forget_mcp_tool_server(name)
+
     def test_non_lazy_server_never_touches_cache(self):
         config = {"playwright": {"command": "npx", "args": []}}
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
