@@ -44,12 +44,17 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_policy import (
+    KanbanCreationDenied,
+    dashboard_human_principal,
+    require_creation_allowed,
+)
 
 log = logging.getLogger(__name__)
 
@@ -621,7 +626,20 @@ class CreateTaskBody(BaseModel):
 
 
 @router.post("/tasks")
-def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+def create_task(
+    payload: CreateTaskBody,
+    request: Request,
+    board: Optional[str] = Query(None),
+):
+    session = getattr(request.state, "session", None)
+    principal_name = getattr(session, "user_id", None) or "dashboard-session"
+    try:
+        require_creation_allowed(
+            dashboard_human_principal(principal_name),
+            operation="dashboard kanban create",
+        )
+    except KanbanCreationDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1263,7 +1281,20 @@ class LinkBody(BaseModel):
 
 
 @router.post("/links")
-def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
+def add_link(
+    payload: LinkBody,
+    request: Request,
+    board: Optional[str] = Query(None),
+):
+    session = getattr(request.state, "session", None)
+    principal_name = getattr(session, "user_id", None) or "dashboard-session"
+    try:
+        require_creation_allowed(
+            dashboard_human_principal(principal_name),
+            operation="dashboard kanban link",
+        )
+    except KanbanCreationDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
