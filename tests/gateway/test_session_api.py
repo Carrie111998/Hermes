@@ -107,6 +107,7 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "offset": 0,
         "order": "latest",
         "returned": 500,
+        "next_before_id": payload["data"][0]["id"],
     }
     assert payload["data"][0]["content"] == "msg 1"
     assert payload["data"][-1]["content"] == "msg 500"
@@ -140,9 +141,13 @@ async def test_session_messages_pages_compacted_history_from_latest(adapter, ses
         )
         assert response.status == 200
         payload = await response.json()
+        # Appending between requests used to move the offset-relative tail,
+        # duplicating one recent row and permanently skipping an older row.
+        session_db.append_message("long-chat", "assistant", "appended later")
         earlier_response = await cli.get(
             "/api/sessions/long-chat/messages"
-            "?include_compacted=true&order=latest&limit=3&offset=2"
+            "?include_compacted=true&order=latest&limit=3"
+            f"&before_id={payload['pagination']['next_before_id']}"
         )
         assert earlier_response.status == 200
         earlier = await earlier_response.json()
@@ -156,12 +161,15 @@ async def test_session_messages_pages_compacted_history_from_latest(adapter, ses
         "offset": 0,
         "order": "latest",
         "returned": 2,
+        "next_before_id": payload["data"][0]["id"],
     }
     assert [message["content"] for message in earlier["data"]] == [
         "old",
         "old reply",
         "summary",
     ]
+    assert not ({message["id"] for message in payload["data"]} & {message["id"] for message in earlier["data"]})
+    assert "rewound" not in [message["content"] for message in payload["data"] + earlier["data"]]
 
 
 @pytest.mark.asyncio

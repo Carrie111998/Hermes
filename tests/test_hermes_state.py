@@ -4229,6 +4229,17 @@ class TestGetMessagesPagination:
         assert [m["content"] for m in page2] == ["msg-2", "msg-3", "msg-4", "msg-5"]
         assert [m["content"] for m in page3] == ["msg-0", "msg-1"]
 
+    def test_before_id_latest_pages_are_stable_across_appends(self, db):
+        self._seed(db)
+        page1 = db.get_messages("s1", limit=4, latest=True)
+        cursor = page1[0]["id"]
+        db.append_message("s1", "user", "appended-after-page-1")
+        page2 = db.get_messages("s1", limit=4, latest=True, before_id=cursor)
+        page3 = db.get_messages("s1", limit=4, latest=True, before_id=page2[0]["id"])
+        contents = [m["content"] for m in page3 + page2 + page1]
+        assert contents == [f"msg-{i}" for i in range(10)]
+        assert len({m["id"] for m in page3 + page2 + page1}) == 10
+
     def test_after_id_keyset_pages_forward_in_insertion_order(self, db):
         self._seed(db)
         page1 = db.get_messages("s1", limit=4, after_id=0)

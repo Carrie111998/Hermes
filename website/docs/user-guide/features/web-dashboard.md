@@ -256,8 +256,9 @@ Expanding a session requests the newest page of its complete transcript,
 including turns archived by context compaction. Rewound or undone messages
 remain hidden. The dashboard requests `include_compacted=true`, `order=latest`,
 and `limit=500`; when a transcript exceeds that page size, **Load earlier
-messages** advances the `order=latest` offset until the complete transcript is
-visible.
+messages** passes the oldest row's stable `before_id` cursor until the complete
+transcript is visible. New messages appended between page requests therefore
+cannot duplicate a row or skip older history.
 
 - **Filter** — **Chats / Automation / All** tabs scope the list: *Chats* (the default) shows human conversations and hides automation noise (cron, tool, API, ACP sessions); *Automation* shows only those; *All* shows everything. An exact-source dropdown narrows further to a single channel (e.g. only Telegram). Search respects the active filter.
 - **Search** — full-text search across all message content using FTS5. Results show highlighted snippets and auto-scroll to the first matching message when expanded.

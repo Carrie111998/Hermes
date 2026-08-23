@@ -165,6 +165,54 @@ describe("api.getSessionMessages", () => {
       expect.objectContaining({ credentials: "include" }),
     );
   });
+
+  it("uses the prior oldest-row cursor when the tail grows between pages", async () => {
+    vi.stubGlobal("window", {});
+    const rows = Array.from({ length: 10 }, (_, index) => ({
+      id: index + 1,
+      role: "user",
+      content: `msg-${index + 1}`,
+    }));
+    const fetchMock = vi.fn(async (rawUrl: string) => {
+      const url = new URL(rawUrl, "http://dashboard.test");
+      const before = url.searchParams.get("before_id");
+      const eligible = before ? rows.filter((row) => row.id < Number(before)) : rows;
+      const messages = eligible.slice(-4);
+      return new Response(
+        JSON.stringify({
+          session_id: "one",
+          messages,
+          pagination: {
+            limit: 4,
+            offset: 0,
+            order: "latest",
+            returned: messages.length,
+            next_before_id: messages[0]?.id ?? null,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await api.getSessionMessages("one", { limit: 4, order: "latest" });
+    rows.push({ id: 11, role: "user", content: "appended-between-pages" });
+    const second = await api.getSessionMessages("one", {
+      limit: 4,
+      order: "latest",
+      beforeId: first.pagination!.next_before_id!,
+    });
+    const third = await api.getSessionMessages("one", {
+      limit: 4,
+      order: "latest",
+      beforeId: second.pagination!.next_before_id!,
+    });
+
+    expect(fetchMock.mock.calls[1][0]).toContain("before_id=7");
+    expect([...third.messages, ...second.messages, ...first.messages].map((row) => row.id)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    ]);
+  });
 });
 
 describe("api OAuth helpers", () => {

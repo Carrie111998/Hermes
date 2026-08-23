@@ -2162,6 +2162,7 @@ class TestWebServerEndpoints:
             "offset": 0,
             "order": "latest",
             "returned": 500,
+            "next_before_id": payload["messages"][0]["id"],
         }
         assert len(payload["messages"]) == 500
         assert payload["messages"][0]["content"] == "msg 1"

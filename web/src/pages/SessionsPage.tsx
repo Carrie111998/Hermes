@@ -520,17 +520,27 @@ function SessionRow({
     setLoadingEarlier(true);
     setError(null);
     const limit = SESSION_MESSAGE_PAGE_SIZE;
-    const offset = messagePagination.offset + messagePagination.returned;
+    const beforeId = messagePagination.next_before_id;
+    const legacyOffset = messagePagination.offset + messagePagination.returned;
     try {
       const resp = await api.getSessionMessages(session.id, {
         includeCompacted: true,
         order: "latest",
         limit,
-        offset,
+        beforeId: beforeId ?? undefined,
+        offset: beforeId === undefined ? legacyOffset : undefined,
       });
-      setMessages((current) =>
-        current ? [...resp.messages, ...current] : resp.messages,
-      );
+      setMessages((current) => {
+        if (!current) return resp.messages;
+        // The cursor is the primary consistency contract. Keep this guard for
+        // mixed-version gateways or a message whose visibility changes while
+        // the row is expanded.
+        const existing = new Set(current.map((message) => message.id));
+        return [
+          ...resp.messages.filter((message) => !existing.has(message.id)),
+          ...current,
+        ];
+      });
       setMessagePagination(resp.pagination ?? null);
     } catch (err) {
       setError(String(err));

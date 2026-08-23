@@ -398,6 +398,9 @@ export const api = {
     if (options.offset !== undefined) {
       params.set("offset", String(options.offset));
     }
+    if (options.beforeId !== undefined) {
+      params.set("before_id", String(options.beforeId));
+    }
     if (options.includeCompacted !== undefined) {
       params.set("include_compacted", String(options.includeCompacted));
     }
@@ -2073,6 +2076,7 @@ export interface SessionMessagesResponse {
     offset: number;
     order: "latest" | "oldest";
     returned: number;
+    next_before_id?: number | null;
   };
 }
 
@@ -2080,6 +2084,7 @@ export interface SessionMessageQuery {
   includeCompacted?: boolean;
   limit?: number;
   offset?: number;
+  beforeId?: number;
   order?: "latest" | "oldest";
 }
 
