@@ -222,6 +222,19 @@ class TestProfileScopedMcp:
 
 
 class TestProfileScopedModel:
+    def test_main_assignment_requires_provider(self, client, isolated_profiles):
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "model": "test/model-1",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "provider and model required for main"
+
     def test_model_set_main_scoped(self, client, isolated_profiles):
         resp = client.post(
             "/api/model/set",
@@ -348,6 +361,24 @@ class TestProfileScopedModel:
         assert confirmation.status_code == 200
         assert confirmation.json()["confirm_required"] is True
         assert "cron_model_impact" not in confirmation.json()
+
+    def test_auxiliary_reset_rejects_reasoning_effort(self, client, isolated_profiles):
+        before = _cfg(isolated_profiles["worker_beta"])
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "__reset__",
+                "reasoning_effort": "high",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "reasoning_effort cannot be combined with task=__reset__"
+        )
+        assert _cfg(isolated_profiles["worker_beta"]) == before
 
     def test_auxiliary_reasoning_update_preserves_provider_and_model(
         self, client, isolated_profiles

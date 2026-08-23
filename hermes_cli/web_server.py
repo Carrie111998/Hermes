@@ -7490,6 +7490,11 @@ def _apply_model_assignment_sync(
         )
 
     if task == "__reset__":
+        if reasoning_effort_set:
+            raise HTTPException(
+                status_code=400,
+                detail="reasoning_effort cannot be combined with task=__reset__",
+            )
         # Reset every slot to provider="auto", model="" — keeps other fields intact.
         for slot in _AUX_TASK_SLOTS:
             slot_cfg = aux.get(slot)
