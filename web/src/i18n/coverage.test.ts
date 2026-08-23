@@ -43,21 +43,9 @@ const LOCALES: Record<Locale, Translations> = {
 };
 
 /**
- * Exact baseline for the English strings each locale intentionally leaves
- * untranslated today.
- *
- * Untranslated strings are invisible here by construction. Most of
- * `Translations` is optional (`?:`) so a locale can omit a key and still
- * type-check, and `ar` goes through `defineLocale`, which merges it over `en`
- * before anyone can look — so at runtime an untranslated key is
- * indistinguishable from a translated one. Nothing surfaces the gap.
- *
- * This is an exact count rather than a loose ceiling. Translating more strings
- * therefore requires lowering the baseline in the same change instead of
- * silently creating regression headroom. If a locale deliberately defers new
- * strings, update the baseline in that commit and explain why. This does not
- * replace human review of the missing-key set, but it prevents accumulated
- * numerical slack from hiding a later regression.
+ * Exact baseline for English strings a locale intentionally leaves untranslated.
+ * Exact counts prevent improvements from silently creating regression headroom;
+ * update a baseline only when the intentional debt changes, and explain why.
  */
 const EXPECTED_UNTRANSLATED: Record<Locale, number> = {
   en: 0,
@@ -117,10 +105,8 @@ function placeholders(value: string): string[] {
 
 const NO_OPTIONAL_PLACEHOLDERS = new Set<string>();
 
-// These three English strings use `{s}` only as an English plural suffix. Their
-// call sites replace it with a literal "s" or an empty string, so translated
-// strings are correct to omit it. Keep the exemption tied to the exact keys so
-// a future data placeholder also named `{s}` cannot disappear unnoticed.
+// `{s}` is an English-only plural suffix at these exact call sites. Keep the
+// exemption key-scoped so a future data placeholder also named `{s}` is checked.
 const OPTIONAL_FORMATTING_PLACEHOLDERS: Readonly<Record<string, ReadonlySet<string>>> = {
   "config.fields": new Set(["s"]),
   "env.keysCount": new Set(["s"]),
@@ -138,11 +124,7 @@ describe("web locale coverage", () => {
   for (const locale of Object.keys(LOCALES) as Locale[]) {
     it(`${locale} matches its untranslated-string baseline of ${EXPECTED_UNTRANSLATED[locale]}`, () => {
       const translations = LOCALES[locale];
-      // The invariant this file rests on: measure what the locale **authored**,
-      // never what it renders. `defineLocale` has already merged `ar` over `en`,
-      // so measuring the merged object reports full coverage for every locale
-      // and catches nothing. `authoredStrings` returns the pre-merge overrides;
-      // the fallback is for a `Translations` literal, which is its own answer.
+      // Measure authored strings, never the object already merged over English.
       const authored = leafKeys(authoredStrings(translations) ?? translations);
       const untranslated = [...ENGLISH_KEYS].filter((key) => !authored.has(key));
 
@@ -154,10 +136,6 @@ describe("web locale coverage", () => {
       ).toBe(EXPECTED_UNTRANSLATED[locale]);
     });
 
-    // Key presence is not enough. A translation that keeps the key but drops a
-    // `{placeholder}` renders the literal token to the user, and counting keys
-    // cannot see it. The only exemptions are exact key/token pairs used as
-    // English-only formatting markers.
     it(`${locale} keeps every data {placeholder} the English string interpolates`, () => {
       const translations = LOCALES[locale];
       const authored = leafEntries(authoredStrings(translations) ?? translations);
