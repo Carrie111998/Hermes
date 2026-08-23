@@ -958,6 +958,18 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Opt-in one-shot notice when a finite tool-iteration budget is nearly
+  # exhausted. false/absent = off. true = warn once at >= 80% used.
+  # positive integer N = warn once when remaining iterations <= N.
+  # Appended to the newest tool result (cache-safe); no synthetic user msg.
+  # Budget resets each user turn (including a later "continue" after a budget
+  # stop): turn_context rebuilds IterationBudget and clears the one-shot latch.
+  # Each agent watches its own IterationBudget — parent uses agent.max_turns /
+  # max_iterations; delegate_task children use separate delegation.max_iterations
+  # budgets — so a child cannot burn the parent's signpost threshold (or vice
+  # versa); size both caps if you need headroom for parent + children work.
+  # tool_loop_budget_warning: false
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

@@ -603,6 +603,8 @@ def build_turn_context(
         agent._compression_warning = None  # send once
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
+    # Fresh iteration budget every user turn — including a later "continue"
+    # after a budget stop (continue is a new run_conversation → build_turn_context).
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Wall-clock run budget: per-run_conversation clock. Only stamped when a
@@ -613,6 +615,9 @@ def build_turn_context(
     else:
         agent._run_budget_started_at = None
     agent._run_budget_wrapup_injected = False
+    # One-shot latch for the tool-iteration budget signpost (reset each turn,
+    # including the continue path after a budget stop).
+    agent._tool_loop_budget_wrapup_injected = False
 
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)

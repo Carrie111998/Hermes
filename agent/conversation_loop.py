@@ -22,6 +22,7 @@ import os
 import random
 import re
 import ssl
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -117,6 +118,43 @@ RUN_BUDGET_WRAPUP_NOTICE = (
     "the state you already have, completing only mandatory writes."
 )
 
+# One-time wrap-up notice when a finite tool-iteration budget approaches its
+# cap (agent.tool_loop_budget_warning). Same delivery channel as run-budget
+# wrap-up: append to newest role:"tool" message (cache-safe, no synthetic user).
+TOOL_LOOP_BUDGET_WRAPUP_NOTICE = (
+    "[SYSTEM NOTICE — tool iteration budget nearly exhausted] "
+    "Tool iteration budget is nearly exhausted. Stop starting new workstreams. "
+    "Finish or checkpoint what is in flight and deliver a concrete result from "
+    "the state you already have. A later user turn gets a fresh iteration budget "
+    "(including the continue path after a budget stop)."
+)
+
+
+def _append_to_newest_tool_message(
+    messages: List[Dict[str, Any]], notice: str
+) -> bool:
+    """Append ``notice`` to the newest ``role:\"tool\"`` message (cache-safe).
+
+    Shared by run-budget and tool-loop budget wrap-ups so append mechanics
+    cannot drift. Returns True when a tool message was updated.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            existing = msg.get("content", "")
+            if isinstance(existing, str):
+                msg["content"] = existing + f"\n\n{notice}"
+            else:
+                # Multimodal content blocks — append a text block.
+                try:
+                    blocks = list(existing) if existing else []
+                    blocks.append({"type": "text", "text": notice})
+                    msg["content"] = blocks
+                except Exception:
+                    return False
+            return True
+    return False
+
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
@@ -141,28 +179,82 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
         return False
     if (time.time() - started) < 0.8 * float(budget):
         return False
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            existing = msg.get("content", "")
-            if isinstance(existing, str):
-                msg["content"] = existing + f"\n\n{RUN_BUDGET_WRAPUP_NOTICE}"
-            else:
-                # Multimodal content blocks — append a text block.
-                try:
-                    blocks = list(existing) if existing else []
-                    blocks.append({"type": "text", "text": RUN_BUDGET_WRAPUP_NOTICE})
-                    msg["content"] = blocks
-                except Exception:
-                    return False
-            agent._run_budget_wrapup_injected = True
-            logger.info(
-                "Run budget wrap-up notice injected (budget=%.0fs, elapsed=%.0fs)",
-                float(budget),
-                time.time() - started,
-            )
-            return True
-    return False
+    if not _append_to_newest_tool_message(messages, RUN_BUDGET_WRAPUP_NOTICE):
+        return False
+    agent._run_budget_wrapup_injected = True
+    logger.info(
+        "Run budget wrap-up notice injected (budget=%.0fs, elapsed=%.0fs)",
+        float(budget),
+        time.time() - started,
+    )
+    return True
+
+
+def _maybe_inject_tool_loop_budget_wrapup(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+) -> bool:
+    """Inject a one-shot tool-iteration budget wrap-up notice near the cap.
+
+    Cache-safe delivery mirrors :func:`_maybe_inject_run_budget_wrapup`: append
+    to the NEWEST ``role:\"tool\"`` message only. No synthetic user message, no
+    system-prompt mutation, no rewrite of older messages.
+
+    Opt-in via ``agent.tool_loop_budget_warning`` (default off):
+
+    - ``False`` / absent → dormant (zero behavior change)
+    - ``True`` → warn once when used >= 80% of a *finite* max_iterations
+      (tiny caps: 0.8*max degrades toward the last iteration)
+    - positive ``int`` N → warn once when remaining <= N (finite cap only)
+
+    Unlimited caps (``max_iterations >= sys.maxsize``) never inject.
+    Latches ``_tool_loop_budget_wrapup_injected`` only on successful append
+    (reset each turn in ``turn_context``, including continue-after-budget-stop).
+    Parent and delegate_task children hold separate IterationBudget instances.
+    Returns True when injected.
+    """
+    warning = getattr(agent, "tool_loop_budget_warning", False)
+    if not warning:
+        return False
+    if getattr(agent, "_tool_loop_budget_wrapup_injected", False):
+        return False
+
+    budget = getattr(agent, "iteration_budget", None)
+    if budget is None:
+        return False
+    max_total = int(getattr(budget, "max_total", 0) or 0)
+    # Treat sys.maxsize (and larger sentinels) as unlimited — no signpost.
+    if max_total <= 0 or max_total >= sys.maxsize:
+        return False
+
+    used = int(getattr(budget, "used", 0) or 0)
+    remaining = int(getattr(budget, "remaining", max(0, max_total - used)) or 0)
+
+    if isinstance(warning, bool):
+        # true => 80% of finite cap
+        if used < 0.8 * max_total:
+            return False
+    else:
+        # positive int N => remaining <= N
+        try:
+            threshold = int(warning)
+        except (TypeError, ValueError):
+            return False
+        if threshold <= 0 or remaining > threshold:
+            return False
+
+    if not _append_to_newest_tool_message(messages, TOOL_LOOP_BUDGET_WRAPUP_NOTICE):
+        return False
+    agent._tool_loop_budget_wrapup_injected = True
+    logger.info(
+        "Tool-loop budget wrap-up notice injected "
+        "(used=%s/%s remaining=%s warning=%r)",
+        used,
+        max_total,
+        remaining,
+        warning,
+    )
+    return True
 
 
 def _restore_user_after_reference_handoff(
@@ -2086,6 +2178,13 @@ def run_conversation(
         # result); dormant when no budget is set.
         if getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
+
+        # ── Tool-iteration budget wrap-up notice ───────────────────────
+        # Opt-in (agent.tool_loop_budget_warning). Same cache-safe channel
+        # as run-budget wrap-up; dormant when off or when max_iterations is
+        # unlimited. Only runs after tool results exist (helper no-ops).
+        if getattr(agent, "tool_loop_budget_warning", False):
+            _maybe_inject_tool_loop_budget_wrapup(agent, messages)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
