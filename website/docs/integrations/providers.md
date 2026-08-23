@@ -895,6 +895,11 @@ reasoning/thinking trace before the visible answer. Whether you can cap or
 disable that trace depends entirely on the server, and the knobs are NOT
 portable between backends:
 
+> For providers that support it, Hermes also has a higher-level
+> `reasoning_effort` / thinking-depth control; this section covers the
+> server-side request knobs (`think`, `reasoning_budget_tokens`,
+> `enable_thinking`) that a local backend may or may not honor on the wire.
+
 | Backend | Knob | Honored? |
 |---------|------|----------|
 | Ollama native `/api/chat` | `think: true\|false` | Yes (binary on/off) |
