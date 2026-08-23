@@ -7187,6 +7187,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint
             _lazy_server_tool_names[name] = list(registered_names)
+            _server_config_digests[name] = _connection_identity(config)
         logger.info(
             "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
             name, len(registered_names),
@@ -7289,26 +7290,47 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     stale_by_digest: List[MCPServerTask] = []
     with _lock:
         for name, cfg in servers.items():
-            if name not in _servers:
-                continue
-            old_digest = _server_config_digests.get(name)
-            if old_digest is None:
-                # Pre-upgrade session — seed the digest so future credential
-                # changes are detected, but don't tear down this session.
-                _server_config_digests[name] = _connection_identity(cfg)
-                continue
-            new_digest = _connection_identity(cfg)
-            if old_digest != new_digest:
-                logger.info(
-                    "MCP server '%s' config changed (digest %s → %s); "
-                    "scheduling reconnect with new credentials",
-                    name, old_digest, new_digest,
-                )
-                stale_by_digest.append(_servers.pop(name))
-                _server_config_digests.pop(name, None)
-                _server_connecting.discard(name)
-                _server_connect_errors.pop(name, None)
-                _clear_connect_failure(name)
+            if name in _servers:
+                # Live session — check digest for credential change.
+                old_digest = _server_config_digests.get(name)
+                if old_digest is None:
+                    # Pre-upgrade session — seed the digest so future
+                    # credential changes are detected, but don't tear
+                    # down this session.
+                    _server_config_digests[name] = _connection_identity(cfg)
+                    continue
+                new_digest = _connection_identity(cfg)
+                if old_digest != new_digest:
+                    logger.info(
+                        "MCP server '%s' config changed (digest %s → %s); "
+                        "scheduling reconnect with new credentials",
+                        name, old_digest, new_digest,
+                    )
+                    stale_by_digest.append(_servers.pop(name))
+                    _server_config_digests.pop(name, None)
+                    _server_connecting.discard(name)
+                    _server_connect_errors.pop(name, None)
+                    _clear_connect_failure(name)
+            elif name in _lazy_server_configs:
+                # Lazy-registered (from schema cache, not yet connected).
+                # If the config changed, evict the stale cache entry so
+                # the server reconnects with fresh credentials on first
+                # tool use (#92565).
+                old_digest = _server_config_digests.get(name)
+                if old_digest is None:
+                    _server_config_digests[name] = _connection_identity(cfg)
+                    continue
+                new_digest = _connection_identity(cfg)
+                if old_digest != new_digest:
+                    logger.info(
+                        "MCP server '%s' (lazy) config changed (digest %s → %s); "
+                        "evicting stale cache entry",
+                        name, old_digest, new_digest,
+                    )
+                    _lazy_server_configs.pop(name, None)
+                    _lazy_server_fingerprints.pop(name, None)
+                    _lazy_server_tool_names.pop(name, None)
+                    _server_config_digests.pop(name, None)
 
     # Shut down stale sessions outside the lock (async, needs the MCP loop).
     if stale_by_digest:
@@ -7317,7 +7339,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             try:
                 _run_on_mcp_loop(srv.shutdown(), timeout=10)
             except Exception as exc:
-                logger.debug(
+                # The server is already gone from _servers — a failed shutdown
+                # may leak the subprocess/session, so warn rather than debug.
+                logger.warning(
                     "MCP server '%s' shutdown during config-change reap failed: %s",
                     srv.name, exc,
                 )

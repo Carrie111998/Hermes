@@ -3177,3 +3177,44 @@ class TestRegisterMcpServersCredentialChange:
         finally:
             _servers.pop("x", None)
             _server_config_digests.pop("x", None)
+
+    def test_lazy_registration_evicts_on_config_change(self):
+        """A lazy-registered server whose config changed gets its cache evicted."""
+        from tools.mcp_tool import (
+            register_mcp_servers, _servers, _server_config_digests,
+            _lazy_server_configs, _lazy_server_fingerprints,
+            _lazy_server_tool_names, _connection_identity,
+        )
+
+        old_config = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer old_token"},
+            "lazy": True,
+        }
+        new_config = {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer new_token"},
+            "lazy": True,
+        }
+
+        # Simulate a lazy-registered server with the old config.
+        _lazy_server_configs["example"] = dict(old_config)
+        _lazy_server_fingerprints["example"] = "fp123"
+        _lazy_server_tool_names["example"] = ["mcp__example__tool1"]
+        _server_config_digests["example"] = _connection_identity(old_config)
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+                register_mcp_servers({"example": new_config})
+
+            # Lazy cache should be evicted
+            assert "example" not in _lazy_server_configs
+            assert "example" not in _lazy_server_fingerprints
+            assert "example" not in _lazy_server_tool_names
+            assert "example" not in _server_config_digests
+        finally:
+            _lazy_server_configs.pop("example", None)
+            _lazy_server_fingerprints.pop("example", None)
+            _lazy_server_tool_names.pop("example", None)
+            _server_config_digests.pop("example", None)
