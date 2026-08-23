@@ -38,8 +38,9 @@ function mergeTranslations<T>(base: T, overrides: TranslationOverride<T> | undef
 
 // `defineLocale` hands back a locale already merged over English, so at runtime
 // a string nobody translated is indistinguishable from one that was. Keep a
-// handle on what each locale actually authored so coverage stays measurable —
-// see `coverage.test.ts`.
+// handle on what each locale actually authored so coverage stays measurable.
+// Coverage must read `AUTHORED`: measuring the merged locale would silently
+// count English fallback strings as translated again. See `coverage.test.ts`.
 const AUTHORED = new WeakMap<Translations, TranslationOverrides>()
 
 export function defineLocale(overrides: TranslationOverrides): Translations {
