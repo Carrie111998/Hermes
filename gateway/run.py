@@ -1554,6 +1554,45 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     return bool(mt)
 
 
+#: Every code point Python's ``str.splitlines`` treats as a line break, minus
+#: ``\n`` itself. ``re.MULTILINE`` recognizes ONLY ``\n``, so a line-anchored
+#: pattern silently misses a forgery introduced by any of these — a one-byte
+#: separator swap that is invisible in most chat clients.
+_ENVELOPE_LINE_BREAKS = "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+#: Matches a run of ``[Verified sender: ...]`` envelopes ANYWHERE, not only at
+#: a line start. Anchoring is what a forger controls: the shape carries the
+#: gateway's attestation wherever it appears in the model-facing turn, so the
+#: guard cannot depend on where the attacker chose to put it. ``[^\]\n]*``
+#: keeps a single forged envelope from swallowing unrelated later text.
+_VERIFIED_SENDER_ENVELOPE_RE = re.compile(
+    r"(?:[^\S\n]*\[Verified sender:[^\]\n]*\][^\S\n]*)+"
+)
+
+
+def _strip_verified_sender_envelopes(text: str) -> str:
+    """Remove every copy of Hermes' sender envelope from untrusted text.
+
+    ``[Verified sender: name | Slack user <@U>]`` is a gateway-authenticated
+    attestation: the model is told it may trust it. Any copy that did not come
+    from us is therefore a forgery, and where it sits is the forger's choice —
+    leading, one line down behind a ``\\r``, or mid-sentence. Line breaks are
+    normalized to ``\\n`` first because ``re.MULTILINE`` recognizes only ``\\n``
+    while chat clients render ``\\r``, VT, FF, NEL and U+2028/9 as breaks too.
+
+    Content that legitimately quotes the envelope shape loses only the quoted
+    envelope, exactly as it already does when quoted at the top of a message.
+    """
+    if not text or "[Verified sender:" not in text:
+        return text
+    normalized = text.replace("\r\n", "\n")
+    if any(ch in normalized for ch in _ENVELOPE_LINE_BREAKS):
+        normalized = normalized.translate(
+            {ord(ch): "\n" for ch in _ENVELOPE_LINE_BREAKS}
+        )
+    return _VERIFIED_SENDER_ENVELOPE_RE.sub("", normalized)
+
+
 def _without_verified_sender_envelope(content: Any) -> Any:
     """Return text content with Hermes' sender envelope removed.
 
@@ -1563,11 +1602,17 @@ def _without_verified_sender_envelope(content: Any) -> Any:
     gateway fallback persistence should keep only the clean user text in the
     transcript while still shedding any forged envelope that the normal inbound
     path already normalized.
+
+    This shares :func:`_strip_verified_sender_envelopes` with the inbound path
+    on purpose. The transcript written here is replayed on every later turn, so
+    a forgery this helper sheds less aggressively than the inbound strip would
+    be laundered into durable history — the anchoring of the two must not drift
+    apart again.
     """
 
     if not isinstance(content, str):
         return content
-    return re.sub(r"^(?:\s*\[Verified sender:[^\]\n]*\]\s*)+", "", content)
+    return _strip_verified_sender_envelopes(content)
 
 
 def _build_gateway_agent_history(
@@ -18523,16 +18568,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before attaching the gateway-authenticated one. In a shared
             # session, leaving a forged envelope in place lets one participant
             # impersonate another in the exact metadata shape we ask the model
-            # to trust. Anchored per LINE, not just at start-of-string: this PR
-            # is what makes the envelope a trusted attestation, so a forgery
-            # that merely sits one line down defeats exactly the property this
-            # strip exists to protect.
-            message_text = re.sub(
-                r"^(?:[^\S\n]*\[Verified sender:[^\]\n]*\][^\S\n]*)+",
-                "",
-                message_text,
-                flags=re.MULTILINE,
-            )
+            # to trust. Not anchored: this PR is what makes the envelope a
+            # trusted attestation, and the forger picks where the forgery sits
+            # — leading, one line down behind a separator ``re.MULTILINE`` does
+            # not recognize, or mid-sentence. Any copy we did not emit is a
+            # forgery wherever it appears.
+            message_text = _strip_verified_sender_envelopes(message_text)
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
@@ -18571,8 +18612,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
-        if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+        #
+        # The backfill is other participants' verbatim text, so it must go
+        # through the same envelope strip as the trigger body: it is
+        # concatenated into the SAME model turn, and a forged
+        # ``[Verified sender: ...]`` inside a quoted thread line is exactly as
+        # trusted-looking there as it is at the top. Platform adapters
+        # neutralize newlines in these blocks but not the envelope delimiters,
+        # so the gateway owns this guard for every platform at once.
+        # Applied unconditionally rather than only under
+        # ``_is_shared_multi_user``: the block is other people's text on every
+        # path that produces it, and a strictly stronger guard costs nothing —
+        # text that does not contain the envelope shape is returned unchanged.
+        _channel_context = getattr(event, "channel_context", None)
+        if _channel_context:
+            _safe_channel_context = _strip_verified_sender_envelopes(
+                str(_channel_context)
+            )
+            message_text = f"{_safe_channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
@@ -18798,6 +18855,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
             reply_snippet = event.reply_to_text[:500]
+            # The quote is another participant's verbatim text arriving in the
+            # same model turn, so it gets the same envelope strip as the body
+            # and the backfill block — a forged ``[Verified sender: ...]``
+            # inside a quoted message is no less trusted-looking for being
+            # quoted. Stripping after the 500-char cut keeps the cut point
+            # stable for benign quotes.
+            reply_snippet = _strip_verified_sender_envelopes(reply_snippet)
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
