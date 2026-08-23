@@ -2292,6 +2292,87 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
         pass
     return -1
 
+
+def _recover_same_branch_divergence(
+    git_cmd: list[str], cwd: Path, branch: str
+) -> bool:
+    """Recover after ``merge --ff-only origin/<branch>`` fails while checked
+    out ON ``branch`` itself (the branch being updated, not a parked custom
+    branch).
+
+    That failure is ambiguous: it can mean upstream force-pushed or rebased
+    (HEAD has nothing unique — resetting to match the remote is safe and
+    correct), or it can mean the checkout has local commits made directly on
+    this branch (e.g. a fix committed here before it was ever pushed
+    anywhere) — resetting would silently destroy those. Distinguish by
+    counting commits on HEAD that origin/<branch> doesn't have, the same
+    signal already used for the parked-custom-branch case.
+
+    Returns True if the checkout is safely resolved (merged or reset) and
+    the update can continue; False if a merge conflict stopped things and
+    the caller should abort the update without touching anything further.
+
+    Note: for a full clone, ff-only failing already implies the count is
+    >= 1 (ff-only succeeding is equivalent to the count being 0), so the
+    reset branch below is mainly a defensive fallback for shallow clones,
+    where the count can be unreliable (see ``apply_is_shallow`` above).
+    """
+    local_unique_count = _count_commits_between(git_cmd, cwd, f"origin/{branch}", "HEAD")
+    if local_unique_count > 0:
+        print(
+            f"  ⚠ {local_unique_count} local commit(s) on '{branch}' "
+            f"not on origin — merging origin/{branch} instead of "
+            "resetting so local commits survive..."
+        )
+        # Best-effort safety tag; recovery anchor if anything goes wrong.
+        subprocess.run(
+            git_cmd + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+        )
+        merge_result = subprocess.run(
+            git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if merge_result.returncode != 0:
+            subprocess.run(
+                git_cmd + ["merge", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
+            print(
+                "✗ Merge conflict between local commits and upstream — "
+                "update stopped, nothing was changed."
+            )
+            print(f"  Resolve manually: cd {cwd} && git merge origin/{branch}")
+            print("  Then re-run the update. Local work is untouched.")
+            return False
+        return True
+    else:
+        # No unique local commits — a true upstream force-push/rebase.
+        # Local changes are already stashed; reset to match the remote
+        # exactly (original behaviour).
+        print(
+            "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+        )
+        reset_result = subprocess.run(
+            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if reset_result.returncode != 0:
+            print(f"✗ Failed to reset to origin/{branch}.")
+            if reset_result.stderr.strip():
+                print(f"  {reset_result.stderr.strip()}")
+            print(f"  Try manually: git fetch origin && git reset --hard origin/{branch}")
+            return False
+        return True
+
 def _should_skip_upstream_prompt() -> bool:
     """Check if user previously declined to add upstream."""
     from hermes_constants import get_hermes_home
@@ -6413,25 +6494,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                    )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
-                        print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                        )
+                    if not _recover_same_branch_divergence(
+                        git_cmd, _m().PROJECT_ROOT, branch
+                    ):
                         sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
