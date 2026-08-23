@@ -731,11 +731,9 @@ _HEX16 = _HEX32
 
 
 def _hermes_home_dir() -> Path:
-    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
-    override = os.environ.get("HERMES_HOME", "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".hermes"
+    """Resolved Hermes home (HERMES_HOME override or platform default)."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home()
 
 
 def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
