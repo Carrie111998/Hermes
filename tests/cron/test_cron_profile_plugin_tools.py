@@ -65,6 +65,47 @@ def _write_plugin(profile_home: Path) -> None:
     )
 
 
+def _make_fixture_provider():
+    """Deterministic stand-in web backend for the sanitized runtime.
+
+    ``web_search`` carries ``check_fn=check_web_api_key``, so it only appears
+    in the tool surface when *some* web backend is available. This fixture's
+    HERMES_HOME is a throwaway tempdir with no credentials, and the hermetic
+    conftest blanks credential env vars — so on a machine without ambient
+    keys (or an undeclared ad-hoc ``ddgs`` install) every real backend probe
+    returns False and ``web_search`` is stripped, failing the toolset-filter
+    assertion below for reasons that have nothing to do with profile plugin
+    loading. Registering one always-available provider gives the production
+    resolution path (agent.web_search_registry → check_web_api_key) a
+    deterministic True on every machine.
+    """
+    """Build the fixture provider as a real WebSearchProvider subclass."""
+    from agent.web_search_provider import WebSearchProvider
+
+    class _FixtureProvider(WebSearchProvider):
+        name = "fixture-always-available"
+        display_name = "Fixture always-available"
+        supports_search_cap = True
+        supports_extract_cap = True
+
+        def supports_search(self) -> bool:
+            return True
+
+        def supports_extract(self) -> bool:
+            return True
+
+        def is_available(self) -> bool:
+            return True
+
+        def search(self, query: str, limit: int = 5, **kwargs):
+            raise NotImplementedError("fixture provider never dispatches")
+
+        def extract(self, urls, **kwargs):
+            raise NotImplementedError("fixture provider never dispatches")
+
+    return _FixtureProvider()
+
+
 @pytest.fixture()
 def isolated_matcher_runtime(tmp_path, monkeypatch):
     root = tmp_path / "hermes-root"
@@ -99,7 +140,8 @@ def isolated_matcher_runtime(tmp_path, monkeypatch):
 
     import cron.scheduler as sched
     import hermes_cli.plugins as plugins
-    from tools.registry import registry
+    from agent import web_search_registry as web_registry
+    from tools.registry import invalidate_check_fn_cache, registry
 
     monkeypatch.setattr(sched, "_hermes_home", None)
     previous_manager = plugins._plugin_manager
@@ -109,12 +151,20 @@ def isolated_matcher_runtime(tmp_path, monkeypatch):
         for name, module in sys.modules.items()
         if name.startswith("hermes_plugins.matcher_score_publisher")
     }
+    # Snapshot the live provider table so the fixture's stand-in can be
+    # removed without disturbing whatever the surrounding session loaded.
+    previous_providers = dict(web_registry._providers)
+    web_registry.register_provider(_make_fixture_provider())
+    invalidate_check_fn_cache()
     registry.deregister(PUBLISHER_TOOL)
     plugins._plugin_manager = plugins.PluginManager()
 
     try:
         yield root, main_home, matcher_home
     finally:
+        web_registry._providers.clear()
+        web_registry._providers.update(previous_providers)
+        invalidate_check_fn_cache()
         registry.deregister(PUBLISHER_TOOL)
         if previous_publisher_entry is not None:
             registry.register(

@@ -204,13 +204,34 @@ def stamp_langfuse_attributes(span, *, session_id=None, user_id=None, tags=None)
 
 
 def _load_env_once() -> None:
-    """Best-effort: if LANGFUSE_* not in os.environ, read ~/.hermes/.env."""
+    """Best-effort: if LANGFUSE_* not in os.environ, read the Hermes ``.env``.
+
+    Resolves the file via :func:`hermes_constants.get_hermes_home` (override →
+    ``HERMES_HOME`` env var → platform default) rather than hardcoding
+    ``Path.home() / ".hermes"``. The hardcoded path leaked every key of the
+    developer's *real* home ``.env`` into ``os.environ`` even when
+    ``HERMES_HOME`` pointed at a profile or a test tempdir — inside pytest
+    that re-injects credentials *after* the hermetic-environment fixture has
+    blanked them, flipping ambient-credential gates (e.g.
+    ``check_web_api_key``) and making tool-visibility tests pass or fail on
+    the developer's machine instead of the code. Never overwrites a value
+    already present in ``os.environ``.
+    """
     if os.environ.get("LANGFUSE_HOST") and os.environ.get("LANGFUSE_PUBLIC_KEY"):
         return
-    env_path = Path.home() / ".hermes" / ".env"
+    try:
+        from hermes_constants import get_hermes_home
+
+        env_path = get_hermes_home() / ".env"
+    except Exception:  # noqa: BLE001 — obs must load without the app too
+        env_path = Path.home() / ".hermes" / ".env"
     if not env_path.exists():
         return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    try:
+        lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
