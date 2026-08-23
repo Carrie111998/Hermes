@@ -21074,6 +21074,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
+            #
+            # A missing optional provider SDK is handled first and separately.
+            # Providers whose client library lives in an extra (anthropic,
+            # boto3 for Bedrock, azure-identity, ...) raise ImportError from
+            # their adapter during agent CONSTRUCTION, before any request is
+            # sent, so there is no status_code and every branch below is
+            # inapplicable — the error fell through to the bare "unexpected
+            # error" catch-all. That reply is actively misleading here: the
+            # failure is deterministic, so "try again" never works, and
+            # /reset destroys the conversation without touching the cause.
+            # Point at the real fix instead.
+            if isinstance(e, ImportError):
+                # Name the package, but never echo str(e) — an arbitrary
+                # ImportError's text is not vetted for info-leakage the way
+                # this branch's own copy is. `.name` is set by the import
+                # machinery, but is None for a hand-raised ImportError, which
+                # is exactly the case the provider adapters produce; fall back
+                # to their shared phrasing, anchored so only that house format
+                # can match ("The 'x' package is required for ...").
+                _missing = getattr(e, "name", None) or ""
+                if not _missing:
+                    _m = re.match(
+                        r"The '([A-Za-z0-9_.\-]{1,40})' (?:Python )?package is required",
+                        str(e),
+                    )
+                    _missing = _m.group(1) if _m else ""
+                _pkg = f" (`{_missing}`)" if _missing else ""
+                return (
+                    f"⚠️ This model's provider needs an optional Python package"
+                    f"{_pkg} that isn't installed.\n"
+                    "Switch to another model with /model, or install the "
+                    "package and restart — retrying and /reset won't help."
+                )
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
