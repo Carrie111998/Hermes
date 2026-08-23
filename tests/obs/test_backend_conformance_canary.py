@@ -209,9 +209,23 @@ def test_dual_backend_drift_preserves_each_emit_meta(tmp_path, monkeypatch):
 
 # ---- Manifest "Laptop Monitor" harness arm (Diego, 2026-08-12) ----
 # The anthropic arm now routes through the self-hosted Manifest harness
-# (base_url /v1/responses, model "auto") instead of api.anthropic.com, which
+# (base_url /v1/responses) instead of api.anthropic.com, which
 # 429s under the background agent fleet. These tests exercise the new probe
 # with a FAKE client (no openai import) so they stay fast and hermetic.
+
+
+def test_manifest_harness_model_is_pinned_not_auto():
+    # A canary must be deterministic. model:"auto" is a SERVER-side routing
+    # policy that flaps: on 2026-08-23 it resolved to opencode-go/deepseek-v4-flash
+    # (upstream rate-limited) with an exhausted fallback chain (gemini -> 403 dead
+    # auth, anthropic -> 429), so this arm read "unknown" every 10 minutes while
+    # Manifest itself was healthy. Pin tracks the same route hindsight-app's
+    # startup gate and laptop-monitor's harness probe use; repoint ALL THREE
+    # together if the pinned model ever dies upstream.
+    import obs.backend_conformance_canary as canary
+
+    assert canary._MANIFEST_HARNESS_MODEL != "auto"
+    assert canary._MANIFEST_HARNESS_MODEL == "openai/gpt-5.4-mini-subscription"
 
 
 class _FakeHarnessResponses:

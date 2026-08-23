@@ -51,13 +51,20 @@ logger = logging.getLogger(__name__)
 _REPAGE_SECONDS = 3600
 
 # Manifest "Laptop Monitor" harness (Diego, 2026-08-12): the canary's
-# Anthropic-shaped arm now routes through this harness instead of hitting
+# Anthropic-shaped arm routes through this harness instead of hitting
 # api.anthropic.com directly (which 429s under the background agent fleet).
-# The harness uses Manifest's OpenAI-compatible /v1/responses surface with
-# model "auto", so Manifest's own fallback chain picks a healthy provider.
+#
+# PINNED MODEL (2026-08-23), not "auto". A canary must be deterministic; model:auto
+# is a SERVER-side routing policy that flaps. Measured live 2026-08-23: auto
+# resolved to opencode-go/deepseek-v4-flash (upstream rate-limited) whose fallback
+# chain was also exhausted (gemini -> 403 dead auth, anthropic -> 429), so this arm
+# returned AuthenticationError fallback_exhausted every run while Manifest itself
+# was healthy -- the pinned model completes in ~1s through the same key/endpoint.
+# Same pin as laptop-monitor's harness probe and hindsight-app's startup gate;
+# repoint ALL THREE together if this model dies upstream.
 _MANIFEST_HARNESS_KEY_FILE = Path("C:/Users/diego/manifest/.mnfst-harness-key")
 _MANIFEST_HARNESS_BASE_URL = "http://localhost:2099/v1"
-_MANIFEST_HARNESS_MODEL = "auto"
+_MANIFEST_HARNESS_MODEL = "openai/gpt-5.4-mini-subscription"
 
 
 @dataclass
@@ -163,13 +170,14 @@ def _read_manifest_harness_key() -> Optional[str]:
 
 def build_manifest_harness_probe_client() -> "Optional[tuple[Any, str]]":
     """Return a raw OpenAI client pointed at the Manifest "Laptop Monitor"
-    harness (base_url /v1/responses, model "auto") + model, or None if the
+    harness (base_url /v1/responses, pinned model) + model, or None if the
     harness key file is missing/empty. Read-only; the caller issues one cheap
     request per run.
 
     This replaces the raw-Anthropic arm so the canary no longer hammers
-    api.anthropic.com directly (429 under the background agent fleet) — the
-    harness lets Manifest's fallback chain route to a healthy provider.
+    api.anthropic.com directly (429 under the background agent fleet) —
+    _MANIFEST_HARNESS_MODEL is a deterministic known-good pin, not "auto"
+    (see the constant's comment for the 2026-08-23 flap evidence).
     """
     key = _read_manifest_harness_key()
     if not key:
@@ -182,7 +190,7 @@ def build_manifest_harness_probe_client() -> "Optional[tuple[Any, str]]":
 
 def check_manifest_harness_conformance(client: Any, model: str) -> ProbeResult:
     """Assert the Manifest harness DELIVERS CONTENT via its OpenAI-compatible
-    /v1/responses endpoint (model "auto"). healthy = status 'completed' with a
+    /v1/responses endpoint (pinned model). healthy = status 'completed' with a
     non-empty assistant text; down = completed but empty text; unknown =
     network/auth (R20, never contract drift)."""
     try:
