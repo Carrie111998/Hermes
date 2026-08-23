@@ -194,6 +194,26 @@ describe('persisted unread (session-unread)', () => {
     expect($unreadFinishedSessionIds.get()).toEqual(['fresh'])
   })
 
+  it('acks a marker filed under a non-active profile when the row is not loaded', () => {
+    // A session in another profile finishes while the gateway is on 'default'.
+    // The live edge files the marker under the ROW's own profile ('alpha')…
+    setSessions([session({ id: 's2', profile: 'alpha', message_count: 4 })])
+    markSessionUnreadFinished('s2')
+    expect($unreadFinishedMarkers.get()).toEqual({ alpha: ['s2'] })
+
+    // …then the profile's section unloads (scope switch, collapsed profile),
+    // and the user opens the pinned session. No row is loaded, so the ack
+    // must retire the marker from EVERY bucket — the active gateway's bucket
+    // ('default') is empty; the marker lives in alpha's.
+    setSessions([])
+    setSelectedStoredSessionId('s2')
+    expect($unreadFinishedMarkers.get()).toEqual({})
+
+    // A later refresh must not repaint the dot from the stale marker.
+    setSessions([session({ id: 's2', profile: 'alpha', message_count: 4 })])
+    expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
+
   it('forgets a deleted session’s persisted unread, per profile', () => {
     $sessionSeenCounts.set({ alpha: { root: 3, other: 1 }, beta: { root: 9 } })
     $unreadFinishedMarkers.set({ alpha: ['root', 'keep'], beta: ['root'] })
