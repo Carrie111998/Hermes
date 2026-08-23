@@ -322,6 +322,21 @@ launch_app() { # attempted BEFORE the terminal event (launch acceptance is
   # part of the outcome — gille's review). Returns nonzero when a launch
   # was due but did not verifiably happen; caller downgrades to manual.
   [ -n "$RELAUNCH_TARGET" ] || return 0
+  # A Kanban worker that spawned this updater must not donate lifecycle
+  # ownership or its profile to the relaunched Desktop (linux setsid inherits
+  # this env; Electron also sanitizes at boot for macOS `open`).
+  local _had_worker=0
+  [ -n "${HERMES_KANBAN_TASK:-}${HERMES_KANBAN_RUN_ID:-}${HERMES_KANBAN_CLAIM_LOCK:-}${HERMES_KANBAN_WORKSPACE:-}${HERMES_KANBAN_BRANCH:-}" ] && _had_worker=1
+  [ "${HERMES_SESSION_SOURCE:-}" = "kanban" ] && _had_worker=1
+  unset HERMES_KANBAN_TASK HERMES_KANBAN_RUN_ID HERMES_KANBAN_WORKSPACE \
+    HERMES_KANBAN_WORKSPACES_ROOT HERMES_KANBAN_CLAIM_LOCK HERMES_KANBAN_BRANCH \
+    HERMES_KANBAN_GOAL_MODE HERMES_KANBAN_GOAL_MAX_TURNS
+  if [ "$_had_worker" = 1 ]; then
+    unset HERMES_PROFILE HERMES_SESSION_SOURCE HERMES_SESSION_ID HERMES_SINGLE_QUERY_SESSION
+    case "${HERMES_HOME:-}" in
+      */profiles/*) HERMES_HOME="${HERMES_HOME%/*/*}"; export HERMES_HOME ;;
+    esac
+  fi
   if [ "$(uname)" = "Darwin" ]; then
     # A supplied target that no longer exists is a REJECTED launch (the
     # swap failed badly or the bundle vanished) — not "no launch due".

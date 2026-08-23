@@ -8080,9 +8080,21 @@ def cmd_gui(args: argparse.Namespace):
             print(f"✓ Desktop packaged app ready: {packaged_executable} (not launching; --build-only)")
         return
 
+    # A kanban worker that relaunches Desktop must not donate its lifecycle
+    # ownership or profile to Hermes.app. Sanitize a *copy* so this worker's
+    # claim heartbeat keeps the original os.environ. See desktop_identity.
+    from hermes_cli.desktop_identity import (
+        explicit_profile_from_argv,
+        sanitize_desktop_host_env,
+    )
+
+    launch_env = sanitize_desktop_host_env(
+        env, explicit_profile=explicit_profile_from_argv(sys.argv)
+    )
+
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")
-        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
+        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=launch_env, check=False)
         sys.exit(launch_result.returncode)
 
     if packaged_executable is None:
@@ -8100,7 +8112,7 @@ def cmd_gui(args: argparse.Namespace):
 
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
-    launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
+    launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=launch_env, check=False)
     sys.exit(launch_result.returncode)
 
 
@@ -11524,6 +11536,18 @@ def cmd_dashboard(args):
             os.environ.pop("HERMES_WEB_DIST", None)
     if not _headless_backend:
         os.environ.pop("HERMES_SERVE_HEADLESS", None)
+
+    # Interactive serve/dashboard is never a dispatcher worker. Inherited
+    # HERMES_KANBAN_* / worker HERMES_PROFILE would make Command Center
+    # sessions believe they own that card. Explicit -p wins.
+    from hermes_cli.desktop_identity import (
+        apply_desktop_host_env_isolation,
+        explicit_profile_from_argv,
+    )
+
+    apply_desktop_host_env_isolation(
+        os.environ, explicit_profile=explicit_profile_from_argv(sys.argv)
+    )
 
     # ── Unified profile launch routing ────────────────────────────────
     # The dashboard is a MACHINE management surface: it can read/write any
