@@ -21300,6 +21300,15 @@ def main(
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
                 cli.tool_progress_mode = "off"
+                # -Q is the machine-readable surface, so presentation config
+                # must not leak into captured stdout (#93220): the reasoning
+                # box renders via the callback bound at agent construction
+                # (clear it on the live agent — cli.show_reasoning alone
+                # would not re-evaluate that binding), and the tool renderer
+                # reads agent.tool_progress_mode, so sync the off there too.
+                if cli.agent is not None:
+                    cli.agent.reasoning_callback = None
+                    cli.agent.tool_progress_mode = "off"
                 if cli._ensure_runtime_credentials():
                     effective_query: Any = query
                     if single_query_images or single_query_image_urls:
