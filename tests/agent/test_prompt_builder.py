@@ -386,24 +386,89 @@ class TestBuildSkillsSystemPrompt:
         assert "existing-skill" in first
         assert "new-skill" not in first
 
-        # Simulate an install from another process: add a SKILL.md, then bump
-        # its mtime so the manifest fingerprint changes even on coarse-grained
-        # filesystems (the manifest is mtime_ns + size based).
+        # Simulate an install from another process: add a SKILL.md. The write
+        # gives it a fresh mtime_ns, so the manifest fingerprint changes even
+        # if it lands within the same whole second.
         new_dir = skills_dir / "new-skill"
         new_dir.mkdir()
         (new_dir / "SKILL.md").write_text(
             "---\nname: new-skill\ndescription: Freshly installed\n---\n"
         )
-        import os
-        import time
-
-        os.utime(new_dir / "SKILL.md", (time.time() + 5, time.time() + 5))
 
         second = build_skills_system_prompt()
         assert "new-skill" in second, (
             "newly installed skill must appear even though the LRU was warm"
         )
         assert "existing-skill" in second
+
+    def test_same_second_same_size_edit_invalidates_cache(self, monkeypatch, tmp_path):
+        """An edit within the same whole second that preserves byte size must
+        still invalidate the LRU: the fingerprint uses mtime_ns, not the
+        whole-second mtime, so the +1ns change is enough to rebuild.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "s"
+        skill_dir.mkdir(parents=True)
+        p = skill_dir / "SKILL.md"
+        base_ns = 1_700_000_000_000_000_000  # fixed epoch ns (deterministic)
+        p.write_text("---\nname: s\ndescription: v1\n---\n")
+        os.utime(p, ns=(base_ns, base_ns))
+
+        first = build_skills_system_prompt()
+        assert "v1" in first
+
+        # Same byte size, content changed, mtime bumped by a single nanosecond
+        # — the whole-second mtime is identical, so only ns resolution can
+        # detect this.
+        p.write_text("---\nname: s\ndescription: v2\n---\n")
+        os.utime(p, ns=(base_ns + 1, base_ns + 1))
+
+        second = build_skills_system_prompt()
+        assert "v2" in second, (
+            "same-second, same-size edit must invalidate (mtime_ns resolution)"
+        )
+
+    def test_rebuilds_prompt_when_skill_added_to_external_dir(
+        self, monkeypatch, tmp_path
+    ):
+        """A skill added to an external skills dir (config `skills.external_dirs`)
+        after the first build must appear on the next build even with a warm
+        LRU — external-dir contents are fingerprinted too, not just the local
+        skills_dir.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local = tmp_path / "skills" / "tools" / "local-skill"
+        local.mkdir(parents=True)
+        (local / "SKILL.md").write_text(
+            "---\nname: local-skill\ndescription: Local\n---\n"
+        )
+        ext = tmp_path / "ext-skills"
+        ext.mkdir()
+        ext_skill = ext / "ext-skill"
+        ext_skill.mkdir()
+        (ext_skill / "SKILL.md").write_text(
+            "---\nname: ext-skill\ndescription: Ext\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {ext}\n"
+        )
+
+        first = build_skills_system_prompt()
+        assert "local-skill" in first
+        assert "ext-skill" in first
+
+        # Simulate another process installing a skill into the external dir.
+        new_skill = ext / "ext-new"
+        new_skill.mkdir()
+        (new_skill / "SKILL.md").write_text(
+            "---\nname: ext-new\ndescription: New ext\n---\n"
+        )
+
+        second = build_skills_system_prompt()
+        assert "ext-new" in second, (
+            "new external-dir skill must appear despite warm LRU"
+        )
+        assert "ext-skill" in second
 
 
 
