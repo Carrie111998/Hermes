@@ -57,6 +57,26 @@ def _clean_env(tmp_path, monkeypatch):
     isolated_home = tmp_path / "user-home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_home))
 
+    # Stub the hindsight-client SDK's exception module so
+    # _is_retain_op_complete's `from hindsight_client_api.exceptions import
+    # NotFoundException` works without the real package installed — it's an
+    # optional extra, not part of the dev environment.
+    import types
+
+    fake_exceptions = types.ModuleType("hindsight_client_api.exceptions")
+
+    class NotFoundException(Exception):
+        def __init__(self, status=None, reason=None, **kwargs):
+            super().__init__(reason or status)
+            self.status = status
+            self.reason = reason
+
+    fake_exceptions.NotFoundException = NotFoundException
+    fake_pkg = types.ModuleType("hindsight_client_api")
+    fake_pkg.exceptions = fake_exceptions
+    monkeypatch.setitem(sys.modules, "hindsight_client_api", fake_pkg)
+    monkeypatch.setitem(sys.modules, "hindsight_client_api.exceptions", fake_exceptions)
+
 
 def _make_mock_client():
     """Create a mock Hindsight client with async methods."""
@@ -352,6 +372,10 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        # hindsight-client isn't installed in this environment (optional
+        # extra) — skip the real lazy-install gate, the stub above already
+        # provides what _get_client needs.
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda feature, prompt=True: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
