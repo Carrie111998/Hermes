@@ -8592,6 +8592,12 @@ def _build_call_kwargs(
     from hermes_constants import resolve_auto_reasoning_config
 
     reasoning_config = resolve_auto_reasoning_config(reasoning_config, messages)
+    extra_body = dict(extra_body or {})
+    extra_reasoning = extra_body.get("reasoning")
+    if isinstance(extra_reasoning, dict):
+        extra_body["reasoning"] = resolve_auto_reasoning_config(
+            extra_reasoning, messages
+        )
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
