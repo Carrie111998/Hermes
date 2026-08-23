@@ -3419,6 +3419,14 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    #
+    # Resolving HERE rather than at each spawn is also the more correct
+    # behaviour: a task's stored ``workspace_path`` is what gets injected
+    # into every claimant's worker_context, and it is never refreshed by a
+    # later board edit. And when neither source yields a path we reject the
+    # create outright — an unresolvable ``dir``/``worktree`` task otherwise
+    # looks healthy on the board and only fails minutes later inside the
+    # dispatcher, as a spawn failure on a card nobody is watching.
     if (
         workspace_path is None
         and project_repo is None
@@ -3429,6 +3437,20 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+        else:
+            # No explicit path, no board default, and no project repo to
+            # anchor on (``project_repo is None`` above): there is nothing
+            # left to resolve at spawn time either, so fail loudly now and
+            # name both remedies.
+            raise ValueError(
+                f"workspace_kind={workspace_kind!r} requires a workspace_path, "
+                f"and board {board_slug!r} has no default_workdir to inherit "
+                "from. Either create the task with an explicit absolute "
+                f"workspace path (CLI: --workspace {workspace_kind}:"
+                "<absolute-repo-path>), or set a board default with "
+                f"`hermes kanban boards set-default-workdir {board_slug} "
+                "<absolute-repo-path>`."
+            )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
