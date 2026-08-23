@@ -87,11 +87,6 @@ export function GlyphSpinner({
   // blurred, exactly as the other decorative animations there do.
   const visible = usePaneVisible()
 
-  const vars: GlyphSpinnerVars = {
-    '--glyph-spinner-duration': `${spin.frames.length * spin.interval}ms`,
-    '--glyph-spinner-frames': spin.frames.length
-  }
-
   return (
     <span
       aria-label={ariaLabel}
