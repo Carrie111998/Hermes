@@ -11375,6 +11375,10 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Dispatcher-owned workers must use the governed effect broker for remote
+    # source-control mutations. Interactive/operator shells never receive this
+    # marker and retain their normal command surface.
+    env["AOS_GITHUB_EFFECT_BROKER_REQUIRED"] = "1"
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
