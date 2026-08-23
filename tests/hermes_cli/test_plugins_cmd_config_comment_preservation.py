@@ -50,6 +50,22 @@ class TestPluginEnableDisablePreserveComments:
         assert "# rationale for the enabled list" in written
         assert "demo" in written
 
+    def test_save_enabled_set_creates_config_on_fresh_install(self, tmp_path):
+        """No pre-existing config.yaml: the round-trip writer must create one
+        instead of erroring, matching save_config()'s old create-on-write
+        behavior for a brand-new HERMES_HOME.
+        """
+        from hermes_cli.plugins_cmd import _save_enabled_set
+
+        config_path = tmp_path / "config.yaml"
+        assert not config_path.exists()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            _save_enabled_set({"demo"})
+
+        written = config_path.read_text(encoding="utf-8")
+        assert "demo" in written
+
 
 class TestPluginEnableDisableRespectsManagedScope:
     """The round-trip writer must still honor per-key managed-scope pins.
