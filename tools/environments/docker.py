@@ -121,7 +121,9 @@ def _sanitize_label_value(value: str) -> str:
 
     Empty or all-invalid inputs collapse to ``"unknown"`` so the resulting
     label is always queryable. Used at container-create time; never round-trip
-    a sanitized value back into application logic.
+    a sanitized value back into application logic. For a *persistent
+    filesystem path* (which has no 63-char limit but must stay collision-safe
+    across distinct inputs), use :func:`_sanitize_path_component` instead.
     """
     if not isinstance(value, str) or not value:
         return "unknown"
@@ -137,10 +139,19 @@ def _sanitize_path_component(value: str) -> str:
     which collide with Docker's ``-v host:container`` mount syntax and make
     the sandbox path unparseable. Unlike :func:`_sanitize_label_value`, this
     is not length-capped since filesystem paths have no 63-char limit.
+
+    The alnum/``_.-`` substitution alone is not injective (e.g. ``a:b`` and
+    ``a_b`` collide, as do all-invalid inputs, which collapse to
+    ``"unknown"``). Since this value backs a *persistent* sandbox directory,
+    a colliding path would silently share one session's home/workspace with
+    another's. A short digest of the raw input is appended to keep distinct
+    inputs on distinct paths.
     """
     if not isinstance(value, str) or not value:
         return "unknown"
-    return _LABEL_VALUE_OK_RE.sub("_", value) or "unknown"
+    cleaned = _LABEL_VALUE_OK_RE.sub("_", value) or "unknown"
+    digest = hashlib.sha1(value.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return f"{cleaned}_{digest}"
 
 
 def _get_active_profile_name() -> str:

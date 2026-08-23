@@ -614,6 +614,17 @@ def test_persistent_sandbox_dir_strips_colons_from_session_task_id(monkeypatch, 
     assert ":" not in host_side, f"docker -v mount source still has a colon: {mount_args[0]}"
 
 
+def test_sanitize_path_component_avoids_collisions_between_distinct_ids():
+    """Distinct raw task_ids that sanitize to the same string (or both
+    degenerate to "unknown") must still map to distinct path components,
+    or two sessions' persistent sandboxes would silently share one
+    home/workspace directory (data bleed, not a crash)."""
+    assert docker_env._sanitize_path_component(
+        "session:agent:a:b:1"
+    ) != docker_env._sanitize_path_component("session_agent_a_b_1")
+    assert docker_env._sanitize_path_component("!!!") != docker_env._sanitize_path_component("@@@")
+
+
 def test_labels_attribute_populated_after_init(monkeypatch):
     """``self._labels`` must be set to the same key/value pairs that went onto
     docker run, so subsequent reuse / reaper paths can match without re-running
