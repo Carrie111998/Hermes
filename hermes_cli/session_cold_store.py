@@ -419,6 +419,15 @@ def _write_text_fsync_at(directory_fd: int, name: str, text: str) -> None:
         os.fsync(output.fileno())
 
 
+def _is_private_owned_entry(metadata: os.stat_result, *, directory: bool) -> bool:
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    return (
+        expected_type(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+    )
+
+
 def _read_regular_text_at(directory_fd: int, name: str) -> str | None:
     try:
         descriptor = os.open(
@@ -429,7 +438,7 @@ def _read_regular_text_at(directory_fd: int, name: str) -> str | None:
     except OSError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        if not _is_private_owned_entry(os.fstat(descriptor), directory=False):
             return None
         with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as source:
             try:
@@ -460,6 +469,8 @@ def _valid_existing_snapshot_at(
         return False
     try:
         try:
+            if not _is_private_owned_entry(os.fstat(snapshot_fd), directory=True):
+                return False
             metadata_text = _read_regular_text_at(snapshot_fd, "metadata.json")
             payload_text = _read_regular_text_at(snapshot_fd, "session.jsonl")
             if metadata_text is None or payload_text is None:
@@ -469,7 +480,13 @@ def _valid_existing_snapshot_at(
                 return False
             records = [json.loads(line) for line in payload_text.splitlines()]
             artifacts_fd = os.open("artifacts", _directory_open_flags(), dir_fd=snapshot_fd)
-            os.close(artifacts_fd)
+            try:
+                if not _is_private_owned_entry(
+                    os.fstat(artifacts_fd), directory=True
+                ):
+                    return False
+            finally:
+                os.close(artifacts_fd)
         except (OSError, json.JSONDecodeError):
             return False
         return (
@@ -1176,7 +1193,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
                 for record in records
             ),
         )
-        os.mkdir("artifacts", dir_fd=staging_fd)
+        os.mkdir("artifacts", 0o700, dir_fd=staging_fd)
         os.fsync(staging_fd)
         if not _valid_existing_snapshot_at(
             snapshot_parent_fd,

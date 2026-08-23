@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import sqlite3
+import stat
 
 import pytest
 
@@ -572,6 +573,47 @@ def test_store_reports_the_same_canonical_path_it_writes(tmp_path: Path) -> None
         assert result.snapshot_dir.is_dir()
         assert result.snapshot_dir.is_relative_to(canonical_root)
         assert "not-created" not in result.snapshot_dir.parts
+    finally:
+        db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are required")
+@pytest.mark.parametrize(
+    ("member", "insecure_mode"),
+    [
+        pytest.param(".", 0o750, id="snapshot-directory"),
+        pytest.param("artifacts", 0o750, id="artifacts-directory"),
+        pytest.param("metadata.json", 0o640, id="metadata-file"),
+        pytest.param("session.jsonl", 0o640, id="payload-file"),
+    ],
+)
+def test_verify_rejects_insecure_snapshot_permissions_and_store_repairs_them(
+    tmp_path: Path,
+    member: str,
+    insecure_mode: int,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="private")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+        target = stored.snapshot_dir if member == "." else stored.snapshot_dir / member
+        target.chmod(insecure_mode)
+
+        with pytest.raises(ValueError, match="snapshot"):
+            cold_store.verify_archived_lineage(db, "terminal", archive_root)
+        assert db.get_session("terminal") is not None
+
+        repaired = store_archived_lineage(db, "terminal", archive_root)
+        assert repaired.snapshot_dir == stored.snapshot_dir
+        repaired_target = (
+            repaired.snapshot_dir if member == "." else repaired.snapshot_dir / member
+        )
+        assert stat.S_IMODE(repaired_target.stat().st_mode) & 0o077 == 0
+        cold_store.verify_archived_lineage(db, "terminal", archive_root)
     finally:
         db.close()
 
