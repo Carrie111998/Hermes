@@ -94,7 +94,7 @@ describe('transcriptPaneBudget', () => {
   it('uses a fixed live-tail budget while hidden instead of charging every mounted transcript', () => {
     expect(transcriptPaneBudget(1, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(4, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
-    expect(transcriptPaneBudget(1, false)).toBeGreaterThan(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
+    expect(transcriptPaneBudget(1, false)).toBe(3_600)
   })
 })
 

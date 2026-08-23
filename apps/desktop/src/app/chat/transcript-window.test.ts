@@ -24,6 +24,14 @@ const transcript = (count: number, chars: number): ChatMessage[] =>
   Array.from({ length: count }, (_, i) => message(`m-${i}`, chars))
 
 describe('selectTranscriptWindow', () => {
+  it('keeps the runtime page below the demonstrated crash-shape weight', () => {
+    expect(TRANSCRIPT_WINDOW_BUDGET).toBe(1_200)
+
+    const crashShape = transcript(40, RENDER_WEIGHT_CHARS * 57)
+
+    expect(selectTranscriptWindow(crashShape).windowed).toBe(true)
+  })
+
   it('does not window a transcript that fits the budget', () => {
     const messages = transcript(50, 100)
 

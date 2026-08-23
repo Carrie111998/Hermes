@@ -10,8 +10,9 @@ import { messageStoreWeight } from '@/lib/render-weight'
  * every message still gets normalized into the repository first — so a session
  * only has to be heavy, not visible, to crash the window.
  *
- * The window spends the same currency as the DOM budget: render weight, not
- * message count. A count cap gets this wrong in both directions — measured on a
+ * The window uses layer-specific render weight, not a message count. The DOM
+ * prices what mounts; this store boundary prices what assistant-ui must
+ * normalize. A count cap gets this wrong in both directions — measured on a
  * real 1,175-session store, a 400-message cap would disable itself on 37
  * sessions that are heavy but short (one was 133 messages / 1.05MB) while
  * engaging on 92 long-but-light sessions that were never at risk.
@@ -20,13 +21,13 @@ import { messageStoreWeight } from '@/lib/render-weight'
 /**
  * One window page, in render-weight units.
  *
- * Two DOM pages (the `RENDER_BUDGET` of 3600 in `thread/list.tsx`). "Show
- * earlier" spends the DOM budget first, so the user can page within the
- * already-materialized window before this asks the store for more. The
- * original crash shape (~231K tokens ≈ 2,260 units) remains bounded rather
- * than handing an unbounded transcript to the repository.
+ * This raw-payload budget is independent of the DOM paint budget in
+ * `thread/list.tsx`: collapsed tool output can be cheap to paint but expensive
+ * for assistant-ui to normalize. Keeping the initial runtime window below the
+ * original crash shape (~231K tokens ≈ 2,260 units) still permits the complete
+ * 720-message hydration tail when its messages are lightweight.
  */
-export const TRANSCRIPT_WINDOW_BUDGET = 7200
+export const TRANSCRIPT_WINDOW_BUDGET = 1_200
 
 /**
  * Floor on messages kept regardless of weight. A transcript of enormous turns

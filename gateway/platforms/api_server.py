@@ -4531,7 +4531,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
-        limit = 500 if default_page else min(requested_limit, 500)
+        max_limit = 720 if latest_page else 500
+        limit = 500 if requested_limit is None else min(requested_limit, max_limit)
         messages = await asyncio.to_thread(
             db.get_messages,
             resolved_id,

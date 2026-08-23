@@ -2012,23 +2012,28 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/sessions/neg-offset-messages/messages?offset=-1")
         assert resp.status_code == 422
 
-    def test_get_session_messages_limit_above_500_is_capped_not_rejected(self):
-        """A limit above the documented 500-row cap is silently clamped
-        (existing ``min(limit, 500)`` behaviour), not rejected — the request
-        still succeeds."""
+    def test_get_session_messages_latest_limit_above_720_is_capped_not_rejected(self):
+        """An explicit latest-page limit above 720 is silently clamped;
+        oldest-page requests retain the narrower 500-row boundary."""
         from hermes_state import SessionDB
 
         db = SessionDB()
         try:
             db.create_session(session_id="many-messages", source="cli")
-            for i in range(60):
+            for i in range(721):
                 db.append_message(session_id="many-messages", role="user", content=f"msg {i}")
         finally:
             db.close()
 
-        resp = self.client.get("/api/sessions/many-messages/messages?limit=1000")
+        resp = self.client.get("/api/sessions/many-messages/messages?limit=1000&order=latest")
         assert resp.status_code == 200
-        assert resp.json()["pagination"]["limit"] == 500
+        assert resp.json()["pagination"]["limit"] == 720
+        assert resp.json()["pagination"]["returned"] == 720
+        assert len(resp.json()["messages"]) == 720
+
+        oldest_resp = self.client.get("/api/sessions/many-messages/messages?limit=1000&order=oldest")
+        assert oldest_resp.status_code == 200
+        assert oldest_resp.json()["pagination"]["limit"] == 500
 
     def test_get_session_messages_default_hides_compacted_rows(self):
         """The endpoint default matches get_messages: active rows only.

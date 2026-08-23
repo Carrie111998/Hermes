@@ -87,7 +87,7 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
     session_id = session_db.create_session("bounded-messages", "api_server")
     session_db.replace_messages(
         session_id,
-        [{"role": "user", "content": f"msg {i}"} for i in range(501)],
+        [{"role": "user", "content": f"msg {i}"} for i in range(721)],
     )
 
     app = _create_session_app(adapter)
@@ -102,18 +102,39 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         assert explicit_resp.status == 200
         explicit = await explicit_resp.json()
 
+        capped_resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?limit=1000&order=latest"
+        )
+        assert capped_resp.status == 200
+        capped = await capped_resp.json()
+
+        oldest_capped_resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?limit=1000&order=oldest"
+        )
+        assert oldest_capped_resp.status == 200
+        oldest_capped = await oldest_capped_resp.json()
+
     assert payload["pagination"] == {
         "limit": 500,
         "offset": 0,
         "order": "latest",
         "returned": 500,
     }
-    assert payload["data"][0]["content"] == "msg 1"
-    assert payload["data"][-1]["content"] == "msg 500"
+    assert payload["data"][0]["content"] == "msg 221"
+    assert payload["data"][-1]["content"] == "msg 720"
     assert [message["content"] for message in explicit["data"]] == [
         "msg 1",
         "msg 2",
     ]
+    assert capped["pagination"] == {
+        "limit": 720,
+        "offset": 0,
+        "order": "latest",
+        "returned": 720,
+    }
+    assert capped["data"][0]["content"] == "msg 1"
+    assert capped["data"][-1]["content"] == "msg 720"
+    assert oldest_capped["pagination"]["limit"] == 500
 
 
 @pytest.mark.asyncio

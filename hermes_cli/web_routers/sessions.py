@@ -627,7 +627,8 @@ async def get_session_messages(
             # dashboard view returns the latest page in chronological order.
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
-            _limit = 500 if default_page else min(limit, 500)
+            max_limit = 720 if latest_page else 500
+            _limit = 500 if limit is None else min(limit, max_limit)
             return sid, _limit, db.get_messages(
                 sid,
                 limit=_limit,
