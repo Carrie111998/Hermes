@@ -9864,6 +9864,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 batch_key,
                 len(event.media_urls),
             )
+            if not (event.metadata or {}).get("telegram_burst_trigger", True):
+                raw = getattr(event, "raw_message", None)
+                if raw is not None and self._should_observe_unmentioned_group_message(raw):
+                    self._observe_unmentioned_group_message(
+                        raw, event.message_type, event=event,
+                    )
+                event = None
+                return
             await self.handle_message(event)
             event = None
         except asyncio.CancelledError:
@@ -9881,19 +9889,72 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         existing = self._pending_photo_batches.get(batch_key)
+        incoming_trigger = bool((event.metadata or {}).get("telegram_burst_trigger"))
         if existing is None:
+            event.metadata["telegram_burst_trigger"] = incoming_trigger
             self._pending_photo_batches[batch_key] = event
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            if incoming_trigger:
+                existing.metadata["telegram_burst_trigger"] = True
+            if event.raw_message is not None:
+                existing.raw_message = event.raw_message
 
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
             prior_task.cancel()
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
+
+    def _is_bufferable_burst_media(self, message: Message) -> bool:
+        """Return True for photo/video/document updates that can share a burst window."""
+        if getattr(message, "sticker", None) or getattr(message, "voice", None) or getattr(message, "audio", None):
+            return False
+        return bool(
+            getattr(message, "photo", None)
+            or getattr(message, "video", None)
+            or getattr(message, "document", None)
+        )
+
+    def _should_buffer_unmentioned_burst(self, message: Message) -> bool:
+        """Buffer group photo/doc/video that failed require_mention, if the chat is allowlisted.
+
+        Sequential PDFs are not a Telegram album. The mention/caption often
+        arrives only on the last file. Hard gates (ignored topic, other-bot
+        exclusive mention, chat allowlist) still drop the update immediately.
+        """
+        if not self._is_bufferable_burst_media(message):
+            return False
+        if not self._is_group_chat(message):
+            return False
+        if not self._telegram_require_mention():
+            return False
+        if self._is_own_message(message):
+            return False
+
+        thread_id = self._effective_message_thread_id(message)
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+            if topic_id not in allowed_topics:
+                return False
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
+
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        allowed = self._telegram_allowed_chats() or self._telegram_observe_allowed_chats()
+        if not allowed or chat_id_str not in allowed:
+            return False
+        return True
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
@@ -9906,24 +9967,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(update.message, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
-                _m = update.message
-                _observe_type = self._media_message_type(_m)
-                _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
-                if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
-                await self._cache_observed_media(_m, _event)
-                self._observe_unmentioned_group_message(
-                    _m, _event.message_type, update_id=update.update_id, event=_event
-                )
-            return
+        burst_trigger = self._should_process_message(update.message)
+        if not burst_trigger:
+            if not self._should_buffer_unmentioned_burst(update.message):
+                if self._should_observe_unmentioned_group_message(update.message):
+                    _m = update.message
+                    _observe_type = self._media_message_type(_m)
+                    _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
+                    if _m.caption:
+                        _event.text = self._clean_bot_trigger_text(_m.caption)
+                    await self._cache_observed_media(_m, _event)
+                    self._observe_unmentioned_group_message(
+                        _m, _event.message_type, update_id=update.update_id, event=_event
+                    )
+                return
 
         msg = update.message
 
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            try:
+                event.metadata = {}
+                metadata = event.metadata
+            except Exception:
+                metadata = None
+        if isinstance(metadata, dict):
+            metadata["telegram_burst_trigger"] = burst_trigger
         
         # Add caption as text
         if msg.caption:

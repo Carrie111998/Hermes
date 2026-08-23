@@ -538,7 +538,7 @@ Hermes already debounced rapid photos into one turn. The same short same-session
 - a real Telegram album still uses `media_group_id` and is unchanged;
 - voice and audio notes are **not** held in this window (they go through STT immediately).
 
-The window is `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` (default `0.8`). In groups with `require_mention: true`, each file still has to pass the mention/reply gate on its own update — this coalesce does not invent a mention.
+The window is `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` (default `0.8`). In groups with `require_mention: true`, a mention, reply, or wake-word on **any** file in that window releases the whole burst. Files that never get a trigger are observed (if enabled) or dropped — the bot still does not answer unsolicited group chatter.
 
 ## Group Chat Usage
 

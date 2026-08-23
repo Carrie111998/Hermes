@@ -121,8 +121,22 @@ def adapter():
 
 
 async def _await_media_flush(adapter):
-    """Wait for the same-session media-burst debounce to flush."""
-    await asyncio.sleep(adapter._media_batch_delay_seconds + 0.05)
+    """Wait for pending same-session media-burst flush tasks to finish."""
+    tasks = [
+        task
+        for task in list(getattr(adapter, "_pending_photo_batch_tasks", {}).values())
+        if task is not None and not task.done()
+    ]
+    album_tasks = [
+        task
+        for task in list(getattr(adapter, "_media_group_tasks", {}).values())
+        if task is not None and not task.done()
+    ]
+    pending = tasks + album_tasks
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        return
+    await asyncio.sleep(getattr(adapter, "_media_batch_delay_seconds", 0.05) + 0.05)
 
 
 @pytest.fixture(autouse=True)
@@ -426,6 +440,136 @@ class TestDocumentBursts:
         pdf_event = adapter.handle_message.await_args_list[1].args[0]
         assert pdf_event.message_type == MessageType.DOCUMENT
         assert len(pdf_event.media_urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_photo_then_pdf_share_the_same_burst_window(self, adapter):
+        photo = _make_photo(_make_file_obj(b"jpeg-bytes"))
+        pdf = _make_document(file_name="scan.pdf", mime_type="application/pdf", file_size=32)
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/first.jpg",
+        ):
+            await adapter._handle_media_message(
+                _make_update(_make_message(photo=[photo], caption="first")),
+                MagicMock(),
+            )
+            await adapter._handle_media_message(
+                _make_update(_make_message(document=pdf)),
+                MagicMock(),
+            )
+            assert adapter.handle_message.await_count == 0
+            await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.media_urls[0] == "/tmp/first.jpg"
+        assert len(event.media_urls) == 2
+        assert "first" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_sequential_native_videos_coalesce(self, adapter):
+        first = _make_file_obj(b"vid-one")
+        first.file_path = "videos/one.mp4"
+        second = _make_file_obj(b"vid-two")
+        second.file_path = "videos/two.mp4"
+        msg1 = _make_message()
+        msg1.video = _make_video(first)
+        msg2 = _make_message()
+        msg2.video = _make_video(second)
+
+        await adapter._handle_media_message(_make_update(msg1), MagicMock())
+        await adapter._handle_media_message(_make_update(msg2), MagicMock())
+        assert adapter.handle_message.await_count == 0
+        await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.VIDEO
+        assert len(event.media_urls) == 2
+
+    @pytest.mark.asyncio
+    async def test_album_does_not_merge_with_a_loose_pdf(self, adapter):
+        photo_a = _make_photo(_make_file_obj(b"a"))
+        photo_b = _make_photo(_make_file_obj(b"b"))
+        album_one = _make_message(photo=[photo_a], media_group_id="album-9", caption="album")
+        album_two = _make_message(photo=[photo_b], media_group_id="album-9")
+        pdf = _make_document(file_name="loose.pdf", mime_type="application/pdf", file_size=16)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            side_effect=["/tmp/a.jpg", "/tmp/b.jpg"],
+        ):
+            await adapter._handle_media_message(_make_update(album_one), MagicMock())
+            await adapter._handle_media_message(_make_update(album_two), MagicMock())
+            await adapter._handle_media_message(_make_update(_make_message(document=pdf)), MagicMock())
+            await _await_media_flush(adapter)
+
+        assert adapter.handle_message.await_count == 2
+        batches = [tuple(call.args[0].media_urls) for call in adapter.handle_message.await_args_list]
+        assert ("/tmp/a.jpg", "/tmp/b.jpg") in batches
+        assert any(len(urls) == 1 for urls in batches)
+
+    @pytest.mark.asyncio
+    async def test_group_mention_on_last_pdf_releases_the_whole_burst(self, adapter):
+        adapter.config.extra["require_mention"] = True
+        adapter.config.extra["allowed_chats"] = ["-1001"]
+        adapter.config.extra["allowed_topics"] = []
+        adapter.config.extra["ignored_threads"] = []
+        adapter.config.extra["mention_patterns"] = [r"analyze"]
+        adapter._mention_patterns = adapter._compile_mention_patterns()
+        adapter._is_user_authorized_from_message = lambda _msg: True
+
+        def _group_doc(name, caption=None):
+            msg = _make_message(
+                document=_make_document(file_name=name, mime_type="application/pdf", file_size=16),
+                caption=caption,
+            )
+            msg.chat.type = "supergroup"
+            msg.chat.id = -1001
+            msg.entities = []
+            msg.caption_entities = []
+            return msg
+
+        await adapter._handle_media_message(_make_update(_group_doc("one.pdf")), MagicMock())
+        await adapter._handle_media_message(_make_update(_group_doc("two.pdf")), MagicMock())
+        await adapter._handle_media_message(
+            _make_update(_group_doc("three.pdf", caption="analyze these")),
+            MagicMock(),
+        )
+        assert adapter.handle_message.await_count == 0
+        await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert len(event.media_urls) == 3
+        assert "analyze these" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_group_unmentioned_pdf_burst_does_not_dispatch(self, adapter):
+        adapter.config.extra["require_mention"] = True
+        adapter.config.extra["allowed_chats"] = ["-1001"]
+        adapter.config.extra["allowed_topics"] = []
+        adapter.config.extra["ignored_threads"] = []
+        adapter.config.extra["mention_patterns"] = [r"analyze"]
+        adapter._mention_patterns = adapter._compile_mention_patterns()
+        adapter._is_user_authorized_from_message = lambda _msg: True
+        adapter._observe_unmentioned_group_message = MagicMock()
+
+        def _group_doc(name):
+            msg = _make_message(
+                document=_make_document(file_name=name, mime_type="application/pdf", file_size=16),
+            )
+            msg.chat.type = "supergroup"
+            msg.chat.id = -1001
+            msg.entities = []
+            msg.caption_entities = []
+            return msg
+
+        await adapter._handle_media_message(_make_update(_group_doc("a.pdf")), MagicMock())
+        await adapter._handle_media_message(_make_update(_group_doc("b.pdf")), MagicMock())
+        await _await_media_flush(adapter)
+
+        adapter.handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
