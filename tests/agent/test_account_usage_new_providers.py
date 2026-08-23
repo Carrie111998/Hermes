@@ -108,7 +108,7 @@ def test_opencode_go_skips_missing_percent_fields(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Anthropic second subscription
+# Anthropic second subscription (isolated login profile)
 # ---------------------------------------------------------------------------
 
 
@@ -119,10 +119,37 @@ def _anthropic_payload():
     }
 
 
-def test_anthropic2_reads_env_token_and_shares_window_mapping(monkeypatch):
+class _ProfileStub:
+    """Stands in for the isolated profile's credential file."""
+
+    def __init__(self, oauth):
+        self.oauth = oauth
+
+
+def _install_profile(monkeypatch, tmp_path, oauth):
+    stub = _ProfileStub(oauth)
+    monkeypatch.setattr(account_usage, "_read_anthropic2_credentials",
+                       lambda config_dir=None: stub.oauth)
+    return stub
+
+
+def _future_expiry_ms():
+    import time
+
+    return int(time.time() * 1000) + 24 * 3600 * 1000
+
+
+def test_anthropic2_reads_isolated_profile_and_shares_window_mapping(
+    monkeypatch, tmp_path
+):
     calls = []
     _patch_client(monkeypatch, _anthropic_payload(), calls)
-    monkeypatch.setenv("ANTHROPIC2_OAUTH_TOKEN", "sk-ant-oat01-anthropic2-token")
+    _install_profile(
+        monkeypatch,
+        tmp_path,
+        {"accessToken": "sk-ant-oat01-anthropic2-token",
+         "refreshToken": "rt-live", "expiresAt": _future_expiry_ms()},
+    )
 
     snap = account_usage._fetch_anthropic2_account_usage()
 
@@ -135,20 +162,100 @@ def test_anthropic2_reads_env_token_and_shares_window_mapping(monkeypatch):
     assert auth == "Bearer sk-ant-oat01-anthropic2-token"
 
 
-def test_anthropic2_unconfigured_returns_none(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC2_OAUTH_TOKEN", raising=False)
+def test_anthropic2_unconfigured_returns_none(monkeypatch, tmp_path):
+    # No isolated-profile credentials file → unconfigured row, not an error.
+    monkeypatch.setattr(account_usage, "_read_anthropic2_credentials",
+                       lambda config_dir=None: None)
 
     assert account_usage._fetch_anthropic2_account_usage() is None
 
 
-def test_anthropic2_non_oauth_token_reports_unavailable(monkeypatch):
-    # An sk-ant-api key must NOT be sent to the oauth usage endpoint.
-    monkeypatch.setenv("ANTHROPIC2_OAUTH_TOKEN", "sk-ant-api03-notoauth")
+def test_anthropic2_non_oauth_token_reports_unavailable(monkeypatch, tmp_path):
+    # An sk-ant-api key in the profile must NOT reach the oauth usage endpoint.
+    _install_profile(
+        monkeypatch,
+        tmp_path,
+        {"accessToken": "sk-ant-api03-notoauth",
+         "refreshToken": "rt", "expiresAt": _future_expiry_ms()},
+    )
 
     snap = account_usage._fetch_anthropic2_account_usage()
 
     assert snap is not None and not snap.available
-    assert snap.unavailable_reason
+    assert "auth login" in snap.unavailable_reason
+
+
+def test_anthropic2_expired_token_refreshes_and_persists_pair(
+    monkeypatch, tmp_path
+):
+    # Expired access token → refresh flow runs, rotated pair is written back
+    # to the profile (single-use rotating refresh token), usage succeeds with
+    # the NEW access token.
+    import time
+
+    payload = {
+        "five_hour": {"utilization": 0.10},
+        "seven_day": {"utilization": 5.0},
+    }
+    calls = []
+    _patch_client(monkeypatch, payload, calls)
+
+    stored = {}
+
+    def fake_read(config_dir=None):
+        return stored.get("creds")
+
+    def fake_write(access, refresh, expires_ms, *, scopes=None):
+        stored["creds"] = {"accessToken": access, "refreshToken": refresh,
+                           "expiresAt": expires_ms,
+                           **({"scopes": scopes} if scopes is not None else {})}
+
+    old_exp = int(time.time() * 1000) - 1000  # already expired
+    original = {"accessToken": "sk-ant-oat01-old", "refreshToken": "rt-old",
+                "expiresAt": old_exp, "scopes": ["user:inference"]}
+    stored["creds"] = dict(original)
+    monkeypatch.setattr(account_usage, "_read_anthropic2_credentials", fake_read)
+    monkeypatch.setattr(account_usage, "_write_anthropic2_credentials", fake_write)
+    monkeypatch.setattr(
+        account_usage, "refresh_anthropic_oauth_pure",
+        lambda rt: (
+            pytest.fail("must use the profile's own refresh token")
+            if rt != "rt-old"
+            else {"access_token": "sk-ant-oat01-new",
+                  "refresh_token": "rt-new",
+                  "expires_at_ms": _future_expiry_ms()}
+        ),
+    )
+
+    snap = account_usage._fetch_anthropic2_account_usage()
+
+    assert snap is not None and snap.available
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-ant-oat01-new"
+    # Rotated pair persisted, original scopes preserved.
+    assert stored["creds"]["accessToken"] == "sk-ant-oat01-new"
+    assert stored["creds"]["refreshToken"] == "rt-new"
+    assert stored["creds"]["scopes"] == ["user:inference"]
+
+
+def test_anthropic2_refresh_failure_reports_unavailable(monkeypatch, tmp_path):
+    import time
+
+    old_exp = int(time.time() * 1000) - 1000
+    _install_profile(
+        monkeypatch,
+        tmp_path,
+        {"accessToken": "sk-ant-oat01-old", "refreshToken": "rt-old",
+         "expiresAt": old_exp},
+    )
+    monkeypatch.setattr(
+        account_usage, "refresh_anthropic_oauth_pure",
+        lambda rt: (_ for _ in ()).throw(RuntimeError("invalid_grant")),
+    )
+
+    snap = account_usage._fetch_anthropic2_account_usage()
+
+    assert snap is not None and not snap.available
+    assert "auth login" in snap.unavailable_reason
 
 
 def test_primary_anthropic_fetcher_still_works_after_refactor(monkeypatch):

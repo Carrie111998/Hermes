@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
+from agent.anthropic_adapter import (
+    _is_oauth_token,
+    refresh_anthropic_oauth_pure,
+    resolve_anthropic_token,
+)
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -877,9 +883,11 @@ def _fetch_anthropic_usage_with_token(
 
     Shared by ``_fetch_anthropic_account_usage`` (primary account via
     ``resolve_anthropic_token()``) and ``_fetch_anthropic2_account_usage``
-    (second subscription via ``ANTHROPIC2_OAUTH_TOKEN``). ``claude
-    setup-token`` issues a long-lived ``sk-ant-oat01`` token per account;
-    ``_is_oauth_token`` accepts it and this endpoint works unchanged.
+    (second subscription via its isolated login profile). NOTE: the token
+    must carry the ``user:profile`` scope -- a full ``claude auth login``
+    OAuth credential does. ``claude setup-token`` tokens are deliberately
+    inference-only and get 403 ``permission_error`` here (verified live
+    2026-08-23), so they are NOT a valid credential source for usage.
     """
     httpx = _ensure_httpx()
     headers = {
@@ -948,6 +956,36 @@ def _fetch_anthropic_account_usage(
     return _fetch_anthropic_usage_with_token(token, timeout=timeout)
 
 
+_ANTHROPIC2_CONFIG_DIR = Path.home() / ".claude-anthropic2"
+
+
+def _read_anthropic2_credentials(
+    config_dir: Optional[Path] = None,
+) -> Optional[dict]:
+    """Read OAuth credentials from the isolated anthropic2 Claude Code profile.
+
+    The second subscription logs in once via ``CLAUDE_CONFIG_DIR``-isolated
+    ``claude auth login``, which writes the same ``.credentials.json`` shape as
+    the primary profile -- full OAuth scopes including ``user:profile`` (which
+    ``claude setup-token`` tokens lack and which /api/oauth/usage requires).
+
+    Returns {accessToken, refreshToken, expiresAt, scopes} or None.
+    """
+    cred_path = (config_dir or _ANTHROPIC2_CONFIG_DIR) / ".credentials.json"
+    try:
+        data = json.loads(cred_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError):
+        return None
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    if not str(oauth.get("accessToken", "") or "").strip():
+        return None
+    return oauth
+
+
 def _fetch_anthropic2_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -956,21 +994,117 @@ def _fetch_anthropic2_account_usage(
 ) -> Optional[AccountUsageSnapshot]:
     """Second Anthropic subscription (diegodearagaous@gmail.com).
 
-    Credential chain: explicit arg → ANTHROPIC2_OAUTH_TOKEN env (loaded from
-    profiles/main/.env by bin/ai_usage_collector_run.ps1). Unset → None, so
-    the row degrades to unconfigured rather than erroring every cycle.
+    Credential source: the isolated login profile at
+    ``~/.claude-anthropic2/.credentials.json`` (one-time
+    ``CLAUDE_CONFIG_DIR=... claude auth login``), NOT an env token --
+    `claude setup-token` tokens are inference-only and get 403 on the usage
+    endpoint (verified live 2026-08-23). Missing profile → None, so the row
+    degrades to unconfigured rather than erroring every cycle.
+
+    Expired access tokens are refreshed in place with the profile's own
+    refresh token. Refresh tokens are SINGLE-USE rotating: a successful
+    refresh invalidates the old one, so the new pair is written back to the
+    profile file immediately -- losing it would force a manual re-login.
     """
-    token = str(api_key or os.environ.get("ANTHROPIC2_OAUTH_TOKEN", "") or "").strip()
-    if not token:
+    del base_url  # dispatcher passes it; this fetcher has no alternate host
+    creds = _read_anthropic2_credentials()
+    if creds is None:
         return None
+
+    token = str(creds.get("accessToken") or "").strip()
     if not _is_oauth_token(token):
         return AccountUsageSnapshot(
             provider="anthropic2",
             source="oauth_usage_api",
             fetched_at=_utc_now(),
-            unavailable_reason="ANTHROPIC2_OAUTH_TOKEN must be an OAuth/setup token (sk-ant-oat01...) from `claude setup-token`.",
+            unavailable_reason="Isolated profile credential is not an OAuth token; re-run the one-time `claude auth login` for this account.",
         )
+
+    expires_at_ms = int(creds.get("expiresAt") or 0)
+    now_ms = int(time.time() * 1000)
+    if now_ms >= (expires_at_ms - 60_000):
+        # Access token expired (or expiry unknown/zero): try a refresh before
+        # giving up. Mirrors anthropic_adapter.is_claude_code_token_valid's
+        # 60s clock-skew buffer.
+        refresh_token = str(creds.get("refreshToken") or "").strip()
+        if not refresh_token:
+            return AccountUsageSnapshot(
+                provider="anthropic2",
+                source="oauth_usage_api",
+                fetched_at=_utc_now(),
+                unavailable_reason="Access token expired and the isolated profile holds no refresh token; re-run the one-time `claude auth login`.",
+            )
+        try:
+            refreshed = refresh_anthropic_oauth_pure(refresh_token)
+        except Exception as exc:
+            logger.debug("anthropic2 token refresh failed: %s", exc)
+            return AccountUsageSnapshot(
+                provider="anthropic2",
+                source="oauth_usage_api",
+                fetched_at=_utc_now(),
+                unavailable_reason="Token refresh failed (refresh token may have been rotated elsewhere); re-run the one-time `claude auth login`.",
+            )
+        token = str(refreshed["access_token"]).strip()
+        # Persist the rotated pair FIRST — single-use refresh tokens die with
+        # the POST, so a crash between refresh and write would strand the
+        # profile. Scopes are preserved from the existing file when the
+        # response omits them (Claude Code gates on user:inference there).
+        _write_anthropic2_credentials(
+            refreshed["access_token"],
+            refreshed["refresh_token"],
+            refreshed["expires_at_ms"],
+            scopes=creds.get("scopes"),
+        )
+
     return _fetch_anthropic_usage_with_token(token, timeout=timeout, provider="anthropic2")
+
+
+def _write_anthropic2_credentials(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+) -> None:
+    """Write the rotated OAuth pair back to the isolated profile.
+
+    Atomic temp-file + rename, 0600-equivalent via os.open flags, mirroring
+    anthropic_adapter._write_claude_code_credentials but against the isolated
+    config dir. Existing non-oauth top-level fields are preserved.
+    """
+    cred_path = _ANTHROPIC2_CONFIG_DIR / ".credentials.json"
+    existing: dict = {}
+    try:
+        if cred_path.exists():
+            existing = json.loads(cred_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        existing = {}
+
+    oauth_data: dict = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at_ms,
+    }
+    if scopes is not None:
+        oauth_data["scopes"] = scopes
+    elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
+        oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
+    existing["claudeAiOauth"] = oauth_data
+
+    payload = json.dumps(existing, indent=2)
+    _ANTHROPIC2_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = cred_path.with_suffix(".json.tmp")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(str(tmp_path), str(cred_path))
+    except Exception:
+        try:
+            os.unlink(str(tmp_path))
+        except OSError:
+            pass
+        raise
 
 
 def _fetch_opencode_go_account_usage(
