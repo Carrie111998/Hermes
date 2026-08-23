@@ -149,8 +149,10 @@ _UTC_NOW = lambda: datetime.now(timezone.utc)
 _DEEPSEEK_PEAK_BILLING_EFFECTIVE_UTC = datetime(2026, 8, 16, 16, 0, tzinfo=timezone.utc)
 
 # Peak windows are 01:00–04:00 and 06:00–10:00 UTC (all other hours are
-# off-peak). Read as half-open intervals: hours 1, 2, 3 and 6, 7, 8, 9.
+# off-peak), Monday through Friday. Read as half-open intervals:
+# hours 1, 2, 3 and 6, 7, 8, 9.  ISO weekday 1–5 = Mon–Fri.
 _DEEPSEEK_PEAK_HOURS = frozenset({1, 2, 3, 6, 7, 8, 9})
+_DEEPSEEK_PEAK_DAYS = frozenset({1, 2, 3, 4, 5})
 
 # Pre-switchover flat card (deepseek-pricing-2026-07). The 2026-08-16 rate
 # card stores OFF-PEAK rates in the snapshot and bills 2x during peak hours;
@@ -546,7 +548,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # DeepSeek
     # Snapshot of https://api-docs.deepseek.com/quick_start/pricing.
     # The 2026-08-16 card lists OFF-PEAK rates here; peak hours
-    # (01:00-04:00 / 06:00-10:00 UTC) bill at 2x — see estimate_usage_cost.
+    # (01:00-04:00 / 06:00-10:00 UTC, Mon-Fri) bill at 2x — see
+    # estimate_usage_cost.
     # deepseek-chat / deepseek-reasoner are deprecated 2026-07-24 and alias
     # deepseek-v4-flash's non-thinking / thinking modes — same rates.
     (
@@ -1499,10 +1502,10 @@ def estimate_usage_cost(
     # DeepSeek switched to peak/off-peak billing at 2026-08-16T16:00Z.
     # Before the switchover the legacy flat card applies; after it, the
     # snapshot's off-peak rates bill at 2x during peak hours
-    # (01:00-04:00 and 06:00-10:00 UTC). The rate is selected at call time
-    # (post-request), matching DeepSeek's per-request timestamp billing;
-    # pass billing_time to price a historical moment instead (insights
-    # re-estimation of past sessions).
+    # (01:00-04:00 and 06:00-10:00 UTC, Monday through Friday). The rate
+    # is selected at call time (post-request), matching DeepSeek's
+    # per-request timestamp billing; pass billing_time to price a
+    # historical moment instead (insights re-estimation of past sessions).
     deepseek_peak_hour = False
     if route.provider == "deepseek":
         if billing_time is not None:
@@ -1519,7 +1522,7 @@ def estimate_usage_cost(
             legacy = _DEEPSEEK_LEGACY_FLAT_RATES.get(route.model.lower())
             if legacy is not None:
                 entry = legacy
-        elif now.hour in _DEEPSEEK_PEAK_HOURS:
+        elif now.isoweekday() in _DEEPSEEK_PEAK_DAYS and now.hour in _DEEPSEEK_PEAK_HOURS:
             deepseek_peak_hour = True
 
     notes: list[str] = []
@@ -1576,7 +1579,7 @@ def estimate_usage_cost(
         notes.append("OpenRouter cost is estimated from the models API until reconciled.")
     if deepseek_peak_hour:
         notes.append(
-            "DeepSeek peak-hour rate applied (2x off-peak; peak 01:00-04:00 / 06:00-10:00 UTC)."
+            "DeepSeek peak-hour rate applied (2x off-peak; peak 01:00-04:00 / 06:00-10:00 UTC, Mon-Fri)."
         )
 
     return CostResult(
