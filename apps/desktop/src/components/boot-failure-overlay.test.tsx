@@ -182,4 +182,32 @@ describe('BootFailureOverlay', () => {
       restore()
     }
   })
+
+  it('ipc-bridge failure (#92927): honest repair copy, no bridge-dependent dead-end actions', () => {
+    $desktopBoot.set({
+      error: 'Desktop IPC bridge is unavailable.',
+      errorKind: 'ipc-bridge',
+      fakeMode: false,
+      message: 'boot failed',
+      phase: 'renderer.error',
+      progress: 6,
+      running: false,
+      timestamp: Date.now(),
+      visible: true
+    })
+
+    render(<BootFailureOverlay />)
+
+    // The ipc-specific title and repair guidance replace the generic
+    // "background gateway didn't come up" copy.
+    expect(screen.getByRole('heading', { name: /Desktop IPC bridge is unavailable/i })).toBeTruthy()
+    expect(screen.getByText(/hermes desktop --force-build/i)).toBeTruthy()
+    // Reload is the only action that works without the bridge; Repair,
+    // Gateway settings and Open logs all round-trip through
+    // window.hermesDesktop and would be silent no-ops here.
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /repair/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /gateway settings/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /open logs/i })).toBeNull()
+  })
 })

@@ -5,6 +5,14 @@ import { translateNow } from '@/i18n'
 
 export interface DesktopBootState extends DesktopBootProgress {
   visible: boolean
+  /**
+   * Machine-readable failure kind for renderer-side boot failures. `undefined`
+   * for main-process failures (which never set it). 'ipc-bridge' marks the
+   * dead-preload state (#92927): every recovery action that round-trips
+   * through window.hermesDesktop is a silent no-op there, so the overlay must
+   * swap to reload + repair copy instead of the bridge-dependent buttons.
+   */
+  errorKind?: 'ipc-bridge' | (string & {})
 }
 
 const INITIAL_BOOT_STATE: DesktopBootState = {
@@ -79,6 +87,7 @@ export function resumeDesktopBootForRetry(message: string) {
   $desktopBoot.set({
     ...current,
     error: null,
+    errorKind: undefined,
     message,
     phase: 'renderer.boot.retry',
     running: true,
@@ -92,6 +101,7 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
   $desktopBoot.set({
     ...current,
     error: null,
+    errorKind: undefined,
     message,
     phase: 'renderer.ready',
     progress: 100,
@@ -101,11 +111,12 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
   })
 }
 
-export function failDesktopBoot(message: string) {
+export function failDesktopBoot(message: string, errorKind?: DesktopBootState['errorKind']) {
   const current = $desktopBoot.get()
   $desktopBoot.set({
     ...current,
     error: message,
+    errorKind,
     message: translateNow('boot.desktopBootFailedWithMessage', message),
     phase: 'renderer.error',
     progress: clampProgress(current.progress),

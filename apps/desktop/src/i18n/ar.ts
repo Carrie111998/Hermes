@@ -117,6 +117,11 @@ export const ar = defineLocale({
       cloudDownDiscord: 'الحصول على مساعدة عبر Discord',
       openLogs: 'فتح السجلات',
       repairHint: 'يعيد الإصلاح تشغيل المثبت وقد يستغرق بضع دقائق على جهاز جديد.',
+      ipcBridgeTitle: 'جسر IPC لسطح المكتب غير متاح',
+      ipcBridgeDescription:
+        'فشل تحميل جسر IPC لسطح المكتب — عادةً ما تكون حزمة التطبيق تالفة بسبب تحديث متقطع. أعد تشغيل Hermes؛ وإن استمر ذلك، فأصلح التثبيت.',
+      ipcBridgeHint:
+        'أعد تشغيل Hermes (إعادة المحاولة تعيد تحميل النافذة). إذا ظل الجسر غير متاح، فأصلح التثبيت من الطرفية: شغّل hermes desktop --force-build أو أعد تشغيل hermes update.',
       remoteSignInHint: signInLabel =>
         `يسجّل الخروج من جلسة المتصفح البعيدة المحفوظة، ثم يفتح ${signInLabel}. استخدم البوابة المحلية للتبديل إلى الخلفية المضمنة.`,
       signOutAndSignIn: 'تسجيل الخروج وإعادة تسجيل الدخول',

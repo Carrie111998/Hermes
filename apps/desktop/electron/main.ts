@@ -195,6 +195,7 @@ import {
   resolveGatewayFileBackend
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
+import { probeGatewayRpc } from './gateway-rpc-probe'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
@@ -12103,6 +12104,20 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     )
   }
 
+  // #92927: HTTP + WS-token readiness is not enough. A backend left half-updated
+  // by an interrupted `hermes update` (Windows venv lock, updater exit 2) still
+  // accepts the WS upgrade while its JSON-RPC dispatcher is dead — declaring it
+  // ready boots the renderer into a silent empty shell (dead BOTS pane, no
+  // bridge). Require the one round-trip every desktop surface depends on.
+  const rpcProbe = await probeGatewayRpc(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+  if (!rpcProbe.ok) {
+    throw new Error(
+      `Hermes backend for profile "${profile}" is reachable but its JSON-RPC gateway did not answer (${rpcProbe.reason}). ` +
+        'The install may be broken by an interrupted update — repair with: hermes desktop --force-build, or re-run: hermes update'
+    )
+  }
+
   return {
     baseUrl,
     mode: 'local',
@@ -12539,6 +12554,20 @@ async function startHermes() {
     if (!wsProbe.ok) {
       throw new Error(
         `Local Hermes backend is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
+      )
+    }
+
+    // #92927: same degraded-install guard as the pool spawn — a torn update can
+    // leave the backend HTTP/WS-reachable with a dead JSON-RPC dispatcher, and
+    // boot would silently proceed into the empty-shell state the issue reports
+    // (empty BOTS pane, "Desktop IPC bridge is unavailable"). Require one RPC
+    // round-trip so this boot fails into the recovery overlay instead.
+    const rpcProbe = await probeGatewayRpc(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+    if (!rpcProbe.ok) {
+      throw new Error(
+        `Local Hermes backend is reachable but its JSON-RPC gateway did not answer (${rpcProbe.reason}). ` +
+          'The install may be broken by an interrupted update — repair with: hermes desktop --force-build, or re-run: hermes update'
       )
     }
 
