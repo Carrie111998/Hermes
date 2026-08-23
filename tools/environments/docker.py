@@ -130,6 +130,19 @@ def _sanitize_label_value(value: str) -> str:
     return cleaned
 
 
+def _sanitize_path_component(value: str) -> str:
+    """Coerce *value* into a single filesystem-path-safe segment (alnum + ``_.-``).
+
+    Session keys (e.g. ``session:agent:main:telegram:dm:123``) contain colons,
+    which collide with Docker's ``-v host:container`` mount syntax and make
+    the sandbox path unparseable. Unlike :func:`_sanitize_label_value`, this
+    is not length-capped since filesystem paths have no 63-char limit.
+    """
+    if not isinstance(value, str) or not value:
+        return "unknown"
+    return _LABEL_VALUE_OK_RE.sub("_", value) or "unknown"
+
+
 def _get_active_profile_name() -> str:
     """Return the active Hermes profile name, or ``"default"`` on any error.
 
@@ -980,7 +993,7 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
+            sandbox = get_sandbox_dir() / "docker" / _sanitize_path_component(task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args.extend([

@@ -590,6 +590,30 @@ def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     )
 
 
+def test_persistent_sandbox_dir_strips_colons_from_session_task_id(monkeypatch, tmp_path):
+    """Session-scoped task_ids (``session:agent:main:telegram:dm:<id>``) contain
+    colons. Regression test for #92640: those colons must not reach the
+    persistent sandbox directory used as the ``-v`` mount source, since
+    Docker splits ``-v`` on every colon and a colon-bearing host path makes
+    the daemon reject the mount with exit 125."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        task_id="session:agent:main:telegram:dm:214054159",
+        persistent_filesystem=True,
+    )
+
+    assert ":" not in env._home_dir, f"sandbox home dir still has a colon: {env._home_dir}"
+
+    run_args = _run_args_from_calls(calls)
+    mount_args = [a for a in run_args if a.endswith(":/root")]
+    assert mount_args, f"expected a -v <home>:/root mount in run args: {run_args}"
+    host_side = mount_args[0].rsplit(":/root", 1)[0]
+    assert ":" not in host_side, f"docker -v mount source still has a colon: {mount_args[0]}"
+
+
 def test_labels_attribute_populated_after_init(monkeypatch):
     """``self._labels`` must be set to the same key/value pairs that went onto
     docker run, so subsequent reuse / reaper paths can match without re-running
