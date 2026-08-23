@@ -55,6 +55,10 @@ def _tool_call(call_id: str, arguments: str):
         pytest.param("[]", id="list"),
         pytest.param("", id="empty"),
         pytest.param('{"query": "cut off', id="truncated"),
+        pytest.param(
+            '{"query": "silently lost", "query": "last value wins"}',
+            id="duplicate-key",
+        ),
     ],
 )
 def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(

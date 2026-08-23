@@ -2896,6 +2896,11 @@ def _run_single_child(
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
+                "model": (
+                    getattr(child, "model", None)
+                    if isinstance(getattr(child, "model", None), str)
+                    else None
+                ),
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
@@ -2946,6 +2951,7 @@ def _run_single_child(
                 not _schema_valid
                 and _first_text.strip()
                 and not result.get("interrupted", False)
+                and result.get("failed") is not True
             ):
                 # Exactly one retry turn, carrying the validation errors
                 # verbatim (no schema re-paste — the child already holds
@@ -2974,6 +2980,19 @@ def _run_single_child(
                         ) + int(_retry_result.get("api_calls", 0) or 0)
                     except (TypeError, ValueError):
                         pass
+                    # The correction turn is the terminal turn. Preserve its
+                    # success/failure semantics rather than keeping the first
+                    # (schema-invalid) completion flags and merely swapping text.
+                    for _terminal_field in (
+                        "completed",
+                        "failed",
+                        "interrupted",
+                        "error",
+                        "failure_reason",
+                        "turn_exit_reason",
+                    ):
+                        if _terminal_field in _retry_result:
+                            result[_terminal_field] = _retry_result[_terminal_field]
                     _retry_messages = _retry_result.get("messages")
                     if isinstance(_retry_messages, list) and isinstance(
                         result.get("messages"), list
@@ -3010,6 +3029,13 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        failed = result.get("failed") is True
+        turn_exit_reason = str(result.get("turn_exit_reason") or "")
+        iteration_exhausted = (
+            not completed
+            and not failed
+            and turn_exit_reason.startswith("max_iterations_reached(")
+        )
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -3021,10 +3047,15 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
+        elif failed:
+            status = "failed"
+        elif completed and summary and not _empty_sentinel:
+            status = "completed"
+        elif iteration_exhausted and summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+            # The explicit max-iteration turn reason tells the parent *how*
+            # the task ended without conflating transport/content-policy
+            # failures that also return non-empty user-facing prose.
             status = "completed"
         else:
             status = "failed"
@@ -3070,10 +3101,18 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif failed:
+            exit_reason = (
+                result.get("failure_reason")
+                or turn_exit_reason
+                or "error"
+            )
         elif completed:
             exit_reason = "completed"
-        else:
+        elif iteration_exhausted:
             exit_reason = "max_iterations"
+        else:
+            exit_reason = turn_exit_reason or "incomplete"
 
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
@@ -3279,6 +3318,11 @@ def _run_single_child(
             "status": "error",
             "summary": None,
             "error": str(exc),
+            "model": (
+                getattr(child, "model", None)
+                if isinstance(getattr(child, "model", None), str)
+                else None
+            ),
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
