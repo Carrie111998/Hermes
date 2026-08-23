@@ -17,6 +17,12 @@ import sys
 import tempfile
 import time
 
+from tests.cron.hermes_checkout_shim import (
+    assert_which_is_shim,
+    install_checkout_hermes_shim,
+    prepend_shim_to_path,
+)
+
 WT = str(Path(__file__).resolve().parents[2])
 FAKE_WORKER = str(Path(__file__).parent / "_fake_worker.py")
 PY = sys.executable
@@ -35,7 +41,7 @@ def make_spawn_fn(home: str):
             "PYTHONPATH": WT,
             "HERMES_KANBAN_TASK": task.id,
             "HERMES_KANBAN_WORKSPACE": workspace,
-            "PATH": f"{os.path.dirname(PY)}:{os.environ.get('PATH','')}",
+            "PATH": prepend_shim_to_path(os.path.dirname(PY), os.environ.get("PATH", "")),
         }
         log_f = open(log_path, "ab")
         proc = subprocess.Popen(
@@ -62,13 +68,9 @@ def main():
     # hermes_cli.main. We do this by putting a shim on PATH.
     shim_dir = os.path.join(home, "bin")
     os.makedirs(shim_dir, exist_ok=True)
-    shim_path = os.path.join(shim_dir, "hermes")
-    with open(shim_path, "w") as f:
-        f.write(f"""#!/bin/sh
-exec {PY} -m hermes_cli.main "$@"
-""")
-    os.chmod(shim_path, 0o755)
-    os.environ["PATH"] = f"{shim_dir}:{os.environ.get('PATH','')}"
+    install_checkout_hermes_shim(shim_dir, python_exe=PY)
+    os.environ["PATH"] = prepend_shim_to_path(shim_dir, os.environ.get("PATH", ""))
+    assert_which_is_shim(shim_dir)
 
     kb.init_db()
     conn = kb.connect()
