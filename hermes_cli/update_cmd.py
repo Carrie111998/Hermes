@@ -1,1 +1,1 @@
-$import:agent-tools/push_update_cmd_exact.json:files[0].content
+__CURSOR_WORKSPACE_FILE__:hermes_cli/update_cmd.py
