@@ -537,12 +537,21 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (includesBlockingClarifyTrigger(parsed.messages)) {
-            if (stream) {
-              streamScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
-            } else {
-              nonStreamingScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
+            // The trigger remains in history after the user answers. Emit the
+            // blocking prompt only before its tool result, then let the resumed
+            // turn fall through to the normal canned response.
+            const hasToolResult =
+              Array.isArray(parsed.messages) &&
+              parsed.messages.some((message: { role?: string }) => message?.role === 'tool')
+
+            if (!hasToolResult) {
+              if (stream) {
+                streamScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
+              } else {
+                nonStreamingScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
+              }
+              return
             }
-            return
           }
 
           if (isQueueStopTrigger) {

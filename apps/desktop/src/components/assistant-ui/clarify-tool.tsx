@@ -33,6 +33,7 @@ import {
   normalizeChoices,
   RECOMMENDED_LABEL,
   sessionClarifyRequest,
+  setClarifyRequest,
   warnDroppedChoices
 } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
@@ -432,6 +433,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
   // trailing index (=== choices.length) is the "Other" free-text row.
   const [activeIndex, setActiveIndex] = useState(0)
   const [otherFocused, setOtherFocused] = useState(false)
+  const submittingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   // Race: tool.start fires a tick before clarify.request, so request_id
@@ -443,6 +445,10 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
 
   const respond = useCallback(
     async (answer: string) => {
+      if (submittingRef.current) {
+        return
+      }
+
       if (!ready || !matchingRequest) {
         notifyError(new Error(copy.notReady), copy.sendFailed)
 
@@ -455,7 +461,12 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
         return
       }
 
+      submittingRef.current = true
       setSubmitting(true)
+      // The answer is already decided. Clear first so the live card cannot be
+      // clicked again while the RPC is in flight or linger beside its settled
+      // tool row. Restore the exact request if delivery fails.
+      clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
 
       try {
         await gateway.request<{ ok?: boolean }>('clarify.respond', {
@@ -463,10 +474,11 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
           answer
         })
         triggerHaptic('submit')
-        clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
         // tool.complete lands next → ClarifyToolSettled.
       } catch (error) {
         notifyError(error, copy.sendFailed)
+        setClarifyRequest(matchingRequest)
+        submittingRef.current = false
         setSubmitting(false)
       }
     },
@@ -474,9 +486,8 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
   )
 
   const trimmedDraft = draft.trim()
-  // The answer is whichever input is active: a picked choice, or typed text.
-  // Picking a choice no longer fires immediately — it selects, then the user
-  // confirms with Continue (or Enter from the field).
+  // The answer is whichever input is active: a staged multi-select choice, a
+  // failed single-select retry, or typed text.
 
   const selectedAnswer = multiSelect
     ? selectedChoices.length > 0
@@ -490,16 +501,20 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
     (choice: string, index: number) => {
       // Picking a choice and typing are mutually exclusive answers.
       setDraft('')
-      setSelectedChoices(selected => {
-        if (!multiSelect) {
-          return [choice]
-        }
+      setActiveIndex(index)
 
+      if (!multiSelect) {
+        setSelectedChoices([choice])
+        void respond(choice)
+
+        return
+      }
+
+      setSelectedChoices(selected => {
         return selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
       })
-      setActiveIndex(index)
     },
-    [multiSelect]
+    [multiSelect, respond]
   )
 
   // Keep the cursor in range when the choice set changes (never past "Other").
@@ -582,8 +597,9 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
     [submitAnswer]
   )
 
-  // Arrow keys move a visual cursor, 1-9 and A/B/C… pick directly, and Enter
-  // confirms the current answer (or acts on the highlighted row). Stands down
+  // Arrow keys move a visual cursor, 1-9 and A/B/C… answer a single-select
+  // immediately (or stage a multi-select), and Enter acts on the highlighted
+  // row. Stands down
   // whenever a focusable control (a field, a choice button, the action bar) is
   // focused, so it never eats keystrokes meant for the composer, the Other box,
   // or a button the user tabbed to.
@@ -768,18 +784,20 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
         <Button disabled={submitting} onClick={() => void respond('')} size="xs" type="button" variant="text">
           {copy.skip}
         </Button>
-        <Button disabled={submitting || !pendingAnswer} size="xs" type="submit">
-          {submitting ? (
-            <Loader2 className="size-3 animate-spin" />
-          ) : (
-            <>
-              {copy.continueLabel}
-              <span aria-hidden className="ml-0.5 text-[0.625rem] opacity-70">
-                ⏎
-              </span>
-            </>
-          )}
-        </Button>
+        {!hasChoices || multiSelect || Boolean(trimmedDraft) ? (
+          <Button disabled={submitting || !pendingAnswer} size="xs" type="submit">
+            {submitting ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <>
+                {copy.continueLabel}
+                <span aria-hidden className="ml-0.5 text-[0.625rem] opacity-70">
+                  ⏎
+                </span>
+              </>
+            )}
+          </Button>
+        ) : null}
       </div>
     </form>
   )

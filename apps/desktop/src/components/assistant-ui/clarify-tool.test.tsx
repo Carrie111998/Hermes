@@ -117,22 +117,65 @@ describe('ClarifyTool choice selection', () => {
     })
   })
 
-  it('keeps single-select replacement and plain-string submission', async () => {
+  it('submits a single-select choice on the first click without Continue', async () => {
     const request = renderLiveClarify()
     const staging = screen.getByRole('button', { name: /staging/ })
-    const production = screen.getByRole('button', { name: /production/ })
+
+    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
+    fireEvent.click(staging)
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'staging',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('suppresses a duplicate single-select response from rapid clicks', async () => {
+    const request = renderLiveClarify()
+    const staging = screen.getByRole('button', { name: /staging/ })
 
     fireEvent.click(staging)
-    fireEvent.click(production)
+    fireEvent.click(staging)
 
-    expect(staging.getAttribute('aria-pressed')).toBe('false')
-    expect(production.getAttribute('aria-pressed')).toBe('true')
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledTimes(1)
+    })
+  })
 
+  it('restores a single-select card when sending the answer fails', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('offline'))
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledTimes(1)
+      expect((screen.getByRole('button', { name: /staging/ }) as HTMLButtonElement).disabled).toBe(false)
+    })
+  })
+
+  it('keeps Continue for a typed Other answer', async () => {
+    const request = renderLiveClarify()
+    const other = screen.getByPlaceholderText(/Other/)
+
+    fireEvent.change(other, { target: { value: 'canary' } })
     fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
 
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
-        answer: 'production',
+        answer: 'canary',
         request_id: 'request-1'
       })
     })
@@ -309,15 +352,17 @@ describe('ClarifyTool keyboard navigation', () => {
     expect(other.closest('label')?.getAttribute('data-highlighted')).toBe('true')
   })
 
-  it('selects by number and confirms the answer with Enter', async () => {
+  it.each([
+    ['2', 'production'],
+    ['a', 'staging']
+  ])('submits a single-select answer directly with shortcut %s', async (key, answer) => {
     const request = renderLiveClarify()
 
-    fireEvent.keyDown(window, { key: '2' })
-    fireEvent.keyDown(window, { key: 'Enter' })
+    fireEvent.keyDown(window, { key })
 
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
-        answer: 'production',
+        answer,
         request_id: 'request-1'
       })
     })
@@ -390,7 +435,6 @@ describe('ClarifyTool recommended option', () => {
     expect(recommended.querySelector('.text-\\(--ui-text-tertiary\\)')?.textContent).toBe('(Recommended)')
 
     fireEvent.click(recommended)
-    fireEvent.keyDown(window, { key: 'Enter' })
 
     // The decorated string goes back verbatim; the tool strips the label before
     // the agent ever sees the answer.
