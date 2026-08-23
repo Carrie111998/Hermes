@@ -1619,6 +1619,10 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "models_discovered",
         "context_length", "rate_limit_delay",
+        # Output cap consumed by _lift_max_output_tokens() /
+        # resolve_runtime_provider() onto AIAgent.max_tokens (per-provider
+        # variant of the documented global model.max_tokens).
+        "max_tokens", "max_output_tokens",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers", "capabilities",
         "ssl_ca_cert", "ssl_verify",
@@ -1758,6 +1762,15 @@ def _normalize_custom_provider_entry(
     context_length = entry.get("context_length")
     if isinstance(context_length, int) and context_length > 0:
         normalized["context_length"] = context_length
+
+    # Per-provider output cap → _lift_max_output_tokens() /
+    # resolve_runtime_provider() map this onto AIAgent.max_tokens when the
+    # global model.max_tokens isn't set (gateway/run.py).
+    for _mot_key in ("max_output_tokens", "max_tokens"):
+        _mot = entry.get(_mot_key)
+        if isinstance(_mot, int) and _mot > 0:
+            normalized["max_output_tokens"] = _mot
+            break
 
     rate_limit_delay = entry.get("rate_limit_delay")
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
