@@ -11,6 +11,7 @@ from gateway.runtime_footer import (
     _home_relative_cwd,
     _model_short,
     build_footer_line,
+    count_turn_tool_calls,
     format_runtime_footer,
     resolve_footer_config,
 )
@@ -244,6 +245,104 @@ def test_build_footer_line_threads_turn_seconds(monkeypatch):
         turn_seconds=22.0,
     )
     assert out == "gpt-5.4 · 22s"
+
+
+def test_format_footer_operational_fields_in_requested_order():
+    out = format_runtime_footer(
+        bot="dante",
+        model="openai-codex/gpt-5.6",
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+        context_tokens=18_000,
+        context_length=100_000,
+        turn_seconds=24.0,
+        tool_calls=3,
+        fields=("profile", "model", "reasoning", "context_pct", "latency", "tool_calls"),
+    )
+    assert out == "Dante · gpt-5.6 · reasoning xhigh · 18% · 24s · 3 outils"
+
+
+@pytest.mark.parametrize(
+    "reasoning_config,expected",
+    [
+        ({"enabled": False}, "reasoning none"),
+        ({"enabled": True, "effort": "low"}, "reasoning low"),
+        (None, "reasoning medium"),
+    ],
+)
+def test_format_footer_reasoning_level(reasoning_config, expected):
+    out = format_runtime_footer(
+        model="m",
+        reasoning_config=reasoning_config,
+        context_tokens=0,
+        context_length=None,
+        fields=("reasoning",),
+    )
+    assert out == expected
+
+
+def test_format_footer_context_warns_only_near_compression():
+    normal = format_runtime_footer(
+        model="m", context_tokens=69, context_length=100, fields=("context_pct",)
+    )
+    warning = format_runtime_footer(
+        model="m", context_tokens=70, context_length=100, fields=("context_pct",)
+    )
+    assert normal == "69%"
+    assert warning == "⚠ 70%"
+
+
+def test_format_footer_marks_fallback_only_when_activated():
+    primary = format_runtime_footer(
+        model="gpt-5.6", context_tokens=0, context_length=None,
+        fallback_activated=False, fields=("fallback",),
+    )
+    fallback = format_runtime_footer(
+        model="gpt-5.6", context_tokens=0, context_length=None,
+        fallback_activated=True, fields=("fallback",),
+    )
+    assert primary == ""
+    assert fallback == "fallback"
+
+
+def test_count_turn_tool_calls_counts_batched_calls_after_history():
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "tool_calls": [{"id": "1"}, {"id": "2"}]},
+        {"role": "tool", "tool_call_id": "1", "content": "a"},
+        {"role": "tool", "tool_call_id": "2", "content": "b"},
+        {"role": "assistant", "tool_calls": [{"id": "3"}]},
+    ]
+    assert count_turn_tool_calls(messages, history_offset=2) == 3
+
+
+def test_count_turn_tool_calls_uses_latest_user_after_compaction():
+    messages = [
+        {"role": "user", "content": "compacted history"},
+        {"role": "assistant", "tool_calls": [{"id": "old"}]},
+        {"role": "user", "content": "current turn"},
+        {"role": "assistant", "tool_calls": [{"id": "new"}]},
+    ]
+    assert count_turn_tool_calls(messages, history_offset=99) == 1
+
+
+def test_build_footer_line_threads_operational_metadata():
+    out = build_footer_line(
+        user_config={"display": {"runtime_footer": {
+            "enabled": True,
+            "fields": ["bot", "model", "reasoning", "tool_calls", "fallback"],
+        }}},
+        platform_key="discord",
+        bot="dante",
+        model="gpt-5.6",
+        reasoning_config={"enabled": True, "effort": "high"},
+        context_tokens=0,
+        context_length=None,
+        tool_calls=2,
+        fallback_activated=True,
+    )
+    assert out == "Dante · gpt-5.6 · reasoning high · 2 outils · fallback"
 
 
 # ---------------------------------------------------------------------------

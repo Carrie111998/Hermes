@@ -12,9 +12,13 @@ Config (``~/.hermes/config.yaml``)::
         fields: [model, context_pct, cwd]   # order shown; drop any to hide
 
 Available fields:
+    bot          - active Hermes profile / bot name (``Dante``)
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
+    reasoning    - effective reasoning effort (``reasoning high``)
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
+    tool_calls   - tool executions in this turn (``3 outils``)
+    fallback     - rendered only when the fallback route was activated
     cwd          — home-relative working dir (``~``)
 
 ``latency`` is opt-in: it is NOT in the default field set, so a footer whose
@@ -60,6 +64,47 @@ def _model_short(model: Optional[str]) -> str:
     if not model:
         return ""
     return model.rsplit("/", 1)[-1]
+
+
+def _bot_label(bot: Optional[str]) -> str:
+    """Humanize a profile identifier without inventing a separate bot name."""
+    if not bot:
+        return ""
+    return str(bot).replace("-", " ").replace("_", " ").strip().title()
+
+
+def _reasoning_level(reasoning_config: dict[str, Any] | None) -> str:
+    """Return the effective user-facing reasoning level."""
+    if reasoning_config and reasoning_config.get("enabled") is False:
+        return "none"
+    if reasoning_config:
+        effort = str(reasoning_config.get("effort") or "").strip().lower()
+        if effort:
+            return effort
+    return "medium"
+
+
+def count_turn_tool_calls(messages: Any, history_offset: int = 0) -> int:
+    """Count assistant tool calls produced after the prior-history boundary."""
+    if not isinstance(messages, list):
+        return 0
+    if 0 <= history_offset <= len(messages):
+        offset = history_offset
+    else:
+        offset = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, dict) and message.get("role") == "user":
+                offset = index + 1
+                break
+    count = 0
+    for message in messages[offset:]:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            count += len(calls)
+    return count
 
 
 def resolve_footer_config(
@@ -113,6 +158,10 @@ def format_runtime_footer(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    bot: Optional[str] = None,
+    reasoning_config: dict[str, Any] | None = None,
+    tool_calls: Optional[int] = None,
+    fallback_activated: bool = False,
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
@@ -124,14 +173,20 @@ def format_runtime_footer(
     """
     parts: list[str] = []
     for field in fields:
-        if field == "model":
+        if field in {"bot", "profile"}:
+            label = _bot_label(bot)
+            if label:
+                parts.append(label)
+        elif field == "model":
             m = _model_short(model)
             if m:
                 parts.append(m)
+        elif field == "reasoning":
+            parts.append(f"reasoning {_reasoning_level(reasoning_config)}")
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(f"{pct}%")
+                parts.append(f"{'⚠ ' if pct >= 70 else ''}{pct}%")
         elif field == "latency":
             # Wall-clock turn duration. Skipped when the caller supplied no
             # timing (call sites that don't measure) or the value is negative.
@@ -141,6 +196,12 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "tool_calls":
+            if tool_calls is not None and tool_calls >= 0:
+                parts.append(f"{tool_calls} outil{'s' if tool_calls != 1 else ''}")
+        elif field == "fallback":
+            if fallback_activated:
+                parts.append("fallback")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -155,6 +216,10 @@ def build_footer_line(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    bot: Optional[str] = None,
+    reasoning_config: dict[str, Any] | None = None,
+    tool_calls: Optional[int] = None,
+    fallback_activated: bool = False,
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
 ) -> str:
@@ -175,6 +240,10 @@ def build_footer_line(
         model=model,
         context_tokens=context_tokens,
         context_length=context_length,
+        bot=bot,
+        reasoning_config=reasoning_config,
+        tool_calls=tool_calls,
+        fallback_activated=fallback_activated,
         cwd=cwd,
         turn_seconds=turn_seconds,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
