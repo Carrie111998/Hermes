@@ -1016,7 +1016,9 @@ class HonchoSessionManager:
             if session.honcho_session_id in self._sessions_cache:
                 ctx = self._authed_call(
                     "session summary fetch",
-                    lambda: self._sdk_session(session.honcho_session_id).context(summary=True),
+                    lambda: self._sdk_session(session.honcho_session_id).context(
+                        summary=True, tokens=self._context_tokens
+                    ),
                 )
                 if ctx.summary and getattr(ctx.summary, "content", None):
                     result["summary"] = ctx.summary.content
@@ -1368,6 +1370,7 @@ class HonchoSessionManager:
                 "session context fetch",
                 lambda: self._sdk_session(session.honcho_session_id).context(
                     summary=True,
+                    tokens=self._context_tokens,
                     peer_target=target_peer_id or observer_peer_id,
                     peer_perspective=observer_peer_id,
                 ),
