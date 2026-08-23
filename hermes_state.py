@@ -2475,7 +2475,9 @@ def preflight_db_writability(
             _ensure_writable(p)
 
 
-def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
+def _connect_repair_durable(
+    db_path: Path, *, timeout: float = 5.0
+) -> sqlite3.Connection:
     """``sqlite3.connect`` for the repair/probe paths, with macOS write barriers.
 
     These paths open ``state.db`` directly rather than through ``SessionDB``
@@ -2506,7 +2508,12 @@ def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
     rewrite the whole file call :func:`_reapply_durability_barriers` once the
     schema parses again, which is the point at which the pragmas can stick.
     """
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    if timeout == 5.0:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+    else:
+        conn = sqlite3.connect(
+            str(db_path), timeout=timeout, isolation_level=None
+        )
     _reapply_durability_barriers(conn)
     return conn
 
@@ -2528,6 +2535,238 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         return False
     except Exception:
         return False
+
+
+_REPAIR_COPY_PAGES = 256
+_REPAIR_COPY_TIMEOUT_SECONDS = 120.0
+
+
+def _remove_repair_candidate(candidate: Path) -> Optional[str]:
+    """Remove a disposable candidate database and all of its sidecars."""
+    failures: list[str] = []
+    for suffix in (*_DB_SIDECAR_SUFFIXES, ""):
+        path = candidate if not suffix else candidate.with_name(candidate.name + suffix)
+        for attempt in range(10):
+            try:
+                path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError as exc:
+                if _IS_WINDOWS and attempt < 9:
+                    time.sleep(0.05)
+                    continue
+                failures.append(f"{path}: {exc}")
+                break
+            except OSError as exc:
+                failures.append(f"{path}: {exc}")
+                break
+    return "; ".join(failures) or None
+
+
+def _capture_repair_bundle(source: Path, bundle: Path) -> None:
+    """Capture the exact main/sidecar bytes for rollback."""
+    import shutil
+
+    cleanup_error = _remove_repair_candidate(bundle)
+    if cleanup_error is not None:
+        raise OSError(f"could not clear repair rollback bundle: {cleanup_error}")
+    for suffix in (*_DB_SIDECAR_SUFFIXES, ""):
+        source_path = source if not suffix else source.with_name(source.name + suffix)
+        if source_path.exists():
+            destination_path = (
+                bundle if not suffix else bundle.with_name(bundle.name + suffix)
+            )
+            shutil.copyfile(source_path, destination_path)
+
+
+def _restore_repair_bundle(bundle: Path, destination: Path) -> None:
+    """Restore exact rollback bytes without replacing the destination inode."""
+    import shutil
+
+    members = ("", *_DB_SIDECAR_SUFFIXES)
+    for suffix in members:
+        source_path = bundle if not suffix else bundle.with_name(bundle.name + suffix)
+        destination_path = (
+            destination if not suffix else destination.with_name(destination.name + suffix)
+        )
+        if source_path.exists():
+            shutil.copyfile(source_path, destination_path)
+        else:
+            try:
+                destination_path.unlink(missing_ok=True)
+            except PermissionError:
+                if suffix:
+                    # A journal/WAL sidecar created by the failed promotion
+                    # may remain locked until the guarded connection closes.
+                    # It did not exist in the preserved generation and is safe
+                    # to retire during the subsequent cleanup pass.
+                    continue
+                raise
+
+
+def _copy_repair_snapshot(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    source_connection: Optional[sqlite3.Connection] = None,
+    destination_connection: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Copy a complete SQLite image without replacing a live pathname.
+
+    ``Connection.backup`` reads committed WAL frames and writes the destination
+    through SQLite's own transaction.  The caller may retain a guarded source
+    or destination connection so staging and promotion share one ownership
+    boundary.  A progress deadline prevents a stalled copy from holding the
+    repair lock forever.
+    """
+    deadline = time.monotonic() + _REPAIR_COPY_TIMEOUT_SECONDS
+    source = source_connection or _connect_repair_durable(source_path)
+    destination = destination_connection
+    own_source = source_connection is None
+    own_destination = destination_connection is None
+    try:
+        if destination is None:
+            cleanup_error = _remove_repair_candidate(destination_path)
+            if cleanup_error is not None:
+                raise OSError(
+                    f"could not clear repair candidate {destination_path}: "
+                    f"{cleanup_error}"
+                )
+            destination = _connect_repair_durable(destination_path)
+        elif destination.in_transaction:
+            raise sqlite3.ProgrammingError(
+                "repair snapshot destination must not have an active transaction"
+            )
+
+        def progress(_status: int, _remaining: int, _total: int) -> None:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out copying repair snapshot after "
+                    f"{_REPAIR_COPY_TIMEOUT_SECONDS:.0f}s"
+                )
+
+        source.backup(
+            destination,
+            pages=_REPAIR_COPY_PAGES,
+            progress=progress,
+            sleep=_REPAIR_LOCK_POLL_SECONDS,
+        )
+    finally:
+        if own_destination and destination is not None:
+            destination.close()
+            destination = None
+        if own_source:
+            source.close()
+            source = None
+        # CPython normally releases the SQLite handle at close(), but the
+        # Windows sqlite3 extension can retain a backup object until its last
+        # temporary reference is collected.  Force that release before the
+        # caller removes the candidate path.
+        import gc
+
+        gc.collect()
+
+
+def _promote_repair_candidate(
+    candidate_path: Path,
+    live_path: Path,
+    live_connection: sqlite3.Connection,
+) -> Optional[str]:
+    """Promote a candidate with exact and logical rollback images."""
+    rollback = live_path.with_name(live_path.name + ".repair-rollback")
+    raw_rollback = live_path.with_name(live_path.name + ".repair-rollback-bytes")
+    cleanup_error = _remove_repair_candidate(rollback)
+    raw_cleanup_error = _remove_repair_candidate(raw_rollback)
+    if cleanup_error or raw_cleanup_error:
+        raise OSError(
+            "could not clear repair rollback artifacts: "
+            f"{cleanup_error or raw_cleanup_error}"
+        )
+
+    try:
+        _capture_repair_bundle(live_path, raw_rollback)
+        _copy_repair_snapshot(
+            live_path,
+            rollback,
+            source_connection=live_connection,
+        )
+        try:
+            _copy_repair_snapshot(
+                candidate_path,
+                live_path,
+                destination_connection=live_connection,
+            )
+        except (OSError, sqlite3.Error, TimeoutError) as promotion_error:
+            raw_restore_error: Optional[str] = None
+            try:
+                _restore_repair_bundle(raw_rollback, live_path)
+            except (OSError, sqlite3.Error) as exc:
+                raw_restore_error = str(exc)
+
+            if raw_restore_error is not None:
+                try:
+                    _copy_repair_snapshot(
+                        rollback,
+                        live_path,
+                        destination_connection=live_connection,
+                    )
+                except (OSError, sqlite3.Error, TimeoutError) as rollback_error:
+                    raise RuntimeError(
+                        "repair promotion failed and neither exact nor logical "
+                        "rollback could restore the previous state.db generation: "
+                        f"raw={raw_restore_error}; logical={rollback_error}"
+                    ) from promotion_error
+                logger.warning(
+                    "Exact state.db rollback failed; logical rollback succeeded: %s",
+                    raw_restore_error,
+                )
+            raise
+    finally:
+        cleanup_errors = [
+            error
+            for error in (
+                _remove_repair_candidate(rollback),
+                _remove_repair_candidate(raw_rollback),
+            )
+            if error
+        ]
+        cleanup_error = "; ".join(cleanup_errors) or None
+        if cleanup_error is not None:
+            logger.warning(
+                "Could not remove state.db repair rollback artifacts: %s",
+                cleanup_error,
+            )
+    return cleanup_error
+
+
+@contextmanager
+def _exclusive_repair_db_guard(db_path: Path):
+    """Hold SQLite writer exclusion across staging, strategies, and promotion."""
+    guard: Optional[sqlite3.Connection] = None
+    try:
+        guard = _connect_repair_durable(db_path, timeout=0.0)
+        guard.execute("PRAGMA locking_mode=EXCLUSIVE")
+        guard.execute("BEGIN EXCLUSIVE")
+        guard.execute("ROLLBACK")
+    except (OSError, sqlite3.Error) as exc:
+        if guard is not None:
+            try:
+                guard.execute("PRAGMA locking_mode=NORMAL")
+            except Exception:
+                pass
+            guard.close()
+        yield None, exc
+        return
+
+    try:
+        yield guard, None
+    finally:
+        try:
+            guard.execute("PRAGMA locking_mode=NORMAL")
+        except Exception:
+            pass
+        guard.close()
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
@@ -2813,21 +3052,67 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         # file re-keys the ledger and restarts the count: that keeps a
         # genuinely NEW corruption event from inheriting a stale budget,
         # while the backup dedupe/cap above bounds the disk cost either way.)
-        _record_repair_outcome(db_path, repaired=bool(result.get("repaired")))
+        attempted = bool(result.pop("_repair_attempted", False))
+        if attempted or result.get("repaired"):
+            _record_repair_outcome(
+                db_path, repaired=bool(result.get("repaired"))
+            )
         return result
+
+
+def _repair_failure_consumes_attempt(exc: BaseException) -> bool:
+    """Return whether *exc* proves deterministic SQLite corruption."""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(error_code, int):
+        return (error_code & 0xFF) in (
+            sqlite3.SQLITE_CORRUPT,
+            sqlite3.SQLITE_NOTADB,
+        )
+    message = str(exc).lower()
+    return (
+        "file is not a database" in message
+        or "database disk image is malformed" in message
+    )
+
+
+def _repair_reason_consumes_attempt(reason: Optional[str]) -> bool:
+    """Classify a health-probe reason without losing its type information."""
+    if not reason:
+        return False
+    message = reason.lower()
+    environmental_markers = (
+        "busy",
+        "disk is full",
+        "disk full",
+        "i/o error",
+        "input/output error",
+        "locked",
+        "permission",
+        "read-only",
+        "readonly",
+        "timed out",
+        "timeout",
+        "unable to open database file",
+    )
+    return not any(marker in message for marker in environmental_markers)
 
 
 def _repair_state_db_schema_locked(
     db_path: Path, *, backup: bool, report: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Repair strategies for :func:`repair_state_db_schema`.
+    """Repair an isolated candidate while the canonical database is guarded."""
+    candidate = db_path.with_name(db_path.name + ".repair-candidate")
+    cleanup_error = _remove_repair_candidate(candidate)
+    if cleanup_error is not None:
+        report["error"] = (
+            "could not remove a stale repair candidate before state.db repair: "
+            f"{cleanup_error}"
+        )
+        report["cleanup_error"] = cleanup_error
+        return report
 
-    Caller must hold the cross-process repair lock for *db_path*.
-    """
-    # Re-probe under the lock: a process we queued behind may have just
-    # repaired the file, in which case redoing the surgery would undo its
-    # work on a now-healthy DB (the repair/re-corrupt cascade this lock
-    # exists to break).
     if _db_opens_cleanly(db_path) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
@@ -2837,28 +3122,107 @@ def _repair_state_db_schema_locked(
         bpath, backup_error = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
         if bpath is None:
-            # HARD STOP (#69603): every strategy below mutates the damaged
-            # file in place (FTS rebuild, REINDEX, writable_schema surgery,
-            # VACUUM). Without the pre-repair backup, the damaged DB is the
-            # only copy of the user's data — a failed or interrupted repair
-            # would then be unrecoverable. Abort and surface the reason
-            # instead of proceeding fail-open.
             report["error"] = (
-                "pre-repair backup refused; aborting schema repair to avoid "
-                f"mutating the only copy of the damaged DB: {backup_error}"
+                "pre-repair backup refused; aborting schema repair to preserve "
+                f"the only damaged source: {backup_error}"
             )
-            logger.error("state.db repair aborted: %s", report["error"])
             return report
 
-    # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
-    # The FTS5 'rebuild' command rewrites the internal index from the canonical
-    # content table. This is the recommended, least-destructive recovery for a
-    # corrupt FTS index that rejects message writes while reads still succeed.
-    try:
-        conn = _connect_repair_durable(db_path)
+    with _exclusive_repair_db_guard(db_path) as (guard, guard_error):
+        if guard is None:
+            report["error"] = (
+                "could not acquire exclusive state.db repair ownership; "
+                f"repair was not attempted: {guard_error}"
+            )
+            if guard_error is not None and _repair_failure_consumes_attempt(
+                guard_error
+            ):
+                report["_repair_attempted"] = True
+            return report
+
         try:
-            # The cjk index can only be rebuilt with its tokenizer loaded;
-            # best-effort (a tokenizer-less host skips it at the probe below).
+            _copy_repair_snapshot(db_path, candidate, source_connection=guard)
+        except (OSError, sqlite3.Error, TimeoutError) as exc:
+            report["error"] = (
+                f"could not stage a complete repair candidate for {db_path}: {exc}"
+            )
+            return report
+
+        try:
+            _run_repair_strategies(candidate, report)
+            if report.get("repaired"):
+                try:
+                    promotion_cleanup_error = _promote_repair_candidate(
+                        candidate,
+                        db_path,
+                        guard,
+                    )
+                    if promotion_cleanup_error is not None:
+                        report["cleanup_error"] = promotion_cleanup_error
+                        report["error"] = (
+                            "repair rollback cleanup failed: "
+                            f"{promotion_cleanup_error}"
+                        )
+                except (OSError, sqlite3.Error, TimeoutError, RuntimeError) as exc:
+                    report["repaired"] = False
+                    report["strategy"] = None
+                    report["_repair_attempted"] = _repair_failure_consumes_attempt(
+                        exc
+                    )
+                    report["error"] = (
+                        "verified repair candidate could not be promoted "
+                        f"transactionally: {exc}"
+                    )
+                else:
+                    logger.warning(
+                        "state.db repaired via '%s' and promoted transactionally: %s",
+                        report.get("strategy"),
+                        db_path,
+                    )
+
+            if not report.get("repaired"):
+                logger.error(
+                    "state.db schema repair could not recover %s automatically "
+                    "(canonical source was preserved; backup: %s); manual "
+                    "recovery may be required.",
+                    db_path,
+                    report["backup_path"],
+                )
+            return report
+        finally:
+            cleanup_error = _remove_repair_candidate(candidate)
+            if cleanup_error is not None:
+                report["cleanup_error"] = cleanup_error
+                report["error"] = (
+                    f"{report.get('error') + '; ' if report.get('error') else ''}"
+                    "repair candidate cleanup failed: "
+                    f"{cleanup_error}"
+                )
+
+
+def _run_repair_strategies(
+    target_path: Path, report: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Run the repair ladder against an isolated candidate only."""
+
+    def strategy_error(label: str, exc: sqlite3.DatabaseError) -> bool:
+        if _repair_failure_consumes_attempt(exc):
+            report["_repair_attempted"] = True
+            report["error"] = str(exc)
+            logger.warning("state.db %s repair pass failed: %s", label, exc)
+            return True
+        report["_repair_attempted"] = False
+        report["error"] = str(exc)
+        logger.error(
+            "state.db %s repair pass stopped by an environmental failure: %s",
+            label,
+            exc,
+        )
+        return False
+
+    try:
+        conn = _connect_repair_durable(target_path)
+        try:
             load_fts5_cjk_extension(conn)
             for table_name in (
                 "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
@@ -2867,52 +3231,45 @@ def _repair_state_db_schema_locked(
                     conn.execute(
                         f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
                     )
-                except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off / cjk not
-                    # present or tokenizer unavailable) — skip it.
-                    continue
+                except sqlite3.OperationalError as exc:
+                    message = str(exc).lower()
+                    if (
+                        "no such table" not in message
+                        and "no such tokenizer" not in message
+                    ):
+                        raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(target_path) is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
-            logger.warning(
-                "state.db FTS indexes rebuilt in place (schema preserved): %s",
-                db_path,
-            )
+            report["error"] = None
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
+        if not strategy_error("FTS rebuild", exc):
+            return report
 
-    # ── Strategy 0.5: rebuild stale B-tree indexes (#63386) ──
-    # PRAGMA integrity_check can report "wrong # of entries in index" when a
-    # B-tree index (e.g. idx_sessions_handoff_state) falls out of sync with its
-    # base table. REINDEX rewrites the index b-tree from the canonical table
-    # rows using the existing index definition, fixing the mismatch without
-    # touching data or FTS schema.
     try:
-        conn = _connect_repair_durable(db_path)
+        conn = _connect_repair_durable(target_path)
         try:
-            # REINDEX rewrites every index b-tree; take the barriers now that
-            # the schema parses, in case the open-time attempt was refused.
             _reapply_durability_barriers(conn)
             conn.execute("REINDEX")
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(target_path) is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
-            logger.warning(
-                "state.db B-tree indexes rebuilt via REINDEX: %s", db_path
-            )
+            report["error"] = None
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db REINDEX pass failed: %s", exc)
+        if not strategy_error("REINDEX", exc):
+            return report
 
-    # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
     try:
-        conn = _connect_repair_durable(db_path)
+        conn = _connect_repair_durable(target_path)
         try:
             conn.execute("PRAGMA writable_schema=ON")
             dupes = conn.execute(
@@ -2921,8 +3278,8 @@ def _repair_state_db_schema_locked(
             ).fetchall()
             for type_, name, _count, keep in dupes:
                 conn.execute(
-                    "DELETE FROM sqlite_master "
-                    "WHERE type IS ? AND name IS ? AND rowid <> ?",
+                    "DELETE FROM sqlite_master WHERE type IS ? AND name IS ? "
+                    "AND rowid <> ?",
                     (type_, name, keep),
                 )
             if dupes:
@@ -2931,52 +3288,40 @@ def _repair_state_db_schema_locked(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(target_path) is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
-            logger.warning(
-                "state.db schema repaired by de-duplicating sqlite_master "
-                "(FTS index preserved): %s", db_path
-            )
+            report["error"] = None
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db dedup repair pass failed: %s", exc)
+        if not strategy_error("sqlite_master de-duplication", exc):
+            return report
 
-    # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     try:
-        conn = _connect_repair_durable(db_path)
+        conn = _connect_repair_durable(target_path)
         try:
             conn.execute("PRAGMA writable_schema=ON")
             conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
             _bump_schema_cookie(conn)
             conn.execute("PRAGMA writable_schema=OFF")
             conn.commit()
-            # The schema is repaired and parseable now, so the barriers can
-            # finally stick — and VACUUM, which rewrites the entire file, is
-            # the single most damaging operation to lose halfway.
             _reapply_durability_barriers(conn)
             conn.execute("VACUUM")
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(target_path)
         if reason is None:
+            report["_repair_attempted"] = True
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
-            logger.warning(
-                "state.db schema repaired by dropping FTS schema; indexes "
-                "will rebuild from messages on next open: %s", db_path
-            )
+            report["error"] = None
             return report
+        report["_repair_attempted"] = _repair_reason_consumes_attempt(reason)
         report["error"] = reason
     except sqlite3.DatabaseError as exc:
-        report["error"] = str(exc)
+        strategy_error("drop-FTS/VACUUM", exc)
 
-    if not report["repaired"]:
-        logger.error(
-            "state.db schema repair could not recover %s automatically "
-            "(backup: %s); manual restore from backup may be required.",
-            db_path, report["backup_path"],
-        )
     return report
 
 
