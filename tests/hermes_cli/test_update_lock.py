@@ -32,6 +32,7 @@ from hermes_cli.update_lock import (
     read_live_update,
     update_marker_path,
 )
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 # A pid no live process owns. os.kill(pid, 0) must report it dead so a crashed
 # updater can never wedge every future update. Deliberately larger than any
@@ -98,6 +99,50 @@ lock.release()
     assert sorted(stdout.strip() for stdout, _ in results) == ["lost", "won"]
 
 
+def test_dead_install_owner_is_reclaimed(tmp_path):
+    install_root = tmp_path / "install"
+    lock_path = install_lock_path(install_root)
+    lock_path.mkdir(parents=True)
+    (lock_path / "owner").write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+
+    lock = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
+    assert lock.acquire() is True
+    assert (lock_path / "owner").read_text(encoding="utf-8").splitlines()[0] == str(os.getpid())
+    lock.release()
+
+
+def test_recent_ownerless_install_lock_is_not_stolen(tmp_path):
+    install_root = tmp_path / "install"
+    lock_path = install_lock_path(install_root)
+    lock_path.mkdir(parents=True)
+
+    contender = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
+    assert contender.acquire() is False
+    assert lock_path.exists()
+
+
+def test_interrupted_owner_write_is_reclaimed_after_grace(tmp_path):
+    install_root = tmp_path / "install"
+    lock_path = install_lock_path(install_root)
+    lock_path.mkdir(parents=True)
+    old = time.time() - 30
+    os.utime(lock_path, (old, old))
+
+    lock = UpdateLock(marker_path=tmp_path / "marker", install_root=install_root)
+    assert lock.acquire() is True
+    lock.release()
+
+
+def test_compatibility_marker_ignores_context_local_profile_override(tmp_path, monkeypatch):
+    process_home = tmp_path / "process-home"
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    token = set_hermes_home_override(tmp_path / "context-profile")
+    try:
+        assert update_marker_path() == process_home / ".hermes-update-in-progress"
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_git_autostash_cannot_remove_a_held_install_lock(tmp_path):
     install_root = tmp_path / "install"
     subprocess.run(["git", "init", "-q", str(install_root)], check=True)
@@ -128,15 +173,23 @@ def test_two_profile_homes_sharing_one_install_serialize(tmp_path, monkeypatch):
     install_root = tmp_path / "install"
     monkeypatch.setattr("hermes_cli.update_lock.PROJECT_ROOT", install_root)
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
-    first = UpdateLock()
-    assert first.path == tmp_path / "profile-a" / ".hermes-update-in-progress"
+    process_home = tmp_path / "process-home"
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    token_a = set_hermes_home_override(tmp_path / "profile-a")
+    try:
+        first = UpdateLock()
+    finally:
+        reset_hermes_home_override(token_a)
+    assert first.path == process_home / ".hermes-update-in-progress"
     assert first.install_path == install_root / ".git" / "hermes-update.lock"
     assert first.acquire() is True
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
-    second = UpdateLock()
-    assert second.path == tmp_path / "profile-b" / ".hermes-update-in-progress"
+    token_b = set_hermes_home_override(tmp_path / "profile-b")
+    try:
+        second = UpdateLock()
+    finally:
+        reset_hermes_home_override(token_b)
+    assert second.path == process_home / ".hermes-update-in-progress"
     assert second.install_path == first.install_path
     assert second.acquire() is False
 

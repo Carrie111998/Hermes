@@ -28,6 +28,7 @@ import path from 'path'
 // of minutes; past this the marker is almost certainly stale (e.g. the OS
 // recycled the pid onto an unrelated process), so the gate self-heals.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+export const INSTALL_LOCK_OWNER_WRITE_GRACE_MS = 5_000
 
 /**
  * Installation-scoped single-flight lock. Keep byte-for-byte path semantics
@@ -218,6 +219,7 @@ export function updateHandoffConflict(
 
     if (fs.existsSync(lock)) {
       let pid = 0
+      let lockAgeMs = 0
 
       try {
         const [pidLine] = fs.readFileSync(path.join(lock, 'owner'), 'utf8').split('\n')
@@ -226,9 +228,32 @@ export function updateHandoffConflict(
         void 0
       }
 
+      try {
+        lockAgeMs = (opts.now || Date.now)() - fs.statSync(lock).mtimeMs
+      } catch {
+        lockAgeMs = Infinity
+      }
+
+      const hasOwner = Number.isInteger(pid) && pid > 0
+      const alive = hasOwner && isPidAlive(pid, opts.kill)
+      const ownerWriteInProgress = !hasOwner && lockAgeMs <= INSTALL_LOCK_OWNER_WRITE_GRACE_MS
+
+      if (!alive && !ownerWriteInProgress) {
+        try {
+          fs.rmSync(lock, { recursive: true, force: true })
+        } catch {
+          // Advisory cleanup only. If another updater won the race, the
+          // authoritative atomic Rust/Python acquisition will still refuse.
+        }
+
+        if (!fs.existsSync(lock)) {
+          return null
+        }
+      }
+
       return {
         pid,
-        ageMs: 0,
+        ageMs: lockAgeMs,
         message:
           pid > 0
             ? `An update is already running for this installation (PID ${pid}). Wait for it to finish, then try again.`

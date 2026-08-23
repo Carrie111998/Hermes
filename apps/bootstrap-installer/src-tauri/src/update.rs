@@ -128,6 +128,24 @@ fn install_lock_path(install_root: &Path) -> PathBuf {
     metadata.join("hermes-update.lock")
 }
 
+const INSTALL_LOCK_OWNER_WRITE_GRACE_SECS: u64 = 5;
+
+fn install_lock_is_stale(path: &Path) -> bool {
+    let owner = std::fs::read_to_string(path.join("owner"));
+    if let Ok(raw) = owner {
+        if let Some(pid) = raw.lines().next().and_then(|line| line.trim().parse::<u32>().ok()) {
+            return !pid_is_alive(pid);
+        }
+    }
+    let age = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(u64::MAX);
+    age > INSTALL_LOCK_OWNER_WRITE_GRACE_SECS
+}
+
 struct InstallLockGuard {
     path: PathBuf,
     owned: bool,
@@ -139,22 +157,50 @@ impl InstallLockGuard {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match std::fs::create_dir(&path) {
-            Ok(()) => {
-                let started_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if let Err(err) = std::fs::write(
-                    path.join("owner"),
-                    format!("{}\n{started_at}\n", std::process::id()),
-                ) {
-                    tracing::warn!(?path, %err, "could not write installation lock owner");
+        for attempt in 0..4 {
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    let started_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Err(err) = std::fs::write(
+                        path.join("owner"),
+                        format!("{}\n{started_at}\n", std::process::id()),
+                    ) {
+                        let _ = std::fs::remove_dir_all(&path);
+                        return Err(err);
+                    }
+                    return Ok(Self { path, owned: true });
                 }
-                Ok(Self { path, owned: true })
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !install_lock_is_stale(&path) {
+                        return Err(err);
+                    }
+                    let nonce = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or(0);
+                    let quarantine = path.with_file_name(format!(
+                        "hermes-update.lock.stale-{}-{attempt}-{nonce}",
+                        std::process::id()
+                    ));
+                    match std::fs::rename(&path, &quarantine) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_dir_all(&quarantine);
+                        }
+                        Err(rename_err)
+                            if rename_err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(rename_err) => return Err(rename_err),
+                    }
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "installation update lock contention did not settle",
+        ))
     }
 
     fn complete(&self) {
@@ -342,9 +388,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
             emit(
                 &app,
                 BootstrapEvent::Failed {
-                    message: msg.to_string(),
-                    log_path: Some(crate::paths::log_path().to_string_lossy().into_owned()),
-                    exit_code: Some(UPDATE_EXIT_CONCURRENT),
+                    stage: Some("update".to_string()),
+                    error: msg.to_string(),
                 },
             );
             return Err(anyhow!(msg));
@@ -354,9 +399,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
             emit(
                 &app,
                 BootstrapEvent::Failed {
-                    message: msg.clone(),
-                    log_path: Some(crate::paths::log_path().to_string_lossy().into_owned()),
-                    exit_code: Some(UPDATE_EXIT_CONCURRENT),
+                    stage: Some("update".to_string()),
+                    error: msg.clone(),
                 },
             );
             return Err(anyhow!(msg));
@@ -1442,6 +1486,46 @@ mod tests {
             install_lock_path(&root),
             metadata.join("hermes-update.lock")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dead_install_lock_owner_is_reclaimed() {
+        let dir = unique_tmp_dir("dead-install-lock");
+        let root = dir.join("hermes-agent");
+        let lock = install_lock_path(&root);
+        std::fs::create_dir_all(&lock).unwrap();
+        let mut foreign = spawn_foreign_holder();
+        let dead_pid = foreign.id();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        std::fs::write(lock.join("owner"), format!("{dead_pid}\n0\n")).unwrap();
+
+        let guard = InstallLockGuard::acquire(&root).expect("dead owner must be reclaimed");
+        assert!(lock.exists());
+        drop(guard);
+        assert!(!lock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_install_lock_owner_is_not_stolen() {
+        let dir = unique_tmp_dir("live-install-lock");
+        let root = dir.join("hermes-agent");
+        let lock = install_lock_path(&root);
+        std::fs::create_dir_all(&lock).unwrap();
+        let mut foreign = spawn_foreign_holder();
+        let foreign_pid = foreign.id();
+        std::fs::write(lock.join("owner"), format!("{foreign_pid}\n0\n")).unwrap();
+
+        let err = match InstallLockGuard::acquire(&root) {
+            Ok(_) => panic!("live owner must block"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(lock.exists());
+        let _ = foreign.kill();
+        let _ = foreign.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

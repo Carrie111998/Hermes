@@ -20,6 +20,7 @@ import path from 'path'
 import { test } from 'vitest'
 
 import {
+  INSTALL_LOCK_OWNER_WRITE_GRACE_MS,
   installLockPath,
   isPidAlive,
   markerPath,
@@ -70,6 +71,39 @@ test('installation lock path resolves a gitfile metadata directory', () => {
 test('legacy handoff marker remains under HERMES_HOME', () => {
   const home = tmpHome('legacy-marker-path')
   assert.equal(markerPath(home), path.join(home, '.hermes-update-in-progress'))
+})
+
+test('dead installation lock owner self-heals', () => {
+  const home = tmpHome('dead-install-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(lock, { recursive: true })
+  fs.writeFileSync(path.join(lock, 'owner'), `999999\n${Math.floor(Date.now() / 1000)}\n`)
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: DEAD }), null)
+  assert.ok(!fs.existsSync(lock))
+})
+
+test('fresh ownerless installation lock preserves the owner-write grace window', () => {
+  const home = tmpHome('fresh-ownerless-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(lock, { recursive: true })
+
+  assert.ok(updateHandoffConflict(home, { installRoot }))
+  assert.ok(fs.existsSync(lock))
+})
+
+test('interrupted owner write self-heals after the grace window', () => {
+  const home = tmpHome('stale-ownerless-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(lock, { recursive: true })
+  const old = new Date(Date.now() - INSTALL_LOCK_OWNER_WRITE_GRACE_MS - 1_000)
+  fs.utimesSync(lock, old, old)
+
+  assert.equal(updateHandoffConflict(home, { installRoot }), null)
+  assert.ok(!fs.existsSync(lock))
 })
 
 test('absent marker => no live update', () => {
