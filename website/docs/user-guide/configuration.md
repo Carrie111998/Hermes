@@ -1578,10 +1578,12 @@ Control how much "thinking" the model does before responding:
 
 ```yaml
 agent:
-  reasoning_effort: ""   # empty = medium. Options: none, minimal, low, medium, high, xhigh, max, ultra
+  reasoning_effort: ""   # empty = medium. Options: auto, none, minimal, low, medium, high, xhigh, max, ultra
 ```
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
+
+Set `reasoning_effort: "auto"` to choose an effort for each request from the latest user message. Hermes uses `low` for simple prompts, `medium` for implementation, configuration, and planning work, and `high` for debugging, security, production, and architecture tasks. Resolution is deterministic, does not modify conversation history or the configured value, and the selected provider can still clamp the result to an effort level it supports.
 
 :::note Adaptive-thinking models (Claude 4.6+, Fable/Mythos-class) over OpenRouter
 These models use *adaptive* thinking and don't accept the usual `reasoning.effort`
@@ -1609,6 +1611,7 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 
 ```
 /reasoning                # Show current effort level and display state
+/reasoning auto           # Select low, medium, or high for each request
 /reasoning high           # Set reasoning effort to high (this session only)
 /reasoning high --global  # Set effort and persist to config.yaml
 /reasoning none           # Disable reasoning (this session only)

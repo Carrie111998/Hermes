@@ -7,21 +7,32 @@ def test_parse_reasoning_effort_accepts_auto_marker():
 
 def test_auto_reasoning_uses_low_for_simple_status_question():
     cfg = {"enabled": True, "effort": "auto"}
-    messages = [{"role": "user", "content": "koks effort nustatytas default profiliui?"}]
+    messages = [{"role": "user", "content": "what effort is active?"}]
 
     assert resolve_auto_reasoning_config(cfg, messages) == {"enabled": True, "effort": "low"}
 
 
 def test_auto_reasoning_uses_medium_for_design_and_config_changes():
     cfg = {"enabled": True, "effort": "auto"}
-    messages = [{"role": "user", "content": "noriu auto effort pakeitimo Hermes confige"}]
+    messages = [{"role": "user", "content": "implement an automatic effort config change"}]
 
     assert resolve_auto_reasoning_config(cfg, messages) == {"enabled": True, "effort": "medium"}
 
 
 def test_auto_reasoning_uses_high_for_debug_security_and_architecture():
     cfg = {"enabled": True, "effort": "auto"}
-    messages = [{"role": "user", "content": "padaryk root cause debugging security architekturos sprendimui"}]
+    messages = [{"role": "user", "content": "find the root cause of this security architecture failure"}]
+
+    assert resolve_auto_reasoning_config(cfg, messages) == {"enabled": True, "effort": "high"}
+
+
+def test_auto_reasoning_reads_structured_latest_user_content():
+    cfg = {"enabled": True, "effort": "auto"}
+    messages = [
+        {"role": "user", "content": "old simple question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": [{"type": "text", "text": "debug this failing test"}]},
+    ]
 
     assert resolve_auto_reasoning_config(cfg, messages) == {"enabled": True, "effort": "high"}
 

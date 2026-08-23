@@ -7766,7 +7766,10 @@ class AIAgent:
         cache[key] = (supported, _time.monotonic())
         return bool(supported)
 
-    def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
+    def _resolve_lmstudio_summary_reasoning_effort(
+        self,
+        reasoning_config: Optional[dict] = None,
+    ) -> Optional[str]:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
@@ -7774,12 +7777,19 @@ class AIAgent:
         can't drift on effort resolution and clamping.
         """
         from agent.lmstudio_reasoning import resolve_lmstudio_effort
+        effective_config = (
+            getattr(self, "reasoning_config", None)
+            if reasoning_config is None else reasoning_config
+        )
         return resolve_lmstudio_effort(
-            self.reasoning_config,
+            effective_config,
             self._lmstudio_reasoning_options_cached(),
         )
 
-    def _github_models_reasoning_extra_body(self) -> dict | None:
+    def _github_models_reasoning_extra_body(
+        self,
+        reasoning_config: Optional[dict] = None,
+    ) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
         try:
             from hermes_cli.models import github_model_reasoning_efforts
@@ -7790,11 +7800,15 @@ class AIAgent:
         if not supported_efforts:
             return None
 
-        if self.reasoning_config and isinstance(self.reasoning_config, dict):
-            if self.reasoning_config.get("enabled") is False:
+        effective_config = (
+            getattr(self, "reasoning_config", None)
+            if reasoning_config is None else reasoning_config
+        )
+        if effective_config and isinstance(effective_config, dict):
+            if effective_config.get("enabled") is False:
                 return None
             requested_effort = str(
-                self.reasoning_config.get("effort", "medium")
+                effective_config.get("effort", "medium")
             ).strip().lower()
         else:
             requested_effort = "medium"

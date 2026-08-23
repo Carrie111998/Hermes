@@ -1160,8 +1160,8 @@ VALID_REASONING_EFFORTS = (
 def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    "ultra".
+    Valid levels: "none", "auto", "minimal", "low", "medium", "high", "xhigh",
+    "max", "ultra".
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
     YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
@@ -1179,9 +1179,67 @@ def parse_reasoning_effort(effort) -> dict | None:
     effort = effort.strip().lower()
     if effort in {"none", "false", "disabled"}:
         return {"enabled": False}
-    if effort in VALID_REASONING_EFFORTS:
+    if effort == "auto" or effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
+
+
+def _latest_user_text(messages) -> str:
+    """Return lowercase text from the latest user message."""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content.lower()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text") or item.get("content") or ""))
+                else:
+                    parts.append(str(item))
+            return " ".join(parts).lower()
+        return str(content).lower()
+    return ""
+
+
+def resolve_auto_reasoning_config(
+    reasoning_config: dict | None,
+    messages,
+) -> dict | None:
+    """Resolve ``effort: auto`` deterministically for one request.
+
+    Resolution reads only the latest user turn and never mutates conversation
+    history or the agent's configured value, preserving prompt-cache stability.
+    """
+    if not isinstance(reasoning_config, dict):
+        return reasoning_config
+    if reasoning_config.get("enabled") is False:
+        return reasoning_config
+    if str(reasoning_config.get("effort") or "").strip().lower() != "auto":
+        return reasoning_config
+
+    text = _latest_user_text(messages)
+    high_markers = (
+        "root cause", "security", "audit", "auth", "credential", "secret",
+        "production", "prod", "architecture", "refactor", "debug", "traceback",
+        "failing test", "test failure", "performance", "incident", "migration",
+        "database", "payment", "gateway", "systemd",
+    )
+    medium_markers = (
+        "implement", "build", "code", "patch", "change", "modify", "config",
+        "configure", "setup", "install", "design", "compare", "research", "plan",
+        "workflow", "automation", "test", "fix",
+    )
+
+    if any(marker in text for marker in high_markers):
+        effort = "high"
+    elif len(text) > 500 or any(marker in text for marker in medium_markers):
+        effort = "medium"
+    else:
+        effort = "low"
+    return {"enabled": True, "effort": effort}
 
 
 def _canonical_model_variants(model: str) -> list[str]:

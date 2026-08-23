@@ -1824,8 +1824,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    from hermes_constants import resolve_auto_reasoning_config
+
     if tools_for_api is None:
         tools_for_api = agent.tools
+    reasoning_config = resolve_auto_reasoning_config(
+        agent.reasoning_config,
+        api_messages,
+    )
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1840,7 +1846,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             messages=anthropic_messages,
             tools=tools_for_api,
             max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=reasoning_config,
             is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
@@ -1939,7 +1945,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=reasoning_config,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
             base_url=agent.base_url,
@@ -1950,7 +1956,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
-            github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
+            github_reasoning_extra=(
+                agent._github_models_reasoning_extra_body(reasoning_config)
+                if is_github_responses else None
+            ),
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
@@ -2048,7 +2057,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
@@ -2081,7 +2090,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
-        reasoning_config=agent.reasoning_config,
+        reasoning_config=reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         cache_scope_id=_cache_scope_id,
@@ -2104,7 +2113,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
         supports_reasoning=agent._supports_reasoning_extra_body(),
-        github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
+        github_reasoning_extra=(
+            agent._github_models_reasoning_extra_body(reasoning_config)
+            if _is_gh else None
+        ),
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
@@ -2880,6 +2892,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
 
     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
+    from hermes_constants import resolve_auto_reasoning_config
+
+    summary_reasoning_config = resolve_auto_reasoning_config(
+        agent.reasoning_config,
+        messages,
+    )
     append_message(messages, {"role": "user", "content": summary_request})
 
     try:
@@ -2981,12 +2999,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             and agent._supports_reasoning_extra_body()
         )
         _lm_reasoning_effort: str | None = (
-            agent._resolve_lmstudio_summary_reasoning_effort()
+            agent._resolve_lmstudio_summary_reasoning_effort(summary_reasoning_config)
             if _is_lmstudio_summary else None
         )
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
-            if agent.reasoning_config is not None:
-                summary_extra_body["reasoning"] = agent.reasoning_config
+            if summary_reasoning_config is not None:
+                summary_extra_body["reasoning"] = summary_reasoning_config
             else:
                 summary_extra_body["reasoning"] = {
                     "enabled": True,
@@ -3029,7 +3047,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         provider_preferences=provider_preferences or None,
                         model=agent.model,
                         base_url=agent.base_url,
-                        reasoning_config=agent.reasoning_config,
+                        reasoning_config=summary_reasoning_config,
                     )
             except Exception:
                 pass
@@ -3073,7 +3091,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     messages=api_messages,
                     tools=None,
                     max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
+                    reasoning_config=summary_reasoning_config,
                     is_oauth=agent._is_anthropic_oauth,
                     preserve_dots=agent._anthropic_preserve_dots(),
                     base_url=getattr(agent, "_anthropic_base_url", None),
@@ -3126,7 +3144,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     tools=None,
                     is_oauth=agent._is_anthropic_oauth,
                     max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
+                    reasoning_config=summary_reasoning_config,
                     preserve_dots=agent._anthropic_preserve_dots(),
                     base_url=getattr(agent, "_anthropic_base_url", None),
                 )
