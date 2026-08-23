@@ -2716,10 +2716,6 @@ def _launch_tui(
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
 
-    # Restore tmux env vars
-    for k, v in tmux_env.items():
-        if v:
-            env[k] = v
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
@@ -2826,18 +2822,16 @@ def _launch_tui(
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
     try:
-        # Use PTY so the TUI renders at the true tmux pane size and gets
-        # resize events. All #88096 review points are addressed inside
-        # _run_tui_under_pty(): no forced startup resize, grow+shrink
-        # forwarding with prompt poller teardown, no global SIGWINCH
-        # handler, no duplicated imports, one debug log on first failure.
-        try:
+        if sys.stdin.isatty():
+            # PTY: the TUI renders at the true pane size and gets resize
+            # events (see _run_tui_under_pty — no forced startup resize,
+            # grow+shrink forwarding with prompt poller teardown, no
+            # global SIGWINCH handler).
             code = _run_tui_under_pty(argv, cwd, env)
-        except ImportError:
-            # Fallback to subprocess if PTY unavailable
+        else:
+            # No controlling tty (pipes/CI): nothing to forward and
+            # ptyprocess would fail on tcgetattr; run plain.
             code = subprocess.call(argv, cwd=str(cwd), env=env)
-        except KeyboardInterrupt:
-            code = 130
 
         if code in {0, 130}:
             _print_tui_exit_summary(resume_session_id, active_session_file)
