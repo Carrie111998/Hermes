@@ -231,6 +231,40 @@ class TestJobCRUD:
         jobs = list_jobs()
         assert len(jobs) == 2
 
+    def test_loads_id_keyed_jobs_store_as_records(self, tmp_cron_dir):
+        import json
+        from cron.jobs import JOBS_FILE
+
+        job = {
+            "id": "cron1234abcd",
+            "name": "Example job",
+            "prompt": "Check server status",
+            "schedule": {
+                "kind": "interval",
+                "minutes": 30,
+                "display": "every 30m",
+            },
+            "enabled": True,
+        }
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(
+            json.dumps(
+                {
+                    "jobs": {job["id"]: job},
+                    "updated_at": "2026-08-23T10:10:12+08:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        listed = list_jobs(include_disabled=True)
+
+        assert load_jobs() == [job]
+        assert len(listed) == 1
+        assert listed[0]["name"] == job["name"]
+        assert listed[0]["prompt"] == job["prompt"]
+        assert listed[0]["schedule"] == job["schedule"]
+
 
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
