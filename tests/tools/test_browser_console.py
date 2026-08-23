@@ -1,5 +1,6 @@
 """Tests for browser_console tool and browser_vision annotate param."""
 
+import base64
 import json
 import os
 import sys
@@ -248,7 +249,11 @@ class TestBrowserVisionConfig:
         shots_dir = tmp_path / "browser_screenshots"
         shots_dir.mkdir()
         screenshot = shots_dir / "shot.png"
-        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        # The native vision history guard validates real image dimensions.
+        # Keep this fixture a valid 1x1 PNG instead of a header-only stub.
+        screenshot.write_bytes(base64.b64decode(
+            b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        ))
         return shots_dir, screenshot
 
     def test_browser_vision_uses_configured_temperature_and_timeout(self, tmp_path):
