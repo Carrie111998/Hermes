@@ -3448,6 +3448,73 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
+_INLINE_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+def _inline_image_part_payload_bytes(part: Any) -> int:
+    """Return the inline wire bytes carried by one image content part.
+
+    This is deliberately separate from ``_count_image_tokens``.  The latter
+    estimates model tokens and must not treat base64 transport bytes as model
+    tokens; this helper measures only embedded data that Hermes serializes into
+    the request. Remote URLs have no inline payload and therefore contribute
+    zero.
+    """
+    if not isinstance(part, dict) or part.get("type") not in _INLINE_IMAGE_PART_TYPES:
+        return 0
+
+    if part.get("type") == "image":
+        source = part.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64":
+            data = source.get("data")
+            return len(data.encode("utf-8")) if isinstance(data, str) else 0
+        return 0
+
+    image_ref = part.get("image_url")
+    if isinstance(image_ref, dict):
+        image_ref = image_ref.get("url")
+    if not isinstance(image_ref, str) or not image_ref.startswith("data:"):
+        return 0
+    return len(image_ref.encode("utf-8"))
+
+
+def estimate_messages_inline_image_bytes(messages: List[Dict[str, Any]]) -> int:
+    """Return the total inline image payload carried by ``messages``.
+
+    The result is a wire-size diagnostic and budget currency, not a model-token
+    estimate. It understands the OpenAI chat/Responses shapes, Anthropic
+    ``source.data`` blocks, and the transient ``_multimodal`` envelope used by
+    native vision tools.
+    """
+    total = 0
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        parts = None
+        if isinstance(content, list):
+            parts = content
+        elif isinstance(content, dict) and content.get("_multimodal"):
+            inner = content.get("content")
+            if isinstance(inner, list):
+                parts = inner
+        if isinstance(parts, list):
+            total += sum(_inline_image_part_payload_bytes(part) for part in parts)
+
+        # This sidecar is only a pre-conversion cache for Anthropic-native
+        # messages. Count it when the canonical content did not already carry
+        # an image list so the diagnostic does not double-count one image.
+        stashed = message.get("_anthropic_content_blocks")
+        content_has_image = any(
+            isinstance(part, dict)
+            and part.get("type") in _INLINE_IMAGE_PART_TYPES
+            for part in (parts or [])
+        )
+        if not content_has_image and isinstance(stashed, list):
+            total += sum(_inline_image_part_payload_bytes(part) for part in stashed)
+    return total
+
+
 def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 

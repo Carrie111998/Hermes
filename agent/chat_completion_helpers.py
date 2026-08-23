@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent.context_compressor import _bound_inline_image_payloads
 from agent.error_classifier import (
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
@@ -2949,6 +2950,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # _thinking_prefill must survive until here so the drop pass can
         # recognize stubs after reasoning fields are stripped.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+
+        # Max-iteration summaries build a second request outside the main
+        # conversation loop. Apply the same byte-budgeted image projection so
+        # this path cannot re-send every historical native-vision payload.
+        api_messages = _bound_inline_image_payloads(api_messages)
 
         # Strip all remaining underscore-prefixed scaffolding keys before the
         # wire. The summary path calls chat.completions.create() directly,

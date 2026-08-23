@@ -892,6 +892,84 @@ class TestMaxIterationsSummaryReplay:
         assert messages[0]["content"] == "q1"
         assert messages[0]["api_content"] == "q1\n\nPLUGIN-CTX"
 
+    def test_summary_request_uses_the_same_inline_image_budget(self):
+        """The independently assembled summary request must age old images."""
+        from run_agent import AIAgent
+        from agent.chat_completion_helpers import handle_max_iterations
+
+        agent = AIAgent(
+            api_key="x",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._cached_system_prompt = "SYS"
+        captured = {}
+
+        class _Completions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return "RAW-RESPONSE"
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=_Completions())
+        )
+        transport = types.SimpleNamespace(
+            normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY")
+        )
+
+        def _tool_turn(call_id: str) -> list[dict]:
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "vision_analyze", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": [
+                        {"type": "text", "text": f"result {call_id}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + ("x" * 300_000),
+                            },
+                        },
+                    ],
+                },
+            ]
+
+        messages = [
+            {"role": "user", "content": "inspect"},
+            *_tool_turn("old"),
+            *_tool_turn("middle"),
+            *_tool_turn("newest"),
+        ]
+        with (
+            patch.object(agent, "_ensure_primary_openai_client", return_value=client),
+            patch.object(agent, "_get_transport", return_value=transport),
+        ):
+            assert handle_max_iterations(agent, messages, 5) == "SUMMARY"
+
+        sent_tools = [
+            message
+            for message in captured["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert all("data:image" not in str(tool["content"]) for tool in sent_tools)
+        assert all(
+            "data:image" in str(message["content"])
+            for message in messages
+            if message.get("role") == "tool"
+        )
+
 
 class TestSessionRowExistsBeforePreflightCompaction:
     """Moving the crash persist after prefetch/pre_llm_call (one write with

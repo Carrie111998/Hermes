@@ -38,6 +38,7 @@ from agent.model_metadata import (
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
+    _inline_image_part_payload_bytes,
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
@@ -1623,7 +1624,9 @@ def _is_image_part(part: Any) -> bool:
 
 
 def _content_has_images(content: Any) -> bool:
-    """True if a message's ``content`` is a multimodal list with image parts."""
+    """True if content carries a multimodal image part."""
+    if isinstance(content, dict) and content.get("_multimodal"):
+        return _content_has_images(content.get("content"))
     if not isinstance(content, list):
         return False
     return any(_is_image_part(p) for p in content)
@@ -1657,64 +1660,232 @@ def _strip_images_from_content(content: Any) -> Any:
     return new_parts
 
 
-def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Replace image parts in older messages with placeholder text.
+# Soft budget for historical inline image bytes in one request. The current
+# user image and the complete in-flight tool exchange are protected while
+# they fit; native vision embeds are capped separately at 256 KiB before they
+# enter history. Historical images larger than 128 KiB are not retained even
+# when aggregate room remains, which prevents one old screenshot from riding
+# every later request forever.
+_INLINE_IMAGE_REQUEST_BUDGET_BYTES = 512 * 1024
+_INLINE_IMAGE_HISTORY_MAX_BYTES = 128 * 1024
+_INLINE_IMAGE_REQUEST_PLACEHOLDER = (
+    "[image omitted from older context to save request bytes]"
+)
 
-    The anchor is the *last* user message that has any image content. Every
-    message before that anchor gets its image parts replaced with a short
-    placeholder so the outgoing request stops re-shipping the same multi-MB
-    base-64 image blobs on every turn.
 
-    If no user message carries images, the list is returned unchanged.
-    If the only user message with images is the very first one (nothing
-    earlier to strip), the list is returned unchanged.
+def _image_parts_in_content(content: Any) -> list[tuple[str, int, dict]]:
+    """Return ``(path, index, part)`` entries for image content parts."""
+    if isinstance(content, list):
+        return [
+            ("content", index, part)
+            for index, part in enumerate(content)
+            if _is_image_part(part)
+        ]
+    if isinstance(content, dict) and content.get("_multimodal"):
+        inner = content.get("content")
+        if isinstance(inner, list):
+            return [
+                ("envelope", index, part)
+                for index, part in enumerate(inner)
+                if _is_image_part(part)
+            ]
+    return []
 
-    Shallow copies of touched messages only; input is never mutated.
-    Port of Kilo-Org/kilocode#9434 (adapted for the OpenAI-style message
-    shape the hermes compressor emits).
+
+def _image_placeholder_part(part: dict) -> dict:
+    """Build a provider-compatible text replacement for one image part."""
+    text_type = "input_text" if part.get("type") == "input_image" else "text"
+    return {"type": text_type, "text": _INLINE_IMAGE_REQUEST_PLACEHOLDER}
+
+
+def _bound_inline_image_payloads(
+    messages: List[Dict[str, Any]],
+    *,
+    max_inline_bytes: int = _INLINE_IMAGE_REQUEST_BUDGET_BYTES,
+) -> List[Dict[str, Any]]:
+    """Project messages onto a bounded inline-image request payload.
+
+    The model-token estimator intentionally uses a flat image heuristic. This
+    separate projection uses the actual data-URL / base64 field length and
+    keeps an image on the current user message plus tool results that still
+    follow the latest user message; remaining inline images are retained
+    newest-first until the aggregate byte budget is full. Older parts become
+    text placeholders, while message rows and tool-call pairing remain intact.
+
+    ``messages`` is never mutated. Only touched message dictionaries and their
+    content containers are copied, and stale ``api_content`` sidecars are
+    discarded because they could restore the removed bytes on replay.
+    ``max_inline_bytes=0`` is used by compaction to age out every non-protected
+    image, regardless of its individual size.
     """
     if not messages:
         return messages
+    try:
+        budget = max(0, int(max_inline_bytes))
+    except (TypeError, ValueError):
+        budget = _INLINE_IMAGE_REQUEST_BUDGET_BYTES
 
-    # Find the newest user message that carries at least one image part.
-    # We anchor on image-bearing user messages (not all user messages) so
-    # a plain text follow-up after a big-image turn still strips the old
-    # image — matching the problem kilocode#9434 set out to solve.
-    anchor = -1
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if not isinstance(msg, dict):
+    records: list[tuple[int, str, int, dict, int]] = []
+    latest_user_index = -1
+    latest_user_image_index = -1
+    latest_tool_index = -1
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
             continue
-        if msg.get("role") != "user":
+        role = message.get("role")
+        if role == "user":
+            latest_user_index = message_index
+        parts = _image_parts_in_content(message.get("content"))
+        if not parts:
+            stashed = message.get("_anthropic_content_blocks")
+            if isinstance(stashed, list):
+                parts = [
+                    ("sidecar", index, part)
+                    for index, part in enumerate(stashed)
+                    if _is_image_part(part)
+                ]
+        if not parts:
             continue
-        if _content_has_images(msg.get("content")):
-            anchor = i
-            break
+        if role == "user":
+            latest_user_image_index = message_index
+        elif role == "tool":
+            latest_tool_index = message_index
+        for path, part_index, part in parts:
+            records.append(
+                (
+                    message_index,
+                    path,
+                    part_index,
+                    part,
+                    _inline_image_part_payload_bytes(part),
+                )
+            )
 
-    if anchor <= 0:
-        # No image-bearing user message, or it's the very first message —
-        # nothing before it to strip.
+    if not records:
         return messages
 
-    changed = False
-    result: List[Dict[str, Any]] = []
-    for i, msg in enumerate(messages):
-        if i >= anchor or not isinstance(msg, dict):
-            result.append(msg)
-            continue
-        content = msg.get("content")
-        if not _content_has_images(content):
-            result.append(msg)
-            continue
-        new_msg = msg.copy()
-        new_msg["content"] = _strip_images_from_content(content)
-        # Content rewritten → the api_content sidecar (exact bytes previously
-        # sent) is stale; drop it so replay can't resend the pre-rewrite bytes.
-        drop_stale_api_content(new_msg)
-        result.append(new_msg)
-        changed = True
+    current_user_keys = {
+        (message_index, path, part_index)
+        for message_index, path, part_index, _part, _size in records
+        if (
+            message_index == latest_user_image_index
+            and latest_user_image_index == latest_user_index
+        )
+    }
+    active_tool_records = [
+        record
+        for record in records
+        if messages[record[0]].get("role") == "tool"
+        and (latest_user_index < 0 or record[0] > latest_user_index)
+    ]
+    current_user_bytes = sum(
+        size
+        for message_index, path, part_index, _part, size in records
+        if (message_index, path, part_index) in current_user_keys
+    )
+    active_tool_bytes = sum(record[4] for record in active_tool_records)
+    protect_complete_active_exchange = (
+        budget > 0 and current_user_bytes + active_tool_bytes <= budget
+    )
 
-    return result if changed else messages
+    protected_keys: set[tuple[int, str, int]] = set(current_user_keys)
+    for message_index, path, part_index, _part, _size in records:
+        # Preserve the complete active exchange when it fits. If it does not,
+        # retain the newest active tool result as the continuity floor and let
+        # the byte budget remove older active screenshots deterministically.
+        is_active_tool = (
+            messages[message_index].get("role") == "tool"
+            and (latest_user_index < 0 or message_index > latest_user_index)
+        )
+        if is_active_tool and (
+            protect_complete_active_exchange or message_index == latest_tool_index
+        ):
+            protected_keys.add((message_index, path, part_index))
+
+    protected_bytes = sum(
+        size
+        for message_index, path, part_index, _part, size in records
+        if (message_index, path, part_index) in protected_keys
+    )
+    remaining = max(0, budget - protected_bytes)
+    kept_keys = set(protected_keys)
+    # Newest-first retention makes the projection stable as history grows: an
+    # image is replaced once when it falls outside the byte budget, not on
+    # every subsequent request.
+    for message_index, path, part_index, _part, size in reversed(records):
+        key = (message_index, path, part_index)
+        if key in kept_keys or (size == 0 and budget > 0):
+            kept_keys.add(key)
+        elif size > _INLINE_IMAGE_HISTORY_MAX_BYTES:
+            continue
+        elif size > 0 and size <= remaining:
+            kept_keys.add(key)
+            remaining -= size
+
+    replacements: dict[int, set[tuple[str, int]]] = {}
+    for message_index, path, part_index, _part, _size in records:
+        key = (message_index, path, part_index)
+        if key not in kept_keys:
+            replacements.setdefault(message_index, set()).add((path, part_index))
+    if not replacements:
+        return messages
+
+    result: List[Dict[str, Any]] = list(messages)
+    for message_index, paths in replacements.items():
+        message = messages[message_index]
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        new_message = message.copy()
+        if isinstance(content, list):
+            new_content = list(content)
+            for path, part_index in paths:
+                if path == "content":
+                    new_content[part_index] = _image_placeholder_part(content[part_index])
+            new_message["content"] = new_content
+        elif isinstance(content, dict) and content.get("_multimodal"):
+            inner = content.get("content")
+            if not isinstance(inner, list):
+                continue
+            new_inner = list(inner)
+            for path, part_index in paths:
+                if path == "envelope":
+                    new_inner[part_index] = _image_placeholder_part(inner[part_index])
+            new_content = content.copy()
+            new_content["content"] = new_inner
+            new_message["content"] = new_content
+        if any(path == "sidecar" for path, _part_index in paths):
+            stashed = message.get("_anthropic_content_blocks")
+            if isinstance(stashed, list):
+                new_stashed = list(stashed)
+                for path, part_index in paths:
+                    if path == "sidecar":
+                        new_stashed[part_index] = _image_placeholder_part(
+                            stashed[part_index]
+                        )
+                new_message["_anthropic_content_blocks"] = new_stashed
+        if not (
+            isinstance(content, list)
+            or (isinstance(content, dict) and content.get("_multimodal"))
+            or any(path == "sidecar" for path, _part_index in paths)
+        ):
+            continue
+        drop_stale_api_content(new_message)
+        result[message_index] = new_message
+
+    return result
+
+
+def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Age out non-current inline images during a compression boundary.
+
+    An image on the current user turn and the newest tool result from the
+    still-active exchange are retained for continuity. All older images are
+    replaced even when they sit inside ``protect_last_n``; the protected-tail
+    token estimator cannot see base64 bytes, so leaving those images untouched
+    is what made compression appear ineffective in native-vision sessions.
+    """
+    return _bound_inline_image_payloads(messages, max_inline_bytes=0)
 
 
 def _image_part_label(part: Dict[str, Any]) -> str:

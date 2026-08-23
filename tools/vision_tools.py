@@ -33,6 +33,7 @@ import contextlib
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import logging
 import os
 import uuid
@@ -625,25 +626,19 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # provider accepts the image and we reject outright.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap (4 MB).  This is the size we resize an image DOWN to
-# before embedding it into conversation history, regardless of the 20 MB hard
-# ceiling.  Anthropic's per-image base64 limit is 5 MB; once an oversized image
-# is baked into history (e.g. a vision tool-result), it is re-sent on every
-# subsequent turn and permanently wedges the session with a 400 that retries
-# can't clear (the bad bytes are immutable history).  Capping at embed time —
-# with headroom under 5 MB — is the only durable fix.  Matches the post-failure
-# shrink target in agent.conversation_compression so behaviour is consistent
-# whether we resize proactively or reactively.
-_EMBED_TARGET_BYTES = 4 * 1024 * 1024
+# Proactive history embed cap (256 KiB).  Native vision results are stored in
+# the live conversation and replayed on every later request; the provider's
+# one-image ceiling is not a useful history budget.  A small bounded embed
+# keeps repeated screenshot turns from dominating the request before the
+# request-level image projection gets a chance to age older results out.
+_EMBED_TARGET_BYTES = 256 * 1024
 
-# Proactive embed dimension cap (px, longest side).  Anthropic enforces an
-# 8000px per-side ceiling INDEPENDENTLY of the 5 MB byte cap — a tall full-page
-# screenshot can be well under 5 MB yet far over 8000px (e.g. 1200×12000 at
-# 0.06 MB), so the byte-only embed check above lets it slip into immutable
-# history un-resized and the session bricks on a non-retryable 400.  We cap at
-# 7900 (headroom under 8000) so the proactive resize shrinks tall small-byte
-# images before they are embedded.
-_EMBED_MAX_DIMENSION = 7900
+# Proactive history dimension cap (px, longest side).  1568 px is enough for
+# ordinary screenshot reading while bounding the pixel work and encoded size
+# of every native result that enters immutable conversation history.  The
+# reactive path still uses provider-reported limits when recovering a rejected
+# request; this cap is specifically for reusable history payloads.
+_EMBED_MAX_DIMENSION = 1568
 
 # Target size when auto-resizing on API failure (5 MB).  After a provider
 # rejects an image, we downscale to this target and retry once.
@@ -660,22 +655,78 @@ def _is_image_size_error(error: Exception) -> bool:
     ))
 
 
-def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> bool:
-    """True if the image's longest side exceeds ``max_dimension`` px.
-
-    Anthropic enforces an 8000px per-side cap independently of the 5 MB byte
-    cap, so a tall small-byte screenshot can pass every byte check yet trip a
-    non-retryable 400.  Returns False (don't force a resize) when Pillow is
-    unavailable or the file can't be read as an image — the byte-based checks
-    still apply, and we never want a missing soft dependency to break the
-    embed path.
-    """
+def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> Optional[bool]:
+    """Return whether an image exceeds ``max_dimension`` px, or ``None``."""
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(image_path) as _img:
             return max(_img.size) > max_dimension
     except Exception:
-        return False
+        return None
+
+
+def _data_url_dimensions(data_url: str) -> Optional[tuple[int, int]]:
+    """Decode a data URL and return its pixel dimensions, or ``None``."""
+    try:
+        from PIL import Image
+
+        _header, separator, encoded = data_url.partition(",")
+        if not separator:
+            return None
+        raw = base64.b64decode(encoded, validate=True)
+        with Image.open(BytesIO(raw)) as image:
+            return image.size
+    except Exception:
+        return None
+
+
+def _prepare_native_vision_embed(
+    image_path: Path,
+    image_data_url: str,
+    *,
+    mime_type: Optional[str] = None,
+    scale_out: Optional[dict] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return a native embed that satisfies both history size constraints.
+
+    This is the single synchronous policy owner for native tool results. Both
+    ``vision_analyze`` and ``browser_vision`` use it, so browser screenshots
+    cannot bypass the cap by calling the result builder directly.
+    """
+    over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+    over_dimensions = _image_exceeds_dimension(image_path, _EMBED_MAX_DIMENSION)
+    if over_dimensions is None:
+        return None, (
+            "Native vision history embed rejected: could not verify image "
+            "dimensions. Install Pillow and retry."
+        )
+    if not over_bytes and not over_dimensions:
+        return image_data_url, None
+
+    resized = _resize_image_for_vision(
+        image_path,
+        mime_type=mime_type,
+        max_base64_bytes=_EMBED_TARGET_BYTES,
+        max_dimension=_EMBED_MAX_DIMENSION,
+        scale_out=scale_out,
+    )
+    if len(resized) > _EMBED_TARGET_BYTES:
+        return None, (
+            "Image too large for native vision history: base64 payload remains "
+            f"{len(resized) / 1024:.0f} KiB (limit "
+            f"{_EMBED_TARGET_BYTES / 1024:.0f} KiB) after resizing. "
+            "Install Pillow or compress the image manually."
+        )
+
+    dimensions = _data_url_dimensions(resized)
+    if dimensions is None or max(dimensions) > _EMBED_MAX_DIMENSION:
+        actual = "unknown" if dimensions is None else f"{max(dimensions)} px"
+        return None, (
+            "Native vision history embed rejected: resized image dimensions "
+            f"remain unverifiable or exceed {_EMBED_MAX_DIMENSION} px "
+            f"(observed {actual}). Compress the image manually."
+        )
+    return resized, None
 
 
 def _crop_image_region(
@@ -1239,39 +1290,21 @@ async def _vision_analyze_native(
             temp_image_path, mime_type=detected_mime_type,
         )
 
-        # Proactive embed cap: this image gets baked into conversation
-        # history and re-sent on every subsequent turn.  Anthropic rejects
-        # any single base64 image over 5 MB OR over 8000px per side with a
-        # 400, and because history is immutable, an oversized embed
-        # permanently wedges the session — retries can't clear bytes (or
-        # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
-        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
-        _over_dims = await _run_encode_on_cpu_executor(
-            _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
+        # Proactive history cap: this image gets baked into conversation
+        # history and re-sent on every subsequent turn. The shared helper
+        # validates both the byte and pixel dimensions after resizing.
+        image_data_url, embed_error = await _run_encode_on_cpu_executor(
+            _prepare_native_vision_embed,
+            temp_image_path,
+            image_data_url,
+            mime_type=detected_mime_type,
+            scale_out=_scale_info,
         )
-        if _over_bytes or _over_dims:
-            image_data_url = await _run_encode_on_cpu_executor(
-                _resize_image_for_vision,
-                temp_image_path, mime_type=detected_mime_type,
-                max_base64_bytes=_EMBED_TARGET_BYTES,
-                max_dimension=_EMBED_MAX_DIMENSION,
-                scale_out=_scale_info,
+        if embed_error or image_data_url is None:
+            return tool_error(
+                embed_error or "Native vision history embed failed.",
+                success=False,
             )
-            # If even resizing can't get under the absolute hard ceiling,
-            # there's nothing more we can do — reject rather than embed a
-            # session-wedging payload.
-            if len(image_data_url) > _MAX_BASE64_BYTES:
-                return tool_error(
-                    f"Image too large for vision API: base64 payload is "
-                    f"{len(image_data_url) / (1024 * 1024):.1f} MB "
-                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
-                    f"even after resizing. Install Pillow "
-                    f"(`pip install Pillow`) for better auto-resize, "
-                    f"or compress the image manually.",
-                    success=False,
-                )
 
         return _build_native_vision_tool_result(
             image_url=image_url,

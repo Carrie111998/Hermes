@@ -248,6 +248,84 @@ class TestHTTP413Compression:
         assert "Screenshot of the dashboard" in str(retried_tool["content"])
         assert not getattr(agent, "_no_list_tool_content_models", set())
 
+    def test_pre_send_image_projection_bounds_the_real_request_copy(self, agent):
+        """The normal request path ages old images before the provider call.
+
+        The persisted/in-memory transcript keeps the original parts, while
+        the outgoing copy drops all tool images from the previous exchange
+        after the user sends a text follow-up.
+        """
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            return _mock_response(content="bounded", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+        image_size = 300_000
+
+        def _tool_turn(call_id: str) -> list[dict]:
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "vision_analyze", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": [
+                        {"type": "text", "text": f"result {call_id}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + ("x" * image_size),
+                            },
+                        },
+                    ],
+                },
+            ]
+
+        prefill = [
+            {"role": "user", "content": "inspect these screenshots"},
+            *_tool_turn("old"),
+            *_tool_turn("middle"),
+            *_tool_turn("newest"),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(
+                agent,
+                "_provider_supports_vision_tool_messages",
+                return_value=True,
+            ),
+        ):
+            result = agent.run_conversation("continue", conversation_history=prefill)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bounded"
+        sent = request_payloads[0]["messages"]
+        sent_tools = [m for m in sent if m.get("role") == "tool"]
+        assert len(sent_tools) == 3
+        assert all("data:image" not in str(tool["content"]) for tool in sent_tools)
+        assert all("result " in str(tool["content"]) for tool in sent_tools)
+
+        # Request projection is copy-on-write: the logical transcript still
+        # carries all three original image parts for persistence/UI use.
+        assert all(
+            "data:image" in str(message.get("content"))
+            for message in result["messages"]
+            if message.get("role") == "tool"
+        )
+
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.
 

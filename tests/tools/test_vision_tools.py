@@ -768,18 +768,18 @@ class TestImageExceedsDimension:
         assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is True
 
 
-    def test_undetectable_dimensions_return_false(self, tmp_path):
-        # Without Pillow — or with bytes Pillow can't parse — we can't inspect
-        # dimensions, so return False: the byte-based checks still apply and a
-        # missing soft dep never breaks the embed path.
+    def test_undetectable_dimensions_return_unknown(self, tmp_path):
+        # Without Pillow — or with bytes Pillow can't parse — dimensions are
+        # unknown. Native history embedding fails closed on this result rather
+        # than treating an unverified image as safe.
         path = tmp_path / "x.png"
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
         with patch.dict("sys.modules", {"PIL": None, "PIL.Image": None}):
-            assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is False
+            assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is None
 
         corrupt = tmp_path / "corrupt.png"
         corrupt.write_bytes(b"not an image at all")
-        assert _image_exceeds_dimension(corrupt, _EMBED_MAX_DIMENSION) is False
+        assert _image_exceeds_dimension(corrupt, _EMBED_MAX_DIMENSION) is None
 
 
 # ---------------------------------------------------------------------------

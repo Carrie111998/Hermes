@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from io import BytesIO
 from unittest.mock import patch
 
 
 from tools.vision_tools import (
     _build_native_vision_tool_result,
     _handle_vision_analyze,
+    _prepare_native_vision_embed,
     _supports_media_in_tool_results,
     _vision_analyze_native,
 )
@@ -121,7 +123,7 @@ class TestVisionAnalyzeNative:
         except ImportError:
             pytest.skip("Pillow not installed — proactive resize is a no-op")
 
-        from tools.vision_tools import _EMBED_TARGET_BYTES
+        from tools.vision_tools import _EMBED_MAX_DIMENSION, _EMBED_TARGET_BYTES
 
         # Noisy PNG that base64-encodes to well over 5 MB (won't compress much).
         big = tmp_path / "big.png"
@@ -138,9 +140,62 @@ class TestVisionAnalyzeNative:
             if p.get("type") == "image_url"
         )
         assert len(url) <= _EMBED_TARGET_BYTES, (
-            f"embedded image {len(url) / 1024 / 1024:.1f} MB exceeds embed cap "
-            f"{_EMBED_TARGET_BYTES / 1024 / 1024:.0f} MB — would wedge sessions on Anthropic"
+            f"embedded image {len(url) / 1024:.0f} KiB exceeds embed cap "
+            f"{_EMBED_TARGET_BYTES / 1024:.0f} KiB — would wedge sessions on Anthropic"
         )
+        with Image.open(BytesIO(base64.b64decode(url.partition(",")[2]))) as resized:
+            assert max(resized.size) <= _EMBED_MAX_DIMENSION
+
+    def test_unresizable_image_is_rejected_before_history_embed(self, tmp_path, monkeypatch):
+        """A best-effort resize must not bypass the reusable-history cap."""
+        img = tmp_path / "unresizable.png"
+        img.write_bytes(_TINY_PNG)
+        from tools.vision_tools import _EMBED_TARGET_BYTES
+
+        oversized = "data:image/png;base64," + ("A" * (_EMBED_TARGET_BYTES + 1))
+        monkeypatch.setattr(
+            "tools.vision_tools._image_to_base64_data_url",
+            lambda *_args, **_kwargs: oversized,
+        )
+        monkeypatch.setattr(
+            "tools.vision_tools._resize_image_for_vision",
+            lambda *_args, **_kwargs: oversized,
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            _vision_analyze_native(str(img), "describe")
+        )
+
+        assert isinstance(result, str)
+        error = json.loads(result)
+        assert error["success"] is False
+        assert "history" in error["error"].lower()
+
+    def test_dimension_cap_is_verified_after_best_effort_resize(self, tmp_path, monkeypatch):
+        img = tmp_path / "extreme.png"
+        img.write_bytes(_TINY_PNG)
+        monkeypatch.setattr(
+            "tools.vision_tools._image_exceeds_dimension",
+            lambda *_args, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            "tools.vision_tools._resize_image_for_vision",
+            lambda *_args, **_kwargs: "data:image/png;base64,QUJD",
+        )
+        monkeypatch.setattr(
+            "tools.vision_tools._data_url_dimensions",
+            lambda *_args, **_kwargs: (64, 12_800),
+        )
+
+        bounded, error = _prepare_native_vision_embed(
+            img,
+            "data:image/png;base64,QUJD",
+            mime_type="image/png",
+        )
+
+        assert bounded is None
+        assert error is not None
+        assert "dimension" in error.lower()
 
 
 # ─── _handle_vision_analyze fast-path gating ─────────────────────────────────

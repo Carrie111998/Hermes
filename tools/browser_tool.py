@@ -4722,14 +4722,25 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # turn — no aux call, no information loss. Consistent with vision_analyze.
         from tools.vision_tools import (
             _build_native_vision_tool_result,
+            _prepare_native_vision_embed,
             _should_use_native_vision_fast_path,
         )
 
         if _should_use_native_vision_fast_path():
+            bounded_data_url, embed_error = _prepare_native_vision_embed(
+                screenshot_path,
+                data_url,
+                mime_type="image/png",
+            )
+            if embed_error or bounded_data_url is None:
+                return json.dumps({
+                    "success": False,
+                    "error": embed_error or "Native vision history embed failed.",
+                }, ensure_ascii=False)
             native_result = _build_native_vision_tool_result(
                 image_url=str(screenshot_path),
                 question=question,
-                image_data_url=data_url,
+                image_data_url=bounded_data_url,
                 image_size_bytes=len(_screenshot_bytes),
             )
             meta = native_result.setdefault("meta", {})

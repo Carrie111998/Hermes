@@ -36,6 +36,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.context_compressor import _bound_inline_image_payloads
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -2435,6 +2436,13 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Keep the request's inline image payload bounded independently of the
+        # model-token estimate. Native vision embeds can remain cheap in token
+        # currency while dominating the serialized request; project the
+        # per-call copy before cache planning so old bytes cannot reach the
+        # provider or reappear through an api_content sidecar.
+        api_messages = _bound_inline_image_payloads(api_messages)
 
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects
