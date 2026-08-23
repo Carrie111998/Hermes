@@ -2542,6 +2542,150 @@ def _apply_tui_python_env(env: dict) -> None:
         env["HERMES_PYTHON"] = sys.executable
 
 
+def _run_tui_under_pty(argv, cwd, env) -> int:
+    """Run the TUI child on a PTY so it renders at the true tmux pane size.
+
+    The Python wrapper is the tmux pane's foreground process, but the Ink
+    child renders on the PTY slave. tmux keys pane size to the pane PID
+    (== our pid), so a poller forwards pane resizes — grow AND shrink — to
+    the PTY. The PTY master is pumped to our stdout and our (raw-mode) stdin
+    into the master, so the child renders and reads keys as on a real tty
+    (#88096 review: no unread master buffer, no forced resize, no global
+    SIGWINCH handler, prompt poller teardown).
+    """
+    import errno
+    import fcntl
+    import ptyprocess
+    import select
+    import struct
+    import termios
+    import threading
+    import tty
+
+    def _outer_tty_size():
+        # tmux resizes the pane tty itself; reading OUR ctty winsize needs no
+        # subprocess and works no matter how deeply hermes is nested under
+        # shells in the pane (unlike pane_pid matching).
+        for stream in (sys.stdin, sys.stdout):
+            try:
+                fd = stream.fileno()
+            except (AttributeError, ValueError, OSError):
+                continue
+            try:
+                buf = bytearray(4)  # struct winsize { rows: u16, cols: u16 }
+                fcntl.ioctl(fd, termios.TIOCGWINSZ, buf)
+                rows, cols = struct.unpack("HH", bytes(buf))
+                if rows > 0 and cols > 0:
+                    return cols, rows
+            except OSError:
+                continue
+        return None
+
+    start_size = _outer_tty_size() or (120, 40)
+    proc = ptyprocess.PtyProcess.spawn(
+        argv, cwd=str(cwd), env=env,
+        dimensions=(start_size[1], start_size[0]),
+    )
+    stop = threading.Event()
+    stdin_fd = sys.stdin.fileno()
+
+    saved_attrs = termios.tcgetattr(stdin_fd)
+    try:
+        # The child owns the PTY slave's termios; the OUTER tty must go raw or
+        # its line discipline line-buffers/echoes the keys we forward.
+        tty.setraw(stdin_fd)
+
+        def _pump_stdin():
+            while not stop.is_set():
+                try:
+                    r, _, _ = select.select([stdin_fd], [], [], 0.2)
+                except (OSError, ValueError):
+                    return
+                if not r:
+                    continue
+                try:
+                    data = os.read(stdin_fd, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                try:
+                    os.write(proc.fd, data)
+                except OSError:
+                    return
+
+        def _poll_tty_size():
+            last = start_size
+            first_failure_logged = False
+            while not stop.is_set():
+                try:
+                    size = _outer_tty_size()
+                    if size and size != last:
+                        # Forward grow AND shrink; the outer tty is the truth.
+                        proc.setwinsize(size[1], size[0])
+                        last = size
+                except Exception as exc:
+                    if not first_failure_logged:
+                        logger.debug("tty size poll failed: %s", exc)
+                        first_failure_logged = True
+                stop.wait(0.3)
+
+        in_thread = threading.Thread(
+            target=_pump_stdin, daemon=True, name="tui-pty-stdin")
+        poll_thread = threading.Thread(
+            target=_poll_tty_size, daemon=True, name="tui-pty-resize")
+        in_thread.start()
+        poll_thread.start()
+
+        try:
+            while proc.isalive():
+                try:
+                    r, _, _ = select.select([proc.fd], [], [], 0.2)
+                except InterruptedError:
+                    continue
+                if not r:
+                    continue
+                try:
+                    data = os.read(proc.fd, 65536)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            # Final drain: the child may have written just before exiting.
+            try:
+                r, _, _ = select.select([proc.fd], [], [], 0.1)
+                if r:
+                    data = os.read(proc.fd, 65536)
+                    if data:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+            except OSError:
+                pass
+        finally:
+            stop.set()
+            in_thread.join(timeout=1)
+            poll_thread.join(timeout=1)
+    except BaseException:
+        # We own the child's only tty pipe; on any unwinding (SIGINT from
+        # outside the pane, errors) don't leave an orphaned Ink process.
+        try:
+            proc.terminate(force=True)
+        except Exception:
+            pass
+        raise
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)
+
+    code = proc.wait()
+    if code is None:
+        code = 128 + (proc.signalstatus or 0)
+    return int(code)
+
+
 def _launch_tui(
     resume_session_id: Optional[str] = None,
     tui_dev: bool = False,
@@ -2681,110 +2825,25 @@ def _launch_tui(
         env["HERMES_TUI_RESUME"] = resume_session_id
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
-    code: Optional[int] = None
     try:
-        # Use PTY so the TUI gets correct terminal dimensions from tmux
+        # Use PTY so the TUI renders at the true tmux pane size and gets
+        # resize events. All #88096 review points are addressed inside
+        # _run_tui_under_pty(): no forced startup resize, grow+shrink
+        # forwarding with prompt poller teardown, no global SIGWINCH
+        # handler, no duplicated imports, one debug log on first failure.
         try:
-            import ptyprocess
-            import termios
-            import struct
-            import fcntl
-            import sys
-            import subprocess
-            import os
-            
-            # Get current terminal size - try multiple methods
-            # Default to a reasonable size for TUI; the polling thread will track max
-            cols, rows = 120, 40
-            
-            proc = ptyprocess.PtyProcess.spawn(argv, cwd=str(cwd), env=env, dimensions=(rows, cols))
-
-            # Forward SIGWINCH from tmux to the PTY so the TUI gets resize events
-            import signal
-            def _forward_sigwinch(signum, frame):
-                # Don't read from fds - they're not the tmux TTY
-                # The polling thread handles resize via tmux list-panes
-                pass
-
-            signal.signal(signal.SIGWINCH, _forward_sigwinch)
-
-            # Also forward resize from tmux by polling pane size (since Python isn't in fg group)
-            # The PTY child (Node.js) is the foreground process, but tmux shows the Python process PID
-            # because Python is the session leader of the tmux pane
-            import threading
-            import time
-            my_pid = os.getpid()
-            
-            # Immediately resize the tmux pane to a reasonable size if we can
-            if cols > 0 and rows > 0:
-                try:
-                    # Get the window ID from the pane ID
-                    result = subprocess.run(
-                        ['tmux', 'list-panes', '-a', '-F', '#{pane_id} #{window_id} #{pane_pid}'],
-                        capture_output=True, text=True, timeout=1
-                    )
-                    window_id = None
-                    for line in result.stdout.strip().split('\n'):
-                        parts = line.split()
-                        if len(parts) >= 3 and int(parts[2]) == my_pid:
-                            window_id = parts[1]
-                            break
-                    if window_id:
-                        subprocess.run(
-                            ['tmux', 'resize-window', '-t', window_id, '-x', str(max(cols, 120)), '-y', str(max(rows, 40))],
-                            capture_output=True, timeout=1
-                        )
-                except Exception:
-                    pass
-            
-            def _poll_tmux_size():
-                # Track maximum size seen to prevent reverting to tmux defaults
-                max_cols, max_rows = cols, rows
-                last_cols, last_rows = cols, rows
-                while True:
-                    time.sleep(0.5)
-                    try:
-                        # Find our pane by matching our own PID (Python is the tmux pane foreground process)
-                        result = subprocess.run(
-                            ['tmux', 'list-panes', '-a', '-F', '#{pane_width} #{pane_height} #{pane_pid}'],
-                            capture_output=True, text=True, timeout=1
-                        )
-                        if result.stdout.strip():
-                            for line in result.stdout.strip().split('\n'):
-                                parts = line.split()
-                                if len(parts) >= 3:
-                                    try:
-                                        pane_pid = int(parts[2])
-                                        if pane_pid == my_pid:
-                                            new_cols, new_rows = int(parts[0]), int(parts[1])
-                                            # Update max size seen
-                                            if new_cols > max_cols:
-                                                max_cols = new_cols
-                                            if new_rows > max_rows:
-                                                max_rows = new_rows
-                                            # Only forward resize if it matches or exceeds max seen
-                                            if (new_cols >= max_cols and new_rows >= max_rows and
-                                                (new_cols != last_cols or new_rows != last_rows)):
-                                                proc.setwinsize(new_rows, new_cols)
-                                                last_cols, last_rows = new_cols, new_rows
-                                            break
-                                    except ValueError:
-                                        continue
-                    except Exception:
-                        pass
-
-            poll_thread = threading.Thread(target=_poll_tmux_size, daemon=True)
-            poll_thread.start()
-
-            code = proc.wait()
-        except (ImportError, AttributeError, OSError):
+            code = _run_tui_under_pty(argv, cwd, env)
+        except ImportError:
             # Fallback to subprocess if PTY unavailable
             code = subprocess.call(argv, cwd=str(cwd), env=env)
         except KeyboardInterrupt:
             code = 130
 
+        if code in {0, 130}:
+            _print_tui_exit_summary(resume_session_id, active_session_file)
     except KeyboardInterrupt:
         code = 130
+    finally:
         try:
             os.unlink(active_session_file)
         except OSError:
