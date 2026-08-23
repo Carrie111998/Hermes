@@ -3552,6 +3552,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "reasoning_effort": reasoning_effort,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
