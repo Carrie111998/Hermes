@@ -16,7 +16,7 @@ jobs:
   publish:
     if: github.repository == 'andrexibiza/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -30,17 +30,83 @@ jobs:
           test "$GITHUB_REF_NAME" = "fix/windows-desktop-pack-transaction"
           git merge-base --is-ancestor db32f7bb0864f5944c6ed9f505d0b979bedc8f2f HEAD
 
-      - name: Materialize reviewed Python rollback composition
+      - name: Recompose canonical delivery on current upstream main
         shell: bash
         run: |
           set -euo pipefail
+          branch=fix/windows-desktop-pack-transaction
+          implementation=db32f7bb0864f5944c6ed9f505d0b979bedc8f2f
+
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+            +refs/heads/main:refs/remotes/upstream/main
+          base="$(git rev-parse refs/remotes/upstream/main)"
+          git switch --detach "$base"
+
+          implementation_paths=(
+            apps/desktop/scripts/before-pack-recovery.mjs
+            apps/desktop/scripts/before-pack.mjs
+            apps/desktop/scripts/before-pack.test.mjs
+            apps/desktop/scripts/desktop-builder-runtime.mjs
+            apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs
+            apps/desktop/scripts/desktop-pack-transaction.mjs
+            apps/desktop/scripts/desktop-pack-transaction.test.mjs
+            apps/desktop/scripts/run-electron-builder.mjs
+            apps/desktop/scripts/stage-native-deps-recovery.mjs
+            apps/desktop/scripts/stage-native-deps-recovery.test.mjs
+            apps/desktop/vitest.config.ts
+            tests/hermes_cli/test_desktop_pack_transaction_windows.py
+          )
+          git checkout "$implementation" -- "${implementation_paths[@]}"
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path('apps/desktop/package.json')
+          s = p.read_text(encoding='utf-8')
+          replacements = (
+              (
+                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs",',
+                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
+              ),
+              (
+                  '    "check:test:desktop:all": "npm run test:desktop:all",',
+                  '    "check:test:desktop:all": "node --test scripts/stage-native-deps-recovery.test.mjs && npm run test:desktop:all",',
+              ),
+              (
+                  '    "beforePack": "scripts/before-pack.mjs",',
+                  '    "beforePack": "scripts/before-pack-recovery.mjs",',
+              ),
+          )
+          for old, new in replacements:
+              if s.count(old) != 1:
+                  raise SystemExit(f'expected exactly one package contract line: {old}')
+              s = s.replace(old, new)
+
+          data = json.loads(s)
+          scripts = data['scripts']
+          assert scripts['build'].endswith('node scripts/stage-native-deps-recovery.mjs')
+          assert 'vite build' not in scripts['build']
+          assert scripts['check:test:desktop:all'].startswith(
+              'node --test scripts/stage-native-deps-recovery.test.mjs && '
+          )
+          assert data['build']['beforePack'] == 'scripts/before-pack-recovery.mjs'
+          assert scripts['check:test:plugins'] == 'node --test src/plugins/*/tests/*.test.mjs'
+          assert 'run-ui-shard.mjs' not in s
+          p.write_text(s, encoding='utf-8')
+          PY
+
           python - <<'PY'
           from pathlib import Path
 
           p = Path('hermes_cli/main.py')
           s = p.read_text(encoding='utf-8')
-          a = s.index('def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n')
-          b = s.index('\ndef _ensure_desktop_exe_launchable(\n', a)
+          start_marker = 'def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n'
+          end_marker = '\ndef _ensure_desktop_exe_launchable(\n'
+          if s.count(start_marker) != 1 or s.count(end_marker) != 1:
+              raise SystemExit('desktop rollback composition anchors are not unique')
+          a = s.index(start_marker)
+          b = s.index(end_marker, a)
           replacement = '''def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:
               """Restore the previous unpacked desktop app from its ``.bak`` tree.
 
@@ -99,95 +165,32 @@ jobs:
           '''
           p.write_text(s[:a] + replacement + s[b:], encoding='utf-8')
           PY
-          python -m py_compile hermes_cli/main.py
-          test "$(sha256sum hermes_cli/main.py | awk '{print $1}')" = "1070cb0d9ec3f9e5772abde631efb3ad682c212accb96eb5f7967d4181031e0c"
-          cp hermes_cli/main.py /tmp/pr91079-main.py
 
-      - name: Recompose exact final tree on upstream main
-        shell: bash
-        run: |
-          set -euo pipefail
-          base=7a54ab22e648a0d2d7e740fad908dda93f025820
-          implementation=db32f7bb0864f5944c6ed9f505d0b979bedc8f2f
-          git fetch --no-tags --depth=1 https://github.com/NousResearch/hermes-agent.git "$base"
-          git switch --detach "$base"
-
-          implementation_paths=(
-            apps/desktop/scripts/before-pack-recovery.mjs
-            apps/desktop/scripts/before-pack.mjs
-            apps/desktop/scripts/before-pack.test.mjs
-            apps/desktop/scripts/desktop-builder-runtime.mjs
-            apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs
-            apps/desktop/scripts/desktop-pack-transaction.mjs
-            apps/desktop/scripts/desktop-pack-transaction.test.mjs
-            apps/desktop/scripts/run-electron-builder.mjs
-            apps/desktop/scripts/stage-native-deps-recovery.mjs
-            apps/desktop/scripts/stage-native-deps-recovery.test.mjs
-            apps/desktop/vitest.config.ts
-            tests/hermes_cli/test_desktop_pack_transaction_windows.py
-          )
-          git checkout "$implementation" -- "${implementation_paths[@]}"
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          p = Path('apps/desktop/package.json')
-          s = p.read_text(encoding='utf-8')
-          replacements = (
-              (
-                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs",',
-                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
-              ),
-              (
-                  '    "check:test:desktop:all": "npm run test:desktop:all",',
-                  '    "check:test:desktop:all": "node --test scripts/stage-native-deps-recovery.test.mjs && npm run test:desktop:all",',
-              ),
-              (
-                  '    "beforePack": "scripts/before-pack.mjs",',
-                  '    "beforePack": "scripts/before-pack-recovery.mjs",',
-              ),
-          )
-          for old, new in replacements:
-              if s.count(old) != 1:
-                  raise SystemExit(f'expected exactly one package contract line: {old}')
-              s = s.replace(old, new)
-          data = json.loads(s)
-          scripts = data['scripts']
-          assert scripts['build'].endswith('node scripts/stage-native-deps-recovery.mjs')
-          assert 'vite build' not in scripts['build']
-          assert scripts['check:test:desktop:all'].startswith(
-              'node --test scripts/stage-native-deps-recovery.test.mjs && '
-          )
-          assert data['build']['beforePack'] == 'scripts/before-pack-recovery.mjs'
-          assert 'run-ui-shard.mjs' not in s
-          assert scripts['check:test:plugins'] == 'node --test src/plugins/*/tests/*.test.mjs'
-          p.write_text(s, encoding='utf-8')
-          PY
-
-          cp /tmp/pr91079-main.py hermes_cli/main.py
           python -m py_compile hermes_cli/main.py
           git add apps/desktop/package.json hermes_cli/main.py "${implementation_paths[@]}"
           git config user.name "Andrex Ibiza, MBA"
           git config user.email "andrexibiza@gmail.com"
           git commit \
             -m "fix(desktop): make Windows package replacement fully transactional (#91079)" \
-            -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire the temporary materializer, and recompose the package transaction on exact upstream main 7a54ab22e648a0d2d7e740fad908dda93f025820. Preserve current-main package-script changes while binding build, test, and beforePack authority to the recovery implementation."
+            -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire all temporary publication machinery, and recompose the package transaction on exact upstream main $base. Preserve current-main package-script and CLI changes while binding build, test, beforePack, rollback, and isolated dependency-realization authority to the reviewed implementation."
 
-      - name: Verify and publish canonical branch tree
+          final_sha="$(git rev-parse HEAD)"
+          final_tree="$(git rev-parse HEAD^{tree})"
+          printf 'PR91079_BASE=%s\nPR91079_FINAL_SHA=%s\nPR91079_FINAL_TREE=%s\n' \
+            "$base" "$final_sha" "$final_tree" >> "$GITHUB_ENV"
+
+      - name: Verify canonical final object
         shell: bash
         run: |
           set -euo pipefail
-          base=7a54ab22e648a0d2d7e740fad908dda93f025820
-          branch=fix/windows-desktop-pack-transaction
-          test "$(git rev-parse HEAD^)" = "$base"
-          test "$(git rev-list --count "$base"..HEAD)" = "1"
-          git diff --check "$base"..HEAD
-          test "$(git show HEAD:hermes_cli/main.py | sha256sum | awk '{print $1}')" = "1070cb0d9ec3f9e5772abde631efb3ad682c212accb96eb5f7967d4181031e0c"
+          test "$(git rev-parse HEAD^)" = "$PR91079_BASE"
+          test "$(git rev-list --count "$PR91079_BASE"..HEAD)" = "1"
+          git diff --check "$PR91079_BASE"..HEAD
+          test ! -e .github/pr91079-actions-kick
           test ! -e .github/workflows/pr91079-materialize-patch.yml
           test ! -e .github/workflows/pr91079-publish-final.yml
 
-          git diff --name-only "$base"..HEAD | sort > /tmp/actual-paths
+          git diff --name-only "$PR91079_BASE"..HEAD | sort > /tmp/actual-paths
           cat > /tmp/expected-paths <<'EOF'
           apps/desktop/package.json
           apps/desktop/scripts/before-pack-recovery.mjs
@@ -213,10 +216,34 @@ jobs:
             esac
           done < /tmp/actual-paths
 
-          final_sha="$(git rev-parse HEAD)"
-          final_tree="$(git rev-parse HEAD^{tree})"
-          echo "final_sha=$final_sha"
-          echo "final_tree=$final_tree"
+          python - <<'PY'
+          from pathlib import Path
+
+          s = Path('hermes_cli/main.py').read_text(encoding='utf-8')
+          block = s.split(
+              'def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n',
+              1,
+          )[1].split('\ndef _ensure_desktop_exe_launchable(\n', 1)[0]
+          required = (
+              'unpacked.rename(corrupt_dir)',
+              'backup_dir.rename(unpacked)',
+              'corrupt_dir.rename(unpacked)',
+              'marker_path.unlink()',
+          )
+          for token in required:
+              assert token in block, token
+          assert 'shutil.rmtree(unpacked' not in block
+          PY
+
+          echo "base=$PR91079_BASE"
+          echo "final_sha=$PR91079_FINAL_SHA"
+          echo "final_tree=$PR91079_FINAL_TREE"
+
+      - name: Publish canonical branch tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch=fix/windows-desktop-pack-transaction
           git push \
             --force-with-lease="refs/heads/$branch:$GITHUB_SHA" \
             origin "HEAD:refs/heads/$branch"
