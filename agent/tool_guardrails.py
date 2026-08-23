@@ -699,7 +699,7 @@ class ToolCallGuardrailController:
                 return None
             spawn_count = _subagent_spawn_count(args)
             if spawn_count == 0:
-                # Control action (list/steer/stop) — spawns nothing. Never
+                # Control action (list/inspect/steer/stop) — spawns nothing. Never
                 # block: once the spawn cap is hit, steering/stopping the
                 # existing children is exactly what should still work.
                 return None
@@ -834,12 +834,12 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     delegate_task runs in one of two modes: a batch (``tasks`` is a non-empty
     list, one child per item) or a single task (``goal``). Count the batch size
     when present, otherwise 1, so the session subagent cap reflects real spawns
-    rather than delegate_task invocations. Control actions (list/steer/stop)
+    rather than delegate_task invocations. Control actions (list/inspect/steer/stop)
     spawn nothing and must not consume the cap.
     """
     if isinstance(args, Mapping):
         action = str(args.get("action") or "").strip().lower()
-        if action in ("list", "steer", "stop"):
+        if action in ("list", "inspect", "steer", "stop"):
             return 0
     tasks = args.get("tasks") if isinstance(args, Mapping) else None
     if isinstance(tasks, list) and tasks:

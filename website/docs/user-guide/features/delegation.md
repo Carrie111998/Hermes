@@ -296,11 +296,13 @@ The parent agent orchestrates its own running children with the same `delegate_t
 
 ```json
 {"action": "list"}
+{"action": "inspect", "subagent_id": "sa-0-1a2b3c4d"}
 {"action": "steer", "subagent_id": "sa-0-1a2b3c4d", "message": "focus on pricing instead"}
 {"action": "stop",  "subagent_id": "sa-0-1a2b3c4d"}
 ```
 
 - **`list`** returns the conversation's live children: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Ids also come back in the spawn dispatch response as `subagent_ids`.
+- **`inspect`** returns a bounded model-safe snapshot for one live child: current/last tool, tool/API-call counts, iteration ceiling, activity age, token/cost counters, and the last 12 sanitized tool lifecycle events. It intentionally excludes thinking/reasoning, assistant text, raw tool arguments, raw tool results, and transcript contents. `telemetry.capture_degraded=true` means supplementary recent-event capture hit an internal error; a core activity-read failure returns an error instead of fabricating a snapshot. `inspect` is live-only — after a child finishes or the process restarts, use normal completion/history surfaces rather than treating retained attribution as a live capability. Full human-readable live transcripts remain the existing operator/audit surface; `inspect` does not parse or inject them into model context.
 - **`steer`** queues a course correction into a running child without stopping it (delivery semantics below).
 - **`stop`** ends a child early at its next iteration boundary; the partial result still re-enters the conversation as a normal completion message.
 

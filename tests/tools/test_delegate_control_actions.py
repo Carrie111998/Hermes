@@ -1,7 +1,7 @@
 """delegate_task(action=...) — model-facing live orchestration of subagents.
 
 Covers the control plane added to delegate_task: action='list' /
-'steer' / 'stop' resolve against the module-level _active_subagents
+'inspect' / 'steer' / 'stop' resolve against the module-level _active_subagents
 registry, scoped by the _delegate_parent_ref ownership chain so a
 conversation can only control its own spawn tree. Also pins the two
 integration contracts: control actions are synchronous (never
@@ -9,14 +9,18 @@ backgrounded) and never consume the per-turn subagent spawn cap.
 """
 
 import json
+import time
 import weakref
 
 from tools.delegate_tool import (
+    DELEGATE_TASK_SCHEMA,
+    _SUBAGENT_INSPECT_EVENT_LIMIT,
     _handle_control_action,
     _is_descendant_of,
     _owns_subagent_record,
     _register_subagent,
     _unregister_subagent,
+    _wrap_subagent_inspect_callback,
     delegate_task,
     get_subagent_attribution,
 )
@@ -29,8 +33,20 @@ class _StubChild:
         self.steered: list[str] = []
         self.accept_steer = accept_steer
         self._live_transcript_path = "/tmp/live/task-0.log"
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+        self.activity = {
+            "current_tool": None,
+            "api_call_count": 0,
+            "max_iterations": 50,
+            "last_activity_ts": time.time(),
+        }
         if parent is not None:
             self._delegate_parent_ref = weakref.ref(parent)
+
+    def get_activity_summary(self):
+        return dict(self.activity)
 
     def steer(self, text: str) -> bool:
         if not self.accept_steer:
@@ -132,6 +148,308 @@ def test_list_empty_registry_has_note():
     out = json.loads(_handle_control_action("list", None, None, _StubParent()))
     assert out["count"] == 0
     assert "note" in out
+
+
+# ---------------------------------------------------------------------------
+# action='inspect'
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_returns_live_activity_usage_and_sanitized_tool_evidence():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    child.activity.update(
+        {
+            "current_tool": "terminal",
+            "api_call_count": 6,
+            "max_iterations": 50,
+            "last_activity_ts": time.time() - 4.0,
+        }
+    )
+    child.session_prompt_tokens = 1234
+    child.session_completion_tokens = 321
+    child.session_estimated_cost_usd = 0.0123456
+    sid = "sid-ctl-inspect-1"
+    _register(sid, child, tool_count=8, last_tool="read_file")
+    cb = _wrap_subagent_inspect_callback(None, sid)
+    try:
+        cb(
+            "tool.started",
+            "read_file",
+            args=json.dumps({"path": "gateway/session.py", "content": "private"}),
+        )
+        cb("tool.completed", "read_file", duration=0.25, is_error=False)
+        out = json.loads(_handle_control_action("inspect", sid, None, parent))
+        assert out["action"] == "inspect"
+        assert out["activity"]["current_tool"] == "terminal"
+        # One start was observed by the always-on telemetry tee.
+        assert out["activity"]["tool_count"] == 9
+        assert out["activity"]["last_tool"] == "read_file"
+        assert out["activity"]["api_calls"] == 6
+        assert out["usage"] == {
+            "input_tokens": 1234,
+            "output_tokens": 321,
+            "estimated_cost_usd": 0.012346,
+        }
+        assert out["telemetry"] == {
+            "capture_degraded": False,
+            "capture_errors": 0,
+            "recent_event_limit": _SUBAGENT_INSPECT_EVENT_LIMIT,
+        }
+        assert [e["type"] for e in out["recent_events"]] == [
+            "tool_started",
+            "tool_completed",
+        ]
+        started = out["recent_events"][0]
+        assert started["tool_input"]["targets"]["path"] == "gateway/session.py"
+        assert "content" in started["tool_input"]["argument_keys"]
+        assert "private" not in json.dumps(out)
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_redacts_url_credentials_and_never_keeps_result_or_thinking_text():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-2"
+    _register(sid, child)
+    cb = _wrap_subagent_inspect_callback(None, sid)
+    try:
+        cb(
+            "tool.started",
+            "web_fetch",
+            args=json.dumps(
+                {
+                    "url": "https://user:secret@example.com/path?token=abc#frag",
+                    "body": "supersecret-body",
+                }
+            ),
+        )
+        cb("_thinking", "PRIVATE CHAIN OF THOUGHT")
+        cb(
+            "tool.completed",
+            "web_fetch",
+            duration=1.5,
+            is_error=True,
+            result="RAW-SECRET-RESULT",
+        )
+        out = json.loads(_handle_control_action("inspect", sid, None, parent))
+        serialized = json.dumps(out)
+        assert "user:secret" not in serialized
+        assert "token=abc" not in serialized
+        assert "supersecret-body" not in serialized
+        assert "PRIVATE CHAIN OF THOUGHT" not in serialized
+        assert "RAW-SECRET-RESULT" not in serialized
+        assert out["recent_events"][0]["tool_input"]["targets"]["url"] == "https://example.com/path"
+        assert out["recent_events"][1]["status"] == "error"
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_event_ring_is_bounded_and_tool_count_is_total():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-ring"
+    _register(sid, child)
+    cb = _wrap_subagent_inspect_callback(None, sid)
+    try:
+        total = _SUBAGENT_INSPECT_EVENT_LIMIT + 3
+        for i in range(total):
+            cb("tool.started", f"tool-{i}", args="{}")
+        out = json.loads(_handle_control_action("inspect", sid, None, parent))
+        assert len(out["recent_events"]) == _SUBAGENT_INSPECT_EVENT_LIMIT
+        assert out["recent_events"][0]["tool"] == "tool-3"
+        assert out["recent_events"][-1]["tool"] == f"tool-{total - 1}"
+        assert out["activity"]["tool_count"] == total
+        assert out["activity"]["last_tool"] == f"tool-{total - 1}"
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_capture_failure_is_reported_without_breaking_inner_callback(monkeypatch):
+    import tools.delegate_tool as dt
+
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-degraded"
+    _register(sid, child)
+    forwarded = []
+
+    def _inner(*args, **kwargs):
+        forwarded.append((args, kwargs))
+
+    def _boom(_arguments):
+        raise RuntimeError("do not retain this secret exception")
+
+    monkeypatch.setattr(dt, "_summarize_tool_arguments", _boom)
+    cb = _wrap_subagent_inspect_callback(_inner, sid)
+    try:
+        cb("tool.started", "terminal", args='{"command":"secret"}')
+        assert len(forwarded) == 1
+        out = json.loads(_handle_control_action("inspect", sid, None, parent))
+        assert out["activity"]["tool_count"] == 1
+        assert out["telemetry"]["capture_degraded"] is True
+        assert out["telemetry"]["capture_errors"] == 1
+        assert "do not retain" not in json.dumps(out)
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_activity_failure_fails_closed():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-activity-fail"
+
+    def _boom():
+        raise RuntimeError("activity source unavailable")
+
+    child.get_activity_summary = _boom
+    _register(sid, child)
+    try:
+        out = _handle_control_action("inspect", sid, None, parent)
+        assert "activity telemetry is unavailable" in out
+        assert '"action": "inspect"' not in out
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_foreign_child_is_refused():
+    parent = _StubParent()
+    foreign = _StubChild(_StubParent())
+    sid = "sid-ctl-inspect-foreign"
+    _register(sid, foreign)
+    try:
+        assert "No live subagent" in _handle_control_action(
+            "inspect", sid, None, parent
+        )
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_samples_agent_activity_outside_registry_lock():
+    import tools.delegate_tool as dt
+
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-lock"
+
+    def _activity():
+        acquired = dt._active_subagents_lock.acquire(blocking=False)
+        assert acquired, "inspect sampled activity while holding registry lock"
+        dt._active_subagents_lock.release()
+        return dict(child.activity)
+
+    child.get_activity_summary = _activity
+    _register(sid, child)
+    try:
+        assert json.loads(_handle_control_action("inspect", sid, None, parent))[
+            "action"
+        ] == "inspect"
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_revalidates_target_after_sampling():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-race"
+
+    def _activity():
+        _unregister_subagent(sid, agent=child)
+        return dict(child.activity)
+
+    child.get_activity_summary = _activity
+    _register(sid, child)
+    out = _handle_control_action("inspect", sid, None, parent)
+    assert "No live subagent" in out
+
+
+def test_inspect_is_read_only_and_repeatable(monkeypatch):
+    import tools.delegate_tool as dt
+
+    parent = _StubParent()
+    child = _StubChild(parent)
+    child.activity["last_activity_ts"] = 900.0
+    sid = "sid-ctl-inspect-repeatable"
+    _register(sid, child, started_at=800.0, tool_count=2, last_tool="read_file")
+    cb = _wrap_subagent_inspect_callback(None, sid)
+    cb("tool.started", "read_file", args='{"path":"x.py"}')
+    monkeypatch.setattr(dt.time, "time", lambda: 1000.0)
+    try:
+        first = _handle_control_action("inspect", sid, None, parent)
+        second = _handle_control_action("inspect", sid, None, parent)
+        assert first == second
+        assert len(json.loads(first)["recent_events"]) == 1
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_finished_child_fails_closed_instead_of_using_recent_registry():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-finished"
+    _register(sid, child)
+    _unregister_subagent(sid)
+    assert "No live subagent" in _handle_control_action(
+        "inspect", sid, None, parent
+    )
+
+
+def test_list_active_subagents_hides_private_inspect_state():
+    from tools.delegate_tool import list_active_subagents
+
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-private"
+    _register(
+        sid,
+        child,
+        _inspect_events=[{"type": "tool_started", "tool": "x"}],
+        _inspect_capture_errors=2,
+    )
+    try:
+        row = next(r for r in list_active_subagents() if r["subagent_id"] == sid)
+        assert "_inspect_events" not in row
+        assert "_inspect_capture_errors" not in row
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_normalizes_nonfinite_numeric_telemetry():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    child.activity.update(
+        {
+            "last_activity_ts": float("inf"),
+            "api_call_count": float("inf"),
+            "max_iterations": float("nan"),
+        }
+    )
+    child.session_estimated_cost_usd = float("inf")
+    child.session_prompt_tokens = float("nan")
+    sid = "sid-ctl-inspect-nonfinite"
+    _register(sid, child, started_at=float("-inf"))
+    cb = _wrap_subagent_inspect_callback(None, sid)
+    try:
+        cb("tool.completed", "terminal", duration=float("inf"), is_error=False)
+        raw = _handle_control_action("inspect", sid, None, parent)
+        assert "Infinity" not in raw
+        assert "NaN" not in raw
+        out = json.loads(raw)
+        assert out["running_seconds"] is None
+        assert out["activity"]["seconds_since_activity"] is None
+        assert out["activity"]["api_calls"] == 0
+        assert out["activity"]["max_iterations"] == 0
+        assert out["usage"]["input_tokens"] == 0
+        assert out["usage"]["estimated_cost_usd"] == 0.0
+        assert "duration_seconds" not in out["recent_events"][0]
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_delegate_task_schema_exposes_inspect_action():
+    actions = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert "inspect" in actions
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +571,18 @@ def test_delegate_task_routes_control_action_before_spawn_machinery():
     parent = _StubParent()
     out = json.loads(delegate_task(action="list", parent_agent=parent))
     assert out["action"] == "list"
+
+
+def test_delegate_task_routes_inspect_before_spawn_machinery():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-routing"
+    _register(sid, child)
+    try:
+        out = json.loads(delegate_task(action="inspect", subagent_id=sid, parent_agent=parent))
+        assert out["action"] == "inspect"
+    finally:
+        _unregister_subagent(sid)
 
 
 def test_delegate_task_control_action_bypasses_spawn_pause():
@@ -536,6 +866,7 @@ def test_spawn_count_zero_for_control_actions():
     from agent.tool_guardrails import _subagent_spawn_count
 
     assert _subagent_spawn_count({"action": "list"}) == 0
+    assert _subagent_spawn_count({"action": "inspect", "subagent_id": "x"}) == 0
     assert _subagent_spawn_count({"action": "steer", "subagent_id": "x"}) == 0
     assert _subagent_spawn_count({"action": "stop", "subagent_id": "x"}) == 0
     # Spawn shapes unchanged
@@ -570,6 +901,12 @@ def test_control_action_not_blocked_at_spawn_cap():
     )
     assert (
         ctl2.before_call("delegate_task", {"action": "list"}).action == "allow"
+    )
+    assert (
+        ctl2.before_call(
+            "delegate_task", {"action": "inspect", "subagent_id": "x"}
+        ).action
+        == "allow"
     )
     # And spawns remain blocked afterwards — the control call didn't reset it
     assert ctl2.before_call("delegate_task", {"goal": "c"}).action == "block"
