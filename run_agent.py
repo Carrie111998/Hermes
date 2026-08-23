@@ -8330,21 +8330,51 @@ class AIAgent:
         original single-path dispatch; mixed batches execute segment by
         segment in emission order so safe subsets still run concurrently
         while side-effect ordering is preserved.
+
+        Batch cap (#93251): calls beyond ``tools.max_tool_calls_per_batch``
+        are denied with a visible per-call result instead of being executed
+        into whatever failure an oversized batch produces. Denial happens
+        HERE — the single dispatch point for every execution shape
+        (sequential, concurrent, segmented) — so the cap holds regardless of
+        how the admitted prefix is scheduled, and the overflow is truncated
+        before any segment planning so denied ids can never be dispatched.
         """
-        tool_calls = assistant_message.tool_calls
+        total_requested = len(assistant_message.tool_calls)
+        from agent.tool_dispatch_helpers import (
+            _plan_tool_batch_segments,
+            append_denied_batch_results,
+            resolve_max_tool_calls_per_batch,
+            split_batch_overflow,
+        )
+
+        limit = resolve_max_tool_calls_per_batch()
+        admitted_calls, denied_calls = split_batch_overflow(
+            assistant_message.tool_calls, limit,
+        )
+        if denied_calls:
+            logger.warning(
+                "Tool batch cap: %d call(s) requested, executing first %d and "
+                "denying %d (tools.max_tool_calls_per_batch=%d)",
+                total_requested, len(admitted_calls), len(denied_calls), limit,
+            )
+            assistant_message.tool_calls = admitted_calls
+            append_denied_batch_results(
+                self, messages, denied_calls, limit=limit,
+            )
+            if getattr(self, "_incremental_persistence_failed", False):
+                return
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if len(tool_calls) <= 1:
+            if len(assistant_message.tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
 
-            from agent.tool_dispatch_helpers import _plan_tool_batch_segments
             _active_env = get_active_env(effective_task_id)
             _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-            segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
+            segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
             if len(segments) == 1:
                 kind = segments[0][0]

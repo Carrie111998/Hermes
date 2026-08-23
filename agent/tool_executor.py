@@ -267,6 +267,53 @@ def _max_workers_for_tool_batch(runnable_calls) -> int:
     return min(len(runnable_calls), max_workers)
 
 
+def _deny_overflow_calls(agent, assistant_message, messages: list) -> frozenset:
+    """Backstop for the per-message tool-call cap (#93251).
+
+    ``AIAgent._execute_tool_calls`` — the single dispatch point — truncates an
+    oversized batch before any executor runs.  These module-level executors
+    are also callable directly (segmented dispatch passes SimpleNamespace
+    wrappers; host code and older plugins may too), so re-check at executor
+    entry and deny the overflow visibly rather than executing into whatever
+    failure an oversized batch produces.
+
+    Returns the set of denied call ids.  When the executor's
+    ``assistant_message.tool_calls`` cannot be truncated in place
+    (read-only wrapper), the caller must skip these ids in its execution
+    loop — the denial results are already appended here.
+    """
+    from agent.tool_dispatch_helpers import (
+        append_denied_batch_results,
+        resolve_max_tool_calls_per_batch,
+        split_batch_overflow,
+    )
+
+    limit = resolve_max_tool_calls_per_batch()
+    admitted_calls, denied_calls = split_batch_overflow(
+        getattr(assistant_message, "tool_calls", None), limit,
+    )
+    if not denied_calls:
+        return frozenset()
+    logger.warning(
+        "Tool batch cap backstop: %d call(s) reached the executor "
+        "un-truncated; denying %d overflow call(s) "
+        "(tools.max_tool_calls_per_batch=%d)",
+        len(admitted_calls) + len(denied_calls), len(denied_calls), limit,
+    )
+    try:
+        assistant_message.tool_calls = admitted_calls
+    except AttributeError:
+        # Read-only wrapper (e.g. a frozen dataclass): leave it untouched.
+        # The returned denied-id set makes the executor skip those calls;
+        # pre-API sanitizers additionally drop any result whose call_id no
+        # longer pairs with an executed call.
+        pass
+    append_denied_batch_results(agent, messages, denied_calls, limit=limit)
+    return frozenset(
+        getattr(tc, "id", "") or "" for tc in denied_calls
+    )
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
@@ -1077,7 +1124,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
-    tool_calls = assistant_message.tool_calls
+    _denied_call_ids = _deny_overflow_calls(agent, assistant_message, messages)
+    if getattr(agent, "_incremental_persistence_failed", False):
+        # Denial results could not be made canonical — the same fail-closed
+        # rule the caller applies around every other incremental flush.
+        return
+
+    def _is_denied(tc) -> bool:
+        return (getattr(tc, "id", "") or "") in _denied_call_ids
+
+    tool_calls = [
+        tc for tc in assistant_message.tool_calls if not _is_denied(tc)
+    ]
     num_tools = len(tool_calls)
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
@@ -1880,6 +1938,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Keep /steer pending until the final post-budget drain below.  The model
     # cannot observe a partial batch, while an early drain can be discarded
     # when aggregate budget enforcement replaces that tool result.
+    # NOTE: `parsed_calls`/`tool_calls` already exclude denied overflow calls
+    # (#93251), whose results sit EARLIER in `messages` — so this tail slice
+    # covers exactly this batch's own results, never a denial notice.
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
@@ -1929,9 +1990,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     def _run_agent_tool_execution_middleware(agent, **kwargs):
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
+    _denied_call_ids = _deny_overflow_calls(agent, assistant_message, messages)
+
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        # Denied overflow call (#93251): its visible denial result was
+        # already appended by the backstop. Skip it here so an untruncated
+        # (read-only) assistant message can never re-dispatch one.
+        if (getattr(tool_call, "id", "") or "") in _denied_call_ids:
+            continue
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -2793,6 +2861,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
             for skipped_tc in assistant_message.tool_calls[i:]:
+                if (getattr(skipped_tc, "id", "") or "") in _denied_call_ids:
+                    continue  # already answered by the cap backstop
                 skipped_name = skipped_tc.function.name
                 messages.append(make_tool_result_message(
                     skipped_name,
@@ -2812,7 +2882,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # Keep /steer pending until the final post-budget drain below.  The model
     # only receives this batch after all calls finish, and an early drain can
     # be discarded when aggregate budget enforcement replaces a tool result.
-    num_tools_seq = len(assistant_message.tool_calls)
+    # Denied overflow results (#93251) sit BEFORE this executor's own results
+    # in `messages`, so the tail slice must skip them — otherwise the cap /
+    # steer would rewrite denial notices instead of real tool outputs.
+    num_tools_seq = len(assistant_message.tool_calls) - len(_denied_call_ids)
     if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
@@ -2854,6 +2927,21 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+
+    # Batch cap (#93251): enforce ONCE for the whole batch here, then strip
+    # denied ids from the plan so no segment can ever run them. Matters when
+    # host code calls this executor directly — the AIAgent dispatcher already
+    # truncated before planning.
+    _denied_call_ids = _deny_overflow_calls(agent, assistant_message, messages)
+    if getattr(agent, "_incremental_persistence_failed", False):
+        return
+    if _denied_call_ids:
+        segments = [
+            (kind, [tc for tc in calls
+                    if (getattr(tc, "id", "") or "") not in _denied_call_ids])
+            for kind, calls in segments
+        ]
+        segments = [(kind, calls) for kind, calls in segments if calls]
 
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):

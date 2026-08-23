@@ -44,6 +44,139 @@ logger = logging.getLogger(__name__)
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-message tool-call cap (#93251)
+#
+# A single assistant message can carry an arbitrarily large parallel tool
+# batch, and an oversized batch must fail VISIBLY per denied call rather
+# than silently losing work.  ``tools.max_tool_calls_per_batch`` in
+# config.yaml sets the hard cap; overflow calls receive a per-call denial
+# tool result (recoverable — the model can re-issue them next turn) instead
+# of being executed into whatever failure an oversized batch produces.
+# Non-secret behavioral setting ⇒ config.yaml, not an env var.
+# ──────────────────────────────────────────────────────────────────────
+_DEFAULT_MAX_TOOL_CALLS_PER_BATCH = 12
+_MAX_TOOL_CALLS_PER_BATCH_KEY = "tools.max_tool_calls_per_batch"
+
+
+def resolve_max_tool_calls_per_batch() -> int:
+    """Return the per-assistant-message tool-call cap.
+
+    Reads ``tools.max_tool_calls_per_batch`` from config.yaml; falls back to
+    ``_DEFAULT_MAX_TOOL_CALLS_PER_BATCH`` when unset or invalid.  Clamped to
+    at least 1 — a cap of 0 would deny every tool call, which is a
+    misconfiguration, not a feature.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        tools_cfg = cfg.get("tools") if isinstance(cfg, dict) else None
+        value = (
+            tools_cfg.get("max_tool_calls_per_batch")
+            if isinstance(tools_cfg, dict)
+            else None
+        )
+    except Exception:
+        value = None
+
+    if value is None:
+        return _DEFAULT_MAX_TOOL_CALLS_PER_BATCH
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_TOOL_CALLS_PER_BATCH
+    return max(1, limit)
+
+
+def split_batch_overflow(tool_calls, limit: int) -> tuple[list, list]:
+    """Split a tool-call batch into ``(admitted, denied)`` under ``limit``."""
+    calls = list(tool_calls or [])
+    if len(calls) <= limit:
+        return calls, []
+    return calls[:limit], calls[limit:]
+
+
+def make_denied_tool_call_message(
+    tool_name: str,
+    tool_call_id: str,
+    *,
+    allowed: int,
+    attempted: int,
+) -> dict:
+    """Build the visible per-call denial result for an overflow call (#93251).
+
+    The text must tell the model three things: the call did NOT run, why,
+    and how to recover (re-issue within the cap next turn).  Paired to the
+    original ``tool_call_id`` so provider-side tool_use/tool_result pairing
+    stays intact.
+
+    Built directly rather than through :func:`make_tool_result_message`:
+    this result is authored by Hermes itself, not produced by the named
+    tool, so it must NOT receive that function's untrusted-data framing or
+    attacker-content risk scan — those apply to tool OUTPUT, and a denial
+    carries none.
+    """
+    content = (
+        f"[Tool call denied: batch cap exceeded — this assistant turn issued "
+        f"{attempted} tool calls but at most {allowed} are executed per turn "
+        f"({_MAX_TOOL_CALLS_PER_BATCH_KEY}). This call was NOT run and had no "
+        f"effect. Re-issue it in your next turn, keeping the total within the "
+        f"{allowed}-call cap.]"
+    )
+    return stamp_message_timestamp({
+        "role": "tool",
+        "name": tool_name,
+        "tool_name": tool_name,
+        "content": content,
+        "tool_call_id": tool_call_id,
+        "effect_disposition": "none",
+    })
+
+
+def append_denied_batch_results(agent, messages: list, denied_calls, *, limit: int) -> None:
+    """Append visible denial results for overflow calls and persist them.
+
+    Mirrors the executor interrupt paths: every denied ``tool_call_id`` gets
+    exactly one result message so the canonical transcript keeps strict
+    call/result pairing, followed by the incremental SessionDB flush so a
+    crash/resume never replays a denied call as unanswered.  Best-effort UI
+    status per denial — the model-facing result is the source of truth.
+    """
+    if not denied_calls:
+        return
+    attempted = limit + len(denied_calls)
+    emit_status = getattr(agent, "_emit_status", None)
+    for tc in denied_calls:
+        name = getattr(getattr(tc, "function", None), "name", "") or "tool"
+        messages.append(make_denied_tool_call_message(
+            name,
+            getattr(tc, "id", "") or "",
+            allowed=limit,
+            attempted=attempted,
+        ))
+        if callable(emit_status):
+            try:
+                emit_status(
+                    f"⚠️ Tool '{name}' denied: batch cap of {limit} tool calls "
+                    f"reached — not executed"
+                )
+            except Exception:
+                pass
+    flush = getattr(agent, "_flush_messages_to_session_db", None)
+    if flush is not None:
+        try:
+            if flush(messages, None) is False:
+                agent._incremental_persistence_failed = True
+                if getattr(agent, "_last_persistence_error_cause", None) is None:
+                    agent._last_persistence_error_cause = "unknown"
+        except Exception as exc:
+            agent._incremental_persistence_failed = True
+            from hermes_state import classify_persistence_error
+            agent._last_persistence_error_cause = classify_persistence_error(exc)
+
+
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
