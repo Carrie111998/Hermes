@@ -69,3 +69,22 @@ test('data-url fallback reads the capped route and decodes it', () => {
   assert.match(fn, /\/api\/fs\/read-data-url\?path=/)
   assert.match(fn, /parseDataUrlToBuffer\(/)
 })
+
+// #92480: both gateway save dialogs opened with no `filters`, so the Windows
+// dialog offered only "All Files" and had no default extension to append. The
+// name was never the problem, which is why this is a wiring assertion: the
+// helper's own behavior is covered in gateway-file-download.test.ts.
+test('the streaming save dialog carries a file type for the resolved name', () => {
+  const fn = extract('async function finalizeGatewayDownload', '\nfunction readGatewayErrorText')
+
+  assert.match(fn, /filters: saveDialogFilters\(filename\)/)
+})
+
+test('the data-url save dialog carries one too', () => {
+  const fn = extract('async function saveGatewayFileViaDataUrl', '// Mint a single-use WS ticket')
+
+  // The fallback saves the same bytes to the same kind of destination; a fix
+  // that reached only the streaming path would leave the bug alive on any
+  // gateway old enough to 404 the streaming route.
+  assert.match(fn, /filters: saveDialogFilters\(filename\)/)
+})
