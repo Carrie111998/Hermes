@@ -722,6 +722,14 @@ export function useMessageStream({
         // tool-call parts that never saw their completion event.
         nextMessages = sealOpenToolParts(nextMessages)
 
+        // Clear `pending` from user messages — the turn is settled, so no
+        // user row is legitimately pending anymore. Without this, the
+        // optimistic user message's `pending: true` permanently prevents
+        // SessionStateCache from evicting the session.
+        nextMessages = nextMessages.map(m =>
+          m.role === 'user' && m.pending ? { ...m, pending: false } : m
+        )
+
         const hasInlineError = nextMessages.some(m => m.role === 'assistant' && m.error && !m.hidden)
         const lastVisible = [...nextMessages].reverse().find(m => !m.hidden)
         const unresolvedUserTail = lastVisible?.role === 'user'
@@ -822,9 +830,16 @@ export function useMessageStream({
               }
             ]
 
+        // Clear `pending` from user messages — same rationale as in
+        // completeAssistantMessage: the turn is settled (failed), so no
+        // user row is legitimately pending anymore.
+        const settledMessages = nextMessages.map(m =>
+          m.role === 'user' && m.pending ? { ...m, pending: false } : m
+        )
+
         return {
           ...state,
-          messages: nextMessages,
+          messages: settledMessages,
           streamId: null,
           pendingBranchGroup: null,
           sawAssistantPayload: true,
