@@ -2219,34 +2219,46 @@ def _cron_adapters_for_profile(runner: "GatewayRunner", profile_name: str):
 
     A named profile owns every platform present in its scoped gateway config,
     including explicit disables and adapters that failed to connect. Those
-    entries therefore mask the primary adapter instead of silently sending as
+    entries therefore mask the Default adapter instead of silently sending as
     the Default bot. Platforms absent from the named config may intentionally
-    reuse the primary live transport. Relay remains process-owned and keeps its
+    reuse the Default live transport. Relay remains process-owned and keeps its
     existing multiplex behavior.
 
     The caller must invoke this under that profile's home + secret scope so
     ``load_gateway_config`` cannot discover Default credentials in os.environ.
     """
     primary_adapters = getattr(runner, "adapters", None) or {}
+    profile_adapters = getattr(runner, "_profile_adapters", None) or {}
     active_profile_name = getattr(runner, "_active_profile_name", None)
     primary_profile = (
         active_profile_name()
         if callable(active_profile_name)
         else "default"
     )
-    if profile_name == primary_profile:
-        return primary_adapters
-
     from gateway.config import Platform, load_gateway_config
 
+    default_adapters = (
+        primary_adapters
+        if primary_profile == "default"
+        else profile_adapters.get("default", {})
+    )
+    resolved = dict(default_adapters)
+    relay_adapter = primary_adapters.get(Platform.RELAY)
+    if relay_adapter is not None:
+        resolved[Platform.RELAY] = relay_adapter
+    if profile_name == "default":
+        return resolved
+
     profile_config = load_gateway_config()
-    resolved = dict(primary_adapters)
     for platform in profile_config.platforms:
         if platform is not Platform.RELAY:
             resolved.pop(platform, None)
-    resolved.update(
-        (getattr(runner, "_profile_adapters", None) or {}).get(profile_name, {})
+    owned_adapters = (
+        primary_adapters
+        if profile_name == primary_profile
+        else profile_adapters.get(profile_name, {})
     )
+    resolved.update(owned_adapters)
     return resolved
 
 

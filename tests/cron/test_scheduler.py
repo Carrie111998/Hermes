@@ -2313,26 +2313,29 @@ class TestCronDeliveryMirror:
 
     def test_seed_thread_session_creates_session_and_mirrors(self):
         """Seeding a freshly-opened thread creates the thread-keyed session via
-        the adapter's live store and appends the brief via mirror_to_session."""
+        the adapter's live store and appends the brief to that exact session."""
         from cron.scheduler import _seed_cron_thread_session
 
         store = MagicMock()
+        store.get_or_create_session.return_value.session_id = "thread-session"
         adapter = MagicMock()
         adapter._session_store = store
 
-        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            _seed_cron_thread_session(
-                {"id": "j1"}, adapter, "telegram", "123", "9001",
-                "Daily brief Task #2", chat_name="Ops",
-            )
+        _seed_cron_thread_session(
+            {"id": "j1"}, adapter, "telegram", "123", "9001",
+            "Daily brief Task #2", chat_name="Ops",
+        )
 
         # Session row created for the thread, then brief mirrored into it.
         store.get_or_create_session.assert_called_once()
         seeded_source = store.get_or_create_session.call_args[0][0]
         assert seeded_source.chat_type == "thread"
         assert seeded_source.thread_id == "9001"
-        mirror_mock.assert_called_once()
-        assert mirror_mock.call_args.kwargs.get("thread_id") == "9001"
+        store.append_to_transcript.assert_called_once()
+        session_id, message = store.append_to_transcript.call_args.args
+        assert session_id == "thread-session"
+        assert message["role"] == "user"
+        assert message["content"].startswith("[Cron delivery: j1]")
 
 
 class TestCronContinuableSurfaceInChannel:
@@ -2449,14 +2452,14 @@ class TestCronContinuableSurfaceInChannel:
         from gateway.config import Platform
 
         store = MagicMock()
+        store.get_or_create_session.return_value.session_id = "channel-session"
         adapter = MagicMock()
         adapter._session_store = store
 
-        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            ok = _seed_cron_channel_session(
-                {"id": "j1", "name": "Brief"}, adapter, "slack", "C123",
-                "Daily brief", is_dm=False, user_id="U_HUMAN", chat_name="ops",
-            )
+        ok = _seed_cron_channel_session(
+            {"id": "j1", "name": "Brief"}, adapter, "slack", "C123",
+            "Daily brief", is_dm=False, user_id="U_HUMAN", chat_name="ops",
+        )
         assert ok is True
         seeded_source = store.get_or_create_session.call_args[0][0]
         seed_key = build_session_key(seeded_source)
@@ -2471,9 +2474,11 @@ class TestCronContinuableSurfaceInChannel:
             f"seed key {seed_key} != inbound reply key {build_session_key(inbound)} "
             "— the reply would NOT continue the seeded session"
         )
-        mirror_mock.assert_called_once()
-        assert mirror_mock.call_args.kwargs.get("thread_id") is None
-        assert mirror_mock.call_args.kwargs.get("user_id") == "U_HUMAN"
+        store.append_to_transcript.assert_called_once()
+        session_id, message = store.append_to_transcript.call_args.args
+        assert session_id == "channel-session"
+        assert message["role"] == "user"
+        assert message["content"].startswith("[Cron delivery: Brief]")
 
     def test_in_channel_seed_fires_without_attach_to_session(self):
         """REGRESSION (live, Alice 2026-08-19): the in_channel seed was gated on
@@ -2652,15 +2657,18 @@ class TestCronContinuableSurfaceInChannel:
         adapter = MagicMock()
         adapter._session_store = store
 
-        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            ok = _seed_cron_channel_session(
-                {"id": "j1", "name": "Brief"}, adapter, "slack", "D0BJTDCSR7C",
-                "Daily brief", is_dm=True, user_id="U_HUMAN", chat_name=None,
-            )
+        ok = _seed_cron_channel_session(
+            {"id": "j1", "name": "Brief"}, adapter, "slack", "D0BJTDCSR7C",
+            "Daily brief", is_dm=True, user_id="U_HUMAN", chat_name=None,
+        )
         assert ok is True
-        # The mirror received the exact created session id — origin-scan
+        # The brief is appended directly to the exact created row — origin-scan
         # heuristics (and their populated-chat bail-out) are out of the path.
-        assert mirror_mock.call_args.kwargs.get("session_id") == "sess-flat-exact"
+        store.append_to_transcript.assert_called_once()
+        session_id, message = store.append_to_transcript.call_args.args
+        assert session_id == "sess-flat-exact"
+        assert message["role"] == "user"
+        assert message["content"].startswith("[Cron delivery: Brief]")
 
     def test_in_channel_also_seeds_thread_surface_of_delivered_brief(self):
         """REGRESSION (live, Alice 2026-08-19 19:19): the user replied IN THE

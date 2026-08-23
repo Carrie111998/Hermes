@@ -1906,7 +1906,7 @@ class SessionStore:
         except Exception:
             return "default"
 
-    def _recovered_row_allowed_for_active_profile(
+    def _recovered_row_allowed_for_profile(
         self,
         *,
         requested_session_key: str,
@@ -2134,7 +2134,7 @@ class SessionStore:
             return None
         if not self._recovered_row_matches_source_scope(recovered, source):
             return None
-        if not self._recovered_row_allowed_for_active_profile(
+        if not self._recovered_row_allowed_for_profile(
             requested_session_key=session_key,
             recovered=recovered,
         ):
@@ -2210,7 +2210,7 @@ class SessionStore:
             return None
         if not self._recovered_row_matches_source_scope(recovered, source):
             return None
-        if not self._recovered_row_allowed_for_active_profile(
+        if not self._recovered_row_allowed_for_profile(
             requested_session_key=session_key,
             recovered=recovered,
         ):

@@ -5649,14 +5649,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str,
         thread_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        session_key_prefix: Optional[str] = None,
     ) -> Optional[str]:
         """Find the most recent live session_id for a platform + chat origin.
 
         Equivalent of gateway/mirror's sessions.json scan: matches on
-        source + chat_id (+ thread_id when provided).  When ``user_id`` is
-        provided, exact sender matches are preferred; if multiple distinct
-        users share the chat and none matches, returns None rather than
-        contaminating another participant's session.
+        source + chat_id (+ thread_id when provided). ``session_key_prefix``
+        optionally confines the lookup to one multiplex profile namespace.
+        When ``user_id`` is provided, exact sender matches are preferred; if
+        multiple distinct users share the chat and none matches, returns None
+        rather than contaminating another participant's session.
         """
         if not platform or chat_id in (None, ""):
             return None
@@ -5668,6 +5670,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
               AND ended_at IS NULL
         """
         params: list = [platform, str(chat_id)]
+        if session_key_prefix:
+            query += " AND SUBSTR(session_key, 1, ?) = ?"
+            params.extend([len(session_key_prefix), session_key_prefix])
         if thread_id is not None:
             query += " AND COALESCE(thread_id, '') = ?"
             params.append(str(thread_id))

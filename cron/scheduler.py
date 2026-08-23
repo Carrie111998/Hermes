@@ -1682,17 +1682,16 @@ def _maybe_mirror_cron_delivery(
     user_id: Optional[str] = None,
     *,
     enabled: bool = False,
+    adapter=None,
 ) -> None:
     """Best-effort mirror of a cron delivery into the origin chat's session.
 
     No-op unless ``enabled`` (resolved once by the caller, and already scoped to
-    the origin target — see ``_target_matches_origin``). Reuses the shipped
-    ``mirror_to_session`` so cron rides exactly the same path that interactive
-    ``send_message`` mirroring already uses, including passing ``user_id`` so a
-    per-user-isolated group chat resolves to the exact member who scheduled the
-    job (parity with ``send_message``). All failures are swallowed — a delivery
-    that succeeded must never be reported as failed because the transcript
-    mirror hit a problem.
+    the origin target — see ``_target_matches_origin``). Live gateway delivery
+    uses the adapter's SessionStore so multiplex lookups can be constrained to
+    the active profile namespace; standalone delivery reuses ``mirror_to_session``.
+    All failures are swallowed — a delivery that succeeded must never be
+    reported as failed because the transcript mirror hit a problem.
 
     Because the caller only enables this for the target that equals the job's
     origin conversation, the session is expected to exist (the job was born in
@@ -1706,6 +1705,48 @@ def _maybe_mirror_cron_delivery(
     if not text:
         return
     try:
+        session_store = getattr(adapter, "_session_store", None)
+        if (
+            session_store is not None
+            and getattr(session_store, "_db", None) is not None
+        ):
+            session_key_prefix = None
+            if getattr(session_store.config, "multiplex_profiles", False):
+                from hermes_cli.profiles import get_active_profile_name
+
+                profile_name = get_active_profile_name() or "default"
+                namespace = "main" if profile_name == "default" else profile_name
+                session_key_prefix = f"agent:{namespace}:"
+            session_id = session_store._db.find_session_by_origin(
+                platform=platform_name,
+                chat_id=str(chat_id),
+                thread_id=thread_id,
+                user_id=user_id,
+                session_key_prefix=session_key_prefix,
+            )
+            if not session_id:
+                logger.debug(
+                    "Job '%s': delivery mirror skipped for %s:%s "
+                    "(no matching profile-scoped gateway session)",
+                    job.get("id", "?"), platform_name, chat_id,
+                )
+                return
+            session_store.append_to_transcript(
+                session_id,
+                {
+                    "role": "user",
+                    "content": (
+                        f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n"
+                        f"{text}"
+                    ),
+                },
+            )
+            logger.info(
+                "Job '%s': mirrored delivery into %s:%s session transcript",
+                job.get("id", "?"), platform_name, chat_id,
+            )
+            return
+
         from gateway.mirror import mirror_to_session
 
         # Mirror as a USER turn with a labelled prefix, NOT an assistant turn.
@@ -1798,7 +1839,7 @@ def _seed_cron_thread_session(
     record of it ("what is Task #2?"). We create the thread-keyed session (the
     same key the user's reply will resolve to — ``build_session_key`` keys
     threads as participant-shared, so no ``user_id`` is needed) and append the
-    brief as an assistant turn via the shipped ``mirror_to_session``.
+    brief directly to that exact session through the adapter's live store.
 
     ``scope_id`` is the workspace/server scope (Slack team id).
     ``build_session_key`` embeds it in every Slack key, so a scoped reply's
@@ -1858,13 +1899,24 @@ def _seed_cron_thread_session(
                     thread_id=str(thread_id),
                     scope_id=str(scope_id) if scope_id else None,
                 )
-                # Ensure the thread-keyed session row exists so the mirror has
-                # a target and the user's later reply joins the same session.
-                # Capture the exact id — the mirror writes into THIS row, not
-                # an origin-heuristic rediscovery (which bails on populated
-                # chats; same class as the flat-seed live failure 2026-08-19).
-                _entry = session_store.get_or_create_session(dest_source)
-                seeded_session_id = getattr(_entry, "session_id", None)
+                # Seed the exact thread-keyed session through the live store;
+                # do not re-discover it through process-global origin lookup.
+                entry = session_store.get_or_create_session(dest_source)
+                session_store.append_to_transcript(
+                    entry.session_id,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n"
+                            f"{text}"
+                        ),
+                    },
+                )
+                logger.info(
+                    "Job '%s': opened continuable thread %s on %s:%s and seeded the brief",
+                    job.get("id", "?"), thread_id, platform_name, chat_id,
+                )
+                return
 
         from gateway.mirror import mirror_to_session
 
@@ -1976,14 +2028,24 @@ def _seed_cron_channel_session(
                     # when the seed carries it too (see thread-seed docstring).
                     scope_id=str(scope_id) if scope_id else None,
                 )
-                # Create the flat session row so the mirror has a target and the
-                # user's later plain reply joins the SAME session. Capture the
-                # exact session id: the mirror must write into THIS row, not
-                # re-discover it via origin heuristics (which bail out on
-                # populated chats where the flat session coexists with
-                # per-message thread sessions — live failure, Alice 2026-08-19).
-                _entry = session_store.get_or_create_session(dest_source)
-                seeded_session_id = getattr(_entry, "session_id", None)
+                # Seed the exact flat session through the live store; do not
+                # re-discover it through process-global origin lookup.
+                entry = session_store.get_or_create_session(dest_source)
+                session_store.append_to_transcript(
+                    entry.session_id,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n"
+                            f"{text}"
+                        ),
+                    },
+                )
+                logger.info(
+                    "Job '%s': seeded flat in_channel session on %s:%s (chat_type=%s)",
+                    job.get("id", "?"), platform_name, chat_id, chat_type,
+                )
+                return True
 
         from gateway.mirror import mirror_to_session
 
@@ -3037,6 +3099,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             # which uses the logical platform's configured credential.
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
+        is_relay_transport = transport is not None and transport.is_relay
 
         # An explicitly supplied native adapter is the authenticated transport
         # for a running gateway, even when this isolated profile has no local
@@ -3050,10 +3113,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         live_native_adapter_ready = (
             live_adapter_ready
             and transport is not None
-            and not transport.is_relay
+            and not is_relay_transport
         )
 
-        if transport is not None and transport.is_relay:
+        if is_relay_transport:
             # A relay transport carries the RELAY adapter's config, and
             # resolve_delivery_transport already applied relay's enablement
             # rule (config block absent OR enabled). The logical platform is
@@ -3416,9 +3479,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if (
-                                    transport is not None and transport.is_relay
-                                ) or not standalone_fallback_available:
+                                if is_relay_transport or not standalone_fallback_available:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -3451,7 +3512,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # lost.
                 if adapter_ok and not timed_out and media_files:
                     routed_media_metadata = dict(media_metadata or {})
-                    if transport is not None and transport.is_relay:
+                    if is_relay_transport:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
                         logical_home = config.get_home_channel(platform)
                         if logical_home is not None and logical_home.chat_id == chat_id:
@@ -3550,14 +3611,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job, platform_name, chat_id, mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
+                        adapter=runtime_adapter,
                     )
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if (
-                    transport is not None and transport.is_relay
-                ) or not standalone_fallback_available:
+                if is_relay_transport or not standalone_fallback_available:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
@@ -3577,7 +3637,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
                 delivery_errors.extend(target_errors)
                 continue
-            if transport is not None and transport.is_relay:
+            if is_relay_transport:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
                 # and cannot be authenticated correctly, so fail closed.
@@ -3683,6 +3743,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
+                adapter=runtime_adapter,
             )
 
     if policy_drop_errors:

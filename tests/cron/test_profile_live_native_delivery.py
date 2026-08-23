@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent import secret_scope
 import cron.scheduler as scheduler
-from cron.scheduler import _deliver_result
+from cron.scheduler import _deliver_result, _maybe_mirror_cron_delivery
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import _cron_adapters_for_profile, _profile_runtime_scope
 
@@ -163,6 +163,87 @@ def test_named_active_profile_uses_its_primary_adapter_map():
     ) == {
         Platform.DISCORD: primary_discord
     }
+
+
+def test_named_active_gateway_shares_only_default_owned_adapters():
+    """The active named profile must not become the shared transport owner."""
+    ops_discord = object()
+    default_discord = object()
+    default_telegram = object()
+    runner = SimpleNamespace(
+        adapters={Platform.DISCORD: ops_discord},
+        _profile_adapters={
+            "default": {
+                Platform.DISCORD: default_discord,
+                Platform.TELEGRAM: default_telegram,
+            },
+            "reports": {},
+        },
+        _active_profile_name=lambda: "ops",
+    )
+
+    with patch(
+        "gateway.config.load_gateway_config",
+        return_value=GatewayConfig(platforms={}),
+    ):
+        reports = _cron_adapters_for_profile(
+            runner,  # type: ignore[arg-type]
+            "reports",
+        )
+
+    assert reports == {
+        Platform.DISCORD: default_discord,
+        Platform.TELEGRAM: default_telegram,
+    }
+
+
+def test_live_cron_mirror_filters_the_shared_db_by_profile(tmp_path):
+    """A Default cron must not append to a newer named-profile peer row."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session(
+            "default-session",
+            "discord",
+            user_id="user-1",
+            session_key="agent:main:discord:dm:123",
+            chat_id="123",
+            chat_type="dm",
+        )
+        db.create_session(
+            "ops-session",
+            "discord",
+            user_id="user-1",
+            session_key="agent:ops:discord:dm:123",
+            chat_id="123",
+            chat_type="dm",
+        )
+        store = SimpleNamespace(
+            _db=db,
+            config=GatewayConfig(multiplex_profiles=True),
+            append_to_transcript=MagicMock(),
+        )
+        adapter = SimpleNamespace(_session_store=store)
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ):
+            _maybe_mirror_cron_delivery(
+                {"id": "default-cron"},
+                "discord",
+                "123",
+                "Default-only report",
+                user_id="user-1",
+                enabled=True,
+                adapter=adapter,
+            )
+
+        store.append_to_transcript.assert_called_once()
+        assert store.append_to_transcript.call_args.args[0] == "default-session"
+    finally:
+        db.close()
 
 
 def test_named_profile_adapter_resolution_owns_local_platform_boundaries(
