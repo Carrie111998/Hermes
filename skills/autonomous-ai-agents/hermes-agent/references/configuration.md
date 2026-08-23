@@ -1,6 +1,6 @@
 # Configuration, Toolsets & Voice
 
-Edit with `hermes config edit` or `hermes config set section.key value`.
+Edit with `hermes config edit` or `hermes config set section.key value`. Use `hermes config set --string section.key value` when scalar-looking syntax such as `{message}`, `true`, or `42` must remain literal text.
 Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configuration
 
 ### Config Sections (most-used keys)

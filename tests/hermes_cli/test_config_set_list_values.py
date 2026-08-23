@@ -7,6 +7,8 @@ stored the value as a raw STRING. Every reader that gates on
 so the setting looked saved but never took effect (observed in the wild as a
 platform running on the wrong toolset bundle for weeks).
 """
+import argparse
+
 import pytest
 
 
@@ -39,6 +41,30 @@ def test_mapping_literal_is_parsed_to_dict(user_home):
     set_config_value("display.tool_progress_overrides", '{"terminal": "off"}')
     raw = read_raw_config()
     assert raw["display"]["tool_progress_overrides"] == {"terminal": "off"}
+
+
+@pytest.mark.parametrize("value", ["{message}", "[literal]", "true", "42", "null"])
+def test_explicit_string_preserves_scalar_syntax(user_home, value):
+    from hermes_cli.config import set_config_value, read_raw_config
+
+    set_config_value("webhooks.routes.example.prompt", value, string=True)
+    raw = read_raw_config()
+    stored = raw["webhooks"]["routes"]["example"]["prompt"]
+    assert stored == value
+    assert isinstance(stored, str)
+
+
+def test_config_set_parser_accepts_explicit_string_flag():
+    from hermes_cli.subcommands.config import build_config_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_config_parser(subparsers, cmd_config=lambda _args: None)
+
+    args = parser.parse_args(
+        ["config", "set", "--string", "webhooks.routes.example.prompt", "{message}"]
+    )
+    assert args.string is True
 
 
 def test_yaml_flow_list_is_parsed(user_home):

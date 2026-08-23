@@ -46,6 +46,11 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
         help="Skip the unknown-key notice printed after writing a key the "
         "running version doesn't recognize (the value is saved either way).",
     )
+    config_set.add_argument(
+        "--string",
+        action="store_true",
+        help="Store the value exactly as a string without type coercion.",
+    )
 
     # config unset
     config_unset = config_subparsers.add_parser(

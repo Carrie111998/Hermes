@@ -42,12 +42,13 @@ hermes config migrate      # Interactively add missing options
 hermes config get model
 hermes config set model anthropic/claude-opus-4
 hermes config set terminal.backend docker
+hermes config set --string hooks.routes.example.prompt '{message}'  # Preserve scalar syntax exactly
 hermes config unset terminal.backend
 hermes config set OPENROUTER_API_KEY sk-or-...  # Saves to .env
 ```
 
 :::tip
-The `hermes config set` command automatically routes values to the right file — API keys are saved to `.env`, everything else to `config.yaml`.
+The `hermes config set` command automatically routes values to the right file — API keys are saved to `.env`, everything else to `config.yaml`. Values that look like lists, mappings, numbers, or booleans are parsed to their corresponding type; use `--string` when the value must remain literal text.
 :::
 
 ## Configuration Precedence

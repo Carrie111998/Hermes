@@ -5381,7 +5381,13 @@ def _coerce_float(value: str):
     return f
 
 
-def set_config_value(key: str, value: str, force: bool = False):
+def set_config_value(
+    key: str,
+    value: str,
+    force: bool = False,
+    *,
+    string: bool = False,
+):
     """Set a configuration value.
 
     Args:
@@ -5394,6 +5400,9 @@ def set_config_value(key: str, value: str, force: bool = False):
             mapping). Without --force, scalar writes over mapping sections are
             refused (bare ``model`` is redirected to ``model.default``). The
             CLI exposes this via ``hermes config set --force``.
+        string: Store ``value`` exactly as a string without bool, number, null,
+            list, or mapping coercion. The CLI exposes this via
+            ``hermes config set --string``.
     """
     if is_managed():
         managed_error("set configuration values")
@@ -5477,7 +5486,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    if not string and not isinstance(_default_value_for_key(key), str):
         _stripped = value.strip()
         _lower = _stripped.lower()
         if _lower in {'true', 'yes', 'on'}:
@@ -5773,8 +5782,9 @@ def config_command(args):
         key = getattr(args, 'key', None)
         value = getattr(args, 'value', None)
         force = bool(getattr(args, 'force', False))
+        string = bool(getattr(args, 'string', False))
         if not key or value is None:
-            print("Usage: hermes config set [--force] <key> <value>")
+            print("Usage: hermes config set [--force] [--string] <key> <value>")
             print()
             print("Examples:")
             print("  hermes config set model anthropic/claude-sonnet-4")
@@ -5783,8 +5793,9 @@ def config_command(args):
             print()
             print("  --force: skip the unknown-key notice for unrecognized keys,")
             print("           and allow a scalar to replace a whole mapping section")
+            print("  --string: store the value exactly without type coercion")
             sys.exit(1)
-        set_config_value(key, value, force=force)
+        set_config_value(key, value, force=force, string=string)
 
     elif subcmd == "unset":
         key = getattr(args, 'key', None)
