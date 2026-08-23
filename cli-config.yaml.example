@@ -1784,6 +1784,21 @@ updates:
   # Number of pre-update backup zips to retain.
   backup_keep: 5
 
+  # Opt-in canary-first updates. Leave blank for the historical all-at-once
+  # behavior. The named profile must have a running gateway when update starts.
+  # A full Git + venv checkpoint is written outside the checkout before any
+  # mutation; failed health/smoke gates restore it automatically.
+  canary_profile: ""
+  rollout_batch_size: 4
+  canary_healthy_after_seconds: 10
+  canary_health_timeout_seconds: 120
+  canary_smoke_timeout_seconds: 30
+  # Optional: make the canary run one bounded provider turn after local checks.
+  # This validates profile credentials/provider routing and may incur usage.
+  canary_smoke_agent_turn: false
+  canary_restart_timeout_seconds: 90
+  rollback_checkpoint_keep: 3
+
   # What non-interactive updates do with local source edits in the Hermes repo.
   # Interactive terminal updates always prompt before restoring the autostash.
   #

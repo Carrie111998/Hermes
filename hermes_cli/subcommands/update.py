@@ -25,13 +25,14 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)",
     )
-    update_parser.add_argument(
+    read_or_restore = update_parser.add_mutually_exclusive_group()
+    read_or_restore.add_argument(
         "--check",
         action="store_true",
         default=False,
         help="Check whether an update is available without installing anything",
     )
-    update_parser.add_argument(
+    read_or_restore.add_argument(
         "--plan",
         action="store_true",
         default=False,
@@ -40,6 +41,17 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "kind (git/docker/nix), every running Hermes service across all "
             "profiles with its supervisor and running code version, and how "
             "each will be restarted. Read-only; safe on a live fleet."
+        ),
+    )
+    read_or_restore.add_argument(
+        "--rollback",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="CHECKPOINT",
+        help=(
+            "Restore an external update checkpoint (default: latest), "
+            "including the exact pre-update Git SHA and dependency environment."
         ),
     )
     update_parser.add_argument(

@@ -11,6 +11,7 @@ import json
 import os
 import time
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -37,6 +38,8 @@ def _make_runner(hermes_home=None):
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
+    runner._profile_adapters = {}
+    runner._active_profile_name = MagicMock(return_value="work")
     runner._voice_mode = {}
     runner._update_prompt_pending = {}
     runner._running_agents = {}
@@ -44,6 +47,7 @@ def _make_runner(hermes_home=None):
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._failed_platforms = {}
+    runner._schedule_update_notification_watch = MagicMock()
     # config is accessed by _check_slash_access and quick_commands lookup;
     # None makes policy_for_source return a disabled (allow-all) policy.
     runner.config = None
@@ -147,17 +151,18 @@ class TestUpdateCommandGatewayFlag:
         mock_popen = MagicMock()
         with patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
+             patch("hermes_cli.runtime_launch.resolve_project_python", return_value="/project/python"), \
              patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
 
-        # Check the bash command string contains --gateway and PYTHONUNBUFFERED
-        call_args = mock_popen.call_args[0][0]
-        cmd_string = call_args[-1] if isinstance(call_args, list) else str(call_args)
-        assert "--gateway" in cmd_string
-        assert "PYTHONUNBUFFERED" in cmd_string
-        assert "rc=$?" in cmd_string
-        assert "status=$?" not in cmd_string
+        launch_argv = mock_popen.call_args.args[0]
+        launch_kwargs = mock_popen.call_args.kwargs
+        assert launch_argv[:2] == ["/usr/bin/setsid", "/project/python"]
+        assert launch_argv[-2:] == ["update", "--gateway"]
+        assert launch_kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+        assert launch_kwargs["env"]["HERMES_UPDATE_CORRELATION_ID"]
+        assert "start_new_session" not in launch_kwargs
         assert "stream progress" in result
 
 
@@ -249,6 +254,287 @@ class TestWatchUpdateProgress:
         assert prompt_found, f"Prompt not forwarded. Sent: {all_sent}"
         # Check session was marked as having pending prompt
         # (may be cleared by the time we check since update finished)
+
+    @pytest.mark.asyncio
+    async def test_confirmation_buttons_receive_current_prompt_identity(self, tmp_path):
+        """Native buttons are only emitted for the correlated confirmation."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        session_key = "agent:work:telegram:dm:111"
+        pending = {
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": session_key,
+            "correlation_id": "corr-current",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(hermes_home),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        }
+        prompt = {
+            "id": "prompt-current",
+            "kind": "update_confirmation",
+            "correlation_id": "corr-current",
+            "prompt": "Apply the verified update?",
+            "default": "n",
+            "context": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+                "control_home": str(hermes_home),
+                "install_root": "/project/hermes",
+                "install_id": "install-1",
+            },
+        }
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_prompt.json").write_text(json.dumps(prompt))
+
+        class NativeAdapter:
+            typed_command_prefix = "/"
+
+            def __init__(self):
+                self.prompts = []
+                self.messages = []
+
+            async def send_update_prompt(self, **kwargs):
+                self.prompts.append(kwargs)
+                return SimpleNamespace(success=True)
+
+            async def send(self, *args, **kwargs):
+                self.messages.append((args, kwargs))
+
+        adapter = NativeAdapter()
+        primary_adapter = AsyncMock()
+        runner._active_profile_name = MagicMock(return_value="default")
+        runner.adapters = {Platform.TELEGRAM: primary_adapter}
+        runner._profile_adapters = {"work": {Platform.TELEGRAM: adapter}}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            watch = asyncio.create_task(runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            ))
+            for _ in range(50):
+                if adapter.prompts:
+                    break
+                await asyncio.sleep(0.01)
+            watch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watch
+
+        assert len(adapter.prompts) == 1
+        forwarded = adapter.prompts[0]
+        assert forwarded["prompt_id"] == "prompt-current"
+        assert forwarded["correlation_id"] == "corr-current"
+        assert forwarded["session_key"] == session_key
+        assert forwarded["context"]["install_id"] == "install-1"
+        assert adapter.messages == []
+        primary_adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_send_failure_keeps_progress_markers(self, tmp_path):
+        """The live watcher cannot erase output when final delivery is down."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+        }))
+        output_path.write_text("durable progress")
+        exit_code_path.write_text("1")
+        adapter = AsyncMock()
+        adapter.send.side_effect = RuntimeError("transport down")
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            watch = asyncio.create_task(runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            ))
+            await asyncio.sleep(0.08)
+            assert not watch.done()
+            assert pending_path.exists()
+            assert output_path.read_text() == "durable progress"
+            assert exit_code_path.read_text() == "1"
+            watch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watch
+
+    @pytest.mark.asyncio
+    async def test_prompt_send_retries_after_explicit_transport_failure(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        session_key = "agent:main:telegram:dm:111"
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": session_key,
+        }))
+        prompt_path = hermes_home / ".update_prompt.json"
+        prompt_path.write_text(json.dumps({
+            "id": "retry-prompt",
+            "prompt": "Continue?",
+            "default": "n",
+        }))
+        adapter = AsyncMock()
+        adapter.send.side_effect = [
+            SimpleNamespace(success=False),
+            SimpleNamespace(success=True),
+        ]
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            watch = asyncio.create_task(runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            ))
+            for _ in range(50):
+                if adapter.send.await_count >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            watch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watch
+
+        assert adapter.send.await_count == 2
+        assert prompt_path.exists()
+        state = runner._peek_session_state(session_key)
+        assert state is not None
+        assert state.persistent.update_prompt_pending is True
+
+    @pytest.mark.asyncio
+    async def test_stale_confirmation_prompt_is_not_forwarded(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending = {
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "session-current",
+            "correlation_id": "corr-current",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+        }
+        prompt = {
+            "id": "prompt-old",
+            "kind": "update_confirmation",
+            "correlation_id": "corr-old",
+            "prompt": "Old update?",
+            "context": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+            },
+        }
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_prompt.json").write_text(json.dumps(prompt))
+        adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            watch = asyncio.create_task(runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            ))
+            await asyncio.sleep(0.05)
+            watch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watch
+
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_correlated_success_marker_uses_exact_receipt(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending = {
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "session-current",
+            "correlation_id": "corr-current",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "install_id": "install-1",
+        }
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_exit_code.corr-current").write_text("0")
+        adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        current = {
+            "correlation_id": "corr-current",
+            "finished_at": "2026-01-01T00:00:01Z",
+            "outcome": "success",
+            "origin": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+                "install_id": "install-1",
+            },
+        }
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("hermes_cli.update_receipt.read_receipt_for_correlation", return_value=current) as read_receipt:
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            )
+
+        read_receipt.assert_called_once_with("corr-current")
+        sent = " ".join(str(call) for call in adapter.send.call_args_list)
+        assert "corr-current" in sent
+        assert not (hermes_home / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exit_code", [2, 0])
+    async def test_terminal_marker_without_receipt_is_bounded_failure(
+        self,
+        tmp_path,
+        exit_code,
+    ):
+        """A preflight exit cannot hang forever or become an rc=0 false green."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending = {
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "session-current",
+            "correlation_id": "corr-current",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "install_id": "install-1",
+        }
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        marker = hermes_home / ".update_exit_code.corr-current"
+        marker.write_text(str(exit_code))
+        # Model the marker after the bounded receipt-rename grace without an
+        # eight-second wall-clock sleep in the regression test.
+        os.utime(marker, (1, 1))
+        adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("hermes_cli.update_receipt.read_receipt_for_correlation", return_value=None):
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            )
+
+        sent = " ".join(str(call) for call in adapter.send.call_args_list)
+        assert f"terminal marker {exit_code}, correlated receipt missing" in sent
+        assert "✅" not in sent
+        assert not (hermes_home / ".update_pending.json").exists()
 
 
     @pytest.mark.asyncio
@@ -397,4 +683,3 @@ class TestCmdUpdateGatewayMode:
 
         assert len(calls) == 1
         assert "Restore" in calls[0]
-

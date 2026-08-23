@@ -1536,6 +1536,13 @@ _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
+# Transactional updates poll this read-only lifecycle probe while gateways are
+# quiesced.  Reusing the normal 120-second Kanban timeout here can pin an
+# update behind a locked board for longer than the rollout's own drain budget.
+# Keep each read attempt short; any lock/error is still propagated so rollout
+# remains fail-closed rather than mistaking an unreadable board for an idle one.
+_ACTIVE_WORKER_PROBE_BUSY_TIMEOUT_MS = 250
+
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per
 # board DB. Content-addressing already dedupes identical corrupt bytes, but
 # repeatedly-mutating corruption (partial repairs, further damage between
@@ -9736,6 +9743,70 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         )
     except Exception:
         return 0
+
+
+def active_worker_pids_all_boards() -> list[int]:
+    """Return live worker PIDs across every active board.
+
+    This is the fail-closed lifecycle probe used by transactional updates.
+    It opens existing databases read-only, never runs schema initialization,
+    and skips the always-listed default board when its database does not yet
+    exist. Unlike dashboard/concurrency counters, it deliberately does not
+    swallow database or process-probe errors: a rollout must not swap the live
+    venv when it cannot prove that detached Kanban workers have drained.
+
+    The SQLite busy wait is intentionally short and bounded. A locked board
+    therefore fails the probe promptly (and fail-closed) instead of inheriting
+    the normal writable connection's 120-second wait.
+    """
+
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    boards = list_boards(include_archived=False)
+    candidates: set[int] = set()
+    visited: set[str] = set()
+    for metadata in boards:
+        slug = str(metadata.get("slug") or DEFAULT_BOARD)
+        path = kanban_db_path(slug).expanduser().resolve(strict=False)
+        resolved = os.path.normcase(str(path))
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+
+        # ``list_boards`` always includes ``default`` even before Kanban has
+        # ever been used.  Stat first so the read-only probe neither creates
+        # that database nor its parent directory.  Only absence is benign;
+        # permission and other filesystem errors must propagate fail-closed.
+        try:
+            path.stat()
+        except FileNotFoundError:
+            continue
+
+        conn = connect_tracked(
+            path.as_uri() + "?mode=ro",
+            tracking_path=path,
+            connect_fn=sqlite3.connect,
+            uri=True,
+            isolation_level=None,
+            timeout=_ACTIVE_WORKER_PROBE_BUSY_TIMEOUT_MS / 1000.0,
+        )
+        try:
+            conn.execute(
+                f"PRAGMA busy_timeout={_ACTIVE_WORKER_PROBE_BUSY_TIMEOUT_MS}"
+            )
+            rows = conn.execute(
+                "SELECT worker_pid FROM tasks "
+                "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            try:
+                pid = int(row[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            candidates.add(pid)
+    return sorted(pid for pid in candidates if _pid_alive(pid))
 
 
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:

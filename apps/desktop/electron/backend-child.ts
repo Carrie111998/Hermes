@@ -37,7 +37,7 @@ export interface StopBackendTreesForUpdateDeps {
   /** Synchronous Windows taskkill /T /F implementation. */
   forceKillProcessTree: (pid: number) => void
   /** Clears and stops the desktop's pooled backends. */
-  stopAllPoolBackends: () => void
+  stopAllPoolBackends: () => Promise<void> | void
 }
 
 export interface BackendProcessRoot {
@@ -94,10 +94,10 @@ export function stopBackendChild(child: KillableChild | null | undefined, deps: 
 export function stopBackendTreesForUpdate(
   primary: BackendProcessRoot | null | undefined,
   deps: StopBackendTreesForUpdateDeps
-): void {
+): Promise<void> | void {
   if (primary && Number.isInteger(primary.pid)) {
     deps.forceKillProcessTree(primary.pid as number)
   }
 
-  deps.stopAllPoolBackends()
+  return deps.stopAllPoolBackends()
 }

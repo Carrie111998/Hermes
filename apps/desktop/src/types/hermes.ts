@@ -1210,7 +1210,17 @@ export interface StatusResponse {
   gateway_running: boolean
   gateway_state: string | null
   gateway_updated_at: string | null
+  /** Optional structured code-skew contract. Absent on older backends. */
+  gateway_code_sha?: string | null
+  checkout_code_sha?: string | null
+  gateway_restart_required?: boolean
+  /** Profile whose gateway owns the stale process; restart must keep this
+   * scope instead of falling back to the active renderer profile. */
+  gateway_profile?: string | null
   hermes_home: string
+  /** Stable install identity shared by every URL/profile that reaches the
+   *  same Hermes checkout. Older backends omit it. */
+  install_id?: string | null
   latest_config_version: number
   release_date: string
   version: string
@@ -1219,15 +1229,34 @@ export interface StatusResponse {
 export interface ActionResponse {
   name: string
   ok: boolean
-  pid: number
+  pid: number | null
   action_id?: string
   already_running?: boolean
+  /** Future update-kernel fields. Optional so a new Desktop remains able to
+   *  drive older dashboard backends during a rolling fleet update. */
+  correlation_id?: string | null
+  deployment_kind?: string | null
+  error_code?: string | null
+  message?: string | null
+  update_command?: string | null
+  refusal?: {
+    code?: string | null
+    message?: string | null
+    update_command?: string | null
+  } | null
 }
 
 export interface UpdateReceiptSummary {
   outcome: 'running' | 'success' | 'partial' | 'failed' | 'refused' | string
   started_at: string | null
   finished_at: string | null
+  correlation_id?: string | null
+  stop_reason?: string | null
+  refusal?: {
+    code?: string | null
+    message?: string | null
+    update_command?: string | null
+  } | null
   pre_sha: string | null
   post_sha: string | null
   post_version: string | null
@@ -1255,11 +1284,33 @@ export interface BackendUpdateCommit {
   at: number
 }
 
+export type BackendDeploymentKind =
+  | 'desktop'
+  | 'external'
+  | 'git-venv'
+  | 'image'
+  | 'launchd'
+  | 'package'
+  | 'systemd'
+  | 'unknown'
+  // Forward compatibility: a newer backend may add a kind before Desktop is
+  // upgraded. Known values above still drive completion and documentation.
+  | (string & {})
+
+export type BackendDeploymentClass = 'external' | 'image' | 'mutable' | 'package' | 'unknown'
+
 /** Shape of `GET /api/hermes/update/check` — the backend's own update state.
  *  Used by the desktop's remote update overlay so the backend version (not the
  *  Electron client clone) drives "what's changed + Install" in remote mode. */
 export interface BackendUpdateCheckResponse {
   install_method: string
+  /** Phase-4 backends always emit this stable contract. Optional/null remains
+   *  in the client type only because Desktop can reach an older backend during
+   *  a rolling fleet update. */
+  deployment_kind?: BackendDeploymentKind | null
+  /** Coarse compatibility class for action policy that does not care which
+   *  mutable supervisor owns restart. Same rolling-compatibility rule. */
+  deployment_class?: BackendDeploymentClass | null
   current_version: string
   behind: number | null
   update_available: boolean

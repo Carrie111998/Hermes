@@ -67,6 +67,10 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+    # This suite stubs the gateway inventory below. A simulated successful
+    # pull must not purge that stub from sys.modules and rediscover/terminate
+    # a real gateway on the test host.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
 
 
 
@@ -376,6 +380,299 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
         ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
     ).stdout
     assert ".hermes-bootstrap-complete" not in status
+
+
+def test_transaction_marker_recovers_stash_after_created_callback_interrupt(
+    tmp_path,
+):
+    """The journal can reclaim a stash even if control never returns to caller."""
+    import shutil
+    import subprocess
+
+    import hermes_cli.update_cmd as update_cmd
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    class AbortAfterCreate(BaseException):
+        pass
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "init")
+    (tmp_path / "tracked.txt").write_text("local edit\n", encoding="utf-8")
+    (tmp_path / "untracked.txt").write_text("local file\n", encoding="utf-8")
+
+    prepared: list[str] = []
+    created: list[str] = []
+
+    def interrupt_after_create(stash_ref: str) -> None:
+        created.append(stash_ref)
+        raise AbortAfterCreate()
+
+    with pytest.raises(AbortAfterCreate):
+        update_cmd._stash_local_changes_if_needed(
+            ["git"],
+            tmp_path,
+            on_prepared=prepared.append,
+            on_created=interrupt_after_create,
+        )
+
+    assert len(prepared) == 1
+    assert len(created) == 1
+    recovered = update_cmd._find_stash_by_transaction_marker(
+        ["git"], tmp_path, prepared[0]
+    )
+    assert recovered == created[0]
+    assert git("status", "--porcelain").stdout == ""
+
+    assert update_cmd._restore_stashed_changes(
+        ["git"],
+        tmp_path,
+        recovered,
+        prompt_user=False,
+    )
+    assert (tmp_path / "tracked.txt").read_text(encoding="utf-8") == "local edit\n"
+    assert (tmp_path / "untracked.txt").read_text(encoding="utf-8") == "local file\n"
+
+
+def test_transaction_stash_ownership_survives_foreign_top_of_stack(
+    tmp_path, monkeypatch
+):
+    import shutil
+    import subprocess
+
+    import hermes_cli.update_cmd as update_cmd
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "init")
+    (tmp_path / "tracked.txt").write_text("local edit\n", encoding="utf-8")
+
+    original_run = update_cmd.subprocess.run
+    injected = False
+
+    def interleaved_run(command, *args, **kwargs):
+        nonlocal injected
+        result = original_run(command, *args, **kwargs)
+        if not injected and command[1:3] == ["stash", "push"]:
+            injected = True
+            (tmp_path / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+            original_run(
+                ["git", "stash", "push", "--include-untracked", "-m", "foreign"],
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        return result
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", interleaved_run)
+
+    owned = update_cmd._stash_local_changes_if_needed(["git"], tmp_path)
+    top = original_run(
+        ["git", "rev-parse", "--verify", "refs/stash"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    assert owned
+    assert owned != top
+    assert update_cmd._restore_stashed_changes(
+        ["git"], tmp_path, owned, prompt_user=False
+    )
+    assert (tmp_path / "tracked.txt").read_text(encoding="utf-8") == "local edit\n"
+
+
+def test_failed_push_never_treats_foreign_stash_as_safe_capture(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    commands: list[list[str]] = []
+
+    def result(command, *, returncode=0, stdout="", stderr=""):
+        return SimpleNamespace(
+            args=command,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def fake_run(command, **kwargs):
+        command = list(command)
+        commands.append(command)
+        if command[1:] == ["status", "--porcelain"]:
+            return result(command, stdout=" M tracked.txt\n")
+        if command[1:] == ["ls-files", "--unmerged"]:
+            return result(command)
+        if command[1:3] == ["stash", "push"]:
+            return result(command, returncode=1, stderr="stash failed")
+        if command[1:3] == ["stash", "list"]:
+            return result(command, stdout=("f" * 40) + "\tOn main: foreign\n")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    with pytest.raises(CalledProcessError):
+        update_cmd._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert ["git", "reset", "--hard", "HEAD"] not in commands
+
+
+def test_rollout_refuses_unmerged_index_without_resetting_it(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    commands: list[list[str]] = []
+
+    def result(command, *, returncode=0, stdout="", stderr=""):
+        return SimpleNamespace(
+            args=command,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def fake_run(command, **kwargs):
+        command = list(command)
+        commands.append(command)
+        if command[1:] == ["status", "--porcelain"]:
+            return result(command, stdout="UU tracked.txt\n")
+        if command[1:] == ["ls-files", "--unmerged"]:
+            return result(command, stdout="100644 deadbeef 1\ttracked.txt\n")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    with pytest.raises(
+        RuntimeError,
+        match="cannot transactionally stash an unmerged Git index",
+    ):
+        update_cmd._stash_local_changes_if_needed(
+            ["git"],
+            tmp_path,
+            on_prepared=lambda marker: None,
+        )
+
+    assert commands == [
+        ["git", "status", "--porcelain"],
+        ["git", "ls-files", "--unmerged"],
+    ]
+
+
+def test_fork_sync_defers_remote_push_until_canary_commit(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    commands: list[list[str]] = []
+    pushes: list[bool] = []
+
+    def fake_run(command, **kwargs):
+        command = list(command)
+        commands.append(command)
+        return SimpleNamespace(
+            args=command,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(update_cmd, "_has_upstream_remote", lambda *args: True)
+    monkeypatch.setattr(
+        update_cmd,
+        "_count_commits_between",
+        lambda command, cwd, base, head: (
+            0 if (base, head) == ("upstream/main", "origin/main") else 1
+        ),
+    )
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        update_cmd,
+        "_sync_fork_with_upstream",
+        lambda *args: pushes.append(True) or True,
+    )
+
+    pending = update_cmd._sync_with_upstream_if_needed(
+        ["git"], tmp_path, push_origin=False
+    )
+
+    assert pending is True
+    assert pushes == []
+    assert ["git", "pull", "--ff-only", "upstream", "main"] in commands
+    assert not any("push" in command for command in commands)
+
+
+def test_bot_rollout_never_prompts_after_gateway_quiescence():
+    import hermes_cli.update_cmd as update_cmd
+
+    assert not update_cmd._should_prompt_for_stash_restore(
+        has_stash=True,
+        assume_yes=False,
+        gateway_mode=True,
+        rollout_enabled=True,
+        stdin_tty=False,
+        stdout_tty=False,
+    )
+    # The historical non-rollout bot updater still has a live watcher capable
+    # of relaying the prompt, so its behavior is intentionally unchanged.
+    assert update_cmd._should_prompt_for_stash_restore(
+        has_stash=True,
+        assume_yes=False,
+        gateway_mode=True,
+        rollout_enabled=False,
+        stdin_tty=False,
+        stdout_tty=False,
+    )
+
+
+def test_verified_rollout_stash_is_never_dropped_by_positional_selector(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("verified rollout cleanup must not invoke git stash drop")
+        ),
+    )
+
+    assert not update_cmd._drop_verified_stash(
+        ["git"], tmp_path, "a" * 40
+    )
 
 
 # ---------------------------------------------------------------------------

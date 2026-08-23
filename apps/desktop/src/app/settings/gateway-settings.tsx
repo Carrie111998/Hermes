@@ -28,6 +28,7 @@ import { notify, notifyError, readableError } from '@/store/notifications'
 
 import { ConnectionsRegistrySection } from './connections-registry'
 import { CONTROL_TEXT } from './constants'
+import { FleetUpdatesSection } from './fleet-updates-section'
 import { EmptyState, ListRow, Pill, SettingsContent, SettingsSkeleton } from './primitives'
 import { enrichSelectedSshHost, selectSshHost } from './ssh-host-selection'
 
@@ -1499,7 +1500,12 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       {/* Unified Gateways page: the full connections registry (add/edit/delete
           named agent sources) lives on this page now, below the window
           connection controls. Hidden in the embedded (boot-recovery) form. */}
-      {embedded ? null : <ConnectionsRegistrySection />}
+      {embedded ? null : (
+        <>
+          <ConnectionsRegistrySection />
+          <FleetUpdatesSection />
+        </>
+      )}
 
       {/* Plain-text token opt-in: gated when secure storage is unavailable and a
           new token would be persisted. Confirm resumes the remembered save/apply. */}

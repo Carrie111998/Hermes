@@ -87,7 +87,25 @@ pub fn installer_dest() -> PathBuf {
 /// Electron desktop — which resolves HERMES_HOME identically and pins it into
 /// the updater's env — agrees on the exact path.
 pub fn update_in_progress_marker() -> PathBuf {
-    hermes_home().join(".hermes-update-in-progress")
+    install_hermes_root(&hermes_home()).join(".hermes-update-in-progress")
+}
+
+/// Named profile homes share one checkout under the containing Hermes root.
+/// Keep their update marker install-wide so Rust, Python, and Electron cannot
+/// acquire independent claims while mutating that same tree.
+fn install_hermes_root(home: &Path) -> PathBuf {
+    if home
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "profiles")
+    {
+        return home
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(home)
+            .to_path_buf();
+    }
+    home.to_path_buf()
 }
 
 /// Copy the currently-running installer binary to `installer_dest()` so it's
@@ -213,4 +231,29 @@ pub fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_hermes_root;
+    use std::path::Path;
+
+    #[test]
+    fn named_profiles_share_the_install_hermes_root() {
+        let root = Path::new("root");
+        assert_eq!(
+            install_hermes_root(&root.join("profiles").join("alpha")),
+            root
+        );
+        assert_eq!(
+            install_hermes_root(&root.join("profiles").join("beta")),
+            root
+        );
+    }
+
+    #[test]
+    fn custom_non_profile_home_stays_unchanged() {
+        let home = Path::new("custom-hermes");
+        assert_eq!(install_hermes_root(home), home);
+    }
 }

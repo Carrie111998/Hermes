@@ -104,7 +104,13 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
 # Provider discovery
 # ---------------------------------------------------------------------------
 
-def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
+def _install_dependencies(
+    provider_name: str,
+    *,
+    force: bool = False,
+    install_cmd_prefix: list[str] | tuple[str, ...] | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
     """Install pip dependencies declared in ``plugin.yaml``.
 
     When ``force`` is true, every declared dependency is handed to the
@@ -166,11 +172,22 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     # is sealed read-only and installs must go to the durable target on the
     # data volume (HERMES_LAZY_INSTALL_TARGET). install_specs handles the
     # routing/gating; on normal installs it is venv-scoped as before (NS-605).
+    # Managed-runtime rollouts supply the transaction's exact installer and
+    # environment, so an external Windows coordinator cannot install provider
+    # packages into its own Python.
     from tools.lazy_deps import install_specs
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
     try:
-        outcome = install_specs(missing, timeout=120)
+        if install_cmd_prefix is None:
+            outcome = install_specs(missing, timeout=120)
+        else:
+            outcome = install_specs(
+                missing,
+                timeout=120,
+                install_cmd_prefix=install_cmd_prefix,
+                env=env,
+            )
         if outcome.ok:
             print(f"  ✓ Installed {', '.join(missing)}")
         elif outcome.blocked:

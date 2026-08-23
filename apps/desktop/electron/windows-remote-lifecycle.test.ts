@@ -4,13 +4,16 @@ import crypto from 'node:crypto'
 import { test } from 'vitest'
 
 import {
+  assertWindowsRemoteInstallUpdateClear,
   buildWindowsInteractiveCommand,
+  connectWindowsRemote,
   detectRemotePlatform,
   encodedPowerShell,
   helperCommand,
   powerShellCommand,
   psLiteral,
   reusableWindowsLock,
+  terminateOwnedWindowsDashboardForUpdate,
   validLock
 } from './windows-remote-lifecycle'
 
@@ -24,6 +27,65 @@ test('PowerShell transport uses UTF-16LE encoded commands and literal escaping',
   assert.equal(Buffer.from(encodedPowerShell("'ok'"), 'base64').toString('utf16le'), "'ok'")
   assert.equal(psLiteral("a'b"), "'a''b'")
   assert.match(powerShellCommand('Write-Output ok'), /^powershell\.exe -NoProfile -NonInteractive .* -EncodedCommand /)
+})
+
+test('Windows relaunch gate refuses live and uncertain markers before executing the remote runtime', async () => {
+  for (const observation of ['LIVE:4242', 'UNCERTAIN']) {
+    const scripts: string[] = []
+    const ssh = sshWith(async command => {
+      const script = Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+      scripts.push(script)
+
+      if (script.includes('Get-Command hermes.exe')) {
+        return JSON.stringify({
+          os: 'Windows',
+          arch: 'AMD64',
+          hermesHome: 'C:\\Users\\alice\\.hermes',
+          hermesPath: 'C:\\Hermes\\hermes.exe',
+          python: 'C:\\Hermes\\python.exe'
+        })
+      }
+      if (script.includes('.hermes-update-in-progress')) {
+        return observation
+      }
+      throw new Error(`unexpected command after update gate: ${script}`)
+    })
+
+    await assert.rejects(
+      () =>
+        connectWindowsRemote({
+          ssh,
+          ownershipId,
+          pickLocalPort: async () => 50000,
+          forward: async () => {},
+          cancelForward: async () => {},
+          waitForHermes: async () => {},
+          probeReuseProof: async () => 'authenticated-ok'
+        }),
+      (error: any) => error.kind === 'update-in-progress'
+    )
+    assert.equal(
+      scripts.some(script => script.includes('hermes_cli.windows_ssh_runtime')),
+      false
+    )
+  }
+})
+
+test('Windows relaunch gate uses strict install-wide marker parsing and fail-closed PID probing', async () => {
+  let script = ''
+  const ssh = sshWith(async command => {
+    script = Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+
+    return 'CLEAR'
+  })
+
+  await assertWindowsRemoteInstallUpdateClear(ssh, 'C:\\Users\\alice\\.hermes\\profiles\\research')
+  assert.match(script, /\.hermes-update-in-progress/)
+  assert.match(script, /Split-Path -Leaf \$parent.*profiles/)
+  assert.match(script, /UTF8Encoding.*true/)
+  assert.match(script, /\\A\(\[1-9\]/)
+  assert.match(script, /GetProcessById/)
+  assert.doesNotMatch(script, /ErrorAction SilentlyContinue/)
 })
 
 test('platform detection preserves POSIX and falls back to Windows PowerShell', async () => {
@@ -146,4 +208,85 @@ test('Windows integrated terminal uses encoded PowerShell and preserves cwd as l
   const script = Buffer.from(command.split(' ').pop()!, 'base64').toString('utf16le')
   assert.match(script, /Set-Location -LiteralPath 'C:\\Users\\O''Brien\\repo'/)
   assert.match(script, /powershell\.exe -NoLogo/)
+})
+
+test('managed update drain preserves a Windows owner when creation time does not match', async () => {
+  const lock = {
+    schemaVersion: 2,
+    protocolVersion: 1,
+    ownershipId,
+    spawnNonce: '0123456789abcdef',
+    pid: 10,
+    creationTimeNs: '1784219690452757504',
+    port: 1234,
+    profile: 'default',
+    tokenFingerprint: 'a'.repeat(32),
+    hermesPath: 'C:\\h\\hermes.exe',
+    hermesHome: 'C:\\h'
+  }
+  const operations: string[] = []
+  const ssh = sshWith(async command => {
+    const script = Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+    operations.push(script)
+
+    return JSON.stringify(lock)
+  })
+
+  await assert.rejects(
+    terminateOwnedWindowsDashboardForUpdate(
+      ssh,
+      { python: 'C:\\h\\python.exe' },
+      { ...lock, creationTimeNs: '1784219690452757505' }
+    ),
+    /ownership record changed/
+  )
+  assert.equal(
+    operations.some(operation => operation.includes("'terminate'")),
+    false
+  )
+  assert.equal(
+    operations.some(operation => operation.includes("'remove-lock'")),
+    false
+  )
+})
+
+test('managed update drain rechecks Windows PID/create-time ownership before exact terminate', async () => {
+  const lock = {
+    schemaVersion: 2,
+    protocolVersion: 1,
+    ownershipId,
+    spawnNonce: '0123456789abcdef',
+    pid: 10,
+    creationTimeNs: '1784219690452757504',
+    port: 1234,
+    profile: 'default',
+    tokenFingerprint: 'a'.repeat(32),
+    hermesPath: 'C:\\h\\hermes.exe',
+    hermesHome: 'C:\\h'
+  }
+  const operations: string[] = []
+  const ssh = sshWith(async command => {
+    const script = Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+    operations.push(script)
+
+    if (script.includes("'read-lock'")) {
+      return JSON.stringify(lock)
+    }
+    if (script.includes("'process-state'")) {
+      return JSON.stringify({ alive: true, owned: true, indeterminate: false })
+    }
+
+    return JSON.stringify({ ok: true })
+  })
+
+  const result = await terminateOwnedWindowsDashboardForUpdate(ssh, { python: 'C:\\h\\python.exe' }, lock)
+
+  assert.equal(result.terminated, true)
+  assert.equal(operations.filter(operation => operation.includes("'read-lock'")).length, 2)
+  assert.equal(operations.filter(operation => operation.includes("'process-state'")).length, 2)
+  assert.equal(operations.filter(operation => operation.includes("'terminate'")).length, 1)
+  assert.equal(
+    operations.some(operation => operation.includes("'remove-lock'")),
+    false
+  )
 })

@@ -44,6 +44,79 @@ async function probeWindowsRemote(ssh, explicitHermesPath = '') {
   return JSON.parse((await ssh.exec(powerShellCommand(script))).trim())
 }
 
+function windowsUpdateMarkerProbeCommand(hermesHome) {
+  const script = [
+    '$ErrorActionPreference="Stop"',
+    `$home=${psLiteral(hermesHome)}`,
+    '$installRoot=$home',
+    '$parent=Split-Path -Parent $home',
+    'if((Split-Path -Leaf $parent) -ieq "profiles"){$installRoot=Split-Path -Parent $parent}',
+    '$marker=Join-Path $installRoot ".hermes-update-in-progress"',
+    '$result="UNCERTAIN"',
+    'try{',
+    'if(-not [IO.File]::Exists($marker)){$result="CLEAR"}',
+    'else{',
+    '$bytes=[IO.File]::ReadAllBytes($marker)',
+    'if($bytes.Length -le 256){',
+    '$utf8=[Text.UTF8Encoding]::new($false,$true)',
+    '$text=$utf8.GetString($bytes)',
+    "$match=[regex]::Match($text,'\\A([1-9][0-9]*)\\r?\\n([0-9]+)(?:\\r?\\n)?\\z')",
+    '[uint32]$ownerPid=0',
+    '[uint64]$lease=0',
+    '$valid=$match.Success',
+    'if($valid){$valid=[uint32]::TryParse($match.Groups[1].Value,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$ownerPid)}',
+    'if($valid){$valid=[uint64]::TryParse($match.Groups[2].Value,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$lease)}',
+    'if($valid -and $lease -le 9007199254740991){',
+    'try{',
+    '$process=[Diagnostics.Process]::GetProcessById([int]$ownerPid)',
+    'try{if($process.HasExited){$result="CLEAR"}else{$result="LIVE:"+[string]$ownerPid}}finally{$process.Dispose()}',
+    '}catch [ArgumentException]{$result="CLEAR"} catch{$result="UNCERTAIN"}',
+    '}',
+    '}',
+    '}',
+    '}catch{$result="UNCERTAIN"}',
+    'Write-Output $result'
+  ].join(';')
+
+  return powerShellCommand(script)
+}
+
+/**
+ * Fail-closed install marker gate for a fresh/relaunched Desktop process.
+ * This uses only PowerShell/.NET and therefore never imports the remote
+ * checkout while an updater may be replacing it.
+ */
+async function assertWindowsRemoteInstallUpdateClear(ssh, hermesHome) {
+  let observation = ''
+
+  try {
+    observation =
+      String(await ssh.exec(windowsUpdateMarkerProbeCommand(hermesHome)))
+        .replace(/^\uFEFF/, '')
+        .trim()
+        .split(/\r?\n/)
+        .pop() || ''
+  } catch (cause) {
+    const error: any = new Error('Could not prove that the remote Hermes install is clear for SSH startup.')
+    error.kind = 'update-in-progress'
+    error.cause = cause
+    throw error
+  }
+
+  if (observation === 'CLEAR') {
+    return
+  }
+
+  const live = /^LIVE:([1-9][0-9]*)$/.exec(observation)
+  const error: any = new Error(
+    live
+      ? `Remote Hermes update process ${live[1]} is still running; SSH startup is paused.`
+      : 'The remote Hermes update marker is unreadable or malformed; refusing SSH startup.'
+  )
+  error.kind = 'update-in-progress'
+  throw error
+}
+
 const TRANSPORT_KINDS = new Set([
   SSH_ERROR.AUTH_FAILED,
   SSH_ERROR.HOST_KEY_CHANGED,
@@ -203,6 +276,77 @@ async function cleanupOwned(ssh, runtime, ownershipId, lock) {
   await attempt(() => helper(ssh, runtime, 'remove-lock', [ownershipId]))
 }
 
+function windowsLockMatchesManagedUpdateScope(lock, expected) {
+  return Boolean(
+    lock &&
+    expected &&
+    lock.ownershipId === expected.ownershipId &&
+    lock.pid === expected.pid &&
+    lock.spawnNonce === expected.spawnNonce &&
+    lock.creationTimeNs === expected.creationTimeNs &&
+    lock.profile === expected.profile &&
+    lock.hermesPath === expected.hermesPath &&
+    lock.hermesHome === expected.hermesHome
+  )
+}
+
+/**
+ * Terminate a Windows serve only after the persisted ownership record and the
+ * kernel creation-time proof still match the exact scope Desktop connected.
+ * Leave the record in place for the post-update reconnect to reclaim; this
+ * prevents a delayed cleanup from deleting a replacement owner's record.
+ */
+async function terminateOwnedWindowsDashboardForUpdate(ssh, runtime, expected) {
+  let lock = await helper(ssh, runtime, 'read-lock', [expected?.ownershipId || ''])
+
+  if (!validLock(lock, expected?.ownershipId) || !windowsLockMatchesManagedUpdateScope(lock, expected)) {
+    const error: any = new Error('The remote Windows ownership record changed before the managed update.')
+    error.kind = 'ownership-changed'
+    throw error
+  }
+
+  let state = await processState(ssh, runtime, lock)
+
+  if (state.indeterminate) {
+    const error: any = new Error('Could not prove the remote Windows process identity for the managed update.')
+    error.kind = 'transient-transport-error'
+    throw error
+  }
+  if (!state.alive) {
+    return { pid: lock.pid, terminated: false, alreadyStopped: true }
+  }
+  if (!state.owned) {
+    const error: any = new Error('Refusing to terminate a remote Windows process whose ownership is unproven.')
+    error.kind = 'foreign-backend'
+    throw error
+  }
+
+  // Fence the proof against a record replacement before signalling.
+  lock = await helper(ssh, runtime, 'read-lock', [expected.ownershipId])
+
+  if (!validLock(lock, expected.ownershipId) || !windowsLockMatchesManagedUpdateScope(lock, expected)) {
+    const error: any = new Error('The remote Windows ownership record changed during process verification.')
+    error.kind = 'ownership-changed'
+    throw error
+  }
+  state = await processState(ssh, runtime, lock)
+
+  if (state.indeterminate || !state.alive || !state.owned) {
+    const error: any = new Error('The remote Windows process identity changed during managed update drain.')
+    error.kind = state.indeterminate ? 'transient-transport-error' : 'ownership-changed'
+    throw error
+  }
+
+  await helper(ssh, runtime, 'terminate', [
+    String(lock.pid),
+    String(lock.creationTimeNs),
+    lock.hermesPath,
+    lock.spawnNonce
+  ])
+
+  return { pid: lock.pid, terminated: true, alreadyStopped: false }
+}
+
 async function waitReady(ssh, runtime, ownershipId, lock, timeoutMs, signal) {
   const deadline = Date.now() + timeoutMs
 
@@ -280,6 +424,7 @@ async function connectWindowsRemote(deps) {
 
   assertBootstrapNotSuperseded(signal)
   const runtime = await probeWindowsRemote(ssh, remoteHermesPath)
+  await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
   const inspection = await helper(ssh, runtime, 'inspect', [runtime.hermesPath])
 
   if (!inspection.supported) {
@@ -293,6 +438,7 @@ async function connectWindowsRemote(deps) {
   rememberLog(`[ssh-lifecycle] remote platform Windows/${runtime.arch}`)
   rememberLog(`[ssh-lifecycle] located hermes at ${runtime.hermesPath}`)
 
+  await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
   const lock = await helper(ssh, runtime, 'read-lock', [ownershipId])
 
   if (validLock(lock, ownershipId)) {
@@ -307,6 +453,7 @@ async function connectWindowsRemote(deps) {
     const reusable = reusableWindowsLock(lock, state, profile, reuseToken, runtime)
 
     if (reusable) {
+      await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
       const localPort = await pickLocalPort()
       await forward(localPort, lock.port)
 
@@ -327,7 +474,9 @@ async function connectWindowsRemote(deps) {
             hermesVersion,
             ownershipId,
             spawnNonce: lock.spawnNonce,
-            creationTimeNs: lock.creationTimeNs
+            creationTimeNs: lock.creationTimeNs,
+            hermesHome: runtime.hermesHome,
+            pythonPath: runtime.python
           }
         }
 
@@ -336,25 +485,30 @@ async function connectWindowsRemote(deps) {
         }
 
         await cancelForward(localPort, lock.port)
+        await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
         await cleanupOwned(ssh, runtime, ownershipId, lock)
       } catch (error) {
         await cancelForward(localPort, lock.port)
         throw error
       }
     } else {
+      await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
       await cleanupOwned(ssh, runtime, ownershipId, lock)
     }
   } else if (lock) {
+    await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
     await helper(ssh, runtime, 'remove-lock', [ownershipId])
   }
 
   assertBootstrapNotSuperseded(signal)
+  await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
   const token = crypto.randomBytes(32).toString('hex')
   const spawnNonce = crypto.randomBytes(8).toString('hex')
   await helper(ssh, runtime, 'upload-token', [ownershipId, spawnNonce], token)
   let spawned
 
   try {
+    await assertWindowsRemoteInstallUpdateClear(ssh, runtime.hermesHome)
     spawned = await helper(
       ssh,
       runtime,
@@ -412,7 +566,9 @@ async function connectWindowsRemote(deps) {
       hermesVersion,
       ownershipId,
       spawnNonce,
-      creationTimeNs: spawned.creationTimeNs
+      creationTimeNs: spawned.creationTimeNs,
+      hermesHome: runtime.hermesHome,
+      pythonPath: runtime.python
     }
   } catch (error) {
     if (localPort && remotePort) {
@@ -440,6 +596,7 @@ function buildWindowsInteractiveCommand(remoteCwd = '') {
 }
 
 export {
+  assertWindowsRemoteInstallUpdateClear,
   buildWindowsInteractiveCommand,
   connectWindowsRemote,
   detectRemotePlatform,
@@ -450,5 +607,6 @@ export {
   probeWindowsRemote,
   psLiteral,
   reusableWindowsLock,
+  terminateOwnedWindowsDashboardForUpdate,
   validLock
 }

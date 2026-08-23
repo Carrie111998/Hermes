@@ -1,5 +1,6 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -16,7 +17,10 @@ if _repo not in sys.path:
     sys.path.insert(0, _repo)
 
 
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _update_prompt_callback_token,
+)
 from gateway.config import Platform, PlatformConfig
 
 
@@ -42,6 +46,31 @@ class _AuthRunner:
     def _is_user_authorized(self, source):
         self.last_source = source
         return self.authorized
+
+
+def test_callback_auth_uses_registered_profile_check_with_closure_handler():
+    """Multiplex callback auth must not fall back to process-global env."""
+
+    adapter = _make_adapter()
+    adapter._message_handler = lambda _event: None
+    calls = []
+
+    def profile_check(user_id, chat_type=None, chat_id=None):
+        calls.append((user_id, chat_type, chat_id))
+        return user_id == "222" and chat_id == "-100"
+
+    adapter.set_authorization_check(profile_check)
+
+    assert adapter._is_callback_user_authorized(
+        "222", chat_id="-100", chat_type="supergroup"
+    ) is True
+    assert adapter._is_callback_user_authorized(
+        "111", chat_id="-100", chat_type="supergroup"
+    ) is False
+    assert calls == [
+        ("222", "group", "-100"),
+        ("111", "group", "-100"),
+    ]
 
 
 # ===========================================================================
@@ -161,6 +190,10 @@ class TestTelegramExecApproval:
             chat_id="12345",
             prompt="Fix [issue]_1 and verify *markdown*",
             default="alpha_beta",
+            prompt_id="prompt-1",
+            correlation_id="corr-1",
+            context={"control_home": "/tmp/hermes"},
+            session_key="session-1",
             metadata={"thread_id": "999"},
         )
 
@@ -168,6 +201,10 @@ class TestTelegramExecApproval:
         assert "MARKDOWN_V2" in repr(sent["parse_mode"])
         assert "Fix \\[issue\\]\\_1" in sent["text"]
         assert "alpha\\_beta" in sent["text"]
+        token = _update_prompt_callback_token("prompt-1", "corr-1")
+        assert adapter._update_prompt_state[token]["prompt_id"] == "prompt-1"
+        assert adapter._update_prompt_state[token]["correlation_id"] == "corr-1"
+        assert len(f"update_prompt:{token}:y".encode()) <= 64
 
 # _handle_callback_query — approval button clicks
 # ===========================================================================
@@ -245,7 +282,8 @@ class TestTelegramApprovalCallback:
         adapter = _make_adapter()
 
         query = AsyncMock()
-        query.data = "update_prompt:y"
+        callback_token = _update_prompt_callback_token("prompt-1", "corr-1")
+        query.data = f"update_prompt:{callback_token}:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.from_user = MagicMock()
@@ -256,6 +294,35 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
+        adapter._update_prompt_state = {
+            callback_token: {
+                "prompt_id": "prompt-1",
+                "control_home": str(tmp_path),
+                "correlation_id": "corr-1",
+                "session_key": "session-1",
+            }
+        }
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "correlation_id": "corr-1",
+            "session_key": "session-1",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(tmp_path),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        }))
+        (tmp_path / ".update_prompt.json").write_text(json.dumps({
+            "id": "prompt-1",
+            "kind": "update_confirmation",
+            "correlation_id": "corr-1",
+            "context": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+                "control_home": str(tmp_path),
+                "install_root": "/project/hermes",
+                "install_id": "install-1",
+            },
+        }))
 
         with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
             with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
@@ -268,7 +335,18 @@ class TestTelegramApprovalCallback:
 
         # Should NOT have triggered approval resolution
         mock_resolve.assert_not_called()
-        assert (tmp_path / ".update_response").read_text() == "y"
+        assert json.loads((tmp_path / ".update_response").read_text()) == {
+            "answer": "yes",
+            "correlation_id": "corr-1",
+            "id": "prompt-1",
+        }
+
+        # A replayed click has no live prompt state and cannot overwrite the
+        # response that authorized this invocation.
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}):
+            await adapter._handle_callback_query(update, context)
+        assert "expired" in query.answer.call_args[1]["text"].lower()
+        assert query.edit_message_text.await_count == 1
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_rejects_unauthorized_user(self, tmp_path):
@@ -276,7 +354,8 @@ class TestTelegramApprovalCallback:
         adapter = _make_adapter()
 
         query = AsyncMock()
-        query.data = "update_prompt:y"
+        callback_token = _update_prompt_callback_token("prompt-1", "corr-1")
+        query.data = f"update_prompt:{callback_token}:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.from_user = MagicMock()
@@ -287,6 +366,14 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
+        adapter._update_prompt_state = {
+            callback_token: {
+                "prompt_id": "prompt-1",
+                "control_home": str(tmp_path),
+                "correlation_id": "corr-1",
+                "session_key": "session-1",
+            }
+        }
 
         with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
             with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
@@ -298,13 +385,45 @@ class TestTelegramApprovalCallback:
         assert not (tmp_path / ".update_response").exists()
 
     @pytest.mark.asyncio
+    async def test_update_prompt_callback_is_bound_to_original_chat(self, tmp_path):
+        adapter = _make_adapter()
+        callback_token = _update_prompt_callback_token("prompt-1", "corr-1")
+        adapter._update_prompt_state = {
+            callback_token: {
+                "prompt_id": "prompt-1",
+                "control_home": str(tmp_path),
+                "correlation_id": "corr-1",
+                "session_key": "session-1",
+                "chat_id": "12345",
+                "thread_id": "",
+            }
+        }
+        query = AsyncMock()
+        query.data = f"update_prompt:{callback_token}:y"
+        query.message = MagicMock()
+        query.message.chat_id = 99999
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.from_user = MagicMock(id=222, first_name="Alice")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        assert "another chat" in query.answer.call_args.kwargs["text"]
+        assert not (tmp_path / ".update_response").exists()
+        assert callback_token in adapter._update_prompt_state
+
+    @pytest.mark.asyncio
     async def test_update_prompt_callback_rejects_user_blocked_by_global_allowlist(self, tmp_path):
         adapter = _make_adapter()
         runner = _AuthRunner(authorized=False)
         adapter._message_handler = runner._handle_message
 
         query = AsyncMock()
-        query.data = "update_prompt:y"
+        callback_token = _update_prompt_callback_token("prompt-1", "corr-1")
+        query.data = f"update_prompt:{callback_token}:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.message.chat.type = "private"
@@ -317,6 +436,14 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
+        adapter._update_prompt_state = {
+            callback_token: {
+                "prompt_id": "prompt-1",
+                "control_home": str(tmp_path),
+                "correlation_id": "corr-1",
+                "session_key": "session-1",
+            }
+        }
 
         with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
             with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}):
@@ -329,4 +456,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

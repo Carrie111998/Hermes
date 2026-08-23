@@ -724,6 +724,11 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+                # Live build/profile identity feeds a split-container
+                # dashboard's /api/status code-skew contract.
+                assert "code_sha" in data
+                assert "code_version" in data
+                assert "profile" in data
 
 
     @pytest.mark.asyncio

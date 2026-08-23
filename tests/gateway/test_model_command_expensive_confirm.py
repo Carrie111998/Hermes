@@ -22,6 +22,7 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from gateway.slash_commands import GatewayCodeSkew, _model_switch_skew_guard
 
 
 def _make_runner():
@@ -63,6 +64,21 @@ def _fake_warning():
             "openai/gpt-5.5-pro has known pricing above Hermes' safety threshold.\n"
             "did you mean to select openai/gpt-5.5?"
         ),
+    )
+
+
+def test_model_switch_skew_guard_returns_structured_restart_signal(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.code_skew.detect_code_skew",
+        lambda: ("boot-sha", "checkout-sha"),
+    )
+
+    skew = _model_switch_skew_guard()
+
+    assert skew == GatewayCodeSkew(
+        gateway_code_sha="boot-sha",
+        checkout_code_sha="checkout-sha",
+        gateway_restart_required=True,
     )
 
 
@@ -116,6 +132,55 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
     overrides = list(runner._session_model_overrides.values())
     assert len(overrides) == 1
     assert overrides[0]["model"] == "openai/gpt-5.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_code_skew_offers_scoped_restart_without_replaying_model_switch(
+    tmp_path,
+    monkeypatch,
+):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+    captured = {}
+    restart_choices = []
+
+    async def _capture_restart_prompt(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    async def _restart(event):
+        restart_choices.append(event.source.profile)
+        return "restart requested"
+
+    runner._request_slash_confirm = _capture_restart_prompt
+    runner._handle_restart_command = _restart
+    monkeypatch.setattr(
+        "gateway.slash_commands._model_switch_skew_guard",
+        lambda: GatewayCodeSkew("boot-sha", "checkout-sha"),
+    )
+
+    def _unexpected_switch(**kwargs):
+        pytest.fail("the rejected model switch must never run or be replayed")
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _unexpected_switch)
+    event = _make_event("/model openai/gpt-5.5-pro")
+    event.source.profile = "work"
+
+    result = await runner._handle_model_command(event)
+
+    assert result is None  # native restart buttons were rendered
+    assert captured["command"] == "restart-stale-gateway"
+    assert "model switch will not" in captured["message"].lower()
+    assert runner._session_model_overrides == {}
+
+    cancelled = await captured["handler"]("cancel")
+    assert "model unchanged" in cancelled.lower()
+    assert restart_choices == []
+
+    restarted = await captured["handler"]("always")
+    assert restarted == "restart requested"
+    assert restart_choices == ["work"]
+    assert runner._session_model_overrides == {}
 
 
 @pytest.mark.asyncio

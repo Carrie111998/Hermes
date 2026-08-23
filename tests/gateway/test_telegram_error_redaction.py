@@ -145,7 +145,13 @@ async def test_send_update_prompt_failure_redacts_token_in_result_and_log(caplog
     )
 
     with caplog.at_level("WARNING"):
-        result = await adapter.send_update_prompt("123", "restart?")
+        result = await adapter.send_update_prompt(
+            "123",
+            "restart?",
+            session_key="telegram:123",
+            prompt_id="redaction-prompt",
+            correlation_id="redaction-correlation",
+        )
 
     assert result.success is False
     assert _SECRET_TOKEN not in (result.error or "")

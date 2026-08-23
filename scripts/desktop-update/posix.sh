@@ -467,9 +467,11 @@ trap '' TERM
 log "hand-off start: root=$INSTALL_ROOT branch=$BRANCH desktopPid=$DESKTOP_PID pid=$$"
 rm -f "$RESULT" 2>/dev/null || true
 
-# Marker claim: same cross-process lock contract as windows.ps1 /
-# update_lock.py (the `hermes update` child adopts it via process ancestry).
-# The Desktop supplies one acquisition time for the whole ownership chain.
+# Marker claim: use update_lock.py's shared mutex + atomic no-clobber/CAS
+# protocol. The Desktop bridge names DESKTOP_PID; only that explicitly supplied
+# predecessor (or our own existing claim) may be replaced. A live foreign or
+# malformed marker is preserved and the handoff refuses before mutation. The
+# later `hermes update` child adopts our claim via process ancestry.
 NOW="$(date +%s)"
 STARTED_AT="${HERMES_UPDATE_STARTED_AT:-$NOW}"
 case "$STARTED_AT" in ''|*[!0-9]*) STARTED_AT="$NOW" ;; esac
@@ -480,9 +482,38 @@ if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
     || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
   STARTED_AT="$NOW"
 fi
-printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || log "WARNING: could not write update marker"
+
+MARKER_PYTHON="${HERMES_UPDATE_MARKER_PYTHON:-}"
+if [ -z "$MARKER_PYTHON" ] && [ -x "$INSTALL_ROOT/venv/bin/python" ]; then
+  MARKER_PYTHON="$INSTALL_ROOT/venv/bin/python"
+fi
+if [ -z "$MARKER_PYTHON" ]; then
+  MARKER_PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+fi
+if [ -z "$MARKER_PYTHON" ]; then
+  FINAL_CODE=2
+  FINAL_MSG="Update refused: Python is unavailable, so exclusive ownership of the install could not be established. Nothing was changed."
+  log "$FINAL_MSG"
+  exit "$FINAL_CODE"
+fi
+
+CLAIM_OUTPUT="$("$MARKER_PYTHON" "$SCRIPT_DIR/marker-claim.py" \
+  --marker "$MARKER" \
+  --owner-pid "$$" \
+  --desktop-pid "$DESKTOP_PID" \
+  --lease-at "$STARTED_AT" 2>&1)"
+CLAIM_CODE=$?
+if [ "$CLAIM_CODE" -ne 0 ]; then
+  FINAL_CODE=2
+  FINAL_MSG="Update refused: another updater owns the install or its update marker cannot be verified. Nothing was changed."
+  log "$FINAL_MSG${CLAIM_OUTPUT:+ ($CLAIM_OUTPUT)}"
+  exit "$FINAL_CODE"
+fi
 
 if [ "$SELF_TEST_MARKER" -eq 1 ]; then
+  if [ -n "${HERMES_UPDATE_SELFTEST_INVOCATION_SENTINEL:-}" ]; then
+    printf 'reached-update-invocation-boundary\n' > "$HERMES_UPDATE_SELFTEST_INVOCATION_SENTINEL"
+  fi
   trap - EXIT
   exit 0
 fi

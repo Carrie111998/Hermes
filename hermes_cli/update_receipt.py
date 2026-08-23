@@ -31,7 +31,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -63,6 +65,8 @@ class UpdateReceipt:
             "finished_at": None,
             "argv": list(sys.argv),
             "pid": os.getpid(),
+            "correlation_id": None,
+            "origin": {},
             "outcome": "running",  # running | success | partial | failed
             "pre_update": {},
             "post_update": {},
@@ -70,6 +74,13 @@ class UpdateReceipt:
             "skips": [],
             "gateway_restart": {},
             "fleet": [],
+            # Phase 4 transaction facts.  These stay empty for the default
+            # (non-canary) updater, preserving the existing behavior while
+            # giving terminal, Desktop, Telegram, and Discord one typed
+            # receipt contract when rollout/rollback is enabled.
+            "checkpoint": {},
+            "canary": {},
+            "rollback": {},
         }
         try:
             from hermes_cli.build_info import get_code_identity
@@ -112,6 +123,21 @@ class UpdateReceipt:
             "phase_error": phase_error,
         }
 
+    def transaction_result(self, field: str, payload: dict[str, Any]) -> None:
+        """Merge a typed transaction section into this receipt."""
+        if field not in {"checkpoint", "canary", "rollback"}:
+            raise ValueError(f"unknown update transaction field: {field}")
+        current = self.data.get(field)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(dict(payload))
+        current["at"] = _utc_now_iso()
+        self.data[field] = current
+
+    def update_context(self, correlation_id: str, origin: dict[str, Any]) -> None:
+        self.data["correlation_id"] = str(correlation_id)
+        self.data["origin"] = dict(origin)
+
     def finalize(self, outcome: str) -> None:
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
@@ -127,6 +153,56 @@ def _receipt_dir() -> Path:
     from hermes_cli.config import get_hermes_home
 
     return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish one complete receipt document with a same-directory replace."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        temp.unlink(missing_ok=True)
+
+
+def _atomic_create_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish an immutable complete receipt without replacing a winner."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A hard link is an atomic no-replace publication on POSIX and Windows.
+        # Readers can never observe a partially-written retained receipt.
+        os.link(temp, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        temp.unlink(missing_ok=True)
 
 
 def begin_update_receipt() -> None:
@@ -166,6 +242,39 @@ def record_gateway_restart(**kwargs: Any) -> None:
         logger.debug("Could not record gateway restart result: %s", exc)
 
 
+def _record_transaction(field: str, payload: dict[str, Any]) -> None:
+    """Attach a checkpoint/canary/rollback result. Never raises."""
+    try:
+        if _current is not None:
+            _current.transaction_result(field, payload)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record update %s result: %s", field, exc)
+
+
+def record_checkpoint(**payload: Any) -> None:
+    """Record the external pre-update checkpoint identity/state."""
+    _record_transaction("checkpoint", payload)
+
+
+def record_canary(**payload: Any) -> None:
+    """Record the canary-first rollout plan and health result."""
+    _record_transaction("canary", payload)
+
+
+def record_rollback(**payload: Any) -> None:
+    """Record an automatic or explicit rollback and its verification."""
+    _record_transaction("rollback", payload)
+
+
+def record_update_context(correlation_id: str, **origin: Any) -> None:
+    """Record stable invocation identity shared with bot pending state."""
+    try:
+        if _current is not None:
+            _current.update_context(correlation_id, dict(origin))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record update invocation context: %s", exc)
+
+
 def finalize_update_receipt(
     outcome: str, fleet: list | None = None, stop_reason: str = ""
 ) -> Optional[Path]:
@@ -190,16 +299,20 @@ def finalize_update_receipt(
         directory = _receipt_dir()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = directory / f"update_{stamp}_{os.getpid()}.json"
-        path.write_text(
-            json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
+        correlation_id = str(receipt.data.get("correlation_id") or "")
+        correlation_token = "".join(
+            char if char.isalnum() or char in {"-", "_"} else "_"
+            for char in correlation_id
+        )[:64] or "uncorrelated"
+        path = directory / (
+            f"update_{stamp}_{os.getpid()}_{correlation_token}_"
+            f"{uuid.uuid4().hex}.json"
         )
+        _atomic_create_json(path, receipt.data)
         # Stable pointer for the dashboard/desktop: latest receipt.
         latest = directory / "latest.json"
         try:
-            latest.write_text(
-                json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
-            )
+            _atomic_write_json(latest, receipt.data)
         except OSError:
             pass
         _prune_old_receipts(directory)
@@ -245,8 +358,37 @@ def finalize_pending_update_receipt(
     return finalize_update_receipt(outcome, stop_reason=stop_reason)
 
 
+def _pending_receipt_correlations(directory: Path) -> Optional[set[str]]:
+    """Return bot correlations whose terminal delivery is still pending.
+
+    ``None`` means the action marker exists but could not be read; pruning then
+    fails closed rather than deleting the only receipt the reconnecting bot
+    may need to verify.
+    """
+
+    home = directory.parent.parent
+    correlations: set[str] = set()
+    for name in (".update_pending.claimed.json", ".update_pending.json"):
+        path = home / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        correlation_id = str(payload.get("correlation_id") or "").strip()
+        if correlation_id:
+            correlations.add(correlation_id)
+    return correlations
+
+
 def _prune_old_receipts(directory: Path) -> None:
     try:
+        pinned = _pending_receipt_correlations(directory)
+        if pinned is None:
+            return
         receipts = sorted(
             (p for p in directory.glob("update_*.json") if p.is_file()),
             key=lambda p: p.stat().st_mtime,
@@ -254,8 +396,15 @@ def _prune_old_receipts(directory: Path) -> None:
         )
         for stale in receipts[_RECEIPT_KEEP:]:
             try:
+                if pinned:
+                    payload = json.loads(stale.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(payload, dict)
+                        and str(payload.get("correlation_id") or "") in pinned
+                    ):
+                        continue
                 stale.unlink()
-            except OSError:
+            except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
     except Exception:
         pass
@@ -271,6 +420,44 @@ def read_latest_receipt() -> Optional[dict[str, Any]]:
         return payload if isinstance(payload, dict) else None
     except Exception:
         return None
+
+
+def read_receipt_for_correlation(correlation_id: str) -> Optional[dict[str, Any]]:
+    """Read the retained receipt for one exact invocation identity.
+
+    ``latest.json`` is only a dashboard convenience pointer and can advance
+    while a bot completion is waiting for its platform to reconnect.  Search
+    the immutable retained receipts when that pointer belongs to another run.
+    Never raises.
+    """
+
+    expected = str(correlation_id or "").strip()
+    if not expected:
+        return None
+    try:
+        latest = read_latest_receipt()
+        if isinstance(latest, dict) and str(latest.get("correlation_id") or "") == expected:
+            return latest
+
+        directory = _receipt_dir()
+        candidates = sorted(
+            (path for path in directory.glob("update_*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("correlation_id") or "") == expected
+            ):
+                return payload
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +537,9 @@ def collect_fleet_versions(
             except Exception:
                 identity = None
             if identity:
+                raw_pid = identity.get("pid")
                 try:
-                    pid = int(identity.get("pid"))
+                    pid = int(raw_pid) if raw_pid is not None else None
                 except (TypeError, ValueError):
                     pid = None
                 if pid is not None:
@@ -377,10 +565,12 @@ def collect_fleet_versions(
             record = read_runtime_status(status_path)
             if not record:
                 continue
-            pid = record.get("pid")
+            raw_pid = record.get("pid")
             try:
-                pid = int(pid)
+                pid = int(raw_pid) if raw_pid is not None else None
             except (TypeError, ValueError):
+                continue
+            if pid is None:
                 continue
             if not _pid_exists(pid):
                 # Dead PID: a DOWN row only when this exact pid was alive at

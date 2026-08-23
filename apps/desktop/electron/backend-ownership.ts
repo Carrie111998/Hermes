@@ -23,11 +23,25 @@ export interface BackendOwnershipStore {
 }
 
 export interface BackendOwnershipDeps {
+  /**
+   * Inspect the whole persisted roster from one process-table snapshot.
+   *
+   * Windows process discovery is a cold PowerShell/CIM call. Calling the two
+   * scalar probes below for every old entry made startup O(roster size) in
+   * multi-second shell launches. A batch inspector keeps the persisted
+   * pid+creation-time ledger authoritative without paying that cost per row.
+   */
+  inspect?: (entries: readonly BackendOwnershipEntry[]) => Promise<readonly BackendOwnershipInspection[]>
   matchesIdentity: (identity: BackendIdentity) => Promise<boolean | undefined>
   /** True when the recorded parent is still running; undefined when unknown. */
   matchesParent: (entry: BackendOwnershipEntry) => Promise<boolean | undefined>
   stop: (identity: BackendIdentity) => Promise<void> | void
   store: BackendOwnershipStore
+}
+
+export interface BackendOwnershipInspection {
+  identityMatches: boolean | undefined
+  parentMatches: boolean | undefined
 }
 
 export interface BackendClaim extends BackendIdentity {
@@ -149,6 +163,103 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
   const read = () => readDetailed().entries
   const write = (entries: BackendOwnershipEntry[]) => deps.store.write(serializeBackendOwnership(entries))
 
+  const inspectBatch = async (
+    entries: readonly BackendOwnershipEntry[],
+    { identityOnly = false }: { identityOnly?: boolean } = {}
+  ): Promise<BackendOwnershipInspection[]> => {
+    if (!entries.length) {
+      return []
+    }
+
+    if (deps.inspect) {
+      try {
+        const inspected = await deps.inspect(entries)
+
+        return entries.map((_, index) => ({
+          identityMatches: inspected[index]?.identityMatches,
+          parentMatches: inspected[index]?.parentMatches
+        }))
+      } catch {
+        // A process-table failure is uncertainty, never proof that a process
+        // is dead. Preserve every record so a later launch can retry.
+        return entries.map(() => ({ identityMatches: undefined, parentMatches: undefined }))
+      }
+    }
+
+    // Non-Windows fallback: overlap independent probes so roster size does
+    // not turn into a serial startup delay even when no batch API exists.
+    return Promise.all(
+      entries.map(async entry => {
+        let parentMatches: boolean | undefined
+
+        if (!identityOnly) {
+          try {
+            parentMatches = await deps.matchesParent(entry)
+          } catch {
+            return { identityMatches: undefined, parentMatches: undefined }
+          }
+
+          if (parentMatches === true) {
+            return { identityMatches: undefined, parentMatches }
+          }
+        }
+
+        try {
+          return {
+            identityMatches: await deps.matchesIdentity(entry),
+            parentMatches
+          }
+        } catch {
+          return { identityMatches: undefined, parentMatches }
+        }
+      })
+    )
+  }
+
+  let claimCompaction: Promise<number> | null = null
+
+  const compactStaleEntries = async (): Promise<number> => {
+    const snapshot = readDetailed()
+
+    if (snapshot.corrupt || !snapshot.entries.length) {
+      return 0
+    }
+
+    const inspected = await inspectBatch(snapshot.entries, { identityOnly: true })
+    const stale = snapshot.entries.filter((_entry, index) => inspected[index]?.identityMatches === false)
+
+    if (!stale.length) {
+      return 0
+    }
+
+    // The snapshot probe awaits. Merge confirmed-stale removals into a fresh
+    // roster so concurrent claims survive and concurrent releases are not
+    // resurrected. Exact identity matching protects PID reuse.
+    const current = readDetailed()
+
+    if (current.corrupt) {
+      return 0
+    }
+
+    const next = current.entries.filter(entry => !stale.some(candidate => identitiesMatch(candidate, entry)))
+
+    if (next.length !== current.entries.length) {
+      write(next)
+    }
+
+    return current.entries.length - next.length
+  }
+
+  const compactStale = (): Promise<number> => {
+    if (!claimCompaction) {
+      claimCompaction = compactStaleEntries().finally(() => {
+        claimCompaction = null
+      })
+    }
+
+    return claimCompaction
+  }
+
   return {
     async claim(claim: BackendClaim): Promise<BackendOwnershipEntry> {
       if (!isCompleteIdentity(claim)) {
@@ -175,8 +286,25 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
       }
 
       try {
+        // Claim is deliberately one synchronous read/merge/write transaction.
+        // In particular, never put a process-table probe between read and
+        // write: Windows pays a multi-second PowerShell cold start for that
+        // probe, and two claims awaiting it can both merge from the same stale
+        // roster then overwrite one another. Persist this exact identity
+        // first; bounded maintenance, when needed, runs after the write and
+        // fresh-merges only confirmed-stale removals.
         const entries = read().filter(candidate => candidate.pid !== entry.pid)
-        write([...entries, entry])
+        const next = [...entries, entry]
+        write(next)
+
+        // Prune on every write (#92875), but never put the cold Windows
+        // process-table snapshot on the claim's critical path. The
+        // single-flight compactor classifies the whole roster in one batch and
+        // fresh-merges confirmed-stale removals after this claim has resolved.
+        void compactStale().catch(() => {
+          // Compaction is maintenance; the persisted exact claim remains
+          // valid and startup reap will retry on the next launch.
+        })
       } catch (error) {
         try {
           await deps.stop(entry)
@@ -189,6 +317,8 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
 
       return entry
     },
+
+    compactStale,
 
     release(identity: BackendIdentity): void {
       if (!isCompleteIdentity(identity)) {
@@ -220,60 +350,59 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         return []
       }
 
-      const survivors: BackendOwnershipEntry[] = []
+      const removed: BackendOwnershipEntry[] = []
       const reaped: number[] = []
+      const inspected = await inspectBatch(entries)
 
-      for (const entry of entries) {
+      for (const [index, entry] of entries.entries()) {
         // A backend whose Electron parent is still running is NOT an orphan:
         // reaping it would kill a live instance's session. This is what stops
         // a second launch from SIGTERMing the running instance's backend even
         // if it reaches reapOrphans (see main.ts startHermes + #87295).
-        let parentAlive: boolean | undefined
-
-        try {
-          parentAlive = await deps.matchesParent(entry)
-        } catch {
-          survivors.push(entry)
-
-          continue
-        }
+        const parentAlive = inspected[index]?.parentMatches
 
         if (parentAlive === true) {
-          survivors.push(entry)
-
           continue
         }
 
-        let matches: boolean | undefined
-
-        try {
-          matches = await deps.matchesIdentity(entry)
-        } catch {
-          survivors.push(entry)
-
-          continue
-        }
+        const matches = inspected[index]?.identityMatches
 
         if (matches === false) {
+          removed.push(entry)
           continue
         }
 
         if (matches !== true) {
-          survivors.push(entry)
-
           continue
         }
 
         try {
           await deps.stop(entry)
           reaped.push(entry.pid)
+          removed.push(entry)
         } catch {
           // Preserve failed ownership so a later startup can retry it.
-          survivors.push(entry)
         }
       }
 
-      write(survivors)
+      // Inspection and process teardown await. Merge the removals into a fresh
+      // roster instead of rewriting the pre-await snapshot: a backend claimed
+      // meanwhile must survive, and an entry released meanwhile must not be
+      // resurrected. Exact pid+start+nonce+profile matching also protects a
+      // newly reused PID from an old snapshot's removal decision.
+      const current = readDetailed()
+
+      if (current.corrupt) {
+        try {
+          deps.store.quarantine?.()
+        } catch {
+          // Preserve rather than overwrite concurrent unreadable evidence.
+        }
+
+        return reaped
+      }
+
+      write(current.entries.filter(entry => !removed.some(candidate => identitiesMatch(candidate, entry))))
 
       return reaped
     },

@@ -9,6 +9,7 @@ import { test } from 'vitest'
 
 import { profileSshOverride } from './connection-config'
 import {
+  assertRemoteInstallUpdateClear,
   buildSpawnCommand,
   cleanupStale,
   connect,
@@ -32,6 +33,7 @@ import {
   spawnLogPath,
   spawnRemoteDashboard,
   spawnTokenPath,
+  terminateOwnedDashboardForUpdate,
   validateRemotePath,
   writeLockfile
 } from './remote-lifecycle'
@@ -54,6 +56,7 @@ function ownedLock(over: any = {}) {
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
     tokenFingerprint: fingerprintToken('stored-token'),
     startedAt: '2026-07-14T00:00:00.000Z',
+    creationTime: 'linux:123456',
     ...over
   }
 }
@@ -67,6 +70,13 @@ function fakeSsh(rules: any[] = []) {
     calls,
     async exec(cmd) {
       calls.push(cmd)
+
+      // Existing lifecycle fixtures predate the install-wide relaunch gate.
+      // Their default remote has no update marker; focused marker tests below
+      // use explicit SSH doubles to exercise live/uncertain transitions.
+      if (cmd.includes('.hermes-update-in-progress')) {
+        return 'CLEAR'
+      }
 
       for (const [matcher, resp] of rules) {
         const hit = typeof matcher === 'function' ? matcher(cmd) : matcher.test(cmd)
@@ -86,6 +96,99 @@ function fakeSsh(rules: any[] = []) {
     }
   }
 }
+
+test('POSIX relaunch gate refuses live and uncertain install markers without executing Hermes', async () => {
+  for (const observation of ['LIVE:4242', 'UNCERTAIN']) {
+    const calls: string[] = []
+    const ssh = {
+      async exec(command) {
+        calls.push(command)
+
+        if (command === 'uname -s; uname -m') {
+          return 'Linux\nx86_64\n'
+        }
+        if (command.includes('HERMES_HOME')) {
+          return '/home/alice/.hermes\n'
+        }
+        if (command.includes('.hermes-update-in-progress')) {
+          return observation
+        }
+        throw new Error(`unexpected command after update gate: ${command}`)
+      }
+    }
+
+    await assert.rejects(
+      () => connect(connectDeps(ssh)),
+      (error: any) => error.kind === 'update-in-progress'
+    )
+    assert.equal(
+      calls.some(command => /\[ -x |--version|lock\.json|serve --help|setsid/.test(command)),
+      false
+    )
+  }
+})
+
+test('POSIX relaunch gate permits absent/dead markers and normalizes named-profile homes install-wide', async () => {
+  const commands: string[] = []
+  const ssh = {
+    async exec(command) {
+      commands.push(command)
+
+      return 'CLEAR'
+    }
+  }
+
+  await assertRemoteInstallUpdateClear(ssh, '/home/alice/.hermes/profiles/research')
+  assert.match(commands[0], /home\.parent\.name/)
+  assert.match(commands[0], /profiles/)
+  assert.match(commands[0], /\.hermes-update-in-progress/)
+})
+
+test('POSIX relaunch gate rechecks after token upload immediately before process creation', async () => {
+  const calls: string[] = []
+  let markerChecks = 0
+  const ssh = {
+    async exec(command) {
+      calls.push(command)
+
+      if (command === 'uname -s; uname -m') {
+        return 'Linux\nx86_64\n'
+      }
+      if (command.includes('HERMES_HOME')) {
+        return '/home/alice/.hermes\n'
+      }
+      if (command.includes('.hermes-update-in-progress')) {
+        markerChecks += 1
+
+        return markerChecks >= 3 ? 'LIVE:4242' : 'CLEAR'
+      }
+      if (/\[ -x /.test(command)) {
+        return 'OK'
+      }
+      if (command.includes('serve --help')) {
+        return 'YES\n'
+      }
+      if (command.includes('python3 -c')) {
+        return ''
+      }
+      if (command.includes('lock.json')) {
+        return ''
+      }
+
+      return ''
+    }
+  }
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh)),
+    (error: any) => error.kind === 'update-in-progress'
+  )
+  assert.equal(markerChecks, 3)
+  assert.equal(
+    calls.some(command => /setsid|nohup/.test(command)),
+    false
+  )
+})
 
 test('listRemoteHermesProfiles inventories Mini-style profile dirs without spawning a dashboard', async () => {
   const ssh = fakeSsh([
@@ -852,6 +955,73 @@ test('connect() respawns when the lockfile pid is dead (killed dashboard)', asyn
   assert.ok(
     !ssh.calls.some(command => command.includes('pid=333') && command.includes('print("OWNED"')),
     'a dead pid has no process identity to verify'
+  )
+})
+
+test('managed update drain preserves a live foreign POSIX owner and its lock bytes', async () => {
+  const lock = ownedLock()
+  const rawLock = JSON.stringify(lock)
+  const ssh = fakeSsh([
+    [/cat .*lock\.json/, rawLock],
+    [/kill -0 333/, 'ALIVE'],
+    [/value="linux:"/, 'linux:123456\n'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  await assert.rejects(terminateOwnedDashboardForUpdate(ssh, lock), /ownership is unproven/)
+  assert.equal(
+    ssh.calls.some(command => /kill 333 &&/.test(command)),
+    false,
+    'foreign process is never signalled'
+  )
+  assert.equal(
+    ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)),
+    false,
+    'foreign ownership bytes remain untouched'
+  )
+})
+
+test('managed update drain rechecks the POSIX ownership record before signalling', async () => {
+  const lock = ownedLock()
+  const replacement = ownedLock({ pid: 334, spawnNonce: 'fedcba9876543210' })
+  let reads = 0
+  const ssh = fakeSsh([
+    [
+      /cat .*lock\.json/,
+      () => {
+        reads += 1
+
+        return JSON.stringify(reads === 1 ? lock : replacement)
+      }
+    ],
+    [/kill -0 333/, 'ALIVE'],
+    [/value="linux:"/, 'linux:123456\n'],
+    [/print\("OWNED"/, 'OWNED\n']
+  ])
+
+  await assert.rejects(terminateOwnedDashboardForUpdate(ssh, lock), /changed during process verification/)
+  assert.equal(
+    ssh.calls.some(command => /kill 333 &&/.test(command)),
+    false
+  )
+})
+
+test('managed update drain refuses a PID whose identity changes at the atomic signal boundary', async () => {
+  const lock = ownedLock()
+  const rawLock = JSON.stringify(lock)
+  const ssh = fakeSsh([
+    [/cat .*lock\.json/, rawLock],
+    [/kill -0 333/, 'ALIVE'],
+    [/value="linux:"/, 'linux:123456\n'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/pidfd_open/, 'REFUSED\n']
+  ])
+
+  await assert.rejects(terminateOwnedDashboardForUpdate(ssh, lock), /identity changed at the signal boundary/)
+  assert.equal(
+    ssh.calls.some(command => /^kill 333\b/.test(command.trim())),
+    false,
+    'the final signal must stay inside the identity-checking helper'
   )
 })
 

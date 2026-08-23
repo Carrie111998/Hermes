@@ -340,13 +340,19 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
-        subprocess.run(
+        fetch_result = subprocess.run(
             fetch_args,
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        return None
+
+    # A failed fetch makes FETCH_HEAD/origin/main stale.  Those refs can no
+    # longer prove that the checkout is current, so never turn them into a
+    # conclusive (and cacheable) result (#82166, contributor fix #83367).
+    if fetch_result.returncode != 0:
+        return None
 
     if is_shallow:
         # No history to count across the shallow boundary. `origin/main` may not
@@ -417,12 +423,14 @@ def check_for_updates() -> Optional[int]:
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            cached_behind = cached.get("behind")
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached_behind is not None
             ):
-                return cached.get("behind")
+                return cached_behind
     except Exception:
         pass
 
@@ -443,13 +451,16 @@ def check_for_updates() -> Optional[int]:
         else:
             behind = _check_via_local_git(repo_dir)
 
-    try:
-        cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+    if behind is not None:
+        try:
+            cache_file.write_text(
+                json.dumps(
+                    {"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     return behind
 

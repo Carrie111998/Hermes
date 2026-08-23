@@ -4,7 +4,7 @@
  * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
  * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
  * update.rs `UpdateMarkerGuard`). The marker body is two lines: the updater's
- * pid and the unix-seconds it started.
+ * pid and a unix-seconds lease timestamp refreshed by the owner.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local
@@ -21,16 +21,23 @@
  */
 
 import fs from 'fs'
+import { randomUUID } from 'node:crypto'
 import path from 'path'
 
-// Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
+// Owners heartbeat the marker's second line well before this nominal ceiling.
+// A live PID remains authoritative beyond it: suspend or heartbeat trouble
+// must never let the desktop start a backend into a mutating checkout.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+const MAX_U32 = 0xffffffff
 
 export function markerPath(hermesHome) {
-  return path.join(hermesHome, '.hermes-update-in-progress')
+  // Named profiles have distinct HERMES_HOME values but mutate the same
+  // <root>/hermes-agent checkout. Keep the desktop reader on the same
+  // install-wide marker as Python and Rust.
+  const profileParent = path.dirname(hermesHome)
+  const installRoot = path.basename(profileParent) === 'profiles' ? path.dirname(profileParent) : hermesHome
+
+  return path.join(installRoot, '.hermes-update-in-progress')
 }
 
 // True only if a host process with this pid is currently alive. Signal 0 does
@@ -38,7 +45,7 @@ export function markerPath(hermesHome) {
 // EPERM => alive but owned by another user (still "alive" for our purposes).
 // Injectable `kill` keeps it unit-testable.
 export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_U32) {
     return false
   }
 
@@ -47,18 +54,21 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
 
     return true
   } catch (err) {
-    return Boolean(err && err.code === 'EPERM')
+    // Only ESRCH proves that the process is gone. Permission denied and
+    // indeterminate host errors fail closed as alive so we never discard a
+    // possibly-live updater claim.
+    return !(err && err.code === 'ESRCH')
   }
 }
 
 /**
  * Read + interpret the marker.
  *
- * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * Returns a live `{ pid, ageMs }` claim for a parseable, alive owner, an
+ * `unavailable` sentinel for unreadable/malformed state, and `null` only for
+ * absence or a well-formed confirmed-dead PID. This read-only desktop observer
+ * never deletes: Python/Rust owners perform mutex-protected dead cleanup,
+ * avoiding a read→unlink race with an atomic heartbeat or ownership handoff.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -80,27 +90,43 @@ export function readLiveUpdateMarker(
 
   try {
     raw = fs.readFileSync(file, 'utf8')
-  } catch {
-    return null // absent or unreadable => no live update
-  }
-
-  const [pidLine, startedLine] = String(raw).split('\n')
-  const pid = Number.parseInt((pidLine || '').trim(), 10)
-  const startedAt = Number.parseInt((startedLine || '').trim(), 10)
-  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
-
-  if (!alive || ageMs > maxAgeMs) {
-    try {
-      fs.unlinkSync(file)
-    } catch {
-      void 0
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return null
     }
 
+    return {
+      pid: null,
+      ageMs: Infinity,
+      leaseExpired: true,
+      unavailable: true,
+      reason: `Update marker is unreadable: ${String(err)}`
+    }
+  }
+
+  const wire = /^([1-9][0-9]*)\r?\n([0-9]+)(?:\r?\n)?$/.exec(String(raw))
+  const pid = wire ? Number(wire[1]) : Number.NaN
+  const startedAt = wire ? Number(wire[2]) : Number.NaN
+  const validPid = Number.isSafeInteger(pid) && pid > 0 && pid <= MAX_U32
+  const validLease = Number.isSafeInteger(startedAt) && startedAt >= 0
+  const ageMs = validLease ? now() - startedAt * 1000 : Infinity
+  const alive = validPid && isPidAlive(pid, kill)
+
+  if (!validPid || !validLease) {
+    return {
+      pid: null,
+      ageMs: Infinity,
+      leaseExpired: true,
+      unavailable: true,
+      reason: 'Update marker is malformed'
+    }
+  }
+
+  if (!alive) {
     return null
   }
 
-  return { pid, ageMs }
+  return { pid, ageMs, leaseExpired: ageMs > maxAgeMs, unavailable: false, reason: null }
 }
 
 /**
@@ -118,45 +144,66 @@ export function readLiveUpdateMarker(
  * files locked and the update bricks.
  *
  * Fix: the desktop writes the marker itself, using the spawned updater's
- * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` will
- * later adopt it or another hand-off stage may replace the PID. A live
- * holder's original timestamp is preserved across those transfers so retries
- * cannot keep resetting the 20-minute stale ceiling. When the updater finishes
- * it deletes the marker as before.
- * If the updater never starts (spawn failure) the marker still contains a
- * real PID, so `readLiveUpdateMarker` will self-heal once that PID exits.
+ * PID, immediately after `spawn()`. The complete two-line payload is staged
+ * and then hard-linked into place, an atomic no-clobber publish shared by the
+ * Python and Rust claimers. If another updater wins the race its marker stays
+ * untouched; `UpdateMarkerGuard` later adopts this marker when our child won.
+ * Confirmed-dead markers are cleaned under the Python/Rust shared mutex;
+ * malformed state remains a conservative blocker.
  */
 export function writeUpdateMarker(
   hermesHome,
   pid,
-  {
-    kill,
-    now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
-    startedAt
-  }: {
+  options: {
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
     startedAt?: number
   } = {}
 ) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return
+  }
   const file = markerPath(hermesHome)
+  const { now = Date.now, startedAt } = options
   const nowMs = now()
-  const owner = readLiveUpdateMarker(hermesHome, { kill, maxAgeMs, now: () => nowMs })
-
   const acquiredAt =
-    typeof startedAt === 'number' && Number.isInteger(startedAt)
+    typeof startedAt === 'number' && Number.isInteger(startedAt) && startedAt >= 0
       ? startedAt
-      : owner
-        ? Math.floor((nowMs - owner.ageMs) / 1000)
-        : Math.floor(nowMs / 1000)
+      : Math.floor(nowMs / 1000)
+  if (!Number.isSafeInteger(acquiredAt) || acquiredAt < 0) {
+    return
+  }
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.claim`)
+  let tempFd
 
   try {
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n`, 'utf8')
+    tempFd = fs.openSync(temp, 'wx', 0o600)
+    fs.writeFileSync(tempFd, `${pid}\n${acquiredAt}\n`, 'utf8')
+    fs.fsyncSync(tempFd)
+    fs.closeSync(tempFd)
+    tempFd = undefined
+
+    // linkSync is atomic and refuses an existing destination. Readers can
+    // observe only the complete staged inode, never an empty/truncated body.
+    fs.linkSync(temp, file)
   } catch {
-    // Best-effort: if we can't write the marker, proceed anyway. The
-    // updater will write its own when it reaches run_update.
+    // Best-effort: an existing winner is intentionally left untouched. If
+    // publication itself is unavailable, Rust still fails closed when it
+    // reaches UpdateMarkerGuard::acquire.
+  } finally {
+    if (tempFd !== undefined) {
+      try {
+        fs.closeSync(tempFd)
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+    try {
+      fs.unlinkSync(temp)
+    } catch {
+      // The temp may never have been created or is already gone.
+    }
   }
 }
 
@@ -164,20 +211,13 @@ export function writeUpdateMarker(
  * Whether a NEW updater hand-off must be refused because a different,
  * already-alive updater currently owns the marker (#75778).
  *
- * `writeUpdateMarker` unconditionally overwrites the marker file. Called
- * before every hand-off with no conflict check, a user who clicks "Update"
- * again while a prior updater is still parked mid-run (e.g. "waiting for
- * Hermes to exit…") clobbers that still-running updater's claim: the
- * retry's pre-write now names the NEW child, so the OLD process — alive
- * and mutating the checkout — is no longer recorded as the owner. A second
- * live updater can then run over the same tree unrecorded, the exact
- * two-updaters-at-once hazard `UpdateMarkerGuard` in the Rust updater
- * exists to prevent (apps/bootstrap-installer/src-tauri/src/update.rs).
+ * A user who clicks "Update" again while a prior updater is still parked
+ * mid-run (e.g. "waiting for Hermes to exit…") must not spawn a second
+ * checkout mutator. `writeUpdateMarker` also publishes no-clobber as a final
+ * race barrier between this check and the detached child starting.
  *
  * Returns the live foreign owner (with a ready-to-show message) when the
- * hand-off must be refused, or `null` when it's safe to spawn — no marker,
- * or the existing one is stale/dead and self-heals via
- * `readLiveUpdateMarker`.
+ * hand-off must be refused, or `null` when no confirmed-live owner exists.
  */
 export function updateHandoffConflict(
   hermesHome,
@@ -193,6 +233,15 @@ export function updateHandoffConflict(
     return null
   }
 
+  if (owner.unavailable || owner.pid === null) {
+    return {
+      pid: null,
+      ageMs: owner.ageMs,
+      message:
+        'Hermes cannot verify the current update marker. Backend startup and new updates are paused to protect the install; check the Hermes home permissions or restart after the active updater exits.'
+    }
+  }
+
   const mins = Math.floor(owner.ageMs / 60_000)
   const secs = Math.floor((owner.ageMs % 60_000) / 1000)
   const elapsed = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`
@@ -200,6 +249,6 @@ export function updateHandoffConflict(
   return {
     pid: owner.pid,
     ageMs: owner.ageMs,
-    message: `An update is already running (PID ${owner.pid}, started ${elapsed} ago). Wait for it to finish, then try again.`
+    message: `An update is already running (PID ${owner.pid}, last active ${elapsed} ago). Wait for it to finish, then try again.`
   }
 }

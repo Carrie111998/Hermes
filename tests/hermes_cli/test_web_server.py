@@ -1290,8 +1290,56 @@ class TestWebServerEndpoints:
             "action_id": "a" * 32,
         }
         assert calls == [
-            (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
+            (
+                ["update"],
+                "hermes-update",
+                {
+                    "HERMES_ACTION_ID": "a" * 32,
+                    "HERMES_UPDATE_CORRELATION_ID": "a" * 32,
+                },
+            )
         ]
+
+    def test_update_status_surfaces_durable_correlation_and_refusal(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_cli.update_receipt as update_receipt
+        import hermes_cli.web_server as web_server
+
+        correlation_id = "d" * 32
+        refusal = {
+            "code": "independent_worker_unavailable",
+            "message": "Updater could not leave the gateway service scope.",
+            "retryable": False,
+        }
+        monkeypatch.setattr(
+            update_receipt,
+            "read_latest_receipt",
+            lambda: {
+                "outcome": "refused",
+                "started_at": "2026-08-23T01:00:00+00:00",
+                "finished_at": "2026-08-23T01:00:01+00:00",
+                "correlation_id": correlation_id,
+                "stop_reason": "independent_worker_unavailable",
+                "refusal": refusal,
+                "pre_update": {"sha": "1" * 40},
+                "post_update": {"sha": "1" * 40, "version": "0.20.5"},
+                "fleet": [],
+            },
+        )
+        monkeypatch.setattr(web_server, "_ACTION_LOG_DIR", tmp_path)
+        monkeypatch.setattr(web_server, "_ACTION_PROCS", {})
+        monkeypatch.setattr(web_server, "_ACTION_RESULTS", {})
+        monkeypatch.setattr(web_server, "_ACTION_COMMANDS", {})
+        monkeypatch.setattr(web_server, "_ACTION_IDS", {})
+
+        response = self.client.get("/api/actions/hermes-update/status")
+
+        assert response.status_code == 200
+        summary = response.json()["receipt"]
+        assert summary["correlation_id"] == correlation_id
+        assert summary["stop_reason"] == "independent_worker_unavailable"
+        assert summary["refusal"] == refusal
 
     def test_update_hermes_reuses_running_action(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -3199,6 +3247,265 @@ class TestStatusRemoteGateway:
         assert data["gateway_running"] is True
         assert data["gateway_pid"] is None
         assert data["gateway_state"] == "running"
+
+
+class TestStatusGatewayCodeSkew:
+    """Structured running-gateway vs. fresh-checkout identity (#69754)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    @staticmethod
+    def _patch_status_basics(monkeypatch, ws, runtime, *, pid=4242):
+        monkeypatch.setattr(ws, "get_running_pid_cached", lambda *a, **k: pid)
+        monkeypatch.setattr(ws, "read_runtime_status", lambda *a, **k: runtime)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
+        monkeypatch.setattr(ws, "_load_configured_gateway_platforms", lambda: set())
+
+    def test_live_socket_is_profile_scoped_and_wins_over_state_file(
+        self, monkeypatch
+    ):
+        import gateway.control_socket as control_socket
+        import hermes_cli.build_info as build_info
+        import hermes_cli.web_server as ws
+        from hermes_cli import profiles as profiles_mod
+
+        target_home = profiles_mod.get_profile_dir("research")
+        target_home.mkdir(parents=True)
+        old_sha = "a" * 40
+        checkout_sha = "b" * 40
+        stale_file_sha = "c" * 40
+        runtime = {
+            "gateway_state": "running",
+            "platforms": {},
+            "pid": 4242,
+            "code_sha": stale_file_sha,
+        }
+        self._patch_status_basics(monkeypatch, ws, runtime)
+        seen = {}
+
+        def identify(home, *, timeout):
+            seen["home"] = home
+            seen["timeout"] = timeout
+            return {
+                "pid": 4242,
+                "profile": "research",
+                "code_sha": old_sha,
+            }
+
+        def checkout_identity(*, refresh=False):
+            seen["refresh"] = refresh
+            return {"sha": checkout_sha}
+
+        monkeypatch.setattr(control_socket, "identify_gateway", identify)
+        monkeypatch.setattr(build_info, "get_code_identity", checkout_identity)
+        # Even if the fallback record validates, the live socket must win.
+        monkeypatch.setattr(
+            ws, "get_runtime_status_running_pid", lambda *a, **k: 4242
+        )
+
+        response = self.client.get("/api/status?profile=research")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert seen["home"] == target_home
+        assert seen["timeout"] == ws._STATUS_GATEWAY_IDENTITY_TIMEOUT
+        assert seen["refresh"] is True
+        assert data["gateway_code_sha"] == old_sha
+        assert data["checkout_code_sha"] == checkout_sha
+        assert data["gateway_restart_required"] is True
+        assert data["gateway_profile"] == "research"
+
+    def test_dead_runtime_record_never_reports_skew(self, monkeypatch):
+        import gateway.control_socket as control_socket
+        import hermes_cli.build_info as build_info
+        import hermes_cli.web_server as ws
+
+        checkout_sha = "d" * 40
+        runtime = {
+            "gateway_state": "running",
+            "platforms": {},
+            "pid": 999999,
+            "code_sha": "e" * 40,
+            "profile": "default",
+        }
+        self._patch_status_basics(monkeypatch, ws, runtime, pid=None)
+        monkeypatch.setattr(
+            ws, "get_runtime_status_running_pid", lambda *a, **k: None
+        )
+        monkeypatch.setattr(control_socket, "identify_gateway", lambda *a, **k: None)
+        monkeypatch.setattr(
+            build_info,
+            "get_code_identity",
+            lambda *, refresh=False: {"sha": checkout_sha},
+        )
+
+        data = self.client.get("/api/status").json()
+
+        assert data["gateway_running"] is False
+        assert data["checkout_code_sha"] == checkout_sha
+        assert "gateway_code_sha" not in data
+        assert "gateway_profile" not in data
+        assert "gateway_restart_required" not in data
+
+    def test_identity_owned_live_runtime_is_the_local_fallback(
+        self, monkeypatch
+    ):
+        import gateway.control_socket as control_socket
+        import hermes_cli.build_info as build_info
+        import hermes_cli.web_server as ws
+        from hermes_cli import profiles as profiles_mod
+
+        target_home = profiles_mod.get_profile_dir("worker")
+        target_home.mkdir(parents=True)
+        sha = "f" * 40
+        runtime = {
+            "gateway_state": "running",
+            "platforms": {},
+            "pid": 4242,
+            "code_sha": sha,
+        }
+        self._patch_status_basics(monkeypatch, ws, runtime)
+        seen = {}
+
+        def owned_pid(record, *, expected_home=None):
+            seen["record"] = record
+            seen["home"] = expected_home
+            return 4242
+
+        monkeypatch.setattr(ws, "get_runtime_status_running_pid", owned_pid)
+        monkeypatch.setattr(control_socket, "identify_gateway", lambda *a, **k: None)
+        monkeypatch.setattr(
+            build_info,
+            "get_code_identity",
+            lambda *, refresh=False: {"sha": sha},
+        )
+
+        data = self.client.get("/api/status?profile=worker").json()
+
+        assert seen == {"record": runtime, "home": target_home}
+        assert data["gateway_code_sha"] == sha
+        assert data["checkout_code_sha"] == sha
+        assert data["gateway_restart_required"] is False
+        assert data["gateway_profile"] == "worker"
+
+    def test_remote_detailed_health_is_live_identity_fallback(self, monkeypatch):
+        import gateway.control_socket as control_socket
+        import hermes_cli.build_info as build_info
+        import hermes_cli.web_server as ws
+
+        gateway_sha = "1" * 40
+        checkout_sha = "2" * 40
+        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
+        monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gateway:8642")
+        monkeypatch.setattr(ws, "_load_configured_gateway_platforms", lambda: set())
+        monkeypatch.setattr(
+            ws,
+            "_probe_gateway_health",
+            lambda: (
+                True,
+                {
+                    "status": "ok",
+                    "gateway_state": "running",
+                    "pid": 77,
+                    "code_sha": gateway_sha,
+                    "profile": "default",
+                },
+            ),
+        )
+        monkeypatch.setattr(control_socket, "identify_gateway", lambda *a, **k: None)
+        monkeypatch.setattr(
+            build_info,
+            "get_code_identity",
+            lambda *, refresh=False: {"sha": checkout_sha},
+        )
+
+        data = self.client.get("/api/status").json()
+
+        assert data["gateway_running"] is True
+        assert data["gateway_code_sha"] == gateway_sha
+        assert data["checkout_code_sha"] == checkout_sha
+        assert data["gateway_restart_required"] is True
+        assert data["gateway_profile"] == "default"
+
+    def test_simple_remote_health_cannot_claim_gateway_identity(self, monkeypatch):
+        import gateway.control_socket as control_socket
+        import hermes_cli.build_info as build_info
+        import hermes_cli.web_server as ws
+
+        checkout_sha = "3" * 40
+        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
+        monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gateway:8642")
+        monkeypatch.setattr(ws, "_load_configured_gateway_platforms", lambda: set())
+        monkeypatch.setattr(
+            ws,
+            "_probe_gateway_health",
+            lambda: (
+                True,
+                {
+                    "status": "ok",
+                    "code_sha": "4" * 40,
+                    "profile": "default",
+                },
+            ),
+        )
+        monkeypatch.setattr(control_socket, "identify_gateway", lambda *a, **k: None)
+        monkeypatch.setattr(
+            build_info,
+            "get_code_identity",
+            lambda *, refresh=False: {"sha": checkout_sha},
+        )
+
+        data = self.client.get("/api/status").json()
+
+        assert data["gateway_running"] is True
+        assert data["checkout_code_sha"] == checkout_sha
+        assert "gateway_code_sha" not in data
+        assert "gateway_restart_required" not in data
+
+    def test_identity_probes_run_off_event_loop(self, monkeypatch):
+        import gateway.control_socket as control_socket
+        import hermes_cli.build_info as build_info
+        import hermes_cli.web_server as ws
+
+        runtime = {"gateway_state": "running", "platforms": {}}
+        self._patch_status_basics(monkeypatch, ws, runtime)
+        seen = {}
+
+        def identify(*_args, **_kwargs):
+            seen["socket_thread"] = threading.get_ident()
+            return None
+
+        def checkout_identity(*, refresh=False):
+            seen["checkout_thread"] = threading.get_ident()
+            return {"sha": "5" * 40}
+
+        monkeypatch.setattr(control_socket, "identify_gateway", identify)
+        monkeypatch.setattr(build_info, "get_code_identity", checkout_identity)
+        monkeypatch.setattr(
+            ws, "get_runtime_status_running_pid", lambda *a, **k: None
+        )
+
+        async def run_status():
+            loop_thread = threading.get_ident()
+            await ws.get_status()
+            return loop_thread
+
+        loop_thread = asyncio.run(run_status())
+
+        assert seen["socket_thread"] != loop_thread
+        assert seen["checkout_thread"] != loop_thread
 
 
 class TestStatusInstallId:

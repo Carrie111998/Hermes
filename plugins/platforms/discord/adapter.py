@@ -5968,7 +5968,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/update", "Update initiated~")
+            # ``handle_message`` only admits the command to background
+            # processing; it does not wait for the gateway's managed-runtime,
+            # repository, or install-wide update-lock checks.  Keep the
+            # deferred interaction neutral and let the gateway send the
+            # authoritative admission/streaming receipt to the channel.
+            await self._run_simple_slash(interaction, "/update")
 
         @tree.command(name="restart", description="Gracefully restart the Hermes gateway")
         async def slash_restart(interaction: discord.Interaction):
@@ -7730,6 +7735,9 @@ class DiscordAdapter(BasePlatformAdapter):
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
+        prompt_id: str = "",
+        correlation_id: str = "",
+        context: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive button-based update prompt (Yes / No).
@@ -7753,6 +7761,9 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             view = UpdatePromptView(
                 session_key=session_key,
+                prompt_id=prompt_id,
+                correlation_id=correlation_id,
+                control_home=str((context or {}).get("control_home") or ""),
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
@@ -9076,9 +9087,15 @@ def _define_discord_view_classes() -> None:
             session_key: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            prompt_id: str = "",
+            correlation_id: str = "",
+            control_home: str = "",
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            self.prompt_id = str(prompt_id or "")
+            self.correlation_id = str(correlation_id or "")
+            self.control_home = str(control_home or "")
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
@@ -9103,6 +9120,29 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            try:
+                from gateway.update_prompt_response import (
+                    write_update_confirmation_response,
+                )
+                from hermes_constants import get_hermes_home
+
+                written = write_update_confirmation_response(
+                    self.control_home or str(get_hermes_home()),
+                    prompt_id=self.prompt_id,
+                    correlation_id=self.correlation_id,
+                    session_key=self.session_key,
+                    answer=answer,
+                )
+            except Exception as exc:
+                logger.error("Failed to write update response: %s", exc)
+                written = False
+
+            if not written:
+                await interaction.response.send_message(
+                    "This update prompt is stale or already answered.", ephemeral=True
+                )
+                return
+
             self.resolved = True
 
             # Update embed
@@ -9115,20 +9155,10 @@ def _define_discord_view_classes() -> None:
                 child.disabled = True
             await interaction.response.edit_message(embed=embed, view=self)
 
-            # Write response file
-            try:
-                from hermes_constants import get_hermes_home
-                home = get_hermes_home()
-                response_path = home / ".update_response"
-                tmp = response_path.with_suffix(".tmp")
-                tmp.write_text(answer, encoding="utf-8")
-                tmp.replace(response_path)
-                logger.info(
-                    "Discord update prompt answered '%s' by %s",
-                    answer, interaction.user.display_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to write update response: %s", exc)
+            logger.info(
+                "Discord update prompt answered '%s' by %s",
+                answer, interaction.user.display_name,
+            )
 
         @discord.ui.button(label="Yes", style=discord.ButtonStyle.green, emoji="✓")
         async def yes_btn(

@@ -5,6 +5,7 @@ import { test, vi } from 'vitest'
 import {
   backendCommandMatches,
   type BackendIdentity,
+  type BackendOwnershipEntry,
   createBackendOwnership,
   createBackendShutdownCoordinator,
   parseBackendOwnership
@@ -70,6 +71,97 @@ test('claim persists the caller-supplied exact identity before resolving', async
   assert.deepEqual(parseBackendOwnership(store.value()), [claim])
 })
 
+test('claim persists immediately, then prunes stale ownership in one non-blocking batch', async () => {
+  const stale = ownershipEntry({ nonce: 'stale', pid: 40, startMarker: 'old-start' })
+  const uncertain = ownershipEntry({ nonce: 'uncertain', pid: 41, startMarker: 'unknown-start' })
+  const claim = ownershipEntry({ nonce: 'new', pid: 42, startMarker: 'new-start' })
+  const store = memoryStore(stored([stale, uncertain]))
+  const gate = deferred()
+  const inspect = vi.fn(async (entries: readonly BackendOwnershipEntry[]) => {
+    await gate.promise
+
+    return entries.map(entry => ({
+      identityMatches: entry.nonce === stale.nonce ? false : entry.nonce === uncertain.nonce ? undefined : true,
+      parentMatches: undefined
+    }))
+  })
+  const ownership = createOwnership(store, { inspect })
+
+  await ownership.claim(claim)
+
+  // Persistence is complete while the cold snapshot remains blocked.
+  assert.deepEqual(parseBackendOwnership(store.value()), [stale, uncertain, claim])
+  assert.equal(inspect.mock.calls.length, 1)
+
+  const compacted = ownership.compactStale()
+  gate.resolve()
+
+  assert.equal(await compacted, 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [uncertain, claim])
+  assert.deepEqual(inspect.mock.calls, [[[stale, uncertain, claim]]])
+})
+
+test('claim batch-compacts a large roster after persisting without blocking startup', async () => {
+  const old = Array.from({ length: 7 }, (_, index) =>
+    ownershipEntry({
+      nonce: `old-${index}`,
+      pid: 100 + index,
+      startMarker: `old-start-${index}`
+    })
+  )
+  const uncertain = old[old.length - 1]
+  const claim = ownershipEntry({ nonce: 'new', pid: 200, startMarker: 'new-start' })
+  const store = memoryStore(stored(old))
+  const gate = deferred()
+  const inspect = vi.fn(async (entries: readonly BackendOwnershipEntry[]) => {
+    await gate.promise
+
+    return entries.map(entry => ({
+      identityMatches: entry.nonce === uncertain.nonce ? undefined : entry.nonce === claim.nonce,
+      parentMatches: undefined
+    }))
+  })
+  const ownership = createOwnership(store, { inspect })
+
+  await ownership.claim(claim)
+
+  // The exact new claim is durable before the cold snapshot finishes.
+  assert.deepEqual(parseBackendOwnership(store.value()), [...old, claim])
+  assert.equal(inspect.mock.calls.length, 1)
+
+  const compacted = ownership.compactStale()
+  gate.resolve()
+
+  assert.equal(await compacted, old.length - 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [uncertain, claim])
+  assert.deepEqual(inspect.mock.calls, [[[...old, claim]]])
+})
+
+test('concurrent claims merge both children without a read-await-write lost update', async () => {
+  const stale = ownershipEntry({ nonce: 'stale', pid: 79, startMarker: 'stale-start' })
+  const store = memoryStore(stored([stale]))
+  const gate = deferred()
+  const inspect = vi.fn(async (entries: readonly BackendOwnershipEntry[]) => {
+    await gate.promise
+
+    return entries.map(entry => ({ identityMatches: entry.nonce !== stale.nonce, parentMatches: undefined }))
+  })
+  const ownership = createOwnership(store, { inspect })
+  const first = ownershipEntry({ nonce: 'first', pid: 80, startMarker: 'first-start' })
+  const second = ownershipEntry({ nonce: 'second', pid: 81, startMarker: 'second-start' })
+
+  await Promise.all([ownership.claim(first), ownership.claim(second)])
+
+  assert.equal(inspect.mock.calls.length, 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [stale, first, second])
+
+  const compacted = ownership.compactStale()
+  gate.resolve()
+
+  assert.equal(await compacted, 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [first, second])
+})
+
 test('incomplete claims and persisted records are rejected', async () => {
   const store = memoryStore(
     stored([
@@ -109,9 +201,8 @@ test('failed persistence awaits asynchronous cleanup of the exact identity', asy
     throw error
   })
 
-  await Promise.resolve()
+  await vi.waitFor(() => assert.deepEqual(stop.mock.calls, [[claim]]))
   assert.equal(rejected, false)
-  assert.deepEqual(stop.mock.calls, [[claim]])
 
   cleanup.resolve()
   await assert.rejects(result, expected)
@@ -151,6 +242,94 @@ test('startup reap preserves records when exact identity probing is uncertain or
   assert.deepEqual(await ownership.reapOrphans(), [])
   assert.equal(stop.mock.calls.length, 0)
   assert.deepEqual(parseBackendOwnership(store.value()), [uncertain, failed])
+})
+
+test('startup reap classifies the whole roster with one batch inspection', async () => {
+  const liveParent = {
+    ...ownershipEntry({ nonce: 'live-parent', pid: 60 }),
+    parentPid: 600,
+    parentStartMarker: 'parent-start'
+  }
+  const stale = ownershipEntry({ nonce: 'stale', pid: 61 })
+  const orphan = ownershipEntry({ nonce: 'orphan', pid: 62 })
+  const store = memoryStore(stored([liveParent, stale, orphan]))
+  const inspect = vi.fn(async () => [
+    { identityMatches: true, parentMatches: true },
+    { identityMatches: false, parentMatches: false },
+    { identityMatches: true, parentMatches: false }
+  ])
+  const stop = vi.fn()
+  const matchesIdentity = vi.fn(async () => assert.fail('batch inspection should replace scalar identity probes'))
+  const matchesParent = vi.fn(async () => assert.fail('batch inspection should replace scalar parent probes'))
+  const ownership = createOwnership(store, { inspect, matchesIdentity, matchesParent, stop })
+
+  assert.deepEqual(await ownership.reapOrphans(), [62])
+  assert.deepEqual(inspect.mock.calls, [[[liveParent, stale, orphan]]])
+  assert.equal(matchesIdentity.mock.calls.length, 0)
+  assert.equal(matchesParent.mock.calls.length, 0)
+  assert.deepEqual(stop.mock.calls, [[orphan]])
+  assert.deepEqual(parseBackendOwnership(store.value()), [liveParent])
+})
+
+test('startup reap overlaps scalar roster probes when a batch inspector is unavailable', async () => {
+  const first = ownershipEntry({ nonce: 'first', pid: 70 })
+  const second = ownershipEntry({ nonce: 'second', pid: 71 })
+  const gate = deferred()
+  let started = 0
+  const matchesIdentity = vi.fn(async () => {
+    started += 1
+    await gate.promise
+    return false
+  })
+  const ownership = createOwnership(memoryStore(stored([first, second])), {
+    matchesIdentity,
+    matchesParent: async () => false
+  })
+  const result = ownership.reapOrphans()
+
+  await vi.waitFor(() => assert.equal(started, 2))
+  gate.resolve()
+
+  assert.deepEqual(await result, [])
+})
+
+test('startup reap fresh-merges a backend claimed while inspection is pending', async () => {
+  const stale = ownershipEntry({ nonce: 'stale', pid: 72, startMarker: 'stale-start' })
+  const claimed = ownershipEntry({ nonce: 'claimed', pid: 73, startMarker: 'claimed-start' })
+  const store = memoryStore(stored([stale]))
+  const gate = deferred()
+  const inspect = vi.fn(async () => {
+    await gate.promise
+    return [{ identityMatches: false, parentMatches: false }]
+  })
+  const ownership = createOwnership(store, { inspect })
+  const reap = ownership.reapOrphans()
+
+  await vi.waitFor(() => assert.equal(inspect.mock.calls.length, 1))
+  await ownership.claim(claimed)
+  gate.resolve()
+
+  assert.deepEqual(await reap, [])
+  assert.deepEqual(parseBackendOwnership(store.value()), [claimed])
+})
+
+test('startup reap does not resurrect an entry released while inspection is pending', async () => {
+  const released = ownershipEntry({ nonce: 'released', pid: 74, startMarker: 'released-start' })
+  const store = memoryStore(stored([released]))
+  const gate = deferred()
+  const inspect = vi.fn(async () => {
+    await gate.promise
+    return [{ identityMatches: undefined, parentMatches: undefined }]
+  })
+  const ownership = createOwnership(store, { inspect })
+  const reap = ownership.reapOrphans()
+
+  await vi.waitFor(() => assert.equal(inspect.mock.calls.length, 1))
+  ownership.release(released)
+  gate.resolve()
+
+  assert.deepEqual(await reap, [])
+  assert.deepEqual(parseBackendOwnership(store.value()), [])
 })
 
 test('startup reap passes the full confirmed identity to stop', async () => {

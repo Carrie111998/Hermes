@@ -3178,6 +3178,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         from gateway.status import (
+            _get_code_identity_fields,
+            _get_process_hermes_home,
+            _profile_label_for_home,
             derive_gateway_busy,
             derive_gateway_drainable,
             normalize_updated_at,
@@ -3186,6 +3189,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         runtime = read_runtime_status() or {}
+        code_identity = _get_code_identity_fields()
         gw_state = runtime.get("gateway_state")
         gw_active = parse_active_agents(runtime.get("active_agents", 0))
         # This endpoint is served BY the gateway process, so it is by definition
@@ -3223,6 +3227,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
+            # Live process identity for a split-container dashboard's skew
+            # guard.  /health/detailed is bearer-authenticated and served by
+            # this gateway process, so these fields cannot come from a stale
+            # shared-volume state record.
+            "code_sha": code_identity.get("code_sha"),
+            "code_version": code_identity.get("code_version"),
+            "profile": _profile_label_for_home(_get_process_hermes_home()),
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":

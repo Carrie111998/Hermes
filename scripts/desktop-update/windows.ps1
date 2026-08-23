@@ -952,22 +952,61 @@ try {
     Write-HandoffLog "hand-off start: root=$InstallRoot branch=$Branch desktopPid=$DesktopPid pid=$PID"
 
     # -- 0. Claim the update marker with OUR pid ---------------------------
-    try {
-        $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $startedAt = 0L
-        $hasStartedAt = [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$startedAt)
-        if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
-            $startedAt = $epoch
-        }
-        # WriteAllText for byte-exact LF framing: Set-Content emits CRLF and
-        # the marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
-        [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
-        Write-HandoffLog "claimed update marker (pid $PID)"
-    } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+    # Use update_lock.py's shared mutex + atomic no-clobber/CAS protocol. The
+    # Electron bridge names DesktopPid; only that explicitly supplied owner
+    # (or our own existing claim) may be replaced. A live foreign or malformed
+    # marker is preserved and this handoff refuses before mutation.
+    $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $startedAt = 0L
+    $hasStartedAt = [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$startedAt)
+    if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
+        $startedAt = $epoch
     }
 
+    $markerPython = "$($env:HERMES_UPDATE_MARKER_PYTHON)".Trim()
+    if (-not $markerPython) {
+        $venvMarkerPython = Join-Path $InstallRoot "venv\Scripts\python.exe"
+        if (Test-Path -LiteralPath $venvMarkerPython -PathType Leaf) {
+            $markerPython = $venvMarkerPython
+        }
+    }
+    if (-not $markerPython) {
+        $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+        if ($pythonCommand) { $markerPython = $pythonCommand.Source }
+    }
+
+    $claimCode = 2
+    $claimOutput = "Python is unavailable"
+    if ($markerPython) {
+        try {
+            $markerHelper = Join-Path $PSScriptRoot "marker-claim.py"
+            $claimOutput = (& $markerPython $markerHelper `
+                --marker $MarkerPath `
+                --owner-pid $PID `
+                --desktop-pid $DesktopPid `
+                --lease-at $startedAt 2>&1 | Out-String).Trim()
+            $claimCode = $LASTEXITCODE
+        } catch {
+            $claimCode = 2
+            $claimOutput = $_.Exception.Message
+        }
+    }
+    if ($claimCode -ne 0) {
+        $finalCode = 2
+        $finalMsg = "Update refused: another updater owns the install or its update marker cannot be verified. Nothing was changed."
+        $claimDetail = if ($claimOutput) { " ($claimOutput)" } else { "" }
+        Write-HandoffLog "$finalMsg$claimDetail"
+        exit $finalCode
+    }
+    Write-HandoffLog "claimed update marker (pid $PID)"
+
     if ($SelfTestMarker) {
+        if ($env:HERMES_UPDATE_SELFTEST_INVOCATION_SENTINEL) {
+            [System.IO.File]::WriteAllText(
+                $env:HERMES_UPDATE_SELFTEST_INVOCATION_SENTINEL,
+                "reached-update-invocation-boundary`n"
+            )
+        }
         $finalCode = 0
         $finalMsg = "marker self-test complete"
         exit 0

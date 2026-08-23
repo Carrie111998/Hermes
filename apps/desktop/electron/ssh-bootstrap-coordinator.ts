@@ -24,7 +24,7 @@ function createBootstrapCoordinator() {
   const generations = new Map<string, number>()
   const drains = new Map<string, Promise<void>>()
 
-  function start(scope, fingerprint, run) {
+  function start(scope, fingerprint, run, metadata = null) {
     const current = pending.get(scope)
 
     if (current?.fingerprint === fingerprint) {
@@ -57,7 +57,7 @@ function createBootstrapCoordinator() {
 
     const drain = drains.get(scope) || Promise.resolve()
     const predecessor = current ? Promise.allSettled([current.promise, drain]) : drain
-    const entry: any = { controller, fingerprint, forceCleanups, generation, promise: null, scope }
+    const entry: any = { controller, fingerprint, forceCleanups, generation, metadata, promise: null, scope }
 
     const promise = predecessor
       .then(() => {

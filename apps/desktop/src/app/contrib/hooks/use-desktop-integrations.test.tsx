@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
 import { _resetLegacyDiscardForTests } from '@/store/session'
+import type * as UpdatesStore from '@/store/updates'
 import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -14,6 +15,7 @@ import { useDesktopIntegrations } from './use-desktop-integrations'
 // hook believes it runs in. Default false keeps the pre-existing restore
 // coverage exercising the real main-window path.
 const { hudWindowMock } = vi.hoisted(() => ({ hudWindowMock: vi.fn(() => false) }))
+const { openUpdateOverlayFor } = vi.hoisted(() => ({ openUpdateOverlayFor: vi.fn() }))
 
 vi.mock('@/store/mcp-deeplink-install', () => ({
   requestMcpInstallFromDeepLink: vi.fn()
@@ -27,6 +29,13 @@ vi.mock('@/store/windows', async importOriginal => {
     isHudWindow: () => hudWindowMock()
   }
 })
+
+vi.mock('@/store/updates', async importOriginal => ({
+  ...(await importOriginal<typeof UpdatesStore>()),
+  openUpdateOverlayFor: (target: 'backend' | 'client') => openUpdateOverlayFor(target),
+  startUpdatePoller: vi.fn(),
+  stopUpdatePoller: vi.fn()
+}))
 
 // Pure-jsdom localStorage (no nanostores persistence module needed — the
 // production functions write directly to window.localStorage through the
@@ -176,6 +185,25 @@ describe('useDesktopIntegrations', () => {
       })
 
       expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
+    })
+  })
+
+  describe('native update command', () => {
+    it('keeps Check for Updates pinned to the Desktop client', () => {
+      let openUpdates: (() => void) | undefined
+      desktopWindow.hermesDesktop = {
+        ...desktopWindow.hermesDesktop,
+        onOpenUpdatesRequested: (callback: () => void) => {
+          openUpdates = callback
+
+          return () => undefined
+        }
+      } as unknown as Window['hermesDesktop']
+
+      render()
+      openUpdates?.()
+
+      expect(openUpdateOverlayFor).toHaveBeenCalledWith('client')
     })
   })
 

@@ -12,7 +12,9 @@ These tests pin user/role/global allowlist semantics, explicit allow-all
 handling, and fail-closed behavior so the parity cannot regress.
 """
 
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -132,6 +134,57 @@ def test_update_prompt_view_accepts_role_allowlist():
     )
     assert view._check_auth(_interaction(99999, role_ids=[42])) is True
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_response_is_correlation_bound_and_replay_inert(tmp_path):
+    pending = {
+        "correlation_id": "corr-1",
+        "session_key": "session-1",
+        "origin_profile": "work",
+        "profile_home": "/profiles/work",
+        "control_home": str(tmp_path),
+        "install_root": "/project/hermes",
+        "install_id": "install-1",
+    }
+    prompt = {
+        "id": "prompt-1",
+        "kind": "update_confirmation",
+        "correlation_id": "corr-1",
+        "context": {
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(tmp_path),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        },
+    }
+    (tmp_path / ".update_pending.json").write_text(json.dumps(pending))
+    (tmp_path / ".update_prompt.json").write_text(json.dumps(prompt))
+    view = UpdatePromptView(
+        session_key="session-1",
+        prompt_id="prompt-1",
+        correlation_id="corr-1",
+        control_home=str(tmp_path),
+        allowed_user_ids={"1"},
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1, display_name="Operator", roles=[]),
+        message=SimpleNamespace(embeds=[]),
+        response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()),
+    )
+
+    await view._respond(interaction, "y", MagicMock(), "Yes")
+
+    assert json.loads((tmp_path / ".update_response").read_text()) == {
+        "answer": "yes",
+        "correlation_id": "corr-1",
+        "id": "prompt-1",
+    }
+    interaction.response.edit_message.assert_awaited_once()
+
+    await view._respond(interaction, "n", MagicMock(), "No")
+    assert "already" in interaction.response.send_message.call_args.args[0].lower()
 
 
 def test_clarify_choice_view_accepts_role_allowlist():
@@ -277,4 +330,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-

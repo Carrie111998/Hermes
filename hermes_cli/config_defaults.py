@@ -3330,6 +3330,25 @@ DEFAULT_CONFIG = {
         # Values below 1 are floored to 1 — the backup just created is
         # always preserved. The quick snapshot always keeps exactly 1.
         "backup_keep": 5,
+        # Opt-in transactional fleet rollout. Empty preserves the historical
+        # all-at-once restart path byte-for-byte. When set to a RUNNING
+        # profile id, update snapshots Git + the complete venv outside the
+        # checkout, restarts this gateway first, and advances later profiles
+        # only after a stable control-socket health + import-smoke gate.
+        "canary_profile": "",
+        # Number of non-canary gateway profiles restarted per batch.
+        "rollout_batch_size": 4,
+        # The canary/new generation must continuously report the target SHA
+        # for this long, within the bounded timeout, before rollout advances.
+        "canary_healthy_after_seconds": 10,
+        "canary_health_timeout_seconds": 120,
+        "canary_smoke_timeout_seconds": 30,
+        # Optional billed provider turn after the structural canary smoke.
+        # False keeps rollout health checks local and network-free.
+        "canary_smoke_agent_turn": False,
+        "canary_restart_timeout_seconds": 90,
+        # Complete external code/dependency checkpoints retained per install.
+        "rollback_checkpoint_keep": 3,
         # What `hermes update` does with uncommitted local changes to the
         # source tree when it runs NON-interactively — i.e. triggered from
         # the desktop/chat app or the gateway, where there's no TTY to answer

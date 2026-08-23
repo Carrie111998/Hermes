@@ -89,6 +89,19 @@ def _patch_gateway_discovery():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_web_build_for_update():
+    """This module exercises updater control flow, not the real web compiler.
+
+    The production updater now treats a missing/stale web bundle as a
+    fail-closed partial update, so these mocked end-to-end flows must declare
+    that their unrelated build leg succeeded. Dedicated web-build tests cover
+    strict failure and stale-bundle rejection.
+    """
+    with patch("hermes_cli.update_cmd._build_web_ui_for_update", return_value=True):
+        yield
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):
@@ -301,7 +314,9 @@ class TestCmdUpdateBranchFallback:
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_called_once_with(
+            expected_git_cmd, PROJECT_ROOT, push_origin=True
+        )
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -1076,7 +1091,11 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
         monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
         monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
-        monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda _failures: None)
+        monkeypatch.setattr(
+            update_cmd,
+            "_finish_dashboard_update_cleanup",
+            lambda _failures, *, web_build_ok: None,
+        )
         monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path / "hermes-home")
 
         with (
