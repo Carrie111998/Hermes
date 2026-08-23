@@ -841,6 +841,15 @@ class ChatCompletionsTransport(ProviderTransport):
                 else:
                     api_kwargs[k] = v
 
+        # Parallel tool calls — per-provider tri-state (see #18470/#18492).
+        # Nous Portal opts in (True); others omit (None) unless an explicit
+        # request_overrides already set the field. Mirrors the tri-state
+        # discussion on current-main where a global default was rejected.
+        if tools and getattr(profile, "supports_parallel_tool_calls", None) is not None:
+            api_kwargs.setdefault(
+                "parallel_tool_calls", bool(profile.supports_parallel_tool_calls)
+            )
+
         if extra_body:
             # Native Gemini (generativelanguage.googleapis.com, non-/openai)
             # speaks Google's REST schema, not OpenAI's. OpenAI-style extra_body

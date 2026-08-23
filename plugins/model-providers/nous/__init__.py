@@ -128,6 +128,9 @@ nous = NousProfile(
     name="nous",
     aliases=("nous-portal", "nousresearch"),
     env_vars=("NOUS_API_KEY",),
+    # Opt-in to parallel tool calls on Chat Completions — fixes batching
+    # on Nous Portal (see #18470/#18492 tri-state). Others omit.
+    supports_parallel_tool_calls=True,
     display_name="Nous Research",
     description="Nous Research — Hermes model family",
     signup_url="https://nousresearch.com/",

@@ -300,7 +300,50 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["think"] is False
 
+    # ── Nous parallel_tool_calls tri-state (see #18470/#18492) ─────────
+    def test_nous_with_tools_sends_parallel(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=[{"role": "user", "content": "Hi"}], tools=tools, provider_profile=profile)
+        assert kw.get("parallel_tool_calls") is True
+        assert "tools" in kw
 
+    def test_nous_without_tools_omits_parallel(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        kw = transport.build_kwargs(model="gpt-4o", messages=[{"role": "user", "content": "Hi"}], tools=None, provider_profile=profile)
+        assert "parallel_tool_calls" not in kw
+
+    def test_nous_empty_tools_omits_parallel(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        kw = transport.build_kwargs(model="gpt-4o", messages=[{"role": "user", "content": "Hi"}], tools=[], provider_profile=profile)
+        assert "parallel_tool_calls" not in kw
+
+    def test_nous_override_false_respected(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=[{"role": "user", "content": "Hi"}], tools=tools, provider_profile=profile, request_overrides={"parallel_tool_calls": False})
+        assert kw.get("parallel_tool_calls") is False
+
+    def test_unrelated_provider_omits_parallel(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("openrouter")
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=[{"role": "user", "content": "Hi"}], tools=tools, provider_profile=profile)
+        assert "parallel_tool_calls" not in kw
+        assert "tools" in kw
+
+    def test_nous_tags_preserved_with_parallel(self, transport):
+        from agent.portal_tags import nous_portal_tags
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=[{"role": "user", "content": "Hi"}], tools=tools, provider_profile=profile)
+        assert kw["extra_body"]["tags"] == nous_portal_tags()
+        assert kw.get("parallel_tool_calls") is True
 
     def test_gemini_openai_compat_flash_reasoning_maps_to_nested_google_thinking_config(self, transport):
         msgs = [{"role": "user", "content": "Hi"}]

@@ -78,6 +78,11 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # Parallel tool calls tri-state: True (send True), False (send False),
+    # None (omit — let provider default). Per-provider opt-in per #18470/#18492
+    # so only providers that need it (Nous) get it.
+    supports_parallel_tool_calls: bool | None = None
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.
