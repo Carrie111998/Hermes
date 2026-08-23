@@ -28,13 +28,13 @@ def test_provider_model_ids_uses_runtime_entra_token_provider(monkeypatch):
 
     def probe(base_url, api_key, *, token_provider=None):
         calls.append((base_url, api_key, token_provider))
-        return True, ["deployment-terra", "deployment-luna"]
+        return True, ["deployment-a", "deployment-b"]
 
     monkeypatch.setattr(azure_detect, "_probe_openai_models", probe)
 
     assert provider_model_ids("azure-foundry", force_refresh=True) == [
-        "deployment-terra",
-        "deployment-luna",
+        "deployment-a",
+        "deployment-b",
     ]
     assert calls == [
         (
@@ -64,20 +64,20 @@ def test_entra_only_azure_foundry_is_present_in_picker_inventory(monkeypatch):
     monkeypatch.setattr(
         models,
         "cached_provider_model_ids",
-        lambda provider, **kwargs: ["deployment-terra"]
+        lambda provider, **kwargs: ["deployment-a"]
         if provider == "azure-foundry"
         else [],
     )
 
     rows = list_authenticated_providers(
         current_provider="azure-foundry",
-        current_model="deployment-terra",
+        current_model="deployment-a",
         custom_providers=[],
         for_picker=True,
     )
 
     azure = next(row for row in rows if row["slug"] == "azure-foundry")
-    assert azure["models"] == ["deployment-terra"]
+    assert azure["models"] == ["deployment-a"]
     assert azure["is_current"] is True
 
 
@@ -105,12 +105,12 @@ def test_picker_keeps_configured_foundry_alias_when_live_probe_is_empty(monkeypa
         "hermes_cli.models._get_model_config_dict",
         lambda: {
             "provider": "azure-foundry",
-            "default": "deployment-terra",
+            "default": "deployment-a",
         },
     )
 
     assert provider_model_ids("azure-foundry", force_refresh=True) == [
-        "deployment-terra"
+        "deployment-a"
     ]
 
 
@@ -138,10 +138,10 @@ def test_picker_keeps_configured_foundry_alias_when_live_probe_raises(monkeypatc
         "hermes_cli.models._get_model_config_dict",
         lambda: {
             "provider": "azure-foundry",
-            "default": "deployment-terra",
+            "default": "deployment-a",
         },
     )
 
     assert provider_model_ids("azure-foundry", force_refresh=True) == [
-        "deployment-terra"
+        "deployment-a"
     ]
