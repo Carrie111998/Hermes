@@ -50,6 +50,7 @@ WorkingDirectory=/home/hermes
 # API keys — is fetched from 1Password at startup or lives in
 # /home/hermes/.hermes/.env.  Keep the file root-owned, chmod 600.
 EnvironmentFile=/etc/hermes/gateway.env
+Environment=OBSIDIAN_VAULT=/home/danizhaky/obsidian-vault
 # The one-line installer symlinks the CLI to ~/.local/bin/hermes.
 ExecStart=/home/hermes/.local/bin/hermes gateway run
 Restart=always

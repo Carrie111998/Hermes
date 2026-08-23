@@ -4,7 +4,7 @@ This runbook wires the Mac-side [Tolaria](https://tolaria.md) vault into
 Hermes on `mfc1` over Tailscale. Nothing here is exposed to the public
 internet.
 
-**Vault:** `~/Dev/obsidian-vault` (existing Obsidian vault — Tolaria reads
+**Vault:** `~/obsidian-vault` (existing Obsidian vault — Tolaria reads
 the same `.md` + YAML frontmatter format, no conversion needed).
 
 **mfc1:** Hetzner box, Tailscale IP `100.86.92.99`, running `nexus-gateway`
@@ -65,7 +65,7 @@ Items via System Settings → General → Login Items, or install
 
 ### 6. Point Tolaria at the vault and lock permissions
 
-1. Open Tolaria, choose **Open Vault**, point at `~/Dev/obsidian-vault`.
+1. Open Tolaria, choose **Open Vault**, point at `~/obsidian-vault`.
 2. In the AI panel, set the vault permission mode to **Vault Safe**.
 3. Verify the MCP server is listening: `lsof -iTCP:9710 -sTCP:LISTEN`
    should show a `Tolaria` process on `127.0.0.1:9710`.
