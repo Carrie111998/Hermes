@@ -497,8 +497,6 @@ class TestCustomProviderVisionAlias:
         assert _supports_vision_override(cfg, "custom", "llava-v1.6") is True
         assert decide_image_input_mode("custom", "llava-v1.6", cfg) == "native"
 
-
-
     def test_vision_alias_none_when_model_absent(self):
         cfg = {
             "custom_providers": [
@@ -506,3 +504,80 @@ class TestCustomProviderVisionAlias:
             ]
         }
         assert _supports_vision_override(cfg, "custom:my-vllm", "other") is None
+
+
+# ─── authenticated local-server probes ───────────────────────────────────────
+
+
+class TestAuthenticatedOllamaProbe:
+    """Capability probes against key-protected local servers must authenticate.
+
+    Regression: ``_should_probe_ollama_vision`` and the ``query_ollama_*``
+    fallback called ``detect_local_server_type(base_url)`` without an api_key,
+    so any key-protected llama.cpp/Ollama endpoint (server started with
+    ``--api-key``) rejected the whole 5-leg server-type waterfall with 401s
+    before the probe could identify the server — producing a burst of
+    ``unauthorized: Invalid API Key`` log lines on every session start.
+    """
+
+    def test_should_probe_passes_api_key(self):
+        from agent.image_routing import _should_probe_ollama_vision
+
+        with patch("agent.model_metadata.detect_local_server_type") as detect:
+            detect.return_value = "ollama"
+            assert _should_probe_ollama_vision("custom", "http://127.0.0.1:8000/v1", "secret-key") is True
+            detect.assert_called_once_with("http://127.0.0.1:8000/v1", api_key="secret-key")
+
+    def test_should_probe_defaults_to_empty_key(self):
+        from agent.image_routing import _should_probe_ollama_vision
+
+        with patch("agent.model_metadata.detect_local_server_type") as detect:
+            detect.return_value = None
+            _should_probe_ollama_vision("custom", "http://127.0.0.1:11434")
+            detect.assert_called_once_with("http://127.0.0.1:11434", api_key="")
+
+    def test_lookup_forwards_resolved_key_to_both_probes(self):
+        cfg = {
+            "model": {
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "api_key": "secret-key",
+            }
+        }
+        with patch(
+            "agent.image_routing._resolve_inference_base_url",
+            return_value="http://127.0.0.1:8000/v1",
+        ), patch(
+            "agent.image_routing._resolve_inference_api_key",
+            return_value="secret-key",
+        ), patch(
+            "agent.model_metadata.detect_local_server_type",
+            return_value="ollama",
+        ), patch(
+            "agent.model_metadata.query_ollama_supports_vision",
+            return_value=True,
+        ) as q:
+            assert _lookup_supports_vision("custom", "llava", cfg) is True
+            q.assert_called_once_with("llava", "http://127.0.0.1:8000/v1", "secret-key")
+
+    def test_key_resolver_reads_custom_providers_entry(self):
+        from agent.image_routing import _resolve_inference_api_key
+
+        cfg = {
+            "model": {"provider": "Hog.legchekov.com"},
+            "custom_providers": [
+                {
+                    "name": "Hog.legchekov.com",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "api_key": "secret-key",
+                }
+            ],
+        }
+        assert _resolve_inference_api_key(cfg, "custom") == "secret-key"
+        assert _resolve_inference_api_key(cfg, "Hog.legchekov.com") == "secret-key"
+
+    def test_key_resolver_returns_empty_when_unconfigured(self):
+        from agent.image_routing import _resolve_inference_api_key
+
+        assert _resolve_inference_api_key({}, "custom") == ""
+        assert _resolve_inference_api_key(None, "custom") == ""

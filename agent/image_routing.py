@@ -332,7 +332,73 @@ def _resolve_inference_base_url(
     return ""
 
 
-def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
+def _resolve_inference_api_key(
+    cfg: Optional[Dict[str, Any]],
+    provider: str,
+    base_url: str = "",
+) -> str:
+    """Best-effort API key for the active inference provider.
+
+    Mirrors ``_resolve_inference_base_url`` so capability probes (e.g. the
+    Ollama server-type detection in ``_should_probe_ollama_vision``) can
+    authenticate against key-protected local endpoints instead of being
+    rejected with 401 before the probe completes.
+    """
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+
+        runtime = str(_runtime_main_value("api_key") or "").strip()
+        runtime_provider = str(_runtime_main_value("provider") or "").strip().lower()
+        requested_provider = str(provider or "").strip().lower()
+        if runtime and (not requested_provider or requested_provider == runtime_provider):
+            return runtime
+    except Exception:
+        pass
+
+    if not isinstance(cfg, dict):
+        return ""
+
+    model_cfg_raw = cfg.get("model")
+    model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
+    api_key = str(model_cfg.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+
+    config_provider = str(model_cfg.get("provider") or "").strip()
+    candidate_names: set[str] = set()
+    for p in filter(None, (provider, config_provider)):
+        candidate_names.add(p)
+        if p.lower().startswith("custom:"):
+            candidate_names.add(p.split(":", 1)[1])
+        else:
+            candidate_names.add(f"custom:{p}")
+
+    providers_cfg = cfg.get("providers")
+    if isinstance(providers_cfg, dict):
+        for name in candidate_names:
+            entry = providers_cfg.get(name)
+            if isinstance(entry, dict):
+                key = str(entry.get("api_key") or "").strip()
+                if key:
+                    return key
+
+    custom_providers = cfg.get("custom_providers")
+    if isinstance(custom_providers, list):
+        lowered = {n.lower() for n in candidate_names}
+        for entry_raw in custom_providers:
+            if not isinstance(entry_raw, dict):
+                continue
+            entry_name = str(entry_raw.get("name") or "").strip()
+            if entry_name not in candidate_names and entry_name.lower() not in lowered:
+                continue
+            key = str(entry_raw.get("api_key") or "").strip()
+            if key:
+                return key
+
+    return ""
+
+
+def _should_probe_ollama_vision(provider: str, base_url: str, api_key: str = "") -> bool:
     """True when the active provider likely fronts a local Ollama server."""
     p = (provider or "").strip().lower()
     if p == "ollama":
@@ -342,7 +408,7 @@ def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
     try:
         from agent.model_metadata import detect_local_server_type
 
-        return detect_local_server_type(base_url) == "ollama"
+        return detect_local_server_type(base_url, api_key=api_key) == "ollama"
     except Exception:
         return False
 
@@ -448,11 +514,12 @@ def _lookup_supports_vision(
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":
         base_url = "http://localhost:11434/v1"
-    if _should_probe_ollama_vision(provider, base_url):
+    api_key = _resolve_inference_api_key(cfg, provider, base_url)
+    if _should_probe_ollama_vision(provider, base_url, api_key):
         try:
             from agent.model_metadata import query_ollama_supports_vision
 
-            ollama_vision = query_ollama_supports_vision(model, base_url)
+            ollama_vision = query_ollama_supports_vision(model, base_url, api_key)
             if ollama_vision is not None:
                 return ollama_vision
         except Exception as exc:  # pragma: no cover - defensive
