@@ -24,6 +24,26 @@ from tools.approval import (
 )
 
 
+class TestApprovalNamespaceContext:
+    def test_run_namespace_preserves_stable_session_identity_and_restores(self):
+        """Per-run approval isolation must not replace tools' native session key."""
+        stable_token = approval_module.set_current_session_key("native-session")
+        try:
+            assert approval_module.get_current_session_key() == "native-session"
+
+            run_token = approval_module.set_current_approval_namespace_key("run-123")
+            try:
+                assert approval_module.get_current_session_key() == "native-session"
+                assert approval_module.get_current_approval_namespace_key() == "run-123"
+            finally:
+                approval_module.reset_current_approval_namespace_key(run_token)
+
+            assert approval_module.get_current_session_key() == "native-session"
+            assert approval_module.get_current_approval_namespace_key() == "native-session"
+        finally:
+            approval_module.reset_current_session_key(stable_token)
+
+
 class TestApprovalModeParsing:
     def test_normalization_table(self):
         # Unquoted YAML `off`/`on` arrive as booleans; unknown/empty fall back

@@ -869,7 +869,7 @@ def _request_protected_instruction_approval(
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session (Telegram/Discord/Slack). One-operation
     # only — no session/permanent buttons are offered.
-    session_key = _approval.get_current_session_key()
+    session_key = _approval.get_current_approval_namespace_key()
     notify_cb = None
     try:
         with _approval._lock:

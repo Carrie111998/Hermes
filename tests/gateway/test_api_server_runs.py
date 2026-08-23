@@ -192,6 +192,50 @@ class TestStartRun:
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
 
+    @pytest.mark.asyncio
+    async def test_start_preserves_stable_identity_with_run_scoped_approvals(
+        self, auth_adapter
+    ):
+        adapter = auth_adapter
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _capture_identity(**kwargs):
+            captured["task_id"] = kwargs["task_id"]
+            captured["stable_session_key"] = approval_mod.get_current_session_key()
+            captured["approval_namespace"] = (
+                approval_mod.get_current_approval_namespace_key()
+            )
+            return {"final_response": "done"}
+
+        agent = MagicMock()
+        agent.run_conversation.side_effect = _capture_identity
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "native-history-id"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": "persisted-native-key",
+                    },
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured == {
+            "task_id": "native-history-id",
+            "stable_session_key": "persisted-native-key",
+            "approval_namespace": run_id,
+        }
+
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):
@@ -381,7 +425,10 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={
+                        "request_id": attacker_entry.data["request_id"],
+                        "choice": "always",
+                    },
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
@@ -403,6 +450,133 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+
+class TestRunApproval:
+    @staticmethod
+    def _seed(adapter, run_id, entries, markers):
+        adapter._set_run_status(run_id, "waiting_for_approval")
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._run_approval_event_sinks[run_id] = markers.append
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = entries
+
+    @pytest.mark.asyncio
+    async def test_response_resolves_exact_request_and_keeps_waiting_for_newer(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        run_id = "run-exact"
+        markers = []
+        first = approval_mod._ApprovalEntry({
+            "command": "bash -c first",
+            "description": "first",
+            "pattern_keys": ["shell-c"],
+            "allow_session": True,
+            "allow_permanent": True,
+        })
+        second = approval_mod._ApprovalEntry({
+            "command": "bash -c second",
+            "description": "second",
+            "pattern_keys": ["shell-c"],
+            "allow_session": True,
+            "allow_permanent": True,
+        })
+
+        class _RecordingEvent(threading.Event):
+            def __init__(self, label):
+                super().__init__()
+                self.label = label
+
+            def set(self):
+                markers.append(f"wake:{self.label}")
+                super().set()
+
+        first.event = _RecordingEvent("first")
+        second.event = _RecordingEvent("second")
+        self._seed(adapter, run_id, [first, second], markers)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"request_id": second.data["request_id"], "choice": "once"},
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["request_id"] == second.data["request_id"]
+        assert first.result is None
+        assert not first.event.is_set()
+        assert second.result == "once"
+        assert second.event.is_set()
+        assert approval_mod.list_gateway_approvals(run_id) == [first.data]
+        assert adapter._run_statuses[run_id]["status"] == "waiting_for_approval"
+        assert markers[0]["event"] == "approval.responded"
+        assert markers[0]["request_id"] == second.data["request_id"]
+        assert markers[1] == "wake:second"
+        approval_mod.clear_session(run_id)
+
+    @pytest.mark.asyncio
+    async def test_stale_request_id_does_not_resolve_another_approval(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run-stale"
+        markers = []
+        current = approval_mod._ApprovalEntry({
+            "command": "bash -c current",
+            "description": "current",
+            "pattern_keys": ["shell-c"],
+            "allow_session": True,
+            "allow_permanent": True,
+        })
+        self._seed(adapter, run_id, [current], markers)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"request_id": "expired-request", "choice": "once"},
+            )
+            payload = await response.json()
+
+        assert response.status == 409
+        assert payload["error"]["code"] == "approval_request_stale"
+        assert current.result is None
+        assert not current.event.is_set()
+        assert approval_mod.list_gateway_approvals(run_id) == [current.data]
+        assert markers == []
+        approval_mod.clear_session(run_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", ["session", "always"])
+    async def test_disallowed_choice_does_not_wake_approval(
+        self, adapter, choice
+    ):
+        app = _create_runs_app(adapter)
+        run_id = f"run-disallowed-{choice}"
+        markers = []
+        entry = approval_mod._ApprovalEntry({
+            "command": "bash -c guarded",
+            "description": "guardian denied",
+            "pattern_keys": ["shell-c"],
+            "smart_denied": True,
+            "allow_session": False,
+            "allow_permanent": False,
+        })
+        self._seed(adapter, run_id, [entry], markers)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"request_id": entry.data["request_id"], "choice": choice},
+            )
+            payload = await response.json()
+
+        assert response.status == 400
+        assert payload["error"]["code"] == "approval_choice_not_allowed"
+        assert entry.result is None
+        assert not entry.event.is_set()
+        assert approval_mod.list_gateway_approvals(run_id) == [entry.data]
+        assert markers == []
+        approval_mod.clear_session(run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +796,7 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"request_id": pending.data["request_id"], "choice": "once"},
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()

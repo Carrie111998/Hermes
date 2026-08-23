@@ -39,6 +39,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from tools import approval as approval_mod
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +315,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -323,6 +326,21 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         adapter._handle_platform_event_callback,
     )
     return app
+
+
+async def _read_sse_event(response):
+    event_name = ""
+    data_lines = []
+    while True:
+        raw_line = await asyncio.wait_for(response.content.readline(), timeout=3)
+        assert raw_line, "SSE stream closed before the expected event"
+        line = raw_line.decode().rstrip("\r\n")
+        if line.startswith("event: "):
+            event_name = line.removeprefix("event: ")
+        elif line.startswith("data: "):
+            data_lines.append(line.removeprefix("data: "))
+        elif not line and event_name:
+            return event_name, json.loads("\n".join(data_lines))
 
 
 class _FakeGoogleChatAdapter:
@@ -1052,6 +1070,211 @@ class TestChatCompletionsEndpoint:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+    @pytest.mark.asyncio
+    async def test_session_chat_stream_emits_and_resolves_approval(self, adapter):
+        app = _create_app(adapter)
+        agent = MagicMock()
+        agent.session_prompt_tokens = 1
+        agent.session_completion_tokens = 1
+        agent.session_total_tokens = 2
+        observed = {}
+
+        def _run_conversation(**_kwargs):
+            approval_session_key = approval_mod.get_current_approval_namespace_key()
+            observed["stable_session_key"] = approval_mod.get_current_session_key()
+            with approval_mod._lock:
+                notify_cb = approval_mod._gateway_notify_cbs.get(approval_session_key)
+            if notify_cb is None:
+                return {"final_response": "approval bridge missing", "messages": []}
+            observed["approval_session_key"] = approval_session_key
+            observed["decision"] = approval_mod._await_gateway_decision(
+                approval_session_key,
+                notify_cb,
+                {
+                    "command": "OPENAI_API_KEY=sk-test-secret bash -c dangerous",
+                    "description": "synthetic dangerous tool",
+                    "pattern_key": "shell-c",
+                    "pattern_keys": ["shell-c"],
+                    "smart_denied": False,
+                    "allow_permanent": True,
+                },
+            )
+            return {"final_response": "approved and complete", "messages": []}
+
+        agent.run_conversation.side_effect = _run_conversation
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_get_existing_session_or_404",
+                    return_value=({"id": "s1"}, None),
+                ),
+                patch.object(adapter, "_conversation_history_for_session", return_value=[]),
+                patch.object(adapter, "_create_agent", return_value=agent),
+            ):
+                response = await cli.post(
+                    "/api/sessions/s1/chat/stream",
+                    json={"message": "run a dangerous tool"},
+                )
+                assert response.status == 200
+
+                while True:
+                    event_name, approval_event = await _read_sse_event(response)
+                    if event_name == "approval.request":
+                        break
+
+                run_id = approval_event["run_id"]
+                assert approval_event["request_id"]
+                assert approval_event["description"] == "synthetic dangerous tool"
+                assert approval_event["pattern_keys"] == ["shell-c"]
+                assert approval_event["smart_denied"] is False
+                assert approval_event["allow_permanent"] is True
+                assert approval_event["choices"] == [
+                    "once",
+                    "session",
+                    "always",
+                    "deny",
+                ]
+                assert "sk-test-secret" not in approval_event["command"]
+
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                assert status_response.status == 200
+                assert (await status_response.json())["status"] == "waiting_for_approval"
+
+                approval_response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "request_id": approval_event["request_id"],
+                        "choice": "once",
+                    },
+                )
+                assert approval_response.status == 200
+                assert (await approval_response.json())["object"] == (
+                    "hermes.run.approval_response"
+                )
+
+                remaining_events = []
+                while "run.completed" not in remaining_events:
+                    event_name, _ = await _read_sse_event(response)
+                    remaining_events.append(event_name)
+
+        assert observed["approval_session_key"] == run_id
+        assert observed["stable_session_key"] == "s1"
+        assert observed["decision"]["choice"] == "once"
+        assert remaining_events.index("approval.responded") < remaining_events.index(
+            "run.completed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_chat_stream_approvals_are_isolated_per_run(self, adapter):
+        app = _create_app(adapter)
+
+        def _approval_agent(label):
+            agent = MagicMock()
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+
+            def _run_conversation(**_kwargs):
+                approval_session_key = approval_mod.get_current_approval_namespace_key()
+                with approval_mod._lock:
+                    notify_cb = approval_mod._gateway_notify_cbs.get(
+                        approval_session_key
+                    )
+                if notify_cb is None:
+                    return {"final_response": "approval bridge missing", "messages": []}
+                approval_mod._await_gateway_decision(
+                    approval_session_key,
+                    notify_cb,
+                    {
+                        "command": f"bash -c {label}-dangerous",
+                        "description": f"{label} approval",
+                        "pattern_key": "shell-c",
+                        "pattern_keys": ["shell-c"],
+                        "allow_permanent": True,
+                    },
+                )
+                return {"final_response": f"{label} complete", "messages": []}
+
+            agent.run_conversation.side_effect = _run_conversation
+            return agent
+
+        first_agent = _approval_agent("first")
+        second_agent = _approval_agent("second")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_get_existing_session_or_404",
+                    return_value=({"id": "shared-session"}, None),
+                ),
+                patch.object(adapter, "_conversation_history_for_session", return_value=[]),
+                patch.object(
+                    adapter,
+                    "_create_agent",
+                    side_effect=[first_agent, second_agent],
+                ),
+            ):
+                first_response, second_response = await asyncio.gather(
+                    cli.post(
+                        "/api/sessions/shared-session/chat/stream",
+                        json={"message": "first"},
+                    ),
+                    cli.post(
+                        "/api/sessions/shared-session/chat/stream",
+                        json={"message": "second"},
+                    ),
+                )
+
+                async def _next_approval(response):
+                    while True:
+                        event_name, event = await _read_sse_event(response)
+                        if event_name == "approval.request":
+                            return event
+
+                first_event, second_event = await asyncio.gather(
+                    _next_approval(first_response),
+                    _next_approval(second_response),
+                )
+                first_run_id = first_event["run_id"]
+                second_run_id = second_event["run_id"]
+                assert first_run_id != second_run_id
+                assert adapter._run_approval_sessions[first_run_id] == first_run_id
+                assert adapter._run_approval_sessions[second_run_id] == second_run_id
+
+                first_approval = await cli.post(
+                    f"/v1/runs/{first_run_id}/approval",
+                    json={
+                        "request_id": first_event["request_id"],
+                        "choice": "once",
+                    },
+                )
+                assert first_approval.status == 200
+
+                while True:
+                    event_name, _ = await _read_sse_event(first_response)
+                    if event_name == "run.completed":
+                        break
+
+                second_status = await cli.get(f"/v1/runs/{second_run_id}")
+                assert (await second_status.json())["status"] == "waiting_for_approval"
+                assert approval_mod.list_gateway_approvals(second_run_id)
+
+                second_approval = await cli.post(
+                    f"/v1/runs/{second_run_id}/approval",
+                    json={
+                        "request_id": second_event["request_id"],
+                        "choice": "deny",
+                    },
+                )
+                assert second_approval.status == 200
+                while True:
+                    event_name, _ = await _read_sse_event(second_response)
+                    if event_name == "run.completed":
+                        break
 
 
     @pytest.mark.asyncio

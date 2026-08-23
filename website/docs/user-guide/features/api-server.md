@@ -544,9 +544,19 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
-| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
+| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits assistant, tool, approval, and run lifecycle events |
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
+
+When a tool needs confirmation, the session stream pauses with
+`approval.request`. Its payload includes the stream's `run_id`, a `request_id`,
+the redacted command and description, and the allowed `choices`. Resolve it
+with `POST /v1/runs/{run_id}/approval` using that exact `request_id` and one of
+the supplied choices (`once`, `session`, `always`, or `deny`). The server
+atomically rejects stale request IDs and disallowed choices; the same session
+stream then emits `approval.responded` with the matching `request_id` before
+normal completion. Approval state is isolated by `run_id`, including when
+concurrent streams use the same session ID.
 
 ```bash
 # fork a session and run one turn
