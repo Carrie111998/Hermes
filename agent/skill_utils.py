@@ -551,7 +551,10 @@ def get_external_skills_dirs() -> List[Path]:
                 _mstat = _managed_path.stat()
                 managed_sig = (_mstat.st_mtime_ns, _mstat.st_size)
                 managed_cfg = managed_scope.load_managed_config() or {}
-    except Exception:
+    except Exception as e:
+        # Fail-open is right for discovery, but leave a breadcrumb so a
+        # misconfigured managed scope shows up as more than mystery absence.
+        logger.debug("Managed Scope config unavailable, using profile-only discovery: %s", e)
         managed_cfg = {}
 
     if not config_path.exists() and not managed_cfg:

@@ -176,6 +176,28 @@ def test_managed_list_replaces_profile_list(managed_scope_home):
     assert profile_only.resolve() not in dirs
 
 
+def test_managed_without_external_dirs_leaf_keeps_profile_list(managed_scope_home):
+    """A managed ``skills`` section without an ``external_dirs`` leaf must
+    leave the profile's list untouched — replacement only happens when the
+    leaf itself exists."""
+    home, _shared, managed = managed_scope_home
+    profile_only = home / "profile_only"
+    profile_only.mkdir()
+    (home / "config.yaml").write_text(
+        "skills:\n"
+        f"  external_dirs:\n"
+        f"    - {profile_only}\n",
+        encoding="utf-8",
+    )
+    (managed / "config.yaml").write_text(
+        "skills:\n"
+        "  auto_sync: true\n",
+        encoding="utf-8",
+    )
+
+    assert get_external_skills_dirs() == [profile_only.resolve()]
+
+
 def test_managed_edit_invalidates_cache(managed_scope_home):
     """Editing the managed config.yaml invalidates the discovery cache."""
     _home, shared, managed = managed_scope_home
