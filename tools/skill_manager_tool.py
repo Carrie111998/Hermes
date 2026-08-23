@@ -435,6 +435,18 @@ def _background_review_read_before_write_guard(
     except Exception:
         return None
 
+    # Config escape hatch: skills.background_review.require_read_before_write
+    # (default True). When False, the autonomous fork may patch without first
+    # loading the target — see issue #73965 for why the turn-scoped marker is
+    # otherwise unreachable for multi-turn / worker-thread review passes.
+    try:
+        from hermes_cli.config import load_config
+        if not cfg_get(load_config(), "skills", "background_review",
+                       "require_read_before_write", default=True):
+            return None
+    except Exception:
+        return None
+
     if _background_review_has_read(target):
         return None
 
