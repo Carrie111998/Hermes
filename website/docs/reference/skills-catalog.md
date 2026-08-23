@@ -52,6 +52,12 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`songwriting-and-ai-music`](/docs/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | Songwriting craft and Suno AI music prompts. | `creative/songwriting-and-ai-music` |
 | [`touchdesigner-mcp`](/docs/user-guide/skills/bundled/creative/creative-touchdesigner-mcp) | Control TouchDesigner via twozero MCP. | `creative/touchdesigner-mcp` |
 
+## devops
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`termux-chromium-browser`](/docs/user-guide/skills/bundled/devops/devops-termux-chromium-browser) | Native headless Chromium browser over CDP for Termux. | `devops/termux-chromium-browser` |
+
 ## email
 
 | Skill | Description | Path |
