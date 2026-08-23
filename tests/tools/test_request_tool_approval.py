@@ -82,6 +82,7 @@ class TestRequestToolApproval:
             display_target=target,
             approval_callback=approve_once,
             cron_deny_message="cron denied",
+            single_query_deny_message="single query denied",
             autoapprove_log_prefix="test approval",
         )
 
