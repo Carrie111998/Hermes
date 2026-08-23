@@ -2336,8 +2336,11 @@ _PARALLEL_PREFETCH_WORKERS = 8
 def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     """Fetch model catalogs for multiple providers in parallel.
 
-    Only providers whose cache entry is stale or missing are fetched; fresh
-    entries are skipped to avoid unnecessary network calls.  Each worker uses
+    Only providers the serial build would otherwise *block* on are fetched.
+    That means missing, fingerprint-mismatched, empty, and hard-expired
+    entries — not merely TTL-expired ones, which
+    :func:`cached_provider_model_ids` already serves from disk while
+    revalidating off-thread.  Each worker uses
     :func:`update_provider_cache_entry` (thread-safe) to persist its result,
     so concurrent writes to ``provider_models_cache.json`` don't clobber each
     other.
@@ -2347,16 +2350,27 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     """
     from hermes_cli.models import cached_provider_model_ids
 
-    # Quick-stale-check: skip providers whose cache is already fresh so we
-    # don't waste network calls on a warm cache.  We check staleness the same
-    # way cached_provider_model_ids does internally: load the cache, compare
-    # age to TTL.  This is a read-only check — if the cache file changes
-    # between this check and the actual fetch, cached_provider_model_ids will
-    # still do the right thing (it re-reads the cache internally).
+    # Which providers actually need a *blocking* fetch?  Only the ones whose
+    # serial cached_provider_model_ids() call would go to the network.  That
+    # function has two non-blocking tiers, not one: inside the TTL it returns
+    # the cached list, and past the TTL but inside
+    # _PROVIDER_MODELS_STALE_SERVE_MAX it *still* returns it immediately and
+    # revalidates on a background thread.  Prefetching a slug in that second
+    # tier trades a non-blocking serial call for a blocking parallel one —
+    # the picker waits on the slowest provider's /v1/models round-trip to
+    # avoid work that would not have blocked it.  Since the disk cache holds
+    # a week of stale-serve but only an hour of TTL, that is what every
+    # picker open more than an hour after the last one pays.
+    #
+    # So gate on usability, not freshness: fetch what
+    # cached_provider_model_ids cannot serve from disk at all, and let the
+    # stale-but-servable entries reach the serial path.  This is a read-only
+    # check — if the cache file changes between here and the fetch,
+    # cached_provider_model_ids re-reads it and still does the right thing.
     from hermes_cli.models import (
         _load_provider_models_cache,
         _credential_fingerprint,
-        _PROVIDER_MODELS_CACHE_TTL,
+        _PROVIDER_MODELS_STALE_SERVE_MAX,
         normalize_provider,
     )
 
@@ -2376,8 +2390,8 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
             and entry["models"]
         ):
             age = now - float(entry.get("at", 0))
-            if age < _PROVIDER_MODELS_CACHE_TTL:
-                continue  # fresh, skip
+            if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
+                continue  # servable from disk without blocking
         stale_slugs.append(normalized)
 
     if not stale_slugs:
@@ -2774,11 +2788,13 @@ def list_authenticated_providers(
     # --- Parallel cache prefetch ---------------------------------------------
     # The serial loops below (sections 1, 2, 2b) each call
     # cached_provider_model_ids(slug) which blocks on a live /v1/models HTTP
-    # round-trip when the disk cache is stale or missing.  With many authed
-    # providers those serial round-trips stack to 15-30s on a cold/expired
+    # round-trip when the disk cache cannot serve the slug at all.  With many
+    # authed providers those serial round-trips stack to 15-30s on a cold
     # cache.  Pre-scanning which providers have credentials (without fetching
-    # their model lists) and warming their cache entries in parallel makes
-    # the subsequent serial calls hit fresh cache entries instead.
+    # their model lists) and warming those entries in parallel makes the
+    # subsequent serial calls hit the cache instead.  Entries that are merely
+    # TTL-expired are left alone — the serial path serves them from disk and
+    # revalidates off-thread (see _prefetch_provider_models_parallel).
     #
     # Skipped entirely when refresh=True (the serial path already force-refreshes)
     # and when there are 3 or fewer authed providers (serial is fast enough;

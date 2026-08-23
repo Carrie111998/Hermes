@@ -188,6 +188,95 @@ class TestPrefetchProviderModelsParallel:
             _prefetch_provider_models_parallel([])
         fetch.assert_not_called()
 
+    def test_skips_ttl_expired_entries_the_serial_path_can_still_serve(self):
+        """A TTL-expired entry inside the stale-serve window is not prefetched.
+
+        ``cached_provider_model_ids`` returns such an entry from disk right
+        away and revalidates on a background thread, so blocking the picker
+        on a parallel fetch buys nothing. The disk cache keeps a week of
+        stale-serve against a one-hour TTL, so this is the state every
+        picker open more than an hour after the previous one lands in.
+        """
+        import hermes_cli.models as models_mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        expired = time.time() - models_mod._PROVIDER_MODELS_CACHE_TTL - 60
+        cache = {"openrouter": {"fp": "fp", "at": expired, "models": ["m1"]}}
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value=cache), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids") as fetch:
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        fetch.assert_not_called()
+
+    def test_fetches_entries_past_the_stale_serve_window(self):
+        """Past ``_PROVIDER_MODELS_STALE_SERVE_MAX`` the serial call blocks.
+
+        Nothing can be served from disk any more, so the parallel prefetch is
+        the cheaper place to pay for it.
+        """
+        import hermes_cli.models as models_mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        dead = time.time() - models_mod._PROVIDER_MODELS_STALE_SERVE_MAX - 60
+        cache = {"openrouter": {"fp": "fp", "at": dead, "models": ["m1"]}}
+        fetched = []
+
+        def mock_fetch(slug, force_refresh=False):
+            fetched.append(slug)
+            return ["m1"]
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value=cache), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        assert fetched == ["openrouter"]
+
+    def test_fetches_when_credentials_rotated_inside_the_window(self):
+        """A fingerprint mismatch is fetched however recent the entry is.
+
+        The cached catalog belongs to the previous credential; serving it
+        would show the old account's models after a key swap.
+        """
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache = {"openrouter": {"fp": "old_fp", "at": time.time(), "models": ["m1"]}}
+        fetched = []
+
+        def mock_fetch(slug, force_refresh=False):
+            fetched.append(slug)
+            return ["m2"]
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value=cache), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="new_fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        assert fetched == ["openrouter"]
+
+    def test_fetches_entries_cached_as_empty(self):
+        """An empty cached catalog is not servable — prefetch it."""
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache = {"openrouter": {"fp": "fp", "at": time.time(), "models": []}}
+        fetched = []
+
+        def mock_fetch(slug, force_refresh=False):
+            fetched.append(slug)
+            return ["m1"]
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value=cache), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        assert fetched == ["openrouter"]
+
 
 # ---------------------------------------------------------------------------
 # Integration: prefetch is called from list_authenticated_providers
