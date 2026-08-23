@@ -6913,6 +6913,32 @@ class TestSupportsReasoningExtraBody:
             agent.model = model
             assert agent._supports_reasoning_extra_body() is True, model
 
+    def test_explicit_override_enables_reasoning_on_unrouted_host(self):
+        """model_overrides.<provider>.<model>.supports_reasoning=true wins
+        even for a host/provider none of the route heuristics recognize
+        (e.g. a local Ollama server reached through provider: custom)."""
+        agent = self._make_agent()
+        agent.provider = "custom"
+        agent.base_url = "http://127.0.0.1:11435/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "hermes-maritime:latest"
+        with patch(
+            "agent.models_dev._explicit_model_override",
+            return_value={"supports_reasoning": True},
+        ):
+            assert agent._supports_reasoning_extra_body() is True
+
+    def test_explicit_override_disables_reasoning_on_otherwise_capable_route(self):
+        """An explicit supports_reasoning: false overrides a route that
+        would otherwise say True (e.g. a deepseek/ model on OpenRouter)."""
+        agent = self._make_agent()
+        agent.model = "deepseek/deepseek-v4"
+        with patch(
+            "agent.models_dev._explicit_model_override",
+            return_value={"supports_reasoning": False},
+        ):
+            assert agent._supports_reasoning_extra_body() is False
+
 
 class TestMemoryContextSanitization:
     """sanitize_context() helper correctness — used at provider boundaries."""

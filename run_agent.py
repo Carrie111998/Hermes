@@ -7623,7 +7623,19 @@ class AIAgent:
         OpenRouter forwards unknown extra_body fields to upstream providers.
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
+
+        An explicit ``model_overrides.<provider>.<model>.supports_reasoning``
+        wins over every route-based heuristic below: the operator knows their
+        model's capability better than a hostname guess, and this is the only
+        way to express it for endpoints with no built-in probe (#92759).
         """
+        try:
+            from agent.models_dev import _explicit_model_override
+            override = _explicit_model_override(self.provider, self.model)
+        except Exception:
+            override = None
+        if override is not None and "supports_reasoning" in override:
+            return bool(override["supports_reasoning"])
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):
