@@ -200,12 +200,27 @@ def finalize_update_receipt(
             latest.write_text(
                 json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
             )
-        except OSError:
-            pass
+        except OSError as exc:
+            # A stale pointer is worse than none: the Desktop reads this file
+            # as "the durable success signal" and would report the PREVIOUS
+            # run's outcome for this one — #81193's exact shape, which this
+            # module exists to end. Drop it and let the reader fall back to
+            # the timestamped receipt just written.
+            logger.warning(
+                "Could not update the latest-receipt pointer %s (%s); "
+                "removing it so the stale one is not read as this run",
+                latest, exc,
+            )
+            try:
+                latest.unlink(missing_ok=True)
+            except OSError:
+                pass
         _prune_old_receipts(directory)
         return path
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not write update receipt: %s", exc)
+        # The module's whole purpose is making update outcomes visible;
+        # failing to record one at DEBUG hides exactly what it promises.
+        logger.warning("Could not write update receipt: %s", exc)
         return None
 
 
@@ -263,14 +278,31 @@ def _prune_old_receipts(directory: Path) -> None:
 
 def read_latest_receipt() -> Optional[dict[str, Any]]:
     """Read the most recent update receipt, or None. Never raises."""
+    directory = _receipt_dir()
     try:
-        path = _receipt_dir() / "latest.json"
-        if not path.is_file():
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else None
-    except Exception:
-        return None
+        path = directory / "latest.json"
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+    except Exception as exc:  # noqa: BLE001 - fall through to the scan
+        logger.debug("latest-receipt pointer unreadable (%s); scanning", exc)
+    # The pointer is an optimization, not the record. Receipt filenames are
+    # timestamped, so the newest file is the run that actually happened —
+    # reachable even when the pointer was never written or was dropped.
+    try:
+        candidates = sorted(
+            (p for p in directory.glob("*.json") if p.name != "latest.json"),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        for candidate in candidates:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+    except Exception as exc:  # noqa: BLE001 - reader never raises
+        logger.debug("Could not scan update receipts: %s", exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
