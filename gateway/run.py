@@ -30451,6 +30451,75 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
+    """Return True when ``--replace`` must refuse to signal ``existing_pid``.
+
+    The PID file is HERMES_HOME-scoped, but a poisoned/stale record can point
+    at another profile's LIVE gateway; signaling it starts the cross-profile
+    SIGTERM restart loop this guard exists to prevent (#89315). This is a
+    destructive-action authority check, so it FAILS CLOSED:
+
+    * readable live cmdline → decide by ``_command_line_belongs_to_profile``;
+    * unreadable cmdline → fall back to the persisted PID record's
+      ``hermes_home``, accepted only while the record stays bound to the live
+      target by PID + start-time identity;
+    * probe error or unprovable ownership → refuse.
+
+    A same-home target keeps replacing normally; every refusal path here only
+    narrows what the legacy start_time check alone used to allow.
+    """
+    try:
+        from gateway.status import (
+            _get_pid_path,
+            _get_process_hermes_home,
+            _get_process_start_time,
+            _pid_from_record,
+            _read_pid_record,
+            _record_looks_like_gateway,
+            _read_process_cmdline,
+            _command_line_belongs_to_profile,
+            _same_hermes_home,
+        )
+
+        our_home = _get_process_hermes_home()
+        live_cmdline = _read_process_cmdline(existing_pid)
+        if live_cmdline:
+            return not _command_line_belongs_to_profile(live_cmdline, our_home)
+
+        # Unreadable cmdline (Windows handle limits, permission walls): fall
+        # back to the persisted record — but only as a BOUND claim. The record
+        # must still describe THIS pid with THIS live start time, otherwise it
+        # is stale/poisoned and proves nothing.
+        record = _read_pid_record(_get_pid_path())
+        if not isinstance(record, dict) or not _record_looks_like_gateway(record):
+            return True
+
+        record_pid = _pid_from_record(record)
+        if record_pid != existing_pid:
+            return True
+
+        recorded_start = record.get("start_time")
+        if not isinstance(recorded_start, int) or isinstance(recorded_start, bool):
+            return True
+        if _get_process_start_time(existing_pid) != recorded_start:
+            return True
+
+        recorded_home = record.get("hermes_home")
+        if not isinstance(recorded_home, str) or not recorded_home.strip():
+            return True
+
+        return not _same_hermes_home(recorded_home, our_home)
+    except Exception:
+        # Destructive action + unknown ownership => fail closed (#89315 review).
+        logger.warning(
+            "cross-profile --replace ownership probe failed for PID %s; "
+            "refusing to signal",
+            existing_pid,
+            exc_info=True,
+        )
+        return True
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -30497,6 +30566,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
+            # Cross-profile ownership gate (#89315): never signal a live
+            # process we cannot prove belongs to this HERMES_HOME. A poisoned
+            # PID record steering --replace at another profile's gateway is
+            # exactly the restart-loop shape this flow must not allow.
+            if _replace_target_belongs_to_other_profile(existing_pid):
+                from gateway.status import _get_process_hermes_home
+
+                logger.error(
+                    "Refusing --replace: PID %d cannot be proven to belong "
+                    "to this profile's gateway (HERMES_HOME %s). Remove the "
+                    "stale PID record or stop the owning profile explicitly.",
+                    existing_pid,
+                    _get_process_hermes_home(),
+                )
+                return False
             existing_start_time = get_process_start_time(existing_pid)
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",
