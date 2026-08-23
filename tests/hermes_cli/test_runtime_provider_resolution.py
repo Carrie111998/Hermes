@@ -1655,6 +1655,81 @@ def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(m
     assert resolved["default_headers"]["Authorization"] == ""
 
 
+def _omniroute_provider(with_default_model: bool) -> dict:
+    """Fixture provider entry for the target_model precedence tests (#93092).
+
+    No credentials on purpose: the resolver falls through to its
+    no-key-required default, which keeps these tests about model precedence.
+    """
+    entry = {
+        "name": "OmniRoute",
+        "base_url": "http://1.2.3.4:1234/v1",
+    }
+    if with_default_model:
+        entry["model"] = "hermes"
+    return entry
+
+
+def test_target_model_outranks_custom_provider_default_model(monkeypatch):
+    """A per-call target_model must win over custom_providers.<name>.model.
+
+    Regression for #93092: an auxiliary task requesting
+    ``provider: custom:<name>`` + ``model: <X>`` used to get the provider's
+    top-level default model back, silently dropping the configured task model.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {"custom_providers": [_omniroute_provider(with_default_model=True)]},
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom:omniroute",
+        target_model="Curador",
+    )
+
+    assert resolved["provider"] == "custom"
+    assert resolved["model"] == "Curador"
+
+
+def test_custom_provider_default_model_stands_without_target_model(monkeypatch):
+    """No target_model → the provider-level default keeps today's behavior."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {"custom_providers": [_omniroute_provider(with_default_model=True)]},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:omniroute")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["model"] == "hermes"
+
+
+def test_target_model_sets_model_when_provider_has_no_default(monkeypatch):
+    """target_model still lands in the runtime when the provider declares no
+    top-level model — callers read rt["model"] as the effective task model."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {"custom_providers": [_omniroute_provider(with_default_model=False)]},
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom:omniroute",
+        target_model="Curador",
+    )
+
+    assert resolved["provider"] == "custom"
+    assert resolved["model"] == "Curador"
+
+
 def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):
     """OpenCode Free resolves keylessly with no env var configured at all —
     the provider declares no credentials."""

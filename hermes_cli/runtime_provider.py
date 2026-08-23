@@ -1889,6 +1889,13 @@ def resolve_runtime_provider(
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
+        # Per-call model intent outranks the provider-level default, mirroring
+        # the ``target_model or model_cfg.get("default")`` precedence every
+        # other branch here already applies (#93092). Without this, a task's
+        # explicit model (e.g. auxiliary.background_review's ``model``) loses
+        # silently to ``custom_providers.<name>.model``.
+        if target_model:
+            custom_runtime["model"] = target_model
         return custom_runtime
 
     # If provider is "auto" (or unset) but config.yaml has an explicit base_url
