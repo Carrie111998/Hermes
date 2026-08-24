@@ -49,7 +49,7 @@ function ErrorFallback({
     <div className="my-2 flex flex-col gap-1 rounded-lg border border-(--ui-stroke-tertiary) bg-muted/35 p-3 text-sm text-muted-foreground">
       <div className="flex items-center gap-2">
         <span aria-hidden>⚠️</span>
-        <span className="min-w-0 flex-1 truncate">Couldn&apos;t load {name}</span>
+        <span className="min-w-0 flex-1 truncate">{copy.loadFailed ? copy.loadFailed(name) : `Couldn't load ${name}`}</span>
         <button
           className="shrink-0 text-xs font-medium text-foreground underline underline-offset-2"
           onClick={onRetry}
