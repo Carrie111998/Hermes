@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -77,6 +78,14 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
+        from gateway.status import get_running_pid
+
+        if get_running_pid() == os.getpid():
+            # This process IS the gateway (the cronjob tool runs inside it):
+            # find_gateway_pids() excludes the current PID by design (#13242),
+            # so a single-process gateway would otherwise probe as dead while
+            # its own ticker is firing (#94143).
+            return True
         from hermes_cli.gateway import find_gateway_pids
 
         return bool(find_gateway_pids())

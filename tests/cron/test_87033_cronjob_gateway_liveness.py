@@ -161,6 +161,91 @@ class TestListSurfacesGatewayLiveness:
 from contextlib import ExitStack
 
 
+class TestInGatewayProcessLiveness:
+    """The cronjob tool is often invoked from inside the gateway process
+    itself (#94143): find_gateway_pids() excludes the current PID by design
+    (#13242), so a single-process gateway probed as dead while its own
+    ticker was firing. When the verified running gateway PID is the current
+    process, liveness must report alive."""
+
+    def test_gateway_process_itself_probes_alive(self, hermes_env):
+        """pid file resolves to *this* process + pid scan self-excluded →
+        still gateway_running: true, no warning."""
+        import os as _os
+        from unittest.mock import patch
+
+        _create_job()
+        with (
+            patch_liveness(provider="builtin", pids=[]),
+            patch("gateway.status.get_running_pid", return_value=_os.getpid()),
+        ):
+            from tools.cronjob_tools import cronjob
+
+            result = json.loads(cronjob(action="list"))
+
+        assert result["success"] is True
+        assert result["gateway_running"] is True
+        assert "warning" not in result
+
+    def test_other_process_gateway_still_probes_via_pid_scan(self, hermes_env):
+        """Out-of-process caller: pid file points at another PID, the pid
+        scan is authoritative as before."""
+        from unittest.mock import patch
+
+        _create_job()
+        with (
+            patch_liveness(provider="builtin", pids=[424242]),
+            patch("gateway.status.get_running_pid", return_value=424242),
+        ):
+            from tools.cronjob_tools import cronjob
+
+            result = json.loads(cronjob(action="list"))
+
+        assert result["success"] is True
+        assert result["gateway_running"] is True
+
+
+class TestBuiltinLivenessUnit:
+    """Direct unit pins for the tri-state helper."""
+
+    def test_self_pid_short_circuits_true(self):
+        import os as _os
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("gateway.status.get_running_pid", return_value=_os.getpid()),
+            patch("hermes_cli.gateway.find_gateway_pids", return_value=[]),
+        ):
+            assert cron_cli._builtin_gateway_liveness() is True
+
+    def test_no_gateway_anywhere_is_false(self):
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("gateway.status.get_running_pid", return_value=None),
+            patch("hermes_cli.gateway.find_gateway_pids", return_value=[]),
+        ):
+            assert cron_cli._builtin_gateway_liveness() is False
+
+    def test_external_gateway_pid_is_true(self):
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("gateway.status.get_running_pid", return_value=424242),
+            patch("hermes_cli.gateway.find_gateway_pids", return_value=[424242]),
+        ):
+            assert cron_cli._builtin_gateway_liveness() is True
+
+
 class _LivenessPatches:
     """Context manager patching the provider/gateway-pid probes."""
 
