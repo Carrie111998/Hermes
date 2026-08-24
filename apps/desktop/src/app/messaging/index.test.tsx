@@ -17,14 +17,29 @@ const openExternalLink = vi.fn()
 const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
-  approvePairing: (platformId: string, requestId: string) => approvePairing(platformId, requestId),
-  getEmailAutoReplyPolicy: () => getEmailAutoReplyPolicy(),
-  getMessagingPlatforms: () => getMessagingPlatforms(),
-  getPairing: () => getPairing(),
-  revokePairing: (platformId: string, userId: string) => revokePairing(platformId, userId),
-  updateEmailAutoReplyPolicy: (body: unknown) => updateEmailAutoReplyPolicy(body),
-  updateMessagingPlatform: (id: string, body: unknown) => updateMessagingPlatform(id, body)
+  approvePairing: (platformId: string, requestId: string, profile?: null | string) =>
+    approvePairing(platformId, requestId, profile),
+  getEmailAutoReplyPolicy: (profile?: null | string) => getEmailAutoReplyPolicy(profile),
+  getMessagingPlatforms: (profile?: null | string) => getMessagingPlatforms(profile),
+  getPairing: (profile?: null | string) => getPairing(profile),
+  getProfiles: vi.fn(async () => ({ profiles: [] })),
+  revokePairing: (platformId: string, userId: string, profile?: null | string) =>
+    revokePairing(platformId, userId, profile),
+  setApiRequestProfile: vi.fn(),
+  updateEmailAutoReplyPolicy: (body: unknown, profile?: null | string) =>
+    updateEmailAutoReplyPolicy(body, profile),
+  updateMessagingPlatform: (id: string, body: unknown, profile?: null | string) =>
+    updateMessagingPlatform(id, body, profile)
 }))
+
+vi.mock('@/store/gateway', () => ({
+  $gateway: { get: () => null, subscribe: () => () => {} },
+  ensureGatewayForAgent: vi.fn(async () => undefined),
+  ensureGatewayForProfile: vi.fn(async () => undefined),
+  openGatewayForProfile: vi.fn(async () => undefined)
+}))
+vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
+vi.mock('@/store/starmap', () => ({ resetStarmapGraph: vi.fn() }))
 
 vi.mock('@/lib/external-link', () => ({
   openExternalLink: (href: string) => openExternalLink(href)
@@ -214,7 +229,7 @@ describe('MessagingView email policy', () => {
       expect(updateEmailAutoReplyPolicy).toHaveBeenCalledWith({
         values: { no_reply_keywords: 'invoice + overdue;vip customer' },
         clear: []
-      })
+      }, undefined)
     )
   })
 
@@ -234,7 +249,7 @@ describe('MessagingView email policy', () => {
       expect(updateEmailAutoReplyPolicy).toHaveBeenCalledWith({
         values: { skip_patterns: '^out of office$' },
         clear: []
-      })
+      }, undefined)
     )
   })
 
