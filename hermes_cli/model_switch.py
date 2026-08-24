@@ -624,11 +624,13 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
 # switch (HERMES_HOME moves, so the path moves) and a config/key rotation
 # (mtime/size move) both invalidate.
 _DIRECT_ALIAS_IDENTITY: Optional[tuple] = None
-# The exact dict this loader last filled. Callers and tests pre-seed
-# DIRECT_ALIASES by rebinding the module attribute; a cache we did not build
-# is not ours to invalidate, and identity bookkeeping alone cannot tell the
-# difference once the attribute has been swapped.
-_DIRECT_ALIAS_CACHE_DICT: Optional[dict] = None
+# A copy of what this loader last produced. Callers and tests seed
+# DIRECT_ALIASES both by rebinding the module attribute AND by editing it in
+# place, so neither the object's identity nor a "did we load" flag can tell
+# our own stale cache from someone else's contents. Comparing against what we
+# actually wrote does: if the dict no longer holds it, the entries are not
+# ours to discard.
+_DIRECT_ALIAS_LOADED: Optional[dict] = None
 
 
 def _direct_alias_source_identity() -> Optional[tuple]:
@@ -659,11 +661,12 @@ def _ensure_direct_aliases() -> None:
     DIRECT_ALIASES` references valid in callers — rebinding would leave them
     pointing at a stale empty dict.
     """
-    global _DIRECT_ALIAS_IDENTITY, _DIRECT_ALIAS_CACHE_DICT
+    global _DIRECT_ALIAS_IDENTITY, _DIRECT_ALIAS_LOADED
     identity = _direct_alias_source_identity()
     if DIRECT_ALIASES and (
-        # Not the dict we built — someone pre-seeded it. Leave it alone.
-        DIRECT_ALIASES is not _DIRECT_ALIAS_CACHE_DICT
+        # Contents are not what we loaded — seeded or edited by a caller.
+        # Not ours to discard.
+        DIRECT_ALIASES != _DIRECT_ALIAS_LOADED
         # Ours, and still the same config file at the same signature.
         or (identity is not None and identity == _DIRECT_ALIAS_IDENTITY)
     ):
@@ -673,7 +676,7 @@ def _ensure_direct_aliases() -> None:
     DIRECT_ALIASES.clear()
     DIRECT_ALIASES.update(loaded)
     _DIRECT_ALIAS_IDENTITY = identity
-    _DIRECT_ALIAS_CACHE_DICT = DIRECT_ALIASES
+    _DIRECT_ALIAS_LOADED = dict(loaded)
 
 
 def direct_alias_api_key(alias: DirectAlias) -> str:
