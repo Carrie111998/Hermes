@@ -3500,6 +3500,39 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                 break
                     continue
 
+                # Stale one-shot guard (#93526): ONESHOT_GRACE_SECONDS is the
+                # one-shot miss-grace, already the enforced contract at the
+                # create/update/resume entry points and in the recovery helper
+                # (_recoverable_oneshot_run_at deems a >grace one-shot
+                # ineligible). But a one-shot stored WITH a past next_run_at —
+                # the normal shape after the machine was off across its fire
+                # time — fell straight through to due.append and fired
+                # arbitrarily late, running a full agent turn to deliver a
+                # stale alert. Skip the fire and retire the record as missed
+                # (terminal retention shape: outcomes stay inspectable, no
+                # last_run_at/last_status write — no run happened), so it
+                # cannot re-evaluate past-due on every tick.
+                if (
+                    kind == "once"
+                    and (now - next_run_dt).total_seconds() > ONESHOT_GRACE_SECONDS
+                ):
+                    logger.info(
+                        "Job '%s': one-shot missed its fire time by %ds "
+                        "(grace=%ds, machine off across it?) — skipping the "
+                        "stale fire and retiring the record as missed",
+                        job.get("name", job.get("id", "?")),
+                        int((now - next_run_dt).total_seconds()),
+                        ONESHOT_GRACE_SECONDS,
+                    )
+                    for rj in raw_jobs:
+                        if rj["id"] == job["id"]:
+                            rj["enabled"] = False
+                            rj["state"] = "completed"
+                            rj["next_run_at"] = None
+                            needs_save = True
+                            break
+                    continue
+
                 # For recurring jobs, check if the scheduled time is stale
                 # (gateway was down and missed the window). Fast-forward to
                 # the next future occurrence instead of firing a stale run.
