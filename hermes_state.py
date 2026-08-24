@@ -2528,6 +2528,16 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
+    """Apply state-store durability barriers without changing journal mode.
+
+    This is the public entry point for secondary users of ``state.db`` that
+    must inherit its owner's journal mode while retaining per-connection
+    durability settings.
+    """
+    return _reapply_durability_barriers(conn)
+
+
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
