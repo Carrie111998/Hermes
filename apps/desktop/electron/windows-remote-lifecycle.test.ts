@@ -8,6 +8,7 @@ import {
   detectRemotePlatform,
   encodedPowerShell,
   helperCommand,
+  listRemoteHermesProfiles,
   powerShellCommand,
   psLiteral,
   reusableWindowsLock,
@@ -91,6 +92,53 @@ test('helper command uses the fixed remote Python entry point and quotes path da
   assert.match(script, /-m' 'hermes_cli\.windows_ssh_runtime' 'inspect'/)
   assert.match(script, /Hermes''s/)
   assert.match(script, /C:\\x y\\hermes\.exe/)
+})
+
+test('profile inventory preserves POSIX listing and uses the Windows runtime helper', async () => {
+  const posixCalls: string[] = []
+  const posixProfiles = await listRemoteHermesProfiles(
+    sshWith(async command => {
+      posixCalls.push(command)
+
+      if (command === 'uname -s; uname -m') return 'Linux\nx86_64\n'
+      if (command.startsWith('echo ')) return '/home/test/.hermes\n'
+
+      return 'writer\ndeals\n'
+    })
+  )
+
+  assert.deepEqual(posixProfiles, ['default', 'deals', 'writer'])
+  assert.equal(posixCalls.some(command => command.includes('list-profiles')), false)
+
+  const windowsCalls: string[] = []
+  const windowsProfiles = await listRemoteHermesProfiles(
+    sshWith(async command => {
+      windowsCalls.push(command)
+
+      if (command.startsWith('uname ')) {
+        throw new Error('PowerShell does not recognize uname')
+      }
+
+      const script = Buffer.from(command.split(' ').pop()!, 'base64').toString('utf16le')
+
+      if (script.includes('ConvertTo-Json')) {
+        return JSON.stringify({
+          os: 'Windows',
+          arch: 'AMD64',
+          hermesHome: 'C:\\h',
+          hermesPath: 'C:\\h\\hermes.exe',
+          python: 'C:\\h\\python.exe'
+        })
+      }
+
+      assert.match(script, /hermes_cli\.windows_ssh_runtime' 'list-profiles'/)
+
+      return JSON.stringify(['default', 'deals'])
+    })
+  )
+
+  assert.deepEqual(windowsProfiles, ['default', 'deals'])
+  assert.equal(windowsCalls.length, 3)
 })
 
 test('Windows lock validation is scoped and exact', () => {

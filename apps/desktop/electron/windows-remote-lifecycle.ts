@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 
+import { listRemoteHermesProfiles as listPosixRemoteHermesProfiles } from './remote-lifecycle'
 import { assertBootstrapNotSuperseded, redactSecrets, SSH_ERROR } from './ssh-connection'
 
 const LOCKFILE_SCHEMA_VERSION = 2
@@ -118,6 +119,22 @@ async function helper(ssh, runtime, operation, args = [], stdinData?) {
   }
 
   return parsed
+}
+
+async function listRemoteHermesProfiles(ssh, explicitHermesPath = '') {
+  const platform: any = await detectRemotePlatform(ssh, explicitHermesPath)
+
+  if (platform.os !== 'Windows') {
+    return listPosixRemoteHermesProfiles(ssh)
+  }
+
+  const profiles = await helper(ssh, platform, 'list-profiles')
+
+  if (!Array.isArray(profiles) || profiles.some(profile => typeof profile !== 'string')) {
+    throw new Error('The remote Windows profile inventory is invalid.')
+  }
+
+  return profiles
 }
 
 function fingerprintToken(token) {
@@ -446,6 +463,7 @@ export {
   encodedPowerShell,
   helper,
   helperCommand,
+  listRemoteHermesProfiles,
   powerShellCommand,
   probeWindowsRemote,
   psLiteral,

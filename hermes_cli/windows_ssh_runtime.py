@@ -450,6 +450,13 @@ def inspect_hermes(hermes_path: str) -> dict[str, Any]:
     }
 
 
+def list_profile_names() -> list[str]:
+    """Return the canonical default + named profile inventory."""
+    from hermes_cli.profiles import profiles_to_serve
+
+    return [name for name, _ in profiles_to_serve(multiplex=True)]
+
+
 def dispatch(argv: list[str]) -> Any:
     if not argv:
         raise ValueError("missing operation")
@@ -489,6 +496,8 @@ def dispatch(argv: list[str]) -> Any:
         return spawn_backend(_read_json_stdin())
     if operation == "inspect" and len(argv) == 2:
         return inspect_hermes(argv[1])
+    if operation == "list-profiles" and len(argv) == 1:
+        return list_profile_names()
     if operation == "process-state" and len(argv) == 5:
         return process_state(int(argv[1]), int(argv[2]), argv[3], argv[4])
     if operation == "terminate" and len(argv) == 5:

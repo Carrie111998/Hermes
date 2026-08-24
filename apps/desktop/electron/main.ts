@@ -349,7 +349,12 @@ import {
   getVenvSitePackagesEntries,
   resolveVenvHermesCommand
 } from './windows-hermes-path'
-import { connectWindowsRemote, detectRemotePlatform, helper } from './windows-remote-lifecycle'
+import {
+  connectWindowsRemote,
+  detectRemotePlatform,
+  helper,
+  listRemoteHermesProfiles as listSshRemoteHermesProfiles
+} from './windows-remote-lifecycle'
 import {
   alreadyHasNoSandbox,
   buildNoSandboxRelaunchArgs,
@@ -13090,7 +13095,7 @@ async function probeSshProfileInventory(connection) {
 
   try {
     await ssh.open()
-    const profiles = await remoteLifecycle.listRemoteHermesProfiles(ssh)
+    const profiles = await listSshRemoteHermesProfiles(ssh, sshConfig.remoteHermesPath || '')
 
     if (profiles.length > 0) {
       sshRosterCache.set(connection.id, profiles)
