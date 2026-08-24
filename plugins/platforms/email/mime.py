@@ -160,6 +160,13 @@ class MimeAttachment:
     content: bytes
 
 
+def _validate_attachment_filename(filename: str) -> None:
+    if any(character in filename for character in ("\x00", "\r", "\n")):
+        raise ValueError(
+            "attachment filename must not contain NUL, CR, or LF characters"
+        )
+
+
 @dataclass(frozen=True)
 class MimeSignature:
     """Validated plain-text and sanitized HTML signature variants."""
@@ -259,12 +266,14 @@ def build_email_message(
             message.attach(MIMEText(plain_body, "plain", "utf-8"))
 
     for attachment in attachments:
+        _validate_attachment_filename(attachment.filename)
         part = MIMEBase("application", "octet-stream")
         part.set_payload(attachment.content)
         encoders.encode_base64(part)
         part.add_header(
             "Content-Disposition",
-            f"attachment; filename={attachment.filename}",
+            "attachment",
+            filename=attachment.filename,
         )
         message.attach(part)
 

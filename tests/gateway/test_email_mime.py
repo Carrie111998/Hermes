@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from email import policy
 from email import utils as email_utils
+from email.parser import BytesParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -13,6 +15,8 @@ import pytest
 from gateway.config import PlatformConfig
 from plugins.platforms.email import adapter as email_adapter
 from plugins.platforms.email.mime import (
+    MimeAttachment,
+    build_email_message,
     render_markdown_html,
     sanitize_message_html,
     sanitize_signature_html,
@@ -48,6 +52,17 @@ def _assert_utf8_plain_part(part, expected_body: str) -> None:
     assert part.get_content_charset() == "utf-8"
     assert part["Content-Transfer-Encoding"] == "base64"
     assert part.get_payload(decode=True).decode("utf-8") == expected_body
+
+
+def _build_message_with_attachment(filename: str):
+    return build_email_message(
+        from_address="hermes@test.com",
+        to_address="user@test.com",
+        subject="Attachment",
+        body="Attached.",
+        date=_DATE,
+        attachments=(MimeAttachment(filename=filename, content=b"payload"),),
+    )
 
 
 def test_plain_reply_preserves_legacy_multipart_envelope_and_threading(monkeypatch):
@@ -140,9 +155,72 @@ def test_single_attachment_preserves_legacy_shape_headers_and_payload(
     _assert_utf8_plain_part(plain_part, "Pièce jointe.")
     assert attachment["Content-Transfer-Encoding"] == "base64"
     assert attachment["Content-Disposition"] == (
-        "attachment; filename=rapport final.bin"
+        'attachment; filename="rapport final.bin"'
     )
+    assert attachment.get_filename() == "rapport final.bin"
     assert attachment.get_payload(decode=True) == b"\x00attachment\xff"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "report.txt",
+        "report final.txt",
+        'report "final".txt',
+        "report;final.txt",
+        "résumé-été.txt",
+    ],
+)
+def test_attachment_filename_round_trips_through_serialization(filename):
+    message = _build_message_with_attachment(filename)
+
+    serialized = message.as_bytes(policy=policy.SMTP)
+    parsed = BytesParser(policy=policy.default).parsebytes(serialized)
+    attachment = next(parsed.iter_attachments())
+
+    assert attachment.get_filename() == filename
+    assert parsed["X-Injected"] is None
+
+
+def test_attachment_filename_uses_quoted_and_rfc2231_parameters():
+    spaced = _build_message_with_attachment("report final.txt").as_bytes(
+        policy=policy.SMTP
+    )
+    punctuation = _build_message_with_attachment(
+        'report; "final".txt'
+    ).as_bytes(policy=policy.SMTP)
+    unicode = _build_message_with_attachment("résumé-été.txt").as_bytes(
+        policy=policy.SMTP
+    )
+
+    assert b'filename="report final.txt"' in spaced
+    assert b'filename="report; \\"final\\".txt"' in punctuation
+    assert b"filename*=utf-8''r%C3%A9sum%C3%A9-%C3%A9t%C3%A9.txt" in unicode
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "report\rinjected.txt",
+        "report\ninjected.txt",
+        "report.txt\r\nX-Injected: true",
+    ],
+    ids=["cr", "lf", "crlf-header"],
+)
+def test_attachment_filename_rejects_header_newlines(filename):
+    with pytest.raises(
+        ValueError,
+        match="attachment filename must not contain NUL, CR, or LF characters",
+    ):
+        _build_message_with_attachment(filename)
+
+
+def test_attachment_filename_rejects_nul():
+    with pytest.raises(
+        ValueError,
+        match="attachment filename must not contain NUL, CR, or LF characters",
+    ):
+        _build_message_with_attachment("report\x00final.txt")
 
 
 def test_multiple_attachments_preserve_order_and_empty_body_semantics(
