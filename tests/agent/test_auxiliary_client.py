@@ -1203,6 +1203,29 @@ class TestGetTextAuxiliaryClient:
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""
 
+    def test_nous_excluded_from_vision_AUTO_but_kept_for_explicit_routing(self):
+        """The two vision tuples must not be collapsed back into one.
+
+        `_VISION_STRICT_BACKENDS` decides ROUTING for an explicit
+        `auxiliary.vision.provider`; `_VISION_AUTO_PROVIDER_ORDER` decides
+        what AUTO probes. Nous belongs in the first and not the second: it
+        has no credential in either auth store, so auto-probing it only
+        logs "no Nous authentication found" on every vision availability
+        check -- but an explicit request for it must still reach the strict
+        backend and fail loudly rather than silently falling through to the
+        generic router.
+        """
+        from agent.auxiliary_client import (
+            _VISION_STRICT_BACKENDS,
+            _VISION_AUTO_PROVIDER_ORDER,
+        )
+        assert "nous" in _VISION_STRICT_BACKENDS
+        assert "nous" not in _VISION_AUTO_PROVIDER_ORDER
+        # AUTO must otherwise stay a faithful subset, in the same order.
+        assert list(_VISION_AUTO_PROVIDER_ORDER) == [
+            p for p in _VISION_STRICT_BACKENDS if p != "nous"
+        ]
+
     def test_vision_auto_includes_active_provider_when_configured(self, monkeypatch):
         """Active provider appears in available backends when credentials exist."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "***")
