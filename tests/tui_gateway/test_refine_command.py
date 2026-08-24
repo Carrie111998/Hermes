@@ -144,3 +144,74 @@ def test_refine_rejects_while_turn_is_running(server, session):
     r = _call(server, "slash.exec", command="/refine", session_id=sid)
     assert "wait for the current turn" in r["result"]["output"]
     assert not s["agent"]._spawn_background_review.called
+
+
+def test_review_shares_the_refusal_guards(server, session):
+    """The extracted preflight must keep /review's contract byte-compatible."""
+    sid, s = session
+    r = _call(server, "slash.exec", command="/review check the diff", session_id=sid)
+    # Live dispatch reached start_review (MagicMock agent -> dispatch note path
+    # raises nothing); what matters here is the guard parity below.
+    s["running"] = True
+    r = _call(server, "slash.exec", command="/review", session_id=sid)
+    assert "wait for the current turn" in r["result"]["output"]
+    del s["agent"]
+    r = _call(server, "slash.exec", command="/review", session_id=sid)
+    assert "Nothing to review yet" in r["result"]["output"]
+
+
+def test_refine_on_compute_host_session_is_refused(server, session, monkeypatch):
+    # turn_isolation defaults off; enable it the way production config would
+    # so the compute-host classification in the preflight actually engages.
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_process_isolation_config",
+        lambda cfg=None: {"turn_isolation": True},
+    )
+    sid, s = session
+    s["_compute_host_active"] = True
+    r = _call(server, "slash.exec", command="/refine", session_id=sid)
+    assert "local agent only" in r["result"]["output"]
+    assert not s["agent"]._spawn_background_review.called
+    # And the same guard governs /review.
+    r = _call(server, "slash.exec", command="/review", session_id=sid)
+    assert "local agent only" in r["result"]["output"]
+
+
+def test_refine_with_empty_conversation_reports_honestly(server, session):
+    sid, s = session
+    agent = s["agent"]
+    agent._session_messages = []
+    del s["history"]
+    s.pop("history_lock", None)
+    r = _call(server, "slash.exec", command="/refine", session_id=sid)
+    assert "conversation is empty" in r["result"]["output"]
+    assert not agent._spawn_background_review.called
+
+
+def test_refine_without_skill_manage_degrades_gracefully(server, session):
+    sid, s = session
+    s["agent"].valid_tool_names = set()
+    r = _call(
+        server,
+        "slash.exec",
+        command="/refine remember the deploy order",
+        session_id=sid,
+    )
+    out = r["result"]["output"]
+    assert out.startswith("⚗")
+    kwargs = s["agent"]._spawn_background_review.call_args.kwargs
+    assert kwargs.get("review_skills") is False
+    assert kwargs.get("review_memory") is True
+
+
+def test_refine_reports_when_no_review_was_started(server, session):
+    """Admission honesty: _spawn_background_review returning falsy (declined:
+    review already active / auto-reviews disabled) must NOT produce a fake
+    '⚗ Reviewing…' success message."""
+    sid, s = session
+    s["agent"]._spawn_background_review.return_value = False
+    r = _call(server, "slash.exec", command="/refine", session_id=sid)
+    out = r["result"]["output"]
+    assert not out.startswith("⚗")
+    assert "No review was started" in out
