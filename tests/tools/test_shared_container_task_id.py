@@ -117,6 +117,42 @@ def test_no_session_key_still_defaults(monkeypatch):
     assert terminal_tool._resolve_container_task_id(None) == "default"
 
 
+def test_persistent_docker_ignores_gateway_session_key(monkeypatch):
+    """Persistent Docker keeps one sandbox across gateway sessions."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    for session_key in ("gateway-A", "gateway-B"):
+        tokens = set_session_vars(session_key=session_key)
+        try:
+            assert terminal_tool._resolve_container_task_id(None) == "default"
+            assert terminal_tool._resolve_container_task_id("subagent-A") == "default"
+        finally:
+            clear_session_vars(tokens)
+
+
+def test_nonpersistent_docker_keeps_gateway_sessions_isolated(monkeypatch):
+    """Non-persistent Docker still assigns a distinct key per session."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    resolved = []
+    for session_key in ("gateway-A", "gateway-B"):
+        tokens = set_session_vars(session_key=session_key)
+        try:
+            resolved.append(terminal_tool._resolve_container_task_id(None))
+        finally:
+            clear_session_vars(tokens)
+
+    assert resolved == ["session:gateway-A", "session:gateway-B"]
+
+
 # --- Production gateway path: session key bound via ContextVars ---------------
 #
 # The tests above set HERMES_SESSION_KEY through os.environ, which only

@@ -1429,8 +1429,16 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     if task_id and _has_isolation_overrides(task_id):
         return task_id
-    if task_id and _docker_session_isolation_enabled():
-        return _resolve_container_alias(task_id)
+    docker_session_isolation = _docker_session_isolation_enabled()
+    if docker_session_isolation:
+        if task_id:
+            return _resolve_container_alias(task_id)
+    elif os.getenv("TERMINAL_ENV", "local") == "docker":
+        # Persistent Docker deliberately shares one long-lived container across
+        # CLI, gateway, dashboard, and subagent sessions. Session-key scoping
+        # below is for backends such as SSH; applying it here fragments the
+        # documented shared Docker sandbox into one container per chat.
+        return "default"
     # Per-session isolation: when a session key is present (the WebUI streaming
     # layer sets it per-session, the gateway per-message via contextvars), scope
     # the container to it so switching profiles can't reuse a previous profile's
@@ -1439,10 +1447,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     # container (the #16177 shared-container intent). CLI mode has no session key
     # and falls through to "default", behaviour unchanged. See commit e00f940a9.
     #
-    # This runs *after* the isolation-override and docker/container_persistent
-    # branches above: those paths already key containers per task_id, so they
-    # stay authoritative where they apply and this only covers the cases that
-    # would otherwise collapse to the shared "default" key (notably SSH).
+    # This runs *after* the isolation-override and Docker persistence branches:
+    # those paths stay authoritative, while non-persistent Docker calls without
+    # a task_id and non-Docker backends still get session-scoped keys.
     session_key = _current_session_key()
     if session_key:
         return f"session:{session_key}"
