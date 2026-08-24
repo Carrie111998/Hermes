@@ -24,6 +24,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
+import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import {
   bareChoice,
@@ -404,7 +405,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
       return null
     }
 
-    if (fromArgs.question && request.question && fromArgs.question !== request.question) {
+    if (fromArgs.question && request.question && normalize(fromArgs.question) !== normalize(request.question)) {
       return null
     }
 
@@ -414,11 +415,15 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
   const question = fromArgs.question || matchingRequest?.question || ''
 
   const choices = useMemo(
-    // Prefer the gateway request's choices over the raw tool args: the backend
-    // labels the recommended option there (`mark_recommended`), and the card
-    // only renders once `matchingRequest` exists, so the args are a fallback
-    // for a hydration race, not the normal path.
-    () => matchingRequest?.choices ?? fromArgs.choices ?? [],
+    // Prefer the raw tool args' choices: they arrive with the tool.start event,
+    // so the card can render before the gateway request_id is wired and avoid
+    // the spinner-then-textarea flash. Fall back to the gateway request's
+    // choices — those carry the `mark_recommended` label from the backend —
+    // when args don't have them.
+    () => {
+      if (fromArgs.choices && fromArgs.choices.length > 0) return fromArgs.choices
+      return matchingRequest?.choices ?? []
+    },
     [fromArgs.choices, matchingRequest?.choices]
   )
 
@@ -436,9 +441,12 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
 
   // Race: tool.start fires a tick before clarify.request, so request_id
   // arrives slightly after the tool block mounts. Hold the whole panel on a
-  // spinner until the gateway request is wired — showing disabled choices or
-  // a "loading question" stub is worse than a brief wait.
-  const ready = Boolean(matchingRequest?.requestId)
+  // spinner until the gateway request is wired — BUT if the tool args
+  // already carry choices, the buttons can mount immediately and the user
+  // isn't held hostage to a gateway request that may never arrive for
+  // single-question blocks. Showing an endlessly-spinning question to a user
+  // who can already see the answer buttons is worse than flashing them on.
+  const ready = Boolean(matchingRequest?.requestId) || hasChoices
   const loading = !ready && !submitting
 
   const respond = useCallback(

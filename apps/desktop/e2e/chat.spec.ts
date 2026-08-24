@@ -101,6 +101,19 @@ test.describe('chat interaction with mock backend', () => {
     await page.keyboard.press('Enter')
     await page.getByText(BLOCKING_CLARIFY_QUESTION).waitFor({ state: 'visible', timeout: 30_000 })
 
+    // Regression: the BLOCKING_CLARIFY_TURN streams a tool.start with
+    // `choices: ['Yes', 'No']` but the mock gateway never sends a separate
+    // `clarify.request`. Before the renderer fix, that mismatch made
+    // matchingRequest drop to null and the card fell through to a
+    // textarea-only fallback. The buttons must still render from the
+    // tool args, with the keyboard-cursor focus on the first option.
+    await expect(page.getByRole('button', { name: 'Yes' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'No' })).toBeVisible()
+    await expect(page.getByRole('button', { name: /Yes|No/ }).first()).toHaveAttribute(
+      'aria-current',
+      'true'
+    )
+
     await expect(primary).toHaveAttribute('aria-label', 'Stop')
     await expect(primary.locator('span')).toHaveClass(/bg-current/)
 
