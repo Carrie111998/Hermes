@@ -1,6 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+// Chat-Z is a local same-user transport, not a remote authentication boundary.
+// UUIDs correlate a bounded request with its deep link; they are not bearer
+// credentials. Spool directories/files are restricted to the current OS user,
+// but another process already running as that user is intentionally inside the
+// trust boundary and can ask the user's running Desktop agent to submit work.
 export const CHAT_Z_VERSION = 1
 export const CHAT_Z_MAX_REQUEST_BYTES = 1_100_000
 export const CHAT_Z_MAX_PROMPT_CHARS = 1_000_000
@@ -27,7 +32,6 @@ export interface ChatZReceipt {
   code?: string
   message?: string
   profile?: string
-  queued?: boolean
   storedSessionId?: string
   title?: string
   created?: boolean
@@ -41,6 +45,57 @@ export class ChatZRequestError extends Error {
   ) {
     super(message)
     this.name = 'ChatZRequestError'
+  }
+}
+
+export class ChatZRequestState {
+  private readonly pendingById = new Map<string, ChatZRequest>()
+  private readonly inflightIds = new Set<string>()
+
+  has(requestId: string): boolean {
+    return this.pendingById.has(requestId) || this.inflightIds.has(requestId)
+  }
+
+  queue(request: ChatZRequest): void {
+    this.pendingById.set(request.requestId, request)
+  }
+
+  begin(request: ChatZRequest): boolean {
+    if (this.inflightIds.has(request.requestId)) {
+      return false
+    }
+
+    this.inflightIds.add(request.requestId)
+    this.pendingById.delete(request.requestId)
+
+    return true
+  }
+
+  pendingRequests(): ChatZRequest[] {
+    return [...this.pendingById.values()]
+  }
+
+  isInflight(requestId: string): boolean {
+    return this.inflightIds.has(requestId)
+  }
+
+  complete(requestId: string): void {
+    this.inflightIds.delete(requestId)
+  }
+
+  rendererLost({ dropPending = false }: { dropPending?: boolean } = {}): string[] {
+    const failed = new Set(this.inflightIds)
+    this.inflightIds.clear()
+
+    if (dropPending) {
+      for (const requestId of this.pendingById.keys()) {
+        failed.add(requestId)
+      }
+
+      this.pendingById.clear()
+    }
+
+    return [...failed]
   }
 }
 
@@ -79,6 +134,7 @@ export function parseChatZRequest(raw: unknown, expectedRequestId: string, now =
   if (!raw || typeof raw !== 'object') {
     throw new ChatZRequestError('invalid-request', 'Request must be a JSON object')
   }
+
   const input = raw as Record<string, unknown>
 
   if (input.version !== CHAT_Z_VERSION) {
@@ -161,18 +217,22 @@ export function readChatZRequest(userData: string, requestId: string, now = Date
     if (error instanceof ChatZRequestError) {
       throw error
     }
+
     throw new ChatZRequestError('invalid-json', `Request JSON is invalid: ${(error as Error).message}`)
   }
 }
 
 export function writeChatZReceipt(userData: string, receipt: ChatZReceipt): void {
   const receiptPath = chatZPaths(userData, receipt.requestId).receipt
-  fs.mkdirSync(path.dirname(receiptPath), { recursive: true })
+  const receiptDirectory = path.dirname(receiptPath)
 
-  const temporary = path.join(
-    path.dirname(receiptPath),
-    `.${path.basename(receiptPath)}.${process.pid}.${Date.now()}.tmp`
-  )
+  fs.mkdirSync(receiptDirectory, { recursive: true, mode: 0o700 })
+
+  if (process.platform !== 'win32') {
+    fs.chmodSync(receiptDirectory, 0o700)
+  }
+
+  const temporary = path.join(receiptDirectory, `.${path.basename(receiptPath)}.${process.pid}.${Date.now()}.tmp`)
 
   try {
     fs.writeFileSync(temporary, JSON.stringify(receipt), { encoding: 'utf8', mode: 0o600, flag: 'wx' })

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { ChatZRequestError, parseChatZRequest } from './chat-z'
+import { type ChatZRequest, ChatZRequestError, ChatZRequestState, parseChatZRequest } from './chat-z'
 
 const ID = '123e4567-e89b-42d3-a456-426614174000'
 const NOW = 1_000
@@ -37,5 +37,33 @@ describe('parseChatZRequest', () => {
 
   it('rejects expired requests before routing them to the renderer', () => {
     expect(() => parseChatZRequest({ ...base(), sessionId: 'stored-1' }, ID, NOW + 30_001)).toThrowError(/expired/i)
+  })
+})
+
+describe('ChatZRequestState', () => {
+  it('fails inflight requests but preserves requests not yet sent across a renderer reload', () => {
+    const state = new ChatZRequestState()
+    const pending = { ...base(), requestId: 'pending', sessionId: 'stored-1' } as ChatZRequest
+    const inflight = { ...base(), requestId: 'inflight', sessionId: 'stored-2' } as ChatZRequest
+
+    state.queue(pending)
+    state.begin(inflight)
+
+    expect(state.rendererLost()).toEqual(['inflight'])
+    expect(state.isInflight('inflight')).toBe(false)
+    expect(state.pendingRequests()).toEqual([pending])
+  })
+
+  it('fails both pending and inflight requests when the Desktop window closes', () => {
+    const state = new ChatZRequestState()
+    const pending = { ...base(), requestId: 'pending', sessionId: 'stored-1' } as ChatZRequest
+    const inflight = { ...base(), requestId: 'inflight', sessionId: 'stored-2' } as ChatZRequest
+
+    state.queue(pending)
+    state.begin(inflight)
+
+    expect(new Set(state.rendererLost({ dropPending: true }))).toEqual(new Set(['pending', 'inflight']))
+    expect(state.pendingRequests()).toEqual([])
+    expect(state.isInflight('inflight')).toBe(false)
   })
 })

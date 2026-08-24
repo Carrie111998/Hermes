@@ -92,6 +92,7 @@ import {
   type ChatZReceipt,
   type ChatZRequest,
   ChatZRequestError,
+  ChatZRequestState,
   isChatZRequestId,
   readChatZRequest,
   removeChatZRequest,
@@ -14155,10 +14156,14 @@ function createWindow() {
     wakeIndicatorController.close()
 
     if (mainWindow === createdMainWindow) {
+      _failChatZRendererRequests(
+        'renderer-window-closed',
+        'Hermes Desktop closed before it could confirm the request',
+        true
+      )
       mainWindow = null
       // the replacement renderer must register before queued links can be delivered.
       _rendererReadyForDeepLink = false
-      _rendererReadyForChatZ = false
     }
   })
 
@@ -14237,6 +14242,14 @@ function createWindow() {
     reloadMax: RENDERER_RELOAD_MAX,
     recentReloadTimesRef: rendererReloadTimesRef,
     reloadOnFailedLoad: true
+  })
+  createdMainWindow.webContents.on('render-process-gone', () => {
+    if (mainWindow === createdMainWindow) {
+      _failChatZRendererRequests(
+        'renderer-process-gone',
+        'Hermes Desktop renderer stopped before it could confirm the request'
+      )
+    }
   })
 
   // Electron always passes the event first. The canonical (Electron 36+) shape
@@ -17327,8 +17340,7 @@ const HERMES_PROTOCOL = DEV_SERVER ? 'hermes-dev' : 'hermes'
 const DEEPLINK_SCHEMES = DEV_SERVER ? ['hermes-dev', 'hermes'] : ['hermes']
 let _pendingDeepLink = null
 let _rendererReadyForDeepLink = false
-const _pendingChatZ = new Map<string, ChatZRequest>()
-const _inflightChatZ = new Set<string>()
+const _chatZRequests = new ChatZRequestState()
 let _rendererReadyForChatZ = false
 
 function _chatZErrorReceipt(requestId: string, error: unknown): ChatZReceipt {
@@ -17338,27 +17350,50 @@ function _chatZErrorReceipt(requestId: string, error: unknown): ChatZReceipt {
   return { requestId, status: 'error', code, message }
 }
 
-function _writeChatZError(requestId: string, error: unknown): void {
+function _writeChatZError(requestId: string, error: unknown): boolean {
   try {
     writeChatZReceipt(app.getPath('userData'), _chatZErrorReceipt(requestId, error))
+
+    return true
   } catch (receiptError) {
     rememberLog(`[chat-z] failed to write error receipt for ${requestId}: ${(receiptError as Error).message}`)
+
+    return false
+  }
+}
+
+function _finishChatZError(requestId: string, error: unknown): void {
+  if (!_writeChatZError(requestId, error)) {
+    return
+  }
+
+  try {
+    removeChatZRequest(app.getPath('userData'), requestId)
+  } catch (removeError) {
+    rememberLog(`[chat-z] failed to remove rejected request ${requestId}: ${(removeError as Error).message}`)
+  }
+}
+
+function _failChatZRendererRequests(code: string, message: string, dropPending = false): void {
+  _rendererReadyForChatZ = false
+
+  for (const requestId of _chatZRequests.rendererLost({ dropPending })) {
+    _finishChatZError(requestId, new ChatZRequestError(code, message))
+    rememberLog(`[chat-z] renderer unavailable for ${requestId}: ${code}`)
   }
 }
 
 function _deliverChatZ(request: ChatZRequest): void {
   if (!_rendererReadyForChatZ || !mainWindow || mainWindow.isDestroyed()) {
-    _pendingChatZ.set(request.requestId, request)
+    _chatZRequests.queue(request)
 
     return
   }
 
-  if (_inflightChatZ.has(request.requestId)) {
+  if (!_chatZRequests.begin(request)) {
     return
   }
 
-  _inflightChatZ.add(request.requestId)
-  _pendingChatZ.delete(request.requestId)
   mainWindow.webContents.send('hermes:chat-z:submit', request)
   rememberLog(`[chat-z] routed ${request.requestId} to primary renderer`)
 }
@@ -17370,7 +17405,7 @@ function _handleChatZLink(requestId: string): void {
     return
   }
 
-  if (_pendingChatZ.has(requestId) || _inflightChatZ.has(requestId)) {
+  if (_chatZRequests.has(requestId)) {
     return
   }
 
@@ -17378,7 +17413,7 @@ function _handleChatZLink(requestId: string): void {
     _deliverChatZ(readChatZRequest(app.getPath('userData'), requestId))
   } catch (error) {
     rememberLog(`[chat-z] rejected ${requestId}: ${(error as Error).message}`)
-    _writeChatZError(requestId, error)
+    _finishChatZError(requestId, error)
   }
 }
 
@@ -17389,7 +17424,7 @@ ipcMain.handle('hermes:chat-z:ready', event => {
 
   _rendererReadyForChatZ = true
 
-  for (const request of [..._pendingChatZ.values()]) {
+  for (const request of _chatZRequests.pendingRequests()) {
     _deliverChatZ(request)
   }
 
@@ -17403,7 +17438,7 @@ ipcMain.on('hermes:chat-z:complete', (event, payload) => {
 
   const requestId = payload?.requestId
 
-  if (!isChatZRequestId(requestId) || !_inflightChatZ.has(requestId)) {
+  if (!isChatZRequestId(requestId) || !_chatZRequests.isInflight(requestId)) {
     return
   }
 
@@ -17431,7 +17466,7 @@ ipcMain.on('hermes:chat-z:complete', (event, payload) => {
     rememberLog(`[chat-z] completion failed for ${requestId}: ${(error as Error).message}`)
     _writeChatZError(requestId, error)
   } finally {
-    _inflightChatZ.delete(requestId)
+    _chatZRequests.complete(requestId)
   }
 })
 

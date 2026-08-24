@@ -24,6 +24,7 @@ function deps() {
 describe('submitChatZRequest', () => {
   it('creates, titles, then submits a project-scoped Desktop session', async () => {
     const d = deps()
+
     const receipt = await submitChatZRequest(
       { ...base, newSession: true, cwd: 'C:\\project', newTitle: 'Knowledge receiver' },
       d
@@ -70,6 +71,17 @@ describe('submitChatZRequest', () => {
     const receipt = await submitChatZRequest({ ...base, title: 'Missing' }, d)
 
     expect(receipt).toMatchObject({ status: 'error', code: 'session-not-found' })
+    expect(d.submitText).not.toHaveBeenCalled()
+  })
+
+  it('rejects a request for a different Desktop profile before lookup or submission', async () => {
+    const d = deps()
+    d.activeProfile = 'research'
+
+    const receipt = await submitChatZRequest({ ...base, sessionId: 'stored-2' }, d)
+
+    expect(receipt).toMatchObject({ status: 'error', code: 'profile-mismatch' })
+    expect(d.requestGateway).not.toHaveBeenCalled()
     expect(d.submitText).not.toHaveBeenCalled()
   })
 })

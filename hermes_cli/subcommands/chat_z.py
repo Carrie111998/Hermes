@@ -4,6 +4,10 @@ The command spools a bounded request into Electron's user-data directory and
 opens a ``hermes://chat-z/<id>`` deep link.  The primary Desktop renderer uses
 its existing gateway connection and returns a receipt as soon as submission is
 accepted; the agent response is never awaited.
+
+This is intentionally a same-OS-user channel, not a remote authentication
+boundary.  UUIDs correlate files and links rather than authorize callers; any
+process already running as the Desktop user is inside the trust boundary.
 """
 
 from __future__ import annotations
@@ -20,15 +24,20 @@ import uuid
 CHAT_Z_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 30.0
 MAX_PROMPT_CHARS = 1_000_000
+MAX_REQUEST_BYTES = 1_100_000
 
 
 def desktop_user_data_dir() -> Path:
     override = os.environ.get("HERMES_DESKTOP_USER_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser().resolve()
+    # Electron sets the packaged app name to "Hermes" before resolving
+    # app.getPath("userData"), whose platform defaults match these locations.
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA", "").strip()
-        return (Path(appdata) if appdata else Path.home() / "AppData" / "Roaming") / "Hermes"
+        return (
+            Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        ) / "Hermes"
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "Hermes"
     config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
@@ -37,15 +46,28 @@ def desktop_user_data_dir() -> Path:
 
 def _spool_paths(user_data: Path, request_id: str) -> tuple[Path, Path]:
     root = user_data / "chat-z"
-    return root / "requests" / f"{request_id}.json", root / "receipts" / f"{request_id}.json"
+    return (
+        root / "requests" / f"{request_id}.json",
+        root / "receipts" / f"{request_id}.json",
+    )
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"serialized request exceeds the {MAX_REQUEST_BYTES:,}-byte limit"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        path.parent.chmod(0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -71,7 +93,9 @@ def _read_prompt(args) -> str:
     elif not sys.stdin.isatty():
         text = sys.stdin.read()
     else:
-        raise ValueError("provide -q/--query, --query-file, or pipe prompt text on stdin")
+        raise ValueError(
+            "provide -q/--query, --query-file, or pipe prompt text on stdin"
+        )
 
     text = text.strip()
     if not text:
@@ -86,7 +110,12 @@ def _launch_deep_link(uri: str) -> None:
         os.startfile(uri)  # type: ignore[attr-defined]
         return
     command = ["open", uri] if sys.platform == "darwin" else ["xdg-open", uri]
-    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _wait_for_receipt(path: Path, timeout_seconds: float) -> dict:
@@ -105,14 +134,18 @@ def _wait_for_receipt(path: Path, timeout_seconds: float) -> dict:
     )
 
 
-def send_to_desktop(args, *, launch=_launch_deep_link, user_data: Path | None = None) -> dict:
+def send_to_desktop(
+    args, *, launch=_launch_deep_link, user_data: Path | None = None
+) -> dict:
     text = _read_prompt(args)
     title = (getattr(args, "conversation", None) or "").strip()
     session_id = (getattr(args, "session_id", None) or "").strip()
     new_session = bool(getattr(args, "new_session", False))
     new_title = (getattr(args, "title", None) or "").strip()
     if sum((bool(title), bool(session_id), new_session)) != 1:
-        raise ValueError("choose exactly one target: -c/--conversation, --session-id, or --new")
+        raise ValueError(
+            "choose exactly one target: -c/--conversation, --session-id, or --new"
+        )
 
     cwd_input = (getattr(args, "cwd", None) or "").strip()
     cwd = ""
@@ -146,7 +179,9 @@ def send_to_desktop(args, *, launch=_launch_deep_link, user_data: Path | None = 
         profile = "default"
 
     request_id = str(uuid.uuid4())
-    request_path, receipt_path = _spool_paths(user_data or desktop_user_data_dir(), request_id)
+    request_path, receipt_path = _spool_paths(
+        user_data or desktop_user_data_dir(), request_id
+    )
     now_ms = int(time.time() * 1000)
     request = {
         "version": CHAT_Z_VERSION,
@@ -156,7 +191,11 @@ def send_to_desktop(args, *, launch=_launch_deep_link, user_data: Path | None = 
         "createdAt": now_ms,
         "expiresAt": now_ms + int(timeout_seconds * 1000),
         **(
-            {"newSession": True, "cwd": cwd, **({"newTitle": new_title} if new_title else {})}
+            {
+                "newSession": True,
+                "cwd": cwd,
+                **({"newTitle": new_title} if new_title else {}),
+            }
             if new_session
             else ({"title": title} if title else {"sessionId": session_id})
         ),
@@ -185,13 +224,16 @@ def cmd_chat_z(args) -> int:
         return 1
 
     if receipt.get("status") != "accepted":
-        message = receipt.get("message") or receipt.get("code") or "Desktop rejected the request"
+        message = (
+            receipt.get("message")
+            or receipt.get("code")
+            or "Desktop rejected the request"
+        )
         print(f"chat-z: {message}", file=sys.stderr)
         return 1
 
     if not getattr(args, "quiet", False):
         target = receipt.get("title") or receipt.get("storedSessionId") or "session"
-        queued = " (queued behind the current turn)" if receipt.get("queued") else ""
         if receipt.get("created"):
             workspace = f" in {receipt['cwd']}" if receipt.get("cwd") else ""
             stored_session_id = receipt.get("storedSessionId")
@@ -202,7 +244,7 @@ def cmd_chat_z(args) -> int:
             )
             print(f"Created by Hermes Desktop: {created_target}{workspace}")
         else:
-            print(f"Accepted by Hermes Desktop: {target}{queued}")
+            print(f"Accepted by Hermes Desktop: {target}")
     return 0
 
 
@@ -219,7 +261,12 @@ def build_chat_z_parser(subparsers):
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("-c", "--conversation", help="Exact Desktop conversation title")
     target.add_argument("--session-id", help="Stored Desktop session ID")
-    target.add_argument("--new", dest="new_session", action="store_true", help="Create a new Desktop conversation")
+    target.add_argument(
+        "--new",
+        dest="new_session",
+        action="store_true",
+        help="Create a new Desktop conversation",
+    )
     parser.add_argument("--cwd", help="Existing project directory for --new")
     parser.add_argument("--title", help="Fixed session title for --new")
     prompt = parser.add_mutually_exclusive_group()
@@ -231,6 +278,8 @@ def build_chat_z_parser(subparsers):
         default=DEFAULT_TIMEOUT_SECONDS,
         help=f"Seconds to wait for Desktop acceptance (default: {DEFAULT_TIMEOUT_SECONDS:g})",
     )
-    parser.add_argument("-Q", "--quiet", action="store_true", help="Print nothing when accepted")
+    parser.add_argument(
+        "-Q", "--quiet", action="store_true", help="Print nothing when accepted"
+    )
     parser.set_defaults(func=cmd_chat_z)
     return parser

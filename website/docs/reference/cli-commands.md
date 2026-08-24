@@ -171,6 +171,8 @@ hermes chat-z --new --cwd "/path/to/project" --title "Knowledge receiver" -q "Wa
 
 Creation prints the stored session ID. Prefer that ID for later sends because titles can be renamed and must otherwise match exactly. Desktop must already be running, and the target must belong to its active profile.
 
+`chat-z` is a local same-OS-user transport, not a remotely authenticated API. Its private, expiring spool directories restrict ordinary access to the current OS account, while processes already running as the Desktop user are inside the trust boundary and can submit work to that user's agent.
+
 ### `hermes -z <prompt>` — scripted one-shot
 
 For programmatic callers (shell scripts, CI, cron, parent processes piping in a prompt), `hermes -z` is the purest one-shot entry point: **single prompt in, final response text out, nothing else on stdout or stderr.** No banner, no spinner, no tool previews, no `Session:` line — just the agent's final reply as plain text.
