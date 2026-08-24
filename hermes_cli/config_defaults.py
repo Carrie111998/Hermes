@@ -54,6 +54,15 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Opt-in signpost when a *finite* tool-iteration budget is nearly
+        # exhausted. false/absent = off (zero behavior change). true = warn
+        # once at >= 80% used. positive int N = warn once when remaining <= N.
+        # Delivered like run_budget wrap-up (append to newest tool message).
+        # Tiny caps (max_iterations < 5, where 0.8*max rounds to the last
+        # iteration) may fire only as the budget runs out — a signpost cannot
+        # appear before the first tool message exists. max_iterations with an
+        # unlimited sentinel (>= sys.maxsize) never injects.
+        "tool_loop_budget_warning": False,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
