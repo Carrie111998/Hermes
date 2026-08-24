@@ -3471,6 +3471,42 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
             if next_run_dt <= now:
 
+                # One-shot lateness bound (#93526): ONESHOT_GRACE_SECONDS is
+                # the documented miss-grace for one-shots — it is enforced on
+                # the create/update/resume validators and on the missing-
+                # next_run_at recovery path, but a stored past-due one-shot
+                # (machine off across its fire time) reached this branch and
+                # fired arbitrarily late. Retain the record as a terminal
+                # miss instead of running a stale alert hours later.
+                if kind == "once":
+                    late_by = (now - next_run_dt).total_seconds()
+                    if late_by > ONESHOT_GRACE_SECONDS:
+                        logger.warning(
+                            "Job '%s' (%s): one-shot missed its fire time %s by "
+                            "%ds (> %ss grace) while the scheduler was down; "
+                            "marking it completed without running so a stale "
+                            "alert is not delivered.",
+                            job.get("name", job.get("id", "?")),
+                            kind,
+                            next_run,
+                            int(late_by),
+                            ONESHOT_GRACE_SECONDS,
+                        )
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["enabled"] = False
+                                rj["state"] = "completed"
+                                rj["next_run_at"] = None
+                                rj["last_status"] = "missed"
+                                if not rj.get("last_error"):
+                                    rj["last_error"] = (
+                                        f"Missed fire time by {int(late_by)}s "
+                                        f"(> {ONESHOT_GRACE_SECONDS}s grace); not run."
+                                    )
+                                needs_save = True
+                                break
+                        continue
+
                 # Stale-schedule guard (#93049): a direct jobs.json edit that
                 # changed schedule.expr leaves next_run_at computed under the
                 # old expression, so the job would fire at an instant the

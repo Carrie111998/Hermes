@@ -374,7 +374,14 @@ def fire_overdue_jobs(
     if grace_minutes <= 0:
         return 0
 
-    from cron.jobs import _ensure_aware, _hermes_now, is_job_runnable, load_jobs
+    from cron.jobs import (
+        ONESHOT_GRACE_SECONDS,
+        _ensure_aware,
+        _hermes_now,
+        is_job_runnable,
+        load_jobs,
+        save_jobs,
+    )
 
     if now is None:
         now = _hermes_now()
@@ -393,6 +400,34 @@ def fire_overdue_jobs(
         overdue_seconds = (now - due_dt).total_seconds()
         if overdue_seconds < grace_minutes * 60:
             continue
+        # One-shot lateness bound (#93526): the 120s miss-grace applies to
+        # one-shots everywhere else; this backstop must not fire a stored
+        # past-due one-shot hours late either. Mark it terminal-missed like
+        # the built-in tick's due-scan does.
+        if (job.get("schedule") or {}).get("kind") == "once":
+            if overdue_seconds > ONESHOT_GRACE_SECONDS:
+                logger.warning(
+                    "Misfire catch-up skips one-shot job %s: overdue by %.0f min "
+                    "(> %ss one-shot grace); marking completed without running.",
+                    str(job.get("id") or ""),
+                    overdue_seconds / 60,
+                    ONESHOT_GRACE_SECONDS,
+                )
+                jobs_now = load_jobs()
+                for j in jobs_now:
+                    if j.get("id") == job.get("id"):
+                        j["enabled"] = False
+                        j["state"] = "completed"
+                        j["next_run_at"] = None
+                        j["last_status"] = "missed"
+                        if not j.get("last_error"):
+                            j["last_error"] = (
+                                f"Missed fire time by {int(overdue_seconds)}s "
+                                f"(> {ONESHOT_GRACE_SECONDS}s grace); not run."
+                            )
+                        save_jobs(jobs_now)
+                        break
+                continue
         job_id = str(job.get("id") or "")
         logger.warning(
             "Misfire catch-up: job %s (%s) was due %s (%.0f min overdue) and "
