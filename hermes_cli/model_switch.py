@@ -2026,11 +2026,25 @@ def switch_model(
             # per-profile secret scope — never a raw os.environ read — and
             # only fall back to the "no-key-required" placeholder when the
             # alias declares neither an inline api_key nor a key_env.
+            #
+            # Note: key resolution runs inside the `_da.base_url` guard. An
+            # alias that declares key_env but no base_url has no endpoint to
+            # associate the resolved key with, so it deliberately skips this
+            # and keeps the provider default — the alias is then a config
+            # error the user should fix, not something we silently key.
             _alias_key = _scoped_key_env(_da.key_env) if _da.key_env else ""
             if not api_key and _alias_key:
                 api_key = _alias_key
             elif not api_key and not _da.key_env:
                 api_key = "no-key-required"
+            elif _da.key_env and not _alias_key:
+                logger.warning(
+                    "Direct alias '%s' declares key_env=%s but it resolved "
+                    "empty in the current secret scope; no key was applied "
+                    "(alias demands one, so the no-key placeholder is not used)",
+                    resolved_alias,
+                    _da.key_env,
+                )
 
     # --- Resolve api_mode from the final (provider, base_url) before validation ---
     # Two cases this closes, both surfaced when the switched model's reasoning

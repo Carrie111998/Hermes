@@ -179,6 +179,88 @@ class TestDirectAliases:
         assert result.api_key == "scoped-secret-key"
         assert result.base_url == "https://open.bigmodel.cn/api/paas/v4"
 
+    def test_direct_alias_empty_key_env_warns_and_does_not_fake_key(
+        self, monkeypatch
+    ):
+        """A key_env that resolves empty must NOT fall back to no-key-required.
+
+        #83908 / review point 3: an alias that declares key_env demands that
+        key — if the env var is empty/unset we must not fake a key with the
+        no-key-required placeholder (that would silently send an invalid key).
+        Instead we leave api_key empty and warn, so the missing-env case is
+        self-diagnosing rather than a bare empty-key error.
+        """
+        from unittest.mock import patch
+
+        import hermes_cli.model_switch as ms
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from hermes_cli.model_switch import DirectAlias, switch_model
+
+        alias = DirectAlias(
+            model="glm-4.7-flash",
+            provider="custom",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            key_env="ZHIPU_VELOS_KEY",
+        )
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {"glm-flash": alias})
+        monkeypatch.setattr(ms, "_ensure_direct_aliases", lambda: None)
+
+        accepted = {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        }
+        # Secret scope has NO ZHIPU_VELOS_KEY -> resolves empty.
+        token = set_secret_scope({})
+        warned = []
+        try:
+            with patch(
+                "hermes_cli.model_switch.resolve_alias",
+                return_value=("custom", "glm-4.7-flash", "glm-flash"),
+            ), patch(
+                "hermes_cli.model_switch.list_provider_models",
+                return_value=[],
+            ), patch(
+                "hermes_cli.model_switch.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ), patch(
+                "hermes_cli.models.validate_requested_model",
+                return_value=accepted,
+            ), patch(
+                "hermes_cli.models.detect_provider_for_model",
+                return_value=None,
+            ), patch(
+                "hermes_cli.model_switch.get_model_info",
+                return_value=None,
+            ), patch(
+                "hermes_cli.model_switch.get_model_capabilities",
+                return_value=None,
+            ), patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "",
+                    "base_url": "",
+                    "api_mode": "",
+                },
+            ), patch(
+                "hermes_cli.model_switch.logger.warning",
+                side_effect=lambda *a, **k: warned.append(a),
+            ):
+                result = switch_model(
+                    raw_input="glm-flash",
+                    current_provider="openrouter",
+                    current_model="old-model",
+                    current_base_url="",
+                )
+        finally:
+            reset_secret_scope(token)
+
+        # No fake key, and a warning naming the env var was emitted.
+        assert result.api_key == ""
+        assert warned, "expected a warning naming the empty key_env"
+        assert any("ZHIPU_VELOS_KEY" in str(w) for w in warned)
+
     def test_direct_alias_resolved_before_catalog(self, monkeypatch):
         """Direct aliases take priority over models.dev catalog lookup."""
         from hermes_cli.model_switch import DirectAlias, resolve_alias
