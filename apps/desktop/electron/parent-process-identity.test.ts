@@ -6,7 +6,8 @@ import {
   createParentStartMarkerResolver,
   electronProcessStartMarker,
   parentWatchdogEnv,
-  spawnTag
+  spawnTag,
+  stablePosixProcessMarkerEnv
 } from './parent-process-identity'
 
 test('electronProcessStartMarker uses Electron creation time only for its own PID', () => {
@@ -83,4 +84,15 @@ test('spawnTag derives seconds from a winms marker and dashes without one', () =
   assert.equal(spawnTag(42, null), 'v1:-:serve:42:-')
   assert.equal(spawnTag(42, 'win:638908765432100000'), 'v1:-:serve:42:-')
   assert.equal(spawnTag(42, 'winms:garbage'), 'v1:-:serve:42:-')
+})
+
+test('POSIX process markers ignore the caller locale and timezone', () => {
+  assert.deepEqual(
+    stablePosixProcessMarkerEnv({ LANG: 'fr_FR.UTF-8', LC_ALL: 'ja_JP.UTF-8', TZ: 'Pacific/Honolulu' }),
+    {
+      LANG: 'fr_FR.UTF-8',
+      LC_ALL: 'C',
+      TZ: 'UTC'
+    }
+  )
 })

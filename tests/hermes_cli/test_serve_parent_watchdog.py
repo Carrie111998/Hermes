@@ -1,6 +1,12 @@
 """Regression tests for Desktop-owned ``hermes serve`` lifecycle tracking."""
 
-from hermes_cli.web_server import _is_serve_orphaned, _valid_parent_start_marker
+import os
+
+from hermes_cli.web_server import (
+    _is_serve_orphaned,
+    _stable_ps_environment,
+    _valid_parent_start_marker,
+)
 
 
 def test_parent_watchdog_tracks_recorded_desktop_pid_not_immediate_ppid():
@@ -57,3 +63,18 @@ def test_parent_watchdog_preserves_legacy_exact_windows_marker():
         )
         is False
     )
+
+
+def test_posix_process_marker_environment_is_locale_and_timezone_stable():
+    env = _stable_ps_environment(
+        {
+            **os.environ,
+            "LANG": "fr_FR.UTF-8",
+            "LC_ALL": "ja_JP.UTF-8",
+            "TZ": "Pacific/Honolulu",
+        }
+    )
+
+    assert env["LANG"] == "fr_FR.UTF-8"
+    assert env["LC_ALL"] == "C"
+    assert env["TZ"] == "UTC"

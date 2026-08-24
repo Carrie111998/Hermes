@@ -224,7 +224,8 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import {
   createParentStartMarkerResolver,
   electronProcessStartMarker,
-  parentWatchdogEnv
+  parentWatchdogEnv,
+  stablePosixProcessMarkerEnv
 } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
 import {
@@ -3160,9 +3161,9 @@ function writeBackendOwnership(contents) {
   }
 }
 
-function execText(command, args, { timeout = 3000 } = {}) {
+function execText(command, args, { env = process.env, timeout = 3000 } = {}) {
   return new Promise<string>((resolve, reject) => {
-    execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', timeout }), (error, stdout) => {
+    execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', env, timeout }), (error, stdout) => {
       if (error) {
         reject(error)
       } else {
@@ -3216,7 +3217,9 @@ async function processStartMarker(pid) {
     return `win:${ticks}`
   }
 
-  const started = await execText('ps', ['-p', String(pid), '-o', 'lstart='])
+  const started = await execText('ps', ['-p', String(pid), '-o', 'lstart='], {
+    env: stablePosixProcessMarkerEnv(process.env)
+  })
 
   if (!started) {
     throw new Error(`Missing process start marker for PID ${pid}`)

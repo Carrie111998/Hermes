@@ -48,7 +48,7 @@ import zipfile
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 import yaml
 
@@ -139,6 +139,11 @@ WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.enviro
 _log = logging.getLogger(__name__)
 
 
+def _stable_ps_environment(source: Mapping[str, str]) -> Dict[str, str]:
+    """Keep BSD/Linux ``ps lstart`` stable across the Desktop and backend."""
+    return {**source, "LC_ALL": "C", "TZ": "UTC"}
+
+
 def _process_start_marker(pid: int) -> str:
     """Return a cross-runtime marker for the current incarnation of ``pid``.
 
@@ -206,6 +211,7 @@ def _process_start_marker(pid: int) -> str:
     result = subprocess.run(
         ["ps", "-p", str(pid), "-o", "lstart="],
         capture_output=True,
+        env=_stable_ps_environment(os.environ),
         text=True,
         check=False,
     )

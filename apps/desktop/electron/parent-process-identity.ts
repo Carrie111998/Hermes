@@ -13,6 +13,11 @@ export interface ParentStartMarkerResolverOptions {
   onError?: (error: unknown) => void
 }
 
+/** Keep BSD/Linux `ps lstart` output identical across the parent and child. */
+export function stablePosixProcessMarkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, LC_ALL: 'C', TZ: 'UTC' }
+}
+
 /**
  * Build the cross-runtime marker for Electron's own process without spawning
  * an OS helper. Electron reports milliseconds since the Unix epoch; the Python
