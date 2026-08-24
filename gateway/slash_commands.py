@@ -707,14 +707,10 @@ class GatewaySlashCommandsMixin:
             if isinstance(configured_context, int) and configured_context > 0:
                 context_total = configured_context
 
-        # Match the reasoning configuration that the next turn will use,
-        # including session-scoped and per-model overrides.  Report only what
-        # the resolver actually determined: ``resolve_reasoning_config``
-        # returns None when nothing is configured, and the turn then omits
-        # ``reasoning`` from the request entirely — the provider picks the
-        # level, so /status must not claim "medium".  Same for an enabled
-        # config with no effort string; the only concrete levels are the
-        # explicit ones.
+        # Report only what the resolver determined: it returns None when
+        # nothing is configured, and the turn then omits ``reasoning``
+        # entirely — the provider picks the level, so /status must not claim
+        # "medium".  Same for an enabled config with no effort string.
         effort_level = ""
         try:
             reasoning_config = self._resolve_session_reasoning_config(
@@ -731,7 +727,10 @@ class GatewaySlashCommandsMixin:
                     "gateway.reasoning.level_provider_default"
                 )
         except Exception:
-            logger.debug("Failed to resolve reasoning effort for /status", exc_info=True)
+            # Broad on purpose: _resolve_session_reasoning_config documents
+            # priority and return values but no exception contract, and reaches
+            # YAML/config loading two layers down. /status must still render.
+            logger.warning("Failed to resolve reasoning effort for /status", exc_info=True)
 
         model_line = ""
         if model_name:
