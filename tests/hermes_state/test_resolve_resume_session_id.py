@@ -52,7 +52,16 @@ def test_returns_self_when_only_parent_has_messages(db):
 
 def test_walks_from_middle_of_chain(db):
     # If the user happens to know an intermediate ID, we still find the msg-bearing descendant.
+    # Real compression chains mark every ended hop with end_reason='compression'
+    # (the discriminator get_compression_tip uses), so model that here.
     _make_chain(db, [("a", None), ("b", "a"), ("c", "b"), ("d", "c")])
+    conn = db._conn
+    for sid in ("a", "b", "c"):
+        conn.execute(
+            "UPDATE sessions SET end_reason = 'compression', ended_at = ? WHERE id = ?",
+            (int(time.time()), sid),
+        )
+    conn.commit()
     db.append_message("d", role="user", content="x")
     assert db.resolve_resume_session_id("b") == "d"
     assert db.resolve_resume_session_id("c") == "d"
@@ -95,8 +104,65 @@ def test_prefers_most_recent_child_when_fork_exists(db):
         ("older_fork", "parent"),
         ("newer_fork", "parent"),
     ])
+    db._conn.execute(
+        "UPDATE sessions SET end_reason = 'compression', ended_at = ? WHERE id = 'parent'",
+        (int(time.time()),),
+    )
+    db._conn.commit()
     db.append_message("newer_fork", role="user", content="x")
     assert db.resolve_resume_session_id("parent") == "newer_fork"
+
+
+def test_does_not_follow_gateway_rotation_chain(db):
+    # The gateway links EVERY rotated session to its predecessor via
+    # parent_session_id: idle/daily expiry ends the old row with
+    # end_reason='session_reset', /reset with 'session_switch'. Those edges
+    # are NOT compression continuations — resuming an older chat by explicit
+    # id must stay on that chat instead of silently landing on whatever
+    # newer conversation descends from it (reported on Telegram: /resume
+    # <old_id> restored a different session's title and 1-message history).
+    _make_chain(db, [
+        ("older", None),
+        ("newer", "older"),
+    ])
+    db.append_message("older", role="user", content="real conversation")
+    db.end_session("older", "session_reset")
+    db.append_message("newer", role="user", content="unrelated newer chat")
+
+    assert db.resolve_resume_session_id("older") == "older"
+
+
+def test_still_follows_multi_hop_compression_chain(db):
+    # Compression chains can span several hops; every followed edge must be
+    # a compression edge (parent ended with 'compression'). Once a hop ends
+    # with a rotation reason ('session_reset'), the chain is broken.
+    base = int(time.time()) - 10_000
+    conn = db._conn
+
+    def _mk(sid, parent, started, end_reason=None, ended_at=None):
+        db.create_session(sid, source="cli", parent_session_id=parent)
+        sets = ["started_at = ?"]
+        args = [base + started]
+        if end_reason:
+            sets.append("end_reason = ?")
+            args.append(end_reason)
+        if ended_at is not None:
+            sets.append("ended_at = ?")
+            args.append(base + ended_at)
+        args.append(sid)
+        conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", args)
+
+    _mk("root", None, 0, end_reason="compression", ended_at=50)
+    _mk("cont1", "root", 100, end_reason="session_reset", ended_at=150)
+    _mk("tip", "cont1", 300)
+    db.append_message("cont1", role="user", content="post-compression turn")
+    conn.commit()
+
+    # root → cont1 is a compression edge and is followed; cont1 → tip sits
+    # behind a rotation edge and must NOT be.
+    assert db.resolve_resume_session_id("root") == "cont1"
+    # And the rotation child never hijacks the target.
+    assert db.get_compression_tip("root") == "cont1"
 
 
 

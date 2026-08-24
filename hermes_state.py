@@ -8585,6 +8585,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The chain is always walked via the child whose ``started_at`` is
         latest; that matches the single-chain shape that compression creates.
         A depth cap (32) guards against accidental loops in malformed data.
+
+        Only compression-created edges are followed: a child counts as a
+        continuation only when its parent ended with ``end_reason =
+        'compression'`` — the same discriminator ``get_compression_tip``
+        uses. The gateway links EVERY rotated session to its predecessor via
+        ``parent_session_id`` (idle/daily expiry ends the old row with
+        ``session_reset``, ``/reset`` with ``session_switch``), so without
+        this gate an explicit ``/resume <id>`` silently lands on whatever
+        unrelated newer chat happens to descend from the target.
         """
         if not session_id:
             return session_id
@@ -8624,20 +8633,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if row is not None:
                     best = current
 
-                # Walk to the most-recently-started child — but skip explicit
-                # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
-                # and tool children. They also carry a ``parent_session_id`` yet
-                # are NOT compression continuations; following them would hijack
-                # the resume target to an unrelated session (e.g. a subagent
-                # run). This mirrors the child-exclusion in ``get_compression_tip``.
+                # Walk to the most-recently-started child — but only across a
+                # compression edge (parent ended with end_reason='compression',
+                # mirroring get_compression_tip), and skip explicit branch
+                # (`_branched_from`), delegate/subagent (`_delegate_from`),
+                # and tool children. They also carry a ``parent_session_id``
+                # yet are NOT compression continuations; following them would
+                # hijack the resume target to an unrelated session (e.g. a
+                # subagent run, or the gateway's next rotated chat — idle/
+                # daily resets link every session to its predecessor via
+                # parent_session_id). This mirrors the child-exclusion in
+                # ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
-                        "SELECT id FROM sessions "
-                        "WHERE parent_session_id = ? "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
-                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        "SELECT sessions.id FROM sessions "
+                        "JOIN sessions AS parent ON parent.id = sessions.parent_session_id "
+                        "WHERE sessions.parent_session_id = ? "
+                        "  AND parent.end_reason = 'compression' "
+                        "  AND json_extract(COALESCE(sessions.model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(sessions.model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND COALESCE(sessions.source, '') != 'tool' "
+                        "ORDER BY sessions.started_at DESC, sessions.id DESC LIMIT 1",
                         (current,),
                     ).fetchone()
                 except Exception:
