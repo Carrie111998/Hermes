@@ -43,7 +43,12 @@ const exec = promisify(execCallback)
 
 async function resolveHostPython(): Promise<string> {
   try {
-    const direct = (await exec('command -v python3 || command -v python')).stdout.trim()
+    const direct = (
+      await exec(
+        'if command -v python3 >/dev/null 2>&1; then command -v python3; ' +
+          'elif command -v python >/dev/null 2>&1; then command -v python; fi'
+      )
+    ).stdout.trim()
 
     if (direct) {
       return direct
@@ -364,18 +369,12 @@ test.skipIf(process.platform === 'win32')(
     const entrypoint = path.join(installDir, 'hermes')
     const launcher = path.join(temp, 'hermes launcher')
     const python = await resolveHostPython()
-    const bash = resolveBashExecutable()
-
-    if (!bash) {
-      throw new Error('no executable bash available on PATH')
-    }
-
     const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
 
     await mkdir(venvBin, { recursive: true })
     await symlink(python, pythonLink)
     await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
-    await writeFile(launcher, `#!${bash}\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
+    await writeFile(launcher, `#!/usr/bin/env bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)
 
     const backendFlags = [
