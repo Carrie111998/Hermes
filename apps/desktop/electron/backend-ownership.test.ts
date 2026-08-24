@@ -257,6 +257,9 @@ test('backend identity check matches only serve and dashboard invocation shapes'
   assert.equal(backendCommandMatches('"C:\\Hermes Runtime\\hermes.exe" dashboard --no-open'), true)
   assert.equal(backendCommandMatches('hermes chat --query serve'), false)
   assert.equal(backendCommandMatches('unrelated dashboard'), false)
+  assert.equal(backendCommandMatches('python -m hermes_cli.main --profile default gateway run --replace'), false)
+  assert.equal(backendCommandMatches('hermes gateway start'), false)
+  assert.equal(backendCommandMatches('hermes cron run'), false)
 })
 
 test('shutdown coordinator returns one promise and awaits teardown exactly once', async () => {

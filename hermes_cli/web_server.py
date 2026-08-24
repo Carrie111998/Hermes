@@ -16384,6 +16384,12 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "ticket_invalid", "ticket-subprotocol"
         ticket = protocol_ticket or ws.query_params.get("ticket", "")
         if not ticket:
+            # Fallback for loopback desktop / local serve clients: allow ?token= with _SESSION_TOKEN
+            # even when auth_required is engaged by dashboard.public_url.
+            token = ws.query_params.get("token", "")
+            client_host = ws.client.host if ws.client else ""
+            if token and client_host in _LOOPBACK_HOST_VALUES and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+                return None, "token"
             return "no_credential", "none"
 
         try:
