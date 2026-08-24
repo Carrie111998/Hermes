@@ -822,10 +822,14 @@ class BuzzAdapter(BasePlatformAdapter):
             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
         return subscriptions
 
-    async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
-        """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
-        self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
+    async def _discover_and_subscribe_new(self, websocket, subscriptions: Dict[str, Optional[str]]) -> None:
+        """Discover conversations and subscribe to new ones on the live socket.
+
+        Shared by the kind-44100 membership path and the WS loop's periodic
+        discovery sweep: some relays never emit a membership event for a
+        fresh DM (#93557), so the sweep gives the WebSocket transport the
+        same _DM_DISCOVERY_EVERY cadence the poll loop already has.
+        """
         before = set(self._channel_state)
         await self._discover_dms(seed=False)
         for channel_id in self._channel_state:
@@ -835,6 +839,12 @@ class BuzzAdapter(BasePlatformAdapter):
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
+
+    async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
+        """A membership event p-tagged to us: rediscover conversations and
+        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
+        self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
+        await self._discover_and_subscribe_new(websocket, subscriptions)
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
@@ -862,32 +872,73 @@ class BuzzAdapter(BasePlatformAdapter):
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
-                        async for raw in websocket:
+                        # Periodic DM discovery on the WS transport (#93557):
+                        # some relays never emit kind-44100 membership events
+                        # for a fresh DM, and the WS loop relied on them
+                        # alone — a mid-session DM stayed invisible until the
+                        # next reconnect. The poll loop already re-runs
+                        # discovery every _DM_DISCOVERY_EVERY sweeps; give
+                        # this loop the same cadence by bounding each receive
+                        # with the remaining time to the next sweep.
+                        _discovery_every = self.poll_interval * _DM_DISCOVERY_EVERY
+                        _next_dm_discovery = time.monotonic() + _discovery_every
+                        stream = websocket.__aiter__()
+                        while True:
+                            _recv_timeout = min(
+                                max(_next_dm_discovery - time.monotonic(), 1.0),
+                                30.0,
+                            )
                             try:
-                                message = json.loads(raw)
-                            except (ValueError, TypeError):
-                                logger.warning("Buzz: ignoring malformed WebSocket frame")
-                                continue
-                            if not isinstance(message, list) or not message:
-                                continue
-                            if message[0] == "EVENT" and len(message) >= 3:
-                                subscription_id = str(message[1])
-                                event = message[2]
-                                if not isinstance(event, dict):
+                                raw = await asyncio.wait_for(
+                                    stream.__anext__(), timeout=_recv_timeout
+                                )
+                            except asyncio.TimeoutError:
+                                # Quiet interval — fall through to the sweep
+                                # check below without a frame to process.
+                                raw = None
+                            except StopAsyncIteration:
+                                break
+                            if raw is not None:
+                                try:
+                                    message = json.loads(raw)
+                                except (ValueError, TypeError):
+                                    logger.warning("Buzz: ignoring malformed WebSocket frame")
                                     continue
-                                if subscription_id == _WS_MEMBERSHIP_SUB_ID:
-                                    await self._handle_membership_event(websocket, subscriptions, event)
+                                if not isinstance(message, list) or not message:
                                     continue
-                                channel_id = subscriptions.get(subscription_id)
-                                state = self._channel_state.get(channel_id or "")
-                                if channel_id and state is not None:
-                                    await self._handle_event(channel_id, state, event)
-                                    self._trim_seen(state)
-                            elif message[0] == "CLOSED":
-                                detail = message[-1] if len(message) > 2 else "subscription closed"
-                                raise ConnectionError(str(detail))
-                            elif message[0] == "NOTICE":
-                                logger.warning("Buzz: relay notice: %s", message[-1])
+                                if message[0] == "EVENT" and len(message) >= 3:
+                                    subscription_id = str(message[1])
+                                    event = message[2]
+                                    if not isinstance(event, dict):
+                                        continue
+                                    if subscription_id == _WS_MEMBERSHIP_SUB_ID:
+                                        await self._handle_membership_event(websocket, subscriptions, event)
+                                        continue
+                                    channel_id = subscriptions.get(subscription_id)
+                                    state = self._channel_state.get(channel_id or "")
+                                    if channel_id and state is not None:
+                                        await self._handle_event(channel_id, state, event)
+                                        self._trim_seen(state)
+                                elif message[0] == "CLOSED":
+                                    detail = message[-1] if len(message) > 2 else "subscription closed"
+                                    raise ConnectionError(str(detail))
+                                elif message[0] == "NOTICE":
+                                    logger.warning("Buzz: relay notice: %s", message[-1])
+                            if time.monotonic() >= _next_dm_discovery:
+                                _next_dm_discovery = (
+                                    time.monotonic() + _discovery_every
+                                )
+                                try:
+                                    await self._discover_and_subscribe_new(
+                                        websocket, subscriptions
+                                    )
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:
+                                    logger.debug(
+                                        "Buzz: WS DM discovery sweep failed",
+                                        exc_info=True,
+                                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
