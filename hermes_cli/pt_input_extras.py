@@ -48,6 +48,49 @@ def _clear_vt100_prefix_cache() -> None:
         pass
 
 
+def install_vt100_str_key_data_fix() -> bool:
+    """Make string-valued ``ANSI_SEQUENCES`` mappings insert the mapped text.
+
+    ``Vt100Parser._call_handler`` always passes the raw matched byte
+    sequence as ``KeyPress.data``. For ``Keys.*`` targets that is fine —
+    bound handlers ignore ``data`` — but for mappings whose value is a
+    plain string (Hermes' Shift+letter table: ``ESC[27;2;97~`` → ``"A"``)
+    the default self-insert binding inserts ``event.data``, i.e. the
+    literal escape text, which is exactly the #92343 symptom: Shift+letter
+    leaks ``[27;2;97~`` into the prompt buffer even though the parser now
+    decodes the sequence.
+
+    Stock prompt_toolkit has zero plain-string mappings (every one of the
+    180 string values is a ``Keys`` member), so overriding ``data`` for
+    string keys affects only Hermes' own tables. Idempotent.
+
+    Returns True when the patch was applied by this call.
+    """
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return False
+    if getattr(Vt100Parser, "_hermes_str_key_data_fix", False):
+        return False
+
+    original = Vt100Parser._call_handler
+
+    def _call_handler(self, key, insert_text):  # type: ignore[no-untyped-def]
+        # ``Keys`` members ARE str subclasses, so exclude them explicitly:
+        # only plain-string mapped values (Hermes' Shift+letter table) get
+        # data rewritten; every Keys.* mapping keeps its raw-byte data.
+        if isinstance(key, str) and not isinstance(key, Keys):
+            # The mapped value IS the intended text; the raw matched
+            # prefix is what used to leak into the buffer (#92343).
+            insert_text = key
+        original(self, key, insert_text)
+
+    Vt100Parser._call_handler = _call_handler  # type: ignore[method-assign]
+    Vt100Parser._hermes_str_key_data_fix = True  # type: ignore[attr-defined]
+    return True
+
+
 def install_shift_enter_alias() -> int:
     """Map Shift+Enter byte sequences to the (Escape, ControlM) key tuple
     that Alt+Enter produces, so the existing Alt+Enter newline handler
