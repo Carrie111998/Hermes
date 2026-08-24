@@ -1332,6 +1332,14 @@ def _trim_error(msg: str) -> str:
     return msg
 
 
+# Null/empty-valued "error"/"failed" keys inside JSON payloads are part of
+# normal success shapes (web_extract, crawl results), not failures.
+_JSON_NULLISH_ERROR_RE = re.compile(
+    r'"((?:error|failed))"\s*:\s*(?:null|""|\[\]|\{\}|false)(?=[\s,}\]\)]|$)',
+    re.IGNORECASE,
+)
+
+
 def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Inspect a tool result string for signs of failure.
 
@@ -1376,6 +1384,11 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     if not isinstance(result, str):
         return False, ""
     lower = result[:500].lower()
+    # Success payloads often carry null-valued "error"/"failed" keys
+    # (e.g. web_extract emits {"results": [{"url": ..., "error": null}, ...]}
+    # per entry even when every URL succeeded). Neutralise the nullish
+    # forms before the substring scan so they are not misread as failures.
+    lower = _JSON_NULLISH_ERROR_RE.sub(r"\1_present", lower)
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
         return True, " [error]"
 
