@@ -1990,10 +1990,18 @@ def _park_stashed_changes(stash_ref: str) -> None:
 def _prompt_answerable() -> bool:
     """True when a human can actually see and answer an interactive prompt.
 
-    Scheduled Tasks, CI, and hidden-window runs keep stdin OPEN but
-    unattended: ``input()`` then blocks forever instead of raising
-    ``EOFError`` (#92303). Mirror the config-migration prompt's guard:
-    require both stdin and stdout to be TTYs before asking anything.
+    Scheduled Tasks ("Run whether user is logged on or not") and CI keep
+    stdin OPEN but unattended: ``input()`` then blocks forever instead of
+    raising ``EOFError`` (#92303). This guard catches those by requiring
+    both stdin and stdout to be TTYs.
+
+    Known limitation: ``-WindowStyle Hidden`` Scheduled Tasks give the
+    process a REAL console that is merely not drawn, so ``isatty()``
+    returns ``True`` on both handles and this guard does NOT fire. That
+    configuration still hangs — the fix for it is a bounded wait
+    (see #92410), not a TTY check. This guard covers the larger
+    population: no-console runs where ``isatty()`` is ``False`` on
+    both handles.
     """
     try:
         return bool(
