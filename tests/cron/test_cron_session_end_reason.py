@@ -63,6 +63,34 @@ class _SucceedingCronAgent:
         pass
 
 
+class _DictFailCronAgent:
+    """Agent that returns a failed result dict WITHOUT raising.
+
+    The AI review on #88454 worried a `failed: True` / `completed: False`
+    result (provider 401s, protocol violations) might fall through to the
+    finally block with the flag still unset and get stamped "cron_complete".
+    run_job converts that result shape into a raise (the result-failure check
+    below), so it lands on the same except handler that sets the failure
+    outcome. This fixture pins that chain so a future refactor can't silently
+    reintroduce the gap.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    def run_conversation(self, prompt):
+        return {
+            "completed": True,
+            "failed": True,
+            "final_response": "",
+            "turn_exit_reason": "",
+            "error": "provider 401 unauthorized",
+        }
+
+    def close(self):
+        pass
+
+
 def _install_patch_set(monkeypatch, tmp_path, session_db, fake_agent_cls):
     """Apply the exact patch set the isolation test uses to make run_job
     execute cleanly down both the success and failure paths."""
@@ -130,3 +158,27 @@ def test_run_job_successful_run_stamps_end_reason_cron_complete(
     assert len(session_db.ended) == 1
     session_id, end_reason = session_db.ended[0]
     assert end_reason == "cron_complete"
+
+
+def test_run_job_failed_result_dict_stamps_cron_failed(monkeypatch, tmp_path):
+    """A run that returns failed:True WITHOUT raising must still stamp
+    end_reason='cron_failed'.
+
+    The AI review on #88454 flagged that a non-raising failure (provider 401,
+    protocol violation, kanban fail-closed) might fall through to the finally
+    block unmarked and be stamped 'cron_complete'. run_job converts that
+    result shape into a raise (the result-failure check), which the except
+    handler catches and marks failed — so it must land 'cron_failed'. Pins the
+    raise→except→outcome chain.
+    """
+    session_db = _RecordingSessionDB()
+    _install_patch_set(monkeypatch, tmp_path, session_db, _DictFailCronAgent)
+
+    success, _output, final_response, error = cron_scheduler.run_job(_JOB)
+
+    assert success is False
+    assert error is not None
+    assert len(session_db.ended) == 1
+    session_id, end_reason = session_db.ended[0]
+    assert end_reason == "cron_failed"
+    assert end_reason != "cron_complete"

@@ -5543,11 +5543,22 @@ def run_job(
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _non_dispatcher_token = None
-    # Whether this run took the failure path. The finally block closes the
-    # cron session via end_session(); it must stamp a FAILED run with
-    # end_reason="cron_failed" instead of "cron_complete" so the session
-    # stays distinguishable from a completed run (#88443).
-    _cron_run_failed = False
+    # Outcome of this run, threaded to the finally block so it closes the
+    # cron session with the correct end_reason. Values: "cron_failed" (any
+    # failure path) or "cron_complete" (success). A failed run must not be
+    # indistinguishable from a completed one (#88443). Held as the reason
+    # string directly (not a bool+map) so future reasons (e.g. "cron_cancelled",
+    # "cron_timeout") don't need another parallel mapping.
+    #
+    # Exits that determine the outcome, in control-flow order:
+    #   - lock fail-closed (raise before session creation) -> no session to
+    #     stamp, the finally's end_session guard no-ops
+    #   - result-shape failure (raise from the failed/completed check below)
+    #     -> "cron_failed"
+    #   - inactivity TimeoutError -> "cron_failed"
+    #   - any other exception -> "cron_failed"
+    #   - normal return -> "cron_complete" (the default, left untouched)
+    _cron_run_outcome = "cron_complete"
     try:
         if not _cwd_lock_acquired:
             # Fail closed (#79768): running without the lock would let a
@@ -6380,7 +6391,7 @@ def run_job(
         # session with end_reason="cron_failed" instead of "cron_complete"
         # (#88443). A failed run must not be indistinguishable from a
         # completed one.
-        _cron_run_failed = True
+        _cron_run_outcome = "cron_failed"
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
         # with a None check so the audit write itself never raises.
@@ -6517,7 +6528,7 @@ def run_job(
                 # ended_at IS NULL), so this must be the correct reason here.
                 _session_db.end_session(
                     _final_cron_session_id,
-                    "cron_failed" if _cron_run_failed else "cron_complete",
+                    _cron_run_outcome,
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
