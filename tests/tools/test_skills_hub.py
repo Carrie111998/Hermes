@@ -573,7 +573,7 @@ class TestCheckForSkillUpdates:
                 hasher.update(path.read_bytes())
         return f"sha256:{hasher.hexdigest()[:16]}"
 
-    def test_legacy_cache_hash_is_accepted_and_migrated_with_remote_proof(
+    def test_legacy_cache_hash_is_accepted_without_migration_with_remote_proof(
         self, tmp_path, monkeypatch
     ):
         from tools.skills_guard import content_hash
@@ -600,6 +600,8 @@ class TestCheckForSkillUpdates:
             install_path="category/demo-skill",
             files=["SKILL.md", "scripts/__pycache__/helper.cpython-313.pyc"],
         )
+        migrate = MagicMock(wraps=lock.migrate_content_hash)
+        monkeypatch.setattr(lock, "migrate_content_hash", migrate)
         source = MagicMock()
         source.source_id.return_value = "github"
         source.fetch.return_value = SkillBundle(
@@ -617,9 +619,80 @@ class TestCheckForSkillUpdates:
         results = check_for_skill_updates(lock=lock, sources=[source])
 
         assert results[0]["status"] == "up_to_date"
-        assert lock.get_installed("demo-skill")["content_hash"] == content_hash(
-            skill_dir
+        assert lock.get_installed("demo-skill")["content_hash"] == legacy_hash
+        assert content_hash(skill_dir) == results[0]["latest_hash"]
+        migrate.assert_not_called()
+
+    @pytest.mark.parametrize("install_path", ["", "../demo-skill", "demo-skill"])
+    def test_legacy_remote_hash_without_resolvable_installed_tree_needs_update(
+        self, tmp_path, monkeypatch, install_path
+    ):
+        import tools.skills_hub as hub
+
+        bundle = SkillBundle(
+            name="demo-skill",
+            files={
+                "SKILL.md": "same content",
+                "scripts/__pycache__/helper.cpython-313.pyc": b"original-cache",
+            },
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
         )
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": hub.legacy_bundle_content_hash(bundle),
+            "install_path": install_path,
+        }]
+        source = MagicMock()
+        source.source_id.return_value = "github"
+        source.fetch.return_value = bundle
+        monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path / "skills")
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results[0]["status"] == "update_available"
+        lock.migrate_content_hash.assert_not_called()
+
+    def test_legacy_remote_hash_with_local_edits_needs_update(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.skills_hub as hub
+
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "demo-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("locally edited", encoding="utf-8")
+        bundle = SkillBundle(
+            name="demo-skill",
+            files={
+                "SKILL.md": "upstream content",
+                "scripts/__pycache__/helper.cpython-313.pyc": b"original-cache",
+            },
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": hub.legacy_bundle_content_hash(bundle),
+            "install_path": "demo-skill",
+        }]
+        source = MagicMock()
+        source.source_id.return_value = "github"
+        source.fetch.return_value = bundle
+        monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results[0]["status"] == "update_available"
+        lock.migrate_content_hash.assert_not_called()
 
     def test_corrupt_lock_hash_is_not_accepted_or_migrated(self, tmp_path, monkeypatch):
         import tools.skills_hub as hub

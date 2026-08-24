@@ -4549,12 +4549,6 @@ def check_for_skill_updates(
             status = "up_to_date"
         elif resolved_tree_hash is not None:
             # The installed tree proves this was a real old-format lock hash.
-            # Re-baseline to its canonical identity before do_update performs
-            # its independent local-edit check.
-            if resolved_tree_hash != current_hash:
-                lock.migrate_content_hash(
-                    entry.get("name", ""), current_hash, resolved_tree_hash
-                )
             status = (
                 "up_to_date"
                 if resolved_tree_hash == latest_hash
@@ -4563,18 +4557,16 @@ def check_for_skill_updates(
         elif current_hash == legacy_bundle_content_hash(bundle):
             # A refreshed generated cache can prevent the local tree from
             # reproducing the old hash.  The remote bundle still proves the
-            # recorded cache-inclusive identity.  Migrate only when canonical
-            # disk content also matches remote, preserving real-edit guards.
-            status = "up_to_date"
+            # recorded cache-inclusive identity.  It is current only when an
+            # existing disk tree also proves its canonical content matches.
+            status = "update_available"
             if install_path is not None and install_path.is_dir():
                 try:
                     disk_hash = content_hash(install_path)
                 except OSError:
                     disk_hash = None
                 if disk_hash == latest_hash:
-                    lock.migrate_content_hash(
-                        entry.get("name", ""), current_hash, latest_hash
-                    )
+                    status = "up_to_date"
         else:
             status = "update_available"
         results.append({
