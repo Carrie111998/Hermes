@@ -1844,6 +1844,15 @@ def _normalize_max_turns(value: Any) -> Optional[int]:
     return turns
 
 
+def _normalize_runtime_policy(value: Any) -> Optional[str]:
+    """Return an operator-owned authoritative policy id, or None."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", value):
+        raise ValueError("runtime_policy must be a lowercase plugin policy id")
+    return value
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1948,6 +1957,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     max_turns: Optional[int] = None,
+    runtime_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2017,6 +2027,8 @@ def create_job(
                 config resolution, pre-existing behavior).
         max_turns: Optional positive per-run model-call cap. A lower global
                 agent.max_turns still clamps this value at fire time.
+        runtime_policy: Optional operator-owned authoritative policy id. The
+                model-facing cron tool cannot set it.
 
     Returns:
         The created job dict
@@ -2051,6 +2063,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_max_turns = _normalize_max_turns(max_turns)
+    normalized_runtime_policy = _normalize_runtime_policy(runtime_policy)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2169,6 +2182,8 @@ def create_job(
         job["reasoning_effort"] = normalized_reasoning_effort
     if normalized_max_turns is not None:
         job["max_turns"] = normalized_max_turns
+    if normalized_runtime_policy is not None:
+        job["runtime_policy"] = normalized_runtime_policy
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2285,6 +2300,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 )
             if "max_turns" in updates:
                 updates["max_turns"] = _normalize_max_turns(updates["max_turns"])
+            if "runtime_policy" in updates:
+                updates["runtime_policy"] = _normalize_runtime_policy(
+                    updates["runtime_policy"]
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

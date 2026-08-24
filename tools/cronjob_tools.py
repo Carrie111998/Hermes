@@ -1284,6 +1284,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     max_turns: Optional[int] = None,
+    runtime_policy: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1397,6 +1398,7 @@ def cronjob(
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
                     max_turns=max_turns,
+                    runtime_policy=runtime_policy,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1603,6 +1605,8 @@ def cronjob(
                 updates["reasoning_effort"] = reasoning_effort
             if max_turns is not None:
                 updates["max_turns"] = max_turns
+            if runtime_policy is not None:
+                updates["runtime_policy"] = runtime_policy
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may

@@ -402,6 +402,66 @@ def test_mcp_runtime_stop_prevents_another_model_call():
     assert result["turn_exit_reason"] == "runtime_stop(max_items)"
 
 
+def test_authoritative_result_failure_prevents_another_model_call():
+    agent = _make_agent("mcp_fleet_claim", max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="", finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("mcp_fleet_claim", "{}", "claim-1")],
+        ),
+        AssertionError("policy failure must prevent another model call"),
+    ]
+
+    def dispatch(*_args, **_kwargs):
+        from tools import mcp_tool
+        mcp_tool._mcp_runtime_stop.set({
+            "reason": "policy_error", "status": "failure", "policy": "required",
+        })
+        return '{"error": "trusted policy failed"}'
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("claim work")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "runtime_stop(policy_error)"
+    assert result["failed"] is True
+    assert result["completed"] is False
+
+
+def test_authoritative_success_is_typed_without_assistant_prose():
+    agent = _make_agent("mcp_fleet_claim", max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [_mock_response(
+        content="", finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call("mcp_fleet_claim", "{}", "claim-1")],
+    )]
+
+    def dispatch(*_args, **_kwargs):
+        from tools import mcp_tool
+        mcp_tool._mcp_runtime_stop.set({
+            "reason": "max_items", "status": "success", "policy": "fleet-runtime",
+        })
+        return '{"result": "done"}'
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("claim work")
+
+    assert result["completed"] is True
+    assert result["final_response"] is None
+    assert result["trusted_terminal_outcome"] == {
+        "reason": "max_items", "status": "success", "policy": "fleet-runtime",
+    }
+
+
 
 
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():

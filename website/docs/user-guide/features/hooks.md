@@ -387,6 +387,24 @@ def register(ctx):
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
 
+### Authoritative scheduled-run policies
+
+`ctx.register_hook()` is always fail-open observer compatibility plumbing. Do
+not use it for scheduled-run admission or identity. An operator can pin an
+agent-backed job with `hermes cron create --runtime-policy <id>` and the plugin
+must register all four callbacks with
+`ctx.register_authoritative_hook(id, hook, callback)`:
+
+- `on_session_start` returns `{"action": "allow"}`;
+- `mcp_request_metadata` returns `{"meta": {...}}` before the RPC;
+- `mcp_tool_result` returns `{"action": "continue"}` or a typed stop with
+  `reason` and `status` (`success` or `failure`);
+- `on_session_finalize` durably settles the run and returns
+  `{"status": "finalized"}`.
+
+Missing, raising, or malformed required callbacks fail closed. Jobs without
+`runtime_policy` retain the ordinary observer-hook behavior.
+
 ### Cache-safe system prompt sections
 
 Plugins that need durable, always-on guidance can register a bounded system

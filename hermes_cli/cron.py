@@ -186,6 +186,8 @@ def cron_list(show_all: bool = False):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
         if job.get("max_turns") is not None:
             print(f"    Max turns: {job['max_turns']}")
+        if job.get("runtime_policy"):
+            print(f"    Runtime policy: {job['runtime_policy']}")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
@@ -414,6 +416,7 @@ def cron_create(args):
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         max_turns=getattr(args, "max_turns", None),
+        runtime_policy=getattr(args, "runtime_policy", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -490,6 +493,7 @@ def cron_edit(args):
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         max_turns=getattr(args, "max_turns", None),
+        runtime_policy=getattr(args, "runtime_policy", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

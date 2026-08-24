@@ -3446,6 +3446,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             directive = consume_mcp_runtime_stop()
             if directive and agent._runtime_stop_reason is None:
                 agent._runtime_stop_reason = directive["reason"]
+                agent._runtime_terminal_outcome = dict(directive)
         except Exception:
             pass
         return result

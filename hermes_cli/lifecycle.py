@@ -39,6 +39,16 @@ def has_hook(hook_name: str) -> bool:
 
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
+    from hermes_cli import plugins
+
+    session_id = str(kwargs.get("session_id") or "")
+    receipt = None
+    if session_id and plugins.authoritative_session_policy(session_id):
+        receipt = plugins.finalize_authoritative_session(
+            session_id, **{key: value for key, value in kwargs.items()
+                           if key != "session_id"},
+        )
+
     try:
         from hermes_cli.observability import observe_lifecycle
 
@@ -46,7 +56,6 @@ def finalize_session(**kwargs: Any) -> List[Any]:
     except Exception:
         logger.warning("Built-in observability hook failed", exc_info=True)
 
-    session_id = str(kwargs.get("session_id") or "")
     if session_id:
         try:
             from agent import relay_runtime
@@ -58,6 +67,5 @@ def finalize_session(**kwargs: Any) -> List[Any]:
         except Exception:
             logger.warning("Core Relay session finalization failed", exc_info=True)
 
-    from hermes_cli import plugins
-
-    return plugins.invoke_hook("on_session_finalize", **kwargs)
+    results = plugins.invoke_hook("on_session_finalize", **kwargs)
+    return ([receipt] if receipt is not None else []) + results

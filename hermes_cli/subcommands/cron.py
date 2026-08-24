@@ -125,6 +125,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Maximum model calls for each run of this job.",
     )
     cron_create.add_argument(
+        "--runtime-policy",
+        help="Require a fail-closed authoritative runtime policy for this job.",
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -263,6 +267,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--max-turns",
         type=int,
         help="Set the per-run model-call cap.",
+    )
+    cron_edit.add_argument(
+        "--runtime-policy",
+        help="Set the required authoritative runtime policy (empty clears).",
     )
 
     # lifecycle actions

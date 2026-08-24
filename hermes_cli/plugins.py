@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import importlib.metadata
@@ -401,6 +402,11 @@ SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "mcp_tool_result",
     "transform_api_error_classification",
 }
+
+AUTHORITATIVE_SCHEDULED_HOOKS = frozenset({
+    "on_session_start", "mcp_request_metadata", "mcp_tool_result",
+    "on_session_finalize",
+})
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
@@ -3158,6 +3164,29 @@ class PluginContext:
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
 
+    def register_authoritative_hook(
+        self, policy_id: str, hook_name: str, callback: Callable,
+    ) -> PluginRegistration:
+        """Register one fail-closed scheduled-run policy callback."""
+        policy_id = str(policy_id).strip()
+        if not policy_id or hook_name not in AUTHORITATIVE_SCHEDULED_HOOKS:
+            raise ValueError("invalid authoritative scheduled-run policy hook")
+        hooks = self._manager._authoritative_policies.setdefault(policy_id, {})
+        if hook_name in hooks:
+            raise ValueError(
+                f"authoritative policy {policy_id!r} already registered {hook_name!r}"
+            )
+        hooks[hook_name] = callback
+
+        def release() -> None:
+            current = self._manager._authoritative_policies.get(policy_id)
+            if current is not None and current.get(hook_name) is callback:
+                del current[hook_name]
+                if not current:
+                    del self._manager._authoritative_policies[policy_id]
+
+        return self._track("authoritative_hook", f"{policy_id}:{hook_name}", release)
+
     def register_system_prompt_section(
         self,
         id: str,
@@ -3424,6 +3453,9 @@ class PluginManager:
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._authoritative_policies: Dict[str, Dict[str, Callable]] = {}
+        self._authoritative_sessions: Dict[str, str] = {}
+        self._authoritative_lock = threading.RLock()
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -3829,6 +3861,8 @@ class PluginManager:
             self._ownership_ledger.clear()
             self._plugins.clear()
             self._hooks.clear()
+            self._authoritative_policies.clear()
+            self._authoritative_sessions.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -6011,6 +6045,75 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
+
+
+def _invoke_authoritative_policy(
+    manager: PluginManager, policy_id: str, hook_name: str, payload: Dict[str, Any],
+) -> Any:
+    callback = manager._authoritative_policies.get(policy_id, {}).get(hook_name)
+    if callback is None:
+        raise RuntimeError(
+            f"required authoritative policy {policy_id!r} has no {hook_name!r} callback"
+        )
+    return manager._invoke_hook_callback(callback, payload)
+
+
+def activate_authoritative_session(
+    policy_id: str, session_id: str, **kwargs: Any,
+) -> Dict[str, Any]:
+    """Admit and bind one session through a required fail-closed policy."""
+    manager = _delivery_manager()
+    with manager._authoritative_lock:
+        if not session_id or session_id in manager._authoritative_sessions:
+            raise RuntimeError("authoritative session id is absent or already active")
+        decision = _invoke_authoritative_policy(
+            manager, policy_id, "on_session_start",
+            {"session_id": session_id, **kwargs},
+        )
+        if not isinstance(decision, dict) or decision.get("action") != "allow":
+            reason = decision.get("reason") if isinstance(decision, dict) else None
+            raise RuntimeError(str(reason or "authoritative session admission denied"))
+        manager._authoritative_sessions[session_id] = policy_id
+        return decision
+
+
+def authoritative_session_policy(session_id: str) -> Optional[str]:
+    manager = _delivery_manager()
+    lock = getattr(manager, "_authoritative_lock", contextlib.nullcontext())
+    with lock:
+        return getattr(manager, "_authoritative_sessions", {}).get(session_id)
+
+
+def invoke_authoritative_session_hook(
+    session_id: str, hook_name: str, **kwargs: Any,
+) -> Any:
+    """Invoke one active session's policy without observer-style isolation."""
+    manager = _delivery_manager()
+    with manager._authoritative_lock:
+        policy_id = manager._authoritative_sessions.get(session_id)
+        if policy_id is None:
+            raise RuntimeError("session has no active authoritative policy")
+        return _invoke_authoritative_policy(
+            manager, policy_id, hook_name,
+            {"session_id": session_id, **kwargs},
+        )
+
+
+def finalize_authoritative_session(session_id: str, **kwargs: Any) -> Dict[str, Any]:
+    """Require a durable policy receipt before forgetting a session binding."""
+    manager = _delivery_manager()
+    with manager._authoritative_lock:
+        policy_id = manager._authoritative_sessions.get(session_id)
+        if policy_id is None:
+            raise RuntimeError("session has no active authoritative policy")
+        receipt = _invoke_authoritative_policy(
+            manager, policy_id, "on_session_finalize",
+            {"session_id": session_id, **kwargs},
+        )
+        if not isinstance(receipt, dict) or receipt.get("status") != "finalized":
+            raise RuntimeError("authoritative session finalizer returned no receipt")
+        del manager._authoritative_sessions[session_id]
+        return receipt
 
 
 def render_system_prompt_sections(

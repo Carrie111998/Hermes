@@ -5857,16 +5857,30 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         request_meta: Dict[str, Any] = {}
         try:
-            from hermes_cli.plugins import invoke_hook
-            for value in invoke_hook(
-                "mcp_request_metadata",
-                server_name=server_name,
-                tool_name=tool_name,
-                session_id=str(kwargs.get("session_id") or ""),
-                task_id=str(kwargs.get("task_id") or ""),
-            ):
+            from hermes_cli.plugins import (
+                authoritative_session_policy,
+                invoke_authoritative_session_hook,
+                invoke_hook,
+            )
+            _session_id = str(kwargs.get("session_id") or "")
+            _policy_id = authoritative_session_policy(_session_id)
+            if _policy_id:
+                values = [invoke_authoritative_session_hook(
+                    _session_id, "mcp_request_metadata",
+                    server_name=server_name, tool_name=tool_name,
+                    task_id=str(kwargs.get("task_id") or ""),
+                )]
+            else:
+                values = invoke_hook(
+                    "mcp_request_metadata", server_name=server_name,
+                    tool_name=tool_name, session_id=_session_id,
+                    task_id=str(kwargs.get("task_id") or ""),
+                )
+            for value in values:
                 supplied = value.get("meta") if isinstance(value, dict) else None
                 if not isinstance(supplied, dict):
+                    if _policy_id:
+                        raise RuntimeError("authoritative metadata callback returned no meta")
                     continue
                 overlap = request_meta.keys() & supplied.keys()
                 if overlap:
@@ -6031,22 +6045,53 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
         def _record_runtime_stop(result: str) -> str:
+            _session_id = str(kwargs.get("session_id") or "")
+            _policy_id = None
             try:
-                from hermes_cli.plugins import invoke_hook
-                decisions = invoke_hook(
-                    "mcp_tool_result",
-                    server_name=server_name,
-                    tool_name=tool_name,
-                    session_id=str(kwargs.get("session_id") or ""),
-                    task_id=str(kwargs.get("task_id") or ""),
-                    meta=response_meta,
+                from hermes_cli.plugins import (
+                    authoritative_session_policy,
+                    invoke_authoritative_session_hook,
+                    invoke_hook,
                 )
+                _policy_id = authoritative_session_policy(_session_id)
+                if _policy_id:
+                    decisions = [invoke_authoritative_session_hook(
+                        _session_id, "mcp_tool_result",
+                        server_name=server_name, tool_name=tool_name,
+                        task_id=str(kwargs.get("task_id") or ""), meta=response_meta,
+                    )]
+                else:
+                    decisions = invoke_hook(
+                        "mcp_tool_result", server_name=server_name,
+                        tool_name=tool_name, session_id=_session_id,
+                        task_id=str(kwargs.get("task_id") or ""), meta=response_meta,
+                    )
                 for decision in decisions:
-                    if isinstance(decision, dict) and decision.get("action") == "stop":
+                    if not isinstance(decision, dict):
+                        if _policy_id:
+                            raise RuntimeError("authoritative result callback returned no decision")
+                        continue
+                    if decision.get("action") == "stop":
                         reason = str(decision.get("reason") or "mcp_result")
-                        _mcp_runtime_stop.set({"reason": reason})
+                        status = str(decision.get("status") or "success")
+                        if _policy_id and status not in {"success", "failure"}:
+                            raise RuntimeError("authoritative stop status is invalid")
+                        directive = {"reason": reason}
+                        if _policy_id:
+                            directive.update(status=status, policy=str(_policy_id))
+                        _mcp_runtime_stop.set(directive)
                         break
-            except Exception:
+                    if _policy_id and decision.get("action") != "continue":
+                        raise RuntimeError("authoritative result action is invalid")
+            except Exception as exc:
+                if _policy_id:
+                    _mcp_runtime_stop.set({
+                        "reason": "policy_error", "status": "failure",
+                        "policy": str(_policy_id),
+                    })
+                    return tool_error(
+                        f"Trusted MCP result policy failed: {type(exc).__name__}"
+                    )
                 logger.warning("MCP result hook failed", exc_info=True)
             return result
 

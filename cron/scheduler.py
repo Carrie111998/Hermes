@@ -5433,6 +5433,7 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    result = None
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -6109,6 +6110,7 @@ def run_job(
         agent.cron_job_id = job_id
         agent.cron_job_name = job_name
         agent.cron_max_turns = job.get("max_turns")
+        agent.runtime_policy = job.get("runtime_policy")
         agent.runtime_task_id = _cron_session_id
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -6436,8 +6438,13 @@ def run_job(
                     cron_job_id=job_id,
                     cron_job_name=job_name,
                     cron_max_turns=job.get("max_turns"),
+                    completed=(result or {}).get("completed") is True,
+                    failed=(result or {}).get("failed") is True,
+                    terminal_outcome=(result or {}).get("trusted_terminal_outcome"),
                 )
             except (Exception, KeyboardInterrupt) as exc:
+                if job.get("runtime_policy"):
+                    raise
                 logger.warning("Job '%s': session finalizer failed: %s", job_id, exc)
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no

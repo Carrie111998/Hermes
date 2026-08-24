@@ -18,11 +18,18 @@ def test_per_job_max_turns_persists_and_validates(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "jobs.json")
     monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "outputs")
 
-    created = jobs.create_job("work", "every 1h", max_turns=12)
+    created = jobs.create_job(
+        "work", "every 1h", max_turns=12, runtime_policy="fleet-runtime")
     assert jobs.get_job(created["id"])["max_turns"] == 12
     assert _format_job(created)["max_turns"] == 12
     assert "max_turns" not in CRONJOB_SCHEMA["parameters"]["properties"]
-    assert jobs.update_job(created["id"], {"max_turns": 7})["max_turns"] == 7
+    assert "runtime_policy" not in CRONJOB_SCHEMA["parameters"]["properties"]
+    assert jobs.get_job(created["id"])["runtime_policy"] == "fleet-runtime"
+    updated = jobs.update_job(created["id"], {
+        "max_turns": 7, "runtime_policy": "replacement.policy",
+    })
+    assert updated["max_turns"] == 7
+    assert updated["runtime_policy"] == "replacement.policy"
     with pytest.raises(ValueError, match="positive integer"):
         jobs.update_job(created["id"], {"max_turns": 0})
 

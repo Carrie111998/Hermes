@@ -1964,6 +1964,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             directive = consume_mcp_runtime_stop()
             if directive and agent._runtime_stop_reason is None:
                 agent._runtime_stop_reason = directive["reason"]
+                agent._runtime_terminal_outcome = dict(directive)
         except Exception:
             pass
         return result

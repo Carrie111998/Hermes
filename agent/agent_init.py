@@ -992,6 +992,8 @@ def init_agent(
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
     agent._runtime_stop_reason = None
+    agent._runtime_terminal_outcome = None
+    agent.runtime_policy = None
 
     # Optional wall-clock run budget (seconds per run_conversation turn).
     # Explicit constructor arg wins; else resolved from config.yaml
