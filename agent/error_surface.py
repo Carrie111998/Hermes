@@ -235,7 +235,12 @@ def build_error_surface_from_exception(
             exc, "status_code"
         )
 
-        if not api_like or not isinstance(exc, Exception):
+        if not isinstance(exc, Exception):
+            # KeyboardInterrupt and SystemExit inherit from BaseException,
+            # not Exception. They are control-flow signals, not failures a
+            # caller can recover from by retrying the turn.
+            return _surface(LAYER_GATEWAY, type(exc).__name__, False, provider, model)
+        if not api_like:
             return _surface(LAYER_GATEWAY, type(exc).__name__, True, provider, model)
 
         from agent.error_classifier import classify_api_error
