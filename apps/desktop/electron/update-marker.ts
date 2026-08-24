@@ -29,6 +29,33 @@ import path from 'path'
 // must never let the desktop start a backend into a mutating checkout.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 const MAX_U32 = 0xffffffff
+const FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0
+
+/**
+ * Open a marker through a stable file handle before doing any I/O.
+ *
+ * POSIX has a native O_NOFOLLOW flag. Node/libuv does not expose the Windows
+ * FILE_FLAG_OPEN_REPARSE_POINT bit through fs.openSync, so Windows uses the
+ * equivalent handle boundary: open first, immediately re-check the path
+ * topology, and read/write only through the already-open descriptor. A handle
+ * cannot be redirected after it is opened; the post-open check rejects a
+ * reparse-point race that happened while opening. Keep the Windows constant
+ * next to this helper as the contract we mirror (and to make the boundary
+ * explicit for native-backed Electron builds).
+ */
+function openMarkerNoFollow(filePath: string, flags: number, mode?: number) {
+  const openFlags =
+    process.platform === 'win32' ? flags | FILE_FLAG_OPEN_REPARSE_POINT : flags | O_NOFOLLOW
+  const fd = fs.openSync(filePath, openFlags, mode)
+  try {
+    assertNoReparseTopology(filePath, { allowMissing: false })
+    return fd
+  } catch (err) {
+    fs.closeSync(fd)
+    throw err
+  }
+}
 
 export function markerPath(hermesHome) {
   // Named profiles have distinct HERMES_HOME values but mutate the same
@@ -157,7 +184,12 @@ export function readLiveUpdateMarker(
 
   try {
     assertNoReparseTopology(file, { allowMissing: true })
-    raw = fs.readFileSync(file, 'utf8')
+    const fd = openMarkerNoFollow(file, fs.constants.O_RDONLY)
+    try {
+      raw = fs.readFileSync(fd, 'utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
   } catch (err) {
     if (err && err.code === 'ENOENT') {
       return null
@@ -258,9 +290,17 @@ export function writeUpdateMarker(
 
     assertNoReparseTopology(file, { allowMissing: true })
     assertNoReparseTopology(temp, { allowMissing: false })
-    // linkSync is atomic and refuses an existing destination. Readers can
-    // observe only the complete staged inode, never an empty/truncated body.
-    fs.linkSync(temp, file)
+    // Keep a no-follow handle on the complete staged inode through the
+    // no-clobber publish. Readers never consume a path that was reparse-swapped
+    // after the topology check.
+    const tempHandle = openMarkerNoFollow(temp, fs.constants.O_RDONLY)
+    try {
+      // linkSync is atomic and refuses an existing destination. Readers can
+      // observe only the complete staged inode, never an empty/truncated body.
+      fs.linkSync(temp, file)
+    } finally {
+      fs.closeSync(tempHandle)
+    }
   } catch {
     // Best-effort: an existing winner is intentionally left untouched. If
     // publication itself is unavailable, Rust still fails closed when it

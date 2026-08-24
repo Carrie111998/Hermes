@@ -39,12 +39,22 @@ async function probeWindowsRemote(ssh, explicitHermesPath = '') {
     '$hermesHome=$env:HERMES_HOME',
     'if(-not $hermesHome){$hermesHome=Join-Path $env:LOCALAPPDATA "hermes"}',
     'Assert-NoReparse $hermesHome $true',
+    '$candidate=[IO.Path]::Combine($hermesHome, "hermes-agent\\venv\\Scripts\\hermes.exe")',
+    '$candidatePython=[IO.Path]::Combine([IO.Path]::GetDirectoryName($candidate), "python.exe")',
+    'Assert-NoReparse $candidate $true',
+    'Assert-NoReparse $candidatePython $true',
+    '$profileCandidate=[IO.Path]::Combine($HOME, "hermes-agent\\.venv\\Scripts\\hermes.exe")',
+    '$profileCandidatePython=[IO.Path]::Combine([IO.Path]::GetDirectoryName($profileCandidate), "python.exe")',
+    'Assert-NoReparse $profileCandidate $true',
+    'Assert-NoReparse $profileCandidatePython $true',
+    '$fallbackHomeCandidate=Join-Path $hermesHome "hermes-agent\\venv\\Scripts\\hermes.exe"',
+    '$fallbackProfileCandidate=Join-Path $HOME "hermes-agent\\.venv\\Scripts\\hermes.exe"',
     '$candidates=@()',
     'if($explicit){$candidates+=$explicit}',
     '$cmd=Get-Command hermes.exe -ErrorAction SilentlyContinue',
-    'if($cmd){Assert-NoReparse $cmd.Source $true;$candidates+=$cmd.Source}',
-    '$candidates+=(Join-Path $hermesHome "hermes-agent\\venv\\Scripts\\hermes.exe")',
-    '$candidates+=(Join-Path $HOME "hermes-agent\\.venv\\Scripts\\hermes.exe")',
+    'if($cmd){Assert-NoReparse $cmd.Source $true;$cmdPython=[IO.Path]::Combine([IO.Path]::GetDirectoryName($cmd.Source), "python.exe");Assert-NoReparse $cmdPython $true;$candidates+=$cmd.Source}',
+    '$candidates+=$fallbackHomeCandidate',
+    '$candidates+=$fallbackProfileCandidate',
     '$hermes=$null',
     'foreach($candidate in $candidates){Assert-NoReparse $candidate $true;$candidatePython=[IO.Path]::Combine([IO.Path]::GetDirectoryName($candidate), "python.exe");Assert-NoReparse $candidatePython $true;try{$item=Get-Item -LiteralPath $candidate -Force -ErrorAction Stop;if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $item.PSIsContainer){$hermes=$item.FullName;break}}catch [Management.Automation.ItemNotFoundException]{continue}}',
     'if(-not $hermes){throw "Hermes is not installed on the remote Windows host."}',
@@ -61,16 +71,44 @@ async function probeWindowsRemote(ssh, explicitHermesPath = '') {
 function windowsUpdateMarkerProbeCommand(hermesHome) {
   const script = [
     '$ErrorActionPreference="Stop"',
+    `Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class HermesMarkerNoFollow {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+  public static FileStream OpenRead(string name) {
+    var handle=CreateFile(name, 0x80000000, 0x00000007, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+    if(handle.IsInvalid) Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+    return new FileStream(handle, FileAccess.Read);
+  }
+}
+'@
+`,
+    'function Assert-NoReparse([string]$candidate,[bool]$allowMissing=$false){',
+    'if([string]::IsNullOrWhiteSpace($candidate)){return}',
+    '$current=[IO.Path]::GetFullPath($candidate);$first=$true',
+    'while($true){',
+    'try{$item=Get-Item -LiteralPath $current -Force -ErrorAction Stop}',
+    'catch [Management.Automation.ItemNotFoundException]{if(-not $allowMissing -and $first){throw "Path was not found: $candidate"};$parent=[IO.Path]::GetDirectoryName($current);if(-not $parent -or $parent -eq $current){break};$current=$parent;$first=$false;continue}',
+    'if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw "Path contains a link or reparse point: $current"}',
+    '$parent=$item.Parent.FullName;if(-not $parent -or $parent -eq $current){break};$current=$parent;$first=$false',
+    '}',
+    '}',
     `$home=${psLiteral(hermesHome)}`,
     '$installRoot=$home',
     '$parent=Split-Path -Parent $home',
     'if((Split-Path -Leaf $parent) -ieq "profiles"){$installRoot=Split-Path -Parent $parent}',
     '$marker=Join-Path $installRoot ".hermes-update-in-progress"',
     '$result="UNCERTAIN"',
+    '$stream=$null;$memory=$null',
     'try{',
-    'if(-not [IO.File]::Exists($marker)){$result="CLEAR"}',
-    'else{',
-    '$bytes=[IO.File]::ReadAllBytes($marker)',
+    'Assert-NoReparse $marker $true',
+    'if(-not (Test-Path -LiteralPath $marker -PathType Leaf)){$result="CLEAR"}else{$stream=[HermesMarkerNoFollow]::OpenRead($marker)',
+    'Assert-NoReparse $marker $false',
+    '$memory=New-Object IO.MemoryStream;$stream.CopyTo($memory);$bytes=$memory.ToArray()',
     'if($bytes.Length -le 256){',
     '$utf8=[Text.UTF8Encoding]::new($false,$true)',
     '$text=$utf8.GetString($bytes)',
@@ -87,8 +125,7 @@ function windowsUpdateMarkerProbeCommand(hermesHome) {
     '}catch [ArgumentException]{$result="CLEAR"} catch{$result="UNCERTAIN"}',
     '}',
     '}',
-    '}',
-    '}catch{$result="UNCERTAIN"}',
+    '}}catch [IO.FileNotFoundException]{$result="CLEAR"}catch{$result="UNCERTAIN"}finally{if($memory){$memory.Dispose()};if($stream){$stream.Dispose()}}',
     'Write-Output $result'
   ].join(';')
 

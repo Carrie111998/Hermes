@@ -25,7 +25,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,9 +179,8 @@ fn validate_no_reparse_topology(path: &Path) -> Result<(), String> {
     }
 
     for component in existing {
-        let metadata = std::fs::symlink_metadata(&component).map_err(|err| {
-            format!("cannot inspect marker path {component:?}: {err}")
-        })?;
+        let metadata = std::fs::symlink_metadata(&component)
+            .map_err(|err| format!("cannot inspect marker path {component:?}: {err}"))?;
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
@@ -199,6 +198,97 @@ fn validate_no_reparse_topology(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn no_follow_open_options(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        return options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        return options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        options
+    }
+}
+
+/// Open an existing marker through a no-follow handle and reject a reparse
+/// handle before its contents are consumed. On Windows OPEN_REPARSE_POINT
+/// opens the reparse point itself rather than its target; on POSIX O_NOFOLLOW
+/// makes the open fail for a symlink.
+fn open_marker_no_follow(path: &Path, allow_missing: bool) -> Result<Option<File>, String> {
+    let mut options = OpenOptions::new();
+    no_follow_open_options(&mut options).read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(err) => return Err(format!("could not open update marker {path:?}: {err}")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("could not stat update marker {path:?}: {err}"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("update marker {path:?} is a reparse point"));
+        }
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(format!("update marker {path:?} is a symlink"));
+    }
+    Ok(Some(file))
+}
+
+/// Delete through a Windows no-follow handle. DELETE_ON_CLOSE binds the
+/// deletion to the object opened with FILE_FLAG_OPEN_REPARSE_POINT, avoiding a
+/// second path lookup after the topology check. POSIX unlink is final-component
+/// safe; its no-follow open still closes the check-to-delete gap for callers.
+fn remove_marker_no_follow(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(DELETE | READ_CONTROL)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE);
+        match options.open(path) {
+            Ok(_file) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(format!("could not remove update marker {path:?}: {err}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _file = open_marker_no_follow(path, true)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("could not remove update marker {path:?}: {err}")),
+        }
+    }
 }
 
 /// Validate a marker and its mutex path before either can be opened.
@@ -231,22 +321,22 @@ fn strict_marker_state(path: &Path) -> StrictMarkerState {
     if let Err(error) = validate_no_reparse_topology(path) {
         return StrictMarkerState::Unavailable(error);
     }
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return StrictMarkerState::Absent;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+    let mut raw = String::new();
+    let mut file = match open_marker_no_follow(path, true) {
+        Ok(Some(file)) => file,
+        Ok(None) => return StrictMarkerState::Absent,
+        Err(error) => return StrictMarkerState::Unavailable(error),
+    };
+    if let Err(err) = file.read_to_string(&mut raw) {
+        if err.kind() == std::io::ErrorKind::InvalidData {
             return StrictMarkerState::Malformed(format!(
                 "update marker {path:?} is not UTF-8: {err}"
             ));
         }
-        Err(err) => {
-            return StrictMarkerState::Unavailable(format!(
-                "could not read update marker {path:?}: {err}"
-            ));
-        }
-    };
+        return StrictMarkerState::Unavailable(format!(
+            "could not read update marker {path:?}: {err}"
+        ));
+    }
     let normalized = raw.replace("\r\n", "\n");
     let body = normalized.strip_suffix('\n').unwrap_or(&normalized);
     let fields: Vec<_> = body.split('\n').collect();
@@ -273,8 +363,8 @@ fn strict_marker_state(path: &Path) -> StrictMarkerState {
         }
     };
     let lease_text = fields[1];
-    let lease_is_decimal = !lease_text.is_empty()
-        && lease_text.as_bytes().iter().all(u8::is_ascii_digit);
+    let lease_is_decimal =
+        !lease_text.is_empty() && lease_text.as_bytes().iter().all(u8::is_ascii_digit);
     let lease_at = match lease_is_decimal
         .then(|| lease_text.parse::<u64>().ok())
         .flatten()
@@ -380,7 +470,8 @@ impl MarkerMutex {
         // Recheck after creating missing parents and immediately before the
         // mutex open; a newly inserted junction must not redirect marker I/O.
         validate_marker_io_topology(marker, &lock_path)?;
-        let mut file = OpenOptions::new()
+        let mut file_options = OpenOptions::new();
+        let mut file = no_follow_open_options(&mut file_options)
             .read(true)
             .write(true)
             .create(true)
@@ -392,12 +483,10 @@ impl MarkerMutex {
             .len()
             == 0
         {
-            file.write_all(&[0]).map_err(|err| {
-                format!("could not initialize update mutex {lock_path:?}: {err}")
-            })?;
-            file.sync_data().map_err(|err| {
-                format!("could not sync update mutex {lock_path:?}: {err}")
-            })?;
+            file.write_all(&[0])
+                .map_err(|err| format!("could not initialize update mutex {lock_path:?}: {err}"))?;
+            file.sync_data()
+                .map_err(|err| format!("could not sync update mutex {lock_path:?}: {err}"))?;
         }
 
         #[cfg(unix)]
@@ -415,9 +504,7 @@ impl MarkerMutex {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-            };
+            use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
             use windows_sys::Win32::System::IO::OVERLAPPED;
 
             let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -457,15 +544,8 @@ impl Drop for MarkerMutex {
             use windows_sys::Win32::System::IO::OVERLAPPED;
 
             let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-            let _ = unsafe {
-                UnlockFileEx(
-                    self.file.as_raw_handle() as _,
-                    0,
-                    1,
-                    0,
-                    &mut overlapped,
-                )
-            };
+            let _ =
+                unsafe { UnlockFileEx(self.file.as_raw_handle() as _, 0, 1, 0, &mut overlapped) };
         }
     }
 }
@@ -481,7 +561,8 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
     let result = (|| {
         validate_no_reparse_topology(path)?;
         validate_no_reparse_topology(&temp)?;
-        let mut file = OpenOptions::new()
+        let mut file_options = OpenOptions::new();
+        let mut file = no_follow_open_options(&mut file_options)
             .write(true)
             .create_new(true)
             .open(&temp)
@@ -502,6 +583,10 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
                 MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
             };
 
+            let _source_handle = open_marker_no_follow(&temp, false)?;
+            {
+                let _destination_handle = open_marker_no_follow(path, true)?;
+            }
             let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
             let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
             let ok = unsafe {
@@ -527,7 +612,7 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
         Ok(())
     })();
     if result.is_err() && validate_no_reparse_topology(&temp).is_ok() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = remove_marker_no_follow(&temp);
     }
     result
 }
@@ -545,7 +630,8 @@ fn create_marker_no_clobber(path: &Path, pid: u32, lease_at: u64) -> Result<(), 
     let result = (|| {
         validate_no_reparse_topology(path)?;
         validate_no_reparse_topology(&temp)?;
-        let mut file = OpenOptions::new()
+        let mut file_options = OpenOptions::new();
+        let mut file = no_follow_open_options(&mut file_options)
             .write(true)
             .create_new(true)
             .open(&temp)
@@ -561,12 +647,13 @@ fn create_marker_no_clobber(path: &Path, pid: u32, lease_at: u64) -> Result<(), 
 
         // A hard link publishes the already-complete inode atomically and
         // fails if Python/Electron/Rust created the destination first.
+        let _source_handle = open_marker_no_follow(&temp, false)?;
         std::fs::hard_link(&temp, path)
             .map_err(|err| format!("could not publish update marker {path:?}: {err}"))?;
         Ok(())
     })();
     if validate_no_reparse_topology(&temp).is_ok() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = remove_marker_no_follow(&temp);
     }
     result
 }
@@ -605,18 +692,10 @@ struct MarkerHeartbeatControl {
 
 impl MarkerHeartbeat {
     fn start(path: PathBuf, pid: u32) -> Result<Self, String> {
-        Self::start_with_interval(
-            path,
-            pid,
-            Duration::from_secs(UPDATE_MARKER_HEARTBEAT_SECS),
-        )
+        Self::start_with_interval(path, pid, Duration::from_secs(UPDATE_MARKER_HEARTBEAT_SECS))
     }
 
-    fn start_with_interval(
-        path: PathBuf,
-        pid: u32,
-        interval: Duration,
-    ) -> Result<Self, String> {
+    fn start_with_interval(path: PathBuf, pid: u32, interval: Duration) -> Result<Self, String> {
         let control = Arc::new((
             Mutex::new(MarkerHeartbeatControl::default()),
             Condvar::new(),
@@ -743,8 +822,7 @@ impl UpdateMarkerGuard {
     /// claim we must not mutate the shared checkout at all.
     fn acquire(path: PathBuf) -> Result<Self, MarkerAcquireError> {
         let pid = std::process::id();
-        let _mutex =
-            MarkerMutex::acquire(&path).map_err(MarkerAcquireError::Unavailable)?;
+        let _mutex = MarkerMutex::acquire(&path).map_err(MarkerAcquireError::Unavailable)?;
         match strict_marker_state(&path) {
             StrictMarkerState::Live(owner) if owner.pid == pid => {
                 let heartbeat = MarkerHeartbeat::start(path.clone(), pid)
@@ -760,10 +838,9 @@ impl UpdateMarkerGuard {
             }
             StrictMarkerState::Dead(dead_pid) => {
                 tracing::debug!(?path, dead_pid, "reclaiming dead update marker owner");
-                validate_no_reparse_topology(&path).map_err(|err| {
-                    MarkerAcquireError::Unavailable(err)
-                })?;
-                std::fs::remove_file(&path).map_err(|err| {
+                validate_no_reparse_topology(&path)
+                    .map_err(|err| MarkerAcquireError::Unavailable(err))?;
+                remove_marker_no_follow(&path).map_err(|err| {
                     MarkerAcquireError::Unavailable(format!(
                         "could not remove dead update marker {path:?}: {err}"
                     ))
@@ -816,7 +893,7 @@ impl UpdateMarkerGuard {
         let heartbeat = match MarkerHeartbeat::start(path.clone(), pid) {
             Ok(heartbeat) => heartbeat,
             Err(err) => {
-                let _ = std::fs::remove_file(&path);
+                let _ = remove_marker_no_follow(&path);
                 return Err(MarkerAcquireError::Unavailable(err));
             }
         };
@@ -877,11 +954,9 @@ impl UpdateMarkerGuard {
             self.owned = false;
             return;
         }
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = ?self.path, %err, "could not remove completed update marker");
-                return;
-            }
+        if let Err(err) = remove_marker_no_follow(&self.path) {
+            tracing::warn!(path = ?self.path, %err, "could not remove completed update marker");
+            return;
         }
         self.owned = false;
     }
@@ -908,48 +983,47 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // update_lock.py claims it too), so a live foreign owner means another
     // updater — most often a dashboard-spawned `hermes update` — is already
     // mutating this checkout. Refuse instead of running a second one over it.
-    let mut _update_marker = match UpdateMarkerGuard::acquire(
-        crate::paths::update_in_progress_marker(),
-    ) {
-        Ok(guard) => guard,
-        Err(MarkerAcquireError::Owned(owner)) => {
-            let mins = owner.age_secs / 60;
-            let secs = owner.age_secs % 60;
-            let elapsed = if mins > 0 {
-                format!("{mins}m {secs}s")
-            } else {
-                format!("{secs}s")
-            };
-            let msg = format!(
-                "Another Hermes update is already running (PID {}, last active {} ago). \
+    let mut _update_marker =
+        match UpdateMarkerGuard::acquire(crate::paths::update_in_progress_marker()) {
+            Ok(guard) => guard,
+            Err(MarkerAcquireError::Owned(owner)) => {
+                let mins = owner.age_secs / 60;
+                let secs = owner.age_secs % 60;
+                let elapsed = if mins > 0 {
+                    format!("{mins}m {secs}s")
+                } else {
+                    format!("{secs}s")
+                };
+                let msg = format!(
+                    "Another Hermes update is already running (PID {}, last active {} ago). \
                  Wait for it to finish, or close the window or dashboard tab that \
                  started it, then try again.",
-                owner.pid, elapsed
-            );
-            emit(
-                &app,
-                BootstrapEvent::Failed {
-                    stage: None,
-                    error: msg.clone(),
-                },
-            );
-            return Err(anyhow!(msg));
-        }
-        Err(MarkerAcquireError::Unavailable(error)) => {
-            let msg = format!(
-                "Could not establish exclusive ownership of the Hermes install: {error}. \
+                    owner.pid, elapsed
+                );
+                emit(
+                    &app,
+                    BootstrapEvent::Failed {
+                        stage: None,
+                        error: msg.clone(),
+                    },
+                );
+                return Err(anyhow!(msg));
+            }
+            Err(MarkerAcquireError::Unavailable(error)) => {
+                let msg = format!(
+                    "Could not establish exclusive ownership of the Hermes install: {error}. \
                  No update files were changed. Check HERMES_HOME permissions, then retry."
-            );
-            emit(
-                &app,
-                BootstrapEvent::Failed {
-                    stage: None,
-                    error: msg.clone(),
-                },
-            );
-            return Err(anyhow!(msg));
-        }
-    };
+                );
+                emit(
+                    &app,
+                    BootstrapEvent::Failed {
+                        stage: None,
+                        error: msg.clone(),
+                    },
+                );
+                return Err(anyhow!(msg));
+            }
+        };
 
     let update_branch = update_branch_from_args(std::env::args().skip(1))
         .or_else(|| option_env_string("BUILD_PIN_BRANCH"))
@@ -1020,12 +1094,9 @@ async fn run_update(app: AppHandle) -> Result<()> {
         &format!("[update] updating against branch {update_branch}"),
     );
     let update_correlation = uuid::Uuid::new_v4().to_string();
-    let independent_status = hermes_home.join(format!(
-        ".update_exit_code.{update_correlation}"
-    ));
-    let independent_ready = hermes_home.join(format!(
-        ".update_coordinator_ready.{update_correlation}"
-    ));
+    let independent_status = hermes_home.join(format!(".update_exit_code.{update_correlation}"));
+    let independent_ready =
+        hermes_home.join(format!(".update_coordinator_ready.{update_correlation}"));
     let mut child_env = update_child_env(&install_root);
     child_env.push((
         "HERMES_UPDATE_CORRELATION_ID".to_string(),
@@ -1039,8 +1110,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         "HERMES_UPDATE_TAURI_READY_PATH".to_string(),
         independent_ready.as_os_str().to_os_string(),
     ));
-    let mut update_args: Vec<String> =
-        vec!["update".into(), "--yes".into(), "--gateway".into()];
+    let mut update_args: Vec<String> = vec!["update".into(), "--yes".into(), "--gateway".into()];
     // --force skips `hermes update`'s Windows running-exe guard (which would
     // `sys.exit(2)` and dead-end the handoff). By contract the desktop has
     // already exited and waited for the install locks to clear before launching
@@ -1244,7 +1314,13 @@ async fn run_update(app: AppHandle) -> Result<()> {
         );
         return Err(anyhow!(msg));
     }
-    emit_stage(&app, "rebuild", StageState::Succeeded, Some(rebuild_ms), None);
+    emit_stage(
+        &app,
+        "rebuild",
+        StageState::Succeeded,
+        Some(rebuild_ms),
+        None,
+    );
 
     let launch_target = if let Some(target_app) = target_app {
         let started = Instant::now();
@@ -1307,8 +1383,11 @@ async fn run_update(app: AppHandle) -> Result<()> {
                 &format!("[update] could not auto-launch desktop: {err}. Launch Hermes manually."),
             );
         }
-    } else if let Err(err) =
-        crate::bootstrap::launch_hermes_desktop(app.clone(), install_root.to_string_lossy().into_owned()).await
+    } else if let Err(err) = crate::bootstrap::launch_hermes_desktop(
+        app.clone(),
+        install_root.to_string_lossy().into_owned(),
+    )
+    .await
     {
         // Launch failed: don't hard-fail the update (it succeeded); surface a
         // log line so the success screen can still tell the user to launch
@@ -1348,7 +1427,12 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
     let lock_targets = install_lock_probe_paths(install_root);
     let deadline = Instant::now() + DESKTOP_EXIT_WAIT;
 
-    emit_log(app, Some(stage), LogStream::Stdout, "[handoff] waiting for Hermes to exit…");
+    emit_log(
+        app,
+        Some(stage),
+        LogStream::Stdout,
+        "[handoff] waiting for Hermes to exit…",
+    );
 
     loop {
         let locked = locked_paths(&lock_targets);
@@ -1410,16 +1494,35 @@ fn desktop_app_payload_paths(install_root: &Path) -> Vec<PathBuf> {
     let release = install_root.join("apps").join("desktop").join("release");
     if cfg!(target_os = "windows") {
         vec![
-            release.join("win-unpacked").join("resources").join("app.asar"),
-            release.join("win-arm64-unpacked").join("resources").join("app.asar"),
+            release
+                .join("win-unpacked")
+                .join("resources")
+                .join("app.asar"),
+            release
+                .join("win-arm64-unpacked")
+                .join("resources")
+                .join("app.asar"),
         ]
     } else if cfg!(target_os = "macos") {
         vec![
-            release.join("mac").join("Hermes.app").join("Contents").join("Resources").join("app.asar"),
-            release.join("mac-arm64").join("Hermes.app").join("Contents").join("Resources").join("app.asar"),
+            release
+                .join("mac")
+                .join("Hermes.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
+            release
+                .join("mac-arm64")
+                .join("Hermes.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
         ]
     } else {
-        vec![release.join("linux-unpacked").join("resources").join("app.asar")]
+        vec![release
+            .join("linux-unpacked")
+            .join("resources")
+            .join("app.asar")]
     }
 }
 
@@ -1428,7 +1531,11 @@ fn locked_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn format_locked_paths(paths: &[PathBuf]) -> String {
-    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Force-kill any `hermes.exe` other than this process. Windows-only; a no-op
@@ -1476,7 +1583,11 @@ fn is_locked(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         Ok(_) => false,
         Err(_) => true,
     }
@@ -1528,7 +1639,9 @@ fn expected_independent_pid(ready_path: &Path, correlation_id: &str) -> Result<u
             ready_path.display()
         )
     })?;
-    if payload.get("correlation_id").and_then(|value| value.as_str())
+    if payload
+        .get("correlation_id")
+        .and_then(|value| value.as_str())
         != Some(correlation_id)
     {
         return Err(anyhow!("coordinator readiness correlation does not match"));
@@ -1638,8 +1751,7 @@ async fn resolve_independent_update_attempt(
     // the marker. Stop the Rust heartbeat and disarm Drop without touching
     // that claim, then wait for the child's truthful command-boundary result.
     marker_guard.relinquish_after_verified_handoff();
-    let exit_code =
-        wait_for_independent_update(status_path, marker_path, expected_pid).await?;
+    let exit_code = wait_for_independent_update(status_path, marker_path, expected_pid).await?;
 
     // The Python child releases its marker before we return. Reclaim the
     // install-wide lock before retrying or entering the desktop rebuild.
@@ -1751,9 +1863,17 @@ fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
         return Some(shim);
     }
     // PATH fallback. which-style probe via env, kept dependency-free.
-    let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
+    let exe = if cfg!(target_os = "windows") {
+        "hermes.exe"
+    } else {
+        "hermes"
+    };
     if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        let sep = if cfg!(target_os = "windows") {
+            ';'
+        } else {
+            ':'
+        };
         for dir in path.split(sep) {
             let cand = Path::new(dir).join(exe);
             if cand.exists() {
@@ -1863,12 +1983,17 @@ async fn install_macos_app_update(
         ));
     }
 
-    let rebuilt_app = crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
-        anyhow!(
-            "desktop rebuild succeeded but no Hermes.app was found under {}",
-            install_root.join("apps").join("desktop").join("release").display()
-        )
-    })?;
+    let rebuilt_app =
+        crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
+            anyhow!(
+                "desktop rebuild succeeded but no Hermes.app was found under {}",
+                install_root
+                    .join("apps")
+                    .join("desktop")
+                    .join("release")
+                    .display()
+            )
+        })?;
 
     let same = match (rebuilt_app.canonicalize(), target_app.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -1966,7 +2091,10 @@ async fn swap_in_new_bundle(tmp: &Path, target: &Path, old: &Path) -> Result<()>
             let _ = tokio::fs::rename(old, target).await;
         }
         remove_dir_if_exists(tmp).await;
-        return Err(anyhow!("installing updated app at {}: {err}", target.display()));
+        return Err(anyhow!(
+            "installing updated app at {}: {err}",
+            target.display()
+        ));
     }
     remove_dir_if_exists(old).await;
     Ok(())
@@ -2173,9 +2301,7 @@ mod tests {
         std::fs::write(&marker, format!("{}\n{now}\n", std::process::id())).unwrap();
         std::fs::write(
             &ready,
-            format!(
-                r#"{{"correlation_id":"corr-1","pid":{expected_pid}}}"#
-            ),
+            format!(r#"{{"correlation_id":"corr-1","pid":{expected_pid}}}"#),
         )
         .unwrap();
 
@@ -2577,11 +2703,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        std::fs::write(
-            &marker,
-            format!("{}\r\n{now}\r\n", std::process::id()),
-        )
-        .unwrap();
+        std::fs::write(&marker, format!("{}\r\n{now}\r\n", std::process::id())).unwrap();
         assert!(matches!(
             strict_marker_state(&marker),
             StrictMarkerState::Live(owner) if owner.pid == std::process::id()
@@ -2654,7 +2776,10 @@ mod tests {
         }
 
         // The refused guard must not delete the live owner's marker.
-        assert!(marker.exists(), "refused acquire must leave the marker intact");
+        assert!(
+            marker.exists(),
+            "refused acquire must leave the marker intact"
+        );
         let _ = foreign.kill();
         let _ = foreign.wait();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2820,8 +2945,14 @@ mod tests {
 
     #[test]
     fn rebuild_retries_only_on_failure() {
-        assert!(!rebuild_needs_retry(Some(0)), "a clean rebuild must not retry");
-        assert!(rebuild_needs_retry(Some(1)), "a failed rebuild retries once");
+        assert!(
+            !rebuild_needs_retry(Some(0)),
+            "a clean rebuild must not retry"
+        );
+        assert!(
+            rebuild_needs_retry(Some(1)),
+            "a failed rebuild retries once"
+        );
         assert!(
             rebuild_needs_retry(None),
             "a killed/signalled rebuild (no exit code) retries once"
@@ -2834,7 +2965,10 @@ mod tests {
             target_app_from_args(["--update", "--target-app", "/Applications/Hermes.app"]),
             Some(PathBuf::from("/Applications/Hermes.app"))
         );
-        assert_eq!(target_app_from_args(["--target-app", "/tmp/not-an-app"]), None);
+        assert_eq!(
+            target_app_from_args(["--target-app", "/tmp/not-an-app"]),
+            None
+        );
     }
 
     // Helpers for the swap tests: make a throwaway dir tree we can rename.
@@ -2897,8 +3031,14 @@ mod tests {
 
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
-        assert!(result.is_err(), "swap should fail when neither move can complete");
-        assert!(target.exists(), "original app must NOT be deleted on failure");
+        assert!(
+            result.is_err(),
+            "swap should fail when neither move can complete"
+        );
+        assert!(
+            target.exists(),
+            "original app must NOT be deleted on failure"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD",
@@ -2920,12 +3060,18 @@ mod tests {
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
         assert!(result.is_err());
-        assert!(target.exists(), "original must be restored after failed install");
+        assert!(
+            target.exists(),
+            "original must be restored after failed install"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD"
         );
-        assert!(!old.exists(), "backup should be rolled back, not left behind");
+        assert!(
+            !old.exists(),
+            "backup should be rolled back, not left behind"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
