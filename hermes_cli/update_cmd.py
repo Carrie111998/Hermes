@@ -759,6 +759,108 @@ def _tracked_checkout_clean(git_cmd, cwd) -> bool:
     )
 
 
+def _reset_tracked_checkout_if_exact_stash(
+    git_cmd: list[str], cwd: Path, stash_ref: str
+) -> bool:
+    """Clear a partial-stash checkout only when the stash proves it lossless.
+
+    A stash push with include-untracked can create a complete stash and still
+    exit non-zero when an undeletable untracked file cannot be swept from
+    disk. Some Git versions leave the captured tracked state in place in that
+    case. Before resetting it, prove all of the following against the
+    immutable stash commit:
+
+    * the stash is based on the current HEAD;
+    * its index parent exactly matches the current index;
+    * its worktree tree exactly matches every current tracked path; and
+    * no merge or unmerged-index state exists.
+
+    A concurrent tracked write makes either diff non-zero, so this remains
+    fail-closed and leaves both the checkout and durable stash pin untouched.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", stash_ref):
+        return False
+
+    head_sha = _resolve_commit(git_cmd, cwd, "HEAD")
+    stash_base = _resolve_commit(git_cmd, cwd, f"{stash_ref}^1")
+    stash_index = _resolve_commit(git_cmd, cwd, f"{stash_ref}^2")
+    merge_head_state, _ = _resolve_optional_commit(git_cmd, cwd, "MERGE_HEAD")
+    if (
+        head_sha is None
+        or stash_base != head_sha
+        or stash_index is None
+        or merge_head_state != _REF_ABSENT
+    ):
+        return False
+
+    try:
+        unmerged = subprocess.run(
+            git_cmd + ["ls-files", "--unmerged"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        worktree_matches = subprocess.run(
+            git_cmd + ["diff", "--quiet", "--no-ext-diff", stash_ref, "--"],
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+        )
+        index_matches = subprocess.run(
+            git_cmd
+            + [
+                "diff",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                f"{stash_ref}^2",
+                "--",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if (
+        unmerged.returncode != 0
+        or unmerged.stdout.strip()
+        or worktree_matches.returncode != 0
+        or index_matches.returncode != 0
+    ):
+        return False
+
+    # Re-prove the immutable boundary immediately before the destructive
+    # cleanup. The install-scoped update lock serializes cooperating updaters;
+    # this second check also narrows the ordinary late-write window.
+    merge_head_state, _ = _resolve_optional_commit(git_cmd, cwd, "MERGE_HEAD")
+    if (
+        _resolve_commit(git_cmd, cwd, "HEAD") != head_sha
+        or merge_head_state != _REF_ABSENT
+    ):
+        return False
+    try:
+        reset = subprocess.run(
+            git_cmd + ["reset", "--hard", head_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    return (
+        reset.returncode == 0
+        and _resolve_commit(git_cmd, cwd, "HEAD") == head_sha
+        and _tracked_checkout_clean(git_cmd, cwd)
+    )
+
+
 def _validate_update_branch(git_cmd, cwd, branch: str) -> bool:
     """Accept only an unambiguous, syntactically valid local branch name."""
     if (
@@ -4442,7 +4544,12 @@ def _stash_local_changes_if_needed(
             # those would turn a recoverable refusal into data loss.
             if push.stderr.strip():
                 print(push.stderr.strip())
-            if not _tracked_checkout_clean(git_cmd, cwd):
+            if (
+                not _tracked_checkout_clean(git_cmd, cwd)
+                and not _reset_tracked_checkout_if_exact_stash(
+                    git_cmd, cwd, stash_ref
+                )
+            ):
                 print(
                     "✗ Update stopped: the failed autostash left tracked or "
                     "index changes in the checkout."

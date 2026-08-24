@@ -661,6 +661,67 @@ def test_nonzero_stash_push_preserves_concurrent_tracked_edit(
     ).stdout.splitlines()
 
 
+def test_nonzero_stash_push_resets_only_exactly_captured_tracked_state(
+    tmp_path, monkeypatch
+):
+    """A complete stash may safely clear the identical captured checkout."""
+    import shutil
+    import subprocess
+
+    import hermes_cli.update_cmd as update_cmd
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("base\n")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "base")
+    original_head = git("rev-parse", "HEAD").stdout.strip()
+    (tmp_path / "tracked.txt").write_text("captured local edit\n")
+
+    original_run = update_cmd.subprocess.run
+    commands: list[list[str]] = []
+
+    def partial_cleanup_failure(command, *args, **kwargs):
+        command = list(command)
+        commands.append(command)
+        result = original_run(command, *args, **kwargs)
+        if command[1:3] == ["stash", "push"]:
+            assert result.returncode == 0
+            # Model Git versions that create the stash but leave its exact
+            # tracked worktree state behind after untracked cleanup fails.
+            (tmp_path / "tracked.txt").write_text("captured local edit\n")
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout=result.stdout,
+                stderr="simulated untracked cleanup failure",
+            )
+        return result
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", partial_cleanup_failure)
+
+    stash_ref = update_cmd._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert stash_ref
+    assert git("rev-parse", "HEAD").stdout.strip() == original_head
+    assert (tmp_path / "tracked.txt").read_text() == "base\n"
+    assert git("show", f"{stash_ref}:tracked.txt").stdout == "captured local edit\n"
+    assert ["git", "reset", "--hard", original_head] in commands
+
+
 def test_rollout_refuses_unmerged_index_without_resetting_it(
     tmp_path, monkeypatch
 ):

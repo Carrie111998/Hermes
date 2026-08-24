@@ -323,10 +323,15 @@ def test_collect_fleet_versions_falls_back_to_state_file(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         "gateway.control_socket.identify_gateway", lambda h, **kw: None
     )
+    monkeypatch.setattr(
+        "gateway.status._get_process_start_time", lambda pid: 123456
+    )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
     (home / "gateway_state.json").write_text(
         json.dumps(
             {
-                "pid": os.getpid(),  # a live pid so _pid_exists passes
+                "pid": os.getpid(),
+                "start_time": 123456,
                 "code_sha": "OLDSHA",
                 "kind": "hermes-gateway",
             }

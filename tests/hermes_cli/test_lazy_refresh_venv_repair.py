@@ -180,8 +180,20 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
         pass
 
     def fake_run(cmd, **kwargs):
-        if "rev-parse" in cmd:
+        if "check-ref-format" in cmd:
+            return SimpleNamespace(returncode=0, stdout=f"{cmd[-1]}\n", stderr="")
+        if "branch" in cmd and "--show-current" in cmd:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if "rev-parse" in cmd and "--is-shallow-repository" in cmd:
+            return SimpleNamespace(returncode=0, stdout="false\n", stderr="")
+        if (
+            "rev-parse" in cmd
+            and "--verify" in cmd
+            and str(cmd[-1]).startswith("MERGE_HEAD")
+        ):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        if "rev-parse" in cmd:
+            return SimpleNamespace(returncode=0, stdout=("a" * 40) + "\n", stderr="")
         if "rev-list" in cmd:
             return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -253,8 +265,6 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
             expected_env,
         )
     ]
-
-
 
 
 
