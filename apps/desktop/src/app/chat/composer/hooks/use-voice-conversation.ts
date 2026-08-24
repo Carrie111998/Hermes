@@ -634,37 +634,6 @@ export function useVoiceConversation({
     })
   }, [handle])
 
-  useEffect(() => {
-    if (!enabled) {
-      return
-    }
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.code !== 'Space' || event.repeat || event.metaKey || event.ctrlKey || event.altKey) {
-        return
-      }
-
-      // Typing a space into the composer (or any editable field / input) must
-      // never be hijacked as "end turn" — otherwise the spacebar goes dead
-      // whenever the mic is live. Only bare presses on the page count.
-      const target = event.target
-      if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
-        return
-      }
-
-      if (statusRef.current !== 'listening') {
-        return
-      }
-
-      event.preventDefault()
-      stopTurn()
-    }
-
-    window.addEventListener('keydown', onKeyDown, { capture: true })
-
-    return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
-  }, [enabled, stopTurn])
-
   // Ambient "thinking" sound: while the agent works (status 'thinking') no
   // audio flows, which reads as dead air mid-conversation. Calm bubble blips
   // fill the gap; they stop the INSTANT speech starts, the mic re-arms, or the
