@@ -94,6 +94,44 @@ def test_claim_review_task_persists_complete_snapshot_without_changing_task_role
     assert task["routing_role"] == "task-review-role"
 
 
+def test_review_capable_role_has_review_specific_source_and_reason(conn, monkeypatch):
+    """Review claims distinguish accepted review roles from implementation claims."""
+    monkeypatch.setattr(
+        kb,
+        "_load_roster",
+        lambda: (
+            {
+                "roles": {
+                    "reviewer": {
+                        "model": "review-model",
+                        "provider": "review-provider",
+                        "review_capable": True,
+                    }
+                }
+            },
+            "review-digest",
+        ),
+    )
+    task_id = kb.create_task(conn, title="review-ready", assignee="coder")
+    conn.execute(
+        "UPDATE tasks SET status='review', routing_role='reviewer' WHERE id=?",
+        (task_id,),
+    )
+
+    claimed = kb.claim_review_task(conn, task_id)
+    assert claimed is not None
+    row = conn.execute(
+        "SELECT routing_source,routing_reason FROM task_runs WHERE task_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+    assert row["routing_source"] == "review_capable"
+    assert row["routing_reason"] == (
+        "review phase: role 'reviewer' already review-capable"
+    )
+
+
 def test_claim_rolls_back_task_transition_when_run_snapshot_insert_fails(
     conn, deterministic_snapshot
 ):

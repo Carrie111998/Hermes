@@ -5067,13 +5067,22 @@ def _semantic_routing_snapshot(
     if not isinstance(entry, dict):
         raise RoutingContractError(f"role {selected!r} not found in roles.yaml")
     resolved_source = source
+    original_role = selected
+    review_reason = None
     if phase == "review":
         if entry.get("review_capable") is True:
             resolved_source = "review_capable"
+            review_reason = (
+                f"review phase: role '{original_role}' already review-capable"
+            )
         else:
             selected = "reviewer"
             entry = roles.get(selected)
             resolved_source = "review_coerced"
+            review_reason = (
+                f"review phase: role '{original_role}' not review-capable, "
+                "coerced to reviewer"
+            )
             if not isinstance(entry, dict):
                 raise RoutingContractError("role 'reviewer' not found in roles.yaml")
     model = entry.get("model")
@@ -5093,10 +5102,12 @@ def _semantic_routing_snapshot(
              "may_edit": entry.get("may_edit")}, sort_keys=True,
         ),
         routing_source=resolved_source,
+        routing_reason=review_reason,
     )
     if parsed:
         snapshot["routing_contract"] = ROUTING_CONTRACT_VERSION
-        snapshot["routing_reason"] = parsed.get("reason")
+        if review_reason is None:
+            snapshot["routing_reason"] = parsed.get("reason")
         ac_ids = parsed.get("ac_ids")
         if ac_ids:
             text = _extract_ac_text(body, ac_ids)
@@ -5197,7 +5208,8 @@ def _claim_task_once(
         # txn is the event row, so the task stays ready and the dispatch
         # loop's circuit breaker decides the next move. No silent loop.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key, body "
+            "SELECT assignee, max_runtime_seconds, current_step_key, body, "
+            "routing_role, model_override, provider_override "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5337,7 +5349,8 @@ def _claim_review_task_once(
         # roster failure emit preflight_rejected and return None; the task
         # stays in review and the dispatch loop's circuit breaker decides.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key, body "
+            "SELECT assignee, max_runtime_seconds, current_step_key, body, "
+            "routing_role, model_override, provider_override "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
