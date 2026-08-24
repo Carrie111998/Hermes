@@ -160,7 +160,10 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
             drain_transcripts,
         )
 
-    assert interrupt_text == '"hello once"'
+    # The turn text keeps the quoted transcript plus the bracketed audio
+    # reference appended on the success path (#93982); the drain/interrupt
+    # equality is what matters here.
+    assert interrupt_text.startswith('"hello once"\n[voice note, audio: ')
     assert drain_text == interrupt_text
     assert drain_transcripts == interrupt_transcripts == ["hello once"]
     mock_transcribe.assert_called_once_with("/tmp/telegram-voice.ogg", None, "gateway")
@@ -215,7 +218,10 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
         )
 
     assert result["final_response"] == "follow-up complete"
-    assert _PendingVoiceAgent.messages == ["initial turn", '"hello once"']
+    # The agent turn keeps the quoted transcript plus the bracketed audio
+    # reference appended on the success path (#93982).
+    assert _PendingVoiceAgent.messages[0] == "initial turn"
+    assert _PendingVoiceAgent.messages[1].startswith('"hello once"\n[voice note, audio: ')
     mock_transcribe.assert_called_once_with("/tmp/telegram-pending-voice.ogg", None, "gateway")
     assert adapter.sent == [("12345", '🎙️ "hello once"', None)]
 
