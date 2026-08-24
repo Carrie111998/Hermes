@@ -14,6 +14,7 @@ values are for special writers.
 from __future__ import annotations
 
 from enum import Enum
+import inspect
 from typing import Any, Mapping, Optional
 
 ACTIVITY_DESCRIPTION_MAX = 120
@@ -58,6 +59,27 @@ def normalize_activity_provenance(
         return ActivityProvenance(value)
     except ValueError:
         return ActivityProvenance.UNKNOWN
+
+
+def touch_activity(agent: Any, description: str, **state: Any) -> None:
+    """Call an agent activity hook while tolerating legacy one-argument readers.
+
+    Production agents accept the structured turn fields. Lightweight readers and
+    test doubles may still expose only ``_touch_activity(description)``; filter
+    the optional fields for those callers without swallowing errors raised by
+    the activity hook itself.
+    """
+    callback = getattr(agent, "_touch_activity")
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        callback(description, **state)
+        return
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        callback(description, **state)
+        return
+    accepted = {name: value for name, value in state.items() if name in parameters}
+    callback(description, **accepted)
 
 
 def reset_session_activity_persist_window(agent: Any) -> None:

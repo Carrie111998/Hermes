@@ -1,5 +1,6 @@
 """Durable session activity projection from AIAgent._touch_activity (#72016)."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,8 +13,15 @@ def _agent_with_db(session_id: str = "sess-1"):
         session_id=session_id,
         _session_db=MagicMock(),
         _last_activity_ts=0.0,
+        _last_activity_mono=0.0,
         _last_activity_desc="",
         _last_activity_provenance=ActivityProvenance.UNKNOWN,
+        _activity_lock=threading.RLock(),
+        _turn_phase=None,
+        _turn_phase_started_at=None,
+        _turn_tool_total=0,
+        _turn_tool_completed=0,
+        _last_heartbeat_mono=0.0,
         _session_activity_last_persist_mono=0.0,
         _current_tool=None,
         _api_call_count=0,
@@ -188,8 +196,55 @@ def test_get_activity_summary_exposes_shared_activity_contract(monkeypatch):
     assert summary["seconds_since_activity"] == 10.0
     assert summary["last_activity_ts"] == 1_700_000_000.0
     assert summary["last_activity_desc"] == "executing tool: terminal"
-    assert "phase" not in summary
-    assert "last_progress_at" not in summary
+    assert summary["phase"] is None
+    assert summary["tool_total"] == 0
+    assert summary["tool_completed"] == 0
+    assert summary["tool_pending"] == 0
+
+
+def test_touch_activity_exposes_safe_monotonic_turn_state(monkeypatch):
+    agent = _agent_with_db()
+    wall = {"t": 1_700_000_000.0}
+    mono = {"t": 500.0}
+    monkeypatch.setattr(run_agent.time, "time", lambda: wall["t"])
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: mono["t"])
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    agent._touch_activity(
+        "waiting for tool batch",
+        phase="tool_batch_wait",
+        current_tool="terminal",
+        tool_total=3,
+        tool_completed=1,
+    )
+
+    first = agent.get_activity_summary()
+    assert first["phase"] == "tool_batch_wait"
+    assert first["current_tool"] == "terminal"
+    assert first["tool_completed"] == 1
+    assert first["tool_total"] == 3
+    assert first["tool_pending"] == 2
+    assert first["phase_started_at"] == 500.0
+    assert first["last_heartbeat_at"] == 500.0
+    assert first["seconds_since_activity"] == 0.0
+    assert first["last_activity_desc"] == "waiting for tool batch"
+    assert not {
+        "arguments",
+        "command",
+        "prompt",
+        "result",
+        "session_id",
+        "chat_id",
+    } & first.keys()
+
+    wall["t"] += 60.0
+    mono["t"] += 2.0
+    agent._touch_activity("tool still running")
+    second = agent.get_activity_summary()
+    assert second["phase"] == "tool_batch_wait"
+    assert second["phase_started_at"] == 500.0
+    assert second["last_heartbeat_at"] == 502.0
+    assert second["seconds_since_activity"] == 0.0
 
 
 def test_reset_activity_labels_after_turn_keeps_ts_and_clears_labels():
