@@ -1120,6 +1120,27 @@ agent:
   #     style: "terse"
 
 # =============================================================================
+# Goals (/goal — persistent cross-turn objectives, the Ralph loop)
+# =============================================================================
+# A /goal is a free-form objective that stays active across turns. After each
+# turn a judge model checks whether it's done; if not, Hermes feeds a
+# continuation prompt back into the same session and keeps working.
+goals:
+  # Max continuation turns before Hermes auto-pauses the goal and asks the
+  # user to /goal resume. Guards against judge false-negatives and unbounded
+  # spend on fuzzy goals.
+  max_turns: 20
+
+  # Default autonomous mode for new goals. When true, every /goal is created
+  # in autonomous mode without needing the explicit --auto flag. Off by
+  # default so /goal keeps its plain per-turn-judge behaviour. Override for a
+  # single session with the GOAL_AUTONOMOUS=1 env var, or per goal with
+  # `/goal --auto <text>`. Autonomous mode is the trigger the optional engine
+  # expansions (session-recycle, decision log, deception check, council gate)
+  # hang off in follow-up releases; on its own it is an inert marker.
+  autonomous: false
+
+# =============================================================================
 # Toolsets
 # =============================================================================
 # Control which tools the agent has access to.

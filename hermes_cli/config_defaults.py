@@ -2078,6 +2078,13 @@ DEFAULT_CONFIG = {
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+        # Default autonomous mode for new goals. When true, every /goal is
+        # created in autonomous mode (opting into the engine expansions:
+        # session-recycle, decision log, deception check, council gate) without
+        # needing the explicit --auto flag. Off by default so /goal keeps its
+        # plain Ralph-loop behaviour; override per session via the GOAL_AUTONOMOUS
+        # env var or per goal with `/goal --auto <text>`.
+        "autonomous": False,
     },
 
 
