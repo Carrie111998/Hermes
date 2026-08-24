@@ -29,7 +29,11 @@ def test_ramp_hidden_link_is_exposed(adapter):
     text = "Read the Ramp paper and others"
     msg = _message(
         text=text,
-        entities=[_entity(offset=9, length=10, url="https://ramp.com/data/ai-jobs-impact/paper")],
+        entities=[
+            _entity(
+                offset=9, length=10, url="https://ramp.com/data/ai-jobs-impact/paper"
+            )
+        ],
     )
     assert adapter._expand_link_entities(msg) == (
         "Read the Ramp paper (https://ramp.com/data/ai-jobs-impact/paper) and others"
@@ -41,7 +45,10 @@ def test_caption_link_is_exposed(adapter):
         caption="Смотри тут проект",
         caption_entities=[_entity(offset=7, length=3, url="https://example.com/x")],
     )
-    assert adapter._expand_link_entities(msg) == "Смотри тут (https://example.com/x) проект"
+    assert (
+        adapter._expand_link_entities(msg)
+        == "Смотри тут (https://example.com/x) проект"
+    )
 
 
 def test_utf16_offset_after_emoji(adapter):
@@ -65,7 +72,10 @@ def test_single_link_expansion_is_idempotent(adapter):
     entity = _entity(offset=0, length=1, url="https://one.example")
     expanded = adapter._expand_link_entities(_message(text="a", entities=[entity]))
     assert expanded == "a (https://one.example)"
-    assert adapter._expand_link_entities(_message(text=expanded, entities=[entity])) == expanded
+    assert (
+        adapter._expand_link_entities(_message(text=expanded, entities=[entity]))
+        == expanded
+    )
 
 
 @pytest.mark.parametrize(
@@ -85,6 +95,9 @@ def test_irrelevant_or_malformed_entities_are_ignored(adapter, entity):
 
 def test_visible_url_without_text_link_is_unchanged(adapter):
     text = "https://example.com"
-    assert adapter._expand_link_entities(
-        _message(text=text, entities=[_entity("url", 0, len(text))])
-    ) == text
+    assert (
+        adapter._expand_link_entities(
+            _message(text=text, entities=[_entity("url", 0, len(text))])
+        )
+        == text
+    )

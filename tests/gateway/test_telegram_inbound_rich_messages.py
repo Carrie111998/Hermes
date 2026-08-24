@@ -16,12 +16,19 @@ def _adapter():
 
 def _message(rich, *, origin=None):
     return SimpleNamespace(
-        text=None, caption=None, api_kwargs=MappingProxyType({"rich_message": rich}),
+        text=None,
+        caption=None,
+        api_kwargs=MappingProxyType({"rich_message": rich}),
         rich_message=None,
         chat=SimpleNamespace(id=123, type="private", title=None, full_name="Private"),
         from_user=SimpleNamespace(id=456, full_name="Maxim", username="qwinty"),
-        message_id=77, date=None, message_thread_id=None, direct_messages_topic=None,
-        is_topic_message=False, reply_to_message=None, forward_origin=origin,
+        message_id=77,
+        date=None,
+        message_thread_id=None,
+        direct_messages_topic=None,
+        is_topic_message=False,
+        reply_to_message=None,
+        forward_origin=origin,
         forum_topic_created=None,
     )
 
@@ -29,12 +36,18 @@ def _message(rich, *, origin=None):
 @pytest.mark.asyncio
 async def test_rich_only_update_routes_through_text_ingress_with_hidden_link():
     adapter = _adapter()
-    rich = MappingProxyType({"blocks": [MappingProxyType({
-        "type": "paragraph", "text": MappingProxyType({
-            "type": "url", "text": "Why Agentic Systems Need Ontologies",
-            "url": "https://www.youtube.com/watch?v=Sir59K8ZDPU",
-        })
-    })]})
+    rich = MappingProxyType({
+        "blocks": [
+            MappingProxyType({
+                "type": "paragraph",
+                "text": MappingProxyType({
+                    "type": "url",
+                    "text": "Why Agentic Systems Need Ontologies",
+                    "url": "https://www.youtube.com/watch?v=Sir59K8ZDPU",
+                }),
+            })
+        ]
+    })
     msg = _message(rich)
     update = SimpleNamespace(effective_message=msg, message=msg, update_id=91)
     adapter._should_process_message = MagicMock(return_value=True)
@@ -47,14 +60,21 @@ async def test_rich_only_update_routes_through_text_ingress_with_hidden_link():
 
     event = adapter._enqueue_text_event.call_args.args[0]
     assert event.message_type is MessageType.TEXT
-    assert event.text == "Why Agentic Systems Need Ontologies (https://www.youtube.com/watch?v=Sir59K8ZDPU)"
+    assert (
+        event.text
+        == "Why Agentic Systems Need Ontologies (https://www.youtube.com/watch?v=Sir59K8ZDPU)"
+    )
 
 
 @pytest.mark.asyncio
 async def test_rich_only_update_preserves_forward_origin():
     adapter = _adapter()
-    origin = SimpleNamespace(type="channel", chat=SimpleNamespace(title="Vibe Coding"), date=None)
-    msg = _message({"blocks": [{"type": "paragraph", "text": "Forwarded body"}]}, origin=origin)
+    origin = SimpleNamespace(
+        type="channel", chat=SimpleNamespace(title="Vibe Coding"), date=None
+    )
+    msg = _message(
+        {"blocks": [{"type": "paragraph", "text": "Forwarded body"}]}, origin=origin
+    )
     update = SimpleNamespace(effective_message=msg, message=msg, update_id=92)
     adapter._should_process_message = MagicMock(return_value=True)
     adapter._is_user_authorized_from_message = MagicMock(return_value=True)
@@ -93,13 +113,27 @@ def test_rich_filter_matches_only_payload_bearing_messages():
 def test_rich_block_flattener_handles_nested_structures():
     blocks = [
         {"type": "section_heading", "text": {"type": "bold", "text": "Heading"}},
-        {"type": "list", "items": [
-            {"label": "1.", "blocks": [{"type": "paragraph", "text": "First"}]},
-            {"blocks": [{"type": "block_quotation", "text": "Second"}]},
-        ]},
-        {"type": "details", "title": "More", "blocks": [{"type": "paragraph", "text": "Details body"}]},
+        {
+            "type": "list",
+            "items": [
+                {"label": "1.", "blocks": [{"type": "paragraph", "text": "First"}]},
+                {"blocks": [{"type": "block_quotation", "text": "Second"}]},
+            ],
+        },
+        {
+            "type": "details",
+            "title": "More",
+            "blocks": [{"type": "paragraph", "text": "Details body"}],
+        },
         {"type": "future_unknown", "children": [{"text": "Fallback"}]},
     ]
     text = TelegramAdapter._flatten_rich_blocks(blocks)
-    for expected in ("Heading", "1. First", "Second", "More", "Details body", "Fallback"):
+    for expected in (
+        "Heading",
+        "1. First",
+        "Second",
+        "More",
+        "Details body",
+        "Fallback",
+    ):
         assert expected in text
