@@ -3368,6 +3368,20 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    def _reaction_trigger_config(self) -> tuple[bool, Optional[set]]:
+        """Parse DISCORD_REACTION_TRIGGERS into (enabled, allowlist).
+
+        unset/''/false-ish -> (False, None); true-ish -> (True, None) meaning ALL
+        emoji; anything else -> (True, {names}) allowlist.
+        """
+        raw = str(self._gate_raw("reaction_triggers", "DISCORD_REACTION_TRIGGERS") or "").strip()
+        if not raw or raw.lower() in {"false", "0", "no", "off"}:
+            return False, None
+        if raw.lower() in {"true", "1", "yes", "on"}:
+            return True, None
+        names = {part.strip() for part in raw.split(",") if part.strip()}
+        return bool(names), names
+
     def _normalize_reaction_emoji(self, emoji) -> str:
         return normalize_reaction_emoji(emoji)
 
@@ -10483,6 +10497,20 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allowed_channels"] = str(ac)
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
             os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+    # reaction_triggers: which emoji the bot reacts with.  true/false gate all
+    # emoji; a list/scalar is an allowlist of emoji names.  Only bools are
+    # lowercased — custom Discord emoji names are case-sensitive.
+    _rt = discord_cfg.get("reaction_triggers")
+    if _rt is not None:
+        if isinstance(_rt, bool):
+            _rt_str = str(_rt).lower()
+        elif isinstance(_rt, (list, tuple)):
+            _rt_str = ",".join(str(x) for x in _rt)
+        else:
+            _rt_str = str(_rt)
+        seeded_extra["reaction_triggers"] = _rt_str  # UNCONDITIONAL — mirrors siblings
+        if not _skip_env_bridge and not os.getenv("DISCORD_REACTION_TRIGGERS"):
+            os.environ["DISCORD_REACTION_TRIGGERS"] = _rt_str
     # no_thread_channels: channels where bot responds directly without creating thread
     ntc = discord_cfg.get("no_thread_channels")
     if ntc is not None:

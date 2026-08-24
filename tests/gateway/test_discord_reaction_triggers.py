@@ -99,3 +99,41 @@ def test_normalize_animated_custom_emoji():
 def test_normalize_empty_is_empty():
     adapter = _make_adapter()
     assert adapter._normalize_reaction_emoji(None) == ""
+
+
+def test_triggers_default_off(monkeypatch):
+    adapter = _make_adapter()
+    monkeypatch.delenv("DISCORD_REACTION_TRIGGERS", raising=False)
+    assert adapter._reaction_trigger_config() == (False, None)
+
+
+def test_triggers_all_emoji_when_true(monkeypatch):
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "true")
+    assert adapter._reaction_trigger_config() == (True, None)
+
+
+def test_triggers_allowlist_parsed(monkeypatch):
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍, paw ,✅")
+    enabled, allowlist = adapter._reaction_trigger_config()
+    assert enabled is True
+    assert allowlist == {"👍", "paw", "✅"}
+
+
+def test_yaml_list_maps_to_comma_env(monkeypatch):
+    # exercise _apply_yaml_config the way cli-config loads it
+    import os
+
+    import plugins.platforms.discord.adapter as m
+    monkeypatch.delenv("DISCORD_REACTION_TRIGGERS", raising=False)
+    yaml_cfg = {"discord": {"reaction_triggers": ["👍", "❤️"]}}
+    discord_cfg = yaml_cfg["discord"]
+    try:
+        # call the real mapper with the same shape other keys use (mirror its callers)
+        m._apply_yaml_config(yaml_cfg, discord_cfg)
+        assert os.getenv("DISCORD_REACTION_TRIGGERS") == "👍,❤️"
+    finally:
+        # _apply_yaml_config writes os.environ DIRECTLY, which monkeypatch
+        # does not track — pop manually or the value leaks into later tests.
+        os.environ.pop("DISCORD_REACTION_TRIGGERS", None)
