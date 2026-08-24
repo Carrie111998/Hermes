@@ -128,8 +128,8 @@ export async function reconcileActiveTranscript({
 const CRON_POLL_INTERVAL_MS = 30_000
 const CRON_BACKSTOP_INTERVAL_MS = 5 * 60_000
 const MESSAGING_POLL_INTERVAL_MS = 10_000
-const ACTIVE_MESSAGING_SESSION_POLL_INTERVAL_MS = 5_000
-const ACTIVE_MESSAGING_SESSION_BACKSTOP_INTERVAL_MS = 30_000
+const ACTIVE_TRANSCRIPT_POLL_INTERVAL_MS = 5_000
+const ACTIVE_TRANSCRIPT_BACKSTOP_INTERVAL_MS = 30_000
 // Match the TUI's live-session refresh cadence. Auto-compression can rotate a
 // stored session id while its turn keeps running; until the next snapshot the
 // sidebar row points at the new id while the renderer still knows the old one.
@@ -354,7 +354,6 @@ function visiblePoll(intervalMs: number, tick: () => void): () => void {
 export function useBackgroundSync({
   activeConnectionId,
   activeGatewayProfile,
-  activeIsMessaging,
   activeSessionId,
   activeStoredSessionId,
   freshDraftReady,
@@ -571,11 +570,12 @@ export function useBackgroundSync({
     requestActiveTranscriptRefresh(true)
   }, [activeSessionId, activeStoredSessionId, activeTranscriptBusy, gatewayState, requestActiveTranscriptRefresh])
 
-  // Preserve the pre-existing messaging behavior: refresh once when a
-  // messaging transcript opens, then keep its visibility backstop. Desktop
-  // sessions never enter this effect and therefore gain no periodic timer.
+  // Refresh once when any transcript opens, then keep a visibility-gated
+  // backstop. Change events remain the live path; the timer covers a renderer
+  // that stayed open while its runtime socket was interrupted or reaped and
+  // can therefore no longer rely on another sessions.changed broadcast.
   useEffect(() => {
-    if (gatewayState !== 'open' || !activeIsMessaging || !activeSessionId || !activeStoredSessionId) {
+    if (gatewayState !== 'open' || !activeSessionId || !activeStoredSessionId) {
       return
     }
 
@@ -584,11 +584,10 @@ export function useBackgroundSync({
     runScheduledRefresh()
 
     return visiblePoll(
-      changeEventsAvailable ? ACTIVE_MESSAGING_SESSION_BACKSTOP_INTERVAL_MS : ACTIVE_MESSAGING_SESSION_POLL_INTERVAL_MS,
+      changeEventsAvailable ? ACTIVE_TRANSCRIPT_BACKSTOP_INTERVAL_MS : ACTIVE_TRANSCRIPT_POLL_INTERVAL_MS,
       runScheduledRefresh
     )
   }, [
-    activeIsMessaging,
     activeSessionId,
     activeStoredSessionId,
     changeEventsAvailable,

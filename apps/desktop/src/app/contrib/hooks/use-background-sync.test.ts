@@ -159,20 +159,22 @@ describe('active transcript refresh', () => {
     )
   })
 
-  it('does not add a periodic transcript poll to local/Desktop sessions', async () => {
+  it('keeps a periodic visibility backstop for local/Desktop sessions', async () => {
     vi.useFakeTimers()
     $changeEventsAvailable.set(true)
     const refresh = vi.fn(async () => undefined)
 
     renderSync(refresh)
-    expect(refresh).not.toHaveBeenCalled()
+    expect(refresh).toHaveBeenCalledTimes(1)
+    await act(async () => Promise.resolve())
+    refresh.mockClear()
 
     await act(async () => {
-      vi.advanceTimersByTime(60_000)
+      vi.advanceTimersByTime(30_000)
       await Promise.resolve()
     })
 
-    expect(refresh).not.toHaveBeenCalled()
+    expect(refresh).toHaveBeenCalledTimes(1)
   })
 
   it('retains the existing periodic backstop for messaging sessions', async () => {
@@ -220,6 +222,7 @@ describe('active transcript refresh', () => {
     const refresh = vi.fn(async () => undefined)
 
     renderSync(refresh)
+    refresh.mockClear()
 
     act(() => {
       for (let index = 0; index < 20; index += 1) {
