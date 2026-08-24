@@ -1,36 +1,9 @@
 """Tests for Telegram model picker thread fallback."""
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-
-def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-
-    mod = MagicMock()
-    mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    mod.constants.ParseMode.MARKDOWN = "Markdown"
-    mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    mod.constants.ParseMode.HTML = "HTML"
-    mod.constants.ChatType.PRIVATE = "private"
-    mod.constants.ChatType.GROUP = "group"
-    mod.constants.ChatType.SUPERGROUP = "supergroup"
-    mod.constants.ChatType.CHANNEL = "channel"
-    mod.error.NetworkError = type("NetworkError", (OSError,), {})
-    mod.error.TimedOut = type("TimedOut", (OSError,), {})
-    mod.error.BadRequest = type("BadRequest", (Exception,), {})
-
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, mod)
-    sys.modules.setdefault("telegram.error", mod.error)
-
-
-_ensure_telegram_mock()
-
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -571,3 +544,35 @@ class TestTelegramModelPicker:
         assert "12345:10" not in adapter._model_picker_state
         assert "12345:20" in adapter._model_picker_state
         assert adapter._model_picker_state["12345"] is adapter._model_picker_state["12345:20"]
+
+    @pytest.mark.asyncio
+    async def test_abandoned_picker_state_is_bounded(self):
+        adapter = _make_adapter()
+        adapter._MODEL_PICKER_STATE_MAX = 2
+        message_ids = iter([10, 20, 30])
+
+        async def mock_send_message(**kwargs):
+            return SimpleNamespace(message_id=next(message_ids))
+
+        adapter._bot.send_message = AsyncMock(side_effect=mock_send_message)
+        providers = [
+            {"slug": "openai", "name": "OpenAI", "total_models": 1}
+        ]
+
+        for index in range(3):
+            result = await adapter.send_model_picker(
+                chat_id="12345",
+                providers=providers,
+                current_model="gpt-5",
+                current_provider="openai",
+                session_key=f"session-{index}",
+                on_model_selected=AsyncMock(),
+                metadata=None,
+            )
+            assert result.success is True
+
+        assert "12345:10" not in adapter._model_picker_state
+        assert "12345:20" in adapter._model_picker_state
+        assert "12345:30" in adapter._model_picker_state
+        assert adapter._model_picker_state["12345"] is adapter._model_picker_state["12345:30"]
+
