@@ -53,6 +53,9 @@ def _make_cli():
     cli_obj._pet_cols = 18
     cli_obj._pet_scale = 0.7
     cli_obj._pet_frames_cache = {}
+    cli_obj._pet_kitty_cache = {}
+    cli_obj._pet_kitty_image_id = 0
+    cli_obj._pet_kitty_pending = ""
     cli_obj._pet_frame_idx = 0
     cli_obj._agent_running = False
     # Transient-beat + reasoning state (set by HermesCLI.__init__ in production).
@@ -114,9 +117,55 @@ def test_pet_fragments_render_half_blocks(boba_like):
     assert sum(1 for _, text in frags if text == "\n") == height - 1
 
 
-def test_pet_resolve_config_enables_and_disables(boba_like):
+def test_pet_fragments_render_kitty_placeholders(boba_like):
+    from agent.pet import render
+
+    cli_obj = _make_cli()
+    pet = store.load_pet("boba")
+    assert pet is not None
+    cli_obj._pet_renderer = PetRenderer(
+        str(pet.spritesheet), mode="kitty", scale=0.4
+    )
+    cli_obj._pet_slug = "boba"
+    cli_obj._pet_kitty_image_id = render.kitty_image_id("boba")
+    cli_obj._pet_enabled = True
+
+    frags = cli_obj._pet_fragments()
+    assert frags
+    assert any("\U0010eeee" in text for _, text in frags)
+    color = render.kitty_color_hex(cli_obj._pet_kitty_image_id)
+    assert all(f"fg:{color}" in style for style, text in frags if text != "\n")
+    assert cli_obj._pet_widget_height() > 0
+
+    cli_obj._pet_queue_kitty_frame("idle")
+    assert cli_obj._pet_kitty_pending.startswith("\x1b_G")
+
+    class Output:
+        def __init__(self):
+            self.raw = ""
+            self.flushed = False
+
+        def write_raw(self, text):
+            self.raw += text
+
+        def flush(self):
+            self.flushed = True
+
+    class App:
+        output = Output()
+
+    app = App()
+    cli_obj._pet_flush_kitty_frame(app)
+    assert app.output.raw.startswith("\x1b_G")
+    assert app.output.flushed is True
+    assert cli_obj._pet_kitty_pending == ""
+
+
+def test_pet_resolve_config_enables_and_disables(boba_like, monkeypatch):
     from hermes_cli.config import load_config, save_config
 
+    monkeypatch.setenv("KITTY_WINDOW_ID", "1")
+    monkeypatch.setenv("TERM", "xterm-kitty")
     cli_obj = _make_cli()
 
     cfg = load_config()
@@ -127,6 +176,7 @@ def test_pet_resolve_config_enables_and_disables(boba_like):
     cli_obj._pet_resolve_config()
     assert cli_obj._pet_enabled is True
     assert cli_obj._pet_renderer is not None
+    assert cli_obj._pet_renderer.mode == "kitty"
     assert cli_obj._pet_slug == "boba"
 
     cfg["display"]["pet"]["enabled"] = False
