@@ -1,4 +1,3 @@
-import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { Dispatch, SetStateAction } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -8,33 +7,31 @@ import { Button } from '@/components/ui/button'
 import { RowButton } from '@/components/ui/row-button'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Switch } from '@/components/ui/switch'
-import { getChannelCapabilities, updateChannelCapabilities } from '@/hermes'
+import { getChannelCapabilities, profileScopeKey, type ProfileScope, updateChannelCapabilities } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Lock } from '@/lib/icons'
 import { queryClient } from '@/lib/query-client'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import type { ChannelMcpMode } from '@/types/hermes'
 
-import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 import { DetailColumn, ListColumn, MasterDetail, ToolChip } from '../master-detail'
 
 const CHANNEL_CAPABILITIES_QUERY_KEY = ['channel-capabilities'] as const
 const HIGH_IMPACT = new Set(['terminal', 'file', 'code_execution', 'computer_use', 'delegation', 'cronjob'])
 
 interface ChannelsTabProps {
+  profile: ProfileScope
   query: string
 }
 
-export function ChannelsTab({ query }: ChannelsTabProps) {
+export function ChannelsTab({ profile, query }: ChannelsTabProps) {
   const { t } = useI18n()
-  const activeProfile = useStore($activeGatewayProfile)
-  const profileKey = normalizeProfileKey(activeProfile)
+  const profileKey = profileScopeKey(profile)
 
   const { data: channels, isError, isLoading } = useQuery({
     queryKey: [...CHANNEL_CAPABILITIES_QUERY_KEY, profileKey],
-    queryFn: getChannelCapabilities,
+    queryFn: () => getChannelCapabilities(profile),
     staleTime: 0
   })
 
@@ -48,16 +45,16 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
   activeProfileRef.current = profileKey
   const saving = savingProfile === profileKey
 
-  // A profile swap changes the backend authority. Drop every local draft
-  // before another click can route profile A's selections to profile B.
-  useOnProfileSwitch(() => {
+  // A capability-scope switch changes the backend authority. Drop every local
+  // draft before another click can route one profile's selections to another.
+  useEffect(() => {
     saveGeneration.current += 1
     setSelected(null)
     setEnabledToolsets(new Set())
     setMcpMode('all')
     setMcpServers(new Set())
     setSavingProfile(null)
-  })
+  }, [profileKey])
 
   const visibleChannels = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -135,14 +132,14 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
         toolsets: [...enabledToolsets].sort(),
         mcp_mode: mcpMode,
         mcp_servers: mcpMode === 'allowlist' ? [...mcpServers].sort() : []
-      })
+      }, profile)
 
       if (!isCurrentRequest()) {
         return
       }
 
       await queryClient.invalidateQueries({
-        queryKey: [...CHANNEL_CAPABILITIES_QUERY_KEY, profileKey]
+        queryKey: [...CHANNEL_CAPABILITIES_QUERY_KEY, requestProfile]
       })
       notify({
         kind: 'success',
