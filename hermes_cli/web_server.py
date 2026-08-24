@@ -8236,8 +8236,13 @@ _CREDENTIAL_PROBES: dict[str, tuple[str, str]] = {
 }
 
 
-def _parse_model_ids(resp: "Any") -> List[str]:
-    """Extract model ids from an OpenAI-compatible ``/v1/models`` response.
+_CUSTOM_ENDPOINT_MODEL_METADATA = (
+    "canonical_model", "reasoning_effort", "supported_reasoning_levels"
+)
+
+
+def _parse_model_catalog(resp: "Any") -> List[Dict[str, Any]]:
+    """Extract safe model routing metadata from a ``/v1/models`` response.
 
     Tolerant of the common shapes: ``{"data": [{"id": ...}]}`` (OpenAI / vLLM /
     llama.cpp) and a bare ``{"data": ["id", ...]}``. Returns ``[]`` on any
@@ -8252,15 +8257,31 @@ def _parse_model_ids(resp: "Any") -> List[str]:
     data = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(data, list):
         return []
-    ids: List[str] = []
+    models: List[Dict[str, Any]] = []
     for item in data:
         if isinstance(item, dict):
             mid = str(item.get("id") or "").strip()
         else:
             mid = str(item or "").strip()
         if mid:
-            ids.append(mid)
-    return ids
+            model: Dict[str, Any] = {"id": mid}
+            if isinstance(item, dict):
+                for field in _CUSTOM_ENDPOINT_MODEL_METADATA:
+                    value = item.get(field)
+                    if field == "supported_reasoning_levels":
+                        if isinstance(value, list):
+                            levels = [str(level).strip() for level in value if str(level).strip()]
+                            if levels:
+                                model[field] = levels
+                    elif isinstance(value, str) and value.strip():
+                        model[field] = value.strip()
+            models.append(model)
+    return models
+
+
+def _parse_model_ids(resp: "Any") -> List[str]:
+    """Compatibility projection for callers that only consume model ids."""
+    return [model["id"] for model in _parse_model_catalog(resp)]
 
 
 def _custom_endpoint_id(raw: str, fallback: str = "custom") -> str:
@@ -8282,6 +8303,23 @@ def _models_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[str]:
 
     seen: set[str] = set()
     return [model for model in models if model and not (model in seen or seen.add(model))]
+
+
+def _model_catalog_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_models = entry.get("models")
+    metadata = raw_models if isinstance(raw_models, dict) else {}
+    return [
+        {
+            "id": model_id,
+            **{
+                field: model_meta[field]
+                for field in _CUSTOM_ENDPOINT_MODEL_METADATA
+                if isinstance(model_meta, dict) and field in model_meta
+            },
+        }
+        for model_id in _models_from_custom_endpoint_entry(entry)
+        for model_meta in [metadata.get(model_id, {})]
+    ]
 
 
 def _api_key_display(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -8332,15 +8370,18 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if not base_url:
                 continue
             endpoint_id = str(provider_id)
-            models = _models_from_custom_endpoint_entry(raw_entry)
-            endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (models[0] if models else ""))
+            model_ids = _models_from_custom_endpoint_entry(raw_entry)
+            models = _model_catalog_from_custom_endpoint_entry(raw_entry)
+            endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (model_ids[0] if model_ids else ""))
             has_api_key, api_key_preview = _api_key_display(raw_entry)
             endpoints.append({
                 "id": endpoint_id,
                 "name": str(raw_entry.get("name") or endpoint_id),
                 "base_url": base_url,
+                "api_mode": str(raw_entry.get("api_mode") or raw_entry.get("transport") or "chat_completions"),
                 "model": endpoint_model,
-                "models": models,
+                "models": model_ids,
+                "model_details": models,
                 "context_length": raw_entry.get("context_length"),
                 "discover_models": bool(raw_entry.get("discover_models", True)),
                 "has_api_key": has_api_key,
@@ -8355,8 +8396,10 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "id": "custom",
             "name": "Custom",
             "base_url": current_base_url,
+            "api_mode": str(model_cfg.get("api_mode") or "chat_completions"),
             "model": current_model,
             "models": [current_model] if current_model else [],
+            "model_details": [{"id": current_model}] if current_model else [],
             "context_length": model_cfg.get("context_length"),
             "discover_models": True,
             "has_api_key": has_api_key,
@@ -8393,7 +8436,7 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
         return
     if str(model_cfg.get("provider") or "").strip().lower() != provider_key:
         return
-    for field in ("provider", "base_url", "api_key", "key_env"):
+    for field in ("provider", "base_url", "api_key", "key_env", "api_mode"):
         model_cfg.pop(field, None)
     cfg["model"] = model_cfg
 
@@ -8420,10 +8463,13 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     existing = providers.get(endpoint_id)
     if not isinstance(existing, dict):
         existing = {}
+    api_mode = body.api_mode or str(
+        existing.get("api_mode") or existing.get("transport") or "chat_completions"
+    )
 
     # Merge onto the existing entry rather than replacing it. A providers.<name>
     # block is not owned by this panel: it can carry hand-written keys the
-    # dashboard has no field for — ``api_mode``, ``key_env``/``api_key_env``,
+    # dashboard has no field for — ``key_env``/``api_key_env``,
     # ``extra_headers`` (which may themselves carry credentials),
     # ``request_overrides`` — and rebuilding from scratch silently dropped every
     # one of them on an unrelated edit, leaving a provider that no longer
@@ -8432,7 +8478,7 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     entry.update({
         "name": name,
         "base_url": base_url,
-        "model": model,
+        "api_mode": api_mode,
         "discover_models": bool(body.discover_models),
     })
     # Same for the model map: merge rather than replace, so existing models
@@ -8443,16 +8489,47 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     # UI) still just ensures the named default is present.
     existing_models = entry.get("models")
     models_map: Dict[str, Any] = dict(existing_models) if isinstance(existing_models, dict) else {}
-    for candidate in (*(body.models or ()), model):
-        model_id = str(candidate).strip()
+    selected_metadata: Dict[str, Any] = {}
+    candidates = body.model_details or body.models or ()
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            model_id = candidate.strip()
+            model_metadata: Dict[str, Any] = {}
+        else:
+            candidate_data = candidate.model_dump(exclude_none=True)
+            model_id = str(candidate_data.pop("id", "")).strip()
+            model_metadata = candidate_data
         if not model_id:
             continue
         current = models_map.get(model_id)
-        models_map[model_id] = dict(current) if isinstance(current, dict) else {}
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update(model_metadata)
+        models_map[model_id] = merged
+        if model_id == model:
+            selected_metadata = merged
+
+    canonical_model = str(selected_metadata.get("canonical_model") or model).strip()
+    current = models_map.get(canonical_model)
+    models_map[canonical_model] = dict(current) if isinstance(current, dict) else {}
+    entry["model"] = canonical_model
     entry["models"] = models_map
     if body.context_length and body.context_length > 0:
         entry["context_length"] = int(body.context_length)
-        entry["models"][model]["context_length"] = int(body.context_length)
+        entry["models"][canonical_model]["context_length"] = int(body.context_length)
+
+    reasoning_effort = str(selected_metadata.get("reasoning_effort") or "").strip().lower()
+    if reasoning_effort:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed_effort = parse_reasoning_effort(reasoning_effort)
+        if parsed_effort and parsed_effort.get("enabled"):
+            agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+            overrides = agent_cfg.get("reasoning_overrides")
+            if not isinstance(overrides, dict):
+                overrides = {}
+            overrides[canonical_model] = reasoning_effort
+            agent_cfg["reasoning_overrides"] = overrides
+            cfg["agent"] = agent_cfg
 
     # API keys never belong in config.yaml (#69449). Write to .env and
     # reference it via ``key_env`` — the same indirection built-in providers
@@ -8482,8 +8559,12 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
 
     if body.make_default:
         cfg["model"] = _apply_main_model_assignment(
-            cfg.get("model", {}), endpoint_id, model, base_url
+            cfg.get("model", {}), endpoint_id, canonical_model, base_url
         )
+        if api_mode == "auto":
+            cfg["model"].pop("api_mode", None)
+        else:
+            cfg["model"]["api_mode"] = api_mode
         if entry.get("key_env") and isinstance(cfg["model"], dict):
             cfg["model"]["key_env"] = entry["key_env"]
             cfg["model"].pop("api_key", None)
@@ -8548,6 +8629,11 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
                 raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
             model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
+            api_mode = str(entry.get("api_mode") or entry.get("transport") or "chat_completions")
+            if api_mode == "auto":
+                model_cfg.pop("api_mode", None)
+            else:
+                model_cfg["api_mode"] = api_mode
             if entry.get("key_env"):
                 model_cfg["key_env"] = entry["key_env"]
                 model_cfg.pop("api_key", None)
@@ -8613,7 +8699,14 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
     if not resp.is_success:
         return {"ok": False, "reachable": True, "message": f"Endpoint returned HTTP {resp.status_code}.", "models": []}
 
-    return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
+    model_details = _parse_model_catalog(resp)
+    return {
+        "ok": True,
+        "reachable": True,
+        "message": "",
+        "models": [model["id"] for model in model_details],
+        "model_details": model_details,
+    }
 
 
 @app.post("/api/providers/validate")

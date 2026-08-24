@@ -50,16 +50,27 @@ class MemoryProviderSetupRequest(BaseModel):
     values: Dict[str, Any] = {}
 
 
+class CustomEndpointModel(BaseModel):
+    id: str
+    canonical_model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    supported_reasoning_levels: Optional[List[str]] = None
+
+
 class CustomEndpointUpdate(BaseModel):
     id: str = ""
     name: str
     base_url: str
     model: str
     api_key: Optional[str] = None
+    api_mode: Optional[Literal[
+        "auto", "chat_completions", "codex_responses", "anthropic_messages"
+    ]] = None
     context_length: Optional[int] = None
     discover_models: bool = True
     make_default: bool = False
     models: Optional[List[str]] = None
+    model_details: Optional[List[CustomEndpointModel]] = None
 
 
 class MessagingPlatformUpdate(BaseModel):

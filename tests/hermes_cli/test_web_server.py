@@ -1598,10 +1598,9 @@ class TestWebServerEndpoints:
 
 
 
-    def test_parse_model_ids_handles_openai_and_bare_shapes(self):
-        """Model discovery must tolerate the common /v1/models shapes and
-        never raise (so a slightly non-standard local endpoint still works)."""
-        from hermes_cli.web_server import _parse_model_ids
+    def test_parse_model_catalog_preserves_recognized_metadata(self):
+        """Discovery keeps routing metadata without trusting arbitrary fields."""
+        from hermes_cli.web_server import _parse_model_catalog
 
         class FakeResp:
             def __init__(self, payload, ok=True):
@@ -1613,18 +1612,105 @@ class TestWebServerEndpoints:
                     raise self._payload
                 return self._payload
 
-        # OpenAI / vLLM / llama.cpp shape.
-        assert _parse_model_ids(
-            FakeResp({"data": [{"id": "llama-3.1-8b"}, {"id": "qwen2.5-7b"}]})
-        ) == ["llama-3.1-8b", "qwen2.5-7b"]
+        assert _parse_model_catalog(FakeResp({"data": [{
+            "id": "gpt-5.6-sol-high",
+            "canonical_model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "supported_reasoning_levels": ["low", "high"],
+            "untrusted": "drop-me",
+        }]})) == [{
+            "id": "gpt-5.6-sol-high",
+            "canonical_model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "supported_reasoning_levels": ["low", "high"],
+        }]
         # Bare list of ids.
-        assert _parse_model_ids(FakeResp({"data": ["m1", "m2"]})) == ["m1", "m2"]
+        assert _parse_model_catalog(FakeResp({"data": ["m1", "m2"]})) == [
+            {"id": "m1"}, {"id": "m2"}
+        ]
         # Top-level list.
-        assert _parse_model_ids(FakeResp([{"id": "x"}])) == ["x"]
+        assert _parse_model_catalog(FakeResp([{"id": "x"}])) == [{"id": "x"}]
         # Non-success / malformed / exception → [] (never raises).
-        assert _parse_model_ids(FakeResp({"data": []}, ok=False)) == []
-        assert _parse_model_ids(FakeResp({"nope": 1})) == []
-        assert _parse_model_ids(FakeResp(ValueError("bad json"))) == []
+        assert _parse_model_catalog(FakeResp({"data": []}, ok=False)) == []
+        assert _parse_model_catalog(FakeResp({"nope": 1})) == []
+        assert _parse_model_catalog(FakeResp(ValueError("bad json"))) == []
+
+    def test_custom_endpoint_persists_transport_and_resolves_reasoning_alias(self):
+        """A discovered Responses alias becomes an executable runtime config."""
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "responses-proxy",
+                "name": "Responses Proxy",
+                "base_url": "https://responses.example/v1",
+                "api_mode": "codex_responses",
+                "model": "gpt-5.6-sol-high",
+                "models": ["gpt-5.6-sol-high"],
+                "model_details": [{
+                    "id": "gpt-5.6-sol-high",
+                    "canonical_model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "supported_reasoning_levels": ["low", "medium", "high"],
+                }],
+                "make_default": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        endpoint = resp.json()["endpoints"][0]
+        assert endpoint["api_mode"] == "codex_responses"
+        assert endpoint["model"] == "gpt-5.6-sol"
+        alias = next(model for model in endpoint["model_details"] if model["id"] == "gpt-5.6-sol-high")
+        assert alias["canonical_model"] == "gpt-5.6-sol"
+
+        cfg = load_config()
+        entry = cfg["providers"]["responses-proxy"]
+        assert entry["api_mode"] == "codex_responses"
+        assert entry["model"] == "gpt-5.6-sol"
+        assert entry["models"]["gpt-5.6-sol-high"]["reasoning_effort"] == "high"
+        assert cfg["model"]["api_mode"] == "codex_responses"
+        assert cfg["model"]["default"] == "gpt-5.6-sol"
+        assert cfg["agent"]["reasoning_overrides"]["gpt-5.6-sol"] == "high"
+
+    def test_custom_endpoint_chat_completions_remains_the_default(self):
+        """Old payloads keep their historical Chat Completions behavior."""
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "legacy-proxy",
+                "name": "Legacy Proxy",
+                "base_url": "https://chat.example/v1",
+                "model": "chat-model",
+                "make_default": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        endpoint = resp.json()["endpoints"][0]
+        assert endpoint["api_mode"] == "chat_completions"
+        assert endpoint["models"] == ["chat-model"]
+        assert endpoint["model_details"] == [{"id": "chat-model"}]
+
+    def test_custom_endpoint_legacy_edit_preserves_explicit_transport(self):
+        """An older Desktop payload must not reset a transport it cannot display."""
+        payload = {
+            "id": "responses-proxy",
+            "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1",
+            "model": "gpt-5.6-sol",
+            "api_mode": "codex_responses",
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+
+        payload.pop("api_mode")
+        payload["name"] = "Renamed Responses Proxy"
+        response = self.client.post("/api/providers/custom-endpoints", json=payload)
+
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "responses-proxy")
+        assert endpoint["api_mode"] == "codex_responses"
 
 
     def test_set_model_main_custom_persists_api_key_and_registers_provider(self):
@@ -4696,6 +4782,7 @@ class TestValidateProviderCredential:
             "reachable": True,
             "message": "",
             "models": ["local-model"],
+            "model_details": [{"id": "local-model"}],
         }
         assert captured == {
             "url": "http://localhost:8000/v1/models",
