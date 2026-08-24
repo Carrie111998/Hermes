@@ -18,7 +18,16 @@ import plugins.platforms.photon.sidecar_paths as sidecar_paths
 
 def _seed_source(source: Path, *, with_node_modules: bool = False) -> None:
     source.mkdir(parents=True, exist_ok=True)
-    for name in sidecar_paths._MIRROR_FILES:
+    # The real sidecar source set: every *.mjs (including the helper modules
+    # #85046 forgot to mirror) plus the two package manifests.
+    for name in (
+        "index.mjs",
+        "patch-spectrum-mixed-attachments.mjs",
+        "send-format.mjs",
+        "stream-staleness.mjs",
+        "package.json",
+        "package-lock.json",
+    ):
         (source / name).write_text(f"// {name}\n", encoding="utf-8")
     if with_node_modules:
         (source / "node_modules").mkdir()
@@ -86,6 +95,46 @@ def test_mirror_refresh_updates_changed_files_and_keeps_node_modules(
     assert resolved == mirror
     assert (mirror / "index.mjs").read_text(encoding="utf-8") == "// index.mjs v2\n"
     assert (mirror / "node_modules" / "installed.txt").exists()
+
+
+def test_mirror_copies_all_mjs_helpers(tmp_path, monkeypatch) -> None:
+    """#85046 regression: send-format.mjs / stream-staleness.mjs (imported by
+    index.mjs but absent from the old hardcoded _MIRROR_FILES) must reach the
+    mirror, or the sidecar dies with ERR_MODULE_NOT_FOUND on hosted installs."""
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "src"
+    _seed_source(source)
+    _freeze_writability(monkeypatch, writable=False)
+
+    mirror = sidecar_paths.resolve_sidecar_dir(source)
+
+    for name in (
+        "index.mjs",
+        "patch-spectrum-mixed-attachments.mjs",
+        "send-format.mjs",
+        "stream-staleness.mjs",
+        "package.json",
+        "package-lock.json",
+    ):
+        assert (mirror / name).exists(), f"{name} not mirrored"
+
+
+def test_mirror_picks_up_newly_added_helper(tmp_path, monkeypatch) -> None:
+    """A helper module added later is mirrored automatically — no hardcoded
+    list to forget to update (the root fragility of #85046)."""
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "src"
+    _seed_source(source)
+    (source / "future-helper.mjs").write_text("// future\n", encoding="utf-8")
+    _freeze_writability(monkeypatch, writable=False)
+
+    mirror = sidecar_paths.resolve_sidecar_dir(source)
+
+    assert (mirror / "future-helper.mjs").exists()
 
 
 def test_dir_writable_probe(tmp_path) -> None:

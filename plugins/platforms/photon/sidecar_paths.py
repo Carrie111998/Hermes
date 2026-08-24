@@ -45,14 +45,18 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
-# The files that define the sidecar. Mirrored into the writable runtime dir
-# when the install tree is read-only. node_modules is deliberately absent —
-# it is either baked (managed image) or installed by npm in the mirror.
-_MIRROR_FILES = (
-    "index.mjs",
+# The runtime files to mirror into a writable runtime dir when the install
+# tree is read-only. Expressed as glob patterns against the source sidecar
+# dir so any module `index.mjs` imports is always present — a hardcoded
+# filename list silently drops new helper modules and crashes the sidecar
+# with ERR_MODULE_NOT_FOUND on hosted installs (see #85046, where
+# send-format.mjs and stream-staleness.mjs were omitted). node_modules is
+# deliberately absent — it is either baked (managed image) or installed by
+# npm in the mirror.
+_MIRROR_FILE_PATTERNS = (
+    "*.mjs",
     "package.json",
     "package-lock.json",
-    "patch-spectrum-mixed-attachments.mjs",
 )
 
 
@@ -122,13 +126,13 @@ def resolve_sidecar_dir(source_dir: Optional[Path] = None) -> Path:
     mirror = get_hermes_home() / "photon" / "sidecar"
     try:
         mirror.mkdir(parents=True, exist_ok=True)
-        for name in _MIRROR_FILES:
-            src = source / name
-            if not src.exists():
-                continue
-            dst = mirror / name
-            if not dst.exists() or not filecmp.cmp(str(src), str(dst), shallow=False):
-                shutil.copy2(str(src), str(dst))
+        for pattern in _MIRROR_FILE_PATTERNS:
+            for src in sorted(source.glob(pattern)):
+                dst = mirror / src.name
+                if not dst.exists() or not filecmp.cmp(
+                    str(src), str(dst), shallow=False
+                ):
+                    shutil.copy2(str(src), str(dst))
         return mirror
     except OSError as exc:
         logger.warning(
