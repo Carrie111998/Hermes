@@ -106,6 +106,9 @@ class TestManifestParsing:
             "distribution_owned:\n"
             "  - SOUL.md\n"
             "  - skills/\n"
+            "preload_skills:\n"
+            "  - api-design\n"
+            "  - auth-integration\n"
         )
         m = read_manifest(tmp_path)
         assert m.name == "telem"
@@ -118,6 +121,7 @@ class TestManifestParsing:
         assert m.env_requires[1].required is False
         assert m.env_requires[1].default == "http://127.0.0.1:8000"
         assert m.distribution_owned == ["SOUL.md", "skills"]
+        assert m.preload_skills == ["api-design", "auth-integration"]
 
 
 
@@ -130,11 +134,13 @@ class TestManifestParsing:
             version="1.0.0",
             description="roundtrip",
             env_requires=[EnvRequirement(name="FOO", description="foo")],
+            preload_skills=["api-design"],
         )
         write_manifest(tmp_path, original)
         parsed = read_manifest(tmp_path)
         assert parsed.name == "rt"
         assert parsed.env_requires[0].name == "FOO"
+        assert parsed.preload_skills == ["api-design"]
 
 
 # ===========================================================================

@@ -839,10 +839,15 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    activation_note_template: str | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
+
+    ``activation_note_template`` may override the default CLI activation note.
+    It receives ``{skill_name}`` and is used by other native surfaces such as
+    profile-distribution preloads without duplicating skill-loading logic.
 
     Disabled skills are treated the same as missing ones: this loads via a
     raw identifier straight into ``_load_skill_payload``, bypassing
@@ -886,11 +891,14 @@ def build_preloaded_skills_prompt(
         except Exception:
             pass  # Non-critical
 
-        activation_note = (
-            f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '
-            "preloaded. Treat its instructions as active guidance for the duration of this "
-            "session unless the user overrides them.]"
-        )
+        if activation_note_template:
+            activation_note = activation_note_template.format(skill_name=skill_name)
+        else:
+            activation_note = (
+                f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '
+                "preloaded. Treat its instructions as active guidance for the duration of this "
+                "session unless the user overrides them.]"
+            )
         prompt_parts.append(
             _build_skill_message(
                 loaded_skill,
