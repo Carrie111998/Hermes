@@ -13351,6 +13351,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
+        # Start background delivery-retry watcher: retries failed
+        # delivery-ledger rows owned by this live gateway (#91653) so a
+        # transient platform rejection no longer strands a completed
+        # answer until the next restart.
+        self._spawn_supervised(self._delivery_retry_watcher, "delivery_retry_watcher")
+
         # Stall watchdog: pending inbound + stale agent activity → warn user
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
@@ -13861,6 +13867,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
+
+    async def _delivery_retry_watcher(self, interval: int = 300):
+        """Background task that retries failed delivery-ledger rows owned by
+        this live gateway (#91653).
+
+        ``sweep_recoverable`` only claims rows whose owner is dead, and the
+        startup sweep is the only redelivery pass. A platform rejection
+        (transient 5xx storm) leaves a row ``state='failed'`` with a live
+        owner forever — the turn completed, the answer sits in the ledger,
+        and nothing ever retries it. This watcher periodically claims
+        failed rows owned by THIS process (older than the freshness floor)
+        and redelivers them with the recovered-reply marker, so a
+        transient platform outage no longer strands a completed answer.
+
+        Runs every ``interval`` seconds (default 5 min). Best-effort: a
+        ledger or send failure is logged and retried on the next tick.
+        """
+        await asyncio.sleep(90)  # initial delay — let the gateway fully start
+        while self._running:
+            try:
+                from gateway.delivery_ledger import (
+                    ledger_enabled,
+                    sweep_live_owner_failed,
+                )
+
+                if not await asyncio.to_thread(ledger_enabled):
+                    await asyncio.sleep(interval)
+                    continue
+                _deliverable = {
+                    getattr(p, "value", str(p)) for p in self.adapters
+                }
+                claimed = await asyncio.to_thread(
+                    sweep_live_owner_failed,
+                    None,
+                    deliverable_platforms=_deliverable,
+                )
+                if claimed:
+                    await self._redeliver_claimed_obligations(claimed)
+            except Exception:
+                logger.debug("delivery retry watcher tick failed", exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.

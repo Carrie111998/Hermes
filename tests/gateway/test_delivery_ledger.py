@@ -123,6 +123,75 @@ class TestSweep:
         assert dl.sweep_recoverable() == []
 
 
+class TestLiveOwnerSweep:
+    """#91653: failed rows owned by a LIVE process must be claimable for
+    periodic redelivery — the startup-only dead-owner sweep strands them."""
+
+    def test_failed_live_owner_row_claimed_after_freshness_floor(self):
+        _record()
+        dl.mark_failed("ob-1", "503 Service Unavailable")
+        # Too fresh: the freshness floor protects the caller's own retry path.
+        assert dl.sweep_live_owner_failed() == []
+        # Age the row past the floor.
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id=?",
+                (time.time() - 120, "ob-1"),
+            )
+        claimed = dl.sweep_live_owner_failed()
+        assert len(claimed) == 1
+        assert claimed[0]["obligation_id"] == "ob-1"
+        assert claimed[0]["needs_marker"] is True  # failed = honest at-least-once
+        assert claimed[0]["attempts"] == 1
+        # Claim re-stamps ownership: a second sweep must not double-claim.
+        assert dl.sweep_live_owner_failed() == []
+
+    def test_pending_or_attempting_live_rows_never_claimed(self):
+        _record("ob-pending")
+        _record("ob-attempting")
+        dl.mark_attempting("ob-attempting")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id IN (?,?)",
+                (time.time() - 120, "ob-pending", "ob-attempting"),
+            )
+        assert dl.sweep_live_owner_failed() == []
+
+    def test_other_process_rows_never_claimed(self):
+        _record()
+        dl.mark_failed("ob-1", "nope")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=999999999, "
+                "owner_started_at=1, updated_at=? WHERE obligation_id=?",
+                (time.time() - 120, "ob-1"),
+            )
+        assert dl.sweep_live_owner_failed() == []
+
+    def test_attempts_cap_abandons(self):
+        _record()
+        dl.mark_failed("ob-1", "nope")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=?, updated_at=? "
+                "WHERE obligation_id=?",
+                (dl.MAX_ATTEMPTS, time.time() - 120, "ob-1"),
+            )
+        assert dl.sweep_live_owner_failed() == []
+        assert _row("ob-1")["state"] == "abandoned"
+
+    def test_absent_platform_does_not_burn_attempts(self):
+        _record()
+        dl.mark_failed("ob-1", "nope")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id=?",
+                (time.time() - 120, "ob-1"),
+            )
+        assert dl.sweep_live_owner_failed(deliverable_platforms={"discord"}) == []
+        assert _row("ob-1")["attempts"] == 0
+
+
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
         _record()

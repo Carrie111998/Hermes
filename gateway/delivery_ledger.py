@@ -322,6 +322,93 @@ def sweep_recoverable(
     return claimed
 
 
+def sweep_live_owner_failed(
+    now: Optional[float] = None,
+    *,
+    deliverable_platforms: Optional[set] = None,
+    min_age_seconds: float = 60.0,
+) -> List[Dict[str, Any]]:
+    """Claim failed rows owned by THIS live process for periodic redelivery.
+
+    #91653: ``sweep_recoverable`` only claims rows whose owner is dead, and
+    the gateway only runs that sweep at startup. A platform rejection
+    (transient 5xx storm) leaves the row ``state='failed'`` with a live
+    owner forever — the turn completed, the answer exists in the ledger,
+    and nothing ever retries delivery. This sweep claims rows in
+    ``failed`` state owned by this process (the gateway that marked them
+    failed) once they are older than ``min_age_seconds``, so the periodic
+    delivery-retry watcher can redeliver them with the recovered-reply
+    marker.
+
+    Only ``failed`` rows qualify: ``pending``/``attempting`` rows owned by
+    a live process are mid-flight and must not be touched. Only rows owned
+    by THIS process qualify: another live gateway owns its own rows, and
+    dead-owner rows are ``sweep_recoverable``'s job.
+
+    Claiming atomically re-stamps the owner and increments ``attempts``
+    (same CAS guard as ``sweep_recoverable``), so a racing sweep cannot
+    double-claim. Rows over the attempts cap or older than the stale cutoff
+    transition to 'abandoned' instead of being returned.
+    """
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, state, attempts, created_at, updated_at,
+                      owner_pid, owner_started_at
+               FROM delivery_obligations
+               WHERE state = 'failed'"""
+        ).fetchall()
+        for (oid, session_key, platform, chat_id, thread_id, content, state,
+             attempts, created_at, updated_at, owner_pid,
+             owner_started_at) in rows:
+            if owner_pid != pid:
+                # Another live process owns this row (or the owner is dead —
+                # sweep_recoverable handles that class). Never steal.
+                continue
+            if (now - updated_at) < min_age_seconds:
+                # Too fresh — a rejection that just happened may be retried
+                # by the caller's own error path; avoid a tight retry loop.
+                continue
+            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
+                    (now, oid),
+                )
+                continue
+            if (
+                deliverable_platforms is not None
+                and platform not in deliverable_platforms
+            ):
+                # No adapter for this platform this boot — claiming would
+                # spend an attempt on a no-op.
+                continue
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
+                       updated_at=?
+                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
+                (pid, started, now, oid, owner_pid, owner_pid),
+            )
+            if cursor.rowcount:
+                claimed.append({
+                    "obligation_id": oid,
+                    "session_key": session_key,
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "content": content,
+                    # failed = definitively rejected once; redelivery carries
+                    # the recovered-reply marker (honest at-least-once).
+                    "needs_marker": True,
+                    "attempts": attempts + 1,
+                })
+    return claimed
+
+
 def _prune(now: Optional[float] = None) -> None:
     now = now if now is not None else time.time()
     cutoff = now - _RETENTION_SECONDS
