@@ -149,11 +149,15 @@ class ClaudeMirrorFloatWorker:
     active sources. Only marker-owned visibility mirrors are ever touched,
     and every per-mirror failure is contained as a skip.
 
-    ``isArchived`` is honored at CREATION time only: the desktop app
-    snapshots it into its own index when it first discovers the file and
-    ignores later edits to the JSON, even across app restarts (verified
-    2026-08-23). Get the flag right in the record this worker writes; a
-    post-hoc file edit cannot change the app's view.
+    ``isArchived`` propagation is LAZY: the desktop app discovers new
+    records within minutes, but re-reads edited records on its own
+    schedule — observed up to ~30 minutes behind, and an app restart alone
+    does not force it (measured 2026-08-23: a 17:38 file edit still read
+    stale at 22:47, live by 23:14). Get the flag right at creation; a
+    post-hoc edit does propagate, but slowly and unsuitably for anything
+    interactive. Bulk post-hoc flips also resurface LEGACY duplicate
+    records (random pre-deterministic ids sharing one cliSessionId), so
+    prefer creation-time correctness over store surgery.
     """
 
     def __init__(
