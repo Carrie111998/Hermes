@@ -1,7 +1,7 @@
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { I18nProvider } from '@/i18n'
@@ -19,12 +19,21 @@ vi.mock('@assistant-ui/react', () => ({
   useAuiState: () => messageRunning
 }))
 
+beforeEach(() => {
+  // jsdom does not implement the Web Animations API used by fallback cards.
+  Object.defineProperty(HTMLElement.prototype, 'animate', {
+    configurable: true,
+    value: () => ({}) as Animation
+  })
+})
+
 afterEach(() => {
   cleanup()
   clearClarifyRequest()
   $activeSessionId.set(null)
   $gateway.set(null)
   messageRunning = true
+  Reflect.deleteProperty(HTMLElement.prototype, 'animate')
   vi.clearAllMocks()
 })
 
@@ -60,8 +69,11 @@ function settledClarifyProps(
   }
 }
 
-function liveClarifyProps(choices = ['staging', 'production']): ToolCallMessagePartProps {
-  const args = { choices, question: 'Which deployment target?' }
+function liveClarifyProps(
+  choices = ['staging', 'production'],
+  requestId: string | undefined = 'request-1'
+): ToolCallMessagePartProps {
+  const args = { choices, question: 'Which deployment target?', ...(requestId ? { request_id: requestId } : {}) }
 
   return {
     addResult: vi.fn(),
@@ -158,7 +170,7 @@ describe('ClarifyTool live card stays mounted across settle', () => {
 
 describe('ClarifyTool choice selection', () => {
   it('keeps a pending gateway question interactive after message hydration settles', () => {
-    assistantUiState.messageRunning = false
+    messageRunning = false
 
     renderLiveClarify()
 
@@ -168,7 +180,7 @@ describe('ClarifyTool choice selection', () => {
   })
 
   it('does not revive an older question when another gateway request is pending', () => {
-    assistantUiState.messageRunning = false
+    messageRunning = false
     $activeSessionId.set('session-1')
     setClarifyRequest({
       choices: ['yes', 'no'],
@@ -182,6 +194,57 @@ describe('ClarifyTool choice selection', () => {
 
     expect(screen.queryByText('Which deployment target?')).toBeNull()
     expect(screen.queryByRole('button', { name: /staging/ })).toBeNull()
+  })
+
+  it('does not revive an older card when the newer request repeats the same question', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-newer',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...liveClarifyProps(['staging', 'production'], 'request-older')} />)
+
+    expect(screen.queryByText('Which deployment target?')).toBeNull()
+    expect(screen.queryByRole('button', { name: /staging/ })).toBeNull()
+  })
+
+  it('does not revive a repeated older card while the newer request is running', () => {
+    messageRunning = true
+    $activeSessionId.set('session-1')
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-newer',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...liveClarifyProps(['staging', 'production'], 'request-older')} />)
+
+    expect(screen.queryByText('Which deployment target?')).toBeNull()
+    expect(screen.queryByRole('button', { name: /staging/ })).toBeNull()
+  })
+
+  it('keeps only the exact repeated request interactive after hydration settles', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-newer',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...liveClarifyProps(['staging', 'production'], 'request-newer')} />)
+
+    expect(screen.getByText('Which deployment target?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /staging/ })).toBeTruthy()
   })
 
   it('selects independently, deselects and submits multi-select choices as a JSON array', async () => {
@@ -546,14 +609,18 @@ describe('ClarifyTool pending marker', () => {
 
 // ─── Batch (multi-question) clarify ─────────────────────────────────────────
 
-function batchArgs(): { questions: { question: string; choices?: string[] }[] } {
+function batchArgs(requestId = 'request-batch'): {
+  questions: { question: string; choices?: string[] }[]
+  request_id: string
+} {
   return {
-    questions: [{ choices: ['red', 'blue'], question: 'Color?' }, { question: 'Name?' }]
+    questions: [{ choices: ['red', 'blue'], question: 'Color?' }, { question: 'Name?' }],
+    request_id: requestId
   }
 }
 
-function liveBatchProps(): ToolCallMessagePartProps {
-  const args = batchArgs()
+function liveBatchProps(requestId = 'request-batch'): ToolCallMessagePartProps {
+  const args = batchArgs(requestId)
 
   return {
     addResult: vi.fn(),
@@ -617,6 +684,27 @@ describe('readClarifyBatchResult', () => {
 })
 
 describe('ClarifyTool batch card', () => {
+  it('does not revive an older batch with identical questions', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'new-q0', question: 'Color?' },
+        { choices: null, multiSelect: false, qid: 'new-q1', question: 'Name?' }
+      ],
+      requestId: 'request-newer-batch',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...liveBatchProps('request-older-batch')} />)
+
+    expect(screen.queryByText('Color?')).toBeNull()
+    expect(screen.queryByText('Name?')).toBeNull()
+  })
+
   it('renders every question at once', () => {
     renderLiveBatch()
 

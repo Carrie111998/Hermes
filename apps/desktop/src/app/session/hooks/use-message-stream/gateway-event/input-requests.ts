@@ -93,6 +93,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
           }
         })
 
+
         if (sessionId === activeSessionIdRef.current) {
           requestScrollToBottom()
         }
@@ -130,6 +131,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
             pendingClarifyToolPayload(request),
             occurredAt
           )
+
 
           return {
             ...state,

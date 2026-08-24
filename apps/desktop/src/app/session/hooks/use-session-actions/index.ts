@@ -273,6 +273,7 @@ function restorePendingApproval(response: SessionResumeResponse, sessionId: stri
   return true
 }
 
+
 function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
   return typeof target === 'string' ? target.trim() || null : target
 }
@@ -1094,6 +1095,7 @@ export function useSessionActions({
               const visibleActivatedMessages =
                 pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? activatedMessages
 
+
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => ({
@@ -1420,10 +1422,12 @@ export function useSessionActions({
 
         // Prefetch-hit fast path: reuse the live array when neither runtime
         // changes nor in-flight recovery changed the reconciled transcript.
-        const messagesForView =
+        const reconciledMessagesForView =
           inFlightRecovery.messages === currentMessages
             ? currentMessages
             : preserveLocalAssistantErrors(inFlightRecovery.messages, currentMessages)
+
+        const messagesForView = reconciledMessagesForView
 
         // Fail-latch on the PRE-recovery transcript: an orphan journal tail
         // must not mask a lost transcript (a retry that reloads real history

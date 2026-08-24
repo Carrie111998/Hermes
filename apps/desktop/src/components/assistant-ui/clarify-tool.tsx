@@ -42,6 +42,7 @@ import { selectMessageRunning } from './tool/fallback-model'
 import { parseMaybeObject } from './tool/fallback-model/format'
 
 interface ClarifyArgs {
+  requestId?: string
   question?: string
   choices?: string[] | null
   multiSelect?: boolean
@@ -105,6 +106,7 @@ function readClarifyArgs(args: unknown): ClarifyArgs {
   }
 
   return {
+    requestId: stringField(row, 'request_id'),
     question,
     choices: choices.length > 0 ? choices : null,
     multiSelect: row.multi_select === true,
@@ -295,28 +297,15 @@ function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
-  const requestMatches = useMemo(() => {
-    if (!request) {
-      return false
-    }
-
-    if (fromArgs.questions?.length) {
-      return (
-        request.questions?.length === fromArgs.questions.length &&
-        fromArgs.questions.every((question, index) => question.question === request.questions?.[index]?.question)
-      )
-    }
-
-    if (request.questions?.length) {
-      return false
-    }
-
-    return !fromArgs.question || !request.question || fromArgs.question === request.question
-  }, [fromArgs.question, fromArgs.questions, request])
+  const requestMatches = Boolean(request && fromArgs.requestId && fromArgs.requestId === request.requestId)
 
   // A hydrated message may already be marked complete while the gateway still
-  // owns this exact live request. A newer request must not revive an older card.
-  if (!messageRunning && !requestMatches) {
+  // owns this exact live request. Whenever a request is present, require its
+  // exact identity even while the message is running: question text is not an
+  // identity and duplicate old cards must stay inert. The sole exception is
+  // the brief tool.start -> clarify.request race, where no request exists yet;
+  // the running card may mount its non-interactive spinner until it arrives.
+  if (!requestMatches && (request || !messageRunning)) {
     return <ToolFallback {...props} />
   }
 
@@ -960,7 +949,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
 
   // qids only exist on the gateway request — args are a hydration-race
   // fallback for display, never answerable (no ids to respond with).
-  const questions = request?.questions ?? []
+  const questions = useMemo(() => request?.questions ?? [], [request?.questions])
   const ready = Boolean(request?.requestId) && questions.length > 0
 
   const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
@@ -1008,8 +997,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
 
       return next
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by the replay map only
-  }, [request?.lockedAnswers])
+  }, [questions, request?.lockedAnswers])
 
   const stageFor = (qid: string) => staged[qid] ?? emptyStage
 

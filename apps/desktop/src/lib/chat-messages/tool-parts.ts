@@ -4,6 +4,14 @@ import type { SessionMessage } from '@/types/hermes'
 
 import type { ChatMessage, ChatMessagePart, GatewayEventPayload } from './types'
 
+interface PendingClarifyIdentity {
+  choices?: string[]
+  multiSelect?: boolean
+  question?: string
+  questions?: string[]
+  requestId: string
+}
+
 function toolId(payload: GatewayEventPayload | undefined): string {
   return payload?.tool_id || payload?.tool_call_id || payload?.id || ''
 }
@@ -44,6 +52,85 @@ function parseMaybeJsonObject(value: unknown): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+function stringChoices(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((choice): choice is string => typeof choice === 'string') : []
+}
+
+function choicesEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((choice, index) => choice === right[index])
+}
+
+function clarifyArgsMatch(row: Record<string, unknown>, pending: PendingClarifyIdentity): boolean {
+  if (pending.questions) {
+    if (!Array.isArray(row.questions)) {
+      return false
+    }
+
+    const questions = row.questions.map(value => {
+      const entry = recordFromUnknown(value)
+
+      return typeof entry?.question === 'string' ? entry.question : ''
+    })
+
+    return choicesEqual(questions, pending.questions)
+  }
+
+  return (
+    row.question === pending.question &&
+    choicesEqual(stringChoices(row.choices), pending.choices ?? []) &&
+    (row.multi_select === true) === Boolean(pending.multiSelect)
+  )
+}
+
+export function bindPendingClarifyIdentity(
+  messages: ChatMessage[],
+  pending: PendingClarifyIdentity
+): ChatMessage[] {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+
+    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = message.parts[partIndex]
+
+      if (part.type !== 'tool-call' || part.toolName !== 'clarify' || part.result !== undefined) {
+        continue
+      }
+
+      const row = parseMaybeJsonObject(part.args)
+
+      if (row.request_id === pending.requestId) {
+        return messages
+      }
+
+      if (typeof row.request_id === 'string' && row.request_id) {
+        if (clarifyArgsMatch(row, pending)) {
+          return messages
+        }
+
+        continue
+      }
+
+      if (!clarifyArgsMatch(row, pending)) {
+        continue
+      }
+
+      const boundPart: ChatMessagePart = {
+        ...part,
+        args: { ...row, request_id: pending.requestId }
+      }
+
+      const boundMessage: ChatMessage = {
+        ...message,
+        parts: message.parts.map((candidate, index) => (index === partIndex ? boundPart : candidate))
+      }
+
+      return messages.map((candidate, index) => (index === messageIndex ? boundMessage : candidate))
+    }
+  }
+
+  return messages
 }
 
 function firstNonEmptyObject(...values: unknown[]): Record<string, unknown> {

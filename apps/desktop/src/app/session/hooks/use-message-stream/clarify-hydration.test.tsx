@@ -135,7 +135,9 @@ describe('clarify.request stream hydration', () => {
     toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-abc' })
     clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-2' })
 
-    expect(clarifyParts()).toHaveLength(1)
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(1)
+    expect(parts[0].type === 'tool-call' && parts[0].args).toMatchObject({ request_id: 'req-2' })
   })
 
   it('does not duplicate when clarify.request arrives before the tool.start row', () => {
@@ -144,7 +146,9 @@ describe('clarify.request stream hydration', () => {
     clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-3' })
     toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-xyz' })
 
-    expect(clarifyParts()).toHaveLength(1)
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(1)
+    expect(parts[0].type === 'tool-call' && parts[0].args).toMatchObject({ request_id: 'req-3' })
   })
 
   it('re-arms a hydrated Codex tool-only clarify in place instead of appending a second card', () => {
