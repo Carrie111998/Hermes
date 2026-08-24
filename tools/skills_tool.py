@@ -932,6 +932,8 @@ def skills_list(
                 frontmatter = plugin_skill.pop("frontmatter", {})
                 if not skill_matches_platform(frontmatter):
                     continue
+                if not skill_matches_environment(frontmatter):
+                    continue
                 if _is_skill_disabled(plugin_skill["name"]):
                     continue
                 if query_mode:

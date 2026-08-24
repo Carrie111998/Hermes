@@ -13,16 +13,26 @@ from typing import Any, Iterable, Mapping
 
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
-_SCALAR_FIELDS = ("qualified_name", "name", "category", "description")
-_SEQUENCE_FIELDS = (
+_FIELDS = (
+    "qualified_name",
+    "name",
+    "category",
+    "description",
     "triggers",
     "tags",
     "related_skills",
     "required_commands",
     "required_environment_variables",
 )
+_SCALAR_FIELDS = frozenset({"qualified_name", "name", "category", "description"})
+_SEQUENCE_FIELDS = frozenset(_FIELDS) - _SCALAR_FIELDS
 _K1 = 1.5
 _B = 0.75
+_DEFAULT_LIMIT = 8
+# A default query is considered separated when its best score clears the
+# runner-up by this ratio. Separated intent needs only a compact handoff set.
+_STRONG_SCORE_RATIO = 1.2
+_STRONG_DEPTH = 3
 
 
 def _tokenize(value: str) -> list[str]:
@@ -43,20 +53,27 @@ def _normalized_values(value: Any) -> list[str]:
     return sorted(cleaned, key=lambda item: (item.casefold(), item))
 
 
-def _canonical_document(skill: Mapping[str, Any]) -> dict[str, Any]:
+def build_routing_card(skill: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a deterministic internal card hashed only from ranking fields."""
     document: dict[str, Any] = {
         field: str(skill.get(field) or "").strip() for field in _SCALAR_FIELDS
     }
     for field in _SEQUENCE_FIELDS:
         document[field] = _normalized_values(skill.get(field))
+    canonical_source = json.dumps(
+        document, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    document["source_fingerprint"] = hashlib.sha256(
+        canonical_source.encode("utf-8")
+    ).hexdigest()
     return document
 
 
-def _document_tokens(document: Mapping[str, Any]) -> list[str]:
+def _document_tokens(document: Mapping[str, Any]) -> tuple[str, ...]:
     text: list[str] = [str(document[field]) for field in _SCALAR_FIELDS]
     for field in _SEQUENCE_FIELDS:
         text.extend(document[field])
-    return _tokenize(" ".join(text))
+    return tuple(_tokenize(" ".join(text)))
 
 
 def _tie_key(document: Mapping[str, Any]) -> tuple[str, ...]:
@@ -88,9 +105,9 @@ def _build_index(
     float,
     str,
 ]:
-    """Build and cache one immutable BM25 corpus from canonical metadata."""
+    """Build and cache one immutable BM25 corpus from source-hashed cards."""
     documents = tuple(json.loads(serialized_documents))
-    tokenized = tuple(tuple(_document_tokens(document)) for document in documents)
+    tokenized = tuple(_document_tokens(document) for document in documents)
     document_frequencies: Counter[str] = Counter()
     for tokens in tokenized:
         document_frequencies.update(set(tokens))
@@ -112,7 +129,7 @@ def rank_skills(
 ) -> dict[str, Any]:
     """Rank canonical skill metadata with deterministic Okapi BM25."""
     skill_list = list(skills)
-    canonical_documents = [_canonical_document(skill) for skill in skill_list]
+    canonical_documents = [build_routing_card(skill) for skill in skill_list]
     serialized_documents = _serialize_documents(canonical_documents)
     (
         documents,
@@ -160,7 +177,15 @@ def rank_skills(
         )
         for skill, document in zip(skill_list, canonical_documents)
     }
-    for rank, (_, score, document) in enumerate(scored[: max(0, limit)], start=1):
+    depth = min(max(0, limit), total)
+    if limit == _DEFAULT_LIMIT and scored:
+        if scored[0][1] > 0.0:
+            runner_up = scored[1][1] if len(scored) > 1 else 0.0
+            if runner_up <= 0.0 or scored[0][1] >= runner_up * _STRONG_SCORE_RATIO:
+                exact_name_count = sum(exact_name for exact_name, _, _ in scored)
+                depth = min(depth, max(_STRONG_DEPTH, exact_name_count))
+
+    for rank, (_, score, document) in enumerate(scored[:depth], start=1):
         ranked.append({
             "rank": rank,
             "name": document["name"],
