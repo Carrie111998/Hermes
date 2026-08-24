@@ -12868,6 +12868,28 @@ def _(rid, params, pdb, conn) -> dict:
     return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
 
 
+@_projects_method("projects.rename_many")
+def _(rid, params, pdb, conn) -> dict:
+    raw_renames = params.get("renames")
+    if not isinstance(raw_renames, list):
+        raise ValueError("renames must be a list")
+
+    renames = []
+    for raw in raw_renames:
+        if not isinstance(raw, dict):
+            raise ValueError("each project rename must be an object")
+        renames.append(
+            {
+                "id": raw.get("id"),
+                "expected_name": raw.get("expectedName"),
+                "new_name": raw.get("newName"),
+            }
+        )
+
+    projects = pdb.rename_many(conn, renames)
+    return _ok(rid, {"projects": [project.to_dict() for project in projects]})
+
+
 @_projects_method("projects.add_folder")
 def _(rid, params, pdb, conn) -> dict:
     proj = _require_project(pdb, conn, params)

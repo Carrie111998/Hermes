@@ -2,12 +2,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { registry } from '@/contrib/registry'
 import type { SessionInfo } from '@/hermes'
 import { notifyError } from '@/store/notifications'
-import { registry } from '@/contrib/registry'
 
-import { PROJECTS_GROUPING_AREA, type ProjectsGroupingContribution } from './projects-presentation'
 import type { SidebarProjectTree } from './projects'
+import { PROJECTS_GROUPING_AREA, type ProjectsGroupingContribution } from './projects-presentation'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import type { VirtualSessionListProps } from './virtual-session-list'
 
@@ -15,12 +15,23 @@ const contributionDisposers: Array<() => void> = []
 
 afterEach(() => {
   cleanup()
-  while (contributionDisposers.length) contributionDisposers.pop()?.()
+
+  while (contributionDisposers.length) {
+    contributionDisposers.pop()?.()
+  }
 })
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
+      common: {
+        cancel: 'Cancel',
+        close: 'Close',
+        confirm: 'Confirm',
+        done: 'Done',
+        loading: 'Loading…'
+      },
+      errors: { genericFailure: 'Something went wrong' },
       sidebar: {
         dateDivider: {
           earlierThisMonth: 'Earlier this month',
@@ -31,8 +42,12 @@ vi.mock('@/i18n', () => ({
           yesterday: 'Yesterday'
         },
         projects: {
+          deleteGroup: 'Delete group',
+          deleteGroupEmptyDescription: 'The empty group will be removed.',
+          deleteGroupTitle: (name: string) => `Delete group “${name}”?`,
           enter: (label: string) => `Enter ${label}`,
           groupUpdateFailed: 'Could not update project group',
+          menu: 'Actions',
           ungrouped: 'Ungrouped'
         }
       }
@@ -177,7 +192,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         onToggleUnread={noop}
         open={true}
         pinned={false}
-        projectOverview={[sidebarProject('a')]}
+        projectOverview={[]}
         sessions={[]}
       />
     )
@@ -185,6 +200,42 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
     fireEvent.click(screen.getByRole('button', { name: 'One' }))
 
     await waitFor(() => expect(notifyError).toHaveBeenCalledWith(rejection, 'Could not update project group'))
+  })
+
+  it('places a native Actions/Delete control on deletable group headings', async () => {
+    const contribution: ProjectsGroupingContribution = {
+      deleteGroup: vi.fn().mockResolvedValue(undefined),
+      getSnapshot: () => ({ groups: [{ id: 'one', label: 'One', projectIds: [] }] }),
+      subscribe: () => () => undefined
+    }
+
+    contributionDisposers.push(
+      registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'deletable-provider' })
+    )
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        projectOverview={[sidebarProject('a')]}
+        sessions={[]}
+      />
+    )
+
+    const trigger = screen.getByRole('button', { name: 'Actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete group' }))
+
+    expect(await screen.findByRole('heading', { name: 'Delete group “One”?' })).toBeTruthy()
   })
 
   it('re-computes flatRows reference when grouping or sessions change', () => {

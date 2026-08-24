@@ -9,7 +9,6 @@ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { notifyError } from '@/store/notifications'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import {
   groupEntriesByRecency,
@@ -19,12 +18,13 @@ import {
 } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
+import { notifyError } from '@/store/notifications'
 import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
-import { useProjectsGrouping } from './projects-presentation'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
+import { ProjectGroupActions } from './project-group-actions'
 import {
   EnteredProjectContent,
   ProjectOverviewRow,
@@ -33,6 +33,7 @@ import {
   SidebarWorkspaceGroup,
   type SidebarWorkspaceTree
 } from './projects'
+import { useProjectsGrouping } from './projects-presentation'
 import { WorkspaceAddButton } from './projects/workspace-header'
 import { ReorderableList, useSortableBindings } from './reorderable-list'
 import { SidebarSessionSkeletons } from './section-states'
@@ -225,7 +226,7 @@ export function SidebarSessionsSection({
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
-  const hasProjectOverview = Boolean(projectOverview?.length)
+  const hasProjectOverview = Boolean(projectOverview?.length || projectsGrouping?.groups.length)
 
   // Lanes count as content even with no rows left in them: the backend only
   // emits a lane that has sessions, so a lane surviving with zero rows means
@@ -406,11 +407,12 @@ export function SidebarSessionsSection({
     )
   } else if (showEmptyState) {
     inner = emptyState
-  } else if (projectOverview?.length) {
+  } else if (projectOverview) {
     const presented = projectsGrouping
 
     if (presented) {
       const NativeRow = ProjectOverviewRow
+
       const nativeRow = (project: SidebarProjectTree) => (
         <NativeRow
           activeProjectId={activeProjectId}
@@ -426,31 +428,50 @@ export function SidebarSessionsSection({
       inner = (
         <>
           {presented.home && nativeRow(presented.home)}
-          {presented.groups.map(group => (
-            <div className="pb-1" key={group.id}>
-              <button
-                aria-expanded={!group.collapsed}
-                className="flex w-full items-center gap-1 px-2 pb-1 pt-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)"
-                disabled={!presented.contribution.setGroupCollapsed}
-                onClick={() => {
-                  if (!presented.contribution.setGroupCollapsed) return
-                  const onError = (error: unknown) => notifyError(error, t.sidebar.projects.groupUpdateFailed)
-                  try {
-                    void Promise.resolve(presented.contribution.setGroupCollapsed(group.id, !group.collapsed)).catch(
-                      onError
-                    )
-                  } catch (error) {
-                    onError(error)
-                  }
-                }}
-                type="button"
-              >
-                <DisclosureCaret open={!group.collapsed} />
-                {group.label}
-              </button>
-              {!group.collapsed && group.projects.map(nativeRow)}
-            </div>
-          ))}
+          {presented.groups.map(group => {
+            const descriptor = presented.snapshot.groups.find(candidate => candidate.id === group.id)
+
+            return (
+              <div className="group/project-group pb-1" key={group.id}>
+                <div className="flex items-center gap-1 pr-2">
+                  <button
+                    aria-expanded={!group.collapsed}
+                    className="flex min-w-0 flex-1 items-center gap-1 px-2 pb-1 pt-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)"
+                    disabled={!presented.contribution.setGroupCollapsed}
+                    onClick={() => {
+                      if (!presented.contribution.setGroupCollapsed) {
+                        return
+                      }
+
+                      const onError = (error: unknown) => notifyError(error, t.sidebar.projects.groupUpdateFailed)
+
+                      try {
+                        void Promise.resolve(
+                          presented.contribution.setGroupCollapsed(group.id, !group.collapsed)
+                        ).catch(onError)
+                      } catch (error) {
+                        onError(error)
+                      }
+                    }}
+                    type="button"
+                  >
+                    <DisclosureCaret open={!group.collapsed} />
+                    {group.label}
+                  </button>
+                  {descriptor ? (
+                    <ProjectGroupActions
+                      contribution={presented.contribution}
+                      group={descriptor}
+                      projects={projectOverview
+                        .filter(project => !project.isNoProject)
+                        .map(project => ({ id: project.id, name: project.label }))}
+                    />
+                  ) : null}
+                </div>
+                {!group.collapsed && group.projects.map(nativeRow)}
+              </div>
+            )
+          })}
           {presented.ungrouped.length > 0 && (
             <div className="pb-1">
               <div className="px-2 pb-1 pt-1.5 text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">

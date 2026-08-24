@@ -500,6 +500,90 @@ def update_project(
     return cur.rowcount > 0
 
 
+def rename_many(conn: sqlite3.Connection, renames: Iterable[dict]) -> List[Project]:
+    """Atomically compare-and-swap a set of Project names.
+
+    Every input must contain ``id``, ``expected_name``, and ``new_name``.
+    Validation and writes share one IMMEDIATE transaction so a stale Project or
+    final-name collision leaves every name untouched.  Only the display name is
+    updated; stable ids, slugs, folders, active state, appearance, board links,
+    and all external session/worktree relationships remain unchanged.
+    """
+    requested = list(renames)
+    if not requested:
+        return []
+
+    normalized: List[tuple[str, str, str]] = []
+    seen_ids: set[str] = set()
+    for raw in requested:
+        if not isinstance(raw, dict):
+            raise ValueError("each project rename must be an object")
+        project_id = raw.get("id")
+        expected_name = raw.get("expected_name")
+        new_name = raw.get("new_name")
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("project rename id must not be empty")
+        if not isinstance(expected_name, str):
+            raise ValueError("project rename expected_name must be a string")
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("project rename new_name must not be empty")
+
+        project_id = project_id.strip()
+        if project_id in seen_ids:
+            raise ValueError(f"duplicate project rename id: {project_id}")
+        seen_ids.add(project_id)
+        normalized.append((project_id, expected_name, new_name.strip()))
+
+    with write_txn(conn):
+        rows = conn.execute("SELECT id, name FROM projects").fetchall()
+        current_names = {row["id"]: row["name"] for row in rows}
+
+        for project_id, expected_name, _new_name in normalized:
+            current = current_names.get(project_id)
+            if current is None:
+                raise ValueError(f"project {project_id} no longer exists")
+            if current != expected_name:
+                raise ValueError(
+                    f"project {project_id} changed since the deletion review "
+                    f"(expected {expected_name!r}, found {current!r})"
+                )
+
+        final_names = dict(current_names)
+        for project_id, _expected_name, new_name in normalized:
+            final_names[project_id] = new_name
+
+        requested_ids = {project_id for project_id, _expected, _new in normalized}
+        for project_id in requested_ids:
+            collision_key = final_names[project_id].casefold()
+            conflicting = [
+                other_id
+                for other_id, other_name in final_names.items()
+                if other_id != project_id and other_name.strip().casefold() == collision_key
+            ]
+            if conflicting:
+                raise ValueError(
+                    f"project name collision for {final_names[project_id]!r}: "
+                    f"{project_id} conflicts with {conflicting[0]}"
+                )
+
+        for project_id, expected_name, new_name in normalized:
+            updated = conn.execute(
+                "UPDATE projects SET name = ? WHERE id = ? AND name = ?",
+                (new_name, project_id, expected_name),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"project {project_id} changed during rename")
+
+        result: List[Project] = []
+        for project_id, _expected_name, _new_name in normalized:
+            project = get_project(conn, project_id)
+            if project is None:  # Defensive: the write transaction guaranteed it.
+                raise RuntimeError(f"renamed project {project_id} disappeared")
+            result.append(project)
+
+    return result
+
+
 def add_folder(
     conn: sqlite3.Connection,
     project_id: str,

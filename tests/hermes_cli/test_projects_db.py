@@ -55,6 +55,70 @@ def test_create_get_list(conn):
     assert len(pdb.list_projects(conn)) == 1
 
 
+def test_rename_many_is_cas_atomic_and_preserves_project_metadata(conn):
+    first = pdb.create_project(
+        conn,
+        name="Alpha",
+        folders=["/work/alpha"],
+        description="first",
+        icon="rocket",
+        color="#123456",
+        board_slug="alpha-board",
+    )
+    second = pdb.create_project(conn, name="Beta", folders=["/work/beta"])
+    pdb.set_active(conn, first)
+
+    renamed = pdb.rename_many(
+        conn,
+        [
+            {"id": first, "expected_name": "Alpha", "new_name": "Group · Alpha"},
+            {"id": second, "expected_name": "Beta", "new_name": "Group · Beta"},
+        ],
+    )
+
+    assert [project.name for project in renamed] == ["Group · Alpha", "Group · Beta"]
+    preserved = pdb.get_project(conn, first)
+    assert preserved is not None
+    assert preserved.slug == "alpha"
+    assert preserved.description == "first"
+    assert preserved.icon == "rocket"
+    assert preserved.color == "#123456"
+    assert preserved.board_slug == "alpha-board"
+    assert [folder.path for folder in preserved.folders] == ["/work/alpha"]
+    assert pdb.get_active_id(conn) == first
+
+
+def test_rename_many_rejects_stale_batch_without_writing_any_name(conn):
+    first = pdb.create_project(conn, name="Alpha")
+    second = pdb.create_project(conn, name="Beta")
+
+    with pytest.raises(ValueError, match="changed since the deletion review"):
+        pdb.rename_many(
+            conn,
+            [
+                {"id": first, "expected_name": "Alpha", "new_name": "Group · Alpha"},
+                {"id": second, "expected_name": "Stale Beta", "new_name": "Group · Beta"},
+            ],
+        )
+
+    assert pdb.get_project(conn, first).name == "Alpha"
+    assert pdb.get_project(conn, second).name == "Beta"
+
+
+def test_rename_many_rejects_final_name_collisions_before_writing(conn):
+    first = pdb.create_project(conn, name="Alpha")
+    second = pdb.create_project(conn, name="Existing")
+
+    with pytest.raises(ValueError, match="project name collision"):
+        pdb.rename_many(
+            conn,
+            [{"id": first, "expected_name": "Alpha", "new_name": " existing "}],
+        )
+
+    assert pdb.get_project(conn, first).name == "Alpha"
+    assert pdb.get_project(conn, second).name == "Existing"
+
+
 
 
 
@@ -142,5 +206,4 @@ def test_per_profile_isolation(tmp_path):
     finally:
         a.close()
         b.close()
-
 

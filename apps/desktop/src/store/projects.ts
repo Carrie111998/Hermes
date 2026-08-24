@@ -978,6 +978,68 @@ export async function renameProject(id: string, name: string): Promise<void> {
   await updateProject(id, { name })
 }
 
+export interface ProjectNameCAS {
+  readonly id: string
+  readonly expectedName: string
+  readonly newName: string
+}
+
+// Transactional, non-optimistic adapter for cross-authority group deletion.
+// The backend validates the whole CAS batch and returns every authoritative
+// Project record. Renderer caches publish only after that complete response is
+// validated, so a rejected batch cannot paint a partial rename.
+export async function renameProjectsMany(renames: readonly ProjectNameCAS[]): Promise<ProjectInfo[]> {
+  if ($projectsRpcAvailable.get() === false) {
+    throw projectsStaleBackendError()
+  }
+
+  let response: { projects: ProjectInfo[] }
+
+  try {
+    response = await gatewayRequest<{ projects: ProjectInfo[] }>(
+      'projects.rename_many',
+      projectParams({ renames: [...renames] })
+    )
+  } catch (error) {
+    markProjectsRpcFailure(error)
+
+    if (isMissingRpcMethod(error)) {
+      throw projectsStaleBackendError()
+    }
+
+    throw error
+  }
+
+  const requestedIds = new Set(renames.map(rename => rename.id))
+  const returnedIds = new Set(response.projects?.map(project => project.id) ?? [])
+
+  if (
+    !Array.isArray(response.projects) ||
+    requestedIds.size !== renames.length ||
+    returnedIds.size !== requestedIds.size ||
+    [...requestedIds].some(id => !returnedIds.has(id))
+  ) {
+    reconcileProjects()
+    throw new Error('projects.rename_many returned an incomplete Project set')
+  }
+
+  const byId = new Map(response.projects.map(project => [project.id, project]))
+  batch(() => {
+    $projects.set($projects.get().map(project => byId.get(project.id) ?? project))
+    $projectTree.set(
+      $projectTree.get().map(project => {
+        const renamed = byId.get(project.id)
+
+        return renamed ? { ...project, label: renamed.name } : project
+      })
+    )
+  })
+
+  markProjectsRpcSuccess()
+
+  return response.projects
+}
+
 // Patch top-level project fields (name / appearance). Optimistic: the cached
 // tree + list update instantly so a color/icon/name change has no round-trip
 // lag; only a failed write reconciles from the server.

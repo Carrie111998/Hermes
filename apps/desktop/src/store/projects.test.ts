@@ -1,11 +1,11 @@
-import { atom } from 'nanostores'
 import { JsonRpcGatewayError } from '@hermes/shared'
+import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   PROJECTS_GROUPING_AREA,
-  resolveProjectsGrouping,
-  type ProjectsGroupingContribution
+  type ProjectsGroupingContribution,
+  resolveProjectsGrouping
 } from '@/app/chat/sidebar/projects-presentation'
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { registry } from '@/contrib/registry'
@@ -37,6 +37,7 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  renameProjectsMany,
   resolveNewSessionCwd,
   scanAndRecordRepos,
   setProjectAppearance,
@@ -182,6 +183,80 @@ describe('projects RPC profile forwarding', () => {
 
     expect(request).not.toHaveBeenCalled()
     setShowAllProfiles(false)
+  })
+})
+
+describe('transactional Project renaming', () => {
+  const alpha = {
+    archived: false,
+    board_slug: 'alpha-board',
+    color: '#123456',
+    created_at: 1,
+    description: 'Alpha description',
+    folders: [{ added_at: 1, is_primary: true, label: null, path: '/alpha' }],
+    icon: 'rocket',
+    id: 'p_alpha',
+    name: 'Alpha',
+    primary_path: '/alpha',
+    slug: 'alpha'
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    setShowAllProfiles(false)
+    $projects.set([alpha])
+    $projectTree.set([
+      {
+        color: alpha.color,
+        icon: alpha.icon,
+        id: alpha.id,
+        label: alpha.name,
+        path: alpha.primary_path,
+        repos: [],
+        sessionCount: 3,
+        totalTokens: 42
+      } as SidebarProjectTree
+    ])
+  })
+
+  it('calls projects.rename_many with CAS inputs and applies authoritative records as one cache update', async () => {
+    const renamed = { ...alpha, name: 'Group · Alpha' }
+    const request = vi.fn().mockResolvedValue({ projects: [renamed] })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await expect(
+      renameProjectsMany([{ expectedName: 'Alpha', id: alpha.id, newName: 'Group · Alpha' }])
+    ).resolves.toEqual([renamed])
+
+    expect(request).toHaveBeenCalledWith('projects.rename_many', {
+      profile: 'default',
+      renames: [{ expectedName: 'Alpha', id: alpha.id, newName: 'Group · Alpha' }]
+    })
+    expect($projects.get()).toEqual([renamed])
+    expect($projectTree.get()[0]).toMatchObject({
+      color: '#123456',
+      icon: 'rocket',
+      id: alpha.id,
+      label: 'Group · Alpha',
+      path: '/alpha',
+      sessionCount: 3,
+      totalTokens: 42
+    })
+  })
+
+  it('does not mutate either renderer cache when the CAS request fails', async () => {
+    const beforeProjects = $projects.get()
+    const beforeTree = $projectTree.get()
+    const rejection = new Error('stale Project name')
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn().mockRejectedValue(rejection) } as never)
+
+    await expect(
+      renameProjectsMany([{ expectedName: 'Old Alpha', id: alpha.id, newName: 'Group · Alpha' }])
+    ).rejects.toBe(rejection)
+
+    expect($projects.get()).toBe(beforeProjects)
+    expect($projectTree.get()).toBe(beforeTree)
   })
 })
 

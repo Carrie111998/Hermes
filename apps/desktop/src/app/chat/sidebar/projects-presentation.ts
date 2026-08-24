@@ -20,12 +20,19 @@ export interface ProjectsGroupingSnapshot {
   readonly revision?: number | string
 }
 
+export interface DeleteProjectGroupRequest {
+  readonly groupId: string
+  readonly expectedProjectIds: readonly string[]
+  readonly operationId: string
+}
+
 export interface ProjectsGroupingContribution {
   /** Keep the returned reference stable until the provider state changes.
    *  The host also reuses structurally equivalent snapshots defensively. */
   getSnapshot(): ProjectsGroupingSnapshot
   subscribe(listener: () => void): () => void
   createGroup?(name: string): Promise<void> | void
+  deleteGroup?(request: DeleteProjectGroupRequest): Promise<void>
   assignProject?(projectId: string, groupId: string | null): Promise<void> | void
   setGroupCollapsed?(groupId: string, collapsed: boolean): Promise<void> | void
 }

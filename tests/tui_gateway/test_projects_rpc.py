@@ -52,6 +52,7 @@ def test_methods_registered():
         "projects.create",
         "projects.get",
         "projects.update",
+        "projects.rename_many",
         "projects.add_folder",
         "projects.remove_folder",
         "projects.set_primary",
@@ -273,6 +274,38 @@ def test_update_and_archive(tmp_path):
 
     payload = _call("projects.archive", {"id": pid})
     assert all(p["id"] != pid or p["archived"] for p in payload["projects"])
+
+
+def test_rename_many_returns_authoritative_records_and_rejects_stale_batches(tmp_path):
+    first = _call("projects.create", {"name": "Alpha", "folders": [str(tmp_path / "alpha")]})["project"]
+    second = _call("projects.create", {"name": "Beta", "folders": [str(tmp_path / "beta")]})["project"]
+
+    renamed = _call(
+        "projects.rename_many",
+        {
+            "renames": [
+                {"id": first["id"], "expectedName": "Alpha", "newName": "Group · Alpha"},
+                {"id": second["id"], "expectedName": "Beta", "newName": "Group · Beta"},
+            ]
+        },
+    )
+    assert [(project["id"], project["name"]) for project in renamed["projects"]] == [
+        (first["id"], "Group · Alpha"),
+        (second["id"], "Group · Beta"),
+    ]
+
+    response = server._methods["projects.rename_many"](
+        1,
+        {
+            "renames": [
+                {"id": first["id"], "expectedName": "Alpha", "newName": "Wrong"},
+                {"id": second["id"], "expectedName": "Group · Beta", "newName": "Also wrong"},
+            ]
+        },
+    )
+    assert response["error"]["code"] == 5063
+    assert _call("projects.get", {"id": first["id"]})["project"]["name"] == "Group · Alpha"
+    assert _call("projects.get", {"id": second["id"]})["project"]["name"] == "Group · Beta"
 
 
 def test_get_unknown_returns_error():
@@ -820,5 +853,4 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
     assert _cached_repo_labels(launch_home) == ["only"]
     assert not (coder_home / "projects.db").exists()
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
-
 

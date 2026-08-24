@@ -1838,6 +1838,19 @@ export interface Translations {
       groupNameDuplicate: string
       groupCreateFailed: string
       groupUpdateFailed: string
+      deleteGroup: string
+      deleteGroupTitle: (name: string) => string
+      deleteGroupEmptyDescription: string
+      deleteGroupMoveDescription: string
+      deleteGroupPrepend: string
+      deleteGroupPreviewBefore: string
+      deleteGroupPreviewAfter: string
+      deleteGroupPreviewLabel: string
+      deleteGroupPending: string
+      deleteGroupStale: string
+      deleteGroupCollision: string
+      deleteGroupFailed: string
+      deleteGroupCompensationFailed: (names: string) => string
       moveToGroup: string
       ungrouped: string
       menu: string
