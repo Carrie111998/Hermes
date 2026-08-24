@@ -1,0 +1,32 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: loppee
+description: >-
+  Public business lookup, trust cards, reviews, and comparisons.
+source: https://github.com/4dwebspro-cell/loppee-mcp
+
+# Loppee hosts this public, read-only MCP over Streamable HTTP. The discovery
+# endpoint requires no credentials and exposes no personal, business-owner,
+# administrator, or precise-location surface.
+transport:
+  type: http
+  url: https://loppee.com/mcp/discovery
+
+auth:
+  type: none
+
+# The discovery endpoint exposes only these five public research tools. Keep
+# the explicit list as a least-privilege contract if the endpoint evolves.
+tools:
+  default_enabled:
+    - lookup_business
+    - get_trust_card
+    - get_business_reviews
+    - explain_recommendation
+    - compare_businesses
+
+post_install: |
+  No authentication or local installation is required. Start a new Hermes
+  session after installing so the five public, read-only tools are loaded.
