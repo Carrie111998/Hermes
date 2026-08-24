@@ -9,10 +9,14 @@ const saveConnectionConfig = vi.fn()
 const restartCurrentBackend = vi.fn()
 const profiles = atom<ProfileInfo[]>([])
 
-vi.mock('@/store/profile', () => ({
-  $profiles: profiles,
-  refreshActiveProfile: vi.fn()
-}))
+vi.mock('@/store/profile', async importOriginal => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    $profiles: profiles,
+    refreshActiveProfile: vi.fn()
+  }
+})
 
 vi.mock('@/store/notifications', () => ({
   notify: vi.fn(),

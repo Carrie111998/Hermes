@@ -162,6 +162,14 @@ function reusableWindowsLock(lock, state, profile, reuseToken, runtime) {
   )
 }
 
+function assertCurrent(signal) {
+  if (signal?.aborted) {
+    const error: any = new Error('SSH bootstrap was cancelled.')
+    error.kind = 'superseded'
+    throw error
+  }
+}
+
 async function processState(ssh, runtime, lock) {
   return helper(ssh, runtime, 'process-state', [
     String(lock.pid),

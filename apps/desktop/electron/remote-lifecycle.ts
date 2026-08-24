@@ -808,6 +808,14 @@ async function cancelForwardSafe(deps, localPort, remotePort) {
   }
 }
 
+function assertNotAborted(signal) {
+  if (signal?.aborted) {
+    const error: any = new Error('SSH bootstrap was cancelled.')
+    error.kind = 'superseded'
+    throw error
+  }
+}
+
 function isForwardBindCollision(error) {
   return /address already in use|cannot listen to port|bind.*failed/i.test(String(error?.message || error || ''))
 }
