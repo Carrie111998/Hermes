@@ -278,7 +278,11 @@ stop_ui() { # error/manual outcomes keep the window up briefly so a watching
   # boot (handoff-result.ts), so the shim window never lingers indefinitely —
   # before this, each aborted update left another orphan browser window on
   # screen until the user closed it by hand.
-  if [ "${1:-}" = "leave-window" ]; then
+  # Do not impose the grace period when no shim was started. Headless/NO_UI
+  # failures already reach the user through notify_fallback + the durable
+  # result, and there is no process or window here to keep visible.
+  if [ "${1:-}" = "leave-window" ] \
+      && { [ -n "$UI_SERVER_PID" ] || [ -n "$UI_BROWSER_PID" ]; }; then
     sleep "${HERMES_UPDATE_SHIM_GRACE_SECONDS:-15}"
   fi
   if [ -n "$UI_SERVER_PID" ]; then
@@ -565,6 +569,11 @@ if [ "$CLAIM_CODE" -ne 0 ]; then
   FINAL_CODE=2
   FINAL_MSG="Update refused: another updater owns the install or its update marker cannot be verified. Nothing was changed."
   log "$FINAL_MSG${CLAIM_OUTPUT:+ ($CLAIM_OUTPUT)}"
+  # Marker self-tests assert the ownership decision itself. They must not run
+  # the real failure finalizer: that writes a durable user-facing result and
+  # may invoke a desktop notifier, violating the self-test's no-side-effects
+  # contract and making its runtime depend on the host notification service.
+  [ "$SELF_TEST_MARKER" -eq 1 ] && trap - EXIT
   exit "$FINAL_CODE"
 fi
 

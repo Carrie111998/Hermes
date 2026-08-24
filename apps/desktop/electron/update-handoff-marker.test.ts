@@ -154,6 +154,11 @@ function assertScriptHandoff(run: (installRoot: string, options?: HandoffRunOpti
       false,
       'a refused handoff must not reach the update invocation boundary'
     )
+    assert.equal(
+      fs.existsSync(path.join(foreign.home, '.hermes-update-result.json')),
+      false,
+      'a marker self-test must not publish a user-facing update result'
+    )
   } finally {
     foreignOwner.kill()
   }
