@@ -135,6 +135,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             server_name: str = "",
             preregistered: bool = False,
             token_user_agent: "str | None" = None,
+            configured_scope: "str | None" = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
@@ -149,6 +150,35 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+            # Explicit ``oauth.scope`` from config.yaml (#93719). The SDK's
+            # challenge loop (Step 3 in ``async_auth_flow``) overwrites
+            # ``client_metadata.scope`` with server-derived scopes and never
+            # consults the configured value; we restore it as the requested
+            # baseline right before the /authorize URL is built.
+            self._hermes_configured_scope = configured_scope
+
+        def _restore_configured_scope(self) -> None:
+            """Re-apply an explicit ``oauth.scope`` after the SDK's Step-3
+            overwrite, unioned with whatever the challenge added.
+
+            Server-required scopes (e.g. a WWW-Authenticate demand or the
+            SEP-2207 offline_access augmentation) are kept — configuration is
+            the baseline, not a replacement. No-op when no scope is configured.
+            """
+            configured = getattr(self, "_hermes_configured_scope", None)
+            if not configured:
+                return
+            metadata = getattr(self.context, "client_metadata", None)
+            if metadata is None:
+                return
+            current = metadata.scope or ""
+            merged: list[str] = []
+            for scope in (configured, current):
+                for item in scope.split():
+                    if item not in merged:
+                        merged.append(item)
+            metadata.scope = " ".join(merged)
+
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -183,6 +213,18 @@ def _make_hermes_provider_class() -> Optional[type]:
             self._coerce_client_secret_post()
             request = await super()._exchange_token_authorization_code(*args, **kwargs)
             return self._stamp_token_user_agent(request)
+
+        async def _perform_authorization_code_grant(self, *args: Any, **kwargs: Any):
+            """Restore an explicitly configured oauth.scope before /authorize.
+
+            The SDK's Step 3 (inside ``async_auth_flow``) overwrites
+            ``client_metadata.scope`` with server-derived scopes; without this
+            restore, an explicit ``oauth.scope`` from config.yaml never reaches
+            the authorization request (#93719). Union order keeps configured
+            scopes first so consent screens show them as requested-baseline.
+            """
+            self._restore_configured_scope()
+            return await super()._perform_authorization_code_grant(*args, **kwargs)
 
         async def _refresh_token(self):
             self._coerce_client_secret_post()
@@ -700,6 +742,7 @@ class MCPOAuthManager:
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            configured_scope=cfg.get("scope"),
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,
