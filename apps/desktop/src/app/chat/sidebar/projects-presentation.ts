@@ -260,7 +260,7 @@ function createStoreAdapter(
     cached = provider ? { contribution: provider.contribution, snapshot: provider.snapshot } : null
   }
 
-  const subscribeToProvider = (initialCandidate = active, preserveActive = false) => {
+  const subscribeToProvider = (initialCandidate = active) => {
     let candidate = initialCandidate
 
     while (candidate) {
@@ -285,9 +285,7 @@ function createStoreAdapter(
       candidate = readValidProvider(entries, candidate.entryIndex + 1)
     }
 
-    if (!preserveActive) {
-      select(null)
-    }
+    select(null)
   }
 
   return {
@@ -319,7 +317,7 @@ function createStoreAdapter(
       if (!unsubscribeProvider) {
         const retrying = retryPreferredProviders
         retryPreferredProviders = false
-        subscribeToProvider(retrying ? readValidProvider(entries) : active, retrying)
+        subscribeToProvider(retrying ? readValidProvider(entries) : active)
       }
 
       return () => {

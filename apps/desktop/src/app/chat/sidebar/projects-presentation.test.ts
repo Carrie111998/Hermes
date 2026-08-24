@@ -228,6 +228,80 @@ describe('Projects grouping contribution', () => {
     expect(primarySubscribeCalls).toBe(3)
   })
 
+  it('disconnects after an idle retry exhausts the provider ladder and retries later', () => {
+    let fallbackRecovered = true
+    let fallbackListener: (() => void) | undefined
+    let fallbackSubscribeCalls = 0
+    const events: string[] = []
+    const primary = provider([{ id: 'primary', label: 'Primary', projectIds: ['a'] }])
+    const fallback = provider([{ id: 'fallback', label: 'Fallback', projectIds: ['b'] }])
+
+    primary.subscribe = () => {
+      events.push('subscribe:primary')
+      throw new Error('primary subscription failed')
+    }
+
+    fallback.subscribe = listener => {
+      fallbackSubscribeCalls += 1
+      events.push('subscribe:fallback')
+
+      if (!fallbackRecovered) {
+        throw new Error('fallback subscription failed')
+      }
+
+      fallbackListener = listener
+
+      return () => {
+        fallbackListener = undefined
+      }
+    }
+
+    register(primary, 0)
+    register(fallback, 10)
+
+    const initial = renderHook(() => useActiveProjectsGrouping())
+
+    expect(initial.result.current?.contribution).toBe(fallback)
+    initial.unmount()
+
+    fallbackRecovered = false
+    events.length = 0
+
+    const exhausted = renderHook(() => {
+      const grouping = useProjectsGrouping([project('a'), project('b')])
+      events.push(`render:${grouping?.snapshot.groups[0]?.id ?? 'empty'}`)
+
+      return grouping
+    })
+
+    expect(exhausted.result.current).toBeNull()
+    expect(events).toEqual(['render:fallback', 'subscribe:primary', 'subscribe:fallback', 'render:empty'])
+
+    exhausted.unmount()
+    fallbackRecovered = true
+    events.length = 0
+
+    const recovered = renderHook(() => {
+      const dialog = useActiveProjectsGrouping()
+      const sidebar = useProjectsGrouping([project('a'), project('b')])
+      events.push(`render:${dialog?.snapshot.groups[0]?.id ?? 'empty'}:${sidebar?.snapshot.groups[0]?.id ?? 'empty'}`)
+
+      return { dialog, sidebar }
+    })
+
+    expect(recovered.result.current.dialog?.contribution).toBe(fallback)
+    expect(recovered.result.current.sidebar?.contribution).toBe(fallback)
+    expect(recovered.result.current.sidebar?.snapshot).toBe(recovered.result.current.dialog?.snapshot)
+    expect(events).toEqual([
+      'render:empty:empty',
+      'subscribe:primary',
+      'subscribe:fallback',
+      'render:fallback:fallback'
+    ])
+    expect(fallbackSubscribeCalls).toBe(3)
+    expect(fallbackListener).toBeTypeOf('function')
+  })
+
   it('settles on a stable empty state when every valid provider throws while subscribing', () => {
     register({
       getSnapshot: () => ({ groups: [{ id: 'broken', label: 'Broken', projectIds: ['a'] }] }),
