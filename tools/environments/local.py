@@ -867,6 +867,7 @@ def _mandatory_aslr_enabled() -> "bool | None":
                 "-Command",
                 "(Get-ProcessMitigation -System).Aslr.ForceRelocateImages.ToString()",
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
@@ -933,6 +934,7 @@ def _bash_starts(bash: str) -> bool:
     try:
         result = subprocess.run(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=15,
