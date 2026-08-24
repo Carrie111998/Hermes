@@ -233,3 +233,5 @@ def test_review_capable_and_coerced_sources(monkeypatch) -> None:
     assert (coerced["routing_role"], coerced["routing_source"]) == (
         "reviewer", "review_coerced"
     )
+    assert "role 'auditor'" in capable["routing_reason"]
+    assert "role 'executor'" in coerced["routing_reason"]
