@@ -8002,6 +8002,37 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _validate_workspace_repository(repo_root: Path, *, board: Optional[str]) -> None:
+    """Validate an explicitly configured board repository identity.
+
+    A board may carry ``repository_identity`` in its metadata.  Keep this
+    optional for backwards compatibility with unscoped boards, but once an
+    identity is configured, never accept a merely plausible Git checkout.
+    """
+    try:
+        identity = read_board_metadata(board if board else get_current_board()).get(
+            "repository_identity"
+        )
+    except Exception:
+        identity = None
+    if not isinstance(identity, dict):
+        return
+    expected = str(identity.get("expected_manifest_name") or "").strip()
+    markers = identity.get("required_markers")
+    if not expected or not isinstance(markers, list):
+        raise ValueError(
+            "BLOCKED/needs-input: repository_identity must specify "
+            "expected_manifest_name and required_markers; candidates were not accepted"
+        )
+    from hermes_cli.repository_identity import validate_repository_identity
+
+    validate_repository_identity(
+        repo_root,
+        expected_manifest_name=expected,
+        required_markers=markers,
+    )
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -8041,6 +8072,7 @@ def _resolve_worktree_workspace(
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
+        _validate_workspace_repository(repo_root, board=board)
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
@@ -8077,6 +8109,7 @@ def _resolve_worktree_workspace(
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
+        _validate_workspace_repository(repo_root, board=board)
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
@@ -8087,6 +8120,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    _validate_workspace_repository(repo_root, board=board)
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
