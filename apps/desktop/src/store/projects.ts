@@ -13,7 +13,13 @@ import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRestEndpoint, isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { cleanPath, comparisonPath, isUnderPath } from '@/lib/path-compare'
 import { persistentAtom } from '@/lib/persisted'
-import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
+import {
+  $gateway,
+  activeGateway,
+  activeGatewayConnectionId,
+  ensureActiveGatewayOpen,
+  requestGatewayForAgent
+} from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import {
@@ -373,6 +379,7 @@ async function gatewayRequestOn<T>(
 }
 
 interface ActiveProjectsContext {
+  connectionId: null | string
   gateway: HermesGateway
   profile: string
 }
@@ -394,11 +401,26 @@ async function activeProjectsContext(): Promise<ActiveProjectsContext> {
     gateway = await ensureActiveGatewayOpen()
   }
 
-  if (!gateway || gateway !== activeGateway() || profile !== projectProfile()) {
+  const connectionId = activeGatewayConnectionId()
+
+  if (
+    !gateway ||
+    gateway !== activeGateway() ||
+    connectionId !== activeGatewayConnectionId() ||
+    profile !== projectProfile()
+  ) {
     throw new Error('Active Hermes profile changed while connecting')
   }
 
-  return { gateway, profile }
+  return { connectionId, gateway, profile }
+}
+
+async function gatewayRequestForContext<T>(
+  context: ActiveProjectsContext,
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  return requestGatewayForAgent<T>(context.connectionId, context.profile, method, params)
 }
 
 function applyPayload(payload: ProjectsPayload): void {
@@ -897,9 +919,9 @@ async function reconcileProjectsOn(context: ActiveProjectsContext, reportErrors 
   // the authority it mutated without advancing foreground generations or
   // publishing that old source into the new source's caches.
   const requests = [
-    gatewayRequestOn<ProjectsPayload>(context.gateway, 'projects.list', projectParams({}, context.profile)),
-    gatewayRequestOn<ProjectTreePayload>(
-      context.gateway,
+    gatewayRequestForContext<ProjectsPayload>(context, 'projects.list', projectParams({}, context.profile)),
+    gatewayRequestForContext<ProjectTreePayload>(
+      context,
       'projects.tree',
       projectParams({ preview_limit: PROJECT_TREE_PREVIEW_LIMIT }, context.profile)
     )
@@ -1014,8 +1036,8 @@ async function renameProjectsManyOn(
   let response: { projects: ProjectInfo[] }
 
   try {
-    response = await gatewayRequestOn<{ projects: ProjectInfo[] }>(
-      context.gateway,
+    response = await gatewayRequestForContext<{ projects: ProjectInfo[] }>(
+      context,
       'projects.rename_many',
       projectParams({ renames: [...renames] }, context.profile)
     )

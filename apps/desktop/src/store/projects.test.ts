@@ -65,6 +65,8 @@ vi.mock('@/lib/desktop-fs', () => ({
 vi.mock('@/store/gateway', () => ({
   $gateway: atom(null),
   activeGateway: vi.fn(),
+  activeGatewayConnectionId: vi.fn(),
+  requestGatewayForAgent: vi.fn(),
   ensureActiveGatewayOpen: vi.fn()
 }))
 
@@ -88,7 +90,9 @@ const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
+const activeGatewayConnectionId = vi.mocked(gw.activeGatewayConnectionId)
 const gatewayAtom = gw.$gateway
+const requestGatewayForAgent = vi.mocked(gw.requestGatewayForAgent)
 
 const git = await import('@/lib/desktop-git')
 const desktopGit = vi.mocked(git.desktopGit)
@@ -147,6 +151,16 @@ describe('project scope', () => {
 describe('projects RPC profile forwarding', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    activeGatewayConnectionId.mockReturnValue(null)
+    requestGatewayForAgent.mockImplementation(async (_connectionId, _profile, method, params) => {
+      const gateway = activeGateway()
+
+      if (!gateway) {
+        throw new Error('Hermes gateway is not connected')
+      }
+
+      return gateway.request(method, params) as never
+    })
     $activeGatewayProfile.set('default')
     $activeProjectId.set(null)
     $projectTree.set([])
@@ -205,6 +219,16 @@ describe('transactional Project renaming', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    activeGatewayConnectionId.mockReturnValue(null)
+    requestGatewayForAgent.mockImplementation(async (_connectionId, _profile, method, params) => {
+      const gateway = activeGateway()
+
+      if (!gateway) {
+        throw new Error('Hermes gateway is not connected')
+      }
+
+      return gateway.request(method, params) as never
+    })
     $activeGatewayProfile.set('default')
     setShowAllProfiles(false)
     $projects.set([alpha])
@@ -308,6 +332,9 @@ describe('transactional Project renaming', () => {
     let current = gatewayA
 
     activeGateway.mockImplementation(() => current as never)
+    requestGatewayForAgent.mockImplementation(
+      async (_connectionId, _profile, method, params) => gatewayA.request(method, params) as never
+    )
 
     const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
       deleteProjectGroup({
@@ -376,6 +403,9 @@ describe('transactional Project renaming', () => {
     let current = gatewayA
 
     activeGateway.mockImplementation(() => current as never)
+    requestGatewayForAgent.mockImplementation(
+      async (_connectionId, _profile, method, params) => gatewayA.request(method, params) as never
+    )
 
     const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
       deleteProjectGroup({
@@ -408,6 +438,85 @@ describe('transactional Project renaming', () => {
       'projects.tree'
     ])
     expect(gatewayA.request.mock.calls.every(([, params]) => params?.profile === 'default')).toBe(true)
+    expect(gatewayB.request).not.toHaveBeenCalled()
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
+    expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
+  })
+
+  it('reconnects the original pinned route for rollback after its socket closes and B becomes active', async () => {
+    const providerFailure = new Error('provider unavailable')
+    let projectNameOnA = alpha.name
+
+    const gatewayA = {
+      connectionState: 'open',
+      request: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (gatewayA.connectionState !== 'open') {
+          throw new Error('gateway A is disconnected')
+        }
+
+        if (method !== 'projects.rename_many') {
+          throw new Error(`unexpected ${method}`)
+        }
+
+        const [rename] = params?.renames as Array<{ expectedName: string; newName: string }>
+        expect(rename.expectedName).toBe(projectNameOnA)
+        projectNameOnA = rename.newName
+
+        if (projectNameOnA === 'Group · Alpha') {
+          gatewayA.connectionState = 'closed'
+        }
+
+        return { projects: [{ ...alpha, name: projectNameOnA }] }
+      })
+    }
+
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+    let current = gatewayA
+
+    activeGateway.mockImplementation(() => current as never)
+    activeGatewayConnectionId.mockReturnValue('source-a')
+    requestGatewayForAgent.mockImplementation(async (connectionId, profile, method, params) => {
+      expect(connectionId).toBe('source-a')
+      expect(profile).toBe('profile-a')
+
+      if (gatewayA.connectionState !== 'open') {
+        gatewayA.connectionState = 'open'
+      }
+
+      return gatewayA.request(method, params) as never
+    })
+    $activeGatewayProfile.set('profile-a')
+
+    const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
+      deleteProjectGroup({
+        contribution: {
+          deleteGroup: vi.fn(async () => {
+            current = gatewayB
+            $activeGatewayProfile.set('profile-b')
+            $projects.set([{ ...alpha, id: 'source-b', name: 'Source B' }])
+            $projectTree.set([{ id: 'source-b', label: 'Source B', path: '/b', repos: [], sessionCount: 0 }])
+            throw providerFailure
+          }),
+          getSnapshot: () => ({ groups: [{ id: 'group', label: 'Group', projectIds: [alpha.id] }] }),
+          subscribe: () => () => undefined
+        },
+        group: { id: 'group', label: 'Group', projectIds: [alpha.id] },
+        operationId: 'operation-a',
+        prependGroupName: true,
+        projects: [alpha],
+        reconcile,
+        renameMany
+      })
+    )
+
+    await expect(pending).rejects.toBe(providerFailure)
+    expect(projectNameOnA).toBe('Alpha')
+    expect(requestGatewayForAgent).toHaveBeenCalledTimes(2)
+    expect(
+      requestGatewayForAgent.mock.calls.every(
+        ([connectionId, profile]) => connectionId === 'source-a' && profile === 'profile-a'
+      )
+    ).toBe(true)
     expect(gatewayB.request).not.toHaveBeenCalled()
     expect($projects.get().map(project => project.id)).toEqual(['source-b'])
     expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])

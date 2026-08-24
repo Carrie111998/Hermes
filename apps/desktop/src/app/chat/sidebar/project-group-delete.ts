@@ -126,8 +126,8 @@ export interface DeleteProjectGroupOptions {
   readonly operationId: string
   readonly prependGroupName: boolean
   readonly projects: readonly ProjectGroupDeleteProject[]
-  readonly renameMany: (renames: readonly ProjectNameCAS[]) => Promise<unknown>
-  readonly reconcile: () => Promise<unknown>
+  readonly renameMany?: (renames: readonly ProjectNameCAS[]) => Promise<unknown>
+  readonly reconcile?: () => Promise<unknown>
 }
 
 /**
@@ -167,17 +167,21 @@ export async function deleteProjectGroup({
   const expectedProjectIds = normalizedMemberIds(group.projectIds)
   const renames = prependGroupName ? buildProjectGroupRenamePlan(group, projects) : []
 
-  if (renames.length) {
-    await renameMany(renames)
+  if (!renames.length) {
+    await contribution.deleteGroup({ expectedProjectIds, groupId: group.id, operationId })
+
+    return
   }
+
+  if (!renameMany || !reconcile) {
+    throw new ProjectGroupDeleteValidationError('unsupported', 'Project rename operations are unavailable')
+  }
+
+  await renameMany(renames)
 
   try {
     await contribution.deleteGroup({ expectedProjectIds, groupId: group.id, operationId })
   } catch (providerError) {
-    if (!renames.length) {
-      throw providerError
-    }
-
     const rollback = renames.map(rename => ({
       expectedName: rename.newName,
       id: rename.id,

@@ -130,16 +130,22 @@ export function ProjectGroupDeleteDialog({
   }
 
   const performDelete = async (prepend: boolean) => {
+    const deletion = {
+      contribution,
+      group: review.group,
+      operationId: review.operationId,
+      prependGroupName: prepend,
+      projects
+    }
+
+    if (!prepend) {
+      await deleteProjectGroup(deletion)
+
+      return
+    }
+
     await withActiveProjectsContext(({ reconcile, renameMany }) =>
-      deleteProjectGroup({
-        contribution,
-        group: review.group,
-        operationId: review.operationId,
-        prependGroupName: prepend,
-        projects,
-        reconcile,
-        renameMany
-      })
+      deleteProjectGroup({ ...deletion, reconcile, renameMany })
     )
   }
 

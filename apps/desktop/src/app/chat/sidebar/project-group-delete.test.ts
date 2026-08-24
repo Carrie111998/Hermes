@@ -39,19 +39,15 @@ describe('Project group deletion saga', () => {
 
   it('deletes an unchecked group with only the provider CAS request', async () => {
     const provider = contribution()
-    const renameMany = vi.fn()
 
     await deleteProjectGroup({
       contribution: provider,
       group,
       operationId: 'operation-1',
       prependGroupName: false,
-      projects,
-      reconcile: vi.fn(),
-      renameMany
+      projects
     })
 
-    expect(renameMany).not.toHaveBeenCalled()
     expect(provider.deleteGroup).toHaveBeenCalledWith({
       expectedProjectIds: ['p_alpha', 'p_prefixed'],
       groupId: 'group-1',

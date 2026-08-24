@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { withActiveProjectsContext } from '@/store/projects'
+
 import { ProjectGroupDeleteDialog } from './project-group-delete-dialog'
 import type { ProjectsGroupingContribution } from './projects-presentation'
 
@@ -68,12 +70,19 @@ function provider(group: { id: string; label: string; projectIds: string[] }, de
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  vi.mocked(withActiveProjectsContext).mockImplementation(operation =>
+    operation({
+      reconcile: vi.fn().mockResolvedValue(undefined),
+      renameMany: vi.fn().mockResolvedValue([])
+    })
+  )
 })
 
 describe('ProjectGroupDeleteDialog', () => {
   it('uses a compact confirmation for an empty group and sends the provider CAS request', async () => {
     const group = { id: 'empty', label: 'Empty', projectIds: [] }
     const { contribution, deleteGroup } = provider(group, vi.fn().mockResolvedValue(undefined))
+    vi.mocked(withActiveProjectsContext).mockRejectedValue(new Error('Projects unavailable in All Profiles'))
 
     render(
       <ProjectGroupDeleteDialog
@@ -96,6 +105,31 @@ describe('ProjectGroupDeleteDialog', () => {
       groupId: 'empty',
       operationId: expect.any(String)
     })
+    expect(withActiveProjectsContext).not.toHaveBeenCalled()
+  })
+
+  it('deletes a nonempty unchecked group in All Profiles without capturing Projects context', async () => {
+    const group = { id: 'work', label: 'Work', projectIds: ['p_alpha'] }
+    const { contribution, deleteGroup } = provider(group, vi.fn().mockResolvedValue(undefined))
+    vi.mocked(withActiveProjectsContext).mockRejectedValue(new Error('Projects unavailable in All Profiles'))
+    const onOpenChange = vi.fn()
+
+    render(
+      <ProjectGroupDeleteDialog
+        contribution={contribution}
+        group={group}
+        onOpenChange={onOpenChange}
+        open
+        projects={projects}
+      />
+    )
+
+    expect(screen.getByRole('checkbox').getAttribute('data-state')).toBe('unchecked')
+    fireEvent.click(screen.getByRole('button', { name: 'Delete group' }))
+
+    await waitFor(() => expect(deleteGroup).toHaveBeenCalledOnce())
+    expect(withActiveProjectsContext).not.toHaveBeenCalled()
+    expect(onOpenChange).toHaveBeenCalledWith(false)
   })
 
   it('starts unchecked with no preview, then renders the exact tree-to-flat preview', async () => {
