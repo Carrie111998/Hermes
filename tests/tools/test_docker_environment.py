@@ -9,95 +9,6 @@ import pytest
 from tools.environments import docker as docker_env
 
 
-def test_sandbox_task_component_preserves_portable_id():
-    assert docker_env._sandbox_task_component("session-20260822_210946") == "session-20260822_210946"
-
-
-def test_sandbox_task_component_sanitizes_windows_invalid_characters():
-    component = docker_env._sandbox_task_component("session:20260822_210946_71d78a")
-
-    assert ":" not in component
-    assert component.startswith("session_20260822_210946_71d78a-")
-    assert len(component.rsplit("-", 1)[1]) == 12
-
-
-def test_sandbox_task_component_keeps_sanitized_values_collision_safe():
-    colon = docker_env._sandbox_task_component("session:a")
-    question = docker_env._sandbox_task_component("session?a")
-
-    assert colon != question
-
-
-@pytest.mark.parametrize("task_id", ["..", "CON", "nested/task", "trailing. "])
-def test_sandbox_task_component_rejects_unsafe_windows_names(task_id):
-    component = docker_env._sandbox_task_component(task_id)
-
-    assert component not in {"", ".", ".."}
-    assert all(char not in component for char in '<>:"/\\|?*')
-    assert not component.endswith((".", " "))
-    assert component.split(".", 1)[0].upper() not in {"CON", "PRN", "AUX", "NUL"}
-
-
-def test_persistent_sandbox_uses_portable_task_component(monkeypatch, tmp_path):
-    from tools.environments import base as base_env
-
-    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    monkeypatch.setattr(base_env, "get_sandbox_dir", lambda: tmp_path)
-    _mock_subprocess_run(monkeypatch)
-
-    env = _make_dummy_env(
-        task_id="session:20260822_210946_71d78a",
-        persistent_filesystem=True,
-        persist_across_processes=False,
-    )
-
-    assert os.path.basename(os.path.dirname(env._home_dir)) == docker_env._sandbox_task_component(
-        "session:20260822_210946_71d78a"
-    )
-    assert os.path.isdir(env._home_dir)
-    assert os.path.isdir(env._workspace_dir)
-
-
-@pytest.mark.linux_only
-def test_persistent_sandbox_preserves_existing_posix_legacy_state(monkeypatch, tmp_path):
-    from tools.environments import base as base_env
-
-    docker_root = tmp_path / "docker"
-    legacy = docker_root / "session:legacy"
-    (legacy / "home").mkdir(parents=True)
-    (legacy / "workspace").mkdir()
-    marker = legacy / "workspace" / "state.txt"
-    marker.write_text("preserved", encoding="utf-8")
-
-    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    monkeypatch.setattr(base_env, "get_sandbox_dir", lambda: tmp_path)
-    _mock_subprocess_run(monkeypatch)
-
-    env = _make_dummy_env(
-        task_id="session:legacy",
-        persistent_filesystem=True,
-        persist_across_processes=False,
-    )
-
-    assert env._home_dir == str(legacy / "home")
-    assert env._workspace_dir == str(legacy / "workspace")
-    assert (legacy / "workspace" / "state.txt").read_text(encoding="utf-8") == "preserved"
-
-
-def test_sandbox_task_dir_uses_portable_path_when_legacy_is_not_allowed(tmp_path):
-    docker_root = tmp_path / "docker"
-    legacy = docker_root / "session:legacy"
-
-    selected = docker_env._sandbox_task_dir(
-        docker_root,
-        "session:legacy",
-        allow_legacy=False,
-    )
-
-    assert selected != legacy
-    assert ":" not in selected.name
-
-
 def _mock_subprocess_run(monkeypatch):
     """Mock subprocess.run to intercept docker run -d and docker version calls.
 
@@ -678,6 +589,140 @@ def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     assert "hermes-task-id=task_with_weird_chars" in labels, (
         f"sanitized task-id label missing; got: {sorted(labels)}"
     )
+
+
+def _bind_mount_specs(run_args):
+    """Return every spec string passed via ``-v``."""
+    return [
+        run_args[i + 1]
+        for i, flag in enumerate(run_args[:-1])
+        if flag == "-v"
+    ]
+
+
+def test_persistent_bind_mounts_survive_a_session_key_task_id(monkeypatch, tmp_path):
+    """A gateway session key reaches the persistent sandbox path as-is, and it
+    carries colons (``session:agent:main:telegram:dm:<chat_id>``). Docker reads
+    every colon in a ``-v`` spec as a field separator, so the raw key made
+    ``docker run`` fail with "invalid spec ... too many colons" (exit 125) and
+    no tool call could run for any Telegram DM session."""
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        task_id="session:agent:main:telegram:dm:8439114563",
+        persistent_filesystem=True,
+    )
+
+    specs = _bind_mount_specs(_run_args_from_calls(calls))
+    mounts = [s for s in specs if s.endswith((":/root", ":/workspace"))]
+    assert len(mounts) == 2, f"expected /root and /workspace binds; got {specs}"
+    for spec in mounts:
+        source, _, target = spec.rpartition(":")
+        assert ":" not in source, (
+            f"bind source still contains a colon, docker run would fail with "
+            f"'too many colons': {spec}"
+        )
+        # Docker splits on ':' — a sane spec has exactly source:target.
+        assert spec.count(":") == 1, f"spec is not a two-field bind: {spec}"
+        assert target in {"/root", "/workspace"}
+
+
+def test_existing_unsafe_legacy_dir_is_not_reused(monkeypatch, tmp_path):
+    """A failed pre-fix launch may leave a colon-bearing directory behind."""
+    task_id = "session:legacy"
+    legacy = tmp_path / "docker" / task_id
+    (legacy / "home").mkdir(parents=True)
+    (legacy / "workspace").mkdir()
+
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(task_id=task_id, persistent_filesystem=True)
+    portable = tmp_path / "docker" / docker_env._sandbox_dir_name(task_id)
+
+    assert env._home_dir == str(portable / "home")
+    assert env._workspace_dir == str(portable / "workspace")
+    assert portable != legacy
+
+
+def test_distinct_session_keys_get_distinct_sandbox_dirs(monkeypatch, tmp_path):
+    """Sanitizing colons to underscores is not injective on its own: two
+    different chats must not be collapsed onto one persistent sandbox, or one
+    DM's ``/root`` (shell history, credentials, installed packages) shows up in
+    another's container."""
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    sources = []
+    for task_id in (
+        "session:agent:main:telegram:dm:111",
+        "session:agent:main:telegram:dm:222",
+        # Collides with the first key under a plain ':' -> '_' rewrite.
+        "session_agent_main_telegram_dm_111",
+    ):
+        calls = _mock_subprocess_run(monkeypatch)
+        _make_dummy_env(task_id=task_id, persistent_filesystem=True)
+        specs = _bind_mount_specs(_run_args_from_calls(calls))
+        sources.append(
+            next(s.rpartition(":")[0] for s in specs if s.endswith(":/root"))
+        )
+
+    assert len(set(sources)) == 3, f"sandbox sources collided: {sources}"
+
+
+def test_sandbox_dir_name_keeps_existing_names_verbatim():
+    """The shared container and RL/benchmark rollouts must keep resolving to the
+    directory they already use — renaming those strands a user's installed
+    packages and /root state in an orphaned sandbox."""
+    for value in ("default", "bench-env", "astropy__astropy-12907", "v1.2.3_x"):
+        assert docker_env._sandbox_dir_name(value) == value
+
+
+def test_sandbox_dir_name_drops_separators_docker_and_the_fs_reserve():
+    """':' is what docker's -v parser splits on; '/' and '\\' would place the
+    sandbox outside its root entirely."""
+    for value in (
+        "session:agent:main:telegram:dm:8439114563",
+        "task/with:weird*chars",
+        "..\\..\\escape",
+        "../../etc",
+    ):
+        name = docker_env._sandbox_dir_name(value)
+        assert not (set(name) & set(':/\\')), name
+
+
+def test_sandbox_dir_name_is_stable_across_calls():
+    """Cross-process container reuse resolves the sandbox by name, so the
+    mapping must be a pure function of the id — no randomness, no pid."""
+    value = "session:agent:main:discord:guild:1:2"
+    assert docker_env._sandbox_dir_name(value) == docker_env._sandbox_dir_name(value)
+
+
+def test_sandbox_dir_name_bounds_pathological_ids():
+    """Long keys (a Matrix room plus thread id) must stay inside the
+    per-component filesystem limit."""
+    name = docker_env._sandbox_dir_name("session:" + "x:" * 500)
+    assert 0 < len(name) <= 128
+
+
+def test_sandbox_dir_name_never_resolves_to_the_sandbox_root():
+    """'.'/'..' would mount the docker sandbox root, and an empty component
+    would bind every task's state into one container."""
+    for value in ("", ".", "..", "  ", None):
+        name = docker_env._sandbox_dir_name(value)
+        assert name not in {"", ".", ".."}, repr(value)
+        assert not (set(name) & set(':/\\')), name
+
+
+@pytest.mark.parametrize("value", ["CON", "con.txt", "LPT1", "aux.json"])
+def test_sandbox_dir_name_rewrites_windows_reserved_devices(value):
+    name = docker_env._sandbox_dir_name(value)
+
+    assert name != value
+    assert name.split(".", 1)[0].upper() not in {"CON", "LPT1", "AUX"}
 
 
 def test_labels_attribute_populated_after_init(monkeypatch):

@@ -22,6 +22,7 @@ from tools.environments.base import (
     BaseEnvironment,
     EnvironmentConnectionError,
     _popen_bash,
+    sanitize_task_id_for_path,
 )
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -143,70 +144,11 @@ def _sanitize_label_value(value: str) -> str:
     return cleaned
 
 
-def _sandbox_task_component(task_id: str) -> str:
-    """Return a portable, collision-resistant directory name for *task_id*.
-
-    Session IDs remain the logical container/cache key, but persistent Docker
-    filesystems also use them as host path components. Windows rejects several
-    characters that are valid in session IDs (notably ``:``), reserved device
-    names, and trailing dots/spaces. Preserve already-portable IDs for backward
-    compatibility; transformed values carry a digest so distinct IDs cannot
-    collapse onto the same persistent sandbox.
-    """
-    raw = str(task_id or "default")
-    cleaned = _WINDOWS_PATH_INVALID_RE.sub("_", raw).rstrip(" .")
-    reserved = cleaned.split(".", 1)[0].upper() in _WINDOWS_RESERVED_PATH_STEMS
-    portable = (
-        cleaned == raw
-        and cleaned not in {"", ".", ".."}
-        and not reserved
-        and len(cleaned) <= 63
-    )
-    if portable:
-        return cleaned
-
-    if cleaned in {"", ".", ".."}:
-        cleaned = "task"
-    elif reserved:
-        cleaned = f"_{cleaned}"
-    stem = cleaned[:50].rstrip(" .") or "task"
-    digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
-    return f"{stem}-{digest}"
-
-
-def _sandbox_task_dir(
-    docker_root: Path,
-    task_id: str,
-    *,
-    allow_legacy: Optional[bool] = None,
-) -> Path:
-    """Resolve persistent storage while preserving valid POSIX legacy paths."""
-    raw = str(task_id or "default")
-    portable = docker_root / _sandbox_task_component(raw)
-    if portable.name == raw:
-        return portable
-
-    if allow_legacy is None:
-        allow_legacy = os.name != "nt"
-    legacy_is_single_component = (
-        raw not in {"", ".", ".."}
-        and "/" not in raw
-        and "\x00" not in raw
-    )
-    if allow_legacy and legacy_is_single_component:
-        legacy = docker_root / raw
-        try:
-            if legacy.is_dir():
-                return legacy
-        except OSError:
-            pass
-    return portable
-
-
-def _task_identity_fingerprint(task_id: str) -> str:
-    """Return a collision-resistant label value for the unsanitized task ID."""
-    raw = str(task_id or "default")
-    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:48]
+# The task_id -> host-directory-name mapping is shared with every backend
+# that persists per-task state on the host filesystem (Singularity overlays
+# use the same helper), so the whole bug class is fixed in one place:
+# tools.environments.base.sanitize_task_id_for_path.
+_sandbox_dir_name = sanitize_task_id_for_path
 
 
 def _get_active_profile_name() -> str:
@@ -1059,7 +1001,9 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = _sandbox_task_dir(get_sandbox_dir() / "docker", task_id)
+            # _sandbox_dir_name(): a raw session-key task_id carries colons,
+            # which `-v` reads as extra spec fields (exit 125).
+            sandbox = get_sandbox_dir() / "docker" / _sandbox_dir_name(task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args.extend([
