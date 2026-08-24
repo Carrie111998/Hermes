@@ -10,6 +10,8 @@ import type {
   AutomationBlueprint,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  ChannelCapability,
+  ChannelCapabilityUpdate,
   ComputerUseStatus,
   ConfigSchemaResponse,
   CronDeliveryTarget,
@@ -141,6 +143,12 @@ export type {
   AutomationBlueprintField,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  ChannelCapability,
+  ChannelCapabilityUpdate,
+  ChannelImplicitToolset,
+  ChannelMcpMode,
+  ChannelMcpPolicy,
+  ChannelToolsetInfo,
   ComputerUseCheck,
   ComputerUsePermissionSource,
   ComputerUseStatus,
@@ -1155,6 +1163,25 @@ export function getToolsets(): Promise<ToolsetInfo[]> {
   return window.hermesDesktop.api<ToolsetInfo[]>({
     ...profileScoped(),
     path: '/api/tools/toolsets'
+  })
+}
+
+export function getChannelCapabilities(): Promise<ChannelCapability[]> {
+  return window.hermesDesktop.api<ChannelCapability[]>({
+    ...profileScoped(),
+    path: '/api/tools/channels'
+  })
+}
+
+export function updateChannelCapabilities(
+  platform: string,
+  update: ChannelCapabilityUpdate
+): Promise<{ ok: boolean; channel: ChannelCapability }> {
+  return window.hermesDesktop.api<{ ok: boolean; channel: ChannelCapability }>({
+    ...profileScoped(),
+    path: `/api/tools/channels/${encodeURIComponent(platform)}`,
+    method: 'PUT',
+    body: update
   })
 }
 
