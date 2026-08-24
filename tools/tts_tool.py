@@ -2660,8 +2660,13 @@ def _generate_gemini_tts(
     """
     import requests
 
-    raw_gemini_config = tts_config.get("gemini") or tts_config.get("vertex") or {}
-    gemini_config = raw_gemini_config if isinstance(raw_gemini_config, dict) else {}
+    raw_gemini = tts_config.get("gemini")
+    raw_vertex = tts_config.get("vertex")
+    raw_gc = tts_config.get("google_cloud")
+
+    gemini_config = raw_gemini if isinstance(raw_gemini, dict) else (raw_vertex if isinstance(raw_vertex, dict) else {})
+    vertex_cfg = raw_vertex if isinstance(raw_vertex, dict) else {}
+    gc_cfg = raw_gc if isinstance(raw_gc, dict) else {}
     provider_name = str(provider or tts_config.get("provider") or "").lower()
 
     api_key = (
@@ -2674,6 +2679,7 @@ def _generate_gemini_tts(
         or bool(gemini_config.get("use_vertex"))
         or bool(tts_config.get("vertex"))
         or (bool(gemini_config.get("project_id")) and not api_key)
+        or (bool(vertex_cfg.get("project_id")) and not api_key)
     )
 
     if not use_vertex and not api_key:
@@ -2726,19 +2732,34 @@ def _generate_gemini_tts(
 
         cred_file = str(
             gemini_config.get("credentials_file")
-            or tts_config.get("vertex", {}).get("credentials_file")
-            or tts_config.get("google_cloud", {}).get("credentials_file")
+            or vertex_cfg.get("credentials_file")
+            or gc_cfg.get("credentials_file")
             or get_env_value("GOOGLE_APPLICATION_CREDENTIALS")
             or ""
         ).strip()
+        if cred_file:
+            cred_file = os.path.expanduser(cred_file)
 
-        if cred_file and os.path.isfile(cred_file):
+        default_proj = None
+        if cred_file:
+            if not os.path.isfile(cred_file):
+                raise ValueError(
+                    f"Vertex AI Gemini TTS credentials file not found: {cred_file}\n"
+                    "Verify the path in tts.vertex.credentials_file, "
+                    "tts.gemini.credentials_file, or GOOGLE_APPLICATION_CREDENTIALS."
+                )
             from google.oauth2 import service_account
-            creds = service_account.Credentials.from_service_account_file(
-                cred_file,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
-            default_proj = getattr(creds, "project_id", None)
+            try:
+                creds = service_account.Credentials.from_service_account_file(
+                    cred_file,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                default_proj = getattr(creds, "project_id", None)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load Vertex AI service account credentials from {cred_file}.\n"
+                    "Ensure the file is a valid service account JSON key."
+                ) from e
         else:
             try:
                 creds, default_proj = google.auth.default(
@@ -2758,8 +2779,8 @@ def _generate_gemini_tts(
 
         project_id = str(
             gemini_config.get("project_id")
-            or tts_config.get("vertex", {}).get("project_id")
-            or tts_config.get("google_cloud", {}).get("project_id")
+            or vertex_cfg.get("project_id")
+            or gc_cfg.get("project_id")
             or default_proj
             or get_env_value("GOOGLE_CLOUD_PROJECT")
             or ""
@@ -2772,9 +2793,9 @@ def _generate_gemini_tts(
 
         location = str(
             gemini_config.get("location")
-            or tts_config.get("vertex", {}).get("location")
-            or tts_config.get("google_cloud", {}).get("location")
-            or "global"
+            or vertex_cfg.get("location")
+            or gc_cfg.get("location")
+            or DEFAULT_GOOGLE_CLOUD_TTS_LOCATION
         ).strip()
         host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
         endpoint = f"https://{host}/v1beta1/projects/{project_id}/locations/{location}/publishers/google/models/{model}:generateContent"
@@ -2909,6 +2930,8 @@ def _resolve_google_cloud_credentials(gc_config: Dict[str, Any]):
     cred_file = str(gc_config.get("credentials_file") or "").strip()
     if not cred_file:
         cred_file = str(get_env_value("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if cred_file:
+        cred_file = os.path.expanduser(cred_file)
 
     if cred_file:
         if not os.path.isfile(cred_file):
@@ -2927,7 +2950,7 @@ def _resolve_google_cloud_credentials(gc_config: Dict[str, Any]):
         except Exception as e:
             raise ValueError(
                 f"Failed to load Google Cloud service account credentials "
-                f"from {cred_file}: {e}\n"
+                f"from {cred_file}.\n"
                 "Ensure the file is a valid service account JSON key."
             ) from e
 
@@ -3017,42 +3040,26 @@ def _generate_google_cloud_tts(
     else:
         audio_encoding = texttospeech.AudioEncoding.MP3
 
-    audio_config = texttospeech.AudioConfig(audio_encoding=audio_encoding)
+    # Build AudioConfig with normalized kwargs
+    ac_kwargs: Dict[str, Any] = {"audio_encoding": audio_encoding}
 
-    # Optional speaking rate
+    # Optional speaking rate (0.25 - 4.0)
     speaking_rate = gc_config.get("speaking_rate") or gc_config.get("speed")
     if speaking_rate is not None:
         try:
-            rate = float(speaking_rate)
-            # Google Cloud TTS accepts 0.25–4.0
-            rate = max(0.25, min(4.0, rate))
-            audio_config = texttospeech.AudioConfig(
-                audio_encoding=audio_encoding,
-                speaking_rate=rate,
-            )
+            ac_kwargs["speaking_rate"] = max(0.25, min(4.0, float(speaking_rate)))
         except (ValueError, TypeError):
             pass
 
-    # Optional pitch
+    # Optional pitch (-20.0 - 20.0)
     pitch = gc_config.get("pitch")
     if pitch is not None:
         try:
-            pitch_val = float(pitch)
-            # Google Cloud TTS accepts -20.0 to 20.0
-            pitch_val = max(-20.0, min(20.0, pitch_val))
-            # Rebuild AudioConfig with pitch included
-            ac_kwargs: Dict[str, Any] = {
-                "audio_encoding": audio_encoding,
-                "pitch": pitch_val,
-            }
-            if speaking_rate is not None:
-                try:
-                    ac_kwargs["speaking_rate"] = max(0.25, min(4.0, float(speaking_rate)))
-                except (ValueError, TypeError):
-                    pass
-            audio_config = texttospeech.AudioConfig(**ac_kwargs)
+            ac_kwargs["pitch"] = max(-20.0, min(20.0, float(pitch)))
         except (ValueError, TypeError):
             pass
+
+    audio_config = texttospeech.AudioConfig(**ac_kwargs)
 
     # Synthesize
     try:
@@ -4146,6 +4153,22 @@ def check_tts_requirements() -> bool:
     if provider in ("gemini", "vertex"):
         if _resolve_provider_key("GEMINI_API_KEY", "gemini") or _resolve_provider_key("GOOGLE_API_KEY", "gemini"):
             return True
+        raw_gemini = tts_config.get("gemini")
+        gemini_cfg = raw_gemini if isinstance(raw_gemini, dict) else {}
+        raw_vertex = tts_config.get("vertex")
+        vertex_cfg = raw_vertex if isinstance(raw_vertex, dict) else {}
+        raw_gc = tts_config.get("google_cloud")
+        gc_cfg = raw_gc if isinstance(raw_gc, dict) else {}
+        cred_file = str(
+            gemini_cfg.get("credentials_file")
+            or vertex_cfg.get("credentials_file")
+            or gc_cfg.get("credentials_file")
+            or get_env_value("GOOGLE_APPLICATION_CREDENTIALS")
+            or ""
+        ).strip()
+        if cred_file:
+            cred_file = os.path.expanduser(cred_file)
+            return os.path.isfile(cred_file)
         try:
             import google.auth
             google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
@@ -4169,6 +4192,16 @@ def check_tts_requirements() -> bool:
             _import_google_cloud_tts()
         except ImportError:
             return False
+        raw_gc = tts_config.get("google_cloud")
+        gc_cfg = raw_gc if isinstance(raw_gc, dict) else {}
+        cred_file = str(
+            gc_cfg.get("credentials_file")
+            or get_env_value("GOOGLE_APPLICATION_CREDENTIALS")
+            or ""
+        ).strip()
+        if cred_file:
+            cred_file = os.path.expanduser(cred_file)
+            return os.path.isfile(cred_file)
         try:
             import google.auth
             google.auth.default(
