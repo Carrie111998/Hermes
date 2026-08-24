@@ -1518,6 +1518,29 @@ def slack_subcommand_map() -> dict[str, str]:
 # Autocomplete
 # ---------------------------------------------------------------------------
 
+_ARGS_HINTS_CACHE: Optional[Dict[str, str]] = None
+
+
+def _registry_args_hints() -> Dict[str, str]:
+    """Map '/name' (and each alias) to the registry ``args_hint``.
+
+    Picker rows used to carry only the description, so syntax the registry
+    already owned -- e.g. ``draft <text>`` under /goal (#93716) -- was
+    invisible in both the CLI dropdown and the Ink TUI picker. Cached for
+    process lifetime: COMMAND_REGISTRY is static after import.
+    """
+    global _ARGS_HINTS_CACHE
+    if _ARGS_HINTS_CACHE is None:
+        hints: Dict[str, str] = {}
+        for cmd in COMMAND_REGISTRY:
+            if not cmd.args_hint:
+                continue
+            hints[f"/{cmd.name}"] = cmd.args_hint
+            for alias in cmd.aliases:
+                hints[f"/{alias}"] = cmd.args_hint
+        _ARGS_HINTS_CACHE = hints
+    return _ARGS_HINTS_CACHE
+
 
 class SlashCommandCompleter(Completer):
     """Autocomplete for built-in slash commands, subcommands, and skill commands."""
@@ -2222,16 +2245,19 @@ class SlashCommandCompleter(Completer):
 
         word = text[1:]
 
+        args_hints = _registry_args_hints()
+
         for cmd, desc in COMMANDS.items():
             if not self._command_allowed(cmd):
                 continue
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
+                hint = args_hints.get(cmd)
                 yield Completion(
                     self._completion_text(cmd_name, word),
                     start_position=-len(word),
                     display=cmd,
-                    display_meta=desc,
+                    display_meta=f"{desc} \u00b7 {hint}" if hint else desc,
                 )
 
         for cmd, info in self._iter_skill_bundles().items():
