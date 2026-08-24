@@ -52,6 +52,25 @@ def test_wrapper_preserves_upstream_env_and_routes_resolved_driver(monkeypatch):
     assert observed["env"]["UPSTREAM_ENV_BUILDER_RAN"] == "1"
 
 
+def test_wrapper_preserves_explicit_resolved_driver(monkeypatch):
+    backend = _dummy_backend()
+    observed = {}
+
+    def fake_wayland_env(driver_cmd, config, env):
+        observed["driver_cmd"] = driver_cmd
+        return dict(env)
+
+    monkeypatch.setattr(linux_wayland, "native_wayland_child_env", fake_wayland_env)
+    backend.resolve_cua_driver_cmd = lambda: (_ for _ in ()).throw(
+        AssertionError("explicit driver must not be re-resolved")
+    )
+
+    wrapped = wayland_runtime._wrap_child_env_for_wayland(backend)
+    wrapped(driver_cmd="/custom/path/cua-driver")
+
+    assert observed["driver_cmd"] == "/custom/path/cua-driver"
+
+
 def test_wrapper_is_idempotent():
     backend = _dummy_backend()
     first = wayland_runtime._wrap_child_env_for_wayland(backend)

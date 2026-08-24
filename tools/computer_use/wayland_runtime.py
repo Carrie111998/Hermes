@@ -73,14 +73,14 @@ def _wrap_child_env_for_wayland(backend: Any):
         return current
 
     @functools.wraps(current)
-    def wrapped(base_env=None):
+    def wrapped(base_env=None, driver_cmd=None):
         env = current(base_env)
         try:
             from tools.computer_use.linux_wayland import native_wayland_child_env
 
-            driver_cmd = backend.resolve_cua_driver_cmd()
+            resolved_driver = driver_cmd or backend.resolve_cua_driver_cmd()
             config = backend._computer_use_cfg()
-            return native_wayland_child_env(driver_cmd, config, env)
+            return native_wayland_child_env(resolved_driver, config, env)
         except Exception:
             # Native Wayland is an authority/capability decision, not a hint.
             # Never let a stale inherited opt-in bypass a failed policy probe.
