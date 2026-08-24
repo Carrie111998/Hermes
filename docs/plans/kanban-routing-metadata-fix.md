@@ -21,13 +21,13 @@
 |---|---|---|
 | 1 | `claim_rejected` accepts a reusable UUID `attempt_id`; retries of that logical attempt deduplicate while omitted IDs create independent attempts. | `a5a8e9caf6` |
 | 2 | Claim-rejection audit writes are best-effort: secondary write/commit failures log a warning and preserve the primary `RoutingContractError`. | `f3792caa68` |
-| 3 | The spawn path validates modern frozen snapshots and rejects malformed snapshots without mutable/config fallback. | `9d558d69f4` |
+| 3 | The spawn path validates modern frozen snapshots and rejects malformed snapshots without mutable/config fallback; modern runs are classified by the migration cutoff rather than optional envelope metadata. | `f4176e3dd8` |
 | 4 | Post-claim corruption follows the tested spawn-failure lifecycle: run closes `failed/spawn_failed`, `spawn_rejected` is emitted once, retry accounting advances, and the task blocks at exhaustion. | `00c375273b` |
 | 5 | Repository consumers were audited: no legacy `preflight_rejected` task-event consumer exists; `spawn_failed` consumers read the distinct `task_runs.outcome`. Legacy events remain readable and new producers use only the canonical names. | `806e73eefa` |
 | 6 | Both `review_capable` and `review_coerced` snapshots preserve the resolved base role in structured `routing_reason` JSON. | `c53f5f5deb` |
 | 7 | Backfill terminality is derived from immutable `task_runs.ended_at/status/outcome`, not mutable `tasks.status`. | `1bb5d08b74` |
 | 8 | Concurrent migration coverage starts with pre-existing runs and verifies cutoff classification excludes a run inserted after cutoff publication. | `2b62652d5f` |
-| 9 | This plan/changelog now describes shipped behavior; stale API, terminality, lifecycle, and provenance text below was synchronized. | this docs commit |
+| 9 | This plan/changelog now describes shipped behavior; stale API, terminality, lifecycle, and provenance text below was synchronized. | `439b488d40` |
 
 ### 0.0 Rev8 → Rev9 Changelog (historical plan revision)
 
