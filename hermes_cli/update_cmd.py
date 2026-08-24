@@ -467,6 +467,13 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
         "    except ImportError as exc:\n"
         "        sys.stdout.write(name + '\\n' + str(exc))\n"
         "        raise SystemExit(3)\n"
+        "    except SyntaxError as exc:\n"
+        # Invalid Python in a restored/updated tree is exactly the breakage
+        # this probe exists to catch (#94264): a file with orphan
+        # merge-conflict markers parses at no level, and swallowing it as a
+        # benign "non-import error" let a broken tree report update success.
+        "        sys.stdout.write(name + '\\n' + str(exc))\n"
+        "        raise SystemExit(3)\n"
         "    except Exception:\n"
         "        pass\n"  # non-import errors (config/env) aren't update breakage
         "raise SystemExit(0)\n"
@@ -2103,6 +2110,62 @@ def _park_stashed_changes(stash_ref: str) -> None:
     print(f"  Restore manually with: git stash apply {stash_ref}")
 
 
+def _stash_python_files_are_valid(
+    git_cmd: list[str], root: Path
+) -> tuple[bool, str | None, str | None]:
+    """Compile every ``*.py`` file in the tree to catch unimportable source.
+
+    Used immediately after a stash restore: unlike the post-PULL guard
+    (``_validate_critical_files_syntax``, which only checks the critical-file
+    list), a stash can re-apply invalid Python to ANY tracked file — e.g.
+    ``tools/terminal_tool.py`` left with orphan merge-conflict markers by an
+    abandoned local edit (#94264). Git applies such content cleanly (no merge
+    conflict is *created*), so the conflict-only checks around the restore
+    never see it, and the resulting tree fails to import on every agent turn.
+
+    Full-tree on purpose: the restored diff can touch any path, and the cost
+    is one ``git diff --name-only`` plus ``py_compile`` of just those files —
+    not a whole-tree walk.
+
+    Returns ``(ok, failing_path, error_message)``, same shape as
+    ``_validate_critical_files_syntax``.
+    """
+    import py_compile
+    import tempfile
+
+    root = Path(root)
+    try:
+        result = subprocess.run(
+            git_cmd + ["diff", "--name-only", "HEAD", "--", "*.py"],
+            cwd=root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        # Can't enumerate the changed files — don't block the update on our
+        # own tooling; the late import probe below remains as backstop.
+        return True, None, None
+
+    changed = [ln for ln in result.stdout.splitlines() if ln.strip().endswith(".py")]
+    if not changed:
+        return True, None, None
+
+    with tempfile.TemporaryDirectory(prefix="hermes-stash-syntax-check-") as tmpdir:
+        for i, relpath in enumerate(changed):
+            path = root / relpath
+            if not path.is_file():
+                continue  # deleted by the restore — nothing to compile
+            cfile = Path(tmpdir) / f"{i}__{relpath.replace('/', '__')}c"
+            try:
+                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
+            except py_compile.PyCompileError as exc:
+                return False, str(path), str(exc)
+            except OSError as exc:
+                return False, str(path), f"could not read: {exc}"
+    return True, None, None
+
+
 def _restore_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
@@ -2117,10 +2180,18 @@ def _restore_stashed_changes(
             "  Restoring them may reapply local customizations onto the updated codebase."
         )
         print("  Review the result afterward if Hermes behaves unexpectedly.")
-        print("Restore local changes now? [Y/n]")
         if input_fn is not None:
-            response = input_fn("Restore local changes now? [Y/n]", "y")
+            # Gateway / other remote-prompt mode (#94264): there is no human
+            # at a keyboard to weigh the risk — a Y-default prompt here is
+            # how a broken local edit gets auto-restored onto a clean update
+            # and bricks every agent turn while the platform adapters stay
+            # connected. Default to PARKING the stash; restoring takes an
+            # explicit "y".
+            print("  Default is to keep changes parked in the stash (safer).")
+            print("Restore local changes now? [y/N]")
+            response = (input_fn("Restore local changes now? [y/N]", "n") or "").strip().lower()
         else:
+            print("Restore local changes now? [Y/n]")
             try:
                 response = input().strip().lower()
             except (EOFError, UnicodeDecodeError):
@@ -2133,6 +2204,13 @@ def _restore_stashed_changes(
         if response not in {"", "y", "yes"}:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
+            print(f"Restore manually with: git stash apply {stash_ref}")
+            return False
+        if input_fn is not None and response == "":
+            # Remote prompt timed out / empty reply (#94264): with the safer
+            # [y/N] default, an empty answer means DECLINE — park the stash.
+            # The interactive terminal branch keeps Enter = yes ([Y/n]).
+            print("No answer received — keeping local changes parked in git stash.")
             print(f"Restore manually with: git stash apply {stash_ref}")
             return False
 
@@ -2195,6 +2273,37 @@ def _restore_stashed_changes(
         # Don't sys.exit — the code update itself succeeded, only the stash
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
+        return False
+
+    # Post-restore syntax gate (#94264): git can apply a stash cleanly even
+    # when the restored content is invalid Python (e.g. orphan merge-conflict
+    # markers left by an abandoned local edit). The conflict checks above only
+    # catch conflicts git itself creates. Compile every .py file the restore
+    # touched BEFORE dropping the stash — if the tree is unimportable, roll it
+    # back to the clean updated HEAD and keep the changes parked in the stash
+    # with explicit recovery instructions, instead of reporting success on a
+    # tree that fails on every agent turn.
+    stash_ok, bad_path, bad_error = _stash_python_files_are_valid(git_cmd, cwd)
+    if not stash_ok:
+        print("✗ Restored local changes contain invalid Python:")
+        print(f"  {bad_path}")
+        if bad_error:
+            for line in str(bad_error).splitlines()[:6]:
+                print(f"    {line}")
+        subprocess.run(
+            git_cmd + ["reset", "--hard", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+        )
+        print()
+        print("  Working tree reset to the clean updated code.")
+        print("  Your local changes are preserved in git stash — nothing is lost.")
+        print(f"  Stash ref: {stash_ref}")
+        print(
+            "  Fix the invalid file in the stash (or re-apply manually) with:"
+        )
+        print(f"    git stash apply {stash_ref}")
+        print("  The update itself succeeded; Hermes will run the updated code.")
         return False
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
