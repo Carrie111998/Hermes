@@ -23,7 +23,7 @@ import random
 import re
 import ssl
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
@@ -1771,6 +1771,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    persist_user_message_id: Optional[str] = None,
+    input_persisted_callback: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1796,6 +1798,11 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        persist_user_message_id: Optional opaque inbound identity to persist
+            on the current user row for exact retry recovery.
+        input_persisted_callback: Optional synchronous callback invoked only
+            after that user row is durably committed. Exceptions abort before
+            the primary conversation provider call.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1872,6 +1879,8 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        persist_user_message_id=persist_user_message_id,
+        input_persisted_callback=input_persisted_callback,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,

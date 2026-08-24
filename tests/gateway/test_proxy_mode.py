@@ -165,6 +165,32 @@ class TestRunAgentProxyDispatch:
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
+    @pytest.mark.asyncio
+    async def test_durable_input_callback_rejects_before_proxy_post(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner._run_agent_via_proxy = AsyncMock()
+
+        with pytest.raises(
+            RuntimeError,
+            match="durable webhook input admission is unavailable in proxy mode",
+        ):
+            await runner._run_agent(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=_make_source(),
+                session_id="test-session-123",
+                session_key="test-key",
+                run_generation=7,
+                persist_user_message_id="delivery-marker",
+                input_persisted_callback=lambda: None,
+            )
+
+        runner._run_agent_via_proxy.assert_not_awaited()
+
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
@@ -252,6 +278,58 @@ class TestRunAgentViaProxy:
                     )
 
         assert "Proxy connection error" in result["final_response"]
+        assert result["failed"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_marks_http_error_failed(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        session = _FakeSession(
+            _FakeSSEResponse(status=502, error_text="upstream unavailable")
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hi",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="test",
+                    )
+
+        assert "Proxy error (502)" in result["final_response"]
+        assert result["failed"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_marks_partial_stream_error(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+
+        class _PartialResponse(_FakeSSEResponse):
+            async def iter_any(self):
+                yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                raise ConnectionError("stream disconnected")
+
+        session = _FakeSession(_PartialResponse())
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hi",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="test",
+                    )
+
+        assert result["final_response"] == "partial"
+        assert result["partial"] is True
 
 
     @pytest.mark.asyncio
@@ -294,4 +372,3 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
-

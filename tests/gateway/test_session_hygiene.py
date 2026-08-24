@@ -792,9 +792,14 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
 
 
+@pytest.mark.parametrize(
+    "compression_route_owned",
+    [True, False],
+    ids=["route-owned", "route-cleaned-before-repoint"],
+)
 @pytest.mark.asyncio
 async def test_session_hygiene_honors_configurable_hard_message_limit(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, compression_route_owned
 ):
     """compression.hygiene_hard_message_limit overrides the default.
 
@@ -846,13 +851,17 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
-    runner.session_store.get_or_create_session.return_value = SessionEntry(
+    session_entry = SessionEntry(
         session_key="agent:main:telegram:private:12345",
         session_id="sess-1",
         created_at=datetime.now(),
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="private",
+    )
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.advance_compression_session.return_value = (
+        session_entry if compression_route_owned else None
     )
     # 12 messages: below default → no compression without override,
     # but above the configured limit of 10 → should compress.
@@ -866,6 +875,8 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._rebind_turn_lease = MagicMock()
+    runner._sync_telegram_topic_binding = MagicMock()
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -908,6 +919,18 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
         "Expected hygiene compression to fire when message count (12) "
         "exceeds configured hygiene_hard_message_limit (10)"
     )
+    runner.session_store.advance_compression_session.assert_called_once_with(
+        session_entry.session_key,
+        "sess-1",
+        "sess-1_compressed",
+    )
+    runner.session_store._save.assert_not_called()
+    if compression_route_owned:
+        runner._rebind_turn_lease.assert_called_once()
+        runner._sync_telegram_topic_binding.assert_called_once()
+    else:
+        runner._rebind_turn_lease.assert_not_called()
+        runner._sync_telegram_topic_binding.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

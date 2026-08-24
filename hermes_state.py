@@ -93,6 +93,134 @@ logger = logging.getLogger(__name__)
 
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
+_WEBHOOK_HANDOFF_OWNER_META_PREFIX = "webhook_handoff_owner:"
+_WEBHOOK_HANDOFF_REQUEST_META_PREFIX = "webhook_handoff_request:"
+_WEBHOOK_HANDOFF_TERMINAL_ROUTE_META_PREFIX = (
+    "webhook_handoff_terminal_route:"
+)
+_WEBHOOK_HANDOFF_ROUTE_BINDING_META_PREFIX = (
+    "webhook_handoff_route_binding:"
+)
+_WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL = "state-db-sidecar-v1"
+
+
+def _webhook_handoff_owner_meta_key(session_id: str) -> str:
+    return f"{_WEBHOOK_HANDOFF_OWNER_META_PREFIX}{session_id}"
+
+
+def _webhook_handoff_request_meta_key(session_id: str) -> str:
+    return f"{_WEBHOOK_HANDOFF_REQUEST_META_PREFIX}{session_id}"
+
+
+def _webhook_handoff_terminal_route_meta_key(session_id: str) -> str:
+    return f"{_WEBHOOK_HANDOFF_TERMINAL_ROUTE_META_PREFIX}{session_id}"
+
+
+def _webhook_handoff_route_binding_meta_key(
+    routing_scope: str,
+    active_session_key: str,
+) -> str:
+    identity = f"{routing_scope}\0{active_session_key}".encode("utf-8")
+    return (
+        f"{_WEBHOOK_HANDOFF_ROUTE_BINDING_META_PREFIX}"
+        f"{hashlib.sha256(identity).hexdigest()}"
+    )
+
+
+def _decode_webhook_handoff_route_binding(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    """Validate one protected handoff route and its retired aliases."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        binding = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(binding, dict):
+        return None
+    required = (
+        "routing_scope",
+        "active_session_key",
+        "active_session_id",
+    )
+    if any(
+        not isinstance(binding.get(field), str) or not binding[field]
+        for field in required
+    ):
+        return None
+    forbidden_routes = binding.get("forbidden_routes", [])
+    if not isinstance(forbidden_routes, list):
+        return None
+    normalized_forbidden = []
+    for route in forbidden_routes:
+        if not isinstance(route, dict):
+            return None
+        session_key = route.get("session_key")
+        session_id = route.get("session_id")
+        if (
+            not isinstance(session_key, str)
+            or not session_key
+            or not isinstance(session_id, str)
+            or not session_id
+        ):
+            return None
+        normalized_forbidden.append(
+            {"session_key": session_key, "session_id": session_id}
+        )
+    binding["forbidden_routes"] = normalized_forbidden
+    retired = binding.get("retired", False)
+    if not isinstance(retired, bool):
+        return None
+    binding["retired"] = retired
+    return binding
+
+
+def _decode_webhook_handoff_owner(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate the durable owner record for an exact-once webhook handoff."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        owner = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(owner, dict):
+        return None
+    if not isinstance(owner.get("token"), str) or not owner["token"]:
+        return None
+    if (
+        not isinstance(owner.get("host"), str)
+        or not owner["host"].strip()
+        or not isinstance(owner.get("instantiation_epoch"), str)
+    ):
+        return None
+    owner["host"] = owner["host"].strip()
+    if (
+        not isinstance(owner.get("routing_scope"), str)
+        or not owner["routing_scope"].strip()
+    ):
+        return None
+    if (
+        not isinstance(owner.get("active_session_key"), str)
+        or not owner["active_session_key"]
+        or not isinstance(owner.get("source_session_key"), str)
+        or not owner["source_session_key"]
+    ):
+        return None
+    if not isinstance(owner.get("pid"), int) or isinstance(owner["pid"], bool):
+        return None
+    if owner["pid"] <= 0:
+        return None
+    if not isinstance(owner.get("process_start_time"), int) or isinstance(
+        owner["process_start_time"], bool
+    ):
+        return None
+    if owner["process_start_time"] <= 0:
+        return None
+    lock_protocol = owner.get("lock_protocol")
+    if lock_protocol is not None and not isinstance(lock_protocol, str):
+        return None
+    return owner
 
 
 def _configured_transcript_limit(key: str, fallback: int) -> int:
@@ -3228,6 +3356,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # Process-owned webhook handoff claims hold a kernel advisory lock for
+        # their full external-side-effect window. The SQLite token fences the
+        # durable state transition; this sidecar proves liveness across a
+        # hostname/container epoch change without guessing from a TTL.
+        self._webhook_handoff_claim_locks: Dict[
+            Tuple[str, str], Tuple[Any, Path]
+        ] = {}
+        self._webhook_delivery_admission_owners: Dict[
+            Tuple[str, str], str
+        ] = {}
+        self._webhook_handoff_claim_locks_guard = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -4395,6 +4534,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         #45383). Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
+        with self._webhook_handoff_claim_locks_guard:
+            held_claims = list(self._webhook_handoff_claim_locks)
+        for session_id, claim_token in held_claims:
+            self.release_webhook_handoff_claim_lock(session_id, claim_token)
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
             atexit.unregister(hook)
@@ -4883,9 +5026,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return data
 
+    @classmethod
+    def _preserve_gateway_active_turn_ownership(
+        cls,
+        current_entry_json: Optional[str],
+        incoming_entry_json: str,
+    ) -> str:
+        """Keep a protected route's live turn token across stale metadata writes."""
+        current = cls._decode_gateway_routing_entry(current_entry_json)
+        incoming = cls._decode_gateway_routing_entry(incoming_entry_json)
+        if current is None or incoming is None:
+            return incoming_entry_json
+        token = current.get("active_turn_token")
+        started_at = current.get("active_turn_started_at")
+        protected_fields = {
+            "active_turn_token": token,
+            "active_turn_started_at": started_at,
+            "resume_pending": current.get("resume_pending"),
+            "resume_reason": current.get("resume_reason"),
+            "last_resume_marked_at": current.get("last_resume_marked_at"),
+        }
+        if all(
+            incoming.get(field) == value
+            for field, value in protected_fields.items()
+        ):
+            return incoming_entry_json
+        merged = dict(incoming)
+        merged.update(protected_fields)
+        return json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _load_webhook_handoff_route_bindings(
+        conn,
+        *,
+        scope: Optional[str] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        rows = conn.execute(
+            "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'",
+            (
+                _escape_like(_WEBHOOK_HANDOFF_ROUTE_BINDING_META_PREFIX)
+                + "%",
+            ),
+        ).fetchall()
+        bindings: List[Tuple[str, Dict[str, Any]]] = []
+        for row in rows:
+            binding = _decode_webhook_handoff_route_binding(row["value"])
+            if binding is None:
+                continue
+            if scope is not None and binding["routing_scope"] != scope:
+                continue
+            bindings.append((row["key"], binding))
+        return bindings
+
+    @staticmethod
+    def _save_webhook_handoff_route_binding(
+        conn,
+        binding: Dict[str, Any],
+    ) -> None:
+        meta_key = _webhook_handoff_route_binding_meta_key(
+            binding["routing_scope"],
+            binding["active_session_key"],
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+            (
+                meta_key,
+                json.dumps(binding, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
     def save_gateway_routing_entry(
         self, session_key: str, entry_json: str, *, scope: str = ""
-    ) -> None:
+    ) -> bool:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON).
 
         The gateway_routing table is the durable replacement for
@@ -4897,23 +5109,171 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         two stores with different directories never share routing state.
         """
         if not session_key or not entry_json:
-            return
+            return False
+
+        payload = self._decode_gateway_routing_entry(entry_json)
 
         def _do(conn):
+            durable_entry_json = entry_json
+            bindings = self._load_webhook_handoff_route_bindings(
+                conn,
+                scope=scope,
+            )
+            active_binding = next(
+                (
+                    binding
+                    for _meta_key, binding in bindings
+                    if not binding["retired"]
+                    and binding["active_session_key"] == session_key
+                ),
+                None,
+            )
+            if active_binding is not None and (
+                payload is None
+                or payload.get("session_id")
+                != active_binding["active_session_id"]
+            ):
+                return False
+            if payload is not None:
+                exact_active_binding = (
+                    active_binding is not None
+                    and active_binding["active_session_id"]
+                    == payload["session_id"]
+                )
+                if exact_active_binding:
+                    current_row = conn.execute(
+                        "SELECT entry_json FROM gateway_routing "
+                        "WHERE scope = ? AND session_key = ?",
+                        (scope, session_key),
+                    ).fetchone()
+                    durable_entry_json = (
+                        self._preserve_gateway_active_turn_ownership(
+                            current_row["entry_json"]
+                            if current_row is not None
+                            else None,
+                            entry_json,
+                        )
+                    )
+                for _meta_key, binding in bindings:
+                    if any(
+                        route["session_key"] == session_key
+                        and route["session_id"] == payload["session_id"]
+                        for route in binding["forbidden_routes"]
+                    ) and not exact_active_binding:
+                        return False
+                terminal = conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (
+                        _webhook_handoff_terminal_route_meta_key(
+                            payload["session_id"]
+                        ),
+                    ),
+                ).fetchone()
+                if terminal is not None and not exact_active_binding:
+                    return False
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
                    ON CONFLICT(scope, session_key) DO UPDATE SET
                        entry_json = excluded.entry_json,
                        updated_at = excluded.updated_at""",
-                (scope, session_key, entry_json, time.time()),
+                (scope, session_key, durable_entry_json, time.time()),
             )
+            if payload is not None:
+                retired_binding = next(
+                    (
+                        binding
+                        for _meta_key, binding in bindings
+                        if binding["retired"]
+                        and binding["active_session_key"] == session_key
+                    ),
+                    None,
+                )
+                if retired_binding is not None:
+                    retired_binding["active_session_id"] = payload["session_id"]
+                    retired_binding["retired"] = False
+                    self._save_webhook_handoff_route_binding(
+                        conn,
+                        retired_binding,
+                    )
+            return True
 
-        self._execute_write(_do)
+        return self._execute_write(_do)
+
+    def replace_gateway_routing_active_turn_if_owned(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        expected_active_turn_token: Optional[str],
+        replacement_entry_json: str,
+        *,
+        scope: str = "",
+    ) -> bool:
+        """CAS one route's active-turn/recovery fields without blind writes."""
+        replacement = self._decode_gateway_routing_entry(
+            replacement_entry_json
+        )
+        if (
+            not session_key
+            or not expected_session_id
+            or replacement is None
+            or replacement.get("session_key") != session_key
+            or replacement.get("session_id") != expected_session_id
+        ):
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            current_json = row["entry_json"] if row is not None else None
+            current = self._decode_gateway_routing_entry(current_json)
+            if (
+                current is None
+                or current.get("session_id") != expected_session_id
+                or current.get("active_turn_token")
+                != expected_active_turn_token
+            ):
+                return False
+
+            updated = dict(current)
+            for field in (
+                "active_turn_token",
+                "active_turn_started_at",
+                "resume_pending",
+                "resume_reason",
+                "last_resume_marked_at",
+                "was_auto_reset",
+                "is_fresh_reset",
+                "auto_reset_reason",
+                "updated_at",
+            ):
+                updated[field] = replacement.get(field)
+            updated_json = json.dumps(
+                updated,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            cursor = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (
+                    updated_json,
+                    time.time(),
+                    scope,
+                    session_key,
+                    current_json,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
 
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = ""
-    ) -> None:
+    ) -> Tuple[Dict[str, str], Dict[str, str]]:
         """Atomically replace the routing index for *scope* with *entries*.
 
         Mirrors the sessions.json full-rewrite semantics: keys absent from
@@ -4924,15 +5284,157 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            current_rows = conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing "
+                "WHERE scope = ?",
+                (scope,),
+            ).fetchall()
+            current_entries = {
+                row["session_key"]: row["entry_json"] for row in current_rows
+            }
+            bindings = self._load_webhook_handoff_route_bindings(
+                conn,
+                scope=scope,
+            )
+            bindings_by_active_key = {
+                binding["active_session_key"]: binding
+                for _meta_key, binding in bindings
+                if not binding["retired"]
+            }
+            terminal_rows = conn.execute(
+                "SELECT key FROM state_meta WHERE key GLOB ?",
+                (f"{_WEBHOOK_HANDOFF_TERMINAL_ROUTE_META_PREFIX}*",),
+            ).fetchall()
+            terminal_session_ids = {
+                row["key"][len(_WEBHOOK_HANDOFF_TERMINAL_ROUTE_META_PREFIX):]
+                for row in terminal_rows
+            }
+            accepted: Dict[str, str] = {}
+            rejected: Dict[str, str] = {}
+            for key, entry_json in entries.items():
+                if not key or not entry_json:
+                    continue
+                payload = self._decode_gateway_routing_entry(entry_json)
+                session_id = (
+                    payload.get("session_id") if payload is not None else None
+                )
+                active_binding = bindings_by_active_key.get(key)
+                protected_key_conflict = (
+                    active_binding is not None
+                    and session_id != active_binding["active_session_id"]
+                )
+                exact_active_binding = (
+                    active_binding is not None
+                    and session_id == active_binding["active_session_id"]
+                )
+                forbidden_alias = any(
+                    any(
+                        route["session_key"] == key
+                        and route["session_id"] == session_id
+                        for route in binding["forbidden_routes"]
+                    )
+                    for _meta_key, binding in bindings
+                ) and not exact_active_binding
+                if (
+                    protected_key_conflict
+                    or forbidden_alias
+                    or (
+                        session_id in terminal_session_ids
+                        and not exact_active_binding
+                    )
+                ):
+                    rejected[key] = session_id or ""
+                else:
+                    durable_entry_json = entry_json
+                    if exact_active_binding:
+                        durable_entry_json = (
+                            self._preserve_gateway_active_turn_ownership(
+                                current_entries.get(key),
+                                entry_json,
+                            )
+                        )
+                    accepted[key] = durable_entry_json
+                    retired_binding = next(
+                        (
+                            binding
+                            for _meta_key, binding in bindings
+                            if binding["retired"]
+                            and binding["active_session_key"] == key
+                        ),
+                        None,
+                    )
+                    if retired_binding is not None and session_id:
+                        retired_binding["active_session_id"] = session_id
+                        retired_binding["retired"] = False
+                        self._save_webhook_handoff_route_binding(
+                            conn,
+                            retired_binding,
+                        )
+
+            # A stale whole-index writer must not erase a newer unrelated
+            # owner that reused the same routing key. Preserve the current row
+            # at each rejected key unless that row itself names a terminally
+            # fenced session. Keys genuinely absent from the incoming snapshot
+            # retain the ordinary full-replacement deletion semantics.
+            preserved: Dict[str, str] = {}
+            if rejected:
+                for row in current_rows:
+                    if row["session_key"] not in rejected:
+                        continue
+                    current_payload = self._decode_gateway_routing_entry(
+                        row["entry_json"]
+                    )
+                    current_session_id = (
+                        current_payload.get("session_id")
+                        if current_payload is not None
+                        else None
+                    )
+                    if current_session_id not in terminal_session_ids:
+                        preserved[row["session_key"]] = row["entry_json"]
+
+            # A targeted handoff move or explicit resume is authoritative for
+            # its selected key.  Whole-index writers may refresh metadata only
+            # while they carry that exact owner; omission or a different owner
+            # is a stale snapshot and cannot delete/replace the committed route.
+            for _meta_key, binding in bindings:
+                if binding["retired"]:
+                    continue
+                active_key = binding["active_session_key"]
+                incoming_payload = self._decode_gateway_routing_entry(
+                    accepted.get(active_key)
+                )
+                if (
+                    incoming_payload is not None
+                    and incoming_payload.get("session_id")
+                    == binding["active_session_id"]
+                ):
+                    continue
+                current_entry_json = current_entries.get(active_key)
+                current_payload = self._decode_gateway_routing_entry(
+                    current_entry_json
+                )
+                if (
+                    current_entry_json is not None
+                    and current_payload is not None
+                    and current_payload.get("session_id")
+                    == binding["active_session_id"]
+                ):
+                    preserved[active_key] = current_entry_json
+
             conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if entries:
+            durable_entries = {**accepted, **preserved}
+            if durable_entries:
                 conn.executemany(
                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                     "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
+                    [
+                        (scope, key, entry_json, now)
+                        for key, entry_json in durable_entries.items()
+                    ],
                 )
+            return rejected, durable_entries
 
-        self._execute_write(_do)
+        return self._execute_write(_do)
 
     def move_gateway_routing_entry_if_owned(
         self,
@@ -4942,7 +5444,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         destination_entry_json: str,
         *,
         scope: str = "",
-    ) -> bool:
+        handoff_claim_token: Optional[str] = None,
+    ) -> Any:
         """Atomically move one durable route while its exact owner is current.
 
         Only the source and destination rows are touched. The source must own
@@ -4951,6 +5454,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         only when the destination already has the expected owner. Because the
         checks and writes run under one ``BEGIN IMMEDIATE`` transaction, a
         stale SessionStore cannot overwrite a newer owner observed in SQLite.
+
+        When ``handoff_claim_token`` is supplied, the same transaction also
+        requires that exact webhook claim and advances its active routing key.
+        A hard process loss can therefore recover the authoritative key without
+        relying on runner-local state or replaying external side effects.
         """
         if (
             not source_session_key
@@ -4972,6 +5480,102 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            terminal = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (
+                    _webhook_handoff_terminal_route_meta_key(
+                        expected_session_id
+                    ),
+                ),
+            ).fetchone()
+            if terminal is not None:
+                return False
+
+            claim_owner = None
+            claim_meta_key = _webhook_handoff_owner_meta_key(expected_session_id)
+            if handoff_claim_token is not None:
+                claim_row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (claim_meta_key,),
+                ).fetchone()
+                claim_owner = _decode_webhook_handoff_owner(
+                    claim_row["value"] if claim_row is not None else None
+                )
+                if (
+                    claim_owner is None
+                    or claim_owner.get("token") != handoff_claim_token
+                    or claim_owner.get("routing_scope") != scope
+                ):
+                    return False
+
+            removed_alias_keys: List[str] = []
+
+            def _record_route_binding() -> None:
+                binding_key = _webhook_handoff_route_binding_meta_key(
+                    scope,
+                    destination_session_key,
+                )
+                binding_row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (binding_key,),
+                ).fetchone()
+                binding = _decode_webhook_handoff_route_binding(
+                    binding_row["value"] if binding_row is not None else None
+                ) or {
+                    "routing_scope": scope,
+                    "active_session_key": destination_session_key,
+                    "active_session_id": expected_session_id,
+                    "forbidden_routes": [],
+                }
+                prior_bindings = self._load_webhook_handoff_route_bindings(
+                    conn,
+                    scope=scope,
+                )
+                binding["active_session_id"] = expected_session_id
+                binding["retired"] = False
+                forbidden = {
+                    (route["session_key"], route["session_id"])
+                    for route in binding["forbidden_routes"]
+                }
+                for meta_key, prior_binding in prior_bindings:
+                    if (
+                        prior_binding["retired"]
+                        or prior_binding["active_session_id"]
+                        != expected_session_id
+                    ):
+                        continue
+                    forbidden.update(
+                        (
+                            route["session_key"],
+                            route["session_id"],
+                        )
+                        for route in prior_binding["forbidden_routes"]
+                    )
+                    if (
+                        prior_binding["active_session_key"]
+                        != destination_session_key
+                    ):
+                        forbidden.add(
+                            (
+                                prior_binding["active_session_key"],
+                                expected_session_id,
+                            )
+                        )
+                        conn.execute(
+                            "DELETE FROM state_meta WHERE key = ?",
+                            (meta_key,),
+                        )
+                forbidden.update(
+                    (key, expected_session_id)
+                    for key in removed_alias_keys
+                    if key != destination_session_key
+                )
+                binding["forbidden_routes"] = [
+                    {"session_key": key, "session_id": session_id}
+                    for key, session_id in sorted(forbidden)
+                ]
+                self._save_webhook_handoff_route_binding(conn, binding)
+
             source_row = conn.execute(
                 "SELECT entry_json FROM gateway_routing "
                 "WHERE scope = ? AND session_key = ?",
@@ -4991,13 +5595,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if destination_row is not None
                 else None
             )
+            route_rows = conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing "
+                "WHERE scope = ?",
+                (scope,),
+            ).fetchall()
+            removed_alias_keys.extend(
+                row["session_key"]
+                for row in route_rows
+                if row["session_key"] != destination_session_key
+                and (
+                    self._decode_gateway_routing_entry(
+                        row["entry_json"]
+                    )
+                    or {}
+                ).get("session_id")
+                == expected_session_id
+            )
 
             if source_row is None:
-                return (
+                already_moved = (
                     destination_current is not None
                     and destination_current.get("session_id")
                     == expected_session_id
                 )
+                if not already_moved:
+                    return False
+                if claim_owner is not None and (
+                    claim_owner.get("active_session_key")
+                    != destination_session_key
+                ):
+                    return False
+                if removed_alias_keys:
+                    conn.executemany(
+                        "DELETE FROM gateway_routing "
+                        "WHERE scope = ? AND session_key = ?",
+                        [(scope, key) for key in removed_alias_keys],
+                    )
+                _record_route_binding()
+                return {
+                    "removed_session_keys": removed_alias_keys,
+                    "destination_entry_json": destination_row["entry_json"],
+                }
             if (
                 source_payload is None
                 or source_payload.get("session_id") != expected_session_id
@@ -5008,12 +5647,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 or destination_current.get("session_id") != expected_session_id
             ):
                 return False
+            if claim_owner is not None and (
+                claim_owner.get("active_session_key") != source_session_key
+            ):
+                return False
 
-            conn.execute(
-                "DELETE FROM gateway_routing "
-                "WHERE scope = ? AND session_key = ?",
-                (scope, source_session_key),
+            durable_destination_entry_json = (
+                self._preserve_gateway_active_turn_ownership(
+                    source_row["entry_json"],
+                    destination_entry_json,
+                )
             )
+            if removed_alias_keys:
+                conn.executemany(
+                    "DELETE FROM gateway_routing "
+                    "WHERE scope = ? AND session_key = ?",
+                    [(scope, key) for key in removed_alias_keys],
+                )
             conn.execute(
                 "INSERT INTO gateway_routing "
                 "(scope, session_key, entry_json, updated_at) "
@@ -5024,11 +5674,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (
                     scope,
                     destination_session_key,
-                    destination_entry_json,
+                    durable_destination_entry_json,
                     time.time(),
                 ),
             )
-            return True
+            if claim_owner is not None:
+                claim_owner["active_session_key"] = destination_session_key
+                owner_updated = conn.execute(
+                    "UPDATE state_meta SET value = ? "
+                    "WHERE key = ? AND value = ?",
+                    (
+                        json.dumps(claim_owner, sort_keys=True, separators=(",", ":")),
+                        claim_meta_key,
+                        claim_row["value"],
+                    ),
+                )
+                if owner_updated.rowcount != 1:
+                    raise RuntimeError(
+                        "webhook handoff owner changed during route move"
+                    )
+            _record_route_binding()
+            return {
+                "removed_session_keys": removed_alias_keys,
+                "destination_entry_json": durable_destination_entry_json,
+            }
 
         return self._execute_write(_do)
 
@@ -5048,12 +5717,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            binding_key = _webhook_handoff_route_binding_meta_key(
+                scope,
+                session_key,
+            )
+            binding_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (binding_key,),
+            ).fetchone()
+            binding = _decode_webhook_handoff_route_binding(
+                binding_row["value"] if binding_row is not None else None
+            )
+            if binding is not None and (
+                not binding["retired"]
+                and binding["active_session_id"] != expected_session_id
+            ):
+                return False
+
+            def _retire_binding() -> None:
+                if binding is None or binding["retired"]:
+                    return
+                forbidden = {
+                    (route["session_key"], route["session_id"])
+                    for route in binding["forbidden_routes"]
+                }
+                forbidden.add((session_key, expected_session_id))
+                binding["forbidden_routes"] = [
+                    {"session_key": key, "session_id": session_id}
+                    for key, session_id in sorted(forbidden)
+                ]
+                binding["retired"] = True
+                self._save_webhook_handoff_route_binding(conn, binding)
             row = conn.execute(
                 "SELECT entry_json FROM gateway_routing "
                 "WHERE scope = ? AND session_key = ?",
                 (scope, session_key),
             ).fetchone()
             if row is None:
+                _retire_binding()
                 return True
             payload = self._decode_gateway_routing_entry(row["entry_json"])
             if payload is None or payload.get("session_id") != expected_session_id:
@@ -5063,7 +5764,222 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE scope = ? AND session_key = ?",
                 (scope, session_key),
             )
+            if cursor.rowcount == 1:
+                _retire_binding()
             return cursor.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def replace_gateway_routing_entry_if_owned(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        replacement_entry_json: str,
+        *,
+        scope: str = "",
+        authorize_terminal_target: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """CAS-replace one route and carry any active handoff protection.
+
+        Explicit resume sets ``authorize_terminal_target``: the selected key
+        becomes the sole binding that may route a previously terminal-fenced
+        session.  The global fence remains intact, so stale webhook aliases do
+        not regain authority.  Ordinary reset/compression replacements carry
+        an existing protected-key binding forward to the new owner.
+        """
+        if not session_key or not expected_session_id or not replacement_entry_json:
+            return False
+        replacement = self._decode_gateway_routing_entry(
+            replacement_entry_json
+        )
+        if replacement is None or replacement.get("session_key") != session_key:
+            return False
+        target_session_id = replacement["session_id"]
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            current = self._decode_gateway_routing_entry(
+                row["entry_json"] if row is not None else None
+            )
+            if current is None or current.get("session_id") != expected_session_id:
+                return False
+
+            bindings = self._load_webhook_handoff_route_bindings(
+                conn,
+                scope=scope,
+            )
+            active_binding_row = next(
+                (
+                    (meta_key, binding)
+                    for meta_key, binding in bindings
+                    if not binding["retired"]
+                    and binding["active_session_key"] == session_key
+                ),
+                None,
+            )
+            if (
+                active_binding_row is not None
+                and active_binding_row[1]["active_session_id"]
+                != expected_session_id
+            ):
+                return False
+            target_binding_rows = [
+                (meta_key, binding)
+                for meta_key, binding in bindings
+                if authorize_terminal_target
+                and binding["active_session_id"] == target_session_id
+                and binding["active_session_key"] != session_key
+            ]
+            target_history_bindings = [
+                binding
+                for _meta_key, binding in bindings
+                if authorize_terminal_target
+                and any(
+                    route["session_id"] == target_session_id
+                    for route in binding["forbidden_routes"]
+                )
+            ]
+
+            terminal = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (
+                    _webhook_handoff_terminal_route_meta_key(
+                        target_session_id
+                    ),
+                ),
+            ).fetchone()
+            if terminal is not None and not authorize_terminal_target:
+                return False
+
+            if authorize_terminal_target:
+                # Reopening and publishing the selected route are one commit.
+                # The terminal fence deliberately stays: only this protected
+                # key receives an exception in blind routing writers.
+                self._reopen_session_on_conn(conn, target_session_id)
+
+            durable_replacement_entry_json = replacement_entry_json
+            carries_active_turn = (
+                target_session_id == expected_session_id
+                or target_session_id
+                in self._canonical_compression_descendant_ids(
+                    conn, expected_session_id
+                )
+            )
+            if active_binding_row is not None and carries_active_turn:
+                durable_replacement_entry_json = (
+                    self._preserve_gateway_active_turn_ownership(
+                        row["entry_json"],
+                        replacement_entry_json,
+                    )
+                )
+            conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ?",
+                (
+                    durable_replacement_entry_json,
+                    time.time(),
+                    scope,
+                    session_key,
+                ),
+            )
+
+            removed_session_keys: List[str] = []
+            authoritative_entries: Dict[str, str] = {}
+            for meta_key, target_binding in target_binding_rows:
+                old_key = target_binding["active_session_key"]
+                old_row = conn.execute(
+                    "SELECT entry_json FROM gateway_routing "
+                    "WHERE scope = ? AND session_key = ?",
+                    (scope, old_key),
+                ).fetchone()
+                old_route = self._decode_gateway_routing_entry(
+                    old_row["entry_json"] if old_row is not None else None
+                )
+                if (
+                    old_route is not None
+                    and old_route.get("session_id") == target_session_id
+                ):
+                    conn.execute(
+                        "DELETE FROM gateway_routing "
+                        "WHERE scope = ? AND session_key = ?",
+                        (scope, old_key),
+                    )
+                    removed_session_keys.append(old_key)
+                elif old_row is not None:
+                    authoritative_entries[old_key] = old_row["entry_json"]
+                conn.execute("DELETE FROM state_meta WHERE key = ?", (meta_key,))
+
+            if active_binding_row is not None or (
+                authorize_terminal_target
+                and (
+                    terminal is not None
+                    or any(
+                        binding["active_session_key"] == session_key
+                        for _meta_key, binding in bindings
+                    )
+                    or bool(target_binding_rows)
+                    or bool(target_history_bindings)
+                )
+            ):
+                if active_binding_row is None:
+                    binding = next(
+                        (
+                            existing
+                            for _meta_key, existing in bindings
+                            if existing["active_session_key"] == session_key
+                        ),
+                        {
+                            "routing_scope": scope,
+                            "active_session_key": session_key,
+                            "active_session_id": target_session_id,
+                            "forbidden_routes": [],
+                        },
+                    )
+                else:
+                    _meta_key, binding = active_binding_row
+                forbidden = {
+                    (route["session_key"], route["session_id"])
+                    for route in binding["forbidden_routes"]
+                }
+                for _meta_key, target_binding in target_binding_rows:
+                    forbidden.update(
+                        (
+                            route["session_key"],
+                            route["session_id"],
+                        )
+                        for route in target_binding["forbidden_routes"]
+                    )
+                    forbidden.add(
+                        (
+                            target_binding["active_session_key"],
+                            target_binding["active_session_id"],
+                        )
+                    )
+                for history_binding in target_history_bindings:
+                    forbidden.update(
+                        (
+                            route["session_key"],
+                            route["session_id"],
+                        )
+                        for route in history_binding["forbidden_routes"]
+                    )
+                if expected_session_id != target_session_id:
+                    forbidden.add((session_key, expected_session_id))
+                binding["forbidden_routes"] = [
+                    {"session_key": key, "session_id": session_id}
+                    for key, session_id in sorted(forbidden)
+                ]
+                binding["active_session_id"] = target_session_id
+                binding["retired"] = False
+                self._save_webhook_handoff_route_binding(conn, binding)
+            return {
+                "removed_session_keys": removed_session_keys,
+                "authoritative_entries": authoritative_entries,
+            }
 
         return self._execute_write(_do)
 
@@ -5075,22 +5991,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         scope: str = "",
         handoff_error: Optional[str] = None,
-    ) -> Optional[bool]:
+        handoff_claim_token: Optional[str] = None,
+        handoff_source_session_key: Optional[str] = None,
+    ) -> Optional[Tuple[List[str], List[str]]]:
         """Atomically finalize a session and conditionally remove its route.
 
         The exact expected session is always ended when the transaction is
         eligible. If the current route owner is that session, or a verified
         compression descendant of it, the route is removed and the live
-        descendant is ended too. An unrelated rebound is retained while the
-        old expected session is still finalized. Returns ``True`` when the
-        route was removed/already missing, ``False`` when an unrelated route
-        was retained but exact-session cleanup committed, and ``None`` when
-        the transaction was ineligible and made no changes.
+        descendant is ended too. Every same-scope route owned by the exact
+        session or its canonical compression continuation is removed; routes
+        rebound to unrelated sessions are retained. Returns the removed route
+        keys plus the removable session IDs after a committed cleanup, or
+        ``None`` when the transaction was ineligible and made no changes. The
+        session IDs let a concurrent losing SessionStore evict its stale local
+        aliases even when the winning transaction already removed every row.
 
         When ``handoff_error`` is supplied, ``expected_session_id`` must still
         have ``handoff_state='running'`` and its failed/error transition lands
         in this same transaction. This expected-state gate prevents late
-        cleanup from ending a handoff another watcher already completed.
+        cleanup from ending a handoff another watcher already completed. A
+        webhook ``handoff_claim_token`` additionally fences cleanup to the
+        process-owned claim and its current active routing key.
         """
         if not session_key or not expected_session_id or not end_reason:
             return None
@@ -5105,11 +6027,150 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if expected_row is None:
                 return None
 
-            route_row = conn.execute(
-                "SELECT entry_json FROM gateway_routing "
-                "WHERE scope = ? AND session_key = ?",
-                (scope, session_key),
-            ).fetchone()
+            route_rows = conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing "
+                "WHERE scope = ?",
+                (scope,),
+            ).fetchall()
+            removable_session_ids = {expected_session_id}
+            removable_session_ids.update(
+                self._canonical_compression_descendant_ids(
+                    conn, expected_session_id
+                )
+            )
+            removable_session_id_list = sorted(removable_session_ids)
+
+            route_owners: List[Tuple[str, Optional[str]]] = []
+            for route in route_rows:
+                route_payload = self._decode_gateway_routing_entry(
+                    route["entry_json"]
+                )
+                route_owner = (
+                    route_payload.get("session_id")
+                    if route_payload is not None
+                    else None
+                )
+                route_owners.append((route["session_key"], route_owner))
+
+            removed_keys = [
+                key
+                for key, owner in route_owners
+                if owner in removable_session_ids
+            ]
+
+            def _ended_lineage_session_ids() -> Set[str]:
+                placeholders = ",".join("?" for _ in removable_session_ids)
+                rows = conn.execute(
+                    "SELECT id FROM sessions "
+                    f"WHERE id IN ({placeholders}) AND ended_at IS NOT NULL",
+                    tuple(removable_session_ids),
+                ).fetchall()
+                return {row["id"] for row in rows}
+
+            def _record_terminal_route_fences(session_ids: Set[str]) -> None:
+                if not session_ids:
+                    return
+                value = json.dumps(
+                    {
+                        "root_session_id": expected_session_id,
+                        "end_reason": end_reason,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+                    [
+                        (
+                            _webhook_handoff_terminal_route_meta_key(
+                                session_id
+                            ),
+                            value,
+                        )
+                        for session_id in session_ids
+                    ],
+                )
+
+            def _retire_terminal_route_bindings(
+                session_ids: Set[str],
+            ) -> None:
+                if not session_ids:
+                    return
+                for _meta_key, binding in (
+                    self._load_webhook_handoff_route_bindings(
+                        conn,
+                        scope=scope,
+                    )
+                ):
+                    if binding["active_session_id"] not in session_ids:
+                        continue
+                    forbidden = {
+                        (route["session_key"], route["session_id"])
+                        for route in binding["forbidden_routes"]
+                    }
+                    forbidden.add(
+                        (
+                            binding["active_session_key"],
+                            binding["active_session_id"],
+                        )
+                    )
+                    binding["forbidden_routes"] = [
+                        {"session_key": key, "session_id": session_id}
+                        for key, session_id in sorted(forbidden)
+                    ]
+                    binding["retired"] = True
+                    self._save_webhook_handoff_route_binding(conn, binding)
+
+            def _repair_terminal_aliases() -> Tuple[List[str], List[str]]:
+                """Remove aliases resurrected after an earlier terminal commit."""
+                ended_session_ids = _ended_lineage_session_ids()
+                _record_terminal_route_fences(ended_session_ids)
+                _retire_terminal_route_bindings(ended_session_ids)
+                repair_keys = [
+                    key
+                    for key, owner in route_owners
+                    if owner in ended_session_ids
+                ]
+                if repair_keys:
+                    conn.executemany(
+                        "DELETE FROM gateway_routing "
+                        "WHERE scope = ? AND session_key = ?",
+                        [(scope, key) for key in repair_keys],
+                    )
+                return (repair_keys, sorted(ended_session_ids))
+
+            terminal_cleanup_committed = (
+                expected_row["handoff_state"] == "failed"
+                and expected_row["ended_at"] is not None
+            )
+
+            claim_meta_key = _webhook_handoff_owner_meta_key(expected_session_id)
+            claim_row = None
+            claim_owner = None
+            if handoff_claim_token is not None:
+                claim_row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (claim_meta_key,),
+                ).fetchone()
+                claim_owner = _decode_webhook_handoff_owner(
+                    claim_row["value"] if claim_row is not None else None
+                )
+                if (
+                    claim_owner is None
+                    or claim_owner.get("token") != handoff_claim_token
+                    or claim_owner.get("routing_scope") != scope
+                    or claim_owner.get("active_session_key") != session_key
+                    or claim_owner.get("source_session_key")
+                    != handoff_source_session_key
+                ):
+                    if terminal_cleanup_committed:
+                        # A stale second SessionStore can rewrite its old source
+                        # alias after the winning finalizer removed the claim and
+                        # destination route. Repair every route still owned by the
+                        # terminal lineage instead of declaring success merely
+                        # because the active destination key is absent.
+                        return _repair_terminal_aliases()
+                    return None
 
             if handoff_error is not None and (
                 expected_row["handoff_state"] != "running"
@@ -5117,38 +6178,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # A fully committed prior cleanup is the only idempotent
                 # terminal success. Never touch a route after a completed or
                 # otherwise-changed handoff state.
-                if (
-                    route_row is None
-                    and expected_row["handoff_state"] == "failed"
-                    and expected_row["ended_at"] is not None
-                ):
-                    return True
+                if terminal_cleanup_committed:
+                    return _repair_terminal_aliases()
                 return None
 
-            route_owner: Optional[str] = None
-            if route_row is not None:
-                route_payload = self._decode_gateway_routing_entry(
-                    route_row["entry_json"]
-                )
-                if route_payload is not None:
-                    route_owner = route_payload.get("session_id")
-
-            removable_owner: Optional[str] = None
-            if route_owner == expected_session_id:
-                removable_owner = expected_session_id
-            elif route_owner and self._is_compression_ancestor(
-                conn,
-                ancestor_id=expected_session_id,
-                descendant_id=route_owner,
-            ):
-                removable_owner = route_owner
-
-            route_is_safe = route_row is None or removable_owner is not None
-            if removable_owner is not None:
-                conn.execute(
+            if removed_keys:
+                conn.executemany(
                     "DELETE FROM gateway_routing "
                     "WHERE scope = ? AND session_key = ?",
-                    (scope, session_key),
+                    [(scope, key) for key in removed_keys],
                 )
 
             # Preserve end_session's first-reason-wins contract. The expected
@@ -5159,15 +6197,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE id = ? AND ended_at IS NULL",
                 (now, end_reason, expected_session_id),
             )
-            if (
-                removable_owner is not None
-                and removable_owner != expected_session_id
-            ):
+            for descendant_session_id in removable_session_ids:
+                if descendant_session_id == expected_session_id:
+                    continue
                 conn.execute(
                     "UPDATE sessions SET ended_at = ?, end_reason = ? "
                     "WHERE id = ? AND ended_at IS NULL",
-                    (now, end_reason, removable_owner),
+                    (now, end_reason, descendant_session_id),
                 )
+
+            _record_terminal_route_fences(removable_session_ids)
+            _retire_terminal_route_bindings(removable_session_ids)
 
             if handoff_error is not None:
                 failed = conn.execute(
@@ -5180,8 +6220,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise RuntimeError(
                         "handoff state changed during routing cleanup"
                     )
+                if claim_row is not None:
+                    owner_deleted = conn.execute(
+                        "DELETE FROM state_meta WHERE key = ? AND value = ?",
+                        (claim_meta_key, claim_row["value"]),
+                    )
+                    if owner_deleted.rowcount != 1:
+                        raise RuntimeError(
+                            "webhook handoff owner changed during routing cleanup"
+                        )
 
-            return route_is_safe
+            return (removed_keys, removable_session_id_list)
 
         return self._execute_write(_do)
 
@@ -6082,32 +7131,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def _reopen_session_on_conn(self, conn, session_id: str) -> None:
+        """Reopen a session while preserving markerless reset-child provenance."""
+        placeholders = ",".join("?" for _ in _RESET_END_REASONS)
+        # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
+        # _legacy_reset_child_sql so the stamping and the listing
+        # predicate cannot drift.
+        conn.execute(
+            "UPDATE sessions AS child SET model_config = json_set("
+            "COALESCE(child.model_config, '{}'), '$._reset_from', "
+            "child.parent_session_id) "
+            "WHERE child.parent_session_id = ? "
+            "AND json_extract(COALESCE(child.model_config, '{}'), "
+            "                 '$._reset_from') IS NULL "
+            f"AND {_legacy_reset_child_sql('child', placeholders)}",
+            (session_id, *_RESET_END_REASONS),
+        )
+        conn.execute(
+            "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+            (session_id,),
+        )
+
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed.
 
         Before clearing a reset boundary, stabilize markerless legacy reset
         children that still depend on the parent's mutable end_reason.
         """
-        def _do(conn):
-            placeholders = ",".join("?" for _ in _RESET_END_REASONS)
-            # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
-            # _legacy_reset_child_sql so the stamping and the listing
-            # predicate cannot drift.
-            conn.execute(
-                "UPDATE sessions AS child SET model_config = json_set("
-                "COALESCE(child.model_config, '{}'), '$._reset_from', "
-                "child.parent_session_id) "
-                "WHERE child.parent_session_id = ? "
-                "AND json_extract(COALESCE(child.model_config, '{}'), "
-                "                 '$._reset_from') IS NULL "
-                f"AND {_legacy_reset_child_sql('child', placeholders)}",
-                (session_id, *_RESET_END_REASONS),
-            )
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (session_id,),
-            )
-        self._execute_write(_do)
+        self._execute_write(
+            lambda conn: self._reopen_session_on_conn(conn, session_id)
+        )
 
     def promote_to_session_reset(
         self, session_id: str, reason: str = "session_reset"
@@ -8304,6 +9357,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return cleaned
 
+    def _canonical_compression_descendant_ids(
+        self, conn, ancestor_id: str
+    ) -> Set[str]:
+        """Return the canonical compression descendants of *ancestor_id*.
+
+        This mirrors :meth:`get_compression_tip`: only children of a
+        compression-ended parent qualify, children carrying any explicit
+        branch/delegate marker and tool children are excluded, and the same
+        ordering selects one continuation when stale siblings exist.
+        """
+        if not ancestor_id:
+            return set()
+        current = ancestor_id
+        seen = {current}
+        descendants: Set[str] = set()
+        for _ in range(100):
+            row = conn.execute(
+                (
+                    f"""
+                SELECT child.id
+                FROM sessions parent
+                JOIN sessions child ON child.parent_session_id = parent.id
+                WHERE parent.id = ?
+                  AND parent.end_reason = 'compression'
+                  AND json_extract(
+                        COALESCE(child.model_config, '{{}}'),
+                        '$._branched_from'
+                      ) IS NULL
+                  AND json_extract(
+                        COALESCE(child.model_config, '{{}}'),
+                        '$._delegate_from'
+                      ) IS NULL
+                  AND COALESCE(child.source, '') != 'tool'
+                ORDER BY
+                  CASE
+                    WHEN child.end_reason = 'compression' THEN 0
+                    WHEN child.ended_at IS NULL THEN 1
+                    ELSE 2
+                  END,
+                  {_sql_session_last_active("child")} DESC,
+                  child.started_at DESC,
+                  child.id DESC
+                LIMIT 1
+                """
+                ),
+                (current,),
+            ).fetchone()
+            if row is None:
+                return descendants
+            child_id = row["id"]
+            if not child_id or child_id in seen:
+                return descendants
+            seen.add(child_id)
+            descendants.add(child_id)
+            current = child_id
+        return descendants
+
     def _is_compression_ancestor(
         self, conn, *, ancestor_id: str, descendant_id: str
     ) -> bool:
@@ -10045,10 +11155,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except (json.JSONDecodeError, TypeError):
                     tool_calls = []
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-            # Accept either `platform_message_id` (new explicit name) or
-            # `message_id` (yuanbao's existing convention on message dicts).
+            # Accept either `platform_message_id` (new explicit name),
+            # `message_id` (the transcript convention), or the internalized
+            # gateway replay key. The underscore form keeps provider payloads
+            # schema-clean while surviving compression rewrites here.
             platform_msg_id = (
-                msg.get("platform_message_id") or msg.get("message_id")
+                msg.get("platform_message_id")
+                or msg.get("message_id")
+                or msg.get("_platform_message_id")
             )
 
             api_content = msg.get("api_content")
@@ -13303,18 +14417,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "                  OR handoff_state IN ('completed', 'failed'))",
                 (platform, session_id),
             )
-            return cur.rowcount > 0
+            if cur.rowcount != 1:
+                return False
+            # Explicit CLI/TUI retries own the established interactive path,
+            # even when the resumed transcript originally came from webhook.
+            conn.execute(
+                "DELETE FROM state_meta WHERE key = ?",
+                (_webhook_handoff_request_meta_key(session_id),),
+            )
+            return True
         return self._execute_write(_do)
 
-    def request_handoff_once(self, session_id: str, platform: str) -> bool:
+    def request_handoff_once(
+        self,
+        session_id: str,
+        platform: str,
+        *,
+        source_session_key: Optional[str] = None,
+    ) -> bool:
         """Request a handoff only if this session never requested one before.
 
         This is the durable idempotency boundary for producers such as webhook
         delivery: the compare-and-set transition accepts only ``NULL`` and
         never resets a terminal row.  Use :meth:`request_handoff` when an
-        explicit user retry after completion or failure is intended.
+        explicit user retry after completion or failure is intended. When a
+        webhook source key is supplied, its exact durable route is bound in the
+        same transaction so a stale whole-index writer cannot erase it before
+        the watcher claims the request.
         """
         def _do(conn):
+            source_binding = None
+            if source_session_key is not None:
+                source_binding = self._prepare_webhook_handoff_source_binding(
+                    conn, session_id, source_session_key
+                )
+                if source_binding is None:
+                    return False
+
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
@@ -13323,7 +14462,565 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE id = ? AND handoff_state IS NULL",
                 (platform, session_id),
             )
-            return cur.rowcount > 0
+            if cur.rowcount != 1:
+                return False
+            conn.execute(
+                "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+                (_webhook_handoff_request_meta_key(session_id), platform),
+            )
+            if source_binding is not None:
+                self._save_webhook_handoff_route_binding(conn, source_binding)
+            return True
+        return self._execute_write(_do)
+
+    def _prepare_webhook_handoff_source_binding(
+        self,
+        conn,
+        session_id: str,
+        source_session_key: str,
+        *,
+        prior_session_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Validate and build the binding for one exact webhook source route."""
+        if prior_session_id and prior_session_id != session_id:
+            if session_id not in self._canonical_compression_descendant_ids(
+                conn, prior_session_id
+            ):
+                return None
+        route_rows = conn.execute(
+            "SELECT scope, entry_json FROM gateway_routing WHERE session_key = ?",
+            (source_session_key,),
+        ).fetchall()
+        exact_routes = [
+            row
+            for row in route_rows
+            if (
+                self._decode_gateway_routing_entry(row["entry_json"]) or {}
+            ).get("session_id")
+            == session_id
+        ]
+        if len(exact_routes) != 1:
+            return None
+        route_scope = exact_routes[0]["scope"]
+        if not isinstance(route_scope, str) or not route_scope:
+            return None
+        terminal = conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (_webhook_handoff_terminal_route_meta_key(session_id),),
+        ).fetchone()
+        if terminal is not None:
+            return None
+        route_bindings = self._load_webhook_handoff_route_bindings(
+            conn,
+            scope=route_scope,
+        )
+        active_source_binding = next(
+            (
+                binding
+                for _binding_key, binding in route_bindings
+                if not binding["retired"]
+                and binding["active_session_key"] == source_session_key
+            ),
+            None,
+        )
+        allowed_source_ids = {session_id}
+        if prior_session_id:
+            allowed_source_ids.add(prior_session_id)
+        if active_source_binding is not None and (
+            active_source_binding["active_session_id"] not in allowed_source_ids
+        ):
+            return None
+        if any(
+            not binding["retired"]
+            and binding["active_session_id"] == session_id
+            and binding["active_session_key"] != source_session_key
+            for _binding_key, binding in route_bindings
+        ):
+            return None
+        binding = next(
+            (
+                existing
+                for _binding_key, existing in route_bindings
+                if existing["active_session_key"] == source_session_key
+            ),
+            None,
+        ) or {
+            "routing_scope": route_scope,
+            "active_session_key": source_session_key,
+            "active_session_id": session_id,
+            "forbidden_routes": [],
+        }
+        binding["active_session_id"] = session_id
+        binding["retired"] = False
+        if prior_session_id and prior_session_id != session_id:
+            forbidden = {
+                (route["session_key"], route["session_id"])
+                for route in binding["forbidden_routes"]
+            }
+            forbidden.add((source_session_key, prior_session_id))
+            binding["forbidden_routes"] = [
+                {"session_key": key, "session_id": forbidden_session_id}
+                for key, forbidden_session_id in sorted(forbidden)
+            ]
+        return binding
+
+    def has_webhook_handoff_input(self, delivery_marker: str) -> bool:
+        """Return whether this delivery's exact user row committed.
+
+        The marker is stored as the row's ``platform_message_id``.  It is
+        globally unique across profile/route/delivery and survives compression
+        copies, so an accepted retry can distinguish a crash after transcript
+        commit from a fresh admission without storing the prompt in state_meta.
+        """
+        if not delivery_marker:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE platform_message_id = ? AND active = 1 LIMIT 1",
+                (delivery_marker,),
+            ).fetchone()
+        return row is not None
+
+    def bind_webhook_handoff_delivery_to_source_route(
+        self,
+        session_id: str,
+        source_session_key: str,
+        delivery_state_key: str,
+        accepted_state: str,
+        running_state: str,
+        active_turn_token: str,
+        admission_owner_nonce: str,
+    ) -> Optional[bool]:
+        """Bind an admitted delivery to its exact live source route.
+
+        The accepted→running transition happens after the marked input commits
+        and before the primary conversation call. It protects the route against
+        stale whole-index writers, but deliberately does not request a handoff:
+        a provider retry must never mistake route existence for successful
+        agent completion.
+        """
+        if (
+            not session_id
+            or not source_session_key
+            or not delivery_state_key
+            or not accepted_state
+            or not running_state
+            or not active_turn_token
+            or not admission_owner_nonce
+            or accepted_state == running_state
+        ):
+            return None
+        try:
+            accepted_payload = json.loads(accepted_state)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(accepted_payload, dict):
+            return None
+        admission_token = accepted_payload.get("admission_token")
+        lock_protocol = accepted_payload.get("lock_protocol")
+        if (
+            not isinstance(admission_token, str)
+            or not admission_token
+            or self.ensure_webhook_delivery_admission_lock(
+                delivery_state_key,
+                admission_token,
+                lock_protocol,
+                admission_owner_nonce,
+            )
+            is not True
+        ):
+            return None
+
+        def _do(conn):
+            binding = self._prepare_webhook_handoff_source_binding(
+                conn, session_id, source_session_key
+            )
+            if binding is None:
+                return None
+            route_row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (binding["routing_scope"], source_session_key),
+            ).fetchone()
+            route = self._decode_gateway_routing_entry(
+                route_row["entry_json"] if route_row is not None else None
+            )
+            if (
+                route is None
+                or route.get("session_id") != session_id
+                or route.get("active_turn_token") != active_turn_token
+            ):
+                return None
+            delivery_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (delivery_state_key,),
+            ).fetchone()
+            delivery_state = (
+                delivery_row["value"] if delivery_row is not None else None
+            )
+            if delivery_state == running_state:
+                self._save_webhook_handoff_route_binding(conn, binding)
+                return True
+            if delivery_state != accepted_state:
+                return False
+            updated = conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = ? AND value = ?",
+                (running_state, delivery_state_key, accepted_state),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook delivery changed during route binding"
+                )
+            claimed_route = dict(route)
+            claimed_route["resume_pending"] = False
+            claimed_route["resume_reason"] = None
+            claimed_route["last_resume_marked_at"] = None
+            claimed_route_json = json.dumps(
+                claimed_route,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            route_updated = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (
+                    claimed_route_json,
+                    time.time(),
+                    binding["routing_scope"],
+                    source_session_key,
+                    route_row["entry_json"],
+                ),
+            )
+            if route_updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook source recovery ownership changed during binding"
+                )
+            self._save_webhook_handoff_route_binding(conn, binding)
+            return True
+
+        return self._execute_write(_do)
+
+    def rollback_webhook_handoff_delivery_input_admission(
+        self,
+        session_id: str,
+        source_session_key: str,
+        delivery_state_key: str,
+        running_state: str,
+        accepted_state: str,
+        active_turn_token: str,
+    ) -> Optional[bool]:
+        """Return a pre-provider running claim to retryable accepted state.
+
+        The worker invokes this only when its durable-input callback will not
+        return successfully. The exact route, turn token, and serialized state
+        fence the rollback; once the provider loop can start, this method is no
+        longer reachable from that turn.
+        """
+        if (
+            not session_id
+            or not source_session_key
+            or not delivery_state_key
+            or not running_state
+            or not accepted_state
+            or not active_turn_token
+            or running_state == accepted_state
+        ):
+            return None
+
+        def _do(conn):
+            route_row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE session_key = ?",
+                (source_session_key,),
+            ).fetchall()
+            exact_routes = []
+            for row in route_row:
+                route = self._decode_gateway_routing_entry(row["entry_json"])
+                if (
+                    route is not None
+                    and route.get("session_id") == session_id
+                    and route.get("active_turn_token") == active_turn_token
+                ):
+                    exact_routes.append(route)
+            if len(exact_routes) != 1:
+                return None
+
+            delivery_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (delivery_state_key,),
+            ).fetchone()
+            delivery_state = (
+                delivery_row["value"] if delivery_row is not None else None
+            )
+            if delivery_state == accepted_state:
+                return True
+            if delivery_state != running_state:
+                return False
+            updated = conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = ? AND value = ?",
+                (accepted_state, delivery_state_key, running_state),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook input admission changed during rollback"
+                )
+            return True
+
+        return self._execute_write(_do)
+
+    def complete_webhook_handoff_delivery_once(
+        self,
+        session_id: str,
+        source_session_key: str,
+        delivery_state_key: str,
+        running_state: str,
+        succeeded_state: str,
+        handoff_platform: str,
+        active_turn_token: str,
+        running_session_id: str,
+    ) -> Optional[bool]:
+        """Atomically publish source success and create watcher work once.
+
+        The exact active-turn marker is cleared in the same transaction.  A
+        process crash after this commit must leave watcher work, never a source
+        turn that startup recovery can execute a second time.
+        """
+        if (
+            not session_id
+            or not source_session_key
+            or not delivery_state_key
+            or not running_state
+            or not succeeded_state
+            or not handoff_platform
+            or not active_turn_token
+            or not running_session_id
+            or running_state == succeeded_state
+        ):
+            return None
+
+        def _do(conn):
+            delivery_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (delivery_state_key,),
+            ).fetchone()
+            delivery_state = (
+                delivery_row["value"] if delivery_row is not None else None
+            )
+            handoff_row = conn.execute(
+                "SELECT ended_at, handoff_state, handoff_platform "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            request_marker = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_webhook_handoff_request_meta_key(session_id),),
+            ).fetchone()
+
+            if delivery_state == succeeded_state:
+                return bool(
+                    handoff_row is not None
+                    and handoff_row["handoff_state"]
+                    in {"pending", "running", "completed", "failed"}
+                    and handoff_row["handoff_platform"] == handoff_platform
+                    and request_marker is not None
+                    and request_marker["value"] == handoff_platform
+                )
+            if delivery_state != running_state:
+                return False
+            if (
+                handoff_row is None
+                or handoff_row["ended_at"] is not None
+                or handoff_row["handoff_state"] is not None
+                or request_marker is not None
+            ):
+                return False
+
+            binding = self._prepare_webhook_handoff_source_binding(
+                conn,
+                session_id,
+                source_session_key,
+                prior_session_id=running_session_id,
+            )
+            if binding is None:
+                return None
+
+            route_row = conn.execute(
+                "SELECT scope, entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (binding["routing_scope"], source_session_key),
+            ).fetchone()
+            route = self._decode_gateway_routing_entry(
+                route_row["entry_json"] if route_row is not None else None
+            )
+            if (
+                route_row is None
+                or route is None
+                or route.get("session_id") != session_id
+                or route.get("active_turn_token") != active_turn_token
+            ):
+                return None
+            cleared_route = dict(route)
+            cleared_route["active_turn_token"] = None
+            cleared_route["active_turn_started_at"] = None
+            cleared_route["resume_pending"] = False
+            cleared_route["resume_reason"] = None
+            cleared_route["last_resume_marked_at"] = None
+            cleared_route_json = json.dumps(
+                cleared_route,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+            delivery_updated = conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = ? AND value = ?",
+                (succeeded_state, delivery_state_key, running_state),
+            )
+            if delivery_updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook delivery changed during success publication"
+                )
+            requested = conn.execute(
+                "UPDATE sessions SET handoff_state = 'pending', "
+                "handoff_platform = ?, handoff_error = NULL "
+                "WHERE id = ? AND handoff_state IS NULL AND ended_at IS NULL",
+                (handoff_platform, session_id),
+            )
+            if requested.rowcount != 1:
+                raise RuntimeError(
+                    "webhook handoff request changed during success publication"
+                )
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (
+                    _webhook_handoff_request_meta_key(session_id),
+                    handoff_platform,
+                ),
+            )
+            route_updated = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (
+                    cleared_route_json,
+                    time.time(),
+                    binding["routing_scope"],
+                    source_session_key,
+                    route_row["entry_json"],
+                ),
+            )
+            if route_updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook source active-turn ownership changed during "
+                    "success publication"
+                )
+            self._save_webhook_handoff_route_binding(conn, binding)
+            return True
+
+        return self._execute_write(_do)
+
+    def resume_webhook_handoff_delivery_on_source_route(
+        self,
+        session_id: str,
+        source_session_key: str,
+        delivery_state_key: str,
+        running_state: str,
+        resumed_state: str,
+        active_turn_token: str,
+        running_session_id: str,
+    ) -> Optional[bool]:
+        """Rotate a crash-recovered running delivery to its new turn owner.
+
+        A different active-turn token is accepted only while the durable route
+        still carries ``resume_pending`` from unclean-startup recovery. The
+        delivery token rotation and consumption of that recovery marker share
+        one transaction, so a second gateway cannot also resume the run.
+        """
+        if (
+            not session_id
+            or not source_session_key
+            or not delivery_state_key
+            or not running_state
+            or not resumed_state
+            or not active_turn_token
+            or not running_session_id
+            or running_state == resumed_state
+        ):
+            return None
+
+        def _do(conn):
+            delivery_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (delivery_state_key,),
+            ).fetchone()
+            if (
+                delivery_row is None
+                or delivery_row["value"] != running_state
+            ):
+                return False
+
+            binding = self._prepare_webhook_handoff_source_binding(
+                conn,
+                session_id,
+                source_session_key,
+                prior_session_id=running_session_id,
+            )
+            if binding is None:
+                return None
+            route_row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (binding["routing_scope"], source_session_key),
+            ).fetchone()
+            route = self._decode_gateway_routing_entry(
+                route_row["entry_json"] if route_row is not None else None
+            )
+            if (
+                route is None
+                or route.get("session_id") != session_id
+                or route.get("active_turn_token") != active_turn_token
+                or route.get("resume_pending") is not True
+            ):
+                return None
+
+            claimed_route = dict(route)
+            claimed_route["resume_pending"] = False
+            claimed_route["resume_reason"] = None
+            claimed_route["last_resume_marked_at"] = None
+            claimed_route_json = json.dumps(
+                claimed_route,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            delivery_updated = conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = ? AND value = ?",
+                (resumed_state, delivery_state_key, running_state),
+            )
+            if delivery_updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook delivery changed during restart recovery"
+                )
+            route_updated = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (
+                    claimed_route_json,
+                    time.time(),
+                    binding["routing_scope"],
+                    source_session_key,
+                    route_row["entry_json"],
+                ),
+            )
+            if route_updated.rowcount != 1:
+                raise RuntimeError(
+                    "webhook recovery route changed during ownership rotation"
+                )
+            self._save_webhook_handoff_route_binding(conn, binding)
+            return True
+
         return self._execute_write(_do)
 
     def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -13349,6 +15046,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             return None
 
+    def is_webhook_handoff_request(
+        self,
+        session_id: str,
+        platform: str,
+    ) -> bool:
+        """Whether the pending/terminal state belongs to webhook exact-once."""
+        if not session_id or not platform:
+            return False
+        try:
+            row = self._conn.execute(
+                "SELECT s.handoff_platform, m.value AS producer_platform "
+                "FROM sessions s "
+                "LEFT JOIN state_meta m ON m.key = ? "
+                "WHERE s.id = ?",
+                (_webhook_handoff_request_meta_key(session_id), session_id),
+            ).fetchone()
+            return bool(
+                row is not None
+                and row["handoff_platform"] == platform
+                and row["producer_platform"] == platform
+            )
+        except Exception:
+            return False
+
     def list_pending_handoffs(self) -> List[Dict[str, Any]]:
         """Return all sessions in handoff_state='pending', oldest first.
 
@@ -13357,15 +15078,222 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             cur = self._conn.execute(
                 "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
+                "whr.value AS _webhook_handoff_request "
                 "FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                "LEFT JOIN state_meta whr ON whr.key = ? || s.id "
                 "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC"
+                "ORDER BY s.started_at ASC",
+                (_WEBHOOK_HANDOFF_REQUEST_META_PREFIX,),
             )
             return [self._session_row_dict(r) for r in cur.fetchall()]
         except Exception:
             return []
+
+    def _webhook_handoff_claim_lock_path(
+        self, session_id: str, claim_token: str
+    ) -> Path:
+        identity = f"{session_id}\0{claim_token}".encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()
+        return self.db_path.with_name(
+            f"{self.db_path.name}.webhook-handoff-{digest}.lock"
+        )
+
+    def _try_acquire_webhook_handoff_claim_lock(
+        self, session_id: str, claim_token: str
+    ) -> Optional[bool]:
+        """Try to hold one crash-released claim fence.
+
+        ``True`` means this SessionDB now owns the lock, ``False`` means a
+        live process owns it, and ``None`` means the filesystem could not
+        provide a trustworthy answer. Any uncertainty fails closed.
+        """
+        if not session_id or not claim_token or self.read_only:
+            return None
+        key = (session_id, claim_token)
+        path = self._webhook_handoff_claim_lock_path(session_id, claim_token)
+        with self._webhook_handoff_claim_locks_guard:
+            if key in self._webhook_handoff_claim_locks:
+                return False
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handle = path.open("a+b")
+            except OSError as exc:
+                logger.warning(
+                    "Could not open webhook handoff claim lock %s: %s",
+                    path,
+                    exc,
+                )
+                return None
+            acquired = False
+            try:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                acquired = True
+            except (BlockingIOError, OSError) as exc:
+                contention_errnos = {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    getattr(errno, "EDEADLK", errno.EAGAIN),
+                }
+                if isinstance(exc, BlockingIOError) or exc.errno in contention_errnos:
+                    return False
+                logger.warning(
+                    "Could not acquire webhook handoff claim lock %s: %s",
+                    path,
+                    exc,
+                )
+                return None
+            finally:
+                if not acquired:
+                    handle.close()
+            self._webhook_handoff_claim_locks[key] = (handle, path)
+            return True
+
+    def try_acquire_webhook_handoff_recovery_lock(
+        self,
+        session_id: str,
+        claim_token: str,
+        lock_protocol: Optional[str],
+    ) -> Optional[bool]:
+        """Prove a persisted claim owner is gone before terminal recovery."""
+        if lock_protocol != _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL:
+            return None
+        return self._try_acquire_webhook_handoff_claim_lock(
+            session_id, claim_token
+        )
+
+    def try_acquire_webhook_delivery_admission_lock(
+        self,
+        delivery_state_key: str,
+        admission_token: str,
+        lock_protocol: Optional[str],
+        owner_nonce: str,
+    ) -> Optional[bool]:
+        """Fence accepted delivery adoption until its run is durably bound.
+
+        The same DB-adjacent lock primitive used by the handoff watcher makes
+        this fence crash-released. A provider retry can therefore adopt an
+        ``accepted`` delivery only after the prior gateway is definitively no
+        longer holding its pre-run admission window.
+        """
+        if (
+            lock_protocol != _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL
+            or not owner_nonce
+        ):
+            return None
+        acquired = self._try_acquire_webhook_handoff_claim_lock(
+            delivery_state_key,
+            admission_token,
+        )
+        if acquired is True:
+            with self._webhook_handoff_claim_locks_guard:
+                self._webhook_delivery_admission_owners[
+                    (delivery_state_key, admission_token)
+                ] = owner_nonce
+        return acquired
+
+    def ensure_webhook_delivery_admission_lock(
+        self,
+        delivery_state_key: str,
+        admission_token: str,
+        lock_protocol: Optional[str],
+        owner_nonce: str,
+    ) -> Optional[bool]:
+        """Return true only when this SessionDB owns the admission fence.
+
+        Authenticated HTTP admission acquires the lock and creates the opaque
+        owner nonce before constructing an event. This call verifies that exact
+        capability (and can re-establish its crash-released OS lock); startup
+        recovery has no nonce and must never adopt an accepted delivery.
+        Contention with any live owner fails closed.
+        """
+        if (
+            lock_protocol != _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL
+            or not owner_nonce
+        ):
+            return None
+        key = (delivery_state_key, admission_token)
+        with self._webhook_handoff_claim_locks_guard:
+            current_owner = self._webhook_delivery_admission_owners.get(key)
+            if key in self._webhook_handoff_claim_locks:
+                return current_owner == owner_nonce
+        acquired = self._try_acquire_webhook_handoff_claim_lock(
+            delivery_state_key,
+            admission_token,
+        )
+        if acquired is True:
+            with self._webhook_handoff_claim_locks_guard:
+                self._webhook_delivery_admission_owners[key] = owner_nonce
+        return acquired
+
+    def release_webhook_delivery_admission_lock(
+        self,
+        delivery_state_key: str,
+        admission_token: str,
+        owner_nonce: str,
+    ) -> bool:
+        """Release this process's exact accepted-delivery fence."""
+        key = (delivery_state_key, admission_token)
+        with self._webhook_handoff_claim_locks_guard:
+            if self._webhook_delivery_admission_owners.get(key) != owner_nonce:
+                return False
+            self._webhook_delivery_admission_owners.pop(key, None)
+        return self.release_webhook_handoff_claim_lock(
+            delivery_state_key,
+            admission_token,
+        )
+
+    def release_webhook_handoff_claim_lock(
+        self, session_id: str, claim_token: str
+    ) -> bool:
+        """Release only this SessionDB's exact process-owned claim fence."""
+        key = (session_id, claim_token)
+        with self._webhook_handoff_claim_locks_guard:
+            held = self._webhook_handoff_claim_locks.pop(key, None)
+            self._webhook_delivery_admission_owners.pop(key, None)
+        if held is None:
+            return False
+        handle, path = held
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            logger.debug(
+                "Could not explicitly unlock webhook handoff claim %s",
+                path,
+                exc_info=True,
+            )
+        finally:
+            handle.close()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug(
+                "Could not remove webhook handoff claim lock %s",
+                path,
+                exc_info=True,
+            )
+        return True
 
     def claim_handoff(self, session_id: str) -> bool:
         """Atomically transition pending → running. Returns True if claimed."""
@@ -13377,6 +15305,214 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cur.rowcount > 0
         return self._execute_write(_do)
+
+    def claim_webhook_handoff(self, session_id: str, owner_json: str) -> bool:
+        """Atomically claim a webhook handoff and persist its process owner.
+
+        The owner record lives in ``state_meta`` so this adds no schema or
+        migration. Its immutable token fences completion/failure, while the
+        PID/start-time identity lets a replacement gateway terminally clean a
+        hard-crashed claim without replaying ambiguous external side effects.
+        """
+        owner = _decode_webhook_handoff_owner(owner_json)
+        if owner is None or not session_id:
+            return False
+        if owner["active_session_key"] != owner["source_session_key"]:
+            return False
+        owner["lock_protocol"] = _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL
+        canonical_owner = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+        meta_key = _webhook_handoff_owner_meta_key(session_id)
+        claim_token = owner["token"]
+        if self._try_acquire_webhook_handoff_claim_lock(
+            session_id, claim_token
+        ) is not True:
+            return False
+
+        def _do(conn):
+            request_marker = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_webhook_handoff_request_meta_key(session_id),),
+            ).fetchone()
+            if request_marker is None:
+                return False
+            route_row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (owner["routing_scope"], owner["active_session_key"]),
+            ).fetchone()
+            route = self._decode_gateway_routing_entry(
+                route_row["entry_json"] if route_row is not None else None
+            )
+            if route is None or route.get("session_id") != session_id:
+                return False
+            terminal = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (_webhook_handoff_terminal_route_meta_key(session_id),),
+            ).fetchone()
+            if terminal is not None:
+                return False
+
+            bindings = self._load_webhook_handoff_route_bindings(
+                conn,
+                scope=owner["routing_scope"],
+            )
+            active_source_binding = next(
+                (
+                    binding
+                    for _binding_key, binding in bindings
+                    if not binding["retired"]
+                    and binding["active_session_key"]
+                    == owner["active_session_key"]
+                ),
+                None,
+            )
+            if active_source_binding is not None and (
+                active_source_binding["active_session_id"] != session_id
+            ):
+                return False
+            if any(
+                not binding["retired"]
+                and binding["active_session_id"] == session_id
+                and binding["active_session_key"]
+                != owner["active_session_key"]
+                for _binding_key, binding in bindings
+            ):
+                return False
+            cur = conn.execute(
+                "UPDATE sessions SET handoff_state = 'running' "
+                "WHERE id = ? AND handoff_state = 'pending' "
+                "AND handoff_platform = ? AND session_key = ?",
+                (
+                    session_id,
+                    request_marker["value"],
+                    owner["active_session_key"],
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            # A conflicting owner means durable state is inconsistent. Raise
+            # so the surrounding transaction rolls the running transition back.
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (meta_key, canonical_owner),
+            )
+            binding = next(
+                (
+                    existing
+                    for _binding_key, existing in bindings
+                    if existing["active_session_key"]
+                    == owner["active_session_key"]
+                ),
+                None,
+            ) or {
+                "routing_scope": owner["routing_scope"],
+                "active_session_key": owner["active_session_key"],
+                "active_session_id": session_id,
+                "forbidden_routes": [],
+            }
+            binding["active_session_id"] = session_id
+            binding["retired"] = False
+            self._save_webhook_handoff_route_binding(conn, binding)
+            return True
+
+        try:
+            claimed = self._execute_write(_do)
+        except BaseException:
+            self.release_webhook_handoff_claim_lock(session_id, claim_token)
+            raise
+        if not claimed:
+            self.release_webhook_handoff_claim_lock(session_id, claim_token)
+        return bool(claimed)
+
+    def list_claimed_webhook_handoffs(self) -> List[Dict[str, Any]]:
+        """Return running webhook handoffs that have a durable owner record."""
+        cur = self._conn.execute(
+            "SELECT s.*, "
+            "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
+            "m.value AS _handoff_claim_owner "
+            "FROM state_meta m "
+            "JOIN sessions s ON m.key = ? || s.id "
+            "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+            "WHERE m.key LIKE ? ESCAPE '\\' "
+            "AND s.handoff_state = 'running' "
+            "ORDER BY s.started_at ASC",
+            (
+                _WEBHOOK_HANDOFF_OWNER_META_PREFIX,
+                _escape_like(_WEBHOOK_HANDOFF_OWNER_META_PREFIX) + "%",
+            ),
+        )
+        return [self._session_row_dict(r) for r in cur.fetchall()]
+
+    def complete_claimed_webhook_handoff(
+        self, session_id: str, claim_token: str
+    ) -> bool:
+        """Complete only the exact process-owned webhook handoff claim."""
+        if not session_id or not claim_token:
+            return False
+        meta_key = _webhook_handoff_owner_meta_key(session_id)
+
+        def _do(conn):
+            claim_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (meta_key,),
+            ).fetchone()
+            owner = _decode_webhook_handoff_owner(
+                claim_row["value"] if claim_row is not None else None
+            )
+            if owner is None or owner.get("token") != claim_token:
+                return False
+            binding_key = _webhook_handoff_route_binding_meta_key(
+                owner["routing_scope"],
+                owner["active_session_key"],
+            )
+            binding_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (binding_key,),
+            ).fetchone()
+            binding = _decode_webhook_handoff_route_binding(
+                binding_row["value"] if binding_row is not None else None
+            )
+            completion_session_ids = {session_id}
+            completion_session_ids.update(
+                self._canonical_compression_descendant_ids(conn, session_id)
+            )
+            route_row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (owner["routing_scope"], owner["active_session_key"]),
+            ).fetchone()
+            route = self._decode_gateway_routing_entry(
+                route_row["entry_json"] if route_row is not None else None
+            )
+            if (
+                binding is None
+                or binding["active_session_id"] not in completion_session_ids
+                or route is None
+                or route.get("session_id") != binding["active_session_id"]
+            ):
+                return False
+            completed = conn.execute(
+                "UPDATE sessions SET handoff_state = 'completed', "
+                "handoff_error = NULL "
+                "WHERE id = ? AND handoff_state = 'running'",
+                (session_id,),
+            )
+            if completed.rowcount != 1:
+                return False
+            deleted = conn.execute(
+                "DELETE FROM state_meta WHERE key = ? AND value = ?",
+                (meta_key, claim_row["value"]),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError(
+                    "webhook handoff owner changed during completion"
+                )
+            return True
+
+        completed = self._execute_write(_do)
+        if completed:
+            self.release_webhook_handoff_claim_lock(session_id, claim_token)
+        return bool(completed)
 
     def complete_running_handoff(self, session_id: str) -> bool:
         """Atomically complete a handoff only while it remains claimed."""

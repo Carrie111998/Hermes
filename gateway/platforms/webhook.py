@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
@@ -140,6 +141,14 @@ _HANDOFF_DELIVERY_STATE_PREFIX = "webhook_handoff_delivery:"
 _EVENT_HANDOFF_TARGET_KEY = "_webhook_handoff_to"
 _EVENT_HANDOFF_MARKER_KEY = "_webhook_handoff_delivery"
 _EVENT_HANDOFF_REQUESTED_KEY = "_webhook_handoff_requested"
+_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY = "_webhook_handoff_ownership_conflict"
+_EVENT_HANDOFF_COMPLETION_ATTEMPTED_KEY = (
+    "_webhook_handoff_completion_attempted"
+)
+_EVENT_HANDOFF_ADMISSION_FUTURE_ATTR = (
+    "_webhook_handoff_admission_future"
+)
+_EVENT_HANDOFF_ADMISSION_OWNER_ATTR = "_webhook_handoff_admission_owner"
 
 
 class _HandoffDeliveryTargetConflict(RuntimeError):
@@ -152,6 +161,10 @@ class _HandoffDeliveryTargetConflict(RuntimeError):
             "durable webhook delivery belongs to target "
             f"{self.stored_target!r}, not {expected_target!r}"
         )
+
+
+class _HandoffRequestOwnershipConflict(RuntimeError):
+    """The session's same-target handoff belongs to an interactive producer."""
 
 
 # Hostnames/IP literals that only serve connections originating on the same
@@ -199,6 +212,11 @@ def check_webhook_requirements() -> bool:
 
 class WebhookAdapter(BasePlatformAdapter):
     """Generic webhook receiver that triggers agent runs from HTTP POSTs."""
+
+    # A handoff delivery is acknowledged only after its exact source route has
+    # a durable active-turn owner.  Running without that owner would let a
+    # losing restart path mutate or finalize another run's delivery state.
+    requires_durable_run_admission: bool = True
 
     # No human is present to answer a "session restored — what next?" prompt:
     # webhook runs are event-triggered.  The startup auto-resume turn must
@@ -932,6 +950,36 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        # The delivery's routing identity is deterministic and side-effect
+        # free. Build it before claiming handoff idempotency so the claim can
+        # name the exact source route, and a bound running turn can reconstruct
+        # that identity after a process restart.
+        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name=f"webhook/{route_name}",
+            chat_type="webhook",
+            user_id=f"webhook:{route_name}",
+            user_name=route_name,
+        )
+        if profile and isinstance(profile, str):
+            source.profile = profile
+        elif handoff_to and getattr(
+            getattr(self.gateway_runner, "config", None),
+            "multiplex_profiles",
+            False,
+        ):
+            # Both the unprefixed webhook URL and /p/default authorize the
+            # same default-profile route. Stamp that effective profile so
+            # session keys and the durable delivery identity cannot diverge
+            # based on which equivalent URL the provider retried.
+            source.profile = "default"
+        if handoff_to:
+            # Persist the provider identity in SessionSource so an active-turn
+            # restart can reconstruct this delivery without process-local
+            # event metadata.
+            source.message_id = str(delivery_id)
+
         # ── Idempotency ─────────────────────────────────────────
         now = time.time()
         handoff_marker = None
@@ -946,19 +994,66 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_name=route_name,
                 delivery_id=delivery_id,
             )
+            source_session_key = self._webhook_source_session_key(source)
             delivery_state_key = self._handoff_delivery_state_key(handoff_marker)
             accepted_state = self._handoff_delivery_state_value(
                 handoff_marker,
                 handoff_to,
                 session_id=None,
+                source_session_key=source_session_key,
             )
-            try:
-                claimed = await self._session_db_call(
-                    "set_meta_if_absent",
+            accepted_delivery_state = self._parse_handoff_delivery_state(
+                accepted_state,
+                marker=handoff_marker,
+                handoff_to=handoff_to,
+            )
+            admission_owner_nonce = uuid.uuid4().hex
+            admission_lock_owned = False
+            admission_lock_attempted = False
+
+            async def _release_admission_lock() -> None:
+                nonlocal admission_lock_attempted, admission_lock_owned
+                if not admission_lock_attempted:
+                    return
+                await self._release_handoff_admission_lock(
                     delivery_state_key,
-                    accepted_state,
+                    accepted_delivery_state,
+                    admission_owner_nonce,
                 )
+                admission_lock_attempted = False
+                admission_lock_owned = False
+
+            try:
+                admission_lock_attempted = True
+                lock_result = await self._try_acquire_handoff_admission_lock(
+                    delivery_state_key,
+                    accepted_delivery_state,
+                    admission_owner_nonce,
+                )
+                if lock_result is None:
+                    raise RuntimeError(
+                        "durable webhook admission lock is unavailable"
+                    )
+                admission_lock_owned = lock_result is True
+                claimed = False
+                if admission_lock_owned:
+                    claimed = await self._session_db_call(
+                        "set_meta_if_absent",
+                        delivery_state_key,
+                        accepted_state,
+                    )
+            except asyncio.CancelledError:
+                await _release_admission_lock()
+                raise
             except Exception as exc:
+                try:
+                    await _release_admission_lock()
+                except Exception:
+                    logger.debug(
+                        "[webhook] Failed to release admission fence for %s",
+                        delivery_id,
+                        exc_info=True,
+                    )
                 logger.error(
                     "[webhook] Durable handoff delivery claim failed for %s: %s",
                     delivery_id,
@@ -978,20 +1073,76 @@ class WebhookAdapter(BasePlatformAdapter):
                         marker=handoff_marker,
                         handoff_to=handoff_to,
                     )
+                    if delivery_state.get("phase") == "accepted":
+                        if not admission_lock_owned:
+                            logger.info(
+                                "[webhook] Delivery %s is still entering its "
+                                "durable agent run",
+                                delivery_id,
+                            )
+                            return web.json_response(
+                                {
+                                    "error": "Webhook handoff admission in progress",
+                                    "delivery_id": delivery_id,
+                                },
+                                status=503,
+                            )
+                        logger.warning(
+                            "[webhook] Recovering crash-left accepted delivery %s",
+                            delivery_id,
+                        )
+                        # This retry owns the crash-released admission fence.
+                        # Rebuild the event from its authenticated provider
+                        # payload and continue to the same accepted→running CAS.
+                        delivery_state = accepted_delivery_state
+                    else:
+                        await _release_admission_lock()
                     bound_session_id = delivery_state.get("session_id")
-                    if bound_session_id:
+                    if (
+                        delivery_state.get("phase") == "succeeded"
+                        and bound_session_id
+                    ):
                         await self._recover_unrequested_handoff(
                             str(bound_session_id), handoff_to
                         )
+                    if delivery_state.get("phase") == "accepted":
+                        # The retry is now the sole admitted owner and must
+                        # continue into event construction below.
+                        pass
+                    else:
+                        logger.info(
+                            "[webhook] Skipping durable duplicate delivery %s",
+                            delivery_id,
+                        )
+                        return web.json_response(
+                            {"status": "duplicate", "delivery_id": delivery_id},
+                            status=200,
+                        )
+                except asyncio.CancelledError:
+                    await _release_admission_lock()
+                    raise
                 except _HandoffDeliveryTargetConflict as exc:
+                    await _release_admission_lock()
                     bound_session_id = exc.state.get("session_id")
                     if (
-                        bound_session_id
+                        exc.state.get("phase") == "succeeded"
+                        and bound_session_id
                         and exc.stored_target in _SUPPORTED_HANDOFF_TARGETS
                     ):
                         try:
                             await self._recover_unrequested_handoff(
                                 str(bound_session_id), exc.stored_target
+                            )
+                        except _HandoffRequestOwnershipConflict as ownership_exc:
+                            # The durable provider tombstone still makes this
+                            # replay terminal. Preserve the interactive owner
+                            # and report the route retarget below instead of
+                            # turning every retry into a permanent 503 loop.
+                            logger.warning(
+                                "[webhook] Skipping original-target recovery "
+                                "for %s: %s",
+                                delivery_id,
+                                ownership_exc,
                             )
                         except Exception as recovery_exc:
                             logger.error(
@@ -1021,7 +1172,32 @@ class WebhookAdapter(BasePlatformAdapter):
                         },
                         status=200,
                     )
+                except _HandoffRequestOwnershipConflict as exc:
+                    await _release_admission_lock()
+                    # The provider delivery is already durably consumed, but
+                    # the bound session's handoff belongs to an explicit
+                    # CLI/TUI request.  Preserve that request and return a
+                    # terminal exact-once response: retrying this provider ID
+                    # must neither run the agent again nor steal ownership.
+                    logger.warning(
+                        "[webhook] Durable duplicate ownership conflict for %s: %s",
+                        delivery_id,
+                        exc,
+                    )
+                    return web.json_response(
+                        {
+                            "message": (
+                                "Delivery ID is bound to a session with an "
+                                "interactive handoff request"
+                            ),
+                            "status": "conflict",
+                            "reason": "handoff_owned_by_interactive_request",
+                            "delivery_id": delivery_id,
+                        },
+                        status=200,
+                    )
                 except Exception as exc:
+                    await _release_admission_lock()
                     logger.error(
                         "[webhook] Durable duplicate recovery failed for %s: %s",
                         delivery_id,
@@ -1030,12 +1206,36 @@ class WebhookAdapter(BasePlatformAdapter):
                     return web.json_response(
                         {"error": "Webhook handoff state unavailable"}, status=503
                     )
-                logger.info(
-                    "[webhook] Skipping durable duplicate delivery %s", delivery_id
+
+            # A proxy gateway has no protocol by which the remote agent can
+            # prove that this exact input is durable before we acknowledge the
+            # provider.  Keep the accepted tombstone retryable and fail before
+            # dispatching any remote agent request.  Legacy webhook routes and
+            # already-terminal duplicates take their existing paths above.
+            runner = self.gateway_runner
+            proxy_url_fn = getattr(runner, "__dict__", {}).get(
+                "_get_proxy_url"
+            )
+            if not callable(proxy_url_fn):
+                proxy_url_fn = getattr(type(runner), "_get_proxy_url", None)
+                if callable(proxy_url_fn):
+                    proxy_url_fn = proxy_url_fn.__get__(runner, type(runner))
+            if callable(proxy_url_fn) and proxy_url_fn():
+                await _release_admission_lock()
+                logger.error(
+                    "[webhook] Durable handoff delivery %s cannot run through "
+                    "gateway proxy mode",
+                    delivery_id,
                 )
                 return web.json_response(
-                    {"status": "duplicate", "delivery_id": delivery_id},
-                    status=200,
+                    {
+                        "error": (
+                            "Webhook handoff requires a local durable agent run; "
+                            "gateway proxy mode is unsupported"
+                        ),
+                        "delivery_id": delivery_id,
+                    },
+                    status=503,
                 )
         else:
             # Legacy routes retain their process-local one-hour cache exactly.
@@ -1106,10 +1306,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
-
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
@@ -1128,26 +1324,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
 
-        # Build source and event
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=f"webhook/{route_name}",
-            chat_type="webhook",
-            user_id=f"webhook:{route_name}",
-            user_name=route_name,
-        )
-        if profile and isinstance(profile, str):
-            source.profile = profile
-        elif handoff_to and getattr(
-            getattr(self.gateway_runner, "config", None),
-            "multiplex_profiles",
-            False,
-        ):
-            # Both the unprefixed webhook URL and /p/default authorize the
-            # same default-profile route. Stamp that effective profile so
-            # session keys and the durable delivery identity cannot diverge
-            # based on which equivalent URL the provider retried.
-            source.profile = "default"
+        # Build event from the routing source established before idempotency.
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -1158,6 +1335,17 @@ class WebhookAdapter(BasePlatformAdapter):
         if handoff_to:
             event.metadata[_EVENT_HANDOFF_TARGET_KEY] = handoff_to
             event.metadata[_EVENT_HANDOFF_MARKER_KEY] = handoff_marker
+            admission_future = asyncio.get_running_loop().create_future()
+            setattr(
+                event,
+                _EVENT_HANDOFF_ADMISSION_FUTURE_ATTR,
+                admission_future,
+            )
+            setattr(
+                event,
+                _EVENT_HANDOFF_ADMISSION_OWNER_ATTR,
+                admission_owner_nonce,
+            )
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
@@ -1168,14 +1356,62 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
-        # Non-blocking — return 202 Accepted immediately.  The per-delivery
-        # session is closed by the ``on_processing_complete`` override below
-        # once the agent run actually finishes (``handle_message`` itself is
-        # fire-and-forget: it spawns ``_process_message_background`` and
-        # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        if handoff_to:
+            # Do not acknowledge a durable handoff while it is only an
+            # unbound ``accepted`` tombstone. ``handle_message`` schedules the
+            # actual run and returns quickly; the runner's persisted-input hook
+            # resolves this future only after the marked user row and the
+            # accepted→running route binding both commit.
+            # A hard crash before that point drops the HTTP connection and its
+            # sidecar lock, allowing the provider retry to adopt the delivery.
+            try:
+                await self.handle_message(event)
+                if not admission_future.done() and source_session_key not in getattr(
+                    self, "_session_tasks", {}
+                ):
+                    raise RuntimeError(
+                        "webhook handoff agent run was not scheduled"
+                    )
+                admitted = await asyncio.shield(admission_future)
+                if admitted is not True:
+                    raise RuntimeError(
+                        "webhook handoff agent run was not durably admitted"
+                    )
+            except asyncio.CancelledError:
+                # The background owner may still commit running after the HTTP
+                # peer disconnects. It releases the lock/future itself.
+                if (
+                    not admission_future.done()
+                    and source_session_key
+                    not in getattr(self, "_session_tasks", {})
+                ):
+                    self._resolve_handoff_admission(event, False)
+                    await _release_admission_lock()
+                raise
+            except Exception as exc:
+                self._resolve_handoff_admission(event, False)
+                try:
+                    await _release_admission_lock()
+                except Exception:
+                    logger.debug(
+                        "[webhook] Failed to release admission fence for %s",
+                        delivery_id,
+                        exc_info=True,
+                    )
+                logger.error(
+                    "[webhook] Handoff agent admission failed for %s: %s",
+                    delivery_id,
+                    exc,
+                )
+                return web.json_response(
+                    {"error": "Webhook handoff admission failed"},
+                    status=503,
+                )
+        else:
+            # Legacy webhook handling remains fire-and-forget.
+            task = asyncio.create_task(self.handle_message(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response(
             {
@@ -1211,13 +1447,33 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery = self._delivery_info.get(event.source.chat_id, {})
             handoff_to = delivery.get("handoff_to")
 
+        # Gateway shutdown deliberately bounds adapter teardown, while this
+        # hook may still be reconciling an offloaded end/request/finalizer.
+        # Let the runner defer storage close until this exact owner task ends,
+        # including the legacy one-shot end_session path below.
+        track_quiescence = getattr(
+            self.gateway_runner,
+            "_track_session_storage_quiescence",
+            None,
+        )
+        if callable(track_quiescence):
+            track_quiescence()
+
         if not handoff_to:
             await self._end_webhook_session(event, event.source.chat_id)
             return
 
-        # Base invokes this hook after every response/error send attempt, so
-        # no more webhook-adapter delivery can occur for this run.
-        self._active_handoff_sessions.discard(event.source.chat_id)
+        ownership_conflict = bool(
+            event.metadata.get(_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY)
+        )
+        # A losing recovery event shares the winner's chat identity.  It may
+        # release only its own accepted admission fence; it must not remove the
+        # winner's process-local delivery suppression before returning.
+        if not ownership_conflict:
+            # Base invokes this hook after every response/error send attempt,
+            # so no more webhook-adapter delivery can occur for this run.
+            self._active_handoff_sessions.discard(event.source.chat_id)
+        await self._release_event_admission_if_accepted(event)
 
         agent_run_succeeded = event.agent_run_failed is False
         # Base derives ProcessingOutcome from text-delivery accounting. A
@@ -1239,20 +1495,45 @@ class WebhookAdapter(BasePlatformAdapter):
             # this hook a second time with CANCELLED. A persisted pending row
             # must remain restart-recoverable, never be reaped by that second
             # callback while its request commit is still in flight.
-            request_task = asyncio.create_task(
+            await self._await_cancel_resistant(
                 self._request_webhook_handoff(event, str(handoff_to))
             )
-            try:
-                await asyncio.shield(request_task)
-            except asyncio.CancelledError:
-                await request_task
-                raise
             return
 
-        if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY):
+        if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY) or ownership_conflict:
             # Cancellation after a successful durable request is a shutdown
-            # boundary, not a failed webhook run. Leave the pending row for the
-            # watcher (or the next gateway process) to claim exactly once.
+            # boundary, not a failed webhook run. A concurrent interactive
+            # request is likewise owned by its user-facing path and must not be
+            # destroyed by webhook cleanup. Leave either row untouched.
+            return
+
+        # A callback-required turn can fail after its user row commits but
+        # before the accepted→running CAS returns (including a hard-cancelled
+        # sync/async bridge).  Preserve that exact route so a provider retry
+        # can reuse the delivery-marked row instead of duplicating or losing
+        # the prompt.  With no committed input, normal failed-run cleanup below
+        # removes the provisional session and the accepted tombstone remains
+        # retryable against a fresh row.
+        try:
+            identity = await self._handoff_delivery_identity_for_event(event)
+            if identity is not None:
+                marker, _state_key, _raw_state, state = identity
+                if state.get("phase") == "accepted" and await self._session_db_call(
+                    "has_webhook_handoff_input",
+                    marker,
+                ):
+                    logger.warning(
+                        "[webhook] Preserving accepted delivery %s with a "
+                        "durably persisted input for provider retry",
+                        marker,
+                    )
+                    return
+        except Exception:
+            logger.error(
+                "[webhook] Could not verify accepted input durability; "
+                "preserving the source route fail-closed",
+                exc_info=True,
+            )
             return
 
         reason = (
@@ -1278,18 +1559,67 @@ class WebhookAdapter(BasePlatformAdapter):
         digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
         return f"{_HANDOFF_DELIVERY_STATE_PREFIX}{digest}"
 
+    def _webhook_source_session_key(self, source: Any) -> str:
+        """Resolve the durable route key before a handoff run is admitted."""
+        runner = self.gateway_runner
+        key_fn = getattr(runner, "_session_key_for_source", None)
+        if callable(key_fn):
+            session_key = key_fn(source)
+        else:
+            from gateway.session import build_session_key
+
+            config = getattr(runner, "config", None)
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=getattr(
+                    config, "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=getattr(
+                    config, "thread_sessions_per_user", False
+                ),
+                profile=getattr(source, "profile", None),
+            )
+        if not isinstance(session_key, str) or not session_key:
+            raise RuntimeError("webhook source route key is unavailable")
+        return session_key
+
     @staticmethod
     def _handoff_delivery_state_value(
         marker: str,
         handoff_to: str,
         *,
         session_id: Optional[str],
+        source_session_key: str,
+        phase: Optional[str] = None,
+        active_turn_token: Optional[str] = None,
     ) -> str:
+        from hermes_state import _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL
+
+        if phase is None:
+            phase = "accepted" if session_id is None else "succeeded"
+        if phase not in {"accepted", "running", "succeeded"}:
+            raise ValueError("invalid webhook handoff delivery phase")
+        if (phase == "accepted") != (session_id is None):
+            raise ValueError("webhook handoff delivery phase/session mismatch")
+        has_active_turn_owner = (
+            isinstance(active_turn_token, str) and bool(active_turn_token)
+        )
+        if (phase == "running") != has_active_turn_owner:
+            raise ValueError(
+                "webhook handoff running phase requires active-turn ownership"
+            )
         return json.dumps(
             {
                 "marker": marker,
+                "phase": phase,
                 "platform": handoff_to,
                 "session_id": session_id,
+                "source_session_key": source_session_key,
+                "active_turn_token": active_turn_token,
+                "admission_token": hashlib.sha256(
+                    f"webhook-admission\0{marker}".encode("utf-8")
+                ).hexdigest(),
+                "lock_protocol": _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -1300,7 +1630,7 @@ class WebhookAdapter(BasePlatformAdapter):
         raw_state: Any,
         *,
         marker: str,
-        handoff_to: str,
+        handoff_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
             state = json.loads(raw_state) if isinstance(raw_state, str) else None
@@ -1312,6 +1642,11 @@ class WebhookAdapter(BasePlatformAdapter):
             raise RuntimeError(
                 "durable webhook delivery belongs to a different route"
             )
+        phase = state.get("phase")
+        if phase not in {"accepted", "running", "succeeded"}:
+            raise RuntimeError(
+                "durable webhook delivery has an invalid lifecycle phase"
+            )
         stored_target = state.get("platform")
         if not isinstance(stored_target, str) or not stored_target:
             raise RuntimeError(
@@ -1320,9 +1655,662 @@ class WebhookAdapter(BasePlatformAdapter):
         session_id = state.get("session_id")
         if session_id is not None and not isinstance(session_id, str):
             raise RuntimeError("durable webhook delivery has an invalid session id")
-        if stored_target != handoff_to:
+        if (phase == "accepted") != (session_id is None):
+            raise RuntimeError(
+                "durable webhook delivery lifecycle is inconsistent"
+            )
+        active_turn_token = state.get("active_turn_token")
+        if (phase == "running") != (
+            isinstance(active_turn_token, str) and bool(active_turn_token)
+        ):
+            raise RuntimeError(
+                "durable webhook delivery has invalid active-turn ownership"
+            )
+        source_session_key = state.get("source_session_key")
+        if (
+            not isinstance(source_session_key, str)
+            or not source_session_key
+        ):
+            raise RuntimeError(
+                "durable webhook delivery has an invalid source route key"
+            )
+        admission_token = state.get("admission_token")
+        lock_protocol = state.get("lock_protocol")
+        if (
+            not isinstance(admission_token, str)
+            or not admission_token
+            or not isinstance(lock_protocol, str)
+            or not lock_protocol
+        ):
+            raise RuntimeError(
+                "durable webhook delivery has an invalid admission fence"
+            )
+        if handoff_to is not None and stored_target != handoff_to:
             raise _HandoffDeliveryTargetConflict(state, handoff_to)
         return state
+
+    async def _try_acquire_handoff_admission_lock(
+        self,
+        state_key: str,
+        state: Dict[str, Any],
+        owner_nonce: str,
+    ) -> Optional[bool]:
+        """Acquire the crash-released fence for one pre-run delivery."""
+        result = await self._session_db_call(
+            "try_acquire_webhook_delivery_admission_lock",
+            state_key,
+            state["admission_token"],
+            state["lock_protocol"],
+            owner_nonce,
+        )
+        return result if result in {True, False, None} else None
+
+    async def _release_handoff_admission_lock(
+        self,
+        state_key: str,
+        state: Dict[str, Any],
+        owner_nonce: str,
+    ) -> None:
+        await self._session_db_call(
+            "release_webhook_delivery_admission_lock",
+            state_key,
+            state["admission_token"],
+            owner_nonce,
+        )
+
+    @staticmethod
+    def _resolve_handoff_admission(
+        event: "MessageEvent",
+        admitted: bool,
+    ) -> None:
+        future = getattr(event, _EVENT_HANDOFF_ADMISSION_FUTURE_ATTR, None)
+        if isinstance(future, asyncio.Future) and not future.done():
+            future.set_result(admitted)
+
+    async def _release_event_admission_if_accepted(
+        self,
+        event: "MessageEvent",
+    ) -> None:
+        """Release a pre-run fence when processing ended before binding."""
+        self._resolve_handoff_admission(event, False)
+        try:
+            identity = await self._handoff_delivery_identity_for_event(event)
+            if identity is None:
+                return
+            _marker, state_key, _raw_state, state = identity
+            if state.get("phase") == "accepted":
+                owner_nonce = getattr(
+                    event,
+                    _EVENT_HANDOFF_ADMISSION_OWNER_ATTR,
+                    "",
+                )
+                if owner_nonce:
+                    await self._release_handoff_admission_lock(
+                        state_key,
+                        state,
+                        owner_nonce,
+                    )
+        except Exception:
+            logger.debug(
+                "[webhook] Failed to release an accepted delivery fence",
+                exc_info=True,
+            )
+
+    async def _handoff_delivery_identity_for_event(
+        self, event: "MessageEvent"
+    ) -> Optional[tuple[str, str, str, Dict[str, Any]]]:
+        """Load the original durable delivery identity for a live/resumed run."""
+        marker = event.metadata.get(_EVENT_HANDOFF_MARKER_KEY)
+        if not marker:
+            route_name = str(getattr(event.source, "user_name", "") or "")
+            delivery_id = str(
+                getattr(event.source, "message_id", "") or ""
+            )
+            if not route_name or not delivery_id:
+                return None
+            marker = self._handoff_delivery_marker(
+                profile=getattr(event.source, "profile", None),
+                route_name=route_name,
+                delivery_id=delivery_id,
+            )
+        marker = str(marker)
+        state_key = self._handoff_delivery_state_key(marker)
+        raw_state = await self._session_db_call("get_meta", state_key)
+        if raw_state is None:
+            return None
+        state = self._parse_handoff_delivery_state(
+            raw_state,
+            marker=marker,
+        )
+        return marker, state_key, str(raw_state), state
+
+    async def on_agent_run_started(
+        self,
+        event: "MessageEvent",
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> Optional[str]:
+        """Validate run ownership and return an input-persistence identity.
+
+        An accepted delivery deliberately remains accepted here.  The runner
+        passes the returned marker into the agent's early transcript write and
+        invokes :meth:`on_agent_input_persisted` only after that write commits.
+        This keeps HTTP 202 behind both durable input and route ownership.
+        """
+        identity = await self._handoff_delivery_identity_for_event(event)
+        if identity is None:
+            if event.metadata.get(_EVENT_HANDOFF_TARGET_KEY):
+                raise RuntimeError("webhook handoff delivery state is missing")
+            return None
+
+        marker, state_key, raw_state, state = identity
+        handoff_to = str(state["platform"])
+        if handoff_to not in _SUPPORTED_HANDOFF_TARGETS:
+            raise RuntimeError(f"unsupported handoff target '{handoff_to}'")
+        if state["source_session_key"] != session_key:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            raise RuntimeError(
+                "durable webhook delivery belongs to a different source route"
+            )
+        active_turn_token = getattr(event, "_gateway_active_turn_token", None)
+        if not isinstance(active_turn_token, str) or not active_turn_token:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            raise RuntimeError("webhook agent active-turn ownership is missing")
+
+        # Restore all process-local suppression/identity state before the
+        # agent can emit status or final delivery. This is required for a
+        # startup-resumed running delivery whose original adapter process died.
+        event.metadata[_EVENT_HANDOFF_TARGET_KEY] = handoff_to
+        event.metadata[_EVENT_HANDOFF_MARKER_KEY] = marker
+        self._active_handoff_sessions.add(event.source.chat_id)
+
+        phase = state["phase"]
+        if phase == "accepted":
+            admission_owner_nonce = getattr(
+                event,
+                _EVENT_HANDOFF_ADMISSION_OWNER_ATTR,
+                None,
+            )
+            if not isinstance(admission_owner_nonce, str) or not admission_owner_nonce:
+                # Only the authenticated HTTP admission path receives this
+                # process-local capability after it acquires the crash-released
+                # sidecar lock.  Startup recovery must never manufacture one
+                # and adopt a delivery whose provider request was not yet
+                # durably admitted.
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+                raise RuntimeError(
+                    "accepted webhook delivery has no admission owner"
+                )
+            try:
+                owns_admission = await self._session_db_call(
+                    "ensure_webhook_delivery_admission_lock",
+                    state_key,
+                    state["admission_token"],
+                    state["lock_protocol"],
+                    admission_owner_nonce,
+                )
+            except asyncio.CancelledError:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+                await self._release_handoff_admission_lock(
+                    state_key,
+                    state,
+                    admission_owner_nonce,
+                )
+                raise
+            except Exception:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+                await self._release_handoff_admission_lock(
+                    state_key,
+                    state,
+                    admission_owner_nonce,
+                )
+                raise
+            if owns_admission is not True:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+                await self._release_handoff_admission_lock(
+                    state_key,
+                    state,
+                    admission_owner_nonce,
+                )
+                raise RuntimeError(
+                    "webhook delivery admission ownership changed"
+                )
+            return marker
+
+        bound_session_id = str(state.get("session_id") or "")
+        if bound_session_id != session_id:
+            compression_tip = await self._session_db_call(
+                "get_compression_tip", bound_session_id
+            )
+            if compression_tip != session_id:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                raise RuntimeError(
+                    "durable webhook delivery is bound to a different session"
+                )
+        if phase == "running":
+            if state["active_turn_token"] == active_turn_token:
+                return None
+            resumed_state = self._handoff_delivery_state_value(
+                marker,
+                handoff_to,
+                session_id=session_id,
+                source_session_key=session_key,
+                phase="running",
+                active_turn_token=active_turn_token,
+            )
+            resumed = await self._session_db_call(
+                "resume_webhook_handoff_delivery_on_source_route",
+                session_id,
+                session_key,
+                state_key,
+                raw_state,
+                resumed_state,
+                active_turn_token,
+                bound_session_id,
+            )
+            if resumed is not True:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                raise RuntimeError(
+                    "webhook running delivery is owned by another agent turn"
+                )
+            return None
+
+        if phase == "succeeded" and await self._owns_webhook_handoff_request(
+            session_id, handoff_to
+        ):
+            event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
+            raise RuntimeError(
+                "webhook delivery already completed before agent restart"
+            )
+        event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+        raise RuntimeError("durable webhook delivery has invalid run ownership")
+
+    async def on_agent_input_persisted(
+        self,
+        event: "MessageEvent",
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> None:
+        """Bind accepted delivery ownership after its user row commits."""
+        identity = await self._handoff_delivery_identity_for_event(event)
+        if identity is None:
+            raise RuntimeError("webhook handoff delivery state is missing")
+        marker, state_key, raw_state, state = identity
+        if state["phase"] != "accepted":
+            raise RuntimeError(
+                "webhook delivery input admission is no longer accepted"
+            )
+        if state["source_session_key"] != session_key:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            raise RuntimeError(
+                "durable webhook delivery belongs to a different source route"
+            )
+        handoff_to = str(state["platform"])
+        if handoff_to not in _SUPPORTED_HANDOFF_TARGETS:
+            raise RuntimeError(f"unsupported handoff target '{handoff_to}'")
+        active_turn_token = getattr(event, "_gateway_active_turn_token", None)
+        admission_owner_nonce = getattr(
+            event,
+            _EVENT_HANDOFF_ADMISSION_OWNER_ATTR,
+            None,
+        )
+        if not isinstance(active_turn_token, str) or not active_turn_token:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            raise RuntimeError("webhook agent active-turn ownership is missing")
+        if not isinstance(admission_owner_nonce, str) or not admission_owner_nonce:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            self._resolve_handoff_admission(event, False)
+            raise RuntimeError("accepted webhook delivery has no admission owner")
+
+        try:
+            input_committed = await self._session_db_call(
+                "has_webhook_handoff_input",
+                marker,
+            )
+        except asyncio.CancelledError:
+            self._resolve_handoff_admission(event, False)
+            await self._release_handoff_admission_lock(
+                state_key,
+                state,
+                admission_owner_nonce,
+            )
+            raise
+        except Exception:
+            # A storage error cannot be distinguished from a committed row.
+            # Fence cleanup away from the possibly-live route and let the
+            # authenticated provider retry reconcile it later.
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            self._resolve_handoff_admission(event, False)
+            await self._release_handoff_admission_lock(
+                state_key,
+                state,
+                admission_owner_nonce,
+            )
+            raise
+        if input_committed is not True:
+            self._resolve_handoff_admission(event, False)
+            await self._release_handoff_admission_lock(
+                state_key,
+                state,
+                admission_owner_nonce,
+            )
+            raise RuntimeError(
+                "durable webhook input row is not committed"
+            )
+
+        running_state = self._handoff_delivery_state_value(
+            marker,
+            handoff_to,
+            session_id=session_id,
+            source_session_key=session_key,
+            phase="running",
+            active_turn_token=active_turn_token,
+        )
+
+        async def _rollback_failed_callback() -> bool:
+            """Keep a callback that cannot return out of ``running``."""
+            try:
+                rolled_back = await self._session_db_call(
+                    "rollback_webhook_handoff_delivery_input_admission",
+                    session_id,
+                    session_key,
+                    state_key,
+                    running_state,
+                    raw_state,
+                    active_turn_token,
+                )
+            except Exception:
+                logger.error(
+                    "[webhook] Could not roll back failed input admission",
+                    exc_info=True,
+                )
+                return False
+            if rolled_back is not True:
+                return False
+            self._resolve_handoff_admission(event, False)
+            try:
+                await self._release_handoff_admission_lock(
+                    state_key,
+                    state,
+                    admission_owner_nonce,
+                )
+            except Exception:
+                # The delivery is accepted again. A live sidecar owner may
+                # temporarily yield 503; process close or a successful retry
+                # releases it without risking a false duplicate.
+                logger.debug(
+                    "[webhook] Failed to release rolled-back admission fence",
+                    exc_info=True,
+                )
+            return True
+
+        try:
+            bound = await self._session_db_call(
+                "bind_webhook_handoff_delivery_to_source_route",
+                session_id,
+                session_key,
+                state_key,
+                raw_state,
+                running_state,
+                active_turn_token,
+                admission_owner_nonce,
+            )
+        except asyncio.CancelledError:
+            if not await _rollback_failed_callback():
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+            raise
+        except Exception:
+            if not await _rollback_failed_callback():
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+            raise
+        if bound is not True:
+            if not await _rollback_failed_callback():
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._resolve_handoff_admission(event, False)
+            raise RuntimeError("webhook delivery could not enter the running phase")
+        # No cancellation point may sit between the running CAS and callback
+        # return. Otherwise an offloaded unlock can complete, surface
+        # cancellation, and leave a brief unlocked-running window before a
+        # rollback; a provider retry in that window sees a terminal duplicate
+        # even though the primary call never started. Queue the unlock and
+        # return synchronously. While it is pending, retries receive a
+        # transient admission-in-progress response; process death releases the
+        # OS lock through SessionDB.close().
+        async def _release_bound_admission() -> None:
+            try:
+                await self._release_handoff_admission_lock(
+                    state_key,
+                    state,
+                    admission_owner_nonce,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "[webhook] Failed to release a bound admission fence",
+                    exc_info=True,
+                )
+
+        release_task = asyncio.create_task(_release_bound_admission())
+        self._background_tasks.add(release_task)
+        release_task.add_done_callback(self._background_tasks.discard)
+        self._resolve_handoff_admission(event, True)
+
+    async def _webhook_completion_is_durable(
+        self,
+        *,
+        marker: str,
+        state_key: str,
+        handoff_to: str,
+        session_key: str,
+        session_id: str,
+    ) -> bool:
+        raw_state = await self._session_db_call("get_meta", state_key)
+        state = self._parse_handoff_delivery_state(
+            raw_state,
+            marker=marker,
+            handoff_to=handoff_to,
+        )
+        exact_success = (
+            state.get("phase") == "succeeded"
+            and state.get("session_id") == session_id
+            and state.get("source_session_key") == session_key
+        )
+        if exact_success and await self._owns_webhook_handoff_request(
+            session_id, handoff_to
+        ):
+            return True
+
+        handoff_state = await self._session_db_call(
+            "get_handoff_state", session_id
+        )
+        if (
+            isinstance(handoff_state, dict)
+            and handoff_state.get("state")
+            in {"pending", "running", "completed", "failed"}
+        ):
+            raise _HandoffRequestOwnershipConflict(
+                "session handoff belongs to an interactive request"
+            )
+        return False
+
+    @staticmethod
+    def _preserve_webhook_active_turn_for_restart(event: "MessageEvent") -> None:
+        """Keep an uncertain running delivery eligible for crash recovery."""
+        try:
+            delattr(event, "_gateway_active_turn_token")
+        except AttributeError:
+            pass
+
+    async def on_agent_run_persisted(
+        self,
+        event: "MessageEvent",
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> None:
+        """Publish successful source completion and watcher work atomically."""
+        if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY):
+            return
+        event.metadata[_EVENT_HANDOFF_COMPLETION_ATTEMPTED_KEY] = True
+
+        identity = await self._handoff_delivery_identity_for_event(event)
+        if identity is None:
+            if event.metadata.get(_EVENT_HANDOFF_TARGET_KEY):
+                raise RuntimeError("webhook handoff delivery state is missing")
+            return
+        marker, state_key, raw_state, state = identity
+        handoff_to = str(state["platform"])
+        if handoff_to not in _SUPPORTED_HANDOFF_TARGETS:
+            raise RuntimeError(f"unsupported handoff target '{handoff_to}'")
+        if state["source_session_key"] != session_key:
+            raise RuntimeError(
+                "durable webhook delivery belongs to a different source route"
+            )
+
+        if state["phase"] == "succeeded":
+            try:
+                if await self._webhook_completion_is_durable(
+                    marker=marker,
+                    state_key=state_key,
+                    handoff_to=handoff_to,
+                    session_key=session_key,
+                    session_id=session_id,
+                ):
+                    event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
+                    return
+            except _HandoffRequestOwnershipConflict:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                raise
+            raise RuntimeError("webhook success publication is incomplete")
+        if state["phase"] != "running":
+            raise RuntimeError(
+                "webhook delivery did not enter the running phase"
+            )
+
+        running_session_id = str(state["session_id"])
+        active_turn_token = getattr(event, "_gateway_active_turn_token", None)
+        if not isinstance(active_turn_token, str) or not active_turn_token:
+            raise RuntimeError("webhook agent active-turn ownership is missing")
+        succeeded_state = self._handoff_delivery_state_value(
+            marker,
+            handoff_to,
+            session_id=session_id,
+            source_session_key=session_key,
+            phase="succeeded",
+        )
+
+        try:
+            completed = await self._session_db_call(
+                "complete_webhook_handoff_delivery_once",
+                session_id,
+                session_key,
+                state_key,
+                raw_state,
+                succeeded_state,
+                handoff_to,
+                active_turn_token,
+                running_session_id,
+            )
+        except asyncio.CancelledError:
+            try:
+                completion_is_durable = (
+                    await self._webhook_completion_is_durable(
+                        marker=marker,
+                        state_key=state_key,
+                        handoff_to=handoff_to,
+                        session_key=session_key,
+                        session_id=session_id,
+                    )
+                )
+                if completion_is_durable:
+                    event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
+                else:
+                    event.metadata[
+                        _EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY
+                    ] = True
+                    self._preserve_webhook_active_turn_for_restart(event)
+            except _HandoffRequestOwnershipConflict:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            except Exception:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                self._preserve_webhook_active_turn_for_restart(event)
+            raise
+        except _HandoffRequestOwnershipConflict:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            raise
+        except Exception:
+            try:
+                if await self._webhook_completion_is_durable(
+                    marker=marker,
+                    state_key=state_key,
+                    handoff_to=handoff_to,
+                    session_key=session_key,
+                    session_id=session_id,
+                ):
+                    event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
+                    return
+            except _HandoffRequestOwnershipConflict:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                raise
+            except Exception:
+                pass
+            # An off-loop SQLite call can commit before its exception/result is
+            # observable by this task. Preserve the route on ambiguity.
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            self._preserve_webhook_active_turn_for_restart(event)
+            raise
+
+        if completed is not True:
+            try:
+                if await self._webhook_completion_is_durable(
+                    marker=marker,
+                    state_key=state_key,
+                    handoff_to=handoff_to,
+                    session_key=session_key,
+                    session_id=session_id,
+                ):
+                    event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
+                    return
+            except _HandoffRequestOwnershipConflict:
+                event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+                raise
+            raise RuntimeError("webhook success publication was rejected")
+
+        event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
+        logger.info(
+            "[webhook] Requested durable handoff for session %s to %s",
+            session_id,
+            handoff_to,
+        )
+
+    @staticmethod
+    async def _await_cancel_resistant(awaitable: Any) -> Any:
+        """Let an admitted off-loop DB operation settle before cancellation."""
+        task = asyncio.ensure_future(awaitable)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while True:
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if task.done():
+                        break
+                    continue
+                except Exception:
+                    break
+                else:
+                    break
+            raise
 
     async def _session_store_call(
         self, method_name: str, *args: Any, **kwargs: Any
@@ -1337,14 +2325,16 @@ class WebhookAdapter(BasePlatformAdapter):
             method = getattr(facade, method_name)
             result = method(*args, **kwargs)
             if inspect.isawaitable(result):
-                return await result
+                return await self._await_cancel_resistant(result)
             return result
 
         store = getattr(runner, "session_store", None)
         if store is None:
             raise RuntimeError("session store is unavailable")
         method = getattr(store, method_name)
-        return await asyncio.to_thread(method, *args, **kwargs)
+        return await self._await_cancel_resistant(
+            asyncio.to_thread(method, *args, **kwargs)
+        )
 
     async def _resolve_webhook_session(
         self, event: "MessageEvent"
@@ -1364,7 +2354,9 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         return session_key, str(session_id)
 
-    async def _session_db_call(self, method_name: str, *args: Any) -> Any:
+    async def _session_db_call(
+        self, method_name: str, *args: Any, **kwargs: Any
+    ) -> Any:
         runner = self.gateway_runner
         if runner is None:
             raise RuntimeError("gateway runner is unavailable")
@@ -1372,10 +2364,23 @@ class WebhookAdapter(BasePlatformAdapter):
         if session_db is None:
             raise RuntimeError("session database is unavailable")
         method = getattr(session_db, method_name)
-        result = method(*args)
+        result = method(*args, **kwargs)
         if inspect.isawaitable(result):
-            return await result
+            return await self._await_cancel_resistant(result)
         return result
+
+    async def _owns_webhook_handoff_request(
+        self,
+        session_id: str,
+        handoff_to: str,
+    ) -> bool:
+        return bool(
+            await self._session_db_call(
+                "is_webhook_handoff_request",
+                session_id,
+                handoff_to,
+            )
+        )
 
     async def _recover_unrequested_handoff(
         self, session_id: str, handoff_to: str
@@ -1390,21 +2395,30 @@ class WebhookAdapter(BasePlatformAdapter):
             # tombstone still suppresses provider retries, but there is no live
             # session that should be handed off again.
             return
+        source_session_key = session_row.get("session_key")
 
         terminal_or_inflight = {"pending", "running", "completed", "failed"}
         state = await self._session_db_call("get_handoff_state", session_id)
         state_value = state.get("state") if isinstance(state, dict) else None
         if state_value in terminal_or_inflight:
-            if state.get("platform") == handoff_to:
+            if await self._owns_webhook_handoff_request(
+                session_id,
+                handoff_to,
+            ):
                 return
-            raise RuntimeError(
-                "marked session has a handoff for a different platform"
+            raise _HandoffRequestOwnershipConflict(
+                "marked session handoff belongs to an interactive request"
             )
         if state_value is not None:
             raise RuntimeError(f"unknown handoff state '{state_value}'")
+        if not isinstance(source_session_key, str) or not source_session_key:
+            raise RuntimeError("marked session has no durable source route key")
 
         if await self._session_db_call(
-            "request_handoff_once", session_id, handoff_to
+            "request_handoff_once",
+            session_id,
+            handoff_to,
+            source_session_key=source_session_key,
         ):
             logger.info(
                 "[webhook] Recovered pending handoff for marked session %s",
@@ -1420,14 +2434,20 @@ class WebhookAdapter(BasePlatformAdapter):
             isinstance(state, dict)
             and state_value in terminal_or_inflight
             and state.get("platform") == handoff_to
+            and await self._owns_webhook_handoff_request(
+                session_id,
+                handoff_to,
+            )
         ):
             raise RuntimeError("marked session has no durable handoff request")
 
     async def _request_webhook_handoff(
         self, event: "MessageEvent", handoff_to: str
     ) -> None:
-        """Durably request one handoff for the exact completed session."""
-        if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY):
+        """Compatibility fallback for runners without the persisted hook."""
+        if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY) or event.metadata.get(
+            _EVENT_HANDOFF_COMPLETION_ATTEMPTED_KEY
+        ):
             return
 
         session_key: Optional[str] = None
@@ -1436,70 +2456,37 @@ class WebhookAdapter(BasePlatformAdapter):
             if handoff_to not in _SUPPORTED_HANDOFF_TARGETS:
                 raise RuntimeError(f"unsupported handoff target '{handoff_to}'")
             session_key, session_id = await self._resolve_webhook_session(event)
-            marker = event.metadata.get(_EVENT_HANDOFF_MARKER_KEY)
-            if not marker:
-                delivery = self._delivery_info.get(event.source.chat_id, {})
-                marker = delivery.get("handoff_marker")
-            if not marker:
-                raise RuntimeError("webhook handoff delivery marker is missing")
-            delivery_state_key = self._handoff_delivery_state_key(str(marker))
-            accepted_state = self._handoff_delivery_state_value(
-                str(marker), handoff_to, session_id=None
+            input_marker = await self.on_agent_run_started(
+                event,
+                session_key=session_key,
+                session_id=session_id,
             )
-            bound_state = self._handoff_delivery_state_value(
-                str(marker), handoff_to, session_id=session_id
-            )
-            bound = await self._session_db_call(
-                "compare_and_set_meta",
-                delivery_state_key,
-                accepted_state,
-                bound_state,
-            )
-            if not bound:
-                stored_state = await self._session_db_call(
-                    "get_meta", delivery_state_key
+            if input_marker:
+                await self.on_agent_input_persisted(
+                    event,
+                    session_key=session_key,
+                    session_id=session_id,
                 )
-                self._parse_handoff_delivery_state(
-                    stored_state,
-                    marker=str(marker),
-                    handoff_to=handoff_to,
-                )
-                if stored_state != bound_state:
-                    raise RuntimeError(
-                        "durable webhook delivery is bound to a different session"
-                    )
-
-            requested = await self._session_db_call(
-                "request_handoff_once", session_id, handoff_to
+            await self.on_agent_run_persisted(
+                event,
+                session_key=session_key,
+                session_id=session_id,
             )
-            if requested:
-                event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
-                logger.info(
-                    "[webhook] Requested durable handoff for session %s to %s",
-                    session_id,
-                    handoff_to,
-                )
-                return
-
-            # A repeated completion callback or an ambiguous DB result is safe
-            # only when the exact same request is already durable.  Never reset
-            # a completed/failed row here; CLI/TUI retain their existing retry
-            # semantics through request_handoff().
-            state = await self._session_db_call("get_handoff_state", session_id)
-            if (
-                isinstance(state, dict)
-                and state.get("platform") == handoff_to
-                and state.get("state") in {"pending", "running", "completed"}
-            ):
-                event.metadata[_EVENT_HANDOFF_REQUESTED_KEY] = True
-                return
-            raise RuntimeError("durable webhook handoff request was rejected")
+        except _HandoffRequestOwnershipConflict as exc:
+            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
+            logger.error(
+                "[webhook] Handoff ownership conflict for %s: %s",
+                event.source.chat_id,
+                exc,
+            )
         except Exception as exc:
             logger.error(
                 "[webhook] Failed to request handoff for %s: %s",
                 event.source.chat_id,
                 exc,
             )
+            if event.metadata.get(_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY):
+                return
             await self._finalize_webhook_handoff(
                 event,
                 "webhook_handoff_request_failed",
@@ -1590,8 +2577,8 @@ class WebhookAdapter(BasePlatformAdapter):
             # plain SessionDB exposes it synchronously.  Handle both.
             _end = session_db.end_session
             result = _end(session_id, "webhook_complete")
-            if asyncio.iscoroutine(result):
-                await result
+            if inspect.isawaitable(result):
+                await self._await_cancel_resistant(result)
             logger.debug(
                 "[webhook] Closed session %s for delivery %s",
                 session_id,

@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -102,6 +103,237 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
     assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_defers_db_close_for_quiescing_adapter_owner(
+    monkeypatch,
+):
+    """Bounded adapter teardown cannot close state.db under a live owner."""
+    runner, adapter = make_restart_runner()
+    db = MagicMock()
+    runner._session_db = SimpleNamespace(_db=db)
+    runner.session_store._db = db
+    runner.session_store.close_all_db_handles = MagicMock()
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
+
+    owner_started = asyncio.Event()
+    owner_cancelled = asyncio.Event()
+    owner_release = asyncio.Event()
+
+    async def _slow_owner():
+        runner._track_session_storage_quiescence()
+        owner_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            owner_cancelled.set()
+            while not owner_release.is_set():
+                try:
+                    await owner_release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    owner_task = asyncio.create_task(_slow_owner())
+    adapter._background_tasks.add(owner_task)
+    owner_task.add_done_callback(adapter._background_tasks.discard)
+    await owner_started.wait()
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await asyncio.wait_for(runner.stop(), timeout=1.0)
+
+    assert owner_cancelled.is_set() is True
+    assert owner_task.done() is False
+    db.close.assert_not_called()
+
+    owner_release.set()
+    await asyncio.wait_for(owner_task, timeout=1.0)
+    await asyncio.sleep(0)
+
+    db.close.assert_called_once_with()
+    runner.session_store.close_all_db_handles.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_bounds_cancellation_resistant_runner_task(
+    monkeypatch,
+):
+    """A runner watcher cannot hang stop or lose its storage lifetime."""
+    runner, _adapter = make_restart_runner()
+    db = MagicMock()
+    runner._session_db = SimpleNamespace(_db=db)
+    runner.session_store._db = db
+    runner.session_store.close_all_db_handles = MagicMock()
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
+
+    owner_started = asyncio.Event()
+    owner_cancelled = asyncio.Event()
+    owner_release = asyncio.Event()
+
+    async def _cancellation_resistant_watcher():
+        owner_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            owner_cancelled.set()
+            while not owner_release.is_set():
+                try:
+                    await owner_release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    owner_task = asyncio.create_task(_cancellation_resistant_watcher())
+    runner._background_tasks.add(owner_task)
+    owner_task.add_done_callback(runner._background_tasks.discard)
+    await owner_started.wait()
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await asyncio.wait_for(runner.stop(), timeout=1.0)
+
+    assert owner_cancelled.is_set() is True
+    assert owner_task.done() is False
+    assert runner._background_tasks == set()
+    db.close.assert_not_called()
+
+    owner_release.set()
+    await asyncio.wait_for(owner_task, timeout=1.0)
+    await asyncio.sleep(0)
+
+    db.close.assert_called_once_with()
+    runner.session_store.close_all_db_handles.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_bounded_teardown_spools_queued_followup_without_late_drain(
+    monkeypatch,
+):
+    """A cancellation-resistant owner must not dispatch queued work after stop."""
+    runner, adapter = make_restart_runner()
+    db = MagicMock()
+    runner._session_db = SimpleNamespace(_db=db)
+    runner.session_store._db = db
+    runner.session_store.close_all_db_handles = MagicMock()
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
+
+    owner_started = asyncio.Event()
+    owner_cancelled = asyncio.Event()
+    owner_release = asyncio.Event()
+    handled_message_ids: list[str] = []
+
+    async def _slow_handler(event):
+        handled_message_ids.append(event.message_id)
+        runner._track_session_storage_quiescence()
+        owner_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            owner_cancelled.set()
+            while not owner_release.is_set():
+                try:
+                    await owner_release.wait()
+                except asyncio.CancelledError:
+                    continue
+        return None
+
+    adapter.set_message_handler(_slow_handler)
+    first = MessageEvent(
+        text="first",
+        source=make_restart_source(),
+        message_id="first",
+    )
+    await adapter.handle_message(first)
+    await owner_started.wait()
+
+    session_key = build_session_key(first.source)
+    owner_task = adapter._session_tasks[session_key]
+    followup = MessageEvent(
+        text="queued during first",
+        source=first.source,
+        message_id="followup",
+    )
+    adapter._pending_messages[session_key] = followup
+    spooled: dict[str, MessageEvent] = {}
+
+    def _capture_spool(pending, *, reason):
+        assert reason == "adapter_shutdown"
+        spooled.update(pending)
+        return len(pending)
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+        patch(
+            "gateway.shutdown_flush.flush_pending_to_file",
+            side_effect=_capture_spool,
+        ),
+    ):
+        await asyncio.wait_for(runner.stop(), timeout=1.0)
+
+    assert owner_cancelled.is_set() is True
+    assert owner_task.done() is False
+    assert handled_message_ids == ["first"]
+    assert spooled == {session_key: followup}
+    assert adapter._pending_messages == {}
+    assert adapter._session_tasks == {}
+    assert adapter._active_sessions == {}
+    db.close.assert_not_called()
+
+    owner_release.set()
+    await asyncio.wait_for(owner_task, timeout=1.0)
+    await asyncio.sleep(0)
+
+    assert handled_message_ids == ["first"]
+    assert adapter._pending_messages == {}
+    assert adapter._background_tasks == set()
+    db.close.assert_called_once_with()
+    runner.session_store.close_all_db_handles.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_completed_adapter_teardown_spools_late_ingress_without_dispatch(
+    monkeypatch,
+):
+    """Ingress after the cancel phase completes cannot restart adapter work."""
+    runner, adapter = make_restart_runner()
+    handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(handler)
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
+    late_event = MessageEvent(
+        text="arrived after teardown",
+        source=make_restart_source(),
+        message_id="late",
+    )
+    session_key = build_session_key(late_event.source)
+    spooled: dict[str, MessageEvent] = {}
+
+    def _capture_spool(pending, *, reason):
+        assert reason == "adapter_shutdown"
+        spooled.update(pending)
+        return len(pending)
+
+    with patch(
+        "gateway.shutdown_flush.flush_pending_to_file",
+        side_effect=_capture_spool,
+    ):
+        await runner._bounded_adapter_teardown(adapter, Platform.TELEGRAM)
+        await adapter.handle_message(late_event)
+
+    assert adapter._background_shutdown_started is True
+    assert spooled == {session_key: late_event}
+    handler.assert_not_awaited()
+    assert adapter._background_tasks == set()
+    assert adapter._session_tasks == {}
+    assert adapter._active_sessions == {}
+    assert adapter._pending_messages == {}
 
 
 @pytest.mark.asyncio
@@ -322,5 +554,3 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
-

@@ -1482,6 +1482,7 @@ class SessionStore:
         # written by an older gateway after a downgrade). Only fills keys the
         # DB didn't provide — DB entries win.
         sessions_file = self.sessions_dir / "sessions.json"
+        imported_legacy_entries = 0
         if sessions_file.exists():
             try:
                 with open(sessions_file, "r", encoding="utf-8") as f:
@@ -1512,6 +1513,7 @@ class SessionStore:
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning("Skipping invalid session entry %r: %s", key, e)
+                imported_legacy_entries = imported
                 if imported and db_had_entries:
                     logger.info(
                         "gateway.session: imported %d legacy sessions.json "
@@ -1522,6 +1524,14 @@ class SessionStore:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
         self._loaded = True
+
+        if imported_legacy_entries:
+            # Reconcile before exposing imported aliases to callers. A hard
+            # crash can leave the legacy mirror at a webhook source key after
+            # state.db atomically moved the route to Discord; protected route
+            # bindings must reject that alias during startup, not on some
+            # later incidental save.
+            self._save()
 
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
@@ -1618,10 +1628,61 @@ class SessionStore:
         if stale_keys or recovered_keys:
             self._save()
 
-    def _save(self) -> None:
+    def _save(self) -> Dict[str, str]:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        snapshot = dict(data)
+        rejected = self._persist_routing_data(data, generation)
+        self._reconcile_persisted_routing_locked(snapshot, data, rejected)
+        return rejected
+
+    def _evict_rejected_routing_locked(
+        self,
+        rejected: Dict[str, str],
+    ) -> None:
+        """Drop only local aliases rejected for their exact terminal owner."""
+        for key, rejected_session_id in rejected.items():
+            current = self._entries.get(key)
+            if (
+                current is not None
+                and current.session_id == rejected_session_id
+            ):
+                self._entries.pop(key, None)
+
+    def _reconcile_persisted_routing_locked(
+        self,
+        snapshot: Dict[str, Any],
+        durable: Dict[str, Any],
+        rejected: Dict[str, str],
+    ) -> None:
+        """Fold primary-store conflict resolution back into live routing.
+
+        ``replace_gateway_routing_entries`` may preserve an authoritative
+        targeted move/resume route that a stale snapshot omitted.  Apply that
+        reconciliation only while the live value still matches the submitted
+        snapshot, so a newer in-process mutation is never overwritten.
+        Caller holds ``_lock``.
+        """
+        keys = set(rejected)
+        keys.update(set(durable) - set(snapshot))
+        for key in keys:
+            current = self._entries.get(key)
+            submitted = snapshot.get(key)
+            current_data = current.to_dict() if current is not None else None
+            if current_data != submitted:
+                continue
+            durable_data = durable.get(key)
+            if not isinstance(durable_data, dict):
+                self._entries.pop(key, None)
+                continue
+            try:
+                self._entries[key] = SessionEntry.from_dict(durable_data)
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "Skipping invalid reconciled routing entry %r: %s",
+                    key,
+                    exc,
+                )
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter. Caller holds ``_lock``.
@@ -1642,7 +1703,11 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+    ) -> Dict[str, str]:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -1650,7 +1715,7 @@ class SessionStore:
             self._save_lock = save_lock
         with save_lock:
             if generation <= getattr(self, "_persisted_routing_generation", 0):
-                return
+                return {}
             # Fold in single-entry upserts with a newer revision than this
             # snapshot (see _save_entry): revisions share the routing
             # generation counter, so a fast record numbered above us was
@@ -1662,15 +1727,49 @@ class SessionStore:
                     if revision > generation:
                         data[key] = json.loads(entry_json)
             db_saved = False
+            rejected: Dict[str, str] = {}
             _db = getattr(self, "_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
                     try:
-                        replacer(
+                        replace_result = replacer(
                             {k: json.dumps(v) for k, v in data.items()},
                             scope=self._routing_scope(),
                         )
+                        if (
+                            isinstance(replace_result, tuple)
+                            and len(replace_result) == 2
+                            and isinstance(replace_result[0], dict)
+                            and isinstance(replace_result[1], dict)
+                        ):
+                            rejected_raw, durable_raw = replace_result
+                            rejected = {
+                                str(key): str(session_id)
+                                for key, session_id in rejected_raw.items()
+                            }
+                            durable_data: Dict[str, Any] = {}
+                            for key, entry_json in durable_raw.items():
+                                try:
+                                    decoded = json.loads(entry_json)
+                                except (TypeError, ValueError):
+                                    continue
+                                if isinstance(decoded, dict):
+                                    durable_data[str(key)] = decoded
+                            data.clear()
+                            data.update(durable_data)
+                        elif isinstance(replace_result, dict):
+                            rejected = {
+                                str(key): str(session_id)
+                                for key, session_id in replace_result.items()
+                            }
+                            for key, session_id in rejected.items():
+                                current = data.get(key)
+                                if (
+                                    isinstance(current, dict)
+                                    and current.get("session_id") == session_id
+                                ):
+                                    data.pop(key, None)
                         db_saved = True
                     except Exception as exc:
                         logger.warning(
@@ -1698,6 +1797,7 @@ class SessionStore:
                     if rev <= generation
                 ]:
                     del fast_persisted[key]
+            return rejected
 
     def _persist_primary_routing_cas_locked(
         self,
@@ -1792,11 +1892,20 @@ class SessionStore:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
     
-    def _save_entries(self) -> None:
+    def _save_entries(self) -> Dict[str, str]:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
         with self._lock:
             data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+            snapshot = dict(data)
+        rejected = self._persist_routing_data(data, generation)
+        if rejected or data.keys() != snapshot.keys():
+            with self._lock:
+                self._reconcile_persisted_routing_locked(
+                    snapshot,
+                    data,
+                    rejected,
+                )
+        return rejected
 
     def _save_entry(
         self,
@@ -1804,7 +1913,7 @@ class SessionStore:
         *,
         entry_data: Optional[Dict[str, Any]] = None,
         lock_held: bool = False,
-    ) -> None:
+    ) -> bool:
         """Persist ONE routing entry via UPSERT — the per-turn fast path.
 
         The steady-state turn only bumps ``updated_at`` /
@@ -1871,8 +1980,58 @@ class SessionStore:
             with self._lock:
                 captured = _capture()
         if captured is None:
-            return
+            return False
         entry_json, revision, candidate_entry = captured
+
+        def _evict_rejected_entry() -> None:
+            try:
+                rejected_session_id = json.loads(entry_json).get("session_id")
+            except (TypeError, ValueError, AttributeError):
+                rejected_session_id = None
+            if not rejected_session_id:
+                return
+            durable_data = None
+            db = getattr(self, "_db", None)
+            loader = getattr(db, "load_gateway_routing_entries", None)
+            if callable(loader):
+                try:
+                    durable_json = loader(
+                        scope=self._routing_scope()
+                    ).get(session_key)
+                    if durable_json is not None:
+                        decoded = json.loads(durable_json)
+                        if isinstance(decoded, dict):
+                            durable_data = decoded
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to reconcile rejected route %r: %s",
+                        session_key,
+                        exc,
+                    )
+
+            def _reconcile() -> None:
+                current = self._entries.get(session_key)
+                if (
+                    current is None
+                    or current.session_id != rejected_session_id
+                ):
+                    return
+                if durable_data is None:
+                    self._entries.pop(session_key, None)
+                else:
+                    try:
+                        self._entries[session_key] = SessionEntry.from_dict(
+                            durable_data
+                        )
+                    except (ValueError, KeyError, TypeError):
+                        self._entries.pop(session_key, None)
+
+            if lock_held:
+                _reconcile()
+            else:
+                with self._lock:
+                    _reconcile()
+
         _db = getattr(self, "_db", None)
         saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
         if callable(saver):
@@ -1881,19 +2040,30 @@ class SessionStore:
                 save_lock = threading.Lock()
                 self._save_lock = save_lock
             try:
+                rejected_save = False
                 with save_lock:
                     if getattr(self, "_persisted_routing_generation", 0) >= revision:
-                        return
+                        return True
                     fast_persisted = getattr(self, "_fast_persisted_entries", None)
                     if fast_persisted is None:
                         fast_persisted = {}
                         self._fast_persisted_entries = fast_persisted
                     persisted = fast_persisted.get(session_key)
                     if persisted is not None and persisted[0] >= revision:
-                        return
-                    saver(session_key, entry_json, scope=self._routing_scope())
-                    fast_persisted[session_key] = (revision, entry_json)
-                return
+                        return True
+                    save_result = saver(
+                        session_key,
+                        entry_json,
+                        scope=self._routing_scope(),
+                    )
+                    if save_result is False:
+                        rejected_save = True
+                    else:
+                        fast_persisted[session_key] = (revision, entry_json)
+                if rejected_save:
+                    _evict_rejected_entry()
+                    return False
+                return True
             except Exception as exc:
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r "
@@ -1917,9 +2087,14 @@ class SessionStore:
                         for key, current in self._entries.items()
                     }
             fallback_data[session_key] = candidate_entry
-            self._persist_routing_data(fallback_data, revision)
+            rejected = self._persist_routing_data(fallback_data, revision)
+            if session_key in rejected:
+                _evict_rejected_entry()
+                return False
+            return True
         else:
-            self._save_entries()
+            rejected = self._save_entries()
+            return session_key not in rejected
 
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
@@ -2776,18 +2951,36 @@ class SessionStore:
         auto_reset_reason = None
         reset_had_activity = False
         prev_session_id: Optional[str] = None
+        route_transition_from_session_id: Optional[str] = None
 
         with self._lock:
             self._ensure_loaded_locked()
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
-                # A heal rewrites entry.session_id, so it must reach the
-                # sessions.json mirror too: force the full-rewrite save
-                # below (the fast path persists state.db only).
-                _healed = self._heal_compression_tip_locked(
-                    entry, existing_session_id, canonical_existing_session_id
-                )
+                _healed = False
+                if (
+                    existing_session_id
+                    and canonical_existing_session_id
+                    and entry.session_id == existing_session_id
+                    and canonical_existing_session_id != existing_session_id
+                ):
+                    healed_entry = replace(
+                        entry,
+                        session_id=canonical_existing_session_id,
+                    )
+                    _healed = self._replace_session_route_locked(
+                        session_key,
+                        existing_session_id,
+                        healed_entry,
+                    )
+                    if _healed:
+                        logger.info(
+                            "SessionStore healed compressed session mapping: %s -> %s",
+                            existing_session_id,
+                            canonical_existing_session_id,
+                        )
+                        entry = healed_entry
 
                 if _is_stale and entry.session_id == _stale_session_id:
                     # Stale routing self-heal (#54878): the in-memory entry
@@ -2805,6 +2998,7 @@ class SessionStore:
                         session_key, entry.session_id,
                     )
                     self._entries.pop(session_key, None)
+                    route_transition_from_session_id = entry.session_id
                     # If an expiry watcher (daily/idle reset) already finalized
                     # this session, honour the reset decision instead of silently
                     # reopening it via recovery.
@@ -2822,8 +3016,8 @@ class SessionStore:
                     # the prior user-activity clock used by reset policy.
                     if touch_activity:
                         entry.updated_at = now
-                    _needs_save = touch_activity or _healed
-                    _metadata_only_save = touch_activity and not _healed
+                    _needs_save = touch_activity
+                    _metadata_only_save = touch_activity
                 else:
                     # Stale check clean.  Apply reset decision.
                     if _reset_reason:
@@ -2832,6 +3026,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        route_transition_from_session_id = entry.session_id
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2861,6 +3056,7 @@ class SessionStore:
                     reset_had_activity = recovered.reset_had_activity
                     db_end_session_id = recovered.session_id
                     prev_session_id = recovered.session_id
+                    route_transition_from_session_id = recovered.session_id
                 else:
                     try:
                         self._db.reopen_session(recovered.session_id)
@@ -2904,6 +3100,13 @@ class SessionStore:
                 if may_publish:
                     self._entries[session_key] = candidate
                     published = candidate
+                    if (
+                        force_new
+                        and force_new_observed_entry is not None
+                    ):
+                        route_transition_from_session_id = (
+                            force_new_observed_entry.session_id
+                        )
                 else:
                     published = current
             assert published is not None
@@ -2938,9 +3141,44 @@ class SessionStore:
 
         if _needs_save:
             if _metadata_only_save:
-                self._save_entry(session_key)
+                route_persisted = self._save_entry(session_key)
+                if route_persisted is False:
+                    with self._lock:
+                        durable_winner = self._entries.get(session_key)
+                    return self._get_or_create_session_impl(
+                        source,
+                        force_new=(
+                            durable_winner is None
+                            or durable_winner.session_id == entry.session_id
+                        ),
+                        touch_activity=touch_activity,
+                    )
             else:
-                self._save_entries()
+                cas_result: Optional[bool] = None
+                if route_transition_from_session_id is not None:
+                    cas_result = (
+                        self._persist_published_session_route_replacement(
+                            session_key,
+                            route_transition_from_session_id,
+                            entry,
+                        )
+                    )
+                rejected = (
+                    self._save_entries() if cas_result is None else {}
+                ) or {}
+                if cas_result is False or (
+                    rejected.get(session_key) == entry.session_id
+                ):
+                    with self._lock:
+                        durable_winner = self._entries.get(session_key)
+                    return self._get_or_create_session_impl(
+                        source,
+                        force_new=(
+                            durable_winner is None
+                            or durable_winner.session_id == entry.session_id
+                        ),
+                        touch_activity=touch_activity,
+                    )
 
         # SQLite operations outside the lock (unchanged).
         if self._db and db_end_session_id:
@@ -3022,7 +3260,8 @@ class SessionStore:
         # Metadata-only change on one entry: single-row UPSERT instead of
         # the full index rewrite (see _save_entry). Both writes run outside
         # ``_lock`` so the SQLite commit never blocks routing lookups.
-        self._save_entry(session_key)
+        if self._save_entry(session_key) is False:
+            return
         self._record_gateway_session_peer(
             peer_session_id,
             session_key,
@@ -3117,6 +3356,43 @@ class SessionStore:
                 return True
         return False
 
+    def _persist_active_turn_transition_locked(
+        self,
+        session_key: str,
+        entry: SessionEntry,
+        candidate: Dict[str, Any],
+        expected_token: Optional[str],
+    ) -> bool:
+        """Persist an owner-CAS active-turn transition before live publication."""
+        db = getattr(self, "_db", None)
+        replacer = getattr(
+            db,
+            "replace_gateway_routing_active_turn_if_owned",
+            None,
+        )
+        if not callable(replacer):
+            return self._save_entry(
+                session_key,
+                entry_data=candidate,
+                lock_held=True,
+            )
+
+        data = {
+            key: current.to_dict()
+            for key, current in self._entries.items()
+        }
+        data[session_key] = dict(candidate)
+        return self._persist_primary_routing_cas_locked(
+            lambda: replacer(
+                session_key,
+                entry.session_id,
+                expected_token,
+                json.dumps(candidate),
+                scope=self._routing_scope(),
+            ),
+            data,
+        )
+
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
@@ -3141,11 +3417,13 @@ class SessionStore:
 
             # Persist before publishing the marker in memory.  If the durable
             # write raises, a later unrelated save cannot leak an unowned token.
-            self._save_entry(
+            if not self._persist_active_turn_transition_locked(
                 session_key,
-                entry_data=candidate,
-                lock_held=True,
-            )
+                entry,
+                candidate,
+                entry.active_turn_token,
+            ):
+                return None
             entry.active_turn_token = token
             entry.active_turn_started_at = now
             entry.updated_at = now
@@ -3167,11 +3445,38 @@ class SessionStore:
 
             # Keep the live token until the clear is durable.  A failed write
             # therefore remains retryable instead of becoming a false mismatch.
-            self._save_entry(
+            if not self._persist_active_turn_transition_locked(
                 session_key,
-                entry_data=candidate,
-                lock_held=True,
-            )
+                entry,
+                candidate,
+                token,
+            ):
+                db = getattr(self, "_db", None)
+                loader = getattr(db, "load_gateway_routing_entries", None)
+                if not callable(loader):
+                    return False
+                try:
+                    durable_json = loader(
+                        scope=self._routing_scope()
+                    ).get(session_key)
+                    if durable_json is None:
+                        self._entries.pop(session_key, None)
+                        return True
+                    durable = SessionEntry.from_dict(
+                        json.loads(durable_json)
+                    )
+                except Exception:
+                    return False
+                if (
+                    durable.session_id != entry.session_id
+                    or durable.active_turn_token is not None
+                ):
+                    return False
+                # The webhook success transaction may have atomically cleared
+                # this exact token before the ordinary runner finally unwinds.
+                # Fold that authoritative row into the live store.
+                self._entries[session_key] = durable
+                return True
             entry.active_turn_token = None
             entry.active_turn_started_at = None
         return True
@@ -3194,12 +3499,12 @@ class SessionStore:
         now = _now()
         max_age = timedelta(seconds=max(0, max_age_seconds))
         promoted = 0
-        changed = False
 
         with self._lock:
             self._ensure_loaded_locked()
-            for entry in self._entries.values():
-                if not entry.active_turn_token:
+            for session_key, entry in list(self._entries.items()):
+                token = entry.active_turn_token
+                if not token:
                     continue
 
                 started_at = entry.active_turn_started_at
@@ -3213,28 +3518,44 @@ class SessionStore:
                     # marker.  Clear rather than risking an unsafe old resume.
                     marker_is_stale = True
 
+                candidate = entry.to_dict()
+                candidate["active_turn_token"] = None
+                candidate["active_turn_started_at"] = None
+                promote_entry = False
                 if not marker_is_stale and not entry.suspended:
                     if entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
                         if entry.last_resume_marked_at is None:
-                            entry.last_resume_marked_at = now
+                            candidate["last_resume_marked_at"] = now.isoformat()
                     else:
-                        entry.resume_pending = True
-                        entry.resume_reason = "restart_interrupted"
+                        candidate["resume_pending"] = True
+                        candidate["resume_reason"] = "restart_interrupted"
                         # Freshness starts when recovery is discovered, not
                         # when a potentially hours-long turn began.
-                        entry.last_resume_marked_at = now
-                        promoted += 1
+                        candidate["last_resume_marked_at"] = now.isoformat()
+                        promote_entry = True
 
+                if not self._persist_active_turn_transition_locked(
+                    session_key,
+                    entry,
+                    candidate,
+                    token,
+                ):
+                    continue
+                if promote_entry:
+                    entry.resume_pending = True
+                    entry.resume_reason = "restart_interrupted"
+                    entry.last_resume_marked_at = now
+                    promoted += 1
+                elif (
+                    entry.resume_pending
+                    and entry.last_resume_marked_at is None
+                    and candidate.get("last_resume_marked_at")
+                ):
+                    entry.last_resume_marked_at = now
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
-                changed = True
-
-            if changed:
-                # Cold-start batch: one durable rewrite is clearer and cheaper
-                # than an upsert per interrupted routing entry.
-                self._save()
 
         return promoted
 
@@ -3243,14 +3564,25 @@ class SessionStore:
         cleared = 0
         with self._lock:
             self._ensure_loaded_locked()
-            for entry in self._entries.values():
+            for session_key, entry in list(self._entries.items()):
                 if not entry.active_turn_token and entry.active_turn_started_at is None:
                     continue
+                token = entry.active_turn_token
+                candidate = entry.to_dict()
+                candidate["active_turn_token"] = None
+                candidate["active_turn_started_at"] = None
+                if not self._persist_active_turn_transition_locked(
+                    session_key,
+                    entry,
+                    candidate,
+                    token,
+                ):
+                    raise RuntimeError(
+                        "active-turn marker changed during clean discard"
+                    )
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
                 cleared += 1
-            if cleared:
-                self._save()
         return cleared
 
     def mark_resume_pending(
@@ -3275,10 +3607,21 @@ class SessionStore:
                 # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
                     return False
+                marked_at = _now()
+                candidate = entry.to_dict()
+                candidate["resume_pending"] = True
+                candidate["resume_reason"] = reason
+                candidate["last_resume_marked_at"] = marked_at.isoformat()
+                if not self._persist_active_turn_transition_locked(
+                    session_key,
+                    entry,
+                    candidate,
+                    entry.active_turn_token,
+                ):
+                    return False
                 entry.resume_pending = True
                 entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
-                self._save()
+                entry.last_resume_marked_at = marked_at
                 return True
         return False
 
@@ -3296,10 +3639,20 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
+            candidate = entry.to_dict()
+            candidate["resume_pending"] = False
+            candidate["resume_reason"] = None
+            candidate["last_resume_marked_at"] = None
+            if not self._persist_active_turn_transition_locked(
+                session_key,
+                entry,
+                candidate,
+                entry.active_turn_token,
+            ):
+                return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
-            self._save()
             return True
 
     def prune_old_entries(self, max_age_days: int) -> int:
@@ -3324,7 +3677,7 @@ class SessionStore:
         from datetime import timedelta
 
         cutoff = _now() - timedelta(days=max_age_days)
-        removed_keys: list[str] = []
+        prune_candidates: list[tuple[str, str]] = []
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -3339,11 +3692,13 @@ class SessionStore:
                 if self._has_active_processes_safe(entry.session_key, context="prune"):
                     continue
                 if entry.updated_at < cutoff:
-                    removed_keys.append(key)
-            for key in removed_keys:
-                self._entries.pop(key, None)
-            if removed_keys:
-                self._save()
+                    prune_candidates.append((key, entry.session_id))
+
+        removed_keys = [
+            key
+            for key, session_id in prune_candidates
+            if self.remove_session_route(key, session_id)
+        ]
 
         if removed_keys:
             logger.info(
@@ -3418,8 +3773,12 @@ class SessionStore:
                 is_fresh_reset=True,
             )
 
-            self._entries[session_key] = new_entry
-            self._save()
+            if not self._replace_session_route_locked(
+                session_key,
+                old_entry.session_id,
+                new_entry,
+            ):
+                return None
             _reset_origin_json = None
             if old_entry.origin is not None:
                 try:
@@ -3482,6 +3841,164 @@ class SessionStore:
 
         return new_entry
 
+    def _replace_session_route_locked(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        replacement: SessionEntry,
+        *,
+        authorize_terminal_target: bool = False,
+    ) -> bool:
+        """CAS one key to *replacement* before publishing it in memory.
+
+        Caller holds ``_lock``.  Real state.db stores use the targeted
+        transaction so protected handoff routes carry their binding across
+        reset/compression and explicit resume.  The fallback retains the
+        historical full-save behavior for DB-less installs and narrow fakes.
+        """
+        current = self._entries.get(session_key)
+        if current is None or current.session_id != expected_session_id:
+            return False
+        if replacement.session_key != session_key:
+            return False
+
+        candidate = {
+            key: entry.to_dict()
+            for key, entry in self._entries.items()
+            if key != session_key
+        }
+        candidate[session_key] = replacement.to_dict()
+        db = getattr(self, "_db", None)
+        replacer = (
+            getattr(db, "replace_gateway_routing_entry_if_owned", None)
+            if db is not None
+            else None
+        )
+        if callable(replacer):
+            removed_session_keys: list[str] = []
+            authoritative_entries: Dict[str, Dict[str, Any]] = {}
+
+            def _replace_primary_route() -> bool:
+                result = replacer(
+                    session_key,
+                    expected_session_id,
+                    json.dumps(replacement.to_dict()),
+                    scope=self._routing_scope(),
+                    authorize_terminal_target=authorize_terminal_target,
+                )
+                if isinstance(result, dict):
+                    removed_session_keys.extend(
+                        str(key)
+                        for key in result.get("removed_session_keys", [])
+                    )
+                    for key in removed_session_keys:
+                        candidate.pop(key, None)
+                    for key, entry_json in result.get(
+                        "authoritative_entries", {}
+                    ).items():
+                        try:
+                            entry_data = json.loads(entry_json)
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(entry_data, dict):
+                            candidate[str(key)] = entry_data
+                            authoritative_entries[str(key)] = entry_data
+                    return True
+                return bool(result)
+
+            committed = self._persist_primary_routing_cas_locked(
+                _replace_primary_route,
+                candidate,
+            )
+            if not committed:
+                return False
+            for key in removed_session_keys:
+                old_route = self._entries.get(key)
+                if (
+                    old_route is not None
+                    and old_route.session_id == replacement.session_id
+                ):
+                    self._entries.pop(key, None)
+            for key, entry_data in authoritative_entries.items():
+                self._entries[key] = SessionEntry.from_dict(entry_data)
+            self._entries[session_key] = replacement
+            return True
+
+        if authorize_terminal_target and db is not None:
+            try:
+                db.reopen_session(replacement.session_id)
+            except Exception as exc:
+                logger.debug("Session DB pre-resume reopen failed: %s", exc)
+        self._entries[session_key] = replacement
+        rejected = self._save() or {}
+        return rejected.get(session_key) != replacement.session_id
+
+    def _persist_published_session_route_replacement(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        replacement: SessionEntry,
+    ) -> Optional[bool]:
+        """Persist a phase-split get/create replacement with an owner CAS.
+
+        Returns ``None`` when the primary store lacks the targeted API, so the
+        caller can use its legacy full-save path.  ``False`` means another
+        durable owner won and the caller must retry from authoritative state.
+        """
+        with self._lock:
+            current = self._entries.get(session_key)
+            if (
+                current is None
+                or current.session_id != replacement.session_id
+            ):
+                return False
+            db = getattr(self, "_db", None)
+            replacer = (
+                getattr(db, "replace_gateway_routing_entry_if_owned", None)
+                if db is not None
+                else None
+            )
+            if not callable(replacer):
+                return None
+            candidate = {
+                key: entry.to_dict()
+                for key, entry in self._entries.items()
+            }
+            committed = self._persist_primary_routing_cas_locked(
+                lambda: replacer(
+                    session_key,
+                    expected_session_id,
+                    json.dumps(replacement.to_dict()),
+                    scope=self._routing_scope(),
+                ),
+                candidate,
+            )
+            if not committed:
+                loader = getattr(db, "load_gateway_routing_entries", None)
+                if callable(loader):
+                    try:
+                        durable_json = loader(
+                            scope=self._routing_scope()
+                        ).get(session_key)
+                        durable_data = (
+                            json.loads(durable_json)
+                            if durable_json is not None
+                            else None
+                        )
+                        if isinstance(durable_data, dict):
+                            self._entries[session_key] = (
+                                SessionEntry.from_dict(durable_data)
+                            )
+                        else:
+                            self._entries.pop(session_key, None)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to reload route %r after rejected CAS: %s",
+                            session_key,
+                            exc,
+                        )
+            return committed
+
     def advance_compression_session(
         self,
         session_key: str,
@@ -3508,17 +4025,19 @@ class SessionStore:
                 return entry
             if entry.session_id != expected_session_id:
                 return None
-            if not self._heal_compression_tip_locked(
-                entry,
+            replacement = replace(entry, session_id=target_session_id)
+            if not self._replace_session_route_locked(
+                session_key,
                 expected_session_id,
-                target_session_id,
+                replacement,
             ):
                 return None
             # Compression repoint is store bookkeeping, not user activity —
             # leave ``updated_at`` alone so a background compression on an
             # idle session cannot make it look fresh to reset policy or the
             # restart-resume freshness gate (#85709).
-            self._save()
+            entry.session_id = target_session_id
+            self._entries[session_key] = entry
             return entry
 
     def move_session_route(
@@ -3527,6 +4046,8 @@ class SessionStore:
         destination_session_key: str,
         expected_session_id: str,
         destination_source: SessionSource,
+        *,
+        handoff_claim_token: Optional[str] = None,
     ) -> Optional[SessionEntry]:
         """CAS-move one live route to a destination without changing its session.
 
@@ -3607,19 +4128,69 @@ class SessionStore:
             )
             if not callable(mover):
                 raise RuntimeError("state.db routing store is unavailable")
-            committed = self._persist_primary_routing_cas_locked(
-                lambda: mover(
+            removed_session_keys: list[str] = []
+
+            def _move_primary_route() -> bool:
+                nonlocal moved_entry
+                move_kwargs: Dict[str, Any] = {
+                    "scope": self._routing_scope(),
+                }
+                if handoff_claim_token is not None:
+                    move_kwargs["handoff_claim_token"] = handoff_claim_token
+                result = mover(
                     source_session_key,
                     destination_session_key,
                     expected_session_id,
                     json.dumps(moved_entry.to_dict()),
-                    scope=self._routing_scope(),
-                ),
+                    **move_kwargs,
+                )
+                if isinstance(result, dict):
+                    removed_session_keys.extend(
+                        str(key)
+                        for key in result.get("removed_session_keys", [])
+                    )
+                    for key in removed_session_keys:
+                        candidate.pop(key, None)
+                    authoritative_json = result.get(
+                        "destination_entry_json"
+                    )
+                    if isinstance(authoritative_json, str):
+                        try:
+                            authoritative_data = json.loads(authoritative_json)
+                            authoritative_entry = SessionEntry.from_dict(
+                                authoritative_data
+                            )
+                        except (TypeError, ValueError, KeyError):
+                            return False
+                        if source_entry is None and destination_entry is moved_entry:
+                            # Preserve the existing live object for the
+                            # no-write already-moved case while reconciling
+                            # fields that the durable store protected from a
+                            # stale writer (notably active-turn ownership).
+                            moved_entry.__dict__.update(
+                                authoritative_entry.__dict__
+                            )
+                        else:
+                            moved_entry = authoritative_entry
+                        candidate[destination_session_key] = (
+                            authoritative_entry.to_dict()
+                        )
+                    return True
+                return bool(result)
+
+            committed = self._persist_primary_routing_cas_locked(
+                _move_primary_route,
                 candidate,
             )
             if not committed:
                 return None
-            self._entries.pop(source_session_key, None)
+            for key in set(removed_session_keys) | {source_session_key}:
+                current = self._entries.get(key)
+                if (
+                    current is not None
+                    and current.session_id == expected_session_id
+                ):
+                    self._entries.pop(key, None)
             self._entries[destination_session_key] = moved_entry
 
         # These operations are idempotent and intentionally run for the
@@ -3682,7 +4253,11 @@ class SessionStore:
                 else None
             )
             if not callable(deleter):
-                raise RuntimeError("state.db routing store is unavailable")
+                # DB-less/JSON-only stores have no competing durable owner to
+                # fence, so preserve their historical local removal path.
+                self._entries.pop(session_key, None)
+                self._save()
+                return True
             committed = self._persist_primary_routing_cas_locked(
                 lambda: deleter(
                     session_key,
@@ -3703,27 +4278,25 @@ class SessionStore:
         end_reason: str,
         *,
         handoff_error: Optional[str] = None,
+        handoff_claim_token: Optional[str] = None,
+        handoff_source_session_key: Optional[str] = None,
     ) -> bool:
         """Atomically remove an owned route and finalize its session lineage.
 
         The state.db transaction also ends ``expected_session_id`` and, when
         the current route owner is its verified compression descendant, ends
         that live descendant. An unrelated newer owner is retained while the
-        old expected session is successfully finalized. Returns ``True`` for
-        either committed outcome and ``False`` only when the expected-state
-        gate rejected cleanup without making changes. The store pops its live
-        route only when state.db reports that the route was actually removed.
+        old expected session is successfully finalized. A process-owned
+        webhook claim may also name its immutable source key so a stale legacy
+        mirror alias is removed in the same fenced transaction. Returns
+        ``True`` for any committed outcome and ``False`` only when the
+        expected-state gate rejected cleanup without making changes.
         """
         if not session_key or not expected_session_id or not end_reason:
             return False
 
         with self._lock:
             self._ensure_loaded_locked()
-            candidate = {
-                key: current.to_dict()
-                for key, current in self._entries.items()
-                if key != session_key
-            }
             db = getattr(self, "_db", None)
             finalizer = (
                 getattr(
@@ -3742,25 +4315,59 @@ class SessionStore:
                 self._save_lock = save_lock
             with save_lock:
                 try:
-                    route_removed = finalizer(
+                    finalizer_kwargs: Dict[str, Any] = {
+                        "scope": self._routing_scope(),
+                        "handoff_error": handoff_error,
+                    }
+                    if handoff_claim_token is not None:
+                        finalizer_kwargs["handoff_claim_token"] = (
+                            handoff_claim_token
+                        )
+                    if handoff_source_session_key is not None:
+                        finalizer_kwargs["handoff_source_session_key"] = (
+                            handoff_source_session_key
+                        )
+                    cleanup_result = finalizer(
                         session_key,
                         expected_session_id,
                         end_reason,
-                        scope=self._routing_scope(),
-                        handoff_error=handoff_error,
+                        **finalizer_kwargs,
                     )
                 except Exception as exc:
                     raise RuntimeError(
                         "state.db routing transition failed"
                     ) from exc
 
-                if route_removed is None:
+                if cleanup_result is None:
                     return False
-                if route_removed is False:
-                    # Exact-session cleanup committed, but an unrelated newer
-                    # route was deliberately retained. No routing mirror or
-                    # in-memory entry changes are needed.
-                    return True
+
+                if isinstance(cleanup_result, bool):
+                    if cleanup_result is False:
+                        # Legacy SessionDB implementations return False when
+                        # exact-session cleanup committed but an unrelated
+                        # newer route was deliberately retained.
+                        return True
+                    # The legacy True result proves only that this requested
+                    # route was removed. It carries no information about
+                    # sibling aliases, so preserve them in memory just as the
+                    # legacy SessionStore did.
+                    remove_keys = {session_key}
+                else:
+                    _removed_durable_keys, removable_session_ids = (
+                        cleanup_result
+                    )
+                    removable_session_id_set = set(removable_session_ids)
+                    remove_keys = {
+                        key
+                        for key, current in self._entries.items()
+                        if current.session_id in removable_session_id_set
+                    }
+
+                candidate = {
+                    key: current.to_dict()
+                    for key, current in self._entries.items()
+                    if key not in remove_keys
+                }
 
                 generation = self._next_routing_generation_locked()
                 if getattr(self, "_write_sessions_json", True):
@@ -3784,7 +4391,8 @@ class SessionStore:
                     ]:
                         del fast_persisted[key]
 
-            self._entries.pop(session_key, None)
+            for key in remove_keys:
+                self._entries.pop(key, None)
             return True
 
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
@@ -3825,8 +4433,13 @@ class SessionStore:
                 chat_type=old_entry.chat_type,
             )
 
-            self._entries[session_key] = new_entry
-            self._save()
+            if not self._replace_session_route_locked(
+                session_key,
+                old_entry.session_id,
+                new_entry,
+                authorize_terminal_target=True,
+            ):
+                return None
 
         if self._db and db_end_session_id:
             try:

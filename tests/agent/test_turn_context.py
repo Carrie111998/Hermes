@@ -299,6 +299,111 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_durable_input_callback_runs_only_after_current_user_row_commits():
+    agent = _FakeAgent()
+    order = []
+
+    def _persist(messages, _history=None):
+        order.append("persist")
+        assert messages[-1]["_platform_message_id"] == "delivery-marker"
+        messages[-1]["_db_persisted"] = True
+
+    def _admit():
+        assert order == ["persist"]
+        order.append("admit")
+
+    agent._persist_session = _persist
+    ctx = _build(
+        agent,
+        persist_user_message_id="delivery-marker",
+        input_persisted_callback=_admit,
+    )
+
+    assert order == ["persist", "admit"]
+    assert ctx.messages[-1]["_platform_message_id"] == "delivery-marker"
+    assert ctx.messages[-1]["_db_persisted"] is True
+
+
+def test_durable_input_callback_fails_closed_when_persistence_fails():
+    agent = _FakeAgent()
+    callback = MagicMock()
+    agent._persist_session = MagicMock(side_effect=OSError("disk full"))
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable input admission requires a committed user row",
+    ):
+        _build(
+            agent,
+            persist_user_message_id="delivery-marker",
+            input_persisted_callback=callback,
+        )
+
+    callback.assert_not_called()
+
+
+def test_durable_input_retry_reuses_marked_tail_and_exact_api_content():
+    agent = _FakeAgent()
+    memory = MagicMock()
+    memory.prefetch_all.return_value = "new retry-time memory"
+    agent._memory_manager = memory
+    callback = MagicMock()
+    stored = {
+        "role": "user",
+        "content": "original provider payload",
+        "api_content": "original provider payload\n\n[old exact sidecar]",
+        "_platform_message_id": "delivery-marker",
+        "timestamp": 123.0,
+    }
+    history = [stored]
+
+    ctx = _build(
+        agent,
+        user_message="provider retry payload must not replace stored input",
+        conversation_history=history,
+        persist_user_message_id="delivery-marker",
+        input_persisted_callback=callback,
+    )
+
+    assert history == []
+    assert ctx.messages == [stored]
+    assert ctx.user_message == "original provider payload"
+    assert stored["api_content"] == (
+        "original provider payload\n\n[old exact sidecar]"
+    )
+    assert stored["_db_persisted"] is True
+    assert ctx.ext_prefetch_cache == ""
+    callback.assert_called_once_with()
+    assert agent._persist_calls == 1
+
+
+def test_durable_input_retry_rejects_marker_before_conversational_tail():
+    agent = _FakeAgent()
+    callback = MagicMock()
+    history = [
+        {
+            "role": "user",
+            "content": "already sent",
+            "_platform_message_id": "delivery-marker",
+        },
+        {"role": "assistant", "content": "already answered"},
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable input marker is not the pending transcript tail",
+    ):
+        _build(
+            agent,
+            conversation_history=history,
+            persist_user_message_id="delivery-marker",
+            input_persisted_callback=callback,
+        )
+
+    callback.assert_not_called()
+    assert agent._persist_calls == 0
+
+
 
 
 

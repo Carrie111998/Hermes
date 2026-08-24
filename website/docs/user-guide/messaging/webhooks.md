@@ -354,6 +354,8 @@ Reliable retry deduplication requires the sender to reuse a stable `X-GitHub-Del
 
 Agent-backed webhook POSTs return `202 Accepted` after the work is accepted, before the run or handoff finishes. Later handoff failures are recorded in gateway logs and durable session/handoff state; they cannot be returned in the original POST response.
 
+A handoff that is still pending resumes after a gateway restart. Once a gateway has durably claimed the handoff, however, a hard process loss is ambiguous: Discord may already have created the thread or accepted the reply. A replacement gateway therefore never replays that claimed work. When it can prove the owning local process exited, it marks the handoff failed and removes the live Hermes route without starting another agent run, thread, or send. A crash at the exact boundary between Discord accepting thread creation and Hermes recording the result can leave an empty or partial Discord thread; the durable delivery tombstone still prevents a retry from creating a second one.
+
 Routes without `handoff_to` retain the normal delivery behavior described above.
 
 ---

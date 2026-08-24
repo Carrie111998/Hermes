@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -440,6 +440,8 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    persist_user_message_id: Optional[str] = None,
+    input_persisted_callback: Optional[Callable[[], None]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -464,6 +466,53 @@ def build_turn_context(
     recovered_history = recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
+
+    # A durable webhook admission can crash after committing its user row but
+    # before publishing accepted→running.  Its provider retry carries the same
+    # globally unique marker. Reuse that committed row as THIS turn's input
+    # instead of appending the prompt a second time. The row must still be the
+    # transcript tail: callback admission happens before the primary provider
+    # call, so any later conversational row would prove this is not the safe
+    # pre-call recovery shape.
+    replayed_persisted_user_msg: Optional[Dict[str, Any]] = None
+    if persist_user_message_id and conversation_history:
+        replay_idx: Optional[int] = None
+        for idx in range(len(conversation_history) - 1, -1, -1):
+            candidate = conversation_history[idx]
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("role") == "user"
+                and (
+                    candidate.get("_platform_message_id")
+                    or candidate.get("message_id")
+                )
+                == persist_user_message_id
+            ):
+                replay_idx = idx
+                break
+        if replay_idx is not None:
+            if any(
+                isinstance(message, dict)
+                and message.get("role") in {"user", "assistant", "tool"}
+                for message in conversation_history[replay_idx + 1 :]
+            ):
+                raise RuntimeError(
+                    "durable input marker is not the pending transcript tail"
+                )
+            replayed_persisted_user_msg = conversation_history.pop(replay_idx)
+            # JSONL/direct callers may still supply the public transcript key.
+            # Normalize it to the transport-stripped internal form before this
+            # row re-enters a provider-bound message list.
+            replayed_persisted_user_msg.pop("message_id", None)
+            replayed_persisted_user_msg[
+                "_platform_message_id"
+            ] = persist_user_message_id
+            replayed_content = replayed_persisted_user_msg.get("content")
+            if replayed_content is None:
+                raise RuntimeError("durable input marker has no user content")
+            replayed_persisted_user_msg["_db_persisted"] = True
+            user_message = replayed_content
+            persist_user_message = replayed_content
 
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
@@ -637,7 +686,11 @@ def build_turn_context(
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
     )
-    if (
+    if replayed_persisted_user_msg is not None:
+        user_msg = replayed_persisted_user_msg
+        if isinstance(pending_cli_message, dict):
+            agent._pending_cli_user_message = None
+    elif (
         isinstance(pending_cli_message, dict)
         and pending_cli_message.get("content") == expected_persist_content
     ):
@@ -656,6 +709,8 @@ def build_turn_context(
     # CLI input is stamped when staged. Gateway input may carry the platform
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
+    if persist_user_message_id:
+        user_msg["_platform_message_id"] = persist_user_message_id
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
@@ -1305,6 +1360,13 @@ def build_turn_context(
             except Exception:
                 pass
 
+    if replayed_persisted_user_msg is not None:
+        # The committed row already carries the exact api_content sidecar from
+        # the pre-crash prologue. Ignore newly recomputed memory/plugin context
+        # so this retry sends the same bytes and preserves the prompt prefix.
+        ext_prefetch_cache = ""
+        plugin_user_context = ""
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next
@@ -1323,7 +1385,8 @@ def build_turn_context(
     # wire either — skip the stamp rather than persist provably wrong "exact
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
     if (
-        not moa_active
+        replayed_persisted_user_msg is None
+        and not moa_active
         and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
@@ -1390,6 +1453,20 @@ def build_turn_context(
         # close path must no longer treat it as a pre-worker UI input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
+
+    if input_persisted_callback is not None:
+        persisted_user = (
+            messages[current_turn_user_idx]
+            if 0 <= current_turn_user_idx < len(messages)
+            else None
+        )
+        if not isinstance(persisted_user, dict) or not persisted_user.get(
+            "_db_persisted"
+        ):
+            raise RuntimeError(
+                "durable input admission requires a committed user row"
+            )
+        input_persisted_callback()
 
     # Title the session from this user message, now — the row exists and the
     # turn has not called the model yet. Titling is derived from the user's

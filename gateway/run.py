@@ -36,11 +36,13 @@ import queue
 import re
 import shlex
 import site
+import socket
 import sys
 import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -1322,6 +1324,11 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    # Keep the persisted platform identity available to internal turn-start
+    # recovery without exposing ``message_id`` to strict provider schemas.
+    # Every transport strips underscore-prefixed message fields.
+    if role == "user" and msg.get("message_id"):
+        entry["_platform_message_id"] = msg["message_id"]
     # api_content sidecar (persist-what-you-send, prompt-cache stability):
     # forward the exact bytes previously sent to the API for this message so
     # the agent's api_messages build can substitute them and keep the request
@@ -1449,6 +1456,7 @@ def _build_gateway_agent_history(
     *,
     channel_prompt: Optional[str] = None,
     inject_timestamps: bool = False,
+    durable_input_marker: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
@@ -1461,6 +1469,11 @@ def _build_gateway_agent_history(
     When ``inject_timestamps`` is True (gateway.message_timestamps.enabled),
     each replayed user message is rendered with a single human-readable
     timestamp prefix from its stored metadata.
+
+    A user row matching ``durable_input_marker`` is the already-committed
+    input for the current provider delivery.  Keep that row byte-stable here:
+    its ``api_content`` sidecar is the exact payload prepared before a crash,
+    and turn setup will reuse the row instead of appending a duplicate.
     """
 
     from hermes_time import get_timezone as _get_msg_tz
@@ -1488,7 +1501,17 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
-        if inject_timestamps and role == "user" and isinstance(content, str):
+        durable_input_replay = bool(
+            durable_input_marker
+            and role == "user"
+            and msg.get("message_id") == durable_input_marker
+        )
+        if (
+            not durable_input_replay
+            and inject_timestamps
+            and role == "user"
+            and isinstance(content, str)
+        ):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
@@ -1509,12 +1532,12 @@ def _build_gateway_agent_history(
             # user's real text after the note, but never replay the recovery
             # instruction itself — that is what caused infinite re-execution
             # loops for interrupted long-running tools.
-            if role == "user":
+            if role == "user" and not durable_input_replay:
                 content = _strip_auto_continue_noise(content)
                 if not content:
                     continue
             # Simple text message - just need role and content.
-            if msg.get("mirror"):
+            if msg.get("mirror") and not durable_input_replay:
                 mirror_src = msg.get("mirror_source", "another session")
                 content = f"[Delivered from {mirror_src}] {content}"
             # Preserve the timestamp on user messages so the
@@ -5642,17 +5665,55 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            _fresh_agent_stale = False
             if _cache_lock and _cache is not None:
                 with _cache_lock:
-                    # Record the session_id the snapshot was taken for
-                    # alongside the message_count, so the cross-process
-                    # guard can skip the (meaningless) count comparison
-                    # when the active session_id later switches under
-                    # the same session_key (#54947).
-                    _cache[ctx.session_key] = (
-                        agent, _sig, _current_msg_count, ctx.session_id,
-                    )
-                    self._runner._enforce_agent_cache_cap()
+                    # Cancellation can land while AIAgent construction is
+                    # still running in this executor. Re-check under the cache
+                    # lock so a late constructor cannot repopulate a stale
+                    # agent after shutdown or terminal handoff cleanup.
+                    if ctx._run_still_current():
+                        # Record the session_id the snapshot was taken for
+                        # alongside the message_count, so the cross-process
+                        # guard can skip the (meaningless) count comparison
+                        # when the active session_id later switches under
+                        # the same session_key (#54947).
+                        _cache[ctx.session_key] = (
+                            agent, _sig, _current_msg_count, ctx.session_id,
+                        )
+                        self._runner._enforce_agent_cache_cap()
+                    else:
+                        _fresh_agent_stale = True
+            else:
+                _fresh_agent_stale = not ctx._run_still_current()
+
+            if _fresh_agent_stale:
+                # /stop or /new can invalidate the generation while a slow
+                # AIAgent constructor is still running without cancelling this
+                # asyncio owner. The new instance was never published through
+                # agent_holder and never entered the prompt cache, so this
+                # worker exclusively owns it and must release it here. Keeping
+                # holder unpublished also prevents the cancellation callback
+                # from discovering and releasing the same instance twice.
+                logger.info(
+                    "Discarding freshly constructed stale gateway agent for "
+                    "%s at generation %s",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+                self._runner._release_evicted_agent_soft(agent)
+                stale_result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "completed": False,
+                    "interrupted": True,
+                }
+                ctx.result_holder[0] = stale_result
+                if _stream_consumer is not None:
+                    _stream_consumer.finish()
+                return stale_result
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
         # Per-message state — callbacks and reasoning config change every
@@ -5931,6 +5992,7 @@ class TurnRunner:
             ctx.history,
             channel_prompt=ctx.channel_prompt,
             inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+            durable_input_marker=ctx.persist_user_message_id,
         )
 
         # FTS write-corruption guard (#50502): when message persistence
@@ -6265,11 +6327,40 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_display_kind"] = (
                     ctx.persist_user_display_kind
                 )
+            if ctx.persist_user_message_id:
+                _conversation_kwargs["persist_user_message_id"] = (
+                    ctx.persist_user_message_id
+                )
+            if ctx.input_persisted_callback is not None:
+                _conversation_kwargs["input_persisted_callback"] = (
+                    ctx.input_persisted_callback
+                )
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if not ctx._run_still_current():
+                # The event-loop owner can be cancelled while this executor
+                # thread is still constructing the agent. Never start model
+                # or tool work after that owner has fenced this generation.
+                logger.info(
+                    "Skipping stale gateway run for %s at generation %s",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+                result = {
+                    "final_response": "",
+                    "messages": agent_history,
+                    "api_calls": 0,
+                    "tools": [],
+                    "completed": False,
+                    "interrupted": True,
+                }
+            else:
+                result = agent.run_conversation(
+                    _api_run_message,
+                    **_conversation_kwargs,
+                )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -6327,31 +6418,28 @@ class TurnRunner:
                 "Session split detected: %s → %s (compression)",
                 ctx.session_id, agent_session_id,
             )
-            entry = self._runner.session_store._entries.get(ctx.session_key)
             _session_split_entry_persisted = False
-            if entry:
-                entry_session_id = getattr(entry, "session_id", None)
-                if not ctx._run_still_current():
-                    logger.info(
-                        "Skipping session split sync for stale run %s — "
-                        "generation %s is no longer current",
-                        ctx.session_key or "?",
-                        ctx.run_generation,
-                    )
-                elif entry_session_id == agent_session_id:
-                    _session_split_entry_persisted = True
-                elif entry_session_id != ctx.session_id:
+            if not ctx._run_still_current():
+                logger.info(
+                    "Skipping session split sync for stale run %s — "
+                    "generation %s is no longer current",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+            else:
+                entry = self._runner.session_store.advance_compression_session(
+                    ctx.session_key,
+                    ctx.session_id,
+                    agent_session_id,
+                )
+                if entry is None:
                     logger.info(
                         "Skipping session split sync for %s because the "
-                        "session binding moved from %s to %s before "
-                        "compression finished",
+                        "session binding no longer owns %s",
                         ctx.session_key or "?",
                         ctx.session_id,
-                        entry_session_id,
                     )
                 else:
-                    entry.session_id = agent_session_id
-                    self._runner.session_store._save()
                     self._runner.session_store._record_gateway_session_peer(
                         agent_session_id,
                         ctx.session_key,
@@ -7057,6 +7145,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Adapter-owned turns can remain alive briefly after bounded platform
+        # teardown while a cancelled executor worker and its completion hook
+        # quiesce. Keep state.db open until those exact owner tasks finish.
+        self._session_storage_quiescence_tasks: set[asyncio.Task] = set()
+        self._session_storage_close_lock = threading.Lock()
+        self._session_storage_closed = False
+        # Exact process-owned webhook claims whose external work has stopped
+        # but whose terminal SQLite cleanup failed. A later watcher tick may
+        # retry cleanup (never dispatch) even though this process is still
+        # alive. Lazily accessed too because tests construct bare runners.
+        self._webhook_handoff_cleanup_pending: Dict[
+            str, Tuple[str, str]
+        ] = {}
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -7149,6 +7250,105 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inner.close()
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
+
+    def _track_session_storage_quiescence(
+        self, task: Optional[asyncio.Task] = None
+    ) -> None:
+        """Keep session storage alive through one write-capable task.
+
+        Cancelling an asyncio owner does not stop a synchronous agent worker.
+        The owner deliberately waits for that worker and then runs adapter
+        completion hooks, both of which can still write state.db. Platform
+        teardown remains bounded; this task fence only defers storage close.
+        """
+        if task is None:
+            task = asyncio.current_task()
+        if task is None:
+            return
+        tasks = getattr(self, "_session_storage_quiescence_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._session_storage_quiescence_tasks = tasks
+        if task in tasks:
+            return
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _close_session_storage(self) -> bool:
+        """Close all session DB handles and the gateway executor exactly once."""
+        close_lock = getattr(self, "_session_storage_close_lock", None)
+        if close_lock is None:
+            close_lock = threading.Lock()
+            self._session_storage_close_lock = close_lock
+
+        with close_lock:
+            if getattr(self, "_session_storage_closed", False):
+                return False
+            self._session_storage_closed = True
+
+        # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
+        # ``session_store`` may hold the same sync handle at ``_db``. Deduping
+        # avoids closing a shared pinned handle twice.
+        handles = []
+        self_db = getattr(self, "_session_db", None)
+        handles.append(getattr(self_db, "_db", self_db))
+        handles.append(getattr(getattr(self, "session_store", None), "_db", None))
+        seen_handles: set[int] = set()
+        for db in handles:
+            if db is None or not hasattr(db, "close") or id(db) in seen_handles:
+                continue
+            seen_handles.add(id(db))
+            try:
+                db.close()
+            except Exception as exc:
+                logger.debug("SessionDB close error: %s", exc)
+
+        sweep = getattr(
+            getattr(self, "session_store", None), "close_all_db_handles", None
+        )
+        if sweep is not None:
+            try:
+                sweep()
+            except Exception as exc:
+                logger.debug("SessionDB handle sweep error: %s", exc)
+        try:
+            GatewayRunner.close_all_session_db_handles(self)
+        except Exception as exc:
+            logger.debug("Runner SessionDB handle sweep error: %s", exc)
+        GatewayRunner._shutdown_executor(self)
+        return True
+
+    def _close_session_storage_when_quiescent(self) -> bool:
+        """Close now, or defer until cancelled adapter owners finish.
+
+        Returns ``True`` when storage closed synchronously and ``False`` when
+        close was deferred. The callbacks are synchronous and idempotent, so a
+        stopped runner does not need to stay awaited merely to hold state.db.
+        """
+        tasks = getattr(self, "_session_storage_quiescence_tasks", None) or set()
+        pending = [task for task in tasks if not task.done()]
+        if not pending:
+            self._close_session_storage()
+            return True
+
+        def _close_after_last_owner(_task: asyncio.Task) -> None:
+            remaining = getattr(
+                self, "_session_storage_quiescence_tasks", None
+            ) or set()
+            if any(not task.done() for task in remaining):
+                return
+            if self._close_session_storage():
+                logger.info(
+                    "Deferred SessionDB close completed after adapter work quiesced"
+                )
+
+        for task in pending:
+            task.add_done_callback(_close_after_last_owner)
+        logger.warning(
+            "Deferring SessionDB close until %d cancelled adapter task(s) quiesce",
+            len(pending),
+        )
+        return False
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -13286,6 +13486,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
+                await self._recover_dead_webhook_handoffs()
                 pending = await self._session_db.list_pending_handoffs()
                 for row in pending:
                     session_id = row.get("id")
@@ -13293,6 +13494,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     is_webhook_handoff = self._is_webhook_handoff_row(row)
                     if is_webhook_handoff:
+                        claim_owner = self._new_webhook_handoff_claim_owner(row)
+                        claim_token = claim_owner["token"]
+                        claim_owner_json = json.dumps(
+                            claim_owner, sort_keys=True, separators=(",", ":")
+                        )
+                        # Publish the fence on the local row before awaiting
+                        # the offloaded claim so cancellation reconciliation
+                        # can use the exact token immediately after a commit.
+                        row["_handoff_claim_token"] = claim_token
+                        row["_handoff_source_session_key"] = claim_owner[
+                            "source_session_key"
+                        ]
+                        row["_handoff_active_session_key"] = claim_owner[
+                            "active_session_key"
+                        ]
                         # AsyncSessionDB offloads the claim to a worker thread,
                         # so cancelling this watcher does not cancel a SQLite
                         # UPDATE already in flight. Reconcile the result before
@@ -13300,7 +13516,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # must be finalized rather than becoming invisible to
                         # the pending-only watcher after restart.
                         claim_task = asyncio.create_task(
-                            self._session_db.claim_handoff(session_id)
+                            self._session_db.claim_webhook_handoff(
+                                session_id, claim_owner_json
+                            )
                         )
                         try:
                             claimed = await asyncio.shield(claim_task)
@@ -13352,8 +13570,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         await self._process_handoff(row)
                         if is_webhook_handoff:
-                            completed = await self._session_db.complete_running_handoff(
-                                session_id
+                            completed = await self._session_db.complete_claimed_webhook_handoff(
+                                session_id,
+                                row["_handoff_claim_token"],
                             )
                             if not completed:
                                 logger.warning(
@@ -13416,11 +13635,225 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
 
+    def _new_webhook_handoff_claim_owner(
+        self, row: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create the durable owner/fence for one webhook handoff claim."""
+        from gateway.drain_control import current_instantiation_epoch
+        from gateway.status import get_process_start_time
+        from hermes_state import _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL
+
+        pid = os.getpid()
+        process_start_time = get_process_start_time(pid)
+        host = socket.gethostname().strip()
+        if process_start_time is None or not host:
+            raise RuntimeError(
+                "cannot claim webhook handoff without a recoverable process identity"
+            )
+        return {
+            "token": uuid.uuid4().hex,
+            "pid": pid,
+            "process_start_time": process_start_time,
+            "host": host,
+            "instantiation_epoch": current_instantiation_epoch(),
+            "lock_protocol": _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL,
+            "routing_scope": self.session_store._routing_scope(),
+            "source_session_key": str(row.get("session_key") or ""),
+            "active_session_key": str(row.get("session_key") or ""),
+        }
+
+    @staticmethod
+    def _parse_webhook_handoff_claim_owner(value: Any) -> Optional[Dict[str, Any]]:
+        from hermes_state import _decode_webhook_handoff_owner
+
+        return _decode_webhook_handoff_owner(value)
+
+    @staticmethod
+    def _webhook_handoff_claim_owner_alive(
+        owner: Dict[str, Any],
+    ) -> Optional[bool]:
+        """Return True for live, False for dead, and None when uncertain."""
+        from gateway.drain_control import current_instantiation_epoch
+        from gateway.status import get_process_start_time
+
+        try:
+            current_host = socket.gethostname().strip()
+        except OSError:
+            return None
+        if not current_host or owner["host"] != current_host:
+            # A PID is meaningful only on the host that stamped it. A shared
+            # state.db may be visible from several machines, so never test a
+            # foreign owner's PID in the local namespace.
+            return None
+
+        owner_epoch = owner["instantiation_epoch"]
+        current_epoch = current_instantiation_epoch()
+        if owner_epoch != current_epoch:
+            # This process cannot own the claim, but a shared state.db may be
+            # visible from another live container with the same configured
+            # hostname. Treat a foreign process namespace as unknown rather
+            # than declaring its locally meaningless PID dead.
+            return None
+
+        # Distinguish a process that is definitively absent from one whose
+        # status or creation time is merely unreadable. psutil is Hermes'
+        # hard cross-platform dependency and avoids the Windows
+        # os.kill(pid, 0) footgun. AccessDenied and probe errors remain
+        # unknown, never dead. Check status before start time because a zombie
+        # still has a readable /proc entry and process-start fingerprint.
+        pid = owner["pid"]
+        try:
+            import psutil
+
+            try:
+                status = psutil.Process(pid).status()
+                dead_statuses = {
+                    psutil.STATUS_ZOMBIE,
+                    getattr(psutil, "STATUS_DEAD", "dead"),
+                }
+                if status in dead_statuses:
+                    return False
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                return False
+            except psutil.AccessDenied:
+                return None
+            except Exception:
+                return None
+        except ImportError:  # pragma: no cover - stripped/scaffold installs only
+            return None
+        except Exception:
+            return None
+
+        current_start = get_process_start_time(pid)
+        if current_start is None:
+            return None
+        return int(current_start) == int(owner["process_start_time"])
+
+    async def _try_acquire_webhook_handoff_recovery_lock(
+        self, session_id: str, owner: Dict[str, Any]
+    ) -> Optional[bool]:
+        acquire = getattr(
+            self._session_db,
+            "try_acquire_webhook_handoff_recovery_lock",
+            None,
+        )
+        if not callable(acquire):
+            return None
+        result = acquire(
+            session_id,
+            owner["token"],
+            owner.get("lock_protocol"),
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return result if result in {True, False, None} else None
+
+    async def _release_webhook_handoff_claim_lock(
+        self, session_id: str, claim_token: str
+    ) -> None:
+        release = getattr(
+            self._session_db,
+            "release_webhook_handoff_claim_lock",
+            None,
+        )
+        if not callable(release):
+            return
+        result = release(session_id, claim_token)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _recover_dead_webhook_handoffs(self) -> None:
+        """Terminally clean process-owned running claims after a hard crash.
+
+        A running claim may already have created a thread, run the agent, or
+        sent a reply, so replay is never safe. Only an owner proven dead is
+        reclaimed, and token-fenced cleanup removes the durable active route
+        without performing another external side effect.
+        """
+        claimed_rows = await self._session_db.list_claimed_webhook_handoffs()
+        routing_scope = await self.async_session_store._routing_scope()
+        cleanup_pending = getattr(
+            self, "_webhook_handoff_cleanup_pending", None
+        )
+        if cleanup_pending is None:
+            cleanup_pending = {}
+            self._webhook_handoff_cleanup_pending = cleanup_pending
+        claimed_session_ids = {
+            str(row.get("id")) for row in claimed_rows if row.get("id")
+        }
+        for session_id in list(cleanup_pending):
+            if session_id not in claimed_session_ids:
+                pending = cleanup_pending.pop(session_id, None)
+                if pending is not None:
+                    await self._release_webhook_handoff_claim_lock(
+                        session_id, pending[0]
+                    )
+        for row in claimed_rows:
+            owner = self._parse_webhook_handoff_claim_owner(
+                row.get("_handoff_claim_owner")
+            )
+            if owner is None:
+                logger.error(
+                    "Running webhook handoff %s has a malformed owner record; "
+                    "leaving it untouched",
+                    row.get("id"),
+                )
+                continue
+            if owner["routing_scope"] != routing_scope:
+                continue
+            session_id = str(row.get("id") or "")
+            pending_cleanup = cleanup_pending.get(session_id)
+            retry_local_cleanup = (
+                pending_cleanup is not None
+                and pending_cleanup[0] == owner["token"]
+            )
+            owner_alive = self._webhook_handoff_claim_owner_alive(owner)
+            if not retry_local_cleanup:
+                if owner_alive is True:
+                    continue
+                recovery_lock = (
+                    await self._try_acquire_webhook_handoff_recovery_lock(
+                        session_id, owner
+                    )
+                )
+                if recovery_lock is not True:
+                    logger.debug(
+                        "Could not acquire crash-released webhook handoff "
+                        "claim lock for %s; leaving it untouched",
+                        row.get("id"),
+                    )
+                    continue
+            row["_handoff_claim_token"] = owner["token"]
+            row["_handoff_source_session_key"] = owner[
+                "source_session_key"
+            ]
+            row["_handoff_active_session_key"] = owner["active_session_key"]
+            try:
+                await self._finalize_failed_webhook_handoff(
+                    row,
+                    (
+                        pending_cleanup[1]
+                        if retry_local_cleanup
+                        else "handoff owner process exited before completion"
+                    ),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Dead-owner webhook handoff cleanup failed for %s: %s",
+                    row.get("id"),
+                    exc,
+                    exc_info=True,
+                )
+
     @staticmethod
     def _is_webhook_handoff_row(row: Dict[str, Any]) -> bool:
         """Whether *row* owns a live webhook routing key to be moved."""
+        producer = str(row.get("_webhook_handoff_request") or "").strip().lower()
+        target = str(row.get("handoff_platform") or "").strip().lower()
         return (
-            str(row.get("source") or "").strip().lower() == "webhook"
+            bool(producer)
+            and producer == target
+            and str(row.get("source") or "").strip().lower() == "webhook"
             and bool(row.get("session_key"))
         )
 
@@ -13431,10 +13864,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Remove a failed webhook handoff route and end its exact session.
 
-        ``_process_handoff`` records the currently-owned key on the in-memory
-        row immediately after a successful move. Before that point the source
-        key remains authoritative. The expected-session CAS prevents cleanup
-        from deleting a newer owner if either key was rebound concurrently.
+        The durable claim records both its immutable source key and its current
+        active key. A stale legacy sessions.json mirror can resurrect the
+        source alias after a crash, so post-move cleanup removes that exact
+        alias before atomically finalizing the active route and session. Every
+        removal is expected-session CAS guarded; a newer owner is retained.
         """
         session_id = str(row.get("id") or "")
         session_key = str(
@@ -13442,15 +13876,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or row.get("session_key")
             or ""
         )
+        source_session_key = str(
+            row.get("_handoff_source_session_key")
+            or row.get("session_key")
+            or ""
+        )
+        claim_token_value = row.get("_handoff_claim_token")
+        claim_token = str(claim_token_value) if claim_token_value else None
         if not session_id:
             return
 
-        if session_key:
+        cleanup_pending = getattr(
+            self, "_webhook_handoff_cleanup_pending", None
+        )
+        if cleanup_pending is None:
+            cleanup_pending = {}
+            self._webhook_handoff_cleanup_pending = cleanup_pending
+
+        try:
+            if not session_key:
+                return
             finalized = await self.async_session_store.remove_session_route_and_end(
                 session_key,
                 session_id,
                 "webhook_handoff_failed",
                 handoff_error=handoff_error,
+                handoff_claim_token=claim_token,
+                handoff_source_session_key=source_session_key,
             )
             if not finalized:
                 raise RuntimeError(
@@ -13459,6 +13911,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if await self.async_session_store.peek_session_id(session_key) is None:
                 self._evict_cached_agent(session_key)
                 self._release_running_agent_state(session_key)
+            if (
+                source_session_key
+                and source_session_key != session_key
+                and await self.async_session_store.peek_session_id(
+                    source_session_key
+                )
+                is None
+            ):
+                self._evict_cached_agent(source_session_key)
+                self._release_running_agent_state(source_session_key)
+        except BaseException:
+            if claim_token is not None:
+                cleanup_pending[session_id] = (claim_token, handoff_error)
+            raise
+        else:
+            cleanup_pending.pop(session_id, None)
+            if claim_token is not None:
+                await self._release_webhook_handoff_claim_lock(
+                    session_id, claim_token
+                )
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""
@@ -13467,12 +13939,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.platforms.base import MessageEvent
 
         handoff_session_id = row["id"]
-        move_source_key = (
+        is_webhook_handoff = self._is_webhook_handoff_row(row)
+        historical_webhook_source_key = (
             str(row.get("session_key"))
-            if self._is_webhook_handoff_row(row)
+            if str(row.get("source") or "").strip().lower() == "webhook"
+            and row.get("session_key")
             else None
         )
-        if move_source_key:
+        move_source_key = (
+            historical_webhook_source_key if is_webhook_handoff else None
+        )
+        if historical_webhook_source_key and not is_webhook_handoff:
+            # An interactive /handoff may take over a still-live webhook-origin
+            # session. Move that exact live route to avoid dual aliases. After
+            # a failed autonomous handoff, however, /resume reopens only the
+            # transcript row: its historical webhook route is absent/fenced,
+            # so preserve the established interactive create+switch path.
+            current_source_session_id = (
+                await self.async_session_store.peek_session_id(
+                    historical_webhook_source_key
+                )
+            )
+            if current_source_session_id == handoff_session_id:
+                move_source_key = historical_webhook_source_key
+        if is_webhook_handoff and move_source_key:
             row["_handoff_active_session_key"] = move_source_key
         platform_name = (row.get("handoff_platform") or "").strip().lower()
         if not platform_name:
@@ -13570,7 +14060,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # back to the configured parent/home channel would both violate that
         # contract and risk taking ownership of an unrelated live session.
         # Interactive CLI/TUI handoffs keep their established fallback.
-        if move_source_key and not new_thread_id:
+        if is_webhook_handoff and not new_thread_id:
             raise RuntimeError(
                 f"could not create a handoff thread on {platform_name}"
             )
@@ -13703,6 +14193,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                     handoff_session_id,
                     dest_source,
+                    handoff_claim_token=row.get("_handoff_claim_token"),
                 )
 
             move_task = asyncio.create_task(_move_session_route())
@@ -13762,6 +14253,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=dest_source,
             internal=True,
         )
+        if is_webhook_handoff:
+            synthetic_event.metadata[
+                "_require_executor_quiescence_on_timeout"
+            ] = True
 
         logger.info(
             "Handoff: dispatching synthetic turn for session %s → %s "
@@ -13775,7 +14270,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
         response_text = await self._handle_message(synthetic_event)
-        if move_source_key and synthetic_event.agent_run_failed is not False:
+        if is_webhook_handoff and synthetic_event.agent_run_failed is not False:
             raise RuntimeError("synthetic destination agent run failed")
         if not response_text:
             # Streaming may have already delivered the response inline.
@@ -15077,6 +15572,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            _cancelled_background_tasks = []
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
                     continue
@@ -15086,7 +15582,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # into this _stop_impl and skip _shutdown_event.set() /
                     # _exit_code = 75 (#12875).  It self-terminates anyway.
                     continue
+                # Runner-owned watchers may still be unwinding a token-fenced
+                # handoff transaction after cancellation. Keep state.db open
+                # for the exact task if it outlives the bounded shutdown wait.
+                _track_storage_quiescence = getattr(
+                    self, "_track_session_storage_quiescence", None
+                )
+                if callable(_track_storage_quiescence):
+                    _track_storage_quiescence(_task)
                 _task.cancel()
+                _cancelled_background_tasks.append(_task)
+            if _cancelled_background_tasks:
+                # Cancellation cleanup can still need state.db (notably the
+                # token-fenced webhook-handoff finalizer). Give it the normal
+                # adapter teardown budget, then detach cancellation-resistant
+                # tasks; their quiescence callbacks close storage afterward.
+                _background_timeout = self._adapter_disconnect_timeout_secs()
+                _done_background, _pending_background = await asyncio.wait(
+                    set(_cancelled_background_tasks),
+                    timeout=_background_timeout,
+                )
+                if _done_background:
+                    await asyncio.gather(
+                        *_done_background,
+                        return_exceptions=True,
+                    )
+                if _pending_background:
+                    for _task in _pending_background:
+                        _task.add_done_callback(consume_detached_task_result)
+                    logger.warning(
+                        "Timed out after %.1fs waiting for %d runner background "
+                        "task(s) to cancel; continuing shutdown with SessionDB "
+                        "close deferred",
+                        _background_timeout,
+                        len(_pending_background),
+                    )
             self._background_tasks.clear()
 
             self.adapters.clear()
@@ -15141,46 +15671,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
 
-            # Close SQLite session DBs so the WAL write lock is released.
-            # Without this, --replace and similar restart flows leave the
-            # old gateway's connection holding the WAL lock until Python
-            # actually exits — causing 'database is locked' errors when
-            # the new gateway tries to open the same file.
-            # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
-            # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
-            _self_db = getattr(self, "_session_db", None)
-            _self_db = getattr(_self_db, "_db", _self_db)
-            for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
-                if _db is None or not hasattr(_db, "close"):
-                    continue
-                try:
-                    _db.close()
-                except Exception as _e:
-                    logger.debug("SessionDB close error: %s", _e)
-            # A multiplexed session_store caches one SessionDB per profile
-            # path (#88532); reading ``_db`` above only resolved the handle
-            # for the shutdown task's own (root) scope. Sweep the rest so
-            # secondary profiles' WAL locks are released before --replace
-            # brings a new gateway up on the same files.
-            _sweep = getattr(
-                getattr(self, "session_store", None), "close_all_db_handles", None
+            # Platform teardown is intentionally bounded (#14128), but a
+            # cancelled synchronous agent worker and its adapter completion
+            # hook may still need state.db. Close now in the normal case, or
+            # let the last exact owner task trigger the idempotent close.
+            _close_storage = getattr(
+                self, "_close_session_storage_when_quiescent", None
             )
-            if _sweep is not None:
-                try:
-                    _sweep()
-                except Exception as _e:
-                    logger.debug("SessionDB handle sweep error: %s", _e)
-            # Same sweep for the runner's own per-profile session_search
-            # handles (slash commands resolve them under profile scopes).
-            try:
-                GatewayRunner.close_all_session_db_handles(self)
-            except Exception as _e:
-                logger.debug("Runner SessionDB handle sweep error: %s", _e)
-            GatewayRunner._shutdown_executor(self)
-            logger.info(
-                "Shutdown phase: SessionDB close done at +%.2fs",
-                _phase_elapsed(),
-            )
+            if not callable(_close_storage) or _close_storage():
+                logger.info(
+                    "Shutdown phase: SessionDB close done at +%.2fs",
+                    _phase_elapsed(),
+                )
+            else:
+                logger.info(
+                    "Shutdown phase: SessionDB close deferred at +%.2fs",
+                    _phase_elapsed(),
+                )
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -19341,7 +19848,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # explicitly degraded past) the per-session lease.  Marking before the
         # await above would falsely recover an alias-routed message that never
         # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        _durable_run_admitted = await self._mark_durable_active_turn(
+            event, session_entry.session_key
+        )
+
+        # Autonomous adapters may need to bind durable delivery ownership to
+        # this exact marked route before any history/hygiene work can fail or
+        # rotate it. A hook failure means no authoritative agent run began.
+        _admission_adapter = self._adapter_for_source(source)
+        if (
+            _admission_adapter is not None
+            and getattr(
+                type(_admission_adapter),
+                "requires_durable_run_admission",
+                False,
+            )
+            and not _durable_run_admitted
+        ):
+            event.agent_run_failed = True
+            raise RuntimeError(
+                "adapter requires durable active-turn admission"
+            )
+        _durable_input_marker: Optional[str] = None
+        _run_started_hook = getattr(
+            type(_admission_adapter), "on_agent_run_started", None
+        )
+        if callable(_run_started_hook) and _admission_adapter is not None:
+            try:
+                _run_admission = await _admission_adapter.on_agent_run_started(
+                    event,
+                    session_key=session_entry.session_key,
+                    session_id=session_entry.session_id,
+                )
+                if isinstance(_run_admission, str) and _run_admission:
+                    _durable_input_marker = _run_admission
+            except asyncio.CancelledError:
+                event.agent_run_failed = True
+                raise
+            except Exception:
+                event.agent_run_failed = True
+                raise
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -19627,9 +20173,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             ]
 
                             if len(_hyg_msgs) >= 4:
+                                _hyg_parent_sid = session_entry.session_id
                                 try:
                                     _hyg_session_row = await self._session_db.get_session(
-                                        session_entry.session_id
+                                        _hyg_parent_sid
                                     )
                                 except Exception as exc:
                                     _hyg_session_row = None
@@ -19638,7 +20185,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         "prompt for session %s: %s. Preserving an empty "
                                         "prompt so the live turn rebuilds it with its "
                                         "configured providers.",
-                                        session_entry.session_id,
+                                        _hyg_parent_sid,
                                         exc,
                                         exc_info=True,
                                     )
@@ -19650,7 +20197,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     quiet_mode=True,
                                     skip_memory=True,
                                     enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
+                                    session_id=_hyg_parent_sid,
                                     session_db=_hyg_session_db,
                                 )
                                 _seed_hygiene_system_prompt(
@@ -19681,7 +20228,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     if callable(_bind_hyg_state):
                                         _bind_hyg_state(
                                             _hyg_session_db,
-                                            session_entry.session_id,
+                                            _hyg_parent_sid,
                                         )
                                     # It must never finalize on close() — close()
                                     # would end the live gateway session row.
@@ -19869,7 +20416,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # the NEW session so the old transcript stays intact
                                     # and searchable via session_search.
                                     _hyg_new_sid = _hyg_agent.session_id
-                                    _hyg_rotated = _hyg_new_sid != session_entry.session_id
+                                    _hyg_rotated = _hyg_new_sid != _hyg_parent_sid
                                     _hyg_in_place = bool(
                                         getattr(_hyg_agent, "_last_compaction_in_place", False)
                                     )
@@ -19928,27 +20475,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "session %s → %s; keeping the live "
                                                 "entry on the original session so the "
                                                 "conversation is not dropped",
-                                                session_entry.session_id,
+                                                _hyg_parent_sid,
                                                 _hyg_new_sid,
                                             )
                                             # Fail closed: treat like no rotation.
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
-                                            session_entry.session_id = _hyg_new_sid
-                                            # The held turn lease follows the
-                                            # rotation so an alias key resolving
-                                            # the fresh child still serializes
-                                            # against this turn (#64934).
-                                            self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
+                                            advanced = await self.async_session_store.advance_compression_session(
+                                                session_entry.session_key,
+                                                _hyg_parent_sid,
+                                                _hyg_new_sid,
                                             )
-                                            await self.async_session_store._save()
-                                            await asyncio.to_thread(
-                                                self._sync_telegram_topic_binding,
-                                                source, session_entry,
-                                                reason="hygiene-compression",
-                                            )
+                                            if advanced is None:
+                                                logger.info(
+                                                    "Session hygiene: route %s no longer "
+                                                    "owns parent session %s; skipping late "
+                                                    "compression repoint to %s",
+                                                    session_entry.session_key,
+                                                    _hyg_parent_sid,
+                                                    _hyg_new_sid,
+                                                )
+                                                _hyg_rotated = False
+                                                _hyg_in_place = False
+                                            else:
+                                                session_entry = advanced
+                                                # The held turn lease follows the
+                                                # rotation so an alias key resolving
+                                                # the fresh child still serializes
+                                                # against this turn (#64934).
+                                                self._rebind_turn_lease(
+                                                    _quick_key,
+                                                    run_generation,
+                                                    _hyg_new_sid,
+                                                )
+                                                await asyncio.to_thread(
+                                                    self._sync_telegram_topic_binding,
+                                                    source,
+                                                    session_entry,
+                                                    reason="hygiene-compression",
+                                                )
 
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
@@ -20320,6 +20886,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _input_persisted_callback: Optional[Callable[[], None]] = None
+            if _durable_input_marker is not None:
+                _input_persisted_hook = getattr(
+                    type(_admission_adapter),
+                    "on_agent_input_persisted",
+                    None,
+                )
+                if not callable(_input_persisted_hook):
+                    raise RuntimeError(
+                        "adapter durable-input admission hook is unavailable"
+                    )
+                _admission_loop = asyncio.get_running_loop()
+
+                def _confirm_input_persisted() -> None:
+                    if not self._is_session_run_current(
+                        session_key,
+                        run_generation,
+                    ):
+                        raise RuntimeError(
+                            "webhook input admission belongs to a stale run"
+                        )
+                    future = asyncio.run_coroutine_threadsafe(
+                        _admission_adapter.on_agent_input_persisted(
+                            event,
+                            session_key=session_key,
+                            session_id=_run_start_session_id,
+                        ),
+                        _admission_loop,
+                    )
+                    future.result()
+
+                _input_persisted_callback = _confirm_input_persisted
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -20335,7 +20933,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_message_id=_durable_input_marker,
+                input_persisted_callback=_input_persisted_callback,
                 message_type=event.message_type,
+                require_executor_quiescence_on_timeout=bool(
+                    event.metadata.get(
+                        "_require_executor_quiescence_on_timeout"
+                    )
+                ),
             )
             # The adapter lifecycle otherwise sees only whether the rendered
             # response was delivered. Some autonomous adapters need to know
@@ -20901,6 +21506,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._refresh_agent_cache_message_count(
                 session_key, session_entry.session_id
             )
+
+            if event.agent_run_failed is False:
+                _persisted_adapter = self._adapter_for_source(source)
+                _persisted_hook = getattr(
+                    type(_persisted_adapter),
+                    "on_agent_run_persisted",
+                    None,
+                )
+                if callable(_persisted_hook) and _persisted_adapter is not None:
+                    await _persisted_adapter.on_agent_run_persisted(
+                        event,
+                        session_key=session_entry.session_key,
+                        session_id=session_entry.session_id,
+                    )
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -27860,6 +28479,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
+        partial_response = False
         _start = time.time()
 
         try:
@@ -27881,6 +28501,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
+                            "failed": True,
                         }
 
                     # Parse SSE stream
@@ -27941,8 +28562,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "failed": True,
                 }
             # Partial response — return what we got
+            partial_response = True
         finally:
             # Finalize stream consumer
             if _stream_consumer:
@@ -27985,6 +28608,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "partial": partial_response,
         }
 
     # ------------------------------------------------------------------
@@ -28005,7 +28629,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_message_id: Optional[str] = None,
+        input_persisted_callback: Optional[Callable[[], None]] = None,
         message_type: Optional[str] = None,
+        require_executor_quiescence_on_timeout: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28025,7 +28652,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_message_id=persist_user_message_id,
+                input_persisted_callback=input_persisted_callback,
                 message_type=message_type,
+                require_executor_quiescence_on_timeout=(
+                    require_executor_quiescence_on_timeout
+                ),
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28038,7 +28670,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_message_id=persist_user_message_id,
+                input_persisted_callback=input_persisted_callback,
                 message_type=message_type,
+                require_executor_quiescence_on_timeout=(
+                    require_executor_quiescence_on_timeout
+                ),
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28181,7 +28818,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_message_id: Optional[str] = None,
+        input_persisted_callback: Optional[Callable[[], None]] = None,
         message_type: Optional[str] = None,
+        require_executor_quiescence_on_timeout: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28197,6 +28837,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if input_persisted_callback is not None:
+                raise RuntimeError(
+                    "durable webhook input admission is unavailable in proxy mode"
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -28491,6 +29135,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            persist_user_message_id=persist_user_message_id,
+            input_persisted_callback=input_persisted_callback,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -29132,6 +29778,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
 
+            async def _await_executor_quiescence() -> None:
+                """Wait through repeated owner cancellation for sync work."""
+                while True:
+                    try:
+                        await asyncio.shield(_executor_task)
+                    except asyncio.CancelledError:
+                        if _executor_task.done():
+                            break
+                        continue
+                    except Exception:
+                        break
+                    else:
+                        break
+
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0
 
@@ -29312,6 +29972,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # pool worker is freed.
                 if _timed_out_agent:
                     request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT)
+
+                if require_executor_quiescence_on_timeout:
+                    # An autonomous webhook handoff timeout is terminal from
+                    # the watcher's point of view. Do not let it remove/end the
+                    # route while the synchronous worker can still append,
+                    # compress, call tools, or perform external work.
+                    self._track_session_storage_quiescence()
+                    await _await_executor_quiescence()
+                else:
+                    # Preserve the established gateway-timeout contract for a
+                    # genuinely wedged ordinary turn: return its diagnostic
+                    # instead of waiting forever for a worker that ignored the
+                    # hard interrupt. The detached worker can still append or
+                    # compress, so keep session storage alive until it exits.
+                    self._track_session_storage_quiescence(_executor_task)
+                    _executor_task.add_done_callback(
+                        consume_detached_task_result
+                    )
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
@@ -29721,8 +30399,127 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    require_executor_quiescence_on_timeout=(
+                        require_executor_quiescence_on_timeout
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
+        except asyncio.CancelledError:
+            # Cancelling the asyncio owner does not stop the executor thread.
+            # Fence this exact generation before hard-interrupting the agent:
+            # hard_interrupt may wait for an admitted compression commit, and
+            # the worker must already be stale throughout that wait.
+            _owns_cancelled_generation = not session_key or run_generation is None
+            if (
+                session_key
+                and run_generation is not None
+                and self._is_session_run_current(session_key, run_generation)
+            ):
+                self._invalidate_session_run_generation(
+                    session_key,
+                    reason="gateway agent task cancelled",
+                )
+                _owns_cancelled_generation = True
+
+            self._track_session_storage_quiescence()
+            _executor_task.add_done_callback(consume_detached_task_result)
+
+            if not _owns_cancelled_generation:
+                # A recursive queued follow-up shares this generation and can
+                # propagate cancellation through several _run_agent_inner
+                # frames. Only the innermost frame that actually invalidated
+                # the generation owns cache eviction, hard interrupt, and
+                # deferred release; outer frames must not release the same
+                # agent while the inner worker is still unwinding. Await this
+                # frame's executor too: it is normally already complete for a
+                # recursive outer frame, but an external /stop may have bumped
+                # the generation just before cancellation reached a live one.
+                await _await_executor_quiescence()
+                raise
+
+            _cancelled_agents_to_release = []
+
+            def _pop_cancelled_agent_from_cache(agent: Any = None) -> None:
+                if not session_key:
+                    return
+                cache = getattr(self, "_agent_cache", None)
+                if cache is None:
+                    return
+
+                def _pop_if_same() -> Any:
+                    cached = cache.get(session_key)
+                    cached_agent = (
+                        cached[0]
+                        if isinstance(cached, tuple) and cached
+                        else cached
+                    )
+                    if cached_agent is not None and (
+                        agent is None or cached_agent is agent
+                    ):
+                        cache.pop(session_key, None)
+                        return cached_agent
+                    return None
+
+                cache_lock = getattr(self, "_agent_cache_lock", None)
+                if cache_lock is None:
+                    popped_agent = _pop_if_same()
+                else:
+                    with cache_lock:
+                        popped_agent = _pop_if_same()
+                if popped_agent is not None:
+                    _cancelled_agents_to_release.append(popped_agent)
+
+            def _release_cancelled_agent_when_done(_future: Any) -> None:
+                cancelled_agent = agent_holder[0] if agent_holder else None
+                # A constructor that finished after cancellation must not
+                # survive in cache. Only remove this exact instance so a
+                # replacement turn cannot be evicted by an old callback.
+                if cancelled_agent is not None:
+                    _pop_cancelled_agent_from_cache(cancelled_agent)
+                    _cancelled_agents_to_release.append(cancelled_agent)
+                seen_agents = set()
+                for stale_agent in _cancelled_agents_to_release:
+                    if id(stale_agent) in seen_agents:
+                        continue
+                    seen_agents.add(id(stale_agent))
+                    try:
+                        threading.Thread(
+                            target=self._release_evicted_agent_soft,
+                            args=(stale_agent,),
+                            daemon=True,
+                            name=(
+                                "agent-cancel-release-"
+                                f"{str(session_key)[:24]}"
+                            ),
+                        ).start()
+                    except Exception:
+                        self._release_evicted_agent_soft(stale_agent)
+
+            _executor_task.add_done_callback(_release_cancelled_agent_when_done)
+            # Remove only the cancelled generation's exact cached instance.
+            # When construction has not published agent_holder yet, its stale
+            # generation check prevents that constructor from inserting itself
+            # afterward. Resource release waits for executor completion.
+            _pop_cancelled_agent_from_cache()
+            _cancelled_agent = agent_holder[0] if agent_holder else None
+            if _cancelled_agent is not None:
+                _cancel_reason = (
+                    _INTERRUPT_REASON_GATEWAY_RESTART
+                    if getattr(self, "_restart_requested", False)
+                    else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    if getattr(self, "_draining", False)
+                    else _INTERRUPT_REASON_STOP
+                )
+                try:
+                    request_hard_interrupt(_cancelled_agent, _cancel_reason)
+                except Exception:
+                    logger.warning(
+                        "Failed to interrupt cancelled gateway agent for %s",
+                        session_key or "?",
+                        exc_info=True,
+                    )
+            await _await_executor_quiescence()
+            raise
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

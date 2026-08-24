@@ -2331,6 +2331,10 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    "message_id": (
+                        msg.get("message_id")
+                        or msg.get("_platform_message_id")
+                    ),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8
@@ -8437,6 +8441,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        persist_user_message_id: Optional[str] = None,
+        input_persisted_callback: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8801,6 +8807,8 @@ class AIAgent:
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
+                        persist_user_message_id=persist_user_message_id,
+                        input_persisted_callback=input_persisted_callback,
                         moa_config=moa_config,
                     )
                 finally:

@@ -2,15 +2,13 @@
 after the agent's compression path mutates it.
 
 When ``_compress_context()`` rolls the agent forward into a new session, the
-agent now returns the new ``session_id`` in its result dict. The gateway
-updates ``session_entry.session_id`` in memory AND must call
+gateway must durably repoint the route. Current executor and hygiene paths use
+``advance_compression_session()`` for a lock-held compare-and-swap; any
+remaining direct ``session_entry.session_id`` assignments must still call
 ``session_store._save()`` so the new mapping survives a gateway restart.
-Without ``_save()``, the next turn loads the OLD session's transcript and
-re-triggers compression forever.
 
-Three sites in ``gateway/run.py`` mutate ``session_entry.session_id`` after
-a compression-induced session split. All three MUST be followed by a
-``_save()`` call. This test pins that invariant.
+This test pins the persistence invariant for the remaining direct-assignment
+paths. CAS-based paths are covered by SessionStore routing tests instead.
 
 ``TestCompressionSessionPropagation`` adds behavioral tests that exercise the
 actual propagation path inline, verifying that the mock session_entry update
@@ -102,11 +100,9 @@ def test_every_post_compression_session_id_assignment_persists():
     """Every ``session_entry.session_id = ...`` in gateway/run.py must be
     followed by a ``session_store._save()`` call within the same block.
 
-    Regression for #29335 — the assignment at the end of
-    ``_handle_message_with_agent`` used to skip ``_save()`` while two sibling
-    sites (hygiene rewrite, manual /compress) already persisted. The agent
-    would compress correctly, the gateway would update its in-memory
-    session_id, then drop it on next gateway restart.
+    Regression for #29335: any direct assignment that omits ``_save()`` is
+    lost on restart. Compression paths that use the atomic SessionStore CAS
+    intentionally have no direct assignment for this structural check to see.
     """
     source = inspect.getsource(gateway_run)
     assignments = _session_id_assignments_followed_by_save(source)
@@ -180,5 +176,4 @@ class TestCompressionSessionPropagation:
             "session_store._save() was not called after session_entry update. "
             "The new session mapping would not survive a gateway restart."
         )
-
 
