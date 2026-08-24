@@ -320,6 +320,36 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _remote_rewrote_history(git_cmd, cwd, pre_fetch_origin_tip: str | None, branch: str) -> bool:
+    """True iff origin/<branch> was force-pushed/rebased, not just advanced.
+
+    Called only when the checkout is already ON ``branch`` and
+    ``merge --ff-only origin/<branch>`` just failed — which happens both for
+    a genuine upstream rewrite AND for the much more common case of local
+    commits origin simply doesn't have yet (e.g. a host-ops deploy committed
+    directly to this checkout). Those two cases must be handled differently:
+    a rewrite means `reset --hard` is intentional and safe; local-only
+    commits mean `reset --hard` silently destroys work that was never
+    pushed anywhere else.
+
+    The tip we knew about BEFORE this fetch is the anchor: if it's still an
+    ancestor of the freshly-fetched tip, origin only moved forward — nothing
+    upstream was rewritten, so any inability to fast-forward must come from
+    local's own extra commits. If we never had a prior tip (fresh clone, no
+    tracking ref yet), there's nothing to compare against — treat it as a
+    rewrite (the original, safe-by-default behavior) rather than guess.
+    """
+    if not pre_fetch_origin_tip:
+        return True
+    anc_check = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", pre_fetch_origin_tip, f"origin/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    return anc_check.returncode != 0
+
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
 _INSTALL_DEFINING_FILES = (
@@ -6086,6 +6116,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if cleared:
             print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
 
+        # Capture the remote tip we already knew about, BEFORE this fetch
+        # overwrites the origin/<branch> tracking ref. This is the only way
+        # to tell a genuine upstream force-push (history rewritten — the old
+        # tip is no longer an ancestor of the new one) apart from a normal
+        # fast-forward where local just happens to carry commits the remote
+        # doesn't have yet. Both look identical to `merge --ff-only` (it
+        # fails either way); without this, the code below can't distinguish
+        # them and silently discards local-only commits in the second case
+        # (2026-08-23 incident: reviewed, tested host-hygiene commits on a
+        # live checkout on `main` were wiped by `reset --hard origin/main`
+        # even though origin/main had simply moved forward, not rewritten).
+        pre_fetch_origin_tip = subprocess.run(
+            git_cmd + ["rev-parse", f"origin/{branch}"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout.strip() or None
+
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch", "origin", branch],
@@ -6551,26 +6599,83 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    # Same branch as the update target. `merge --ff-only`
+                    # failing here does NOT by itself mean an upstream
+                    # force-push — it also fails when local HEAD simply
+                    # carries commits origin doesn't have (e.g. an earlier
+                    # host-ops deploy committed directly to this checkout).
+                    # Tell the two apart: if the origin tip we knew about
+                    # BEFORE this fetch is still an ancestor of the new
+                    # origin tip, the remote only advanced — nothing was
+                    # rewritten — so treat this exactly like the custom-
+                    # branch case (merge, never reset). Only fall through to
+                    # reset when that ancestry check fails (a genuine
+                    # rewrite) or we couldn't determine it (fresh clone with
+                    # no prior tracking ref).
+                    remote_rewrote_history = _remote_rewrote_history(
+                        git_cmd, _m().PROJECT_ROOT, pre_fetch_origin_tip, branch
                     )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
+
+                    if not remote_rewrote_history:
                         print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            "  ⚠ Local checkout carries commits not on origin "
+                            f"(origin/{branch} only advanced, nothing was "
+                            "rewritten) — merging instead of resetting so "
+                            "local commits survive..."
                         )
-                        sys.exit(1)
+                        subprocess.run(
+                            git_cmd
+                            + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            check=False,
+                        )
+                        merge_result = subprocess.run(
+                            git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        if merge_result.returncode != 0:
+                            subprocess.run(
+                                git_cmd + ["merge", "--abort"],
+                                cwd=_m().PROJECT_ROOT,
+                                capture_output=True,
+                                check=False,
+                            )
+                            print(
+                                "✗ Merge conflict between local commits and upstream — "
+                                "update stopped, nothing was changed."
+                            )
+                            print(
+                                f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
+                                f"git merge origin/{branch}"
+                            )
+                            print(
+                                "  Then re-run the update. Local work is untouched."
+                            )
+                            sys.exit(1)
+                    else:
+                        # True upstream force-push/rebase. Local changes are
+                        # already stashed; reset to match the remote exactly
+                        # (original behaviour).
+                        print(
+                            "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                        )
+                        reset_result = subprocess.run(
+                            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        if reset_result.returncode != 0:
+                            print(f"✗ Failed to reset to origin/{branch}.")
+                            if reset_result.stderr.strip():
+                                print(f"  {reset_result.stderr.strip()}")
+                            print(
+                                f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            )
+                            sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
