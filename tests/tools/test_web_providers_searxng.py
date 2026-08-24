@@ -253,3 +253,76 @@ class TestSearXNGOnlyExtractCrawlErrors:
         result = json.loads(result_str)
         assert result["success"] is False
         assert "search-only" in result["error"].lower() or "SearXNG" in result["error"]
+
+    def test_capability_checks_distinguish_search_only_searxng(self, monkeypatch):
+        """A healthy search-only backend must not advertise extraction."""
+        from agent.web_search_registry import list_providers
+        from tools import web_tools
+
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        for provider in list_providers():
+            monkeypatch.setattr(
+                provider,
+                "is_available",
+                lambda provider=provider: provider.name == "searxng",
+            )
+            monkeypatch.setattr(provider, "is_keyless_available", lambda: False)
+
+        assert web_tools.check_web_search_available() is True
+        assert web_tools.check_web_extract_available() is False
+
+    def test_registry_hides_extract_for_search_only_searxng(self, monkeypatch):
+        """Tool definitions must expose search, not a predictably failing extract."""
+        from agent.web_search_registry import list_providers
+        from tools import web_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        for provider in list_providers():
+            monkeypatch.setattr(
+                provider,
+                "is_available",
+                lambda provider=provider: provider.name == "searxng",
+            )
+            monkeypatch.setattr(provider, "is_keyless_available", lambda: False)
+
+        invalidate_check_fn_cache()
+        definitions = web_tools.registry.get_definitions(
+            {"web_search", "web_extract"}, quiet=True
+        )
+        names = {definition["function"]["name"] for definition in definitions}
+
+        assert names == {"web_search"}
+
+    def test_split_backends_expose_each_supported_capability(self, monkeypatch):
+        """A search-only backend may coexist with a distinct extractor."""
+        from agent.web_search_registry import list_providers
+        from tools import web_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setattr(
+            web_tools,
+            "_load_web_config",
+            lambda: {"search_backend": "searxng", "extract_backend": "firecrawl"},
+        )
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        for provider in list_providers():
+            monkeypatch.setattr(
+                provider,
+                "is_available",
+                lambda provider=provider: provider.name in {"searxng", "firecrawl"},
+            )
+            monkeypatch.setattr(provider, "is_keyless_available", lambda: False)
+
+        assert web_tools.check_web_search_available() is True
+        assert web_tools.check_web_extract_available() is True
+
+        invalidate_check_fn_cache()
+        definitions = web_tools.registry.get_definitions(
+            {"web_search", "web_extract"}, quiet=True
+        )
+        names = {definition["function"]["name"] for definition in definitions}
+
+        assert names == {"web_search", "web_extract"}

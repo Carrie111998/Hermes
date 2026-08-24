@@ -1365,7 +1365,69 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
+def _provider_supports_capability(provider, capability: str) -> bool:
+    """Return whether *provider* implements the requested web capability."""
+    try:
+        if capability == "search":
+            return bool(provider.supports_search())
+        if capability == "extract":
+            return bool(provider.supports_extract())
+    except Exception as exc:  # noqa: BLE001 — broken provider == unsupported
+        logger.debug(
+            "web provider %r capability probe %r raised: %s",
+            getattr(provider, "name", provider),
+            capability,
+            exc,
+        )
+    return False
+
+
+def _check_web_capability_available(capability: str) -> bool:
+    """Check whether the selected backend can service *capability* now.
+
+    Tool registration must follow the same strict per-capability selection as
+    dispatch. A healthy search-only backend (SearXNG, Brave Free, DDGS) is not
+    sufficient to advertise ``web_extract``: exposing it guarantees a tool
+    failure even though ``web_search`` is fully operational.
+    """
+    if capability not in {"search", "extract"}:
+        return False
+
+    try:
+        _ensure_web_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        backend = _get_capability_backend(capability)
+        provider = get_provider(backend)
+        if provider is not None:
+            return (
+                _provider_supports_capability(provider, capability)
+                and _provider_is_ready(provider)
+            )
+
+        # xAI remains a legacy search-only path rather than a registered
+        # WebSearchProvider. Keep it available for search, never extraction.
+        return (
+            capability == "search"
+            and backend == "xai"
+            and _is_backend_available(backend)
+        )
+    except Exception as exc:  # noqa: BLE001 — discovery must never be fatal
+        logger.debug("web %s capability availability check failed: %s", capability, exc)
+        return False
+
+
+def check_web_search_available() -> bool:
+    """Return True when the selected backend can execute ``web_search``."""
+    return _check_web_capability_available("search")
+
+
+def check_web_extract_available() -> bool:
+    """Return True when the selected backend can execute ``web_extract``."""
+    return _check_web_capability_available("extract")
+
+
+# Convenience function to check provider readiness.
 def _provider_is_ready(provider) -> bool:
     """Return True when *provider* reports readiness without raising.
 
@@ -1403,14 +1465,13 @@ def _provider_is_ready(provider) -> bool:
 
 
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available.
+    """Check whether any configured web capability is available.
 
-    Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
-    tool registry entries — so a plugin-registered provider that reports
-    ``is_available()`` must light the tools up even when no built-in backend
-    has credentials (issues #28651, #31873). Resolution funnels through
-    :func:`_is_backend_available`, which delegates non-legacy names to the
-    registry.
+    Retained for doctor/setup and callers that need a combined web-service
+    readiness signal. Individual tool registry entries use
+    :func:`check_web_search_available` and
+    :func:`check_web_extract_available` so a search-only provider cannot
+    incorrectly advertise extraction.
     """
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
     # ``None.lower()`` would raise. Mirrors ``_get_backend``.
@@ -1578,7 +1639,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1592,7 +1653,7 @@ registry.register(
         "markdown",
         char_limit=args.get("char_limit"),
     ),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
