@@ -611,3 +611,163 @@ def test_update_on_main_fast_path_unchanged(repo_pair, monkeypatch, capsys):
     head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
     remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
     assert head == remote
+
+
+# ---------------------------------------------------------------------------
+# updates.parked_branch_dirty_strategy: "commit"
+# ---------------------------------------------------------------------------
+
+def _commit_strategy_config(monkeypatch, **extra):
+    """Point load_config at a config selecting the auto-commit strategy."""
+    import hermes_cli.config as hermes_config
+
+    cfg = {"updates": {"parked_branch_dirty_strategy": "commit", **extra}}
+    monkeypatch.setattr(hermes_config, "load_config", lambda: cfg)
+
+
+def test_dirty_strategy_defaults_to_skip(monkeypatch):
+    """No config → the conservative default; a dirty parked branch still
+    skips, preserving the pre-existing behavior."""
+    assert update_cmd._parked_branch_dirty_strategy() == "skip"
+
+
+def test_dirty_strategy_reads_commit_from_config(monkeypatch):
+    _commit_strategy_config(monkeypatch)
+    assert update_cmd._parked_branch_dirty_strategy() == "commit"
+
+
+def test_dirty_strategy_unknown_value_falls_back_to_skip(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_dirty_strategy": "yolo"}},
+    )
+    assert update_cmd._parked_branch_dirty_strategy() == "skip"
+
+
+def test_auto_commit_captures_modified_and_untracked(repo_pair):
+    """Both tracked edits and untracked files land in the commit — untracked
+    files are exactly what would otherwise ride along on a checkout."""
+    (repo_pair / "a.txt").write_text("local edit\n")
+    (repo_pair / "scratch.py").write_text("wip\n")
+
+    committed, detail = update_cmd._auto_commit_parked_branch(
+        GIT, repo_pair, "old-feature"
+    )
+
+    assert committed is True
+    assert detail  # short sha
+    assert _git(repo_pair, "status", "--porcelain").stdout.strip() == ""
+    files = _git(
+        repo_pair, "show", "--name-only", "--format=", "HEAD"
+    ).stdout.split()
+    assert sorted(files) == ["a.txt", "scratch.py"]
+    subject = _git(
+        repo_pair, "log", "-1", "--format=%s"
+    ).stdout.strip()
+    assert subject.startswith("wip: pre-update auto-commit")
+
+
+def test_auto_commit_makes_the_guard_safe_to_switch(repo_pair):
+    """After the auto-commit the branch is clean, so the guard now reports
+    it as switchable with the work carried as an unmerged commit."""
+    (repo_pair / "a.txt").write_text("local edit\n")
+    assert update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    ) == (False, "dirty")
+
+    update_cmd._auto_commit_parked_branch(GIT, repo_pair, "old-feature")
+
+    safe, reason = update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    )
+    assert safe is True
+    assert reason == "unmerged:1"
+
+
+def test_auto_commit_failure_leaves_tree_unstaged(repo_pair, tmp_path):
+    """A commit failure (here: a rejecting pre-commit hook) must not leave
+    work half-staged — the user's tree is handed back as it was found."""
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    _git(repo_pair, "config", "core.hooksPath", str(hooks))
+    (repo_pair / "a.txt").write_text("local edit\n")
+
+    committed, detail = update_cmd._auto_commit_parked_branch(
+        GIT, repo_pair, "old-feature"
+    )
+
+    assert committed is False
+    # " M" (unstaged) rather than "M " (staged): the `git add -A` was undone.
+    status = _git(repo_pair, "status", "--porcelain").stdout
+    assert status.splitlines() == [" M a.txt"]
+
+
+def test_update_auto_commits_dirty_parked_branch_and_switches(
+    repo_pair, monkeypatch, capsys
+):
+    """End-to-end: the exact failure shape (dirty parked branch) now commits
+    the work and carries the update through to the target branch."""
+    (repo_pair / "a.txt").write_text("local edit\n")
+    (repo_pair / "scratch.py").write_text("wip\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+    _commit_strategy_config(monkeypatch)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "CODE UPDATE SKIPPED" not in out
+    assert "committed as" in out
+    # Landed on the target branch, at origin/main.
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "main"
+    )
+    head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    assert head == _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
+    # Nothing was stashed, and the work is recoverable on the branch.
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
+    branch_files = _git(
+        repo_pair, "show", "--name-only", "--format=", "old-feature"
+    ).stdout.split()
+    assert sorted(branch_files) == ["a.txt", "scratch.py"]
+
+
+def test_update_still_skips_dirty_parked_branch_when_opted_out(
+    repo_pair, monkeypatch, capsys
+):
+    """auto_switch_parked_branch: false is an explicit opt-out and the
+    commit strategy must not override it."""
+    (repo_pair / "a.txt").write_text("local edit\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+    _commit_strategy_config(monkeypatch, auto_switch_parked_branch=False)
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "CODE UPDATE SKIPPED" in out
+    # The tree was never committed.
+    assert _git(repo_pair, "status", "--porcelain").stdout.strip() != ""
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )

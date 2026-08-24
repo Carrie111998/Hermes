@@ -3379,6 +3379,28 @@ DEFAULT_CONFIG = {
         #                         run (e.g. a deep feature branch that must
         #                         not accumulate update merge commits).
         "parked_branch_strategy": "switch",
+        # WHAT happens when the parked branch has a DIRTY working tree
+        # (uncommitted or untracked changes):
+        #   "skip" (default) — touch nothing; the code update is SKIPPED with
+        #                      a loud warning naming the branch, the behind-
+        #                      count, and the commands to resolve it. Safe,
+        #                      but a non-interactive caller (desktop update
+        #                      button, gateway /update, cron) has no way to
+        #                      act on it, so the checkout stays stale until a
+        #                      human intervenes.
+        #   "commit"         — commit the working tree onto the parked branch
+        #                      first ("wip: pre-update auto-commit"),
+        #                      then proceed down the normal clean-tree path.
+        #                      Nothing is discarded and nothing is stashed
+        #                      across a checkout: the commit stays on the
+        #                      branch, and `git checkout` never discards
+        #                      committed work. Amend or reset it to resume.
+        #                      Choose this when unattended updates matter more
+        #                      than a tidy branch history.
+        # Only a dirty tree is recoverable this way — auto_switch_parked_branch:
+        # false is an explicit opt-out and an unverifiable repo state is not
+        # overridden.
+        "parked_branch_dirty_strategy": "skip",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

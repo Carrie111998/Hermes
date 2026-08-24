@@ -1125,6 +1125,92 @@ def _assess_parked_branch_switch(
     return True, ""
 
 
+def _parked_branch_dirty_strategy() -> str:
+    """Resolve ``updates.parked_branch_dirty_strategy``: ``"skip"`` or
+    ``"commit"``.
+
+    Unknown values fall back to ``"skip"`` — the conservative default that
+    touches nothing.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("updates", {})
+        if isinstance(cfg, dict):
+            raw = cfg.get("parked_branch_dirty_strategy", "skip")
+            if isinstance(raw, str) and raw.strip().lower() == "commit":
+                return "commit"
+            if isinstance(raw, str) and raw.strip().lower() not in ("skip", ""):
+                logger.warning(
+                    "Unknown updates.parked_branch_dirty_strategy value %r — "
+                    "using 'skip'",
+                    raw,
+                )
+    except Exception as exc:
+        logger.debug("Could not read updates.parked_branch_dirty_strategy: %s", exc)
+    return "skip"
+
+
+def _auto_commit_parked_branch(
+    git_cmd: list[str], cwd: Path, current_branch: str
+) -> tuple[bool, str]:
+    """Commit the working tree onto the parked branch so the update can move.
+
+    This is the ``updates.parked_branch_dirty_strategy: commit`` path. A dirty
+    parked branch otherwise SKIPS the code update outright (the checkout stays
+    behind main until a human resolves it), which non-interactive callers — the
+    desktop Update button, gateway ``/update``, cron — cannot do.
+
+    Committing is safe where autostashing across a checkout is not: the commit
+    lands on the parked branch and stays there. ``git checkout`` never discards
+    committed work, so the subsequent switch to the update target carries no
+    risk of the conflict-on-reapply failure mode the parked-branch guard exists
+    to prevent.
+
+    Returns ``(committed, detail)``. ``detail`` is the new short SHA on success
+    or a human-readable failure reason.
+    """
+    add = subprocess.run(
+        git_cmd + ["add", "-A"],
+        cwd=cwd, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if add.returncode != 0:
+        return False, (add.stderr or add.stdout or "git add failed").strip()
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message = (
+        f"wip: pre-update auto-commit ({stamp})\n\n"
+        f"Uncommitted work on '{current_branch}' was committed automatically "
+        f"so\nthe updater could switch to the target branch. Nothing was "
+        f"discarded;\namend or reset this commit to resume where you left off."
+    )
+    commit = subprocess.run(
+        git_cmd + ["commit", "-m", message],
+        cwd=cwd, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if commit.returncode != 0:
+        # Most common real cause is missing user.name/user.email identity.
+        detail = (commit.stderr or commit.stdout or "git commit failed").strip()
+        # Leave nothing half-staged: the tree goes back to how we found it so
+        # the skip warning's advice ("commit or stash your work") still applies
+        # to the same set of changes the user has.
+        subprocess.run(
+            git_cmd + ["reset", "-q"],
+            cwd=cwd, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        return False, detail
+
+    sha = subprocess.run(
+        git_cmd + ["rev-parse", "--short", "HEAD"],
+        cwd=cwd, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    return True, sha.stdout.strip() if sha.returncode == 0 else ""
+
+
 def _print_parked_branch_skip_warning(
     git_cmd: list[str],
     cwd: Path,
@@ -6140,6 +6226,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
                 git_cmd, _m().PROJECT_ROOT, current_branch, branch
             )
+            if (
+                not switch_safe
+                and switch_block_reason == "dirty"
+                and _m()._parked_branch_dirty_strategy() == "commit"
+            ):
+                # updates.parked_branch_dirty_strategy: commit — park the
+                # uncommitted work as a commit ON the branch, then re-assess.
+                # Only the dirty reason is recoverable this way: "disabled"
+                # is an explicit opt-out and "unverifiable" means we could not
+                # read the repo state, so neither may be overridden here.
+                committed, detail = _m()._auto_commit_parked_branch(
+                    git_cmd, _m().PROJECT_ROOT, current_branch
+                )
+                if committed:
+                    print(
+                        f"  ℹ Uncommitted work on '{current_branch}' committed "
+                        f"as {detail} (updates.parked_branch_dirty_strategy: "
+                        f"commit)."
+                    )
+                    switch_safe, switch_block_reason = (
+                        _m()._assess_parked_branch_switch(
+                            git_cmd, _m().PROJECT_ROOT, current_branch, branch
+                        )
+                    )
+                else:
+                    print(
+                        f"  ⚠ Could not auto-commit '{current_branch}': "
+                        f"{detail}"
+                    )
             if not switch_safe:
                 _m()._print_parked_branch_skip_warning(
                     git_cmd,

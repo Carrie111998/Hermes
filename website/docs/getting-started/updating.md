@@ -51,7 +51,16 @@ If the source checkout was left sitting on a feature branch (by tooling, a workt
 
 If you *deliberately* run a custom branch (local patches maintained on top of main), set `updates.parked_branch_strategy: update_in_place` in `config.yaml`. The update then merges `origin/main` **into** your branch instead of switching away from it — the checkout never moves, your commits survive, and the running code advances. Fast-forward when possible; on divergence a true merge behind a `pre-update-<stamp>` safety tag, stopping cleanly (nothing changed) on conflict. `hermes update --switch-branch` overrides back to the switch path for one run — useful on a deep feature branch that must not accumulate update-driven merge commits.
 
-When the parked branch has **uncommitted changes** (dirty tree), Hermes does **not** touch it. The code update is marked **SKIPPED** with a loud warning naming the branch, how far behind `origin/main` it is, and the exact commands to resolve — instead of pretending the update succeeded. The completion line always shows the actual branch and HEAD (`✓ Update complete! [main @ 30fcf9580]`) so drift is visible at a glance. Set `updates.auto_switch_parked_branch: false` in `config.yaml` to disable the auto-switch entirely (the skip warning still fires).
+When the parked branch has **uncommitted changes** (dirty tree), Hermes does **not** touch it by default. The code update is marked **SKIPPED** with a loud warning naming the branch, how far behind `origin/main` it is, and the exact commands to resolve — instead of pretending the update succeeded. The completion line always shows the actual branch and HEAD (`✓ Update complete! [main @ 30fcf9580]`) so drift is visible at a glance. Set `updates.auto_switch_parked_branch: false` in `config.yaml` to disable the auto-switch entirely (the skip warning still fires).
+
+A skip is unresolvable for the callers that need updates most — the desktop Update button, gateway `/update`, cron — since none of them can stop and commit for you. Set `updates.parked_branch_dirty_strategy: commit` in `config.yaml` to have the update commit the working tree onto the parked branch first (`wip: pre-update auto-commit`), then continue down the normal clean-tree path:
+
+```yaml
+updates:
+  parked_branch_dirty_strategy: commit   # default: skip
+```
+
+Nothing is discarded and nothing is stashed across a checkout — the commit stays on the parked branch, and `git checkout` never discards committed work, so this avoids the conflict-on-reapply failure the parked-branch guard exists to prevent. Both tracked edits and untracked files are included. To resume where you left off, `git checkout <branch>` and `git reset HEAD~1` (or amend the commit). Only a dirty tree is recoverable this way: `auto_switch_parked_branch: false` is an explicit opt-out, and a repo state Hermes could not verify is never overridden.
 
 ### Local changes on non-interactive updates
 
