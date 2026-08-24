@@ -151,6 +151,7 @@ const profile = (name: string): ProfileInfo => ({
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.clearAllMocks()
   $activeGatewayProfile.set('remote-worker')
   $gatewaySwapTarget.set(null)
@@ -255,6 +256,52 @@ describe('connection-aware plugin host APIs', () => {
     expect(requestGatewayForProfile).not.toHaveBeenCalled()
   })
 
+  it('keeps an explicitly bounded relay request alive beyond the generic 30-second deadline', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'remote-worker',
+      targetProfile: 'backend-worker'
+    }
+    vi.useFakeTimers()
+    vi.mocked(requestGatewayForAgent).mockImplementationOnce(
+      async (_connectionId, _profile, _method, _params, timeoutMs) =>
+        new Promise((resolve, reject) => {
+          setTimeout(() => reject(new Error('request timed out')), timeoutMs)
+          setTimeout(() => resolve({ reply: 'completed after 31s' }), 31_000)
+        })
+    )
+
+    const request = host.requestProfile<{ reply: string }>(
+      route,
+      'bot_relay.deliver',
+      { message: 'hello' },
+      1_320_000
+    )
+
+    let settled = false
+    void request.finally(() => {
+      settled = true
+    })
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1_000)
+    await expect(request).resolves.toEqual({ reply: 'completed after 31s' })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'remote-worker',
+      'bot_relay.deliver',
+      { message: 'hello' },
+      1_320_000
+    )
+
+    vi.useRealTimers()
+    vi.mocked(requestGatewayForAgent).mockClear()
+    await host.requestProfile(route, 'profiles.list', {})
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'remote-worker', 'profiles.list', {})
+  })
+
   it('fails closed when a descriptor omits connection or target profile identity', async () => {
     await expect(
       host.requestProfile(
@@ -351,6 +398,17 @@ describe('connection-aware plugin host APIs', () => {
     expect(requestGatewayForProfile).toHaveBeenCalledWith('legacy-worker', 'profiles.list', {
       include_sessions: true
     })
+  })
+
+  it('forwards an explicit deadline through the profile-only compatibility path', async () => {
+    await host.requestProfile('legacy-worker', 'bot_relay.deliver', { message: 'hello' }, 1_320_000)
+
+    expect(requestGatewayForProfile).toHaveBeenCalledWith(
+      'legacy-worker',
+      'bot_relay.deliver',
+      { message: 'hello' },
+      1_320_000
+    )
   })
 
   it('rejects a profile-only request when the current registry makes it ambiguous', async () => {

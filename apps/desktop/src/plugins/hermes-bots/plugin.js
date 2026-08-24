@@ -1500,6 +1500,10 @@ function handleSessionsGatewayTransition() {
 // Older backends without the RPCs fail per-call and are skipped — the
 // relay degrades to whatever subset of connections supports it.
 const RELAY_ROSTER_INTERVAL_MS = 60_000
+// The backend can wait 120s for the profile turn lock, then run one 600s
+// turn and one policy-gated 600s retry. Keep only bot_relay.deliver on this
+// bounded 1,320s contract; every other plugin RPC keeps the generic deadline.
+const RELAY_DELIVER_TIMEOUT_MS = 22 * 60 * 1000
 // Backstop cadence only (#93594): the push path below carries envelope latency,
 // so the interval poll exists for older backends and missed events — 30s
 // matches LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS. It was 4s back when the
@@ -1770,7 +1774,7 @@ async function drainRelayOutboxes() {
           const res = await host.requestProfile(target.route, 'bot_relay.deliver', {
             profile: String(envelope?.target_profile || ''),
             message: String(envelope?.message || '')
-          })
+          }, RELAY_DELIVER_TIMEOUT_MS)
           clearBotAttention(attentionKey)
           await postReply({ reply: String(res?.reply || '') })
         } catch (error) {
