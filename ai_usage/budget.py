@@ -67,10 +67,20 @@ def budget_provider(
     if "mo" in by_id:
         bits.append(_bit("mo", "mo"))
 
-    return {
+    row = {
         **base,
         "state": "ok",
         "fetched_at": iso(snapshot.fetched_at),
         "windows": windows,
         "detail": " · ".join(bits) or "ok",
     }
+    # Which account this credential actually belongs to (Anthropic only today).
+    # Carried into ai-tokens.json so the collector's duplicate-account guard can
+    # spot two rows backed by the same subscription.
+    account_uuid = getattr(snapshot, "account_uuid", None)
+    if account_uuid:
+        row["account_uuid"] = account_uuid
+    account_email = getattr(snapshot, "account_email", None)
+    if account_email:
+        row["account_email"] = account_email
+    return row

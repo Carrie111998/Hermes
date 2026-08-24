@@ -155,6 +155,12 @@ class AccountUsageSnapshot:
     # instead of rolling %-windows. None for subscription/quota providers.
     balance_usd: Optional[float] = None
     balance_currency: Optional[str] = None
+    # Which account the credential actually belongs to. Populated for the
+    # Anthropic providers from GET /api/oauth/usage's sibling profile endpoint
+    # so the collector can tell two DISTINCT subscriptions apart from two
+    # tokens minted against the SAME one (see _flag_duplicate_accounts).
+    account_uuid: Optional[str] = None
+    account_email: Optional[str] = None
 
     @property
     def available(self) -> bool:
@@ -873,6 +879,36 @@ def redeem_codex_reset_credit(
     )
 
 
+def _fetch_anthropic_account_identity(
+    client: Any, headers: dict
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve which account an OAuth token belongs to (uuid, email).
+
+    ``/api/oauth/profile`` is the sibling of the usage endpoint and needs the
+    same ``user:profile`` scope, so a token that can read usage can always read
+    this. Best-effort: any failure returns ``(None, None)`` rather than losing
+    the usage numbers we already fetched successfully.
+
+    Exists so the collector can distinguish two DISTINCT subscriptions from two
+    tokens minted against the SAME account -- the 2026-08-23 defect where the
+    tray's "Claude" and "Claude 2" rows both reported diegodearagaous@gmail.com
+    (identical percentages) because the isolated ~/.claude-anthropic2 login
+    landed on the already-signed-in browser account.
+    """
+    try:
+        response = client.get(
+            "https://api.anthropic.com/api/oauth/profile", headers=headers
+        )
+        response.raise_for_status()
+        account = (response.json() or {}).get("account") or {}
+    except Exception as exc:  # noqa: BLE001 - identity is advisory, never fatal
+        logger.debug("anthropic profile lookup failed: %s", exc)
+        return None, None
+    uuid = str(account.get("uuid") or "").strip() or None
+    email = str(account.get("email") or "").strip() or None
+    return uuid, email
+
+
 def _fetch_anthropic_usage_with_token(
     token: str,
     *,
@@ -900,6 +936,7 @@ def _fetch_anthropic_usage_with_token(
     with httpx.Client(timeout=timeout) as client:
         response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
         response.raise_for_status()
+        account_uuid, account_email = _fetch_anthropic_account_identity(client, headers)
     payload = response.json() or {}
     windows: list[AccountUsageWindow] = []
     mapping = (
@@ -937,6 +974,8 @@ def _fetch_anthropic_usage_with_token(
         fetched_at=_utc_now(),
         windows=tuple(windows),
         details=tuple(details),
+        account_uuid=account_uuid,
+        account_email=account_email,
     )
 
 

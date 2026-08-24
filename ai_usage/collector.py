@@ -228,6 +228,34 @@ def _diagnostic(key: str, outcome: str, elapsed: float, budget: float) -> dict:
     }
 
 
+def _flag_duplicate_accounts(providers: list[dict]) -> None:
+    """Mark rows whose credentials resolve to the SAME upstream account.
+
+    Two provider rows exist to track two DISTINCT subscriptions. Two tokens
+    minted against ONE account produce two rows with identical numbers and no
+    visible symptom -- exactly the 2026-08-23 defect where the isolated
+    ``~/.claude-anthropic2`` login landed on the already-signed-in browser
+    account, so "Claude" and "Claude 2" both reported diegodearagaous@gmail.com.
+
+    The first row of a colliding group keeps its data (it is the one whose
+    numbers are genuinely its own); every later row is flagged so the tray shows
+    the collision instead of a plausible duplicate. Mutates in place.
+    """
+    first_by_account: dict[str, dict] = {}
+    for row in providers:
+        account = str(row.get("account_uuid") or "").strip()
+        if not account or row.get("state") != "ok":
+            continue
+        incumbent = first_by_account.get(account)
+        if incumbent is None:
+            first_by_account[account] = row
+            continue
+        email = row.get("account_email") or account
+        row["state"] = "error"
+        row["duplicate_of"] = incumbent.get("key")
+        row["detail"] = f"same account as {incumbent.get('label')} ({email})"
+
+
 def collect(
     *,
     db_path: str,
@@ -316,6 +344,8 @@ def collect(
     finally:
         if conn is not None:
             conn.close()
+
+    _flag_duplicate_accounts(providers)
 
     elapsed = max(0.0, _monotonic() - started)
     result = {
