@@ -93,6 +93,7 @@ import {
   $focusedStoredSessionId,
   $sessionStates,
   $sessionTiles,
+  $stalledSessionIds,
   $workingSessionIds
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -564,7 +565,21 @@ export const host = {
      * directly. Prefer this over `busy` (one bit, focused chat only) or
      * `busyBySession` (runtime ids) for any per-row "is this working" readout.
      */
-    workingStoredSessionIds: readonlyAtom<readonly string[]>($workingSessionIds)
+    workingStoredSessionIds: readonlyAtom<readonly string[]>($workingSessionIds),
+    /**
+     * STORED session ids whose mid-turn state has gone silent past the stream
+     * watchdog window — still `busy` on paper, but with no publish behind it
+     * for minutes. A turn that dies without a terminal frame AND without
+     * dropping its socket (so neither the error path nor
+     * reconcileBusyStatesOnReconnect fires) leaves `busy` stranded true
+     * forever; this is the only witness that arrives in that case. Per-row
+     * "is this working" chrome should subtract these from
+     * `workingStoredSessionIds` rather than inventing a second clock — a long
+     * healthy turn (typecheck, test run) is quiet in the transcript but is
+     * NOT stalled, so any timeout keyed off message age would drop the
+     * indicator on exactly the turns worth showing.
+     */
+    stalledStoredSessionIds: readonlyAtom<readonly string[]>($stalledSessionIds)
   },
 
   /** Toast into the app's notification stack. */
@@ -1362,7 +1377,11 @@ export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
  *  one that animates — the string renderer ignores `animate` by design).
  *  `motion.css` is imported here rather than by each consumer: nothing
  *  animates without it, and it costs the stylesheet and nothing else on the
- *  static path (imported at the top of this file). */
+ *  static path (imported at the top of this file). That import is a deliberate
+ *  SIDE EFFECT, not dead weight — it is what makes `animate` work at all, so
+ *  every consumer pays the sheet whether or not it renders a Blobatar. Do not
+ *  "optimize" it into a per-consumer import: the faces silently stop moving in
+ *  whichever surface forgets it. */
 export { blobatar as blobatarSvg } from 'blobatar/blob'
 export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll

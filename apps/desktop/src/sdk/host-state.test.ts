@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $gatewayState } from '@/store/session'
-import { $sessionStates, dropSessionState, publishSessionState } from '@/store/session-states'
+import { $sessionStates, dropSessionState, publishSessionState, setSessionStalled } from '@/store/session-states'
 
 import { host } from './index'
 
@@ -292,5 +292,24 @@ describe('host.state busy vs gateway', () => {
 
     dropSessionState('runtime-a')
     expect([...host.state.workingStoredSessionIds.get()]).toEqual(['stored-b'])
+  })
+
+  // A turn can die with `busy` stranded true: no terminal frame (so the
+  // stream's error path never runs) and no socket drop (so
+  // reconcileBusyStatesOnReconnect never runs). The watchdog is the only
+  // witness left, and roster chrome needs to see it to release its indicator.
+  it('exposes watchdog-stalled chats by stored id, alongside the working set', () => {
+    publishSessionState('runtime-a', { ...createClientSessionState('stored-a'), busy: true })
+    expect([...host.state.workingStoredSessionIds.get()]).toEqual(['stored-a'])
+    expect([...host.state.stalledStoredSessionIds.get()]).toEqual([])
+
+    setSessionStalled('stored-a', true)
+    // Still busy on paper — the flag is what stalled, so both sets hold it and
+    // the consumer subtracts rather than the store guessing for it.
+    expect([...host.state.workingStoredSessionIds.get()]).toEqual(['stored-a'])
+    expect([...host.state.stalledStoredSessionIds.get()]).toEqual(['stored-a'])
+
+    setSessionStalled('stored-a', false)
+    expect([...host.state.stalledStoredSessionIds.get()]).toEqual([])
   })
 })

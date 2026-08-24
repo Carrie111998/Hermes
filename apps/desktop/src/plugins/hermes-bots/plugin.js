@@ -89,6 +89,11 @@ const Blobatar = typeof sdk === 'undefined' ? undefined : sdk.Blobatar
 // that never reads 'busy'. Feature-detected: older desktops get worker
 // liveness only.
 const $workingChats = host.state.workingStoredSessionIds || atom([])
+/** Stored ids whose busy bit has gone silent past the stream watchdog. A turn
+ *  that dies without a terminal frame and without dropping its socket strands
+ *  `busy` true forever; this is the witness that says so. Older desktops
+ *  publish no such atom and fall back to the flag alone. */
+const $stalledChats = host.state.stalledStoredSessionIds || atom([])
 
 /** Stored ids this bot's own chats answer to — registry row and lineage tip
  *  both, since a surface holds whichever one it opened. */
@@ -103,9 +108,20 @@ function botChatIds(bot) {
     .map(String)
 }
 
+/** True when any of this bot's own chats is in `ids`. */
+function botOwnsChat(bot, ids) {
+  return Boolean(ids?.length) && botChatIds(bot).some(id => ids.includes(id))
+}
+
 /** True when one of this bot's own chats is mid-turn. */
 function botOwnsWorkingChat(bot, workingIds) {
-  return Boolean(workingIds?.length) && botChatIds(bot).some(id => workingIds.includes(id))
+  return botOwnsChat(bot, workingIds)
+}
+
+/** True when one of this bot's own chats is busy-but-silent (see
+ *  $stalledChats): the flag still claims a turn, the stream stopped agreeing. */
+function botOwnsStalledChat(bot, stalledIds) {
+  return botOwnsChat(bot, stalledIds)
 }
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
@@ -2416,7 +2432,7 @@ async function deleteBot(bot) {
 if (typeof document !== 'undefined') {
   const style = document.getElementById('hermes-bots-roster-css') || document.createElement('style')
   style.id = 'hermes-bots-roster-css'
-  style.textContent =
+  const css =
     '.hermes-bots-roster [data-radix-scroll-area-viewport] > div {' +
     ' display: block !important; width: 100%; min-width: 0; }' +
     '.hermes-scroll-cap > [data-radix-scroll-area-viewport] { max-height: inherit; }' +
@@ -2430,6 +2446,13 @@ if (typeof document !== 'undefined') {
     '.hermes-bots-typing > span { animation: hermes-bots-typing 1.25s ease-in-out infinite; }' +
     '.hermes-bots-typing > span:nth-child(2) { animation-delay: 0.16s; }' +
     '.hermes-bots-typing > span:nth-child(3) { animation-delay: 0.32s; }'
+
+  // Compared rather than assigned blind: an unchanged sheet skips a re-parse
+  // on every HMR cycle, and an EDITED one still differs, so the reload
+  // guarantee above is untouched.
+  if (style.textContent !== css) {
+    style.textContent = css
+  }
 
   if (!style.isConnected) {
     document.head.appendChild(style)
@@ -7597,6 +7620,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const workingChats = useValue($workingChats)
+  const stalledChats = useValue($stalledChats)
   // Preview identity must match click identity (#88200): when the backend
   // resolved the pinned canonical chat, preview THAT session — not the
   // profile's most recent (but unrelated) activity. Activity signals
@@ -7631,7 +7655,18 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   // the turn that produced it is over. An older gateway sends no last_role,
   // and there the flag still governs on its own.
   const answered = String(activitySession?.last_role || '').toLowerCase() === 'assistant'
-  const working = workerWorking || (!answered && botOwnsWorkingChat(bot, workingChats))
+  // The roster poll only witnesses turns that PRODUCED something. A turn that
+  // dies before any assistant message — no terminal frame, no socket drop, so
+  // neither the stream's error path nor reconcileBusyStatesOnReconnect fires —
+  // leaves `last_role` on 'user' and `busy` stranded true, and the dots run
+  // forever. The stream watchdog is the witness that always arrives there.
+  //
+  // Deliberately NOT a timeout on message age: a healthy long turn (typecheck,
+  // full test run) is silent in the transcript for minutes and is exactly the
+  // turn worth indicating. Stalled means the STREAM went quiet, not the
+  // transcript.
+  const stalled = botOwnsStalledChat(bot, stalledChats)
+  const working = workerWorking || (!answered && !stalled && botOwnsWorkingChat(bot, workingChats))
   // Legacy math face follows the same signal; blobatars stay idle and let
   // the dots carry it.
   const botMood = working ? 'work' : 'idle'

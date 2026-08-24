@@ -67,10 +67,13 @@ test('BotRow keys the highlight off the focused profile, not the socket home', (
 // 'busy'. Mid-turn is now per-chat, keyed by the bot's own stored session ids.
 test('BotRow reads mid-turn per chat, not from focus or the socket', () => {
   const rowStart = source.indexOf('function BotRow(')
-  const row = source.slice(rowStart, rowStart + 5000)
+  const row = source.slice(rowStart, rowStart + 7000)
 
   assert.match(row, /const workingChats = useValue\(\$workingChats\)/)
-  assert.match(row, /const working = workerWorking \|\| \(!answered && botOwnsWorkingChat\(bot, workingChats\)\)/)
+  assert.match(
+    row,
+    /const working = workerWorking \|\| \(!answered && !stalled && botOwnsWorkingChat\(bot, workingChats\)\)/
+  )
   assert.match(row, /const botMood = working \? 'work' : 'idle'/)
   assert.ok(!/gatewayState === 'busy'/.test(row), 'the socket atom never reads busy')
   assert.ok(!/focusedTurnBusy/.test(row), 'a single focused-chat bit cannot answer a roster')
@@ -78,14 +81,43 @@ test('BotRow reads mid-turn per chat, not from focus or the socket', () => {
 
 test('the working-chats atom is feature-detected for older desktops', () => {
   assert.match(source, /const \$workingChats = host\.state\.workingStoredSessionIds \|\| atom\(\[\]\)/)
+  assert.match(source, /const \$stalledChats = host\.state\.stalledStoredSessionIds \|\| atom\(\[\]\)/)
+})
+
+// A turn that dies before any assistant message leaves `last_role` on 'user'
+// (so `answered` never flips) and, with no terminal frame and no socket drop,
+// `busy` stranded true — the dots would run forever. The stream watchdog is
+// the only witness that arrives in that case.
+test('a stalled chat releases the typing dots even when the busy flag is stranded', () => {
+  const idsStart = source.indexOf('function botChatIds(')
+  const ownsStart = source.indexOf('function botOwnsChat(')
+  const stalledStart = source.indexOf('function botOwnsStalledChat(')
+  const body =
+    source.slice(idsStart, source.indexOf('\n}', idsStart) + 2) +
+    source.slice(ownsStart, source.indexOf('\n}', ownsStart) + 2) +
+    source.slice(stalledStart, source.indexOf('\n}', stalledStart) + 2)
+  const stalledFor = new Function(`${body}; return botOwnsStalledChat`)()
+
+  const bot = { canonical_session: { id: 'reg-1', resolved_id: 'tip-9' } }
+  const working = (answered, stalled) => !answered && !stalled
+
+  assert.equal(stalledFor(bot, ['tip-9']), true)
+  assert.equal(stalledFor(bot, []), false)
+  // Stranded busy + no assistant reply yet: the watchdog releases the dots.
+  assert.equal(working(false, stalledFor(bot, ['tip-9'])), false)
+  // A healthy long turn is quiet in the TRANSCRIPT, not on the stream, so it
+  // never lands in the stalled set and keeps its dots.
+  assert.equal(working(false, stalledFor(bot, [])), true)
 })
 
 // The turn lands on whichever id the runtime bound, so both must match.
 test('botOwnsWorkingChat matches the registry id and the lineage tip', () => {
   const idsStart = source.indexOf('function botChatIds(')
+  const ownsStart = source.indexOf('function botOwnsChat(')
   const start = source.indexOf('function botOwnsWorkingChat(')
   const body =
     source.slice(idsStart, source.indexOf('\n}', idsStart) + 2) +
+    source.slice(ownsStart, source.indexOf('\n}', ownsStart) + 2) +
     source.slice(start, source.indexOf('\n}', start) + 2)
   const owns = new Function(`${body}; return botOwnsWorkingChat`)()
 
@@ -116,7 +148,7 @@ test('the $selectedBot tracker binds the focused profile ladder (reseed + unbind
 // tool row used to hold the typing dots lit for the whole window.
 test('a finished turn does not keep the dots on via its tool row', () => {
   const rowStart = source.indexOf('function BotRow(')
-  const row = source.slice(rowStart, rowStart + 5000)
+  const row = source.slice(rowStart, rowStart + 7000)
 
   assert.match(row, /const workerWorking = workerLive && workerTs > chatTs/)
   // The age label still counts a live worker, dots or not.
@@ -129,8 +161,11 @@ test('a finished turn does not keep the dots on via its tool row', () => {
 // the profile at all). The roster poll is the witness that always arrives.
 test('a stranded busy flag cannot outlive the answer', () => {
   const rowStart = source.indexOf('function BotRow(')
-  const row = source.slice(rowStart, rowStart + 6000)
+  const row = source.slice(rowStart, rowStart + 8000)
 
   assert.match(row, /const answered = String\(activitySession\?\.last_role \|\| ''\)\.toLowerCase\(\) === 'assistant'/)
-  assert.match(row, /const working = workerWorking \|\| \(!answered && botOwnsWorkingChat\(bot, workingChats\)\)/)
+  assert.match(
+    row,
+    /const working = workerWorking \|\| \(!answered && !stalled && botOwnsWorkingChat\(bot, workingChats\)\)/
+  )
 })
