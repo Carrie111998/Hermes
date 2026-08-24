@@ -112,6 +112,32 @@ def test_manual_run_claims_stale_oneshot_without_marking_it_missed(
     assert persisted.get("missed_at") is None
 
 
+def test_due_scan_preserves_manual_claim_for_stale_oneshot(temp_home, monkeypatch):
+    """A scheduler scan must not retire an in-flight explicit Run-now."""
+    import cron.jobs as jobs
+
+    now = datetime(2026, 6, 22, 20, 0, 0, tzinfo=timezone.utc)
+    run_at = (now - timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(prompt="x", schedule="1h", name="manual stale")
+    records = jobs.load_jobs()
+    records[0]["schedule"] = {"kind": "once", "run_at": run_at}
+    records[0]["next_run_at"] = run_at
+    jobs.save_jobs(records)
+
+    claimed = jobs.claim_job_for_fire(
+        job["id"], scheduled_fire=False, return_job=True
+    )
+    owner = claimed["fire_claim"]
+
+    assert jobs.get_due_jobs() == []
+    persisted = jobs.get_job(job["id"])
+    assert persisted["enabled"] is True
+    assert persisted["state"] == "scheduled"
+    assert persisted["fire_claim"] == owner
+    assert persisted.get("last_status") != "missed"
+
+
 def test_stale_claim_is_reclaimable(temp_home, monkeypatch):
     """A claim older than the TTL is overwritten — the fire isn't stuck forever
     if the winning machine crashed before mark_job_run cleared the claim."""

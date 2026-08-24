@@ -2952,10 +2952,27 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+_DEFAULT_FIRE_CLAIM_TTL_SECONDS = 300
+
+
+def _claim_is_fresh(
+    claim: Any, now: datetime, claim_ttl_seconds: float
+) -> bool:
+    """Return whether a claim timestamp is valid and inside its bounded lease."""
+    if not isinstance(claim, dict):
+        return False
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(claim["at"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    age = (now - claimed_at).total_seconds()
+    return 0 <= age < claim_ttl_seconds
+
+
 def claim_job_for_fire(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: int = _DEFAULT_FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     scheduled_fire: bool = True,
     return_job: bool = False,
@@ -2975,7 +2992,7 @@ def claim_job_for_fire(
 def _claim_job_for_fire_locked(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: int = _DEFAULT_FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     scheduled_fire: bool = True,
     return_job: bool = False,
@@ -3018,20 +3035,10 @@ def _claim_job_for_fire_locked(
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
-            if existing:
-                try:
-                    claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
-                    # Bounded on BOTH sides (#60703): a claim stamped in the
-                    # future (clock/TZ skew across a restart, or a corrupted
-                    # timestamp) would otherwise have a negative age and stay
-                    # "fresh" forever — the job becomes permanently unfireable
-                    # and every manual `cron run` reports "already being
-                    # fired". Treat future-dated claims as stale/overwritable.
-                    _age = (now - claimed_at).total_seconds()
-                    if 0 <= _age < claim_ttl_seconds:
-                        return False  # someone holds a fresh claim
-                except Exception:
-                    pass  # malformed claim → overwrite
+            # Bounded on BOTH sides (#60703): a claim stamped in the future
+            # must be stale/overwritable rather than permanently blocking fire.
+            if _claim_is_fresh(existing, now, claim_ttl_seconds):
+                return False  # someone holds a fresh claim
             if force:
                 job["enabled"] = True
                 job["state"] = "scheduled"
@@ -3552,6 +3559,17 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     continue
 
                 if _oneshot_missed_grace(job, next_run_dt, now):
+                    # An explicit Run-now leaves a one-shot's stale schedule in
+                    # place while fire_claim owns the execution. A concurrent
+                    # built-in ticker must not retire that in-flight run or
+                    # clear its ownership fence. Expired/malformed/future-dated
+                    # claims still fall through to normal stale retirement.
+                    if _claim_is_fresh(
+                        job.get("fire_claim"),
+                        now,
+                        _DEFAULT_FIRE_CLAIM_TTL_SECONDS,
+                    ):
+                        continue
                     logger.info(
                         "Job '%s': one-shot missed its scheduled time (%s, grace=%ds); "
                         "retiring without dispatch",
