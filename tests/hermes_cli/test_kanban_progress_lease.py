@@ -36,6 +36,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -130,8 +132,8 @@ def _stub_operator_reclaim(monkeypatch):
     no-op that reports a non-local worker."""
     monkeypatch.setattr(
         kb, "_terminate_reclaimed_worker",
-        lambda *a, **kw: {"prev_pid": None, "host_local": False,
-                          "termination_attempted": False, "terminated": False,
+        lambda *a, **kw: {"prev_pid": None, "host_local": True,
+                          "termination_attempted": True, "terminated": True,
                           "sigkill": False},
     )
 
@@ -811,6 +813,19 @@ def test_remote_and_custom_spawn_claims_are_safely_deferred(kanban_home, monkeyp
     with kb.connect() as conn:
         remote = _running_task(conn, title="remote", pid=None, claimer="otherhost:worker")
         custom = _running_task(conn, title="custom", pid=None)
+        # These cases intentionally bypass the native spawner; remove the
+        # opt-in lifecycle fixture's synthetic PID/identity.
+        with kb.write_txn(conn):
+            for tid in (remote, custom):
+                run_id = _row(conn, tid)["current_run_id"]
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = NULL WHERE id = ?", (tid,),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = NULL, worker_identity = NULL "
+                    "WHERE id = ?",
+                    (run_id,),
+                )
         for tid in (remote, custom):
             _age_progress(conn, tid, 7200)
         deferred = kb.detect_no_progress_running(conn, no_progress_timeout_seconds=60)
