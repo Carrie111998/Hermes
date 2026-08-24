@@ -8,6 +8,8 @@ never consult the content-filter fallback ladder, and never budget-boost
 retry a truncated tool call.
 
 Run: uv run --with pytest python -m pytest tests/test_run_agent_length_truncation_modes.py
+
+Covers both wire shapes: omitted incomplete_details (self-hosted servers) and the canonical Responses ``incomplete_details.reason == "max_output_tokens"`` shape routed through the shared length-continuation budget-boost dispatcher.
 """
 import sys
 import types
