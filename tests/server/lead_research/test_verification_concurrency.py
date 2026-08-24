@@ -25,6 +25,7 @@ from server.lead_research.models import (
 )
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
+from tests.server.lead_research.fakes import cited_source
 
 
 class ConcurrencyWatchingVerifier:
@@ -57,9 +58,8 @@ class ConcurrencyWatchingVerifier:
                 self.gate.wait(timeout=10)
             return VerificationBundle(
                 candidate_source_record_id=candidate.source_record_id,
-                sources=[VerificationSource(
+                sources=[cited_source(
                     provenance_url=f"https://registry.example/{candidate.source_record_id}",
-                    raw_hash="d" * 64,
                     classification="independent",
                     retrieved_via="https://search.example",
                     facts={

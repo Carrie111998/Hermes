@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 import pytest
 
@@ -7,6 +8,7 @@ from server.lead_research.candidates import CandidateRepository
 from server.lead_research.identity import IdentityResolver
 from server.lead_research.models import VerificationBundle
 from server.lead_research.registry import ProviderRegistry
+from server.lead_research.quotes import spans_for_facts
 import server.lead_research.service as service_module
 from server.lead_research.service import LeadResearchService
 from server.lead_research.storage import EvidenceRepository
@@ -607,7 +609,15 @@ class EvidenceIdentityVerifier:
                     "provenance_url": f"https://{verified_domain}",
                     "retrieved_via": f"https://{verified_domain}",
                 })
-            sources.append(source.model_copy(update={"facts": facts}))
+            content = " | ".join(
+                str(value) for values in facts.values() for value in values
+            )
+            sources.append(source.model_copy(update={
+                "facts": facts,
+                "snapshot_content": content,
+                "raw_hash": hashlib.sha256(content.encode()).hexdigest(),
+                "fact_spans": spans_for_facts(content, facts),
+            }))
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
             sources=sources,

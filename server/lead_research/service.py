@@ -11,14 +11,18 @@ from ..db import json_dump, json_load, new_id, now
 from .candidates import CandidateRecord, CandidateRepository
 from .enrichment import FeaturePlanner, satisfied_playbook_fields
 from .discovery import CandidateDiscoveryService
+from .facts import FactRepository
 from .identity import IdentityResolver
 from .languages import build_market_terms
 from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
-from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchReadiness, ResearchResultData
+from .models import (
+    CampaignConfig, Claim, DiscoveryQuery, ResearchFact, ResearchReadiness, ResearchResultData,
+)
 from .profiles import ProfileRepository
 from .qualification import EligibilityService
 from .registry import ProviderRegistry, build_registry
-from .scoring import attainable_dimensions, score_lead
+from .quotes import EvidenceRejected, accept_fact
+from .scoring import FACT_TTL_DAYS, attainable_dimensions, score_lead
 from .sectors import load_sectors
 from .storage import EvidenceRepository
 from .verdicts import SourceCoverage, evaluate_verdict, terminal_value
@@ -542,6 +546,75 @@ class LeadResearchService:
             )
             for item in plan
         ]
+
+    def _persist_accepted_facts(
+        self,
+        company_id: str,
+        campaign_id: str,
+        organization_id: str,
+        prepared_evidence: list[dict],
+    ) -> list[str]:
+        """Dual-write mechanically accepted facts into the durable fact pools."""
+        facts = FactRepository(self.db)
+        stored_ids: list[str] = []
+        for stored in prepared_evidence:
+            source = stored["source"]
+            definition = self.registry.definitions.get(stored["source_id"])
+            access_tier = definition.access_tier if definition else "public"
+            if access_tier == "customer_upload":
+                source_class, visibility = "customer", "private"
+            elif access_tier == "licensed":
+                source_class, visibility = "licensed", "licensed"
+            elif source.classification == "official":
+                source_class, visibility = "official", "public"
+            elif self._is_registry(stored["source_id"]):
+                source_class, visibility = "registry", "public"
+            else:
+                source_class, visibility = "public", "public"
+            retrieved = stored["envelope"].retrieved_at.timestamp()
+            observed = source.retrieved_at or retrieved
+            for field, values in source.facts.items():
+                spans = source.fact_spans.get(field, [])
+                for value, span in zip(values, spans):
+                    ttl_days = FACT_TTL_DAYS.get(
+                        field, definition.freshness_days if definition else 180
+                    )
+                    proposed = ResearchFact(
+                        organization_id=organization_id,
+                        campaign_id=campaign_id,
+                        field=field,
+                        value_en=value,
+                        original_text=span.original,
+                        source_language=source.source_language,
+                        derivation_kind="observed",
+                        status="observed",
+                        confidence=stored["confidence"],
+                        validation_basis="pending exact-span validation",
+                        evidence_id=stored["evidence_id"],
+                        span=span,
+                        source_class=source_class,
+                        visibility=visibility,
+                        mechanically_validated=False,
+                        observed_at=observed,
+                        retrieved_at=retrieved,
+                        expires_at=observed + ttl_days * 86400,
+                    )
+                    try:
+                        accepted = accept_fact(stored["envelope"], proposed)
+                        stored_ids.append(facts.accept(company_id, accepted).id)
+                    except (EvidenceRejected, ValueError) as exc:
+                        self._try_save_processing_issue(
+                            company_id,
+                            campaign_id,
+                            organization_id,
+                            "evidence_rejected",
+                            {
+                                "field": field,
+                                "source_id": stored["source_id"],
+                                "message": str(exc)[:240],
+                            },
+                        )
+        return stored_ids
 
     @staticmethod
     def _identity_payload(prepared_evidence: list[dict]) -> dict | None:
@@ -1405,6 +1478,9 @@ class LeadResearchService:
                             metrics["resolved_organizations"] += 1
                             stage = "evidence"
                             repo.save_verification(prepared_evidence, campaign_id, organization_id)
+                            self._persist_accepted_facts(
+                                company_id, campaign_id, organization_id, prepared_evidence,
+                            )
                             stage = "claims"
                             claims = self._save_claim_plan(
                                 company_id, campaign_id, organization_id, claim_plan

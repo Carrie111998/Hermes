@@ -18,6 +18,7 @@ from server.lead_research.qualification import EligibilityResult
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
 from server.lead_research.verdicts import SourceCoverage, evaluate_verdict
+from tests.server.lead_research.fakes import cited_source
 
 
 def _candidate() -> CandidateRecord:
@@ -115,12 +116,12 @@ class RejectingVerifier:
         markdown = f"Independent identity record for {candidate.company_name}"
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
-            sources=[VerificationSource(
+            sources=[cited_source(
                 provenance_url="https://registry.example.test/atlas",
-                raw_hash=hashlib.sha256(markdown.encode()).hexdigest(),
                 classification="independent",
                 retrieved_via="https://search.example.test",
                 facts={"company_name": [candidate.company_name]},
+                content=markdown,
             )],
             independent_source_count=1,
         )
@@ -130,13 +131,19 @@ class ReviewingVerifier(RejectingVerifier):
     def verify(self, query, candidate):
         bundle = super().verify(query, candidate)
         source = bundle.sources[0]
+        facts = {
+            "company_name": [candidate.company_name],
+            "buyer_role": ["distributor"],
+            "product_term": ["household-appliances"],
+        }
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
-            sources=[source.model_copy(update={"facts": {
-                "company_name": [candidate.company_name],
-                "buyer_role": ["distributor"],
-                "product_term": ["household-appliances"],
-            }})],
+            sources=[cited_source(
+                provenance_url=source.provenance_url,
+                classification=source.classification,
+                retrieved_via=source.retrieved_via,
+                facts=facts,
+            )],
             independent_source_count=1,
         )
 
@@ -162,23 +169,20 @@ class StrongEvidenceVerifier(RejectingVerifier):
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
             sources=[
-                VerificationSource(
+                cited_source(
                     provenance_url=f"https://{candidate.domain}/about",
-                    raw_hash=hashlib.sha256(b"official").hexdigest(),
                     classification="official",
                     retrieved_via=f"https://{candidate.domain}",
                     facts={**shared, "domain": [candidate.domain]},
                 ),
-                VerificationSource(
+                cited_source(
                     provenance_url="https://registry.example.test/atlas",
-                    raw_hash=hashlib.sha256(b"registry").hexdigest(),
                     classification="independent",
                     retrieved_via="https://search.example.test",
                     facts=shared,
                 ),
-                VerificationSource(
+                cited_source(
                     provenance_url="https://trade-press.example.test/atlas",
-                    raw_hash=hashlib.sha256(b"press").hexdigest(),
                     classification="independent",
                     retrieved_via="https://search.example.test",
                     facts=shared,

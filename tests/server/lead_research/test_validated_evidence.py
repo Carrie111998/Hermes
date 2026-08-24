@@ -17,6 +17,9 @@ from server.lead_research.models import Claim, ScoringProfile
 from server.lead_research.scoring import (
     FACT_TTL_DAYS, claim_freshness, derive_dimension_scores, score_lead,
 )
+from tests.server.lead_research.test_vertical_slice import (
+    campaign_body, make_research_client, start_and_settle,
+)
 
 DAY = 86400.0
 NOW = 1_760_000_000.0
@@ -146,3 +149,19 @@ def test_a_stale_lead_scores_lower_confidence_than_a_fresh_one():
 
     assert fresh.evidence_confidence > stale.evidence_confidence
     assert fresh.fit_score == stale.fit_score  # fit is fit; age belongs to confidence
+
+
+def test_campaign_dual_writes_exact_facts_to_shared_and_tenant_pools():
+    app, client, headers, _ = make_research_client()
+    body = campaign_body()
+    body["target_countries"] = ["DE"]
+    campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
+
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
+
+    assert settled["status"] == "succeeded"
+    assert app.state.db.one("SELECT COUNT(*) AS n FROM shared_facts")["n"] > 0
+    assert app.state.db.one(
+        "SELECT COUNT(*) AS n FROM tenant_facts WHERE company_id=?",
+        (campaign["company_id"],),
+    )["n"] > 0

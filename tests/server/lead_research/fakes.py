@@ -17,6 +17,32 @@ from server.lead_research.models import (
     VerificationBundle,
     VerificationSource,
 )
+from server.lead_research.quotes import spans_for_facts
+
+
+def cited_source(
+    *,
+    provenance_url: str,
+    classification: str,
+    retrieved_via: str,
+    facts: dict[str, list[str]],
+    content: str | None = None,
+    retrieved_at: float | None = None,
+) -> VerificationSource:
+    """A strict verifier double backed by the exact text it claims to read."""
+    snapshot = content or " | ".join(
+        str(value) for values in facts.values() for value in values
+    )
+    return VerificationSource(
+        provenance_url=provenance_url,
+        raw_hash=hashlib.sha256(snapshot.encode()).hexdigest(),
+        classification=classification,
+        retrieved_via=retrieved_via,
+        facts=facts,
+        snapshot_content=snapshot,
+        fact_spans=spans_for_facts(snapshot, facts),
+        retrieved_at=retrieved_at,
+    )
 
 
 def fixture_definition() -> DatasetDefinition:
@@ -109,11 +135,25 @@ class DeterministicProvider:
         roles = [str(value) for value in candidate.data.get("buyer_types") or []] or ["distributor"]
         role_phrase = " and ".join(roles)
         official_markdown = (
-            f"{candidate.company_name} is a {role_phrase} of household appliances in {candidate.country}."
+            f"{candidate.company_name} is a {role_phrase} of household-appliances "
+            f"in {candidate.country}. Website: {candidate.domain}."
         )
         independent_markdown = (
             f"Registry profile for {candidate.company_name}, a household-appliances {role_phrase}."
         )
+        official_facts = {
+            "company_name": [candidate.company_name],
+            "country": [candidate.country],
+            "buyer_role": roles,
+            "product_term": ["household-appliances"],
+        }
+        if candidate.domain:
+            official_facts["domain"] = [candidate.domain]
+        independent_facts = {
+            "company_name": [candidate.company_name],
+            "buyer_role": roles,
+            "product_term": ["household-appliances"],
+        }
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
             sources=[
@@ -122,24 +162,18 @@ class DeterministicProvider:
                     raw_hash=hashlib.sha256(official_markdown.encode()).hexdigest(),
                     classification="official",
                     retrieved_via=f"https://{candidate.domain}",
-                    facts={
-                        "company_name": [candidate.company_name],
-                        "country": [candidate.country],
-                        "domain": [candidate.domain],
-                        "buyer_role": roles,
-                        "product_term": ["household-appliances"],
-                    },
+                    facts=official_facts,
+                    snapshot_content=official_markdown,
+                    fact_spans=spans_for_facts(official_markdown, official_facts),
                 ),
                 VerificationSource(
                     provenance_url=f"https://registry.example.test/{candidate.source_record_id}",
                     raw_hash=hashlib.sha256(independent_markdown.encode()).hexdigest(),
                     classification="independent",
                     retrieved_via="https://search.example.test",
-                    facts={
-                        "company_name": [candidate.company_name],
-                        "buyer_role": roles,
-                        "product_term": ["household-appliances"],
-                    },
+                    facts=independent_facts,
+                    snapshot_content=independent_markdown,
+                    fact_spans=spans_for_facts(independent_markdown, independent_facts),
                 ),
             ],
             independent_source_count=1,

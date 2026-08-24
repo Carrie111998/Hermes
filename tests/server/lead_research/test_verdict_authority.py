@@ -20,6 +20,7 @@ from server.lead_research.models import Claim, LeadScore
 from server.lead_research.qualification import EligibilityResult
 from server.lead_research.registry import build_registry
 from server.lead_research.verdicts import SourceCoverage, evaluate_verdict
+from tests.server.lead_research.fakes import cited_source
 
 
 TED = "ted.europa.eu"
@@ -206,21 +207,20 @@ class _RegistryNotice:
 
     def verify(self, query, candidate):
         del query
-        from server.lead_research.models import VerificationBundle, VerificationSource
-        import hashlib
+        from server.lead_research.models import VerificationBundle
+        facts = {
+            "company_name": [candidate.company_name],
+            "country": [candidate.country],
+            "buyer_role": ["public procurement supplier", "distributor"],
+            "product_term": ["white goods", "built-in ovens", "household-appliances"],
+        }
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
-            sources=[VerificationSource(
+            sources=[cited_source(
                 provenance_url=f"https://{TED}/en/notice/-/detail/255023-2024",
-                raw_hash=hashlib.sha256(b"notice").hexdigest(),
                 classification="independent",
                 retrieved_via=f"https://{TED}/",
-                facts={
-                    "company_name": [candidate.company_name],
-                    "country": [candidate.country],
-                    "buyer_role": ["public procurement supplier", "distributor"],
-                    "product_term": ["white goods", "built-in ovens", "household-appliances"],
-                },
+                facts=facts,
             )],
             independent_source_count=1,
         )
@@ -238,8 +238,7 @@ class _WebMentions:
 
     def verify(self, query, candidate):
         del query
-        from server.lead_research.models import VerificationBundle, VerificationSource
-        import hashlib
+        from server.lead_research.models import VerificationBundle
         facts = {
             "company_name": [candidate.company_name],
             "country": [candidate.country],
@@ -249,23 +248,20 @@ class _WebMentions:
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
             sources=[
-                VerificationSource(
+                cited_source(
                     provenance_url=f"https://trade-press.example/{candidate.source_record_id}",
-                    raw_hash=hashlib.sha256(b"press").hexdigest(),
                     classification="independent",
                     retrieved_via="https://search.example/",
                     facts=facts,
                 ),
-                VerificationSource(
+                cited_source(
                     provenance_url=f"https://directory.example/{candidate.source_record_id}",
-                    raw_hash=hashlib.sha256(b"directory").hexdigest(),
                     classification="independent",
                     retrieved_via="https://search.example/",
                     facts=facts,
                 ),
-                VerificationSource(
+                cited_source(
                     provenance_url=f"https://chamber.example/{candidate.source_record_id}",
-                    raw_hash=hashlib.sha256(b"chamber").hexdigest(),
                     classification="independent",
                     retrieved_via="https://search.example/",
                     facts=facts,

@@ -26,6 +26,7 @@ from server.lead_research.models import (
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
 from server.lead_research.storage import EvidenceRepository
+from tests.server.lead_research.fakes import cited_source
 
 
 class CountingVerifier:
@@ -56,16 +57,14 @@ class CountingVerifier:
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
             sources=[
-                VerificationSource(
+                cited_source(
                     provenance_url=f"https://{candidate.domain}/about",
-                    raw_hash="a" * 64,
                     classification="official",
                     retrieved_via=f"https://{candidate.domain}",
                     facts=facts,
                 ),
-                VerificationSource(
+                cited_source(
                     provenance_url=f"https://registry.example/{candidate.source_record_id}",
-                    raw_hash="b" * 64,
                     classification="independent",
                     retrieved_via="https://search.example",
                     facts=facts,

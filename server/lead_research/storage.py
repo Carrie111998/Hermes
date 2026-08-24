@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Iterable
 
 from ..db import json_dump, json_load, new_id, now
-from .models import EvidenceEnvelope, RawPage, VerificationBundle, VerificationSource
+from .models import EvidenceEnvelope, EvidenceSpan, RawPage, VerificationBundle, VerificationSource
 from .paths import tenant_research_root
+from .quotes import validate_span
 
 
 class EvidenceRepository:
@@ -166,6 +167,13 @@ class EvidenceRepository:
                     retrieved_via=payload.get("retrieved_via") or row["provenance_url"] or "",
                     facts=payload.get("facts") or {},
                     retrieved_at=row["retrieved_at"],
+                    snapshot_content=payload.get("snapshot_content") or "",
+                    source_language=payload.get("source_language") or "en",
+                    archive_snapshot_at=payload.get("archive_snapshot_at"),
+                    fact_spans={
+                        field: [EvidenceSpan.model_validate(span) for span in spans]
+                        for field, spans in (payload.get("fact_spans") or {}).items()
+                    },
                 )
             except Exception:
                 # One unreadable row must not cost a run its whole cache, and it
@@ -197,6 +205,35 @@ class EvidenceRepository:
         """Derive immutable evidence identities without writing tenant state."""
         prepared: list[dict] = []
         for source in bundle.sources:
+            if (
+                not source.snapshot_content
+                or hashlib.sha256(source.snapshot_content.encode()).hexdigest() != source.raw_hash
+            ):
+                continue
+            accepted_facts: dict[str, list[str]] = {}
+            accepted_spans: dict[str, list[EvidenceSpan]] = {}
+            for field, values in source.facts.items():
+                spans = source.fact_spans.get(field, [])
+                for value in values:
+                    for span in spans:
+                        validation = validate_span(source.snapshot_content, span)
+                        if not validation.valid:
+                            continue
+                        literal = str(value).strip()
+                        if literal.casefold() not in span.original.casefold():
+                            continue
+                        if field in {"company_name", "registry_id", "domain"}:
+                            if literal not in span.original:
+                                continue
+                        accepted_facts.setdefault(field, []).append(value)
+                        accepted_spans.setdefault(field, []).append(span)
+                        break
+            if not accepted_facts:
+                continue
+            source = source.model_copy(update={
+                "facts": accepted_facts,
+                "fact_spans": accepted_spans,
+            })
             seed = f"{self.company_id}:{source_id}:{source.raw_hash}".encode()
             snapshot_id = f"snap_{hashlib.sha256(seed).hexdigest()[:20]}"
             evidence_seed = (
@@ -215,6 +252,9 @@ class EvidenceRepository:
                 raw_hash=source.raw_hash,
                 method="observed",
                 confidence=.95 if source.classification == "official" else .85,
+                snapshot_content=source.snapshot_content,
+                source_language=source.source_language,
+                archive_snapshot_at=source.archive_snapshot_at,
                 payload={
                     "facts": source.facts,
                     "classification": source.classification,
@@ -222,6 +262,16 @@ class EvidenceRepository:
                     # What question this answered. Reuse requires a match; see
                     # `query_fingerprint`.
                     "query_fingerprint": query_fingerprint,
+                    "fact_spans": {
+                        field: [span.model_dump(mode="json") for span in spans]
+                        for field, spans in source.fact_spans.items()
+                    },
+                    "snapshot_content": source.snapshot_content,
+                    "source_language": source.source_language,
+                    "archive_snapshot_at": (
+                        source.archive_snapshot_at.isoformat()
+                        if source.archive_snapshot_at else None
+                    ),
                 },
             )
             prepared.append({
@@ -264,6 +314,12 @@ class EvidenceRepository:
                             "provenance_url": source.provenance_url,
                             "retrieved_via": source.retrieved_via,
                             "classification": source.classification,
+                            "snapshot_content": source.snapshot_content,
+                            "source_language": source.source_language,
+                            "archive_snapshot_at": (
+                                source.archive_snapshot_at.isoformat()
+                                if source.archive_snapshot_at else None
+                            ),
                         }),
                         stamp,
                     ),

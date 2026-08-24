@@ -8,6 +8,7 @@ import pytest
 from server.lead_research.candidates import CandidateRecord
 from server.lead_research.models import DiscoveryQuery
 from server.lead_research.providers.ted import TedVerifier, _identity_match, _search_term
+from server.lead_research.quotes import validate_span
 from server.lead_research.registry import build_registry
 
 
@@ -111,6 +112,13 @@ def test_matching_winner_yields_a_cited_independent_source(query):
     assert source.facts["country"] == ["PL"]
     assert "public procurement supplier" in source.facts["buyer_role"]
     assert source.facts["product_term"] == ["kitchen-appliances"]
+    assert source.snapshot_content
+    assert source.fact_spans["company_name"]
+    assert all(
+        validate_span(source.snapshot_content, span).valid
+        for spans in source.fact_spans.values()
+        for span in spans
+    )
 
 
 # TED reports alpha-3 and candidates carry alpha-2; a mismatch must stay silent

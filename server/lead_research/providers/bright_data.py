@@ -26,6 +26,7 @@ from ..models import (
     VerificationBundle,
     VerificationSource,
 )
+from ..quotes import spans_for_facts
 from .base import CatalogProvider
 
 
@@ -340,7 +341,6 @@ class BrightDataVerifier(CatalogProvider):
                     official_url,
                     official_url,
                     markdown,
-                    markdown,
                     candidate,
                     buyer_terms,
                     product_terms,
@@ -350,7 +350,6 @@ class BrightDataVerifier(CatalogProvider):
         for search_url in self._search_urls(query, candidate, buyer_terms, product_terms):
             markdown, spent = self._fetch_markdown(search_url)
             requests += spent
-            digest = hashlib.sha256(markdown.encode()).hexdigest()
             matches = list(MARKDOWN_LINK.finditer(markdown))
             for index, match in enumerate(matches[:MAX_RESULTS_PER_PAGE]):
                 provenance_url = _result_url(match.group(2))
@@ -376,10 +375,12 @@ class BrightDataVerifier(CatalogProvider):
                     continue
                 sources.append(VerificationSource(
                     provenance_url=provenance_url,
-                    raw_hash=digest,
+                    raw_hash=hashlib.sha256(evidence_text.encode()).hexdigest(),
                     classification=classification,
                     retrieved_via=search_url,
                     facts=facts,
+                    snapshot_content=evidence_text,
+                    fact_spans=spans_for_facts(evidence_text, facts),
                 ))
                 seen_urls.add(provenance_url)
 
@@ -408,7 +409,6 @@ class BrightDataVerifier(CatalogProvider):
     def _source(
         provenance_url: str,
         retrieved_via: str,
-        markdown: str,
         evidence_text: str,
         candidate: CandidateRecord,
         buyer_terms: list[str],
@@ -419,16 +419,19 @@ class BrightDataVerifier(CatalogProvider):
             if _is_official(provenance_url, _normalized_domain(candidate.domain))
             else "independent"
         )
+        facts = _fact_matches(
+            evidence_text,
+            candidate,
+            buyer_terms,
+            product_terms,
+            classification,
+        )
         return VerificationSource(
             provenance_url=provenance_url,
-            raw_hash=hashlib.sha256(markdown.encode()).hexdigest(),
+            raw_hash=hashlib.sha256(evidence_text.encode()).hexdigest(),
             classification=classification,
             retrieved_via=retrieved_via,
-            facts=_fact_matches(
-                evidence_text,
-                candidate,
-                buyer_terms,
-                product_terms,
-                classification,
-            ),
+            facts=facts,
+            snapshot_content=evidence_text,
+            fact_spans=spans_for_facts(evidence_text, facts),
         )

@@ -28,6 +28,7 @@ from ..models import (
     VerificationBundle,
     VerificationSource,
 )
+from ..quotes import spans_for_facts
 from .base import CatalogProvider
 from .bright_data import _clean_terms, _normalized_domain
 
@@ -271,6 +272,7 @@ class TedVerifier(CatalogProvider):
         if matched_buyers:
             facts["buyer_role"] = [*facts["buyer_role"], *matched_buyers]
 
+        content = raw.decode("utf-8")
         return VerificationSource(
             provenance_url=NOTICE_URL.format(publication),
             raw_hash=hashlib.sha256(raw).hexdigest(),
@@ -279,6 +281,8 @@ class TedVerifier(CatalogProvider):
             classification="independent",
             retrieved_via=SEARCH_ENDPOINT,
             facts=facts,
+            snapshot_content=content,
+            fact_spans=spans_for_facts(content, facts),
         )
 
     def verify(self, query: DiscoveryQuery, candidate: CandidateRecord) -> VerificationBundle:

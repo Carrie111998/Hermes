@@ -213,12 +213,28 @@ class ProviderHealth(ApiModel):
     reason: Literal["credential_required", "disabled"] | None = None
 
 
+class EvidenceSpan(ApiModel):
+    original: str = Field(min_length=1)
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def ordered_offsets(self):
+        if self.end <= self.start:
+            raise ValueError("evidence span end must be after its start")
+        return self
+
+
 class VerificationSource(ApiModel):
     provenance_url: str
     raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     classification: Literal["official", "independent"]
     retrieved_via: str
     facts: dict[str, list[str]] = Field(default_factory=dict)
+    snapshot_content: str = ""
+    fact_spans: dict[str, list[EvidenceSpan]] = Field(default_factory=dict)
+    source_language: str = "en"
+    archive_snapshot_at: datetime | None = None
     # When this page was actually fetched. None for a bundle a provider just
     # returned, which is by definition now; a bundle rebuilt from the cache
     # carries the age of the evidence, which is the whole reason freshness can
@@ -263,6 +279,9 @@ class EvidenceEnvelope(ApiModel):
     method: Literal["observed", "calculated", "estimated_range"] = "observed"
     confidence: float = Field(ge=0, le=1)
     payload: dict[str, Any]
+    snapshot_content: str = ""
+    source_language: str = "en"
+    archive_snapshot_at: datetime | None = None
 
 
 class Organization(ApiModel):
@@ -280,18 +299,6 @@ class ResolvedIdentity(ApiModel):
     shared_organization_id: str | None = None
     created: bool
     matched_by: str
-
-
-class EvidenceSpan(ApiModel):
-    original: str = Field(min_length=1)
-    start: int = Field(ge=0)
-    end: int = Field(gt=0)
-
-    @model_validator(mode="after")
-    def ordered_offsets(self):
-        if self.end <= self.start:
-            raise ValueError("evidence span end must be after its start")
-        return self
 
 
 class ResearchFact(ApiModel):

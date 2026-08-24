@@ -25,6 +25,7 @@ from ..models import (
     VerificationBundle,
     VerificationSource,
 )
+from ..quotes import spans_for_facts
 from .base import CatalogProvider
 from .bright_data import _normalized_domain
 
@@ -79,16 +80,19 @@ class CorpusProvider(CatalogProvider):
         if categories:
             facts["product_term"] = categories
 
-        payload = json.dumps(
+        snapshot_content = json.dumps(
             {"source_record_id": candidate.source_record_id, "facts": facts},
             sort_keys=True, ensure_ascii=False,
-        ).encode()
+        )
+        payload = snapshot_content.encode()
         source = VerificationSource(
             provenance_url=provenance,
             raw_hash=hashlib.sha256(payload).hexdigest(),
             classification="official" if official else "independent",
             retrieved_via=provenance,
             facts=facts,
+            snapshot_content=snapshot_content,
+            fact_spans=spans_for_facts(snapshot_content, facts),
         )
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,

@@ -26,6 +26,7 @@ from server.lead_research.models import (
     VerificationSource,
 )
 from server.lead_research.providers.bright_data import BrightDataVerifier
+from tests.server.lead_research.fakes import cited_source
 from server.lead_research.providers.corpus import CorpusProvider
 from server.lead_research.providers.ted import TedVerifier
 from server.lead_research.registry import ProviderRegistry
@@ -165,9 +166,8 @@ class SpendingVerifier:
         del query
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
-            sources=[VerificationSource(
+            sources=[cited_source(
                 provenance_url=f"https://registry.example/{candidate.source_record_id}",
-                raw_hash="c" * 64,
                 classification="independent",
                 retrieved_via="https://search.example",
                 facts={

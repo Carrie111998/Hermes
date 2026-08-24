@@ -10,6 +10,7 @@ from server.config import Settings
 from server.lead_research.candidates import CandidateRecord
 from server.lead_research.models import DiscoveryQuery
 from server.lead_research.providers.bright_data import BrightDataVerifier, _fact_matches
+from server.lead_research.quotes import validate_span
 from server.lead_research.registry import build_registry
 
 
@@ -127,6 +128,13 @@ def test_verifier_returns_cited_sources(candidate, query):
     assert {source.classification for source in bundle.sources} == {"official", "independent"}
     assert bundle.independent_source_count == 1
     assert all(source.facts for source in bundle.sources)
+    assert all(source.snapshot_content for source in bundle.sources)
+    assert all(
+        validate_span(source.snapshot_content, span).valid
+        for source in bundle.sources
+        for spans in source.fact_spans.values()
+        for span in spans
+    )
     assert candidate.data["provenance_url"] not in {
         source.provenance_url for source in bundle.sources
     }

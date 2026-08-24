@@ -27,6 +27,7 @@ from server.lead_research.models import (
 )
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
+from tests.server.lead_research.fakes import cited_source
 
 
 class CountingDatabase:
@@ -69,9 +70,8 @@ class SimpleVerifier:
         del query
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
-            sources=[VerificationSource(
+            sources=[cited_source(
                 provenance_url=f"https://registry.example/{candidate.source_record_id}",
-                raw_hash="e" * 64,
                 classification="independent",
                 retrieved_via="https://search.example",
                 facts={
@@ -174,14 +174,21 @@ def test_two_candidates_resolving_to_one_company_still_share_a_lead(harness):
         """Every candidate turns out to be the same company."""
 
         def verify(self, query, candidate):
-            bundle = super().verify(query, candidate)
-            return VerificationBundle(
-                candidate_source_record_id=candidate.source_record_id,
-                sources=[bundle.sources[0].model_copy(update={"facts": {
+                bundle = super().verify(query, candidate)
+                source = bundle.sources[0]
+                facts = {
                     "company_name": ["One Company GmbH"],
                     "country": ["DE"],
                     "buyer_role": ["distributor"],
-                }})],
+                }
+                return VerificationBundle(
+                    candidate_source_record_id=candidate.source_record_id,
+                    sources=[cited_source(
+                        provenance_url=source.provenance_url,
+                        classification=source.classification,
+                        retrieved_via=source.retrieved_via,
+                        facts=facts,
+                    )],
                 independent_source_count=1,
                 requests=1,
             )
