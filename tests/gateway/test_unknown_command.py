@@ -225,3 +225,49 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_receives_event_only_when_keyword_compatible(monkeypatch):
+    """New event context is opt-in and cannot break legacy plugin handlers."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    from hermes_cli import plugins as _plugins_mod
+
+    def accepts_event(args, *, event):
+        return f"event:{args}:{event.get_command_args()}"
+
+    monkeypatch.setattr(
+        _plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: accepts_event if name == "metricas" else None,
+    )
+
+    assert await runner._handle_message(_make_event("/metricas seven")) == "event:seven:seven"
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_positional_only_event_keeps_legacy_invocation(monkeypatch):
+    """A positional-only optional event cannot receive the keyword injection."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    from hermes_cli import plugins as _plugins_mod
+
+    def legacy(args, event=None, /):
+        return f"legacy:{args}:{event}"
+
+    monkeypatch.setattr(
+        _plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: legacy if name == "metricas" else None,
+    )
+
+    assert await runner._handle_message(_make_event("/metricas seven")) == "legacy:seven:None"
