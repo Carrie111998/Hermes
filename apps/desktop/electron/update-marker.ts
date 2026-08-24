@@ -149,7 +149,12 @@ export function readLiveUpdateMarker(
  * Python and Rust claimers. If another updater wins the race its marker stays
  * untouched; `UpdateMarkerGuard` later adopts this marker when our child won.
  * Confirmed-dead markers are cleaned under the Python/Rust shared mutex;
- * malformed state remains a conservative blocker.
+ * malformed state remains a conservative blocker. Python and Rust mutation
+ * paths open the marker/mutex with no-follow/reparse-point checks and publish
+ * complete staged payloads atomically. Electron is intentionally a read-only
+ * observer except for this initial no-clobber hard-link claim; it leaves any
+ * existing winner untouched and the Python/Rust owner performs replacement or
+ * cleanup under the mutex.
  */
 export function writeUpdateMarker(
   hermesHome,

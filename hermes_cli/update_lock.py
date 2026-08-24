@@ -104,6 +104,7 @@ UPDATE_EXIT_CONCURRENT = 2
 _MAX_U32 = (1 << 32) - 1
 _MAX_SAFE_WIRE_INTEGER = (1 << 53) - 1
 _MARKER_WIRE_RE = re.compile(r"(?P<pid>[1-9][0-9]*)\r?\n(?P<lease>[0-9]+)(?:\r?\n)?\Z")
+_REPARSE_POINT = 0x00000400
 
 
 def update_marker_path() -> Path:
@@ -257,11 +258,12 @@ def _write_all(fd: int, payload: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _open_marker_mutex_no_follow(path: Path) -> int:
-    """Open the mutex without following a symlink or Windows reparse point."""
-
-    flags = os.O_RDWR | os.O_CREAT
+def _open_no_follow(path: Path, *, writable: bool, create: bool) -> int:
+    """Open a marker object without following links or Windows reparse points."""
     if sys.platform != "win32":
+        flags = os.O_RDWR if writable else os.O_RDONLY
+        if create:
+            flags |= os.O_CREAT
         flags |= getattr(os, "O_NOFOLLOW", 0)
         return os.open(path, flags, 0o600)
 
@@ -271,9 +273,9 @@ def _open_marker_mutex_no_follow(path: Path) -> int:
     generic_write = 0x40000000
     share_all = 0x00000001 | 0x00000002 | 0x00000004
     open_always = 4
+    open_existing = 3
     file_attribute_normal = 0x00000080
     file_flag_open_reparse_point = 0x00200000
-    file_attribute_reparse_point = 0x00000400
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -291,10 +293,10 @@ def _open_marker_mutex_no_follow(path: Path) -> int:
     close_handle.restype = ctypes.c_int
     handle = create_file(
         str(path),
-        generic_read | generic_write,
+        generic_read | (generic_write if writable else 0),
         share_all,
         None,
-        open_always,
+        open_always if create else open_existing,
         file_attribute_normal | file_flag_open_reparse_point,
         None,
     )
@@ -307,20 +309,17 @@ def _open_marker_mutex_no_follow(path: Path) -> int:
     try:
         import msvcrt
 
-        fd = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+        fd_flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_BINARY
+        fd = msvcrt.open_osfhandle(int(handle), fd_flags)
         transferred = True
         metadata = os.fstat(fd)
-        if bool(
-            getattr(metadata, "st_file_attributes", 0) & file_attribute_reparse_point
-        ):
+        if bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT):
             os.close(fd)
             fd = None
-            raise OSError(0, f"mutex path is a reparse point: {path}")
+            raise OSError(0, f"update marker path is a reparse point: {path}")
         assert fd is not None
         return fd
     except BaseException:
-        # open_osfhandle transfers ownership only when it succeeds.  Close the
-        # matching resource for either the CRT fd or the raw Win32 handle.
         if fd is not None:
             try:
                 os.close(fd)
@@ -329,6 +328,36 @@ def _open_marker_mutex_no_follow(path: Path) -> int:
         elif not transferred:
             close_handle(handle)
         raise
+
+
+def _open_marker_mutex_no_follow(path: Path) -> int:
+    """Open the mutex without following a symlink or Windows reparse point."""
+    return _open_no_follow(path, writable=True, create=True)
+
+
+def _read_marker_bytes(marker: Path) -> bytes:
+    """Read the marker through a no-follow descriptor, never a path read."""
+    fd = _open_no_follow(marker, writable=False, create=False)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def _validate_marker_no_reparse(marker: Path) -> None:
+    """Fail closed when the marker or any parent is a reparse point."""
+    try:
+        from hermes_cli.update_rollout import validate_no_reparse_topology
+
+        validate_no_reparse_topology(marker.parent)
+        validate_no_reparse_topology(marker)
+    except Exception as exc:
+        raise OSError(f"update marker path is not reparse-safe: {marker}: {exc}") from exc
 
 
 class _MarkerMutex:
@@ -452,10 +481,11 @@ class _MarkerRead:
 def _read_marker_snapshot(marker: Path) -> _MarkerRead:
     """Read one marker version, distinguishing absence from uncertainty."""
     try:
+        _validate_marker_no_reparse(marker)
         # read_text() performs universal-newline translation, which would turn
         # lone CR bytes into LF and make Python accept a wire Rust/Electron
         # reject. Decode explicit bytes so CAS also retains exact payload bytes.
-        raw = marker.read_bytes().decode("utf-8")
+        raw = _read_marker_bytes(marker).decode("utf-8")
     except FileNotFoundError:
         return _MarkerRead(snapshot=None)
     except (OSError, UnicodeError) as exc:
@@ -519,7 +549,9 @@ def _holder_from_snapshot(snapshot: _MarkerSnapshot) -> UpdateHolder | None:
 
 def _atomic_write_marker(marker: Path, *, pid: int, lease_at: float) -> None:
     """Atomically publish one complete, exactly-two-line marker payload."""
+    _validate_marker_no_reparse(marker)
     marker.parent.mkdir(parents=True, exist_ok=True)
+    _validate_marker_no_reparse(marker)
     fd, raw_tmp = tempfile.mkstemp(
         prefix=f".{marker.name}.", suffix=".tmp", dir=str(marker.parent)
     )
@@ -545,7 +577,9 @@ def _atomic_write_marker(marker: Path, *, pid: int, lease_at: float) -> None:
 
 def _create_marker_exclusive(marker: Path, *, pid: int, lease_at: float) -> None:
     """Publish a complete marker atomically without clobbering a winner."""
+    _validate_marker_no_reparse(marker)
     marker.parent.mkdir(parents=True, exist_ok=True)
+    _validate_marker_no_reparse(marker)
     fd, raw_tmp = tempfile.mkstemp(
         prefix=f".{marker.name}.", suffix=".claim", dir=str(marker.parent)
     )

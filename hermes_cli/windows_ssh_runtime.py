@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ _OPEN_REPARSE_POINT = 0x00200000
 _DELETE_ON_CLOSE = 0x04000000
 _MOVE_REPLACE_EXISTING = 0x00000001
 _MOVE_WRITE_THROUGH = 0x00000008
+_REPARSE_POINT = 0x00000400
 
 
 def _win32() -> tuple[Any, ...]:
@@ -46,6 +48,40 @@ def _nonce(value: str) -> str:
     if not _HEX16.fullmatch(value or ""):
         raise ValueError("invalid spawn nonce")
     return value
+
+
+def _validate_no_reparse_path(
+    path_value: str, *, label: str, allow_missing: bool = False
+) -> None:
+    """Reject links/reparse points before resolving or executing a path."""
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    current = Path(os.path.abspath(path_value))
+    first = True
+    while True:
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            if first and not allow_missing:
+                raise ValueError(f"{label} was not found: {path_value}")
+            if current == current.parent:
+                break
+            current = current.parent
+            first = False
+            continue
+        except OSError as exc:
+            raise ValueError(f"could not inspect {label}: {exc}") from exc
+        if stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT
+        ):
+            raise ValueError(
+                f"{label} contains a link or reparse point: {current}"
+            )
+        if current == current.parent:
+            break
+        current = current.parent
+        first = False
 
 
 def _root() -> Path:
@@ -386,11 +422,10 @@ def _resolve_direct_interpreter(python_entry: str) -> tuple[str, list[str]]:
 
 
 def spawn_backend(payload: dict[str, Any]) -> dict[str, Any]:
+    configured_path = str(payload["hermesPath"])
+    _validate_no_reparse_path(configured_path, label="Hermes path")
     ownership_id = _ownership(str(payload["ownershipId"]))
     spawn_nonce = _nonce(str(payload["spawnNonce"]))
-    configured_path = str(payload["hermesPath"])
-    if not os.path.isabs(configured_path):
-        raise ValueError("Hermes path must be absolute")
     hermes_path = os.path.abspath(configured_path)
     token_path = str(_token_path(ownership_id, spawn_nonce))
     log_path = _log_path(ownership_id, spawn_nonce)
@@ -399,9 +434,9 @@ def spawn_backend(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid profile")
     venv_dir = os.path.dirname(hermes_path)
     python_entry = os.path.join(venv_dir, "python.exe")
-    if not os.path.isfile(python_entry):
-        raise ValueError("Hermes Python runtime was not found")
+    _validate_no_reparse_path(python_entry, label="Hermes Python runtime")
     base_python, sys_path = _resolve_direct_interpreter(python_entry)
+    _validate_no_reparse_path(base_python, label="base Python interpreter")
     # Seed sys.path IN-PROCESS via a -c bootstrap rather than exporting PYTHONPATH:
     # PYTHONPATH would be inherited by every subprocess the running backend spawns
     # (terminal tool, user scripts), shadowing their imports. This keeps the path

@@ -120,6 +120,10 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// The marker is also the cross-process update lock: `hermes update` claims
 /// the same file (see `hermes_cli/update_lock.py`) so a dashboard-spawned
 /// update and this updater can't mutate one checkout at the same time.
+/// Python and Rust mutation paths validate every existing path component with
+/// no-follow/reparse-safe opens, then publish complete staged payloads through
+/// atomic no-clobber claims or replacement. Electron is a read-only observer
+/// after its initial no-clobber hard-link handoff and never cleans a marker;
 /// `acquire` therefore REFUSES when a live foreign owner holds it rather than
 /// overwriting — the pre-fix clobber is what let a dashboard `hermes update`
 /// keep running while install-mode bootstrap rewrote the tree underneath it.

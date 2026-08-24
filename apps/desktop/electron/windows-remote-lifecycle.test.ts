@@ -12,6 +12,7 @@ import {
   encodedPowerShell,
   helperCommand,
   powerShellCommand,
+  probeWindowsRemote,
   psLiteral,
   reusableWindowsLock,
   terminateOwnedWindowsDashboardForUpdate,
@@ -126,6 +127,35 @@ test('Windows relaunch gate uses strict install-wide marker parsing and fail-clo
   assert.match(script, /\\A\(\[1-9\]/)
   assert.match(script, /GetProcessById/)
   assert.doesNotMatch(script, /ErrorAction SilentlyContinue/)
+})
+
+test('Windows probe validates Hermes and Python topology before selection', async () => {
+  let script = ''
+  await probeWindowsRemote(
+    sshWith(async command => {
+      script = Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+      return JSON.stringify({
+        os: 'Windows',
+        arch: 'AMD64',
+        hermesHome: 'C:\\\\h',
+        hermesPath: 'C:\\\\h\\\\hermes.exe',
+        python: 'C:\\\\h\\\\python.exe'
+      })
+    }),
+    'C:\\\\h\\\\hermes.exe'
+  )
+
+  const explicitCheck = script.indexOf('if($explicit){Assert-NoReparse $explicit $false}')
+  const fallbackJoin = script.indexOf('Join-Path $hermesHome')
+  const pythonJoin = script.indexOf('$python=[IO.Path]::Combine')
+  const pythonCheck = script.indexOf('Assert-NoReparse $python $false')
+  const output = script.indexOf('[ordered]@{')
+
+  assert.ok(explicitCheck >= 0)
+  assert.ok(explicitCheck < fallbackJoin)
+  assert.ok(pythonJoin >= 0)
+  assert.ok(pythonJoin < pythonCheck)
+  assert.ok(pythonCheck < output)
 })
 
 test('platform detection preserves POSIX and falls back to Windows PowerShell', async () => {

@@ -325,7 +325,7 @@ def test_live_owner_past_the_age_ceiling_is_never_stolen(marker, monkeypatch):
     ids=["empty", "garbage-pid", "blank-lines", "no-start-time"],
 )
 def test_malformed_markers_fail_closed_without_being_deleted(marker, body):
-    marker.write_text(body, encoding="utf-8")
+    marker.write_bytes(body.encode("utf-8"))
 
     observation = read_live_update(path=marker)
     assert observation is not None and observation.pid is None
@@ -372,7 +372,7 @@ def test_live_pid_with_missing_lease_fails_closed(marker):
     ],
 )
 def test_noncanonical_or_overflow_wire_payload_fails_closed(marker, body):
-    marker.write_text(body, encoding="utf-8")
+    marker.write_bytes(body.encode("utf-8"))
 
     observation = read_live_update(path=marker)
     assert observation is not None and observation.pid is None
@@ -524,6 +524,36 @@ def test_marker_mutex_rejects_windows_junction(marker, tmp_path):
     finally:
         subprocess.run(
             ["cmd.exe", "/d", "/c", "rmdir", str(mutex_path)],
+            capture_output=True,
+            check=False,
+        )
+
+
+@pytest.mark.windows_only
+def test_marker_reader_rejects_reparse_parent_without_following_it(marker, tmp_path):
+    target = tmp_path / "marker-target"
+    target.mkdir()
+    redirected = tmp_path / "redirected-marker-root"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(redirected), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot create junction: {result.stdout} {result.stderr}")
+
+    redirected_marker = redirected / marker.name
+    (target / marker.name).write_bytes(
+        f"{os.getpid()}\\n{int(time.time())}\\n".encode("ascii")
+    )
+    try:
+        observation = read_live_update(path=redirected_marker)
+        assert observation is not None and observation.pid is None
+        assert "reparse" in (observation.unavailable_reason or "")
+    finally:
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "rmdir", str(redirected)],
             capture_output=True,
             check=False,
         )

@@ -1982,7 +1982,9 @@ def restart_profile_gateway(
                 "externally_supervised_profiles": [],
                 "killed_pids": [old_pid] if old_pid else [],
             }
-        if sys.platform == "win32":
+        if supervisor == "service":
+            if sys.platform != "win32":
+                raise RolloutError(f"{profile}: Windows service supervisor on {sys.platform}")
             from hermes_cli import gateway_windows
 
             gateway_windows.restart()
@@ -2309,7 +2311,9 @@ def quiesce_profile_gateway(
             gateway_cli.systemd_stop(system=scopes[0] == "system")
         elif supervisor == "launchd":
             gateway_cli.launchd_stop()
-        elif sys.platform == "win32":
+        elif supervisor == "service":
+            if sys.platform != "win32":
+                raise RolloutError(f"{profile}: Windows service supervisor on {sys.platform}")
             from hermes_cli import gateway_windows
 
             gateway_windows.stop()
