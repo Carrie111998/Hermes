@@ -1,5 +1,6 @@
 import type { BillingBlock, UsageModelData } from '@hermes/shared/billing'
 import type { HermesSkin } from '@hermes/shared/skin'
+import type { GatewayTranscriptPart, GatewayTranscriptPartsFields } from '@hermes/shared/transcript-parts'
 
 import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
 
@@ -16,7 +17,7 @@ export interface GatewayCompletionItem {
   text: string
 }
 
-export interface GatewayTranscriptMessage {
+export interface GatewayTranscriptMessage extends GatewayTranscriptPartsFields {
   context?: string
   display_kind?: string
   display_metadata?: Record<string, unknown>
@@ -212,10 +213,12 @@ export interface SessionActiveListResponse {
   sessions?: SessionActiveItem[]
 }
 
-export interface SessionInflightTurn {
+export interface SessionInflightTurn extends GatewayTranscriptPartsFields {
   assistant?: string
   streaming?: boolean
   user?: string
+  user_parts?: GatewayTranscriptPart[]
+  user_parts_clipped?: boolean
 }
 
 export interface SessionActivateResponse {
@@ -616,7 +619,7 @@ export type GatewayEvent =
   | { payload: SessionInfo; session_id?: string; type: 'session.info' }
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
-  | { payload?: undefined; session_id?: string; type: 'message.start' }
+  | { payload?: GatewayTranscriptPartsFields; session_id?: string; type: 'message.start' }
   | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | {
       payload?: {
@@ -684,12 +687,18 @@ export type GatewayEvent =
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {
-      payload: { args_text?: string; context?: string; name?: string; tool_id: string; todos?: unknown[] }
+      payload: GatewayTranscriptPartsFields & {
+        args_text?: string
+        context?: string
+        name?: string
+        tool_id: string
+        todos?: unknown[]
+      }
       session_id?: string
       type: 'tool.start'
     }
   | {
-      payload: {
+      payload: GatewayTranscriptPartsFields & {
         duration_s?: number
         error?: string
         inline_diff?: string
@@ -735,14 +744,18 @@ export type GatewayEvent =
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.tool' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.progress' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.complete' }
-  | { payload: { rendered?: string; text?: string }; session_id?: string; type: 'message.delta' }
   | {
-      payload: { already_streamed?: boolean; text: string }
+      payload: GatewayTranscriptPartsFields & { rendered?: string; text?: string }
+      session_id?: string
+      type: 'message.delta'
+    }
+  | {
+      payload: GatewayTranscriptPartsFields & { already_streamed?: boolean; text: string }
       session_id?: string
       type: 'message.interim'
     }
   | {
-      payload?: {
+      payload?: GatewayTranscriptPartsFields & {
         billing?: BillingBlock
         failure_reason?: string
         reasoning?: string

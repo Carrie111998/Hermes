@@ -8,12 +8,35 @@
   },
   "inflight": {
     "assistant": "partial answer",
+    "parts": [
+      {
+        "kind": "text",
+        "text": "partial answer"
+      }
+    ],
+    "parts_clipped": false,
+    "parts_version": 1,
     "streaming": true,
-    "user": "current prompt"
+    "user": "current prompt",
+    "user_parts": [
+      {
+        "kind": "text",
+        "text": "current prompt"
+      }
+    ],
+    "user_parts_clipped": false
   },
   "message_count": 1,
   "messages": [
     {
+      "parts": [
+        {
+          "kind": "text",
+          "text": "earlier prompt"
+        }
+      ],
+      "parts_clipped": false,
+      "parts_version": 1,
       "role": "user",
       "text": "earlier prompt"
     }

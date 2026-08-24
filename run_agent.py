@@ -220,6 +220,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
+from transcript_parts import message_parts
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
@@ -2324,9 +2325,16 @@ class AIAgent:
                     and sanitize_context(content).strip() != content.strip()
                 ):
                     _row_api_content = content
+                # Persist a bounded ordered envelope before the legacy content
+                # fallback below is reduced to a provider-safe text summary.
+                # The envelope is presentation/storage metadata; `content`
+                # remains the historical model-context projection, preserving
+                # prompt-cache bytes and role alternation for existing clients.
+                _row_parts = message_parts({**msg, "content": content})
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
-                # for cross-session replay.
+                # for cross-session replay. The ordered envelope above carries
+                # bounded inert media references for display/resume.
                 if _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
                 elif isinstance(content, list):
@@ -2349,6 +2357,7 @@ class AIAgent:
                 _batch_rows.append({
                     "role": role,
                     "content": content,
+                    "parts": _row_parts,
                     "tool_name": msg.get("tool_name"),
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),

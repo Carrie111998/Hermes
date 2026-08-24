@@ -432,6 +432,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id),
     role TEXT NOT NULL,
     content TEXT,
+    parts TEXT,
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
