@@ -115,6 +115,7 @@ _EXCLUDED_NAMES = {
     ".backup.lock",
     "gateway.pid",
     "cron.pid",
+    "gateway.sock",
 }
 
 # File names that ``hermes import`` must never overwrite, matched by basename so
