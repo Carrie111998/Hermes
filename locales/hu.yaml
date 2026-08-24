@@ -148,6 +148,8 @@ gateway:
 
     busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
     busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+    busy_identity_missing: "The current work is still in progress. The new Telegram request was not added because it has no durable delivery identity."
+    busy_already_handled:  "The current work is still in progress. This request was already handled. Task ID: {task_id}, final status: {status}."
 
   help:
     header:                "📖 **Hermes parancsok**\n"
@@ -159,6 +161,7 @@ gateway:
     error:                 "Hiba a betekintések generálásakor: {error}"
 
   kanban:
+    unknown_status:        "unknown status ({status})"
     error_prefix:          "⚠ kanban hiba: {error}"
     subscribed_suffix:     "(feliratkozva — értesítést kapsz, ha a {task_id} befejeződik vagy elakad)"
     truncated_suffix:      "… (csonkítva; használd a `hermes kanban …` parancsot a terminálban a teljes kimenethez)"

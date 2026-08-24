@@ -148,6 +148,8 @@ gateway:
 
     busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
     busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+    busy_identity_missing: "The current work is still in progress. The new Telegram request was not added because it has no durable delivery identity."
+    busy_already_handled:  "The current work is still in progress. This request was already handled. Task ID: {task_id}, final status: {status}."
 
   help:
     header:                "📖 **Comandos do Hermes**\n"
@@ -159,6 +161,7 @@ gateway:
     error:                 "Erro ao gerar análise: {error}"
 
   kanban:
+    unknown_status:        "unknown status ({status})"
     error_prefix:          "⚠ erro do kanban: {error}"
     subscribed_suffix:     "(subscrito — receberás uma notificação quando {task_id} terminar ou bloquear)"
     truncated_suffix:      "… (truncado; usa `hermes kanban …` no teu terminal para a saída completa)"

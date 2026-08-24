@@ -152,6 +152,8 @@ gateway:
 
     busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
     busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+    busy_identity_missing: "The current work is still in progress. The new Telegram request was not added because it has no durable delivery identity."
+    busy_already_handled:  "The current work is still in progress. This request was already handled. Task ID: {task_id}, final status: {status}."
 
   help:
     header:                "📖 **Orduithe Hermes**\n"
@@ -163,6 +165,7 @@ gateway:
     error:                 "Earráid agus léargais á gcruthú: {error}"
 
   kanban:
+    unknown_status:        "unknown status ({status})"
     error_prefix:          "⚠ earráid kanban: {error}"
     subscribed_suffix:     "(síntiúsaithe — cuirfear in iúl duit nuair a chríochnóidh nó a stopfaidh {task_id})"
     truncated_suffix:      "… (giorraithe; úsáid `hermes kanban …` i do theirminéal le haghaidh aschur iomláin)"

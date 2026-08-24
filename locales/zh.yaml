@@ -148,6 +148,8 @@ gateway:
 
     busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
     busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+    busy_identity_missing: "The current work is still in progress. The new Telegram request was not added because it has no durable delivery identity."
+    busy_already_handled:  "The current work is still in progress. This request was already handled. Task ID: {task_id}, final status: {status}."
 
   help:
     header:                "📖 **Hermes 命令**\n"
@@ -159,6 +161,7 @@ gateway:
     error:                 "生成洞察时出错：{error}"
 
   kanban:
+    unknown_status:        "unknown status ({status})"
     error_prefix:          "⚠ kanban 错误：{error}"
     subscribed_suffix:     "（已订阅 — 当 {task_id} 完成或被阻塞时将通知您）"
     truncated_suffix:      "…（已截断；如需完整输出请在终端运行 `hermes kanban …`）"

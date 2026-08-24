@@ -2673,7 +2673,7 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import GatewayKanbanWatchersMixin, _localized_kanban_status
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -16681,11 +16681,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         import hashlib
 
+        message_id = str(getattr(event, "message_id", "") or "")
+        update_id = getattr(event, "platform_update_id", None)
+        platform = getattr(
+            getattr(source, "platform", ""),
+            "value",
+            getattr(source, "platform", ""),
+        )
+        if str(platform).lower() == "telegram" and not message_id and update_id is None:
+            return t("gateway.goal.busy_identity_missing")
+
         def _enqueue_goal():
             from hermes_cli import kanban_db as kb
 
-            message_id = str(getattr(event, "message_id", "") or "")
-            update_id = getattr(event, "platform_update_id", None)
             if message_id:
                 delivery_identity = f"message:{message_id}"
             elif update_id is not None:
@@ -16706,11 +16714,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             title = " ".join(goal_arg.split())[:120]
             conn = kb.connect()
             try:
-                platform = getattr(
-                    getattr(source, "platform", ""),
-                    "value",
-                    getattr(source, "platform", ""),
-                )
                 thread_id = str(getattr(source, "thread_id", "") or "")
                 chat_type = str(getattr(source, "chat_type", "") or "dm")
                 delivery_metadata = {"chat_type": chat_type}
@@ -16772,21 +16775,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             delivery_metadata=delivery_metadata,
                         )
                 task = kb.get_task(conn, task_id)
-                return task_id, (getattr(task, "status", None) or "ready")
+                return task_id, (getattr(task, "status", None) or "ready"), archived
             finally:
                 conn.close()
 
         try:
-            task_id, status = await asyncio.to_thread(_enqueue_goal)
+            task_id, status, archived = await asyncio.to_thread(_enqueue_goal)
         except Exception as exc:
             logger.warning("busy /goal kanban enqueue failed: %s", exc)
             return t("gateway.goal.busy_enqueue_failed", error=str(exc))
 
-        return t(
-            "gateway.goal.busy_enqueued",
-            task_id=task_id,
-            status=t(f"gateway.kanban.status.{status}"),
-        )
+        status_text = _localized_kanban_status(status)
+        if archived:
+            return t(
+                "gateway.goal.busy_already_handled",
+                task_id=task_id,
+                status=status_text,
+            )
+        return t("gateway.goal.busy_enqueued", task_id=task_id, status=status_text)
 
     async def _busy_loop_command(self, event: MessageEvent, quick_key: str, source):
         # /loop mirrors /goal: control verbs are safe mid-run (state

@@ -55,6 +55,30 @@ def kanban_home(tmp_path, monkeypatch):
 # Idempotency key
 # ---------------------------------------------------------------------------
 
+def test_create_task_idempotency_key_can_be_reused_after_archive(kanban_home):
+    """Global create_task keeps its established active-lifetime semantics."""
+    conn = kb.connect()
+    try:
+        first = kb.create_task(
+            conn,
+            title="first lifetime",
+            assignee="worker",
+            idempotency_key="reusable-key",
+        )
+        assert kb.archive_task(conn, first)
+
+        second = kb.create_task(
+            conn,
+            title="second lifetime",
+            assignee="worker",
+            idempotency_key="reusable-key",
+        )
+
+        assert second != first
+        tasks = kb.list_tasks(conn, include_archived=True)
+        assert {task.id for task in tasks} == {first, second}
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

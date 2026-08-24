@@ -193,6 +193,38 @@ def _event_int(payload: dict, key: str) -> int:
         return 0
 
 
+_KNOWN_KANBAN_STATUSES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+)
+
+
+def _localized_kanban_status(status: Any) -> str:
+    """Render a DB status without leaking an untranslated locale key."""
+    normalized = str(status or "").strip().lower()
+    if normalized in _KNOWN_KANBAN_STATUSES:
+        return t(f"gateway.kanban.status.{normalized}")
+    safe = "".join(
+        char for char in str(status or "")
+        if char.isalnum() or char in {" ", "_", "-"}
+    ).strip()[:32]
+    return t("gateway.kanban.unknown_status", status=safe or "unknown")
+
+
+def _completion_handoff(task: Any, event: Any) -> str:
+    """Return the first bounded completion line for notices and wake turns."""
+    payload = getattr(event, "payload", None)
+    payload = payload if isinstance(payload, dict) else {}
+    summary = payload.get("summary")
+    if summary:
+        lines = str(summary).strip().splitlines()
+        return lines[0][:200] if lines else str(summary)[:200]
+    result = getattr(task, "result", None)
+    if result:
+        lines = str(result).strip().splitlines()
+        return lines[0][:160] if lines else str(result)[:160]
+    return ""
+
+
 def _format_kanban_event_message(
     sub: dict,
     task: Any,
@@ -219,14 +251,8 @@ def _format_kanban_event_message(
     retry = t("gateway.kanban.notice.retry") if retry_confirmed else ""
 
     if kind == "completed":
-        handoff = ""
-        summary = payload.get("summary")
-        if summary:
-            lines = str(summary).strip().splitlines()
-            handoff = "\n" + (lines[0][:200] if lines else str(summary)[:200])
-        elif getattr(task, "result", None):
-            lines = str(task.result).strip().splitlines()
-            handoff = "\n" + (lines[0][:160] if lines else str(task.result)[:160])
+        handoff_text = _completion_handoff(task, event)
+        handoff = f"\n{handoff_text}" if handoff_text else ""
         return t("gateway.kanban.notice.completed", handoff=handoff, **common)
     if kind == "blocked":
         reason = f": {str(payload['reason'])[:160]}" if payload.get("reason") else ""
@@ -274,7 +300,7 @@ def _format_kanban_event_message(
         )
     if kind == "status":
         status = str(payload.get("status") or "")
-        localized = t(f"gateway.kanban.status.{status}") if status else status
+        localized = _localized_kanban_status(status)
         return t("gateway.kanban.notice.status", status=localized, **common)
     if kind == "review_requested":
         handoff = f"\n{str(payload['summary'])[:200]}" if payload.get("summary") else ""
@@ -651,12 +677,7 @@ class GatewayKanbanWatchersMixin:
                     for ev in d["events"]:
                         kind = ev.kind
                         if kind == "completed":
-                            if ev.payload and ev.payload.get("summary"):
-                                lines = str(ev.payload["summary"]).strip().splitlines()
-                                wake_handoff = lines[0][:200] if lines else ""
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                wake_handoff = lines[0][:160] if lines else ""
+                            wake_handoff = _completion_handoff(task, ev)
                         msg = _format_kanban_event_message(sub, task, ev, board_slug)
                         if msg is None:
                             # archived / unblocked are claimed by TERMINAL_KINDS

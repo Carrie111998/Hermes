@@ -8,6 +8,7 @@ from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
     _format_kanban_event_message,
+    _localized_kanban_status,
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
@@ -81,6 +82,18 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_localized_kanban_status_known_and_unknown_are_safe(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+
+    assert _localized_kanban_status("ready") == "대기"
+    unknown = _localized_kanban_status("mystery<script>상태" + "x" * 100)
+
+    assert unknown.startswith("알 수 없는 상태 (mysteryscript상태")
+    assert "gateway.kanban.status." not in unknown
+    assert "<" not in unknown and ">" not in unknown
+    assert len(unknown) <= 48
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):

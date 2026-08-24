@@ -162,6 +162,8 @@ gateway:
     set:                   "⊙ Goal set ({budget}-turn budget): {goal}\nI'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\nControls: /goal status · /goal pause · /goal resume · /goal clear"
     busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
     busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+    busy_identity_missing: "The current work is still in progress. The new Telegram request was not added because it has no durable delivery identity."
+    busy_already_handled:  "The current work is still in progress. This request was already handled. Task ID: {task_id}, final status: {status}."
 
   help:
     header:                "📖 **Hermes Commands**\n"
@@ -174,6 +176,7 @@ gateway:
 
   kanban:
     error_prefix:          "⚠ kanban error: {error}"
+    unknown_status:        "unknown status ({status})"
     subscribed_suffix:     "(subscribed — you'll be notified when {task_id} completes or blocks)"
     truncated_suffix:      "… (truncated; use `hermes kanban …` in your terminal for full output)"
     no_output:             "(no output)"

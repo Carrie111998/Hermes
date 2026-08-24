@@ -30,7 +30,12 @@ def kanban_home(tmp_path, monkeypatch):
     kb._INITIALIZED_PATHS.clear()
 
 
-def _event(text: str, *, message_id: str = "msg-1") -> MessageEvent:
+def _event(
+    text: str,
+    *,
+    message_id: str = "msg-1",
+    platform_update_id: int | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         source=SessionSource(
@@ -42,6 +47,7 @@ def _event(text: str, *, message_id: str = "msg-1") -> MessageEvent:
             profile="worker-a",
         ),
         message_id=message_id,
+        platform_update_id=platform_update_id,
     )
 
 
@@ -119,12 +125,12 @@ async def test_concurrent_redelivery_still_creates_exactly_one_task(kanban_home)
 
 
 @pytest.mark.asyncio
-async def test_distinct_messages_without_platform_ids_are_not_collapsed(kanban_home):
+async def test_same_text_with_new_message_id_creates_a_distinct_task(kanban_home):
     from hermes_cli import kanban_db as kb
 
     runner = _runner()
-    first = _event("/goal 같은 요청", message_id="")
-    second = _event("/goal 같은 요청", message_id="")
+    first = _event("/goal 같은 요청", message_id="msg-same-text-1")
+    second = _event("/goal 같은 요청", message_id="msg-same-text-2")
 
     await runner._busy_goal_command(first, "telegram:u1:c1", first.source)
     await runner._busy_goal_command(second, "telegram:u1:c1", second.source)
@@ -136,6 +142,54 @@ async def test_distinct_messages_without_platform_ids_are_not_collapsed(kanban_h
         conn.close()
 
     assert len(tasks) == 2
+
+
+@pytest.mark.asyncio
+async def test_telegram_goal_without_delivery_identity_creates_nothing(kanban_home):
+    from hermes_cli import kanban_db as kb
+
+    runner = _runner()
+    event = _event("/goal 식별자 없는 요청", message_id="", platform_update_id=None)
+
+    result = await runner._busy_goal_command(event, "telegram:u1:c1", event.source)
+
+    conn = kb.connect(board="default")
+    try:
+        assert kb.list_tasks(conn, include_archived=True) == []
+    finally:
+        conn.close()
+    assert "현재 작업은 그대로 진행 중입니다." in result
+    assert "안전하게 식별할 수 없어" in result
+    assert "등록하지 않았습니다" in result
+
+
+@pytest.mark.asyncio
+async def test_telegram_delivery_identity_prefers_message_id_then_update_id(kanban_home):
+    from hermes_cli import kanban_db as kb
+
+    runner = _runner()
+    same_message_new_update = [
+        _event("/goal 메시지 우선", message_id="msg-priority", platform_update_id=101),
+        _event("/goal 메시지 우선", message_id="msg-priority", platform_update_id=202),
+    ]
+    update_only = _event("/goal 업데이트 대체", message_id="", platform_update_id=303)
+
+    for event in same_message_new_update:
+        await runner._busy_goal_command(event, "telegram:u1:c1", event.source)
+    update_first = await runner._busy_goal_command(
+        update_only, "telegram:u1:c1", update_only.source,
+    )
+    update_second = await runner._busy_goal_command(
+        update_only, "telegram:u1:c1", update_only.source,
+    )
+
+    conn = kb.connect(board="default")
+    try:
+        tasks = kb.list_tasks(conn)
+    finally:
+        conn.close()
+    assert len(tasks) == 2
+    assert update_first == update_second
 
 
 @pytest.mark.asyncio
@@ -229,8 +283,36 @@ async def test_archived_message_redelivery_does_not_create_or_resubscribe(
     assert tasks[0].id == task.id
     assert tasks[0].status == "archived"
     assert task.id in first and task.id in second
-    assert "상태: 보관됨" in second
+    assert "이미 처리한 요청입니다" in second
+    assert "최종 상태: 보관됨" in second
     assert subs == []
+
+
+@pytest.mark.asyncio
+async def test_busy_goal_unknown_status_uses_safe_bounded_fallback(kanban_home):
+    from hermes_cli import kanban_db as kb
+
+    runner = _runner()
+    event = _event("/goal 알 수 없는 상태", message_id="msg-unknown-status")
+    await runner._busy_goal_command(event, "telegram:u1:c1", event.source)
+
+    conn = kb.connect(board="default")
+    try:
+        task = kb.list_tasks(conn)[0]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                ("mystery<script>상태" + "x" * 100, task.id),
+            )
+    finally:
+        conn.close()
+
+    result = await runner._busy_goal_command(event, "telegram:u1:c1", event.source)
+
+    assert "gateway.kanban.status." not in result
+    assert "<" not in result and ">" not in result
+    assert "알 수 없는 상태 (mysteryscript상태" in result
+    assert len(result) < 500
 
 
 @pytest.mark.asyncio
