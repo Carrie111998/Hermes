@@ -5725,8 +5725,17 @@ def probe_api_models(
         try:
             with _urlopen_model_catalog_request(req, **_open_kwargs) as resp:
                 data = json.loads(resp.read().decode())
+                models = [m.get("id", "") for m in data.get("data", [])]
+                # Filter empty IDs and sort case-insensitively so the
+                # /model picker renders a stable, alphabetical order.
+                # Built-in providers (anthropic/xai/github) already sort
+                # their catalogs; this custom OpenAI-compatible path did
+                # not, so the ordering changed with every /v1/models
+                # response and cache refresh.
+                models = [m for m in models if m]
+                models = sorted(models, key=str.lower)
                 return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "models": models,
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
                     "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
