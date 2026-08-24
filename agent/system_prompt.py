@@ -59,7 +59,11 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
-    r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
+    # Up to 9 digits: sections may legitimately exceed 9,999 chars when
+    # plugins.system_prompt_section_max_chars is raised in config.yaml
+    # (#92774). Forged/malformed frames are still rejected by the canonical
+    # re-render equality check in _restore_plugin_prompt_sections.
+    r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,9}) -->\n\n",
     re.MULTILINE,
 )
 
@@ -222,6 +226,7 @@ def _restore_plugin_prompt_sections(prompt: str) -> tuple:
         PLUGIN_SECTIONS_START,
         RenderedPluginSystemPromptSection,
         format_system_prompt_sections,
+        system_prompt_section_max_chars,
     )
 
     start = prompt.rfind(PLUGIN_SECTIONS_START)
@@ -235,10 +240,16 @@ def _restore_plugin_prompt_sections(prompt: str) -> tuple:
         return ()
     framed = prompt[start:after_end]
 
+    # Honor a raised plugins.system_prompt_section_max_chars: sections that
+    # were legitimately persisted under a larger configured cap must survive
+    # resume. Never restore below the built-in default so lowering the config
+    # afterwards cannot invalidate default-sized persisted prompts.
+    restore_cap = max(MAX_SYSTEM_PROMPT_SECTION_CHARS, system_prompt_section_max_chars())
+
     restored = []
     for match in _PLUGIN_SECTION_FRAME_RE.finditer(framed):
         content_len = int(match.group("chars"))
-        if content_len > MAX_SYSTEM_PROMPT_SECTION_CHARS:
+        if content_len > restore_cap:
             continue
         content_start = match.end()
         content = framed[content_start : content_start + content_len]

@@ -12249,6 +12249,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         detail = f" ({', '.join(bits)})" if bits else ""
                         label = "" if state == "enabled" else f" [{state}]"
                         error = f" — {info['error']}" if info.get("error") else ""
+                        dropped = info.get("prompt_sections_dropped") or 0
+                        if dropped:
+                            error += (
+                                f" — ⚠ {dropped} prompt section(s) dropped over budget"
+                                " (see plugins.system_prompt_section_* in config.yaml)"
+                            )
                         print(f"  {glyph} {name}{ver}{label}{detail}{error}")
                     if bundled_count:
                         print(f"  (+{bundled_count} bundled — see: hermes plugins list)")
