@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
 import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
+import { reconnectGateway } from '@/store/gateway-reconnect'
 import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
 import { $connection, $currentCwd, $gatewayState } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
-import { useGatewayBoot } from './use-gateway-boot'
+import { primaryRuntimeConnectionId, useGatewayBoot } from './use-gateway-boot'
 
 // End-to-end-ish repro of the "remote VPS → stuck on CONNECTING, no Settings"
 // bug that drives the REAL useGatewayBoot hook + REAL HermesGateway through a
@@ -22,6 +24,21 @@ import { useGatewayBoot } from './use-gateway-boot'
 
 type Listener = (ev: unknown) => void
 let connectionApplied: null | (() => void) = null
+let powerResume: null | (() => void) = null
+
+describe('primaryRuntimeConnectionId', () => {
+  it('uses the registry identity when the primary connection has one', () => {
+    expect(primaryRuntimeConnectionId({ connectionId: ' tower ', mode: 'remote' })).toBe('tower')
+  })
+
+  it('uses the stable local identity for an app-managed backend', () => {
+    expect(primaryRuntimeConnectionId({ mode: 'local' })).toBe('local')
+  })
+
+  it('returns null for an unknown remote identity so the caller falls back to live-connection scoping', () => {
+    expect(primaryRuntimeConnectionId({ mode: 'remote' })).toBeNull()
+  })
+})
 
 // Minimal WebSocket stand-in implementing only what json-rpc-gateway.connect()
 // touches: readyState, add/removeEventListener('open'|'error'|'close'), close().
@@ -81,6 +98,7 @@ class FakeWebSocket {
 const primaryConn = {
   authMode: 'token' as const,
   baseUrl: 'https://vps.example.com',
+  connectionId: 'primary-vps',
   profile: 'default',
   token: 't',
   wsUrl: 'wss://vps.example.com/api/ws?token=t'
@@ -89,12 +107,15 @@ const primaryConn = {
 const coderConn = {
   authMode: 'token' as const,
   baseUrl: 'https://coder.example.com',
+  connectionId: 'coder-remote',
   profile: 'coder',
   token: 'c',
   wsUrl: 'wss://coder.example.com/api/ws?token=c'
 }
 
 function fakeDesktop() {
+  let bootProgressHandler: ((payload: Record<string, unknown>) => void) | null = null
+
   return {
     getConnection: vi.fn(async (profile?: null | string) => {
       const key = (profile ?? '').trim()
@@ -103,15 +124,26 @@ function fakeDesktop() {
     }),
     getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primaryConn.wsUrl),
     getBootProgress: vi.fn(async () => ({
-      error: null,
+      error: null as null | string,
       fakeMode: false,
       message: '',
       phase: 'init',
       progress: 0,
-      running: true,
+      retryable: false as boolean,
+      running: true as boolean,
       timestamp: Date.now()
     })),
-    onBootProgress: vi.fn(() => () => undefined),
+    onBootProgress: vi.fn(callback => {
+      bootProgressHandler = callback
+
+      return () => {
+        bootProgressHandler = null
+      }
+    }),
+    // Test helper: fire a post-boot progress event through the real subscription.
+    emitBootProgress(payload: Record<string, unknown>) {
+      bootProgressHandler?.(payload)
+    },
     onBackendExit: vi.fn(() => () => undefined),
     onConnectionApplied: vi.fn(callback => {
       connectionApplied = callback
@@ -120,7 +152,14 @@ function fakeDesktop() {
         connectionApplied = null
       }
     }),
-    onPowerResume: vi.fn(() => () => undefined),
+    onPowerResume: vi.fn(callback => {
+      powerResume = callback
+
+      return () => {
+        powerResume = null
+      }
+    }),
+    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
     profile: { get: vi.fn(async () => ({ profile: 'default' })) }
@@ -161,10 +200,12 @@ beforeEach(() => {
   $activeGatewayProfile.set('default')
   $connection.set(null)
   $profiles.set([])
+  $sessionTiles.set([])
   vi.useFakeTimers()
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
   connectionApplied = null
+  powerResume = null
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
@@ -199,6 +240,7 @@ afterEach(() => {
   $activeGatewayProfile.set('default')
   $connection.set(null)
   $profiles.set([])
+  $sessionTiles.set([])
   vi.useRealTimers()
   ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
@@ -337,11 +379,9 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
 
-    // Burn a couple backoff cycles BEFORE the escalation threshold (<6 attempts,
-    // ~the first ~15s). This is the window where stock and fixed behave the
-    // same: socket down, hook retrying, gatewayState non-open, boot.error still
-    // null → CONNECTING covers the screen with no recovery surface. (Past ~45s
-    // the fix raises boot.error; that's asserted in the next test.)
+    // Burn a couple backoff cycles BEFORE the escalation threshold. Socket
+    // down, hook retrying, gatewayState non-open, boot.error still null so
+    // chat stays usable (no CONNECTING / no couldn't-start overlay).
     await advanceBackoff()
 
     expect($gatewayState.get()).not.toBe('open')
@@ -350,7 +390,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(FakeWebSocket.instances.length).toBeGreaterThan(1)
   })
 
-  it('FIX: after the prolonged drop the hook raises a recoverable boot error (the escape hatch)', async () => {
+  it('FIX: after a prolonged drop the chat stays unlocked (toast, not boot.error)', async () => {
     render(<Harness />)
     await flushAsync()
     expect($desktopBoot.get().error).toBeNull()
@@ -359,17 +399,21 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
 
-    // Walk the backoff past the >=6 attempt threshold (~45s of failures).
-    for (let i = 0; i < 8; i += 1) {
+    // Walk the backoff well past the historical 45s threshold and into the
+    // current multi-minute escalate window. Chat must stay unlocked either way.
+    for (let i = 0; i < 24; i += 1) {
       await advanceBackoff()
     }
 
-    // The hook surfaced the recoverable error → BootFailureOverlay (Use local
-    // gateway / Sign in / Retry) becomes reachable instead of CONNECTING.
-    expect($desktopBoot.get().error).toBeTruthy()
+    // Transport blips must NOT take the full-screen "couldn't start" overlay —
+    // users were locked out of reading/drafting for the whole reconnect window.
+    expect($desktopBoot.get().error).toBeNull()
+    expect($gatewayState.get()).not.toBe('open')
+    // Still retrying.
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(1)
   })
 
-  it('FIX: a successful reconnect clears the recoverable error', async () => {
+  it('FIX: a successful reconnect after a prolonged drop restores the open gateway', async () => {
     render(<Harness />)
     await flushAsync()
 
@@ -377,11 +421,11 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
 
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 24; i += 1) {
       await advanceBackoff()
     }
 
-    expect($desktopBoot.get().error).toBeTruthy()
+    expect($desktopBoot.get().error).toBeNull()
 
     // The remote comes back: next reconnect attempt opens.
     FakeWebSocket.mode = 'open'
@@ -389,6 +433,120 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+  })
+
+  it('rebinds Bot tabs owned by the restarted primary without touching another gateway', async () => {
+    render(<Harness />)
+    await flushAsync()
+    $sessionTiles.set([
+      {
+        ownerRoute: { connectionId: 'primary-vps', mode: 'remote', profile: 'writer', targetProfile: 'writer' },
+        runtimeId: 'runtime-primary-dead',
+        storedSessionId: 'primary-bot-chat',
+        workspaceMode: 'bots',
+        workspaceOwnerKey: 'primary-vps::writer'
+      },
+      {
+        ownerRoute: { connectionId: 'coder-remote', mode: 'remote', profile: 'coder', targetProfile: 'coder' },
+        runtimeId: 'runtime-secondary-live',
+        storedSessionId: 'secondary-bot-chat',
+        workspaceMode: 'bots',
+        workspaceOwnerKey: 'coder-remote::coder'
+      }
+    ])
+
+    act(() => FakeWebSocket.instances[0].drop())
+    FakeWebSocket.mode = 'open'
+    await advanceBackoff()
+
+    const [primaryBot, secondaryBot] = $sessionTiles.get()
+
+    expect(primaryBot).not.toHaveProperty('runtimeId')
+    expect(secondaryBot).toMatchObject({ runtimeId: 'runtime-secondary-live' })
+  })
+
+  it('manual reconnect revalidates, re-resolves, re-mints, and re-dials the dropped socket', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    act(() => FakeWebSocket.instances[0].drop())
+    FakeWebSocket.mode = 'open'
+
+    await act(async () => {
+      const reconnect = reconnectGateway()
+      await vi.advanceTimersByTimeAsync(0)
+      await reconnect
+    })
+
+    expect(desktop.revalidateConnection).toHaveBeenCalledOnce()
+    // The manual reconnect dials the WINDOW-owned primary backend (no profile
+    // arg) — same contract as the sleep/wake reconnect: passing the active
+    // profile would retarget the primary socket after a live profile swap.
+    const lastCall = desktop.getConnection.mock.calls.at(-1) ?? []
+    expect(lastCall.length === 0 || lastCall[0] == null || lastCall[0] === '').toBe(true)
+    expect(desktop.getGatewayWsUrl).toHaveBeenCalledTimes(2)
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect($gatewayState.get()).toBe('open')
+  })
+
+  it('power resume force-redials a half-open primary socket that still reports OPEN', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    const staleSocket = FakeWebSocket.instances[0]
+
+    expect(staleSocket.readyState).toBe(FakeWebSocket.OPEN)
+    expect($gatewayState.get()).toBe('open')
+    expect(powerResume).not.toBeNull()
+
+    // macOS can discard the TCP connection during sleep without updating the
+    // renderer WebSocket object. Leave readyState OPEN and emit only resume.
+    act(() => powerResume?.())
+    await flushAsync()
+    await flushAsync()
+
+    expect(staleSocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(desktop.revalidateConnection).toHaveBeenCalledOnce()
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect($gatewayState.get()).toBe('open')
+  })
+
+  it('FIX: post-boot ticket-mint boot-progress errors do not lock the UI', async () => {
+    const desktop = fakeDesktop() as ReturnType<typeof fakeDesktop> & {
+      emitBootProgress: (payload: Record<string, unknown>) => void
+    }
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+
+    // Main re-emits the exact transient ticket error after a liveness rebuild.
+    // That used to promote into BootFailureOverlay and lock reading/drafting.
+    act(() => {
+      desktop.emitBootProgress({
+        error: 'Could not reach the remote Hermes gateway while refreshing its WebSocket ticket. Try reconnecting.',
+        message: 'Desktop boot failed',
+        phase: 'backend.error',
+        progress: 94,
+        running: false,
+        timestamp: Date.now()
+      })
+    })
+
+    expect($desktopBoot.get().error).toBeNull()
+    expect($desktopBoot.get().visible).toBe(false)
   })
 
   it('FIX: a failed session-list fetch during boot is non-fatal — the app still boots', async () => {
@@ -497,5 +655,110 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(primaryReconnectSockets.length).toBeGreaterThan(0)
     expect($connection.get()?.profile).toBe('coder')
     expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
+  })
+
+  it('FIX #82679: a transient remote boot failure self-heals — the next attempt rebuilds the dropped connection', async () => {
+    // The reported class: the app relaunches (or wakes) against a registered
+    // SSH/HTTP remote whose transport dropped. startHermes() rejects with a
+    // transient transport error ("Could not verify the existing SSH backend"),
+    // main tags the boot progress `retryable`, and — before the fix — the app
+    // parked on "Desktop boot failed" until the user re-entered the exact same
+    // connection details. Now the renderer retries the boot with backoff and
+    // the second attempt (fresh bootstrap, same details) succeeds.
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Could not verify the existing SSH backend.'))
+      .mockImplementation(async () => primaryConn)
+    desktop.getBootProgress = vi.fn(async () => ({
+      error: 'Could not verify the existing SSH backend.',
+      fakeMode: false,
+      message: 'Desktop boot failed: Could not verify the existing SSH backend.',
+      phase: 'backend.error',
+      progress: 24,
+      retryable: true,
+      running: false,
+      timestamp: Date.now()
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    // First attempt failed but the failure is retryable: no terminal error,
+    // the overlay shows the retry status instead of the dead-end failure.
+    expect($desktopBoot.get().error).toBeNull()
+    expect($gatewayState.get()).not.toBe('open')
+
+    // Walk past the first backoff delay (2s base, 15s cap, full jitter).
+    await advanceBackoff()
+
+    // Second boot attempt rebuilt the connection — no manual re-entry.
+    expect(desktop.getConnection.mock.calls.length).toBeGreaterThan(1)
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+  })
+
+  it('FIX #82679: boot retries are BOUNDED — a persistently dead remote ends in the recovery overlay, not a spinner', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () => {
+      throw new Error('Could not verify the existing SSH backend.')
+    })
+    desktop.getBootProgress = vi.fn(async () => ({
+      error: 'Could not verify the existing SSH backend.',
+      fakeMode: false,
+      message: 'Desktop boot failed: Could not verify the existing SSH backend.',
+      phase: 'backend.error',
+      progress: 24,
+      retryable: true,
+      running: false,
+      timestamp: Date.now()
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    // Exhaust the bounded retry budget (5 attempts, ≤15s jittered delay each).
+    for (let i = 0; i < 7; i += 1) {
+      await advanceBackoff()
+    }
+
+    // 1 initial + 5 bounded retries; the loop then STOPS retrying and the
+    // terminal boot error surfaces the real recovery affordance.
+    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+    expect($desktopBoot.get().error).toBeTruthy()
+
+    // No further attempts after the budget is spent — bounded, not infinite.
+    await advanceBackoff()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+  })
+
+  it('FIX #82679: a NON-retryable boot failure (local / confirmed reauth) fails immediately without auto-retry', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () => {
+      throw new Error('401: gateway session expired')
+    })
+    desktop.getBootProgress = vi.fn(async () => ({
+      error: '401: gateway session expired',
+      fakeMode: false,
+      message: 'Desktop boot failed: 401: gateway session expired',
+      phase: 'backend.error',
+      progress: 24,
+      retryable: false,
+      running: false,
+      timestamp: Date.now()
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($desktopBoot.get().error).toBeTruthy()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(1)
+
+    // Still no retry later: a missing capability is not a transient failure.
+    await advanceBackoff()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(1)
   })
 })
