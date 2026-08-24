@@ -126,6 +126,49 @@ class TestBlocksMutationsInSourceRepo:
         hit, _ = _detect("git co main", repo, repo)
         assert hit is True
 
+    def test_alias_config_read_error_fails_closed(self, repo, monkeypatch):
+        """A subcommand that *could* be a mutating alias must block if the
+        alias config read itself errors (OSError/timeout) -- not be treated
+        as "no such alias" the way a clean returncode=1 is. Regression test
+        for the fail-open gap flagged in PR #81664 review: _read_git_alias
+        must not collapse "config read failed" into the same None as
+        "alias not configured".
+        """
+        import subprocess as subprocess_mod
+        from tools import self_repo_guard as guard_mod
+
+        original_run = subprocess_mod.run
+
+        def _flaky_run(cmd, *args, **kwargs):
+            # Only break the alias config lookup; let git init / other
+            # setup calls through untouched.
+            if len(cmd) >= 4 and cmd[-3:-1] == ["config", "--get"] or (
+                "config" in cmd and "--get" in cmd
+            ):
+                raise OSError("simulated alias config read failure")
+            return original_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(guard_mod.subprocess, "run", _flaky_run)
+
+        # "co" is not a known git builtin, so a successful read would return
+        # None (no such alias) and the command would be allowed. With the
+        # read forced to error, the guard must fail closed and block.
+        hit, _ = _detect("git co main", repo, repo)
+        assert hit is True
+
+    def test_alias_read_error_sentinel_distinct_from_no_alias(self):
+        """_read_git_alias must return a distinct value for a config-read
+        error vs. a clean "no such alias" result, so callers can tell them
+        apart and fail closed only on the former.
+        """
+        from tools.self_repo_guard import _read_git_alias, _ALIAS_READ_ERROR
+        import subprocess as subprocess_mod
+
+        # Nonexistent git binary -> OSError inside _read_git_alias.
+        result = _read_git_alias("this-binary-does-not-exist-xyz", Path("."), "co")
+        assert result is _ALIAS_READ_ERROR
+        assert result is not None
+
     def test_mutation_in_command_substitution(self, repo):
         hit, _ = _detect('echo "$(git checkout main)"', repo, repo)
         assert hit is True
