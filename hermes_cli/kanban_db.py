@@ -3015,6 +3015,78 @@ class RoutingBackfillResult:
     errors: int = 0
 
 
+@dataclass(frozen=True)
+class RunRoutingSnapshot:
+    """Frozen routing decision stored for one board-local run."""
+
+    run_id: int
+    task_id: str
+    board: str
+    routing_role: Optional[str]
+    routing_model: Optional[str]
+    routing_provider: Optional[str]
+    routing_reason: Optional[str]
+    routing_contract: Optional[int]
+    routing_policy: Optional[str]
+    roster_digest: Optional[str]
+    ac_revision: Optional[str]
+    routing_source: Optional[str]
+
+
+def get_routing_snapshot(
+    conn: sqlite3.Connection, run_id: int, *, board: str
+) -> RunRoutingSnapshot:
+    """Return the frozen snapshot for a run in an explicitly named board."""
+    if not isinstance(board, str) or not board.strip():
+        raise ValueError("board must be explicit")
+    row = conn.execute(
+        "SELECT id,task_id,routing_role,routing_model,routing_provider,"
+        "routing_reason,routing_contract,routing_policy,roster_digest,ac_revision,"
+        "routing_source FROM task_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(run_id)
+    return RunRoutingSnapshot(
+        run_id=row["id"], task_id=row["task_id"], board=board.strip(),
+        routing_role=row["routing_role"], routing_model=row["routing_model"],
+        routing_provider=row["routing_provider"], routing_reason=row["routing_reason"],
+        routing_contract=row["routing_contract"], routing_policy=row["routing_policy"],
+        roster_digest=row["roster_digest"], ac_revision=row["ac_revision"],
+        routing_source=row["routing_source"],
+    )
+
+
+def set_routing_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    role: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> None:
+    """Atomically select role mode or raw-model mode for a task."""
+    if role is not None and (model is not None or provider is not None):
+        raise ValueError("role mode and model mode are mutually exclusive")
+    if provider is not None and model is None:
+        raise ValueError("provider requires model")
+    if role is None and model is None:
+        raise ValueError("role or model is required")
+    with write_txn(conn):
+        if role is not None:
+            cur = conn.execute(
+                "UPDATE tasks SET routing_role=?,model_override=NULL,provider_override=NULL "
+                "WHERE id=?", (role, task_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET routing_role=NULL,model_override=?,provider_override=? "
+                "WHERE id=?", (model, provider, task_id),
+            )
+        if cur.rowcount != 1:
+            raise KeyError(task_id)
+
+
 def _routing_usage_evidence(
     state_db: Path, worker_session_id: str
 ) -> Optional[tuple[str, str]]:
