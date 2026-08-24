@@ -357,6 +357,13 @@ DEFAULT_CONFIG = {
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
 
+        # Per-task-mode reasoning effort overrides (skill-suggested).
+        # Dict mapping skill/mode name -> effort level (or off/false to disable
+        # a skill's own suggestion). When the active skill has a suggestion and
+        # its name matches a key here, the user's value wins. Empty by default:
+        # skill frontmatter suggestions pass through unchanged.
+        "reasoning_by_skill": {},
+
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,
         # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name

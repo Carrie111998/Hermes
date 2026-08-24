@@ -515,7 +515,6 @@ class TestReasoningOverridesDefaultConfig:
         assert "reasoning_overrides" in DEFAULT_CONFIG["agent"]
         assert DEFAULT_CONFIG["agent"]["reasoning_overrides"] == {}
 
-
     def test_spelling_tolerant_lookup_works_with_user_config(self):
         """resolve_per_model_reasoning_effort works with user-added overrides."""
         from hermes_constants import resolve_per_model_reasoning_effort
@@ -532,6 +531,21 @@ class TestReasoningOverridesDefaultConfig:
         # Lookup with provider prefix — should match
         result2 = resolve_per_model_reasoning_effort("openai/gpt-5", overrides2)
         assert result2 == {"enabled": True, "effort": "low"}
+
+
+class TestReasoningBySkillDefaultConfig:
+    """Tests for the agent.reasoning_by_skill default config key.
+
+    Maps skill/mode name -> reasoning effort (or off/false to disable a
+    skill's suggestion). Empty by default: skill frontmatter suggestions
+    pass through unchanged.
+    """
+
+    def test_default_config_has_reasoning_by_skill_key(self):
+        """DEFAULT_CONFIG['agent'] contains 'reasoning_by_skill' as an empty dict."""
+        from hermes_cli.config import DEFAULT_CONFIG
+        assert "reasoning_by_skill" in DEFAULT_CONFIG["agent"]
+        assert DEFAULT_CONFIG["agent"]["reasoning_by_skill"] == {}
 
 
 class TestSecureParentDir:
