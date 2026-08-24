@@ -621,12 +621,25 @@ to the routed profile**:
 - Unprefixed routes and `/p/default/...` keep using the default profile's key.
 - A named profile with no `API_SERVER_KEY` of its own fails closed — its
   prefix is unreachable until you set one.
+- Run-scoped routes — `/v1/runs/{run_id}` and its `/events`, `/approval`,
+  `/steer` and `/stop` children — are bound to the profile that created the
+  run. Authentication proves *a* valid key; it does not prove the run is
+  yours. A profile asking for someone else's run gets `404`, the same answer
+  it would get for a run id that never existed.
 
 :::warning Breaking change (July 2026)
 Before this fix, a valid default-profile key was accepted on any
 `/p/<profile>/` prefix. If you relied on one shared key across profile
 prefixes, set a distinct `API_SERVER_KEY` in each profile's `.env` — reused
 default keys on named prefixes now return `401`.
+:::
+
+:::warning Breaking change (August 2026)
+Run-scoped routes used to accept any served profile's key, because run state
+is keyed by `run_id` alone and records nothing about ownership. If you polled,
+steered or stopped a run from a profile other than the one that created it,
+that now returns `404` — send the request under the creating profile's prefix
+and key.
 :::
 
 :::warning Security

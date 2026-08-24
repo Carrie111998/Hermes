@@ -208,6 +208,16 @@ home). `hermes status` reports the multiplexer and the profiles it serves;
 own `runtime_status.json` under its own home, so existing per-profile readers
 keep working.
 
+#### 6. API runs belong to the profile that started them
+
+The [API server](/user-guide/features/api-server)'s run-scoped routes
+(`/v1/runs/{run_id}` and its `/events`, `/approval`, `/steer`, `/stop`
+children) are keyed by run id, which is unique per host but says nothing about
+ownership. Multiplexed, every served profile holds a valid key, so a bearer
+token proves only that the caller is *some* served profile. Those routes now
+also require the caller to be the profile that created the run; anyone else
+gets `404`, indistinguishable from a run id that never existed.
+
 #### What does **not** change
 
 Per-profile `.env` credential isolation is preserved and, if anything,
