@@ -72,6 +72,15 @@ class CustomEndpointUpdate(BaseModel):
     models: Optional[List[str]] = None
     model_details: Optional[List[CustomEndpointModel]] = None
 
+    @field_validator("api_mode", mode="before")
+    @classmethod
+    def _normalize_api_mode(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        from hermes_cli.config import _canonical_api_mode
+
+        return _canonical_api_mode(value)
+
 
 class MessagingPlatformUpdate(BaseModel):
     enabled: Optional[bool] = None

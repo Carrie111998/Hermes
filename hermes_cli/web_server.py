@@ -82,6 +82,7 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
+    _canonical_api_mode,
     _deep_merge,
 )
 from plugins.memory.config_schema import (
@@ -8378,7 +8379,11 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "id": endpoint_id,
                 "name": str(raw_entry.get("name") or endpoint_id),
                 "base_url": base_url,
-                "api_mode": str(raw_entry.get("api_mode") or raw_entry.get("transport") or "chat_completions"),
+                "api_mode": _canonical_api_mode(str(
+                    raw_entry.get("api_mode")
+                    or raw_entry.get("transport")
+                    or "chat_completions"
+                )),
                 "model": endpoint_model,
                 "models": model_ids,
                 "model_details": models,
@@ -8396,7 +8401,9 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "id": "custom",
             "name": "Custom",
             "base_url": current_base_url,
-            "api_mode": str(model_cfg.get("api_mode") or "chat_completions"),
+            "api_mode": _canonical_api_mode(str(
+                model_cfg.get("api_mode") or "chat_completions"
+            )),
             "model": current_model,
             "models": [current_model] if current_model else [],
             "model_details": [{"id": current_model}] if current_model else [],
@@ -8463,9 +8470,11 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     existing = providers.get(endpoint_id)
     if not isinstance(existing, dict):
         existing = {}
-    api_mode = body.api_mode or str(
-        existing.get("api_mode") or existing.get("transport") or "chat_completions"
-    )
+    api_mode = body.api_mode or _canonical_api_mode(str(
+        existing.get("api_mode")
+        or existing.get("transport")
+        or "chat_completions"
+    ))
 
     # Merge onto the existing entry rather than replacing it. A providers.<name>
     # block is not owned by this panel: it can carry hand-written keys the
@@ -8629,7 +8638,11 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
                 raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
             model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
-            api_mode = str(entry.get("api_mode") or entry.get("transport") or "chat_completions")
+            api_mode = _canonical_api_mode(str(
+                entry.get("api_mode")
+                or entry.get("transport")
+                or "chat_completions"
+            ))
             if api_mode == "auto":
                 model_cfg.pop("api_mode", None)
             else:

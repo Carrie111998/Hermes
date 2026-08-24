@@ -1712,6 +1712,65 @@ class TestWebServerEndpoints:
         endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "responses-proxy")
         assert endpoint["api_mode"] == "codex_responses"
 
+    def test_custom_endpoint_legacy_transport_alias_round_trips(self):
+        """Legacy aliases returned by config remain editable through Desktop."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg.setdefault("providers", {})["legacy-responses"] = {
+            "name": "Legacy Responses",
+            "base_url": "https://responses.example/v1",
+            "transport": "responses",
+            "model": "gpt-5.6-sol",
+            "models": {"gpt-5.6-sol": {}},
+        }
+        save_config(cfg)
+
+        listed = self.client.get("/api/providers/custom-endpoints")
+        assert listed.status_code == 200
+        endpoint = next(
+            item for item in listed.json()["endpoints"]
+            if item["id"] == "legacy-responses"
+        )
+        assert endpoint["api_mode"] == "codex_responses"
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": endpoint["id"],
+                "name": "Renamed Legacy Responses",
+                "base_url": endpoint["base_url"],
+                "model": endpoint["model"],
+                "models": endpoint["models"],
+                "api_mode": endpoint["api_mode"],
+                "make_default": True,
+            },
+        )
+
+        assert response.status_code == 200
+        saved = load_config()
+        assert saved["providers"]["legacy-responses"]["api_mode"] == "codex_responses"
+        assert saved["model"]["api_mode"] == "codex_responses"
+
+    def test_custom_endpoint_accepts_legacy_transport_alias(self):
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "legacy-input",
+                "name": "Legacy Input",
+                "base_url": "https://responses.example/v1",
+                "model": "gpt-5.6-sol",
+                "api_mode": "openai-responses",
+            },
+        )
+
+        assert response.status_code == 200
+        endpoint = next(
+            item for item in response.json()["endpoints"]
+            if item["id"] == "legacy-input"
+        )
+        assert endpoint["api_mode"] == "codex_responses"
+
 
     def test_set_model_main_custom_persists_api_key_and_registers_provider(self):
         """A custom endpoint that requires auth must persist model.api_key (where
