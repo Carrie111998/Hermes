@@ -10903,6 +10903,14 @@ def _default_spawn(
     # sidebar renders one row per attempt, labeled with the worker's own prompt
     # ("work kanban task t_…").
     env["HERMES_SESSION_SOURCE"] = "kanban"
+    # P1-B: one-shot dispatcher ownership proof. Embedded ONLY in this worker
+    # subprocess's env; the worker bootstrap consumes it and converts it into
+    # process-local ContextVar authority, so ordinary child processes inherit
+    # generic Kanban vars but no reconstructable ownership.
+    from agent.delegation_context import _dispatcher_ownership_proof
+
+    _proof, _nonce = _dispatcher_ownership_proof(task.id)
+    env["HERMES_KANBAN_WORKER_OWNERSHIP"] = f"{_proof}.{_nonce}"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already

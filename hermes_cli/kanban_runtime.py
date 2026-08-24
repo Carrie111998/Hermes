@@ -17,9 +17,11 @@ before using the mounts.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
@@ -29,6 +31,32 @@ KANBAN_TERMINAL_RUNTIME_VERSION = 1
 _WORKSPACE_TARGET = "/workspace"
 _ALLOWED_WORKSPACE_KINDS = {"scratch", "dir", "worktree"}
 _ALLOWED_PURPOSES = {"workspace", "git-common-dir"}
+
+# Policy classes for the final typed bind plan (P1-A).
+POLICY_TASK_AUTHORITY = "task-authority"
+POLICY_TRUSTED_SUBSTRATE = "trusted-substrate"
+_ALLOWED_POLICY_CLASSES = {POLICY_TASK_AUTHORITY, POLICY_TRUSTED_SUBSTRATE}
+
+
+def physical_task_key(task_id: str) -> str:
+    """Deterministic portable-safe physical key derived from a logical task id.
+
+    Logical Kanban task ids may contain characters that are unsafe as
+    filesystem/container bookkeeping components (notably ``:``, which Windows
+    reserves for drive separators).  Physical identity therefore derives from a
+    128-bit SHA-256 prefix of the authoritative task id, producing a fixed
+    ``kbt-<32 hex>`` string that is safe on every supported filesystem.
+
+    Collision resistance is 2^-64 at 10^9 samples (birthday bound on 128 bits);
+    the full logical identity is retained separately in envelope metadata and
+    container labels for diagnostics — this key is never round-tripped back
+    into application logic.
+    """
+    raw = str(task_id or "").strip()
+    if not raw:
+        raise KanbanRuntimeError("physical_task_key requires a non-empty task id")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"kbt-{digest[:32]}"
 
 
 class KanbanRuntimeError(ValueError):
@@ -462,3 +490,186 @@ def translate_runtime_mounts(
             }
         )
     return translated
+
+
+# ---------------------------------------------------------------------------
+# P1-C: immutable Docker endpoint selector for Kanban task runtimes
+# ---------------------------------------------------------------------------
+
+
+class DockerEndpointSelectorError(RuntimeError):
+    """Raised when the effective Docker endpoint cannot be resolved."""
+
+
+@dataclass(frozen=True)
+class DockerEndpointSelector:
+    """One resolved, immutable Docker daemon selector.
+
+    ``selection`` records which input won precedence; ``context`` /
+    ``host`` record the selector identity; ``daemon_host`` is the resolved
+    daemon address used for local/remote and path-map policy. The CLI args to
+    pin every lifecycle call are precomputed: exactly one of
+    ``cli_args``/``cli_kwargs`` carries ``--context <name>`` or
+    ``--host <endpoint>``, so ambient DOCKER_* state can never retarget a
+    later probe/run/start/exec/rm.
+    """
+
+    selection: str  # "context" | "host" | "sticky-context" | "default"
+    context: str | None
+    host: str | None
+    daemon_host: str
+
+    @property
+    def is_remote(self) -> bool:
+        return is_remote_docker_host(self.daemon_host)
+
+    @property
+    def cli_args(self) -> tuple[str, ...]:
+        """Global docker CLI args that pin this selector."""
+        if self.selection == "context":
+            return ("--context", self.context)
+        if self.selection == "sticky-context":
+            return ("--context", self.context)
+        if self.selection == "host":
+            return ("--host", self.host)
+        return ()
+
+    def command_prefix(self, docker_exe: str) -> list[str]:
+        return [docker_exe, *self.cli_args]
+
+
+def resolve_docker_endpoint_selector(
+    *,
+    environ: Mapping[str, str] | None = None,
+    inspect_context=None,
+) -> DockerEndpointSelector:
+    """Resolve ONE immutable Docker endpoint selector. Fail closed on errors.
+
+    Precedence (Docker's own documented order):
+
+    1. explicit ``DOCKER_CONTEXT`` — overrides everything, including
+       ``DOCKER_HOST``, matching the docker CLI contract;
+    2. explicit ``DOCKER_HOST``;
+    3. sticky current context via ``docker context show`` (the CLI's own
+       default), with its resolved endpoint inspected so remote classification
+       and path-map policy use the real daemon host;
+    4. no context machinery / default context — plain local default endpoint.
+
+    Never mutates any environment. ``inspect_context`` is injectable for tests
+    and defaults to running ``docker context inspect``. Any resolution failure
+    raises :class:`DockerEndpointSelectorError` — it never silently falls back
+    to a different daemon than the one authorization was computed against.
+    """
+    import shutil as shutil_mod
+
+    env = environ if environ is not None else os.environ
+
+    ctx_name = str(env.get("DOCKER_CONTEXT", "")).strip()
+    explicit_host = str(env.get("DOCKER_HOST", "")).strip()
+
+    if ctx_name:
+        daemon = _inspect_context_endpoint(ctx_name, inspect_context)
+        if ctx_name == "default":
+            # An explicitly selected default context still wins over
+            # DOCKER_HOST per docker CLI semantics; its endpoint IS the
+            # local default unless configured otherwise.
+            selection = "context"
+        else:
+            selection = "context"
+        return DockerEndpointSelector(
+            selection=selection,
+            context=ctx_name,
+            host=explicit_host or None,
+            daemon_host=daemon,
+        )
+
+    if explicit_host:
+        return DockerEndpointSelector(
+            selection="host",
+            context=None,
+            host=explicit_host,
+            daemon_host=explicit_host,
+        )
+
+    sticky = _current_docker_context(inspect_context)
+    if sticky and sticky != "default":
+        daemon = _inspect_context_endpoint(sticky, inspect_context)
+        return DockerEndpointSelector(
+            selection="sticky-context",
+            context=sticky,
+            host=None,
+            daemon_host=daemon,
+        )
+    if sticky == "default":
+        # Resolve the default context too when the machinery exists, so the
+        # recorded daemon host reflects reality rather than an assumption.
+        daemon = _inspect_context_endpoint(
+            "default", inspect_context, allow_missing=True
+        )
+        return DockerEndpointSelector(
+            selection="sticky-context",
+            context="default",
+            host=None,
+            daemon_host=daemon or "",
+        )
+    return DockerEndpointSelector(
+        selection="default",
+        context=None,
+        host=explicit_host or None,
+        daemon_host="",
+    )
+
+
+def _run_context_cmd(args: list[str], inspect_context) -> subprocess.CompletedProcess | None:
+    import shutil as shutil_mod
+
+    if inspect_context is not None:
+        argv = ["docker", *args]
+        out, err, rc = inspect_context(argv)
+        return subprocess.CompletedProcess(argv, rc, out, err)
+    docker_exe = shutil_mod.which("docker")
+    if not docker_exe:
+        return None
+    try:
+        return subprocess.run(
+            [docker_exe, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _current_docker_context(inspect_context) -> str | None:
+    proc = _run_context_cmd(["context", "show"], inspect_context)
+    if proc is None or proc.returncode != 0:
+        return None
+    name = proc.stdout.strip()
+    return name or None
+
+
+def _inspect_context_endpoint(
+    name: str,
+    inspect_context,
+    *,
+    allow_missing: bool = False,
+) -> str:
+    proc = _run_context_cmd(["context", "inspect", "--format", "{{json .Endpoints.docker.Host}}", name], inspect_context)
+    if proc is None or proc.returncode != 0:
+        if allow_missing:
+            return ""
+        raise DockerEndpointSelectorError(
+            f"cannot inspect docker context {name!r}: "
+            f"{(proc.stderr.strip() if proc else 'docker CLI unavailable')}"
+        )
+    raw = (proc.stdout or "").strip().strip('"')
+    if not raw and not allow_missing:
+        raise DockerEndpointSelectorError(
+            f"docker context {name!r} has no resolvable docker endpoint"
+        )
+    return raw

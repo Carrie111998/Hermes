@@ -385,21 +385,25 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _kanban_runtime_context_allowed() -> bool:
-    """Whether this in-process context may inherit the dispatcher's container.
+    """Whether this in-process context may use the dispatcher's task runtime.
 
-    The dispatcher-owned worker itself and delegate_task children share one
-    sandbox.  An unrelated cron agent launched in-process from that worker must
-    *not* inherit the worker's task mount.
+    Positive-provenance gate (P1-B): dispatcher authority exists ONLY after a
+    successful one-shot ownership bootstrap, or inside a delegate_task child
+    whose parent already possessed it. Cron jobs and ordinary subprocesses
+    (which inherit generic HERMES_KANBAN_* env vars but no ContextVar proof)
+    are denied by default. Any probe/import failure denies — never fails open.
     """
     try:
         from agent.delegation_context import (
+            has_dispatcher_owned_authority,
             is_delegated_child_context,
-            is_dispatcher_owned_worker_context,
         )
 
-        return bool(is_dispatcher_owned_worker_context() or is_delegated_child_context())
+        if is_delegated_child_context():
+            return has_dispatcher_owned_authority()
+        return bool(has_dispatcher_owned_authority())
     except Exception:
-        return True
+        return False
 
 
 def _load_kanban_runtime(path_map: list | None = None) -> tuple[dict, list[dict]] | None:
@@ -413,6 +417,7 @@ def _load_kanban_runtime(path_map: list | None = None) -> tuple[dict, list[dict]
         KANBAN_TERMINAL_RUNTIME_ENV,
         KanbanRuntimeError,
         decode_kanban_terminal_runtime,
+        resolve_docker_endpoint_selector,
         translate_runtime_mounts,
     )
 
@@ -428,6 +433,11 @@ def _load_kanban_runtime(path_map: list | None = None) -> tuple[dict, list[dict]
             "HERMES_SESSION_SOURCE/task/workspace identity; refusing host mounts"
         )
     try:
+        # P1-C: resolve the effective endpoint ONCE — including Docker context
+        # precedence — and use the daemon it resolves for path translation.
+        # The same frozen selector is attached to the returned mounts so
+        # DockerEnvironment pins every lifecycle call to it.
+        selector = resolve_docker_endpoint_selector()
         runtime = decode_kanban_terminal_runtime(
             raw,
             expected_task_id=task_id,
@@ -436,11 +446,11 @@ def _load_kanban_runtime(path_map: list | None = None) -> tuple[dict, list[dict]
         mounts = translate_runtime_mounts(
             runtime,
             path_map=path_map or [],
-            docker_host=os.getenv("DOCKER_HOST"),
+            docker_host=selector.daemon_host or None,
         )
     except KanbanRuntimeError as exc:
         raise RuntimeError(f"invalid Kanban Docker runtime: {exc}") from exc
-    return runtime, mounts
+    return runtime, mounts, selector
 
 
 def _active_kanban_runtime_container_key() -> str | None:
@@ -454,6 +464,7 @@ def _active_kanban_runtime_container_key() -> str | None:
     from hermes_cli.kanban_runtime import (
         KANBAN_TERMINAL_RUNTIME_ENV,
         decode_kanban_terminal_runtime,
+        physical_task_key,
     )
 
     raw = os.getenv(KANBAN_TERMINAL_RUNTIME_ENV, "").strip()
@@ -467,7 +478,11 @@ def _active_kanban_runtime_container_key() -> str | None:
     runtime = decode_kanban_terminal_runtime(
         raw, expected_task_id=task_id, expected_workspace=workspace
     )
-    return f"kanban:{runtime['task_id']}"
+    # P1-D: physical bookkeeping identity is a portable-safe deterministic key
+    # derived from the authoritative task id. The logical task id is retained
+    # separately in container labels for diagnostics and never becomes a
+    # filesystem path component.
+    return physical_task_key(runtime["task_id"])
 
 def _check_all_guards(command: str, env_type: str,
                       has_host_access: bool = False) -> dict:
@@ -1766,10 +1781,13 @@ def _get_env_config() -> Dict[str, Any]:
     # worker: profile docker_volumes are intentionally discarded so a shared
     # worker profile cannot widen the task's filesystem view.
     docker_runtime_mounts = []
+    kanban_endpoint_selector = None
     if docker_backend and os.getenv("HERMES_KANBAN_TERMINAL_RUNTIME"):
         loaded_runtime = _load_kanban_runtime(docker_host_path_map)
         if loaded_runtime is not None:
-            _runtime, docker_runtime_mounts = loaded_runtime
+            _runtime, docker_runtime_mounts, kanban_endpoint_selector = (
+                loaded_runtime
+            )
             docker_volumes = []
             host_cwd = None
             cwd = "/workspace"
@@ -1810,6 +1828,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_runtime_mounts": docker_runtime_mounts,
         "docker_host_path_map": docker_host_path_map,
+        "kanban_endpoint_selector": kanban_endpoint_selector,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
@@ -1874,6 +1893,7 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "vercel_runtime": config.get("vercel_runtime", ""),
         "docker_volumes": config.get("docker_volumes", []),
         "docker_runtime_mounts": config.get("docker_runtime_mounts", []),
+        "kanban_endpoint_selector": config.get("kanban_endpoint_selector"),
         "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
         "docker_forward_env": config.get("docker_forward_env", []),
         "docker_env": config.get("docker_env", {}),
@@ -1950,6 +1970,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
             volumes=volumes,
             runtime_mounts=cc.get("docker_runtime_mounts", []),
+            endpoint_selector=cc.get("kanban_endpoint_selector"),
             host_cwd=host_cwd,
             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
             forward_env=docker_forward_env,

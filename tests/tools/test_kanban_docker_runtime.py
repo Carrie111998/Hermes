@@ -9,7 +9,10 @@ from hermes_cli.kanban_runtime import (
     KANBAN_TERMINAL_RUNTIME_ENV,
     build_kanban_terminal_runtime,
     encode_kanban_terminal_runtime,
+    physical_task_key,
 )
+
+HERMES_KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
 
 
 def _pin_kanban_worker(monkeypatch, workspace: Path, task_id: str = "t_runtime"):
@@ -26,7 +29,54 @@ def _pin_kanban_worker(monkeypatch, workspace: Path, task_id: str = "t_runtime")
         KANBAN_TERMINAL_RUNTIME_ENV,
         encode_kanban_terminal_runtime(runtime),
     )
+    # P1-B: terminal_tool requires positive dispatcher authority. Grant it the
+    # same way the worker bootstrap does: embed the one-shot marker, then
+    # consume it via bootstrap_dispatcher_authority.
+    from agent.delegation_context import (
+        DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV,
+        _dispatcher_ownership_proof,
+        bootstrap_dispatcher_authority,
+    )
+
+    proof, nonce = _dispatcher_ownership_proof(task_id)
+    monkeypatch.setenv(
+        DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV, f"{proof}.{nonce}"
+    )
+    bootstrap_dispatcher_authority(
+        task_id=task_id,
+        workspace=str(workspace.resolve()),
+    )
     return runtime
+
+
+@pytest.fixture(autouse=True)
+def _isolated_dispatcher_authority():
+    """Keep positive dispatcher authority test-local (ContextVar hygiene)."""
+    from agent import delegation_context as dc
+
+    token = dc._DISPATCHER_AUTHORITY.set(False)
+    veto_token = dc._NON_DISPATCHER_VETO.set(False)
+    yield
+    dc._DISPATCHER_AUTHORITY.reset(token)
+    dc._NON_DISPATCHER_VETO.reset(veto_token)
+
+
+def _grant_worker_authority(monkeypatch, task_id: str, workspace: Path) -> None:
+    """Embed + consume the dispatcher ownership marker for *task_id* (P1-B)."""
+    from agent.delegation_context import (
+        DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV,
+        _dispatcher_ownership_proof,
+        bootstrap_dispatcher_authority,
+    )
+
+    proof, nonce = _dispatcher_ownership_proof(task_id)
+    monkeypatch.setenv(
+        DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV, f"{proof}.{nonce}"
+    )
+    bootstrap_dispatcher_authority(
+        task_id=task_id,
+        workspace=str(workspace),
+    )
 
 
 def test_runtime_mount_overrides_profile_docker_volumes(monkeypatch, tmp_path):
@@ -63,8 +113,24 @@ def test_runtime_gets_unique_container_key(monkeypatch, tmp_path):
     ws = tmp_path / "task"
     ws.mkdir()
     _pin_kanban_worker(monkeypatch, ws, task_id="t_unique")
-    assert terminal_tool._resolve_container_task_id(None) == "kanban:t_unique"
-    assert terminal_tool._resolve_container_task_id("arbitrary-session") == "kanban:t_unique"
+    assert terminal_tool._resolve_container_task_id(None) == physical_task_key("t_unique")
+    assert terminal_tool._resolve_container_task_id("arbitrary-session") == physical_task_key("t_unique")
+    # P1-D: the physical key is portable-safe even for logical ids containing ':'.
+    unsafe = "task:with:colons"
+    runtime_unsafe = build_kanban_terminal_runtime(
+        task_id=unsafe,
+        workspace_kind="dir",
+        workspace=ws,
+        authorized_roots=[ws.parent],
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", unsafe)
+    monkeypatch.setenv(
+        KANBAN_TERMINAL_RUNTIME_ENV,
+        encode_kanban_terminal_runtime(runtime_unsafe),
+    )
+    key = terminal_tool._resolve_container_task_id(None)
+    assert ":" not in key
+    assert key == physical_task_key(unsafe)
 
 
 def test_runtime_container_never_cross_process_reuses(monkeypatch, tmp_path):
@@ -98,7 +164,7 @@ def test_runtime_container_never_cross_process_reuses(monkeypatch, tmp_path):
         task_id=task_key,
         host_cwd=cfg["host_cwd"],
     )
-    assert captured["task_id"] == "kanban:t_runtime"
+    assert captured["task_id"] == physical_task_key("t_runtime")
     assert captured["runtime_mounts"] == cfg["docker_runtime_mounts"]
     assert captured["persist_across_processes"] is False
     assert getattr(env, "_session_scoped") is True
@@ -150,6 +216,7 @@ def test_agreed_runtime_workspace_outside_authority_fails_closed(
     monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_DOCKER_HOST_PATH_MAP", "[]")
+    _grant_worker_authority(monkeypatch, "t_outside", outside.resolve())
 
     with pytest.raises(RuntimeError, match="outside authorized workspace roots"):
         terminal_tool._get_env_config()
