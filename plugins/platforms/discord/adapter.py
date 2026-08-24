@@ -2757,7 +2757,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     try:
                         channel = await self._client.fetch_channel(int(channel_id))
                     except Exception as exc:
-                        logger.debug("[%s] Cannot fetch backfill channel %s: %s", self.name, channel_id, exc)
+                        logger.debug(
+                            "[%s] Cannot fetch backfill channel %s: %s",
+                            self.name,
+                            channel_id,
+                            _redact_discord_error_text(exc),
+                        )
                         continue
                 candidate_channels.append(channel)
 
@@ -2813,7 +2818,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 for message in reversed(messages):
                     yield message
             except Exception as exc:
-                logger.debug("[%s] Cannot read history for %s: %s", self.name, channel_key, exc)
+                logger.debug(
+                    "[%s] Cannot read history for %s: %s",
+                    self.name,
+                    channel_key,
+                    _redact_discord_error_text(exc),
+                )
 
         child_threads = list(getattr(channel, "threads", []) or [])
         archived_threads = getattr(channel, "archived_threads", None)
@@ -2822,7 +2832,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 async for thread in archived_threads(limit=limit):
                     child_threads.append(thread)
             except Exception as exc:
-                logger.debug("[%s] Cannot list archived threads for %s: %s", self.name, channel_key, exc)
+                logger.debug(
+                    "[%s] Cannot list archived threads for %s: %s",
+                    self.name,
+                    channel_key,
+                    _redact_discord_error_text(exc),
+                )
 
         for thread in child_threads:
             thread_key = str(getattr(thread, "id", ""))
@@ -4985,7 +5000,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error("Voice listen loop error: %s", e, exc_info=True)
+            logger.error("Voice listen loop error: %s", _redact_discord_error_text(e))
 
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
         """Convert PCM -> WAV -> STT -> callback."""
@@ -5023,10 +5038,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     _ff_err = _ff_err.decode("utf-8", "replace")
                 logger.warning(
                     "Voice input processing failed: %s (ffmpeg: %s)",
-                    e, _ff_err.strip(), exc_info=True,
+                    _redact_discord_error_text(e),
+                    _redact_discord_error_text(_ff_err.strip()),
                 )
             else:
-                logger.warning("Voice input processing failed: %s", e, exc_info=True)
+                logger.warning(
+                    "Voice input processing failed: %s",
+                    _redact_discord_error_text(e),
+                )
         finally:
             try:
                 os.unlink(wav_path)
@@ -5522,11 +5541,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=str(msg.id))
 
-        except ImportError:
+        except ImportError as e:
             logger.warning(
-                "[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp",
+                "[%s] aiohttp not installed, falling back to URL (%s). Run: pip install aiohttp",
                 self.name,
-                exc_info=True,
+                _redact_discord_error_text(e),
             )
             return await super().send_image(chat_id, image_url, caption, reply_to)
         except Exception as e:  # pragma: no cover - defensive logging
@@ -5593,11 +5612,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=str(msg.id))
 
-        except ImportError:
+        except ImportError as e:
             logger.warning(
-                "[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp",
+                "[%s] aiohttp not installed, falling back to URL (%s). Run: pip install aiohttp",
                 self.name,
-                exc_info=True,
+                _redact_discord_error_text(e),
             )
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive logging
@@ -7387,8 +7406,13 @@ class DiscordAdapter(BasePlatformAdapter):
             thread = self._client.get_channel(thread_id_int)
             if thread is None:
                 thread = await self._client.fetch_channel(thread_id_int)
-        except Exception:
-            logger.debug("[%s] Failed to resolve Discord thread %s for rename", self.name, thread_id, exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed to resolve Discord thread %s for rename: %s",
+                self.name,
+                thread_id,
+                _redact_discord_error_text(exc),
+            )
             return False
 
         current_name = getattr(thread, "name", None)
@@ -7411,8 +7435,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, thread_id, current_name, cleaned,
             )
             return True
-        except Exception:
-            logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed to rename Discord thread %s: %s",
+                self.name,
+                thread_id,
+                _redact_discord_error_text(exc),
+            )
             return False
 
     async def create_handoff_thread(
@@ -8483,9 +8512,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         # ``to_agent_visible_cache_path()`` (important for
                         # Docker/Modal terminal backends).
                     except Exception as e:
+                        safe_error = _redact_discord_error_text(e)
                         logger.warning(
                             "[Discord] Failed to cache document %s: %s",
-                            att.filename, e, exc_info=True,
+                            att.filename,
+                            safe_error,
                         )
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
@@ -8968,7 +8999,10 @@ def _define_discord_view_classes() -> None:
                     count, self.session_key, choice, interaction.user.display_name,
                 )
             except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
+                logger.error(
+                    "Failed to resolve gateway approval from button: %s",
+                    _redact_discord_error_text(exc),
+                )
                 count = 0
 
             if not count:
@@ -9849,11 +9883,11 @@ def _define_discord_view_classes() -> None:
 
             try:
                 await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
+            except Exception as exc:
                 logger.debug(
-                    "Discord clarify edit_message failed for %s",
+                    "Discord clarify edit_message failed for %s: %s",
                     self.clarify_id,
-                    exc_info=True,
+                    _redact_discord_error_text(exc),
                 )
                 try:
                     await interaction.response.defer()
@@ -10367,8 +10401,9 @@ async def _standalone_send(
     except Exception as e:
         # Include the exception type: TimeoutError().str() is empty, so
         # "Discord send failed: " alone gave no diagnostic signal.
-        logger.error("Discord standalone send failed", exc_info=True)
-        return {"error": _standalone_sanitize_error(f"Discord send failed: {type(e).__name__}: {e}")}
+        safe_error = _redact_discord_error_text(f"{type(e).__name__}: {e}")
+        logger.error("Discord standalone send failed: %s", safe_error)
+        return {"error": _standalone_sanitize_error(f"Discord send failed: {safe_error}")}
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

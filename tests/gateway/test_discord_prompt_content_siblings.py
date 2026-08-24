@@ -4,12 +4,12 @@ their payload into plain message content, since embeds don't render on some
 Discord clients (web/mobile)."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.discord.adapter import DiscordAdapter, _redact_discord_error_text
 
 
 def _capture_channel(adapter):
@@ -70,62 +70,62 @@ async def test_clarify_with_choices_mirrors_question_into_content():
 @pytest.mark.asyncio
 async def test_update_and_clarify_return_redacted_transport_errors():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    secret = "synthetic-discord-transport-secret-1234567890"
     channel = SimpleNamespace(
-        send=AsyncMock(side_effect=RuntimeError("transport secret=do-not-leak")),
+        send=AsyncMock(
+            side_effect=RuntimeError(
+                f"transport Authorization: Bearer {secret}"
+            )
+        ),
     )
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
         fetch_channel=AsyncMock(),
     )
 
-    with patch(
-        "plugins.platforms.discord.adapter._redact_discord_error_text",
-        return_value="<safe transport error>",
-    ) as redact:
-        update_result = await adapter.send_update_prompt(
-            chat_id="555",
-            prompt="Continue update?",
-            session_key="discord:555",
-            prompt_id="p1",
-            correlation_id="c1",
-        )
-        clarify_result = await adapter.send_clarify(
-            chat_id="555",
-            question="Which environment?",
-            choices=["staging"],
-            clarify_id="cl1",
-            session_key="discord:555",
-        )
+    update_result = await adapter.send_update_prompt(
+        chat_id="555",
+        prompt="Continue update?",
+        session_key="discord:555",
+        prompt_id="p1",
+        correlation_id="c1",
+    )
+    clarify_result = await adapter.send_clarify(
+        chat_id="555",
+        question="Which environment?",
+        choices=["staging"],
+        clarify_id="cl1",
+        session_key="discord:555",
+    )
 
-    assert update_result.error == "<safe transport error>"
-    assert clarify_result.error == "<safe transport error>"
-    assert redact.call_count == 3
+    assert update_result.error and secret not in update_result.error
+    assert clarify_result.error and secret not in clarify_result.error
 
 
 @pytest.mark.asyncio
 async def test_send_and_forum_transport_errors_use_redaction_boundary():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    secret = "synthetic-discord-transport-secret-1234567890"
     channel = SimpleNamespace(
-        send=AsyncMock(side_effect=RuntimeError("transport secret=do-not-leak")),
+        send=AsyncMock(
+            side_effect=RuntimeError(
+                f"transport Authorization: Bearer {secret}"
+            )
+        ),
     )
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
         fetch_channel=AsyncMock(),
     )
 
-    with patch(
-        "plugins.platforms.discord.adapter._redact_discord_error_text",
-        return_value="<safe transport error>",
-    ) as redact:
-        result = await adapter.send("555", "hello")
+    result = await adapter.send("555", "hello")
 
-    assert result.error == "<safe transport error>"
-    assert redact.called
+    assert result.error and secret not in result.error
 
     forum = SimpleNamespace(
         id=777,
         create_thread=AsyncMock(
-            side_effect=RuntimeError("forum secret=do-not-leak")
+            side_effect=RuntimeError(f"forum Authorization: Bearer {secret}")
         ),
     )
     adapter._client = SimpleNamespace(
@@ -134,13 +134,20 @@ async def test_send_and_forum_transport_errors_use_redaction_boundary():
     )
     adapter._is_forum_parent = lambda _channel: True
 
-    with patch(
-        "plugins.platforms.discord.adapter._redact_discord_error_text",
-        return_value="<safe forum error>",
-    ) as redact:
-        result = await adapter.send("555", "hello")
+    result = await adapter.send("555", "hello")
 
-    assert result.error == "Forum thread creation failed: <safe forum error>"
-    assert redact.call_count >= 1
+    assert result.error and secret not in result.error
+    assert result.error.startswith("Forum thread creation failed:")
+
+
+def test_discord_error_redaction_masks_real_transport_secret():
+    secret = "synthetic-discord-transport-secret-1234567890"
+
+    redacted = _redact_discord_error_text(
+        f"Discord transport failed: Authorization: Bearer {secret}"
+    )
+
+    assert secret not in redacted
+    assert "Authorization: Bearer" in redacted
 
 
