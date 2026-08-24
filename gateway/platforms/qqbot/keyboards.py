@@ -50,6 +50,7 @@ _APPROVAL_DATA_RE = re.compile(
 
 # Pattern: update_prompt:y | update_prompt:n
 _UPDATE_PROMPT_RE = re.compile(r"^update_prompt:(y|n)$")
+_UPDATE_PROMPT_CALLBACK_RE = re.compile(r"^update_prompt:([^:]+):(y|n)$")
 
 
 # ── Keyboard dataclasses ─────────────────────────────────────────────
@@ -171,8 +172,21 @@ def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
     return m.group(1), m.group(2)
 
 
+def parse_update_prompt_callback_data(
+    button_data: str,
+) -> Optional[tuple[str, str]]:
+    """Parse a correlation-bound update callback into ``(token, answer)``."""
+    m = _UPDATE_PROMPT_CALLBACK_RE.match(button_data or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
 def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
     """Parse update-prompt ``button_data`` into ``'y'`` or ``'n'``."""
+    callback = parse_update_prompt_callback_data(button_data)
+    if callback is not None:
+        return callback[1]
     m = _UPDATE_PROMPT_RE.match(button_data or "")
     if not m:
         return None
@@ -231,8 +245,9 @@ def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -
     return InlineKeyboard(content=KeyboardContent(rows=[KeyboardRow(buttons=buttons)]))
 
 
-def build_update_prompt_keyboard() -> InlineKeyboard:
-    """Build a Yes/No keyboard for update confirmation prompts."""
+def build_update_prompt_keyboard(callback_token: str = "") -> InlineKeyboard:
+    """Build a Yes/No keyboard for a correlation-bound update prompt."""
+    suffix = f"{callback_token}:" if callback_token else ""
     return InlineKeyboard(
         content=KeyboardContent(
             rows=[
@@ -241,7 +256,7 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
                         btn_id="yes",
                         label="✓ 确认",
                         visited_label="已确认",
-                        data=f"{UPDATE_PROMPT_PREFIX}y",
+                        data=f"{UPDATE_PROMPT_PREFIX}{suffix}y",
                         style=1,
                         group_id="update_prompt",
                     ),
@@ -249,7 +264,7 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
                         btn_id="no",
                         label="✗ 取消",
                         visited_label="已取消",
-                        data=f"{UPDATE_PROMPT_PREFIX}n",
+                        data=f"{UPDATE_PROMPT_PREFIX}{suffix}n",
                         style=0,
                         group_id="update_prompt",
                     ),

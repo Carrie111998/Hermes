@@ -106,6 +106,21 @@ async def test_drain_probe_error_fails_closed_within_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_kanban_termination_probe_error_fails_closed(monkeypatch):
+    from hermes_cli import kanban_db
+
+    runner = _runner()
+
+    def _broken_probe() -> list[int]:
+        raise OSError("board WAL unreadable")
+
+    monkeypatch.setattr(kanban_db, "active_worker_pids_all_boards", _broken_probe)
+
+    with pytest.raises(RuntimeError, match="environment"):
+        await runner._terminate_active_kanban_workers("gateway restart")
+
+
+@pytest.mark.asyncio
 async def test_drain_waits_for_dispatch_admitted_just_before_quiesce(monkeypatch):
     from hermes_cli import kanban_db
 

@@ -1,6 +1,7 @@
 """Tests for the QQ Bot platform adapter."""
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -908,7 +909,7 @@ class TestDefaultInteractionDispatch:
 
     @pytest.mark.asyncio
     async def test_update_prompt_click_writes_response_file(self, tmp_path, monkeypatch):
-        """update_prompt:y click writes 'y' to ~/.hermes/.update_response."""
+        """A QQ update click uses the shared correlation/actor-bound writer."""
         adapter = self._make_adapter()
         hermes_home = tmp_path / "hermes_home"
         hermes_home.mkdir()
@@ -916,17 +917,45 @@ class TestDefaultInteractionDispatch:
             "hermes_constants.get_hermes_home",
             lambda: hermes_home,
         )
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "correlation_id": "corr-1",
+            "user_id": "u-1",
+            "session_key": "agent:main:qqbot:c2c:u-1",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(hermes_home),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        }))
+        (hermes_home / ".update_prompt.json").write_text(json.dumps({
+            "id": "prompt-1",
+            "kind": "update_confirmation",
+            "correlation_id": "corr-1",
+            "context": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+                "control_home": str(hermes_home),
+                "install_root": "/project/hermes",
+                "install_id": "install-1",
+            },
+        }))
+        adapter._update_prompt_state["token-1"] = {
+            "prompt_id": "prompt-1",
+            "correlation_id": "corr-1",
+            "session_key": "agent:main:qqbot:c2c:u-1",
+            "control_home": str(hermes_home),
+        }
 
         from gateway.platforms.qqbot.keyboards import parse_interaction_event
         event = parse_interaction_event({
             "id": "i", "chat_type": 2, "user_openid": "u-1",
-            "data": {"resolved": {"button_data": "update_prompt:y"}},
+            "data": {"resolved": {"button_data": "update_prompt:token-1:y"}},
         })
         await adapter._default_interaction_dispatch(event)
 
         response = hermes_home / ".update_response"
         assert response.exists()
-        assert response.read_text() == "y"
+        assert json.loads(response.read_text())["answer"] == "yes"
 
 
 class TestSendExecApproval:
@@ -992,7 +1021,9 @@ class TestSendUpdatePrompt:
 
         result = await adapter.send_update_prompt(
             chat_id="u1", prompt="Continue with update?",
-            default="y", session_key="ignored", metadata={"x": 1},
+            default="y", session_key="ignored", prompt_id="prompt-1",
+            correlation_id="corr-1", context={"control_home": "C:/tmp"},
+            metadata={"x": 1},
         )
         assert result.success
         assert "Continue with update?" in captured["content"]
@@ -1001,7 +1032,8 @@ class TestSendUpdatePrompt:
         # Keyboard has the Yes/No buttons.
         dd = captured["keyboard"].to_dict()
         datas = [b["action"]["data"] for b in dd["content"]["rows"][0]["buttons"]]
-        assert datas == ["update_prompt:y", "update_prompt:n"]
+        assert datas[0].startswith("update_prompt:") and datas[0].endswith(":y")
+        assert datas[1].startswith("update_prompt:") and datas[1].endswith(":n")
 
 
 # ---------------------------------------------------------------------------

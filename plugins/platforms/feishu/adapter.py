@@ -2163,6 +2163,9 @@ class FeishuAdapter(BasePlatformAdapter):
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
+        prompt_id: str = "",
+        correlation_id: str = "",
+        context: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive update prompt with Yes/No buttons."""
@@ -2170,9 +2173,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            prompt_id = next(self._update_prompt_counter)
+            card_prompt_id = next(self._update_prompt_counter)
+            callback_prompt_id = str(prompt_id or "")
             payload = json.dumps(
-                self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id),
+                self._build_update_prompt_card(
+                    prompt=prompt, default=default, prompt_id=card_prompt_id
+                ),
                 ensure_ascii=False,
             )
             response = await self._feishu_send_with_retry(
@@ -2185,8 +2191,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_update_prompt failed")
             if result.success:
-                self._update_prompt_state[prompt_id] = {
+                self._update_prompt_state[card_prompt_id] = {
                     "session_key": session_key,
+                    "prompt_id": callback_prompt_id,
+                    "correlation_id": str(correlation_id),
+                    "control_home": str((context or {}).get("control_home") or ""),
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
@@ -2229,12 +2238,6 @@ class FeishuAdapter(BasePlatformAdapter):
             ],
         }
 
-    @staticmethod
-    def _write_update_prompt_response(answer: str) -> None:
-        response_path = get_hermes_home() / ".update_response"
-        tmp_path = response_path.with_suffix(".tmp")
-        tmp_path.write_text(answer, encoding="utf-8")
-        tmp_path.replace(response_path)
 
     async def send_voice(
         self,
@@ -2959,11 +2962,6 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        if open_id:
-            sender_id = SimpleNamespace(open_id=open_id, user_id="")
-            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
-                logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
-                return
         expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
             logger.warning(
@@ -2973,12 +2971,24 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id,
             )
             return
-        state = self._update_prompt_state.pop(prompt_id, None)
-        if not state:
-            logger.debug("[Feishu] Update prompt %s already resolved while validating callback", prompt_id)
-            return
         try:
-            self._write_update_prompt_response(answer)
+            from gateway.update_prompt_response import write_update_confirmation_response
+
+            written = write_update_confirmation_response(
+                state.get("control_home", ""),
+                prompt_id=state.get("prompt_id", ""),
+                correlation_id=state.get("correlation_id", ""),
+                session_key=state.get("session_key", ""),
+                actor_id=open_id,
+                answer=answer,
+            )
+            if not written:
+                logger.warning(
+                    "[Feishu] Rejected stale or invalid update prompt %s",
+                    prompt_id,
+                )
+                return
+            self._update_prompt_state.pop(prompt_id, None)
             logger.info(
                 "Feishu update prompt resolved for session %s (answer=%s, user=%s)",
                 state["session_key"], answer, user_name,

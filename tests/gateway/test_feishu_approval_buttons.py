@@ -178,6 +178,9 @@ class TestFeishuUpdatePrompt:
                 prompt="Restore stashed changes after update?",
                 default="y",
                 session_key="agent:main:feishu:group:oc_12345",
+                prompt_id="prompt-up-1",
+                correlation_id="corr-up-1",
+                context={"control_home": "/tmp/hermes"},
                 metadata={"thread_id": "th_1"},
             )
 
@@ -195,6 +198,9 @@ class TestFeishuUpdatePrompt:
         assert "Default: `y`" in card["elements"][0]["content"]
         actions = card["elements"][1]["actions"]
         assert [a["value"]["hermes_update_prompt_action"] for a in actions] == ["y", "n"]
+        state = next(iter(adapter._update_prompt_state.values()))
+        assert state["prompt_id"] == "prompt-up-1"
+        assert state["correlation_id"] == "corr-up-1"
 
 
 # ===========================================================================
@@ -435,15 +441,43 @@ class TestResolveUpdatePrompt:
         adapter = _make_adapter()
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         (tmp_path / ".hermes").mkdir()
+        control_home = tmp_path / ".hermes"
+        (control_home / ".update_pending.json").write_text(json.dumps({
+            "correlation_id": "corr-1",
+            "user_id": "ou_user1",
+            "session_key": "sess-up-1",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(control_home),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        }))
+        (control_home / ".update_prompt.json").write_text(json.dumps({
+            "id": "prompt-1",
+            "kind": "update_confirmation",
+            "correlation_id": "corr-1",
+            "context": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+                "control_home": str(control_home),
+                "install_root": "/project/hermes",
+                "install_id": "install-1",
+            },
+        }))
         adapter._update_prompt_state[1] = {
             "session_key": "sess-up-1",
+            "prompt_id": "prompt-1",
+            "correlation_id": "corr-1",
+            "control_home": str(control_home),
             "message_id": "msg_up_003",
             "chat_id": "oc_12345",
         }
 
-        await adapter._resolve_update_prompt(1, "y", "Alice")
+        await adapter._resolve_update_prompt(
+            1, "y", "Alice", open_id="ou_user1", chat_id="oc_12345"
+        )
 
-        assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
+        assert json.loads((tmp_path / ".hermes" / ".update_response").read_text())["answer"] == "yes"
         assert 1 not in adapter._update_prompt_state
 
 

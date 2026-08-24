@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -132,8 +133,8 @@ from gateway.platforms.qqbot.keyboards import (
     build_approval_keyboard,
     build_update_prompt_keyboard,
     parse_approval_button_data,
+    parse_update_prompt_callback_data,
     parse_interaction_event,
-    parse_update_prompt_button_data,
 )
 
 
@@ -288,6 +289,7 @@ class QQAdapter(BasePlatformAdapter):
         # box; callers can override with set_interaction_callback(None) or
         # register a custom handler.
         self._interaction_callback = self._default_interaction_dispatch
+        self._update_prompt_state: Dict[str, Dict[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -1199,16 +1201,46 @@ class QQAdapter(BasePlatformAdapter):
                 )
             return
 
-        update_answer = parse_update_prompt_button_data(button_data)
-        if update_answer is not None:
-            update_session_key = f"agent:main:qqbot:{event.scene}:{event.group_openid or event.guild_id or event.user_openid}"
+        update_callback = parse_update_prompt_callback_data(button_data)
+        if update_callback is not None:
+            callback_token, update_answer = update_callback
+            prompt_state = self._update_prompt_state.get(callback_token)
+            if not prompt_state:
+                logger.warning(
+                    "[%s] Rejected expired update prompt click (operator=%s)",
+                    self._log_tag, event.operator_openid,
+                )
+                return
+            update_session_key = prompt_state.get("session_key", "")
             if not self._is_authorized_interaction_for_session(event, update_session_key):
                 logger.warning(
                     "[%s] Rejected unauthorized update prompt click (operator=%s)",
                     self._log_tag, event.operator_openid,
                 )
                 return
-            self._write_update_response(update_answer, event.operator_openid)
+            try:
+                from gateway.update_prompt_response import (
+                    write_update_confirmation_response,
+                )
+
+                written = write_update_confirmation_response(
+                    prompt_state.get("control_home", ""),
+                    prompt_id=prompt_state.get("prompt_id", ""),
+                    correlation_id=prompt_state.get("correlation_id", ""),
+                    session_key=update_session_key,
+                    actor_id=event.operator_openid,
+                    answer=update_answer,
+                )
+            except Exception as exc:
+                logger.error("[%s] Failed to validate QQ update prompt: %s", self._log_tag, exc)
+                written = False
+            if not written:
+                logger.warning(
+                    "[%s] Rejected stale or invalid update prompt click (operator=%s)",
+                    self._log_tag, event.operator_openid,
+                )
+                return
+            self._update_prompt_state.pop(callback_token, None)
             return
 
         logger.debug(
@@ -1216,28 +1248,6 @@ class QQAdapter(BasePlatformAdapter):
             self._log_tag, button_data, event.id,
         )
 
-    @staticmethod
-    def _write_update_response(answer: str, operator: str = "") -> None:
-        """Atomically write the update-prompt answer to ``.update_response``.
-
-        Mirrors the Discord / Telegram / Feishu adapters: the detached
-        ``hermes update --gateway`` watcher polls this file for a ``y``/``n``
-        response to its interactive prompts (stash-restore, config migration).
-        Writes via ``tmp + rename`` so a partial write can't fool the reader.
-        """
-        try:
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            response_path = home / ".update_response"
-            tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer, encoding="utf-8")
-            tmp.replace(response_path)
-            logger.info(
-                "QQ update prompt answered %r by %s",
-                answer, operator or "(unknown)",
-            )
-        except Exception as exc:
-            logger.error("Failed to write update response: %s", exc)
 
     async def _handle_c2c_message(
             self,
@@ -2746,6 +2756,9 @@ class QQAdapter(BasePlatformAdapter):
             prompt: str,
             default: str = "",
             session_key: str = "",
+            prompt_id: str = "",
+            correlation_id: str = "",
+            context: Optional[Dict[str, Any]] = None,
             metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Yes/No update-confirmation prompt with inline buttons.
@@ -2758,17 +2771,33 @@ class QQAdapter(BasePlatformAdapter):
         ``~/.hermes/.update_response`` so the detached update process
         can read it.
         """
-        del session_key, metadata  # present for contract parity only.
+        del metadata  # present for contract parity only.
+        prompt_id = str(prompt_id or "")
+        correlation_id = str(correlation_id or "")
+        if not prompt_id or not correlation_id or not session_key:
+            return SendResult(success=False, error="Missing update prompt identity")
+        callback_token = hashlib.sha256(
+            f"{prompt_id}\0{correlation_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        self._update_prompt_state[callback_token] = {
+            "prompt_id": prompt_id,
+            "correlation_id": correlation_id,
+            "session_key": str(session_key),
+            "control_home": str((context or {}).get("control_home") or ""),
+        }
 
         default_hint = f" (default: {default})" if default else ""
         content = f"⚕ **Update Needs Your Input**\n\n{prompt}{default_hint}"
         msg_id = self._last_msg_id.get(chat_id)
-        return await self.send_with_keyboard(
+        result = await self.send_with_keyboard(
             chat_id,
             content,
-            build_update_prompt_keyboard(),
+            build_update_prompt_keyboard(callback_token),
             reply_to=msg_id,
         )
+        if not result.success:
+            self._update_prompt_state.pop(callback_token, None)
+        return result
 
     def _build_text_body(
             self, content: str, reply_to: Optional[str] = None

@@ -10866,18 +10866,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pids = list(kanban_db.active_worker_pids_all_boards())
         except Exception as exc:
             logger.warning(
-                "Unable to enumerate Kanban workers during %s; refusing to "
-                "claim a clean replacement: %s",
+                "Unable to enumerate Kanban workers during %s; refusing "
+                "environment replacement: %s",
                 reason,
                 exc,
             )
-            return 0
+            raise RuntimeError(
+                f"Cannot safely replace the environment during {reason}: "
+                "Kanban worker enumeration failed"
+            ) from exc
 
         for pid in pids:
             try:
                 await asyncio.to_thread(terminate_pid, int(pid), force=False)
-            except (ProcessLookupError, OSError, ValueError) as exc:
+            except ProcessLookupError as exc:
                 logger.debug("Kanban worker %s already exited or resisted SIGTERM: %s", pid, exc)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot safely replace the environment during {reason}: "
+                    f"failed to terminate Kanban worker {pid}"
+                ) from exc
 
         loop = asyncio.get_running_loop()
         grace_deadline = loop.time() + 2.0
@@ -10886,25 +10894,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(0.1)
             try:
                 live = set(kanban_db.active_worker_pids_all_boards())
-            except Exception:
-                live = set(remaining)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Cannot safely replace the environment during {reason}: "
+                    "Kanban worker enumeration failed while waiting for termination"
+                ) from exc
             remaining = [pid for pid in remaining if pid in live]
 
         for pid in remaining:
             try:
                 await asyncio.to_thread(terminate_pid, int(pid), force=True)
-            except (ProcessLookupError, OSError, ValueError) as exc:
+            except ProcessLookupError as exc:
                 logger.debug("Kanban worker %s force termination failed: %s", pid, exc)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot safely replace the environment during {reason}: "
+                    f"failed to force-terminate Kanban worker {pid}"
+                ) from exc
 
         try:
             remaining = list(kanban_db.active_worker_pids_all_boards())
-        except Exception:
-            remaining = list(remaining)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot safely replace the environment during {reason}: "
+                "Kanban worker enumeration failed after termination"
+            ) from exc
         if remaining:
             logger.error(
                 "Kanban worker termination incomplete during %s; live PIDs=%s",
                 reason,
                 remaining,
+            )
+            raise RuntimeError(
+                f"Cannot safely replace the environment during {reason}: "
+                f"Kanban workers remain alive ({remaining!r})"
             )
         else:
             logger.info("Terminated %d detached Kanban worker(s) during %s", len(pids), reason)
@@ -15283,9 +15306,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
-                await self._terminate_active_kanban_workers(
+                remaining_kanban_workers = await self._terminate_active_kanban_workers(
                     "gateway restart" if self._restart_requested else "gateway shutdown"
                 )
+                if remaining_kanban_workers:
+                    raise RuntimeError(
+                        "Refusing environment replacement while detached Kanban "
+                        f"workers remain ({remaining_kanban_workers})"
+                    )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 # Wait on API-server work too. The interrupt is cooperative:
                 # without this the settle window closes the instant

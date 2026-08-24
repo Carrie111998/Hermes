@@ -305,6 +305,7 @@ class TestTelegramApprovalCallback:
         (tmp_path / ".update_pending.json").write_text(json.dumps({
             "correlation_id": "corr-1",
             "session_key": "session-1",
+            "user_id": "123",
             "origin_profile": "work",
             "profile_home": "/profiles/work",
             "control_home": str(tmp_path),

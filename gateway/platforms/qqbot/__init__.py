@@ -51,6 +51,7 @@ from .keyboards import (  # noqa: F401
     build_approval_text,
     build_update_prompt_keyboard,
     parse_approval_button_data,
+    parse_update_prompt_callback_data,
     parse_interaction_event,
     parse_update_prompt_button_data,
 )
@@ -86,6 +87,7 @@ __all__ = [
     "build_approval_text",
     "build_update_prompt_keyboard",
     "parse_approval_button_data",
+    "parse_update_prompt_callback_data",
     "parse_interaction_event",
     "parse_update_prompt_button_data",
 ]
