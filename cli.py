@@ -54,6 +54,7 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
+from agent.pet import render as pet_render
 from agent.interrupt_compat import request_hard_interrupt
 
 # prompt_toolkit for fixed input area TUI
@@ -6754,7 +6755,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         the TUI's steady poll. Cheap and fail-open: any problem disables the pet.
         """
         try:
-            from agent.pet import constants, render, store
+            from agent.pet import constants, store
             from agent.pet.render import PetRenderer
             from hermes_cli.config import load_config
 
@@ -6769,7 +6770,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
             cols = constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
             configured_mode = str(pet_cfg.get("render_mode", "auto") or "auto").lower()
-            detected_mode = render.detect_terminal_graphics() if configured_mode in ("", "auto") else configured_mode
+            detected_mode = pet_render.detect_terminal_graphics() if configured_mode in ("", "auto") else configured_mode
             # Kitty's virtual Unicode-placeholder placement is grid-safe inside
             # prompt_toolkit. iTerm and sixel stay on the Unicode fallback.
             renderer_mode = "kitty" if detected_mode == "kitty" else "unicode"
@@ -6811,7 +6812,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_frames_cache.clear()
                     self._pet_kitty_cache.clear()
                     self._pet_kitty_pending = ""
-                    self._pet_kitty_image_id = render.kitty_image_id(pet.slug)
+                    self._pet_kitty_image_id = pet_render.kitty_image_id(pet.slug)
                     self._pet_frame_idx = 0
                 self._pet_enabled = True
         except Exception:
@@ -6909,6 +6910,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             payload = None
         if payload is not None:
+            payload = {**payload, "image_id": image_id}
             with self._pet_lock:
                 if self._pet_renderer is renderer and self._pet_kitty_image_id == image_id:
                     self._pet_kitty_cache[state] = payload
@@ -6945,14 +6947,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return []
             state = self._derive_pet_state()
             kitty = self._pet_renderer.mode == "kitty"
-            image_id = self._pet_kitty_image_id
         if kitty:
-            from agent.pet import render
-
             payload = self._pet_kitty_payload_for(state)
             if not payload:
                 return []
-            color = render.kitty_color_hex(image_id)
+            color = pet_render.kitty_color_hex(payload["image_id"])
             frags = []
             for y, row in enumerate(payload["placeholder"]):
                 if y:
@@ -20149,6 +20148,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         from agent.pet.render import detect_terminal_graphics
 
+        # Kitty placeholders encode their image id in exact foreground RGB, so
+        # Kitty-class terminals intentionally use 24-bit color for the whole
+        # prompt_toolkit application; quantizing only that pane is not supported.
         # Create the application
         app = Application(
             layout=layout,
