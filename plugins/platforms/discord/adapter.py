@@ -1087,6 +1087,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        # Public per-guild music queues are created lazily on the first music
+        # command so text-only Discord users pay no yt-dlp/import overhead.
+        self._music_manager = None
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -4643,6 +4646,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+            music_manager = getattr(self, "_music_manager", None)
+            if music_manager is not None:
+                await music_manager.on_voice_disconnected(guild_id)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
@@ -5839,6 +5845,138 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
 
+    def _get_music_manager(self):
+        if self._music_manager is None:
+            from plugins.platforms.discord.music import DiscordMusicManager
+
+            self._music_manager = DiscordMusicManager(self)
+        return self._music_manager
+
+    async def _send_music_error(self, interaction, exc: Exception) -> None:
+        message = f"Music request failed: {exc}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            logger.warning("[Discord] Could not deliver music error: %s", exc)
+
+    async def _handle_music_play(self, interaction, query: str) -> None:
+        if not await self._check_slash_authorization(interaction, "/play"):
+            return
+        try:
+            await self._get_music_manager().add(interaction, query)
+        except Exception as exc:
+            logger.warning("[Discord] /play failed: %s", exc)
+            await self._send_music_error(interaction, exc)
+
+    async def _handle_music_queue(self, interaction) -> None:
+        if not await self._check_slash_authorization(interaction, "/musicqueue"):
+            return
+        guild = getattr(interaction, "guild", None)
+        if guild is None:
+            await interaction.response.send_message(
+                "Music queues are only available in a server.", ephemeral=True
+            )
+            return
+        manager = self._get_music_manager()
+        await manager.show_queue(interaction, int(guild.id))
+
+    async def _handle_music_admin(self, interaction, action: str) -> None:
+        command = "/forceskip" if action == "forceskip" else "/clearqueue"
+        if not await self._check_slash_authorization(interaction, command):
+            return
+        guild = getattr(interaction, "guild", None)
+        if guild is None:
+            await interaction.response.send_message(
+                "Music administration is only available in a server.", ephemeral=True
+            )
+            return
+        await self._get_music_manager().admin_action(interaction, int(guild.id), action)
+
+    async def _handle_announce_slash(
+        self,
+        interaction: "discord.Interaction",
+        channel: "discord.TextChannel",
+        message: str,
+        ping_everyone: bool = False,
+    ) -> None:
+        """Post an exact announcement to a selected channel after authorization."""
+        if not await self._check_slash_authorization(interaction, "/announce"):
+            return
+
+        # Direct native handlers do not pass through GatewayRunner's command
+        # dispatcher, so apply the optional slash access split here as well.
+        from gateway.slash_access import policy_from_extra
+
+        scope = "dm" if isinstance(interaction.channel, discord.DMChannel) else "group"
+        policy = policy_from_extra(getattr(self.config, "extra", {}) or {}, scope)
+        user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+        if not policy.can_run(user_id, "announce"):
+            await self._reject_slash(
+                interaction,
+                "/announce",
+                reason="command blocked by slash access policy",
+            )
+            return
+
+        source_guild = getattr(interaction, "guild", None)
+        target_guild = getattr(channel, "guild", None)
+        if (
+            source_guild is None
+            or target_guild is None
+            or getattr(source_guild, "id", None) != getattr(target_guild, "id", None)
+        ):
+            await interaction.response.send_message(
+                "Choose a text channel in this server.", ephemeral=True
+            )
+            return
+
+        if not message or not message.strip():
+            await interaction.response.send_message(
+                "Announcement text cannot be empty.", ephemeral=True
+            )
+            return
+        prefix = "@everyone\n\n" if ping_everyone and "@everyone" not in message else ""
+        content = prefix + message
+        if len(content) > 2000:
+            await interaction.response.send_message(
+                "Announcement text must be 2,000 characters or fewer.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if ping_everyone:
+                sent_message = await channel.send(
+                    content,
+                    allowed_mentions=getattr(discord, "AllowedMentions")(
+                        everyone=True,
+                        roles=False,
+                        users=True,
+                        replied_user=False,
+                    ),
+                )
+            else:
+                sent_message = await channel.send(content)
+        except Exception as exc:
+            logger.warning("[Discord] /announce delivery failed: %s", exc)
+            await interaction.edit_original_response(
+                content=f"Announcement failed: {exc}"
+            )
+            return
+
+        message_id = str(getattr(sent_message, "id", ""))
+        if message_id:
+            self._nonconversational_messages.mark_many([message_id])
+        jump_url = str(getattr(sent_message, "jump_url", "") or "")
+        receipt = f"Announcement posted in <#{channel.id}>"
+        if jump_url:
+            receipt += f": {jump_url}"
+        await interaction.edit_original_response(content=receipt)
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
@@ -5966,6 +6104,23 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
+        @tree.command(name="play", description="Add a song or streaming link to the public music queue")
+        @discord.app_commands.describe(query="Song name, Spotify link, YouTube link, or supported media URL")
+        async def slash_play(interaction: discord.Interaction, query: str):
+            await self._handle_music_play(interaction, query)
+
+        @tree.command(name="musicqueue", description="Show or refresh the public music queue")
+        async def slash_musicqueue(interaction: discord.Interaction):
+            await self._handle_music_queue(interaction)
+
+        @tree.command(name="forceskip", description="Administrator: force-skip the current song")
+        async def slash_forceskip(interaction: discord.Interaction):
+            await self._handle_music_admin(interaction, "forceskip")
+
+        @tree.command(name="clearqueue", description="Administrator: stop playback and clear the music queue")
+        async def slash_clearqueue(interaction: discord.Interaction):
+            await self._handle_music_admin(interaction, "clear")
+
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/update", "Update initiated~")
@@ -6009,6 +6164,22 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(prompt="The prompt to run in the background")
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
+
+        @tree.command(name="announce", description="Confirm and post an announcement")
+        @discord.app_commands.describe(
+            channel="Channel where the announcement will be posted",
+            message="Announcement text, exactly as it should appear",
+            ping_everyone="Whether to notify everyone in the server",
+        )
+        async def slash_announce(
+            interaction: "discord.Interaction",
+            channel: "discord.TextChannel",
+            message: str,
+            ping_everyone: bool = False,
+        ):
+            await self._handle_announce_slash(
+                interaction, channel, message, ping_everyone
+            )
 
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
