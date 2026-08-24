@@ -55,6 +55,21 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _canonical_tc_id(tc: Any) -> str:
+    """Extract the canonical tool_call_id from a tool-call object.
+
+    SDK tool-call objects may carry distinct ``id`` (e.g. ``fc_0``) and
+    ``call_id`` (e.g. ``call_0``).  The assistant-message normalizer in
+    ``chat_completion_helpers`` stores both ``id`` and ``call_id`` as the
+    canonical ``call_id`` value.  Tool results must use the same canonical
+    form so downstream pairing passes can match them (#93404).
+    """
+    call_id = getattr(tc, "call_id", None)
+    if isinstance(call_id, str) and call_id.strip():
+        return call_id.strip()
+    return getattr(tc, "id", "") or ""
+
+
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Tell the stall guards where a persisted result's full content lives.
 
@@ -1103,7 +1118,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             messages.append(make_tool_result_message(
                 tc.function.name,
                 cancelled_result,
-                tc.id,
+                _canonical_tc_id(tc),
                 effect_disposition="none",
             ))
             _emit_terminal_post_tool_call(
@@ -1818,7 +1833,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         tool_message = make_tool_result_message(
             name,
             _tool_content,
-            tc.id,
+            _canonical_tc_id(tc),
             effect_disposition=effect_disposition,
         )
         messages.append(tool_message)
@@ -1917,7 +1932,7 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         messages.append(make_tool_result_message(
             name,
             f"[Tool execution cancelled — {name} was skipped due to {reason}]",
-            getattr(tc, "id", "") or "",
+            _canonical_tc_id(tc),
             effect_disposition="none",
         ))
 
@@ -1956,7 +1971,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages.append(make_tool_result_message(
                     skipped_name,
                     cancelled_result,
-                    skipped_tc.id,
+                    _canonical_tc_id(skipped_tc),
                     effect_disposition="none",
                 ))
                 _emit_terminal_post_tool_call(
@@ -1999,7 +2014,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 make_tool_result_message(
                     function_name,
                     malformed_args_result,
-                    tool_call.id,
+                    _canonical_tc_id(tool_call),
                 )
             )
             if not _flush_session_db_after_tool_progress(
@@ -2732,7 +2747,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_message = make_tool_result_message(
             function_name,
             _tool_content,
-            tool_call.id,
+            _canonical_tc_id(tool_call),
             effect_disposition="unknown" if _execution_timed_out else None,
         )
         messages.append(tool_message)
@@ -2805,7 +2820,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages.append(make_tool_result_message(
                     skipped_name,
                     f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
-                    skipped_tc.id,
+                    _canonical_tc_id(skipped_tc),
                     effect_disposition="none",
                 ))
                 if not _flush_session_db_after_tool_progress(
