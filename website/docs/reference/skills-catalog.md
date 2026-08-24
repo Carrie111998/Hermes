@@ -56,7 +56,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`termux-gateway-keepalive`](/docs/user-guide/skills/bundled/devops/devops-termux-gateway-keepalive) | Keep Hermes gateway alive on Android Termux via watchdog. | `devops/termux-gateway-keepalive` |
+| [`termux-gateway-keepalive`](/docs/user-guide/skills/bundled/devops/devops-termux-gateway-keepalive) | Supervise and resurrect Hermes gateway on Android Termux. | `devops/termux-gateway-keepalive` |
 
 ## email
 

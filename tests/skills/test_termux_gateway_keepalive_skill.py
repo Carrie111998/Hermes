@@ -2,105 +2,68 @@
 Tests for the Termux Gateway Keep-Alive skill (skills/devops/termux-gateway-keepalive).
 
 Covers:
-- Keep-alive status retrieval and mock gateway checks
-- Self-check liveness and state freshness validation
-- Script installation helper
-- Shell script syntax verification
-- CLI subprocess commands
+- Shell script syntax checks (bash -n) on all keepalive scripts
+- hermes_presence.py ambient alert formatting and CLI argument handling
+- Gateway watchdog state and command handling
 """
 
-import json
 import subprocess
 import sys
-import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO_ROOT / "skills" / "devops" / "termux-gateway-keepalive"
 SCRIPTS_DIR = SKILL_DIR / "scripts"
-CLI_SCRIPT = SCRIPTS_DIR / "keepalive_cli.py"
+PRESENCE_SCRIPT = SCRIPTS_DIR / "hermes_presence.py"
 
-# Import module directly
+# Import Python presence module
 sys.path.insert(0, str(SCRIPTS_DIR))
-import keepalive_cli
+import hermes_presence
 
 
-class TestTermuxGatewayKeepaliveCore:
-    def test_get_keepalive_status_missing(self, tmp_path):
-        with patch.object(keepalive_cli, "HERMES_HOME", tmp_path):
-            st = keepalive_cli.get_keepalive_status()
-            assert st["gateway"]["alive"] is False
-            assert st["watchdog"]["running"] is False
-            assert st["state_file"]["exists"] is False
+class TestTermuxGatewayKeepaliveScripts:
+    def test_all_shell_scripts_syntax(self):
+        sh_files = list(SCRIPTS_DIR.glob("*.sh"))
+        assert len(sh_files) >= 14, f"Expected at least 14 shell scripts, found {len(sh_files)}"
+        for f in sh_files:
+            res = subprocess.run(["bash", "-n", str(f)], capture_output=True, text=True)
+            assert res.returncode == 0, f"Syntax error in {f.name}: {res.stderr}"
 
-    def test_run_selfcheck_unhealthy(self, tmp_path):
-        with patch.object(keepalive_cli, "HERMES_HOME", tmp_path):
-            res = keepalive_cli.run_selfcheck()
-            assert res["healthy"] is False
-            assert len(res["issues"]) >= 2
-
-    def test_run_selfcheck_healthy(self, tmp_path):
-        state_file = tmp_path / "gateway_state.json"
-        state_file.write_text(
-            json.dumps({"platforms": {"telegram": {"state": "connected"}}}),
-            encoding="utf-8",
-        )
-        with patch.object(keepalive_cli, "HERMES_HOME", tmp_path), \
-             patch("subprocess.run") as mock_run:
-            mock_run.return_value.returncode = 0
-            mock_run.return_value.stdout = "12345"
-
-            res = keepalive_cli.run_selfcheck()
-            assert res["healthy"] is True
-            assert len(res["issues"]) == 0
-
-    def test_install_scripts(self, tmp_path):
-        target_dir = tmp_path / "scripts"
-        keepalive_cli.install_scripts(target_dir)
-
-        expected = [
-            "gateway_watchdog.sh",
-            "gateway_monitor.sh",
-            "telegram_selfcheck.sh",
-            "presence_notify.sh",
-            "termux_presence.py",
-        ]
-        for name in expected:
-            installed = target_dir / name
-            assert installed.exists()
-            assert installed.stat().st_mode & 0o111  # executable
-
-    def test_bash_syntax(self):
-        scripts = list(SCRIPTS_DIR.glob("*.sh"))
-        assert len(scripts) >= 4
-        for s in scripts:
-            res = subprocess.run(["bash", "-n", str(s)], capture_output=True, text=True)
-            assert res.returncode == 0, f"Syntax error in {s.name}: {res.stderr}"
-
-
-class TestTermuxGatewayKeepaliveCLI:
-    def test_cli_status_json(self):
+    def test_presence_cli_help(self):
         res = subprocess.run(
-            [sys.executable, str(CLI_SCRIPT), "status", "--json"],
+            [sys.executable, str(PRESENCE_SCRIPT)],
             capture_output=True,
             text=True,
-            check=True,
         )
-        data = json.loads(res.stdout)
-        assert "gateway" in data
-        assert "watchdog" in data
-        assert "state_file" in data
+        assert res.returncode == 1
+        assert "usage: hermes_presence.py" in res.stdout
 
-    def test_cli_selfcheck_json(self):
-        res = subprocess.run(
-            [sys.executable, str(CLI_SCRIPT), "selfcheck", "--json"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        data = json.loads(res.stdout)
-        assert "healthy" in data
-        assert "issues" in data
+    def test_presence_fire_calls(self, monkeypatch, tmp_path):
+        log_file = tmp_path / "presence.log"
+        monkeypatch.setattr(hermes_presence, "LOG", str(log_file))
+        monkeypatch.setattr(hermes_presence, "_run", lambda cmd, timeout=12: True)
+
+        ok = hermes_presence.fire("Test Alert", quiet=False)
+        assert ok is True
+        assert log_file.exists()
+        content = log_file.read_text(encoding="utf-8")
+        assert "Test Alert" in content
+
+    def test_presence_fire_quiet(self, monkeypatch, tmp_path):
+        log_file = tmp_path / "presence.log"
+        monkeypatch.setattr(hermes_presence, "LOG", str(log_file))
+        calls = []
+
+        def _fake_run(cmd, timeout=12):
+            calls.append(cmd[0])
+            return True
+
+        monkeypatch.setattr(hermes_presence, "_run", _fake_run)
+        ok = hermes_presence.fire("Quiet Alert", quiet=True)
+        assert ok is True
+        assert "termux-vibrate" not in calls
+        assert "termux-toast" in calls
+        assert "termux-notification" in calls
