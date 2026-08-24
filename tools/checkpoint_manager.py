@@ -490,6 +490,12 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _migrate_legacy_store(base)
 
     if (store / "HEAD").exists():
+        # Reusing an existing store: ``git gc`` may have pruned the empty
+        # refs/heads/ (and branches/) dirs, which makes every later
+        # ``git add -A`` fail with "fatal: not a git repository" and
+        # disables checkpoints for the session. Repair on reuse, matching
+        # what the operation paths already do (#94257).
+        _repair_bare_repo_dirs(store)
         return None
 
     store.mkdir(parents=True, exist_ok=True)

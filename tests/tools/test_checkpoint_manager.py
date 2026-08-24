@@ -113,6 +113,40 @@ class TestStoreInit:
         # Idempotent.
         assert _init_store(store, str(work_dir)) is None
 
+    def test_reused_store_repairs_gc_pruned_dirs(
+        self, work_dir, checkpoint_base, monkeypatch
+    ):
+        """An existing store whose refs/heads/ (and branches/) were pruned by
+        ``git gc`` must be repaired on reuse — otherwise every git add -A
+        fails with 'fatal: not a git repository' (#94257)."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        # Simulate gc --prune=now on a bare store with only packed refs.
+        import shutil
+
+        shutil.rmtree(store / "refs" / "heads")
+        shutil.rmtree(store / "branches", ignore_errors=True)
+        (store / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted \n"
+            "0000000000000000000000000000000000000001 refs/heads/some-project\n",
+            encoding="utf-8",
+        )
+        assert not (store / "refs" / "heads").exists()
+
+        # Re-running init on the existing store repairs the pruned dirs.
+        assert _init_store(store, str(work_dir)) is None
+        assert (store / "refs" / "heads").is_dir()
+        assert (store / "branches").is_dir()
+
+        # And a working-tree command against the reused store now succeeds.
+        (work_dir / "f.txt").write_text("content", encoding="utf-8")
+        from tools.checkpoint_manager import _run_git
+
+        ok, _, stderr = _run_git(["add", "-A"], store, str(work_dir))
+        assert ok, f"git add -A against reused store failed: {stderr}"
+
     def test_legacy_migration_archives_prev2_repos(
         self, checkpoint_base, work_dir,
     ):
