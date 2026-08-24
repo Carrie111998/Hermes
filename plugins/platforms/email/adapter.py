@@ -641,7 +641,14 @@ class EmailAdapter(BasePlatformAdapter):
             extra.get("rich_html_enabled"),
             default=False,
         )
-        self._signature = _signature_from_extra(extra)
+        try:
+            self._signature = _signature_from_extra(extra)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Invalid Email signature configuration; signature disabled: %s",
+                exc,
+            )
+            self._signature = None
 
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is

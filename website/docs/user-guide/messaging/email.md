@@ -162,6 +162,9 @@ rendered `text/html` version in a `multipart/alternative` part. Messages with
 attachments keep a `multipart/mixed` root containing that alternative before
 the attachments. The rendered HTML is sanitized: active content, event
 attributes, unsafe URL protocols, styles, and remote images are removed.
+Relative links are also removed from the sanitized HTML because Email messages
+have no trusted base URL. Use absolute URLs, such as `https://example.com/docs`,
+for links that should remain clickable.
 
 ### Backend Signature
 

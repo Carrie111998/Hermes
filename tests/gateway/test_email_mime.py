@@ -16,6 +16,7 @@ from gateway.config import PlatformConfig
 from plugins.platforms.email import adapter as email_adapter
 from plugins.platforms.email.mime import (
     MimeAttachment,
+    MimeSignature,
     build_email_message,
     render_markdown_html,
     sanitize_message_html,
@@ -270,6 +271,28 @@ def test_multiple_attachments_preserve_order_and_empty_body_semantics(
     ]
 
 
+def test_html_with_attachments_and_omitted_empty_body_remains_attachments_only():
+    message = build_email_message(
+        from_address="hermes@test.com",
+        to_address="user@test.com",
+        subject="Attachment only",
+        body="",
+        date=_DATE,
+        html_body="<p>Rendered empty body</p>",
+        attachments=(MimeAttachment(filename="report.bin", content=b"report"),),
+        include_empty_body=False,
+    )
+
+    assert message.get_content_type() == "multipart/mixed"
+    assert [part.get_content_type() for part in message.walk()] == [
+        "multipart/mixed",
+        "application/octet-stream",
+    ]
+    attachment = message.get_payload()[0]
+    assert attachment.get_filename() == "report.bin"
+    assert attachment.get_payload(decode=True) == b"report"
+
+
 def test_standalone_send_preserves_legacy_text_plain_envelope(monkeypatch):
     monkeypatch.setenv("EMAIL_PASSWORD", "secret")
     monkeypatch.setenv("EMAIL_SMTP_PORT", "587")
@@ -472,18 +495,67 @@ def test_message_sanitizer_preserves_safe_links_and_drops_active_content():
     assert "display: none" not in lowered
 
 
-def test_enabled_signature_requires_nonempty_canonical_text(monkeypatch):
-    with pytest.raises(ValueError, match=r"signature\.text.*required"):
-        _make_adapter(
-            monkeypatch,
-            {"signature": {"enabled": True, "html": "<strong>HTML only</strong>"}},
-        )
+def test_message_sanitizer_drops_relative_urls():
+    cleaned = sanitize_message_html(
+        '<p><a href="/docs/setup">relative link</a> '
+        '<a href="https://example.com/docs/setup">absolute link</a></p>'
+    )
 
-    with pytest.raises(ValueError, match=r"signature\.text.*required"):
-        _make_adapter(
-            monkeypatch,
-            {"signature": {"enabled": True, "text": "   "}},
-        )
+    assert "relative link" in cleaned
+    assert 'href="/docs/setup"' not in cleaned
+    assert 'href="https://example.com/docs/setup"' in cleaned
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "John",
+        {"enabled": True, "text": ""},
+    ],
+    ids=["not-a-mapping", "enabled-with-empty-text"],
+)
+def test_invalid_signature_config_disables_only_signature_and_keeps_rich_html(
+    monkeypatch,
+    caplog,
+    signature,
+):
+    adapter = _make_adapter(
+        monkeypatch,
+        {"rich_html_enabled": True, "signature": signature},
+    )
+    smtp = _capture_adapter_message(monkeypatch, adapter)
+
+    adapter._send_email("user@test.com", "Message **riche**.")
+
+    assert adapter._signature is None
+    assert adapter._rich_html_enabled is True
+    message = smtp.send_message.call_args.args[0]
+    assert message.get_content_type() == "multipart/alternative"
+    plain_part, html_part = message.get_payload()
+    _assert_utf8_plain_part(plain_part, "Message **riche**.")
+    assert "<strong>riche</strong>" in html_part.get_payload(decode=True).decode(
+        "utf-8"
+    )
+    assert "Invalid Email signature configuration; signature disabled" in caplog.text
+
+
+def test_valid_signature_config_initializes_unchanged(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        {
+            "rich_html_enabled": True,
+            "signature": {
+                "enabled": True,
+                "text": "Canonical signature",
+                "html": "<strong>Rendered signature</strong>",
+            },
+        },
+    )
+
+    assert adapter._signature == MimeSignature(
+        text="Canonical signature",
+        html="<strong>Rendered signature</strong>",
+    )
 
 
 def test_disabled_signature_keeps_unsigned_legacy_body(monkeypatch):
