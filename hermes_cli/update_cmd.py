@@ -3322,8 +3322,12 @@ def _run_update_check_fetch(
     remote: str,
     branch: str,
     repo_root: Path,
+    *,
+    timeout_seconds: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
     """Run one bounded update-check fetch and clean abandoned temp packs."""
+    if timeout_seconds is None:
+        timeout_seconds = UPDATE_CHECK_FETCH_TIMEOUT_SECONDS
     cmd = git_cmd + ["fetch"] + depth_args + [remote, branch]
     proc = subprocess.Popen(
         cmd,
@@ -3337,7 +3341,7 @@ def _run_update_check_fetch(
     )
     safe_to_sweep = True
     try:
-        stdout, stderr = proc.communicate(timeout=UPDATE_CHECK_FETCH_TIMEOUT_SECONDS)
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
         result = subprocess.CompletedProcess(
             cmd, proc.returncode, stdout=stdout, stderr=stderr
         )
