@@ -19,7 +19,11 @@ Examples::
     hermes checkpoints clear -f
     hermes checkpoints activate /mnt/recovery/store.repaired
 
-None of these require the agent to be running.  Safe to call any time.
+None of these require the agent to be running.  Activation/deactivation
+and checkpoint operations serialize through one interprocess store lock,
+so running them while Hermes is live is safe: operations queue behind each
+other instead of racing (a busy store reports it and fails closed rather
+than corrupting state).
 """
 
 from __future__ import annotations

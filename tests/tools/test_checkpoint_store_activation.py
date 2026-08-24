@@ -21,11 +21,16 @@ import time
 import pytest
 from pathlib import Path
 
+import tools.checkpoint_manager as checkpoint_manager_mod
 from tools.checkpoint_manager import (
     CheckpointManager,
     CheckpointStoreSelectorError,
     _init_store,
+    _store_lock,
     _store_path,
+    _StoreLockTimeout,
+    _unique_selector_tmp,
+    _verify_store_generation,
     activate_store_generation,
     active_generation_name,
     deactivate_store_generation,
@@ -444,3 +449,234 @@ class TestEndToEndRecoveryScenario:
         assert deactivate_store_generation(checkpoint_base=base)["success"]
         assert mgr.list_checkpoints(str(work_dir)), \
             "legacy store lost its history?"
+
+
+# =========================================================================
+# Review round 1 — blocker 1: interprocess generation/activation authority
+# =========================================================================
+
+class TestActivationAuthority:
+    def test_two_concurrent_activations_serialize(
+        self, base, live_store, work_dir, monkeypatch,
+    ):
+        """Two activations racing the same base must both succeed with
+        DISTINCT generations, and the selector must always name an existing
+        verified generation (the shared-tmp corruption from the review's
+        bad interleaving must be impossible)."""
+        import threading
+
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", base)
+
+        results = []
+
+        def _activate(i):
+            cand = work_dir.parent / f"candidate_{i}"
+            shutil.copytree(live_store, cand)
+            results.append(activate_store_generation(cand, checkpoint_base=base))
+
+        threads = [threading.Thread(target=_activate, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+
+        assert len(results) == 2
+        for r in results:
+            assert r["success"] is True, r.get("error")
+        gens = {r["generation"] for r in results}
+        assert len(gens) == 2, "two racers produced the same generation?"
+
+        # Invariant: whatever the pointer names exists and passes fsck.
+        sel = _store_path(base)
+        assert sel != base / "store"
+        assert (sel / "HEAD").exists()
+        err = _verify_store_generation(sel, str(base))
+        assert err is None, err
+        # Every successful activation left a real generation dir behind.
+        for name in gens:
+            assert (base / name / "HEAD").exists()
+
+    def test_activation_waits_for_live_checkpoint_write(
+        self, base, live_store, work_dir, monkeypatch,
+    ):
+        """A checkpoint write holding the store authority blocks activation
+        until it finishes — the pre-edit commit can never land in a store
+        that stops being canonical mid-write."""
+        import threading
+
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", base)
+
+        mgr = CheckpointManager(enabled=True)
+        assert mgr.ensure_checkpoint(str(work_dir), "seed") is True
+
+        # Give the slow write real content, or it exits early on "no changes".
+        (work_dir / "main.py").write_text("print('changed')\n")
+
+        gate = threading.Event()
+        release = threading.Event()
+        original_take_locked = CheckpointManager._take_locked
+
+        def _slow_take_locked(self, working_dir, reason):
+            # We are ALREADY under mgr._take's store lock — pausing here
+            # simulates an in-flight write holding the authority.
+            gate.set()
+            release.wait(timeout=60)
+            return original_take_locked(self, working_dir, reason)
+
+        slow_results = []
+
+        def _slow_writer():
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(CheckpointManager, "_take_locked", _slow_take_locked)
+                slow_results.append(
+                    mgr._take(str(work_dir), "slow in-flight write"))
+
+        writer = threading.Thread(target=_slow_writer, daemon=True)
+        writer.start()
+        assert gate.wait(timeout=30), "writer never took the lock"
+
+        cand = work_dir.parent / "candidate"
+        shutil.copytree(live_store, cand)
+        act_result = {}
+
+        def _activator():
+            act_result.update(activate_store_generation(cand, checkpoint_base=base))
+
+        activator = threading.Thread(target=_activator, daemon=True)
+        activator.start()
+        # Give the activator a moment to block on the held lock.
+        time.sleep(1.0)
+
+        release.set()
+        writer.join(timeout=120)
+        activator.join(timeout=120)
+
+        # The in-flight write completed against the OLD canonical store...
+        assert slow_results == [True]
+        # ...and only then did activation flip the pointer.
+        assert act_result.get("success") is True, act_result.get("error")
+        assert _store_path(base) == base / act_result["generation"]
+
+    def test_unique_selector_tmp_no_shared_temp(
+        self, base, live_store, work_dir,
+    ):
+        """The selector temp is per-PID: two writers can never replace each
+        other's half-written pointer bytes."""
+        from tools.checkpoint_manager import _unique_selector_tmp
+        import os as _os
+
+        t1 = _unique_selector_tmp(base)
+        t2 = _unique_selector_tmp(base)
+        assert t1 == t2  # same process -> same temp (deterministic cleanup)
+        assert ".tmp" in t1.name and str(_os.getpid()) in t1.name
+        # A different PID maps to a different temp path.
+        old = _os.getpid
+        _os.getpid = lambda: 123456
+        try:
+            t3 = _unique_selector_tmp(base)
+        finally:
+            _os.getpid = old
+        assert t3 != t1
+
+
+class TestStoreLockContract:
+    def test_timeout_fails_closed(self, base):
+        """A lock held past the timeout surfaces an explicit error instead
+        of hanging forever."""
+        import threading
+
+        acquired = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def _holder():
+            try:
+                with _store_lock(base, "holder"):
+                    acquired.set()
+                    release.wait(timeout=180)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        holder = threading.Thread(target=_holder, daemon=True)
+        holder.start()
+        assert acquired.wait(timeout=30)
+
+        # Same-process flock would succeed on a NEW fd?  No: flock locks are
+        # per-open-file-description, so a second open in this process still
+        # conflicts — but to keep the test hermetic we shrink the timeout.
+        old_timeout = checkpoint_manager_mod._STORE_LOCK_TIMEOUT_S
+        checkpoint_manager_mod._STORE_LOCK_TIMEOUT_S = 0.2
+        try:
+            with pytest.raises(_StoreLockTimeout):
+                with _store_lock(base, "contender"):
+                    pass
+        finally:
+            checkpoint_manager_mod._STORE_LOCK_TIMEOUT_S = old_timeout
+            release.set()
+            holder.join(timeout=60)
+
+
+# =========================================================================
+# Review round 1 — blocker 2: verifier proves runtime-writable store
+# =========================================================================
+
+class TestStrongVerifier:
+    def test_rejects_stale_index_lock(self, live_store, work_dir, candidate):
+        """fsck-green + index.lock present -> activation refuses."""
+        indexes = candidate / "indexes"
+        indexes.mkdir(exist_ok=True)
+        (indexes / "index.lock").write_text("", encoding="utf-8")
+        err = _verify_store_generation(candidate, str(work_dir))
+        assert err is not None and "index lock" in err
+
+    def test_rejects_unwritable_store_for_runtime(
+        self, live_store, work_dir, candidate, tmp_path,
+    ):
+        """fsck clean but mode 0o500 -> activation refuses BEFORE any
+        pointer flip: a green fsck alone can hide an unwritable store."""
+        os.chmod(candidate, 0o500)
+        try:
+            err = _verify_store_generation(candidate, str(work_dir))
+            assert err is not None and (
+                "not readable/writable" in err or "Permission" in err
+            )
+            unused_base = tmp_path / "unused-base"
+            result = activate_store_generation(
+                candidate, checkpoint_base=unused_base, verify=True,
+            )
+            assert result["success"] is False
+            assert not list(unused_base.glob("store.*")) \
+                if unused_base.exists() else True
+        finally:
+            os.chmod(candidate, 0o755)
+
+    def test_accepts_coherent_generation(
+        self, base, live_store, work_dir, candidate, tmp_path, monkeypatch,
+    ):
+        """A real store with project metadata + ref + index verifies clean."""
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", base)
+        mgr = CheckpointManager(enabled=True)
+        assert mgr.ensure_checkpoint(str(work_dir), "populate") is True
+        populated = tmp_path / "populated_candidate"
+        shutil.copytree(base / "store", populated)
+        err = _verify_store_generation(populated, str(work_dir))
+        assert err is None, err
+
+    def test_rejects_metadata_without_ref(
+        self, base, live_store, work_dir, candidate,
+    ):
+        """projects/<hash>.json whose ref was lost must fail verification —
+        activating it would strand that project's checkpoints."""
+        orphan_hash = "0123456789abcdef01"
+        projects = candidate / "projects"
+        projects.mkdir(exist_ok=True)
+        (projects / f"{orphan_hash}.json").write_text(
+            json.dumps({"workdir": "/gone/project",
+                        "created_at": 0, "last_touch": 0}),
+            encoding="utf-8",
+        )
+        err = _verify_store_generation(candidate, str(work_dir))
+        assert err is not None and "no matching ref" in err

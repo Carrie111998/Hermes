@@ -60,6 +60,11 @@ import re
 import shutil
 import subprocess
 import time
+import contextlib
+try:  # POSIX: real advisory locks; Windows falls back to O_EXCL spin below
+    import fcntl
+except ImportError:  # pragma: no cover — Windows
+    fcntl = None  # type: ignore[assignment]
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -552,8 +557,11 @@ def _migrate_legacy_store(base: Path) -> Optional[Path]:
     legacy_root: Optional[Path] = None
     # Reserved top-level entries managed by v2.  ``store.current`` and
     # generation dirs (``store.<ts>``) belong to the atomic-activation
-    # layout (#93314) — archiving either would orphan the activated store.
-    reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME, _STORE_SELECTOR_NAME}
+    # layout (#93314); ``.store.lock`` is the interprocess authority file —
+    # archiving ANY of these would break live coordination (a lock holder
+    # would keep guarding a moved file while newcomers create a fresh one).
+    reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME, _STORE_SELECTOR_NAME,
+                _STORE_LOCK_NAME}
     for child in list(base.iterdir()):
         name = child.name
         if name in reserved or name.startswith(_LEGACY_PREFIX):
@@ -919,14 +927,28 @@ class CheckpointManager:
     # ------------------------------------------------------------------
 
     def record_agent_write(self, file_path: str) -> None:
+        """Record an agent write under the store authority (blocker 1).
+
+        Never raises — the ledger is best-effort bookkeeping, and a busy or
+        unavailable store lock only means this hash is not recorded.
+        """
+        if not self.enabled:
+            return
+        try:
+            with _store_lock(CHECKPOINT_BASE, "agent-write ledger"):
+                self.record_agent_write_locked(file_path)
+        except Exception as exc:
+            logger.debug("record_agent_write failed for %s: %s", file_path, exc)
+
+    def record_agent_write_locked(self, file_path: str) -> None:
         """Record the content hash of a file Hermes just successfully wrote.
+
+        Caller holds the store lock.
 
         Feeds the agent-write ledger used by :meth:`restore` in safe mode:
         at restore time, a file whose current content no longer matches the
         recorded hash was hand-edited by the user after Hermes last touched
         it, and is skipped instead of clobbered.
-
-        Never raises — the ledger is best-effort bookkeeping.
         """
         if not self.enabled:
             return
@@ -945,13 +967,27 @@ class CheckpointManager:
             logger.debug("record_agent_write failed for %s: %s", file_path, exc)
 
     def safe_restore_plan(self, working_dir: str, commit_hash: str) -> Dict:
+        """Classify safe-restore targets under the store authority."""
+        try:
+            with _store_lock(CHECKPOINT_BASE, "safe-restore plan"):
+                return self.safe_restore_plan_locked(working_dir, commit_hash)
+        except _StoreLockTimeout as exc:
+            return {"success": False, "error": str(exc)}
+        except OSError as exc:
+            return {"success": False,
+                    "error": f"Checkpoint store lock unavailable: {exc}"}
+
+    def safe_restore_plan_locked(
+        self, working_dir: str, commit_hash: str,
+    ) -> Dict:
         """Classify files changed since ``commit_hash`` for a safe restore.
 
-        Returns ``{"success", "restore": [rel...], "skipped": [rel...],
-        "error"?}`` where ``restore`` lists files whose current content
-        still matches what Hermes last wrote (per the agent-write ledger)
-        and ``skipped`` lists files the user hand-edited after Hermes'
-        last write or that Hermes never wrote at all.
+        Caller holds the store lock.  Returns ``{"success", "restore":
+        [rel...], "skipped": [rel...], "error"?}`` where ``restore`` lists
+        files whose current content still matches what Hermes last wrote
+        (per the agent-write ledger) and ``skipped`` lists files the user
+        hand-edited after Hermes' last write or that Hermes never wrote at
+        all.
         """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1222,7 +1258,32 @@ class CheckpointManager:
         self,
         working_dir: str,
         commit_hash: str,
-        file_path: str = None,
+        file_path: Optional[str] = None,
+        safe: bool = False,
+    ) -> Dict:
+        """Restore files under the store-generation authority (blocker 1).
+
+        Holding the interprocess store lock across the restore prevents an
+        activation from flipping ``store.current`` between reading a
+        checkpoint and checking it out — the restore reads and writes one
+        coherent generation.
+        """
+        try:
+            with _store_lock(CHECKPOINT_BASE, "checkpoint restore"):
+                return self.restore_locked(
+                    working_dir, commit_hash, file_path=file_path, safe=safe,
+                )
+        except _StoreLockTimeout as exc:
+            return {"success": False, "error": str(exc)}
+        except OSError as exc:
+            return {"success": False,
+                    "error": f"Checkpoint store lock unavailable: {exc}"}
+
+    def restore_locked(
+        self,
+        working_dir: str,
+        commit_hash: str,
+        file_path: Optional[str] = None,
         safe: bool = False,
     ) -> Dict:
         """Restore files to a checkpoint state.
@@ -1261,7 +1322,9 @@ class CheckpointManager:
         skipped_user_edits: List[str] = []
         restore_paths: Optional[List[str]] = None
         if safe and not file_path:
-            plan = self.safe_restore_plan(abs_dir, commit_hash)
+            # Locked variant: we already hold the store lock — re-acquiring
+            # it here would deadlock against ourselves.
+            plan = self.safe_restore_plan_locked(abs_dir, commit_hash)
             if not plan.get("success"):
                 return {"success": False, "error": plan.get("error", "Safe-restore plan failed")}
             if plan.get("ledger_empty"):
@@ -1282,7 +1345,10 @@ class CheckpointManager:
                     }
 
         # Take a pre-rollback snapshot so you can undo the undo.
-        self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
+        # Locked variant: we already hold the store lock — going through
+        # self._take() would re-acquire it and self-deadlock (flock
+        # conflicts across file descriptors even within one process).
+        self._take_locked(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
 
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
@@ -1365,7 +1431,26 @@ class CheckpointManager:
     # ------------------------------------------------------------------
 
     def _take(self, working_dir: str, reason: str) -> bool:
-        """Take a snapshot.  Returns True on success."""
+        """Take a snapshot while holding the store-generation authority.
+
+        The interprocess lock guarantees the resolved store path stays
+        canonical for the whole snapshot: activation cannot flip
+        ``store.current`` mid-write, so no successful checkpoint is ever
+        stranded in a generation that is about to stop being canonical
+        (review blocker 1, second half).
+        """
+        try:
+            with _store_lock(CHECKPOINT_BASE, "checkpoint write"):
+                return self._take_locked(working_dir, reason)
+        except _StoreLockTimeout as exc:
+            logger.warning("Checkpoint skipped: %s", exc)
+            return False
+        except OSError as exc:
+            logger.debug("Checkpoint lock unavailable (non-fatal): %s", exc)
+            return False
+
+    def _take_locked(self, working_dir: str, reason: str) -> bool:
+        """Take a snapshot.  Returns True on success.  Caller holds the lock."""
         try:
             store = _store_path(CHECKPOINT_BASE)
         except CheckpointStoreSelectorError as exc:
@@ -1869,7 +1954,45 @@ def prune_checkpoints(
     max_total_size_mb: int = 0,
     orphan_allowlist: Optional[set] = None,
 ) -> Dict[str, int]:
+    """Prune checkpoints under the store-generation authority (blocker 1).
+
+    Holding the interprocess store lock keeps ref deletion and GC from
+    racing an activation or a live checkpoint write.
+    """
+    base = checkpoint_base or CHECKPOINT_BASE
+    try:
+        with _store_lock(base, "checkpoint prune"):
+            return _prune_checkpoints_locked(
+                retention_days=retention_days,
+                delete_orphans=delete_orphans,
+                checkpoint_base=base,
+                max_total_size_mb=max_total_size_mb,
+                orphan_allowlist=orphan_allowlist,
+            )
+    except _StoreLockTimeout as exc:
+        logger.warning("checkpoint prune skipped: %s", exc)
+        return {
+            "scanned": 0, "deleted_orphan": 0, "deleted_stale": 0,
+            "errors": 1, "bytes_freed": 0,
+        }
+    except OSError as exc:
+        logger.warning("checkpoint prune skipped: %s", exc)
+        return {
+            "scanned": 0, "deleted_orphan": 0, "deleted_stale": 0,
+            "errors": 1, "bytes_freed": 0,
+        }
+
+
+def _prune_checkpoints_locked(
+    retention_days: int = 7,
+    delete_orphans: bool = True,
+    checkpoint_base: Optional[Path] = None,
+    max_total_size_mb: int = 0,
+    orphan_allowlist: Optional[set] = None,
+) -> Dict[str, int]:
     """Delete stale/orphan checkpoints and reclaim store space.
+
+    Caller holds the store lock.
 
     A project entry is deleted when either:
 
@@ -2409,6 +2532,110 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+class _StoreLockTimeout(RuntimeError):
+    """Another process held the checkpoint-store authority too long."""
+
+
+_STORE_LOCK_NAME = ".store.lock"
+_STORE_LOCK_TIMEOUT_S = 120
+
+
+@contextlib.contextmanager
+def _store_lock(base: Path, purpose: str):
+    """Serialize checkpoint operations across processes (review blocker 1).
+
+    One advisory lock file per checkpoint base guards *every* transition
+    that reads or flips the ``store.current`` selector — activation,
+    deactivation, and each resolved-store checkpoint operation.  This makes
+    the generation pointer a real interprocess authority instead of an
+    unsynchronized file two racers can flip concurrently, and it closes the
+    activation-vs-writer race where an in-flight checkpoint keeps committing
+    to a store path while activation re-points subsequent operations.
+
+    POSIX uses ``fcntl.flock`` (auto-released on process death); Windows has
+    no equivalent unlockable-then-readable lock, so a stale ``O_EXCL`` lock
+    older than ``_STORE_LOCK_TIMEOUT_S`` is considered dead and stolen.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / _STORE_LOCK_NAME
+    deadline = time.monotonic() + _STORE_LOCK_TIMEOUT_S
+    fd = None
+    try:
+        while True:
+            if fcntl is not None:
+                fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break  # acquired
+                except OSError:
+                    os.close(fd)
+                    fd = None
+            else:
+                try:
+                    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 0o644)
+                    break  # acquired (O_EXCL won the race)
+                except FileExistsError:
+                    fd = None
+                    try:
+                        age = time.time() - path.stat().st_mtime
+                        if age > _STORE_LOCK_TIMEOUT_S:
+                            # Stale lock from a crashed holder — steal it.
+                            path.unlink(missing_ok=True)
+                            continue
+                    except FileNotFoundError:
+                        pass
+                except OSError:
+                    fd = None
+            if time.monotonic() >= deadline:
+                raise _StoreLockTimeout(
+                    f"checkpoint store busy ({purpose}): another process "
+                    f"holds {path}"
+                )
+            time.sleep(0.05)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _unique_selector_tmp(base: Path) -> Path:
+    """Same-directory temp file unique to this writer (no shared tmp race).
+
+    Two concurrent activations writing one shared ``.store.current.tmp``
+    could each ``os.replace()`` the other's half-written content; per-PID
+    temps make every replace move only bytes this process wrote.
+    """
+    return base / f".{_STORE_SELECTOR_NAME}.{os.getpid()}.tmp"
+
+
+def _force_rmtree(path: Path) -> None:
+    """Best-effort recursive delete that tolerates read-only entries.
+
+    A rejected candidate can itself carry read-only modes (copystat
+    preserves them), which would leave a stranded partial copy under a
+    plain ``rmtree``; restore writability bottom-up before deleting.
+    """
+    try:
+        if path.exists():
+            for child in sorted(path.rglob("*"), reverse=True):
+                try:
+                    child.chmod(0o700)
+                except OSError:
+                    pass
+            try:
+                path.chmod(0o700)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _write_store_selector(base: Path, generation: Optional[str]) -> None:
     """Atomically point ``store.current`` at ``generation`` (or clear it).
 
@@ -2425,7 +2652,7 @@ def _write_store_selector(base: Path, generation: Optional[str]) -> None:
             return
         _fsync_directory(base)
         return
-    tmp = base / f".{_STORE_SELECTOR_NAME}.tmp"
+    tmp = _unique_selector_tmp(base)
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(generation)
         fh.flush()
@@ -2442,11 +2669,39 @@ def _write_store_selector(base: Path, generation: Optional[str]) -> None:
 
 
 def _verify_store_generation(store: Path, working_dir: str) -> Optional[str]:
-    """Sanity-check a generation directory. Returns error string or None."""
+    """Prove a candidate generation is a *runtime-writable* store (blocker 2).
+
+    Beyond git object integrity (``fsck``), verifies what #93314's
+    acceptance contract demands before the pointer may flip:
+
+    * real directory (no symlink) with ``HEAD``;
+    * per-project coherence — every ``projects/<hash>.json`` has its ref
+      present and its index file loadable as a git index;
+    * no live/stale ``index.lock`` anywhere under ``indexes/``;
+    * ownership/write access for the invoking principal — ``copytree``
+      preserves permission bits but NOT ownership, so an activation run as
+      root would otherwise hand Hermes a green-fsck store it cannot write.
+
+    Returns error string or None.
+    """
     if store.is_symlink() or not store.is_dir():
         return f"{store} is not a real directory"
     if not (store / "HEAD").exists():
         return f"{store} has no HEAD file — not an initialised git store"
+    if not os.access(store, os.R_OK | os.W_OK | os.X_OK):
+        return (
+            f"{store} is not readable/writable/executable by the current "
+            "user — activation would hand the runtime an unusable store "
+            "(copytree preserves modes but not ownership; run recovery as "
+            "the same uid as Hermes)."
+        )
+    indexes_dir = store / _INDEXES_DIRNAME
+    if indexes_dir.exists():
+        for lock in indexes_dir.rglob("index.lock"):
+            return (
+                f"stale/live index lock present: {lock} — another git "
+                "process may still hold the candidate store"
+            )
 
     # Isolated-config env (same isolation as every other bare git call):
     # user global/system config must not influence verification, and fsck
@@ -2461,15 +2716,19 @@ def _verify_store_generation(store: Path, working_dir: str) -> Optional[str]:
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
-    try:
-        result = subprocess.run(
-            ["git", "fsck", "--full"],
+
+    def _git(args: List[str], timeout: int = _GIT_TIMEOUT * 4) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=env, timeout=_GIT_TIMEOUT * 4,
+            env=env, timeout=timeout,
             cwd=working_dir,
             stdin=subprocess.DEVNULL,
             creationflags=windows_hide_flags(),
         )
+
+    try:
+        result = _git(["fsck", "--full"])
     except subprocess.TimeoutExpired:
         return f"git fsck timed out on {store}"
     except FileNotFoundError:
@@ -2483,14 +2742,7 @@ def _verify_store_generation(store: Path, working_dir: str) -> Optional[str]:
     # the operator's recovery flow demands a *strictly* clean structure
     # before a candidate becomes canonical (#93314 acceptance criteria).
     try:
-        strict = subprocess.run(
-            ["git", "fsck", "--full", "--strict", "--no-progress"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=env, timeout=_GIT_TIMEOUT * 4,
-            cwd=working_dir,
-            stdin=subprocess.DEVNULL,
-            creationflags=windows_hide_flags(),
-        )
+        strict = _git(["fsck", "--full", "--strict", "--no-progress"])
     except subprocess.TimeoutExpired:
         return f"git fsck --strict timed out on {store}"
     except Exception as exc:  # pragma: no cover — defensive
@@ -2498,6 +2750,45 @@ def _verify_store_generation(store: Path, working_dir: str) -> Optional[str]:
     if strict.returncode != 0:
         detail = (strict.stderr or strict.stdout or "").strip()
         return f"git fsck --strict rejected {store}: {detail[:500]}"
+
+    # Per-project metadata/ref/index coherence (#93314 acceptance contract):
+    # a generation whose project bookkeeping disagrees with its refs would
+    # activate green and fail on first use.
+    for meta in _list_projects(store):
+        dir_hash = meta.get("_hash") or ""
+        if not dir_hash:
+            return "projects/ contains an entry without a usable hash"
+        ok, _, err = _run_git(
+            ["rev-parse", "--verify", "--quiet", _ref_name(dir_hash)],
+            store, working_dir,
+        )
+        if not ok:
+            return (
+                f"project metadata {dir_hash} has no matching ref "
+                f"{_ref_name(dir_hash)} ({(err or 'ref missing').strip()[:200]})"
+            )
+        idx = _index_path(store, dir_hash)
+        if idx.exists():
+            env_idx = dict(env)
+            env_idx["GIT_INDEX_FILE"] = str(idx)
+            try:
+                chk = subprocess.run(
+                    ["git", "ls-files", "--cached"],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", env=env_idx, timeout=_GIT_TIMEOUT,
+                    cwd=working_dir, stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"index check timed out for project {dir_hash}"
+            except Exception as exc:  # pragma: no cover — defensive
+                return f"index check failed for project {dir_hash}: {exc}"
+            if chk.returncode != 0:
+                detail = (chk.stderr or chk.stdout or "").strip()
+                return (
+                    f"index for project {dir_hash} is unreadable/corrupt: "
+                    f"{detail[:300]}"
+                )
     return None
 
 
@@ -2506,7 +2797,13 @@ def activate_store_generation(
     checkpoint_base: Optional[Path] = None,
     verify: bool = True,
 ) -> Dict[str, object]:
-    """Activate a verified store copy as the canonical checkpoint store.
+    """Activate a verified store copy under the generation authority.
+
+    Holding the interprocess store lock across the whole copy → verify →
+    flip sequence makes activation atomic for *all* callers, not just one:
+    two concurrent activations serialize, and an activation can never race
+    a live checkpoint write that holds a resolved store path (review
+    blocker 1).
 
     Copies ``generation_source`` (an offline-repaired store candidate) into
     a new sibling generation ``store.<UTC ts>``, verifies the copy, then
@@ -2522,13 +2819,32 @@ def activate_store_generation(
 
     Note: file contents, permissions and timestamps are copied verbatim;
     file *ownership* follows the invoking user (Python cannot chown
-    without privileges) — run the recovery tool as the store owner when
-    that matters (containers: same uid as Hermes).
+    without privileges).  Verification refuses to hand over a store the
+    invoking principal cannot write — run the recovery tool as the store
+    owner when that matters (containers: same uid as Hermes).
 
     Returns ``{"success": bool, ...}``; on success ``generation`` names the
     activated copy and ``previous`` the prior selection (None = legacy).
     """
     base = checkpoint_base or CHECKPOINT_BASE
+    try:
+        with _store_lock(base, "store activation"):
+            return _activate_store_generation_locked(
+                generation_source, base, verify=verify,
+            )
+    except _StoreLockTimeout as exc:
+        return {"success": False, "error": str(exc)}
+    except OSError as exc:
+        return {"success": False,
+                "error": f"Checkpoint store lock unavailable: {exc}"}
+
+
+def _activate_store_generation_locked(
+    generation_source: Path,
+    base: Path,
+    verify: bool = True,
+) -> Dict[str, object]:
+    """Activation body.  Caller holds the store lock."""
     src = Path(generation_source)
     out: Dict[str, object] = {
         "success": False,
@@ -2610,21 +2926,21 @@ def activate_store_generation(
         shutil.copytree(src, target, symlinks=True)
     except OSError as exc:
         out["error"] = f"Copy {src} -> {target} failed: {exc}"
-        shutil.rmtree(target, ignore_errors=True)
+        _force_rmtree(target)
         return out
 
     if verify:
         err = _verify_store_generation(target, str(base))
         if err:
             out["error"] = err
-            shutil.rmtree(target, ignore_errors=True)
+            _force_rmtree(target)
             return out
 
     try:
         _write_store_selector(base, gen_name)
     except OSError as exc:
         out["error"] = f"Pointer update failed ({exc}); previous state kept"
-        shutil.rmtree(target, ignore_errors=True)
+        _force_rmtree(target)
         return out
 
     logger.warning(
@@ -2644,6 +2960,9 @@ def deactivate_store_generation(
 ) -> Dict[str, object]:
     """Atomically restore the legacy ``store/`` as the canonical store.
 
+    Runs under the store-generation authority so a concurrent activation
+    cannot interleave with the pointer removal (blocker 1).
+
     Removes the ``store.current`` pointer after confirming the legacy store
     actually exists and is initialised — deactivating onto a missing or
     half-built legacy store would trade a known state for a worse one.
@@ -2651,17 +2970,25 @@ def deactivate_store_generation(
     """
     base = checkpoint_base or CHECKPOINT_BASE
     out: Dict[str, object] = {"success": False}
-    legacy = base / _STORE_DIRNAME
-    if not (legacy / "HEAD").exists():
-        out["error"] = (
-            f"Refusing deactivation: legacy store {legacy} has no HEAD — "
-            "there is no healthy store to fall back to."
-        )
-        return out
     try:
-        _write_store_selector(base, None)
-    except OSError as exc:
-        out["error"] = f"Could not remove store selector: {exc}"
+        with _store_lock(base, "store deactivation"):
+            legacy = base / _STORE_DIRNAME
+            if not (legacy / "HEAD").exists():
+                out["error"] = (
+                    f"Refusing deactivation: legacy store {legacy} has no HEAD — "
+                    "there is no healthy store to fall back to."
+                )
+                return out
+            try:
+                _write_store_selector(base, None)
+            except OSError as exc:
+                out["error"] = f"Could not remove store selector: {exc}"
+                return out
+            out["success"] = True
+            return out
+    except _StoreLockTimeout as exc:
+        out["error"] = str(exc)
         return out
-    out["success"] = True
-    return out
+    except OSError as exc:
+        out["error"] = f"Checkpoint store lock unavailable: {exc}"
+        return out
