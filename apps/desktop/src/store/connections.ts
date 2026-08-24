@@ -16,6 +16,13 @@ import { $connection } from '@/store/session'
 
 const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
 
+// The local pool ("This device") is keyed under a reserved name that can never
+// collide with a real connection id. A connection id is user/migration
+// controlled (`import`, `add`, a hand-edited registry) and could in principle
+// be `local`; keeping the pool's remembered profile in a disjoint slot means
+// the two writers can never stomp each other.
+const LOCAL_POOL_KEY = '__local_pool__'
+
 export const $connectionsRegistry = atom<DesktopConnectionsRegistry | null>(null)
 
 // Use only the resolved descriptor identity Electron publishes. `primary`
@@ -39,8 +46,8 @@ export const $pendingConnectionId = atom<null | string>(null)
 $lastProfileByConnection.subscribe(value => persistStringRecord(LAST_PROFILE_STORAGE_KEY, value))
 
 const $activeConnectionProfile = computed(
-  [$activeConnectionId, $activeGatewayProfile, $connection],
-  (connectionId, profile, connection) => ({
+  [$activeConnectionId, $activeGatewayProfile, $connection, $pendingConnectionId],
+  (connectionId, profile, connection, pendingConnectionId) => ({
     connectionId,
     descriptorProfile: normalizeProfileKey(connection?.profile),
     profile: normalizeProfileKey(profile),
@@ -49,35 +56,39 @@ const $activeConnectionProfile = computed(
     // Distinguish "primary backend has no profile field" (undefined → record
     // the live gateway profile directly) from a pooled secondary or a stale
     // startup descriptor that DOES carry a profile but must still match.
-    hasDescriptorProfile: connection?.profile != null
+    hasDescriptorProfile: connection?.profile != null,
+    pendingConnectionId
   })
 )
 
 // Remember one profile per source, so switching machines is a re-home rather
 // than a reset to `default`. The map is local UI preference only; Electron
 // remains the authority for the connection registry and all secrets.
-$activeConnectionProfile.subscribe(({ connectionId, descriptorProfile, profile, registryScoped, mode, hasDescriptorProfile }) => {
+$activeConnectionProfile.subscribe(({ connectionId, descriptorProfile, profile, registryScoped, mode, hasDescriptorProfile, pendingConnectionId }) => {
   // A local-pool switch carries no connectionId (legacy route), but it is
-  // still "This device" — key it under `local` so switching back from a
-  // remote source re-homes to the last-used local profile instead of
-  // resetting to `default`.
-  const key = connectionId ?? (mode === 'local' ? 'local' : null)
+  // still "This device" — key it under a reserved name so switching back from
+  // a remote source re-homes to the last-used local profile instead of
+  // resetting to `default`. Remote sources key under their connectionId.
+  const key = mode === 'local' ? LOCAL_POOL_KEY : connectionId
 
   if (!key) {
+    // No source to attribute yet (the boot window before $connection resolves,
+    // or a descriptor with neither a local mode nor an id).
     return
   }
 
   // A connection switch in flight leaves $activeGatewayProfile briefly naming
   // the TARGET (via onActiveRouteChanged) while $connection still describes the
   // previous source — recording then would write the wrong profile under the
-  // old key (e.g. `local` ← the remote's profile). Skip until the switch
-  // settles. Profile switches (selectProfile) never set this, so they still
-  // record immediately.
-  if ($pendingConnectionId.get()) {
+  // old key (e.g. the local pool ← the remote's profile). Deriving pending into
+  // this computed makes its true→false edge re-emit here, so the settled state
+  // is recorded even when the reset lands after the last $connection update.
+  // Profile switches (selectProfile) never set it, so they record immediately.
+  if (pendingConnectionId) {
     return
   }
 
-  if (key !== 'local') {
+  if (mode !== 'local') {
     // Remote source: keep the full guard (registryScoped + descriptor match),
     // which also rejects a migrated v1 routing alias.
     if (!registryScoped || descriptorProfile !== profile) {
@@ -188,7 +199,8 @@ export async function selectConnection(connectionId: string): Promise<void> {
 
   const currentConnectionId = $activeConnectionId.get()
   const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
-  const targetProfile = normalizeProfileKey($lastProfileByConnection.get()[connectionId] ?? 'default')
+  const rememberKey = targetConnection.kind === 'local' ? LOCAL_POOL_KEY : connectionId
+  const targetProfile = normalizeProfileKey($lastProfileByConnection.get()[rememberKey] ?? 'default')
   const targetKey = `${connectionId}::${targetProfile}`
 
   if (pendingTarget === targetKey) {

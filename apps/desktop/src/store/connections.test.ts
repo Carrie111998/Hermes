@@ -254,3 +254,75 @@ describe('selectConnection', () => {
     expect(setLastUsed).not.toHaveBeenCalled()
   })
 })
+
+describe('profile memory per source', () => {
+  const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
+
+  const remembered = (): Record<string, string> =>
+    JSON.parse(localStorage.getItem(LAST_PROFILE_STORAGE_KEY) ?? '{}') as Record<string, string>
+
+  it('remembers a local-pool switch under the reserved key', () => {
+    $connection.set({ mode: 'local' })
+    $activeGatewayProfile.set('xiaolu')
+
+    expect(remembered()).toEqual({ __local_pool__: 'xiaolu' })
+  })
+
+  it('remembers a remote source under its connection id', () => {
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'research', registryScoped: true })
+    $activeGatewayProfile.set('research')
+
+    expect(remembered()).toEqual({ homelab: 'research' })
+  })
+
+  it('rejects a pooled secondary whose descriptor profile mismatches the live gateway', () => {
+    $connection.set({ mode: 'local', profile: 'research', registryScoped: true })
+    $activeGatewayProfile.set('default')
+
+    expect(remembered()).toEqual({})
+  })
+
+  it('does not record when there is no connection record to attribute', () => {
+    $connection.set(null)
+    $activeGatewayProfile.set('xiaolu')
+
+    expect(remembered()).toEqual({})
+  })
+
+  it('suppresses the in-flight window and records the settled state once pending clears', () => {
+    // A connection switch is in flight: pending is set before the target
+    // profile/descriptor land.
+    $pendingConnectionId.set('homelab')
+    $activeGatewayProfile.set('xiaoma')
+    $connection.set({ mode: 'local' })
+
+    expect(remembered()).toEqual({})
+
+    // The descriptor settles on the remote source, still pending.
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'xiaoma', registryScoped: true })
+
+    expect(remembered()).toEqual({})
+
+    // Pending clears (the finally block). Deriving it into the computed makes
+    // that edge re-emit, recording the settled state with no further
+    // $connection/$activeGatewayProfile change.
+    $pendingConnectionId.set(null)
+
+    expect(remembered()).toEqual({ homelab: 'xiaoma' })
+  })
+
+  it('keeps the local-pool key disjoint from a same-named connection id', () => {
+    // A remote source could in principle be registered with id "local".
+    $connection.set({ connectionId: 'local', mode: 'remote', profile: 'research', registryScoped: true })
+    $activeGatewayProfile.set('research')
+
+    expect(remembered()).toEqual({ local: 'research' })
+
+    // The local pool still keys under the reserved name, so the two writers
+    // never stomp each other's remembered profile.
+    $connection.set({ mode: 'local' })
+    $activeGatewayProfile.set('xiaolu')
+
+    expect(remembered()).toEqual({ local: 'research', __local_pool__: 'xiaolu' })
+  })
+})
