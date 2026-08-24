@@ -150,11 +150,14 @@ service tier — and share two primitives:
   live persists that snapshot, never the one-turn model or the virtual `moa`
   provider). An I/O failure on the durable write reaches `apply_session_options()`
   callers as `rejected`/`durable_write_failed`; slash commands surface it as the
-  adapter's error reply. Persist and live assignment run as one unit that is
-  settled under the lock before the caller's cancellation propagates, across
-  repeated cancellation: a caller cancelled mid-commit (however many times)
-  still observes live state equal to disk, and a durable-write failure behind
-  the cancellation is logged rather than left as an unobserved task exception.
+  adapter's error reply. Persist and live assignment run as one unit: live
+  assignment is a done-callback on the durable write's executor Future (not a
+  task, so no task cancellation -- including event-loop teardown -- can
+  separate the two), and the caller waits for that callback under the lock
+  before its own cancellation propagates, across repeated cancellation. A
+  caller cancelled mid-commit (however many times) still observes live state
+  equal to disk, and a durable-write failure behind the cancellation is logged
+  rather than left as an unobserved task exception.
 - **`session_admission_lock(runner, key)`** — one `asyncio.Lock` per session key.
   `_handle_message` holds it across its synchronous idle→running claim (uncontended
   acquire never yields, so the "claim before any await" rule still holds); every

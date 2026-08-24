@@ -29,7 +29,7 @@ import contextlib
 import logging
 from typing import Any, Mapping
 
-from gateway.session import sanitize_model_override
+from gateway.session import AsyncSessionStore, sanitize_model_override
 from gateway.session_state import SERVICE_TIER_UNSET
 
 logger = logging.getLogger(__name__)
@@ -226,44 +226,62 @@ async def _commit_session_runtime_options_locked(
         _assign_live()
         return True
 
-    async def _persist_then_assign() -> bool:
-        # Off-loop via the async facade. Raises on a failed save (the store
-        # rolls its own entry back); False when no routing entry exists yet.
-        persisted = bool(
-            await runner.async_session_store.set_runtime_options(
-                session_key,
-                model_override=durable_model,
-                reasoning_override=new_reasoning,
-                service_tier_override=_durable_tier(new_tier),
-            )
-        )
-        if not persisted and require_routing_entry:
-            return False
-        _assign_live()
-        return persisted
-
     # Persist + live assignment are one unit: the worker-thread write cannot
     # be un-done by cancelling the awaiting task, so a cancelled caller must
-    # still see live state follow whatever landed on disk. The unit runs as
-    # its own task and is settled here, under the admission lock, before the
-    # caller's cancellation propagates -- across arbitrarily repeated
-    # cancellation, so a second Task.cancel() during settlement cannot
-    # release the lock with the unit still in flight. Nothing else holds a
-    # reference to the unit, so it can only be cancelled by event-loop
-    # teardown, when no admission can run.
-    unit = asyncio.ensure_future(_persist_then_assign())
-    cancelled: asyncio.CancelledError | None = None
-    while not unit.done():
+    # still see live state follow whatever landed on disk. Live assignment is
+    # a done-callback on the write's executor Future -- not a task -- so
+    # nothing that cancels tasks (a caller's owner, event-loop teardown) can
+    # separate the two. The caller waits for that callback (``settled``) here,
+    # under the admission lock, before its own cancellation propagates --
+    # across arbitrarily repeated cancellation, so a second Task.cancel()
+    # during settlement cannot release the lock with the unit in flight.
+    write = dict(
+        model_override=durable_model,
+        reasoning_override=new_reasoning,
+        service_tier_override=_durable_tier(new_tier),
+    )
+    facade = runner.async_session_store
+    if isinstance(facade, AsyncSessionStore):
+        unit: asyncio.Future[Any] = facade.submit("set_runtime_options", session_key, **write)
+    else:  # test doubles that replace the facade with an async fake
+        unit = asyncio.ensure_future(facade.set_runtime_options(session_key, **write))
+    settled: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+    def _assign_then_settle(done: asyncio.Future[Any]) -> None:
+        # Mirror the write's terminal state onto ``settled`` after assigning
+        # live. The store raises on a failed save (it rolls its own entry
+        # back) and returns False when no routing entry exists yet. Whatever
+        # happens here, ``settled`` must resolve: the caller is parked on it
+        # under the admission lock.
         try:
-            await asyncio.shield(unit)
+            if done.cancelled():
+                settled.cancel()
+                return
+            failure = done.exception()
+            if failure is not None:
+                settled.set_exception(failure)
+                return
+            persisted = bool(done.result())
+            if persisted or not require_routing_entry:
+                _assign_live()
+            settled.set_result(persisted)
+        except BaseException as exc:  # noqa: BLE001 - never leave the caller parked
+            if not settled.done():
+                settled.set_exception(exc)
+
+    unit.add_done_callback(_assign_then_settle)
+    cancelled: asyncio.CancelledError | None = None
+    while not settled.done():
+        try:
+            await asyncio.shield(settled)
         except asyncio.CancelledError as exc:
             cancelled = exc
-        except Exception:  # noqa: BLE001 - unit is terminal; retrieved below
+        except Exception:  # noqa: BLE001 - settled is terminal; retrieved below
             break
     if cancelled is not None:
         # Retrieve the terminal result so a durable-write failure is never
         # left as an unobserved task exception behind the cancellation.
-        failure = None if unit.cancelled() else unit.exception()
+        failure = None if settled.cancelled() else settled.exception()
         if failure is not None:
             logger.warning(
                 "Durable runtime-options write for %s failed while the caller "
@@ -275,7 +293,7 @@ async def _commit_session_runtime_options_locked(
         # task's cancelling() count is left alone: this loop did not request
         # any of those cancellations, so it must not uncancel() them either.
         raise cancelled
-    return unit.result()
+    return settled.result()
 
 
 # ---------------------------------------------------------------------------

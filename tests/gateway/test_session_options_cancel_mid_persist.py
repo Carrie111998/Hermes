@@ -1,6 +1,6 @@
 """A cancelled apply_session_options() task cannot leave disk ahead of live.
 
-The durable write runs in a worker thread (AsyncSessionStore -> to_thread);
+The durable write runs in a worker thread (AsyncSessionStore -> executor);
 cancelling the awaiting task does not un-write the file. The primitive must
 therefore settle the persist+assign unit -- under the admission lock, across
 arbitrarily repeated cancellation -- before propagating the cancellation, so

@@ -9,6 +9,8 @@ Handles:
 """
 
 import asyncio
+import contextvars
+import functools
 import hashlib
 import logging
 import os
@@ -1281,6 +1283,18 @@ class AsyncSessionStore:
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded
+
+    def submit(self, name: str, *args, **kwargs) -> "asyncio.Future[Any]":
+        """Offload ``store.<name>`` like attribute access, but return the loop
+        Future for the worker instead of a coroutine.
+
+        The Future is not a Task, so no task cancellation -- including
+        ``asyncio.run`` teardown's cancel-all-tasks -- can detach a
+        done-callback from the worker's completion.
+        """
+        call = functools.partial(getattr(self._store, name), *args, **kwargs)
+        ctx = contextvars.copy_context()  # same propagation as to_thread
+        return asyncio.get_running_loop().run_in_executor(None, ctx.run, call)
 
 
 # Sentinel for "no explicit SessionDB has been pinned on this store", so the
