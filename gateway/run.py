@@ -2750,8 +2750,11 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
-            "GATEWAY_ALLOW_ALL_USERS", ""
+        # Scoped read (#93522): under multiplex, each profile validates its
+        # own opt-in — the default profile's env flag must not satisfy (or
+        # veto) a secondary profile's open-policy startup check.
+        gateway_allow_all = (
+            _getenv("GATEWAY_ALLOW_ALL_USERS", "") or ""
         ).lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
