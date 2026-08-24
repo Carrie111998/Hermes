@@ -21,8 +21,9 @@ Design:
 - replace/remove use short unique substring matching (not full text or IDs)
 - Behavioral guidance lives in the tool schema description
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
-- Presentation-equivalent entries added by external editors are coalesced on the
-  next tool write; the first spelling and formatting are retained
+- Canonically equivalent entries that differ only in whitespace and were added
+  by external editors are coalesced on the next tool write; the first formatting
+  is retained
 """
 
 import copy
@@ -94,7 +95,12 @@ _REVIEW_MAX_CANDIDATES = 20
 
 
 def _duplicate_key(content: str) -> str:
-    """Return a conservative key for duplicate-entry comparisons."""
+    """Return a lossless canonical/whitespace key for destructive deduplication."""
+    return " ".join(unicodedata.normalize("NFC", content).split())
+
+
+def _review_key(content: str) -> str:
+    """Return a broad, non-destructive key for advisory overlap review."""
     return " ".join(unicodedata.normalize("NFKC", content).casefold().split())
 
 
@@ -474,9 +480,9 @@ class MemoryStore:
             entries = self._entries_for(target)
             limit = self._char_limit(target)
 
-            # Treat presentation-only differences as duplicates. This stays
-            # deliberately narrower than semantic matching: automatically
-            # merging merely related facts risks losing user intent.
+            # Destructive deduplication is deliberately limited to canonical
+            # Unicode and whitespace differences. Compatibility characters and
+            # case can carry meaning in formulas, paths, commands, and IDs.
             content_key = _duplicate_key(content)
             if any(_duplicate_key(entry) == content_key for entry in entries):
                 return self._success_response(
@@ -647,11 +653,19 @@ class MemoryStore:
         if not read_ok:
             return _read_failed_error(path)
 
+        safe_entries = []
+        excluded_unsafe_entry_count = 0
+        for entry in entries:
+            if _scan_memory_content(entry):
+                excluded_unsafe_entry_count += 1
+                continue
+            safe_entries.append(entry)
+
         candidates = []
-        for left_index, left in enumerate(entries):
-            left_key = _duplicate_key(left)
-            for right in entries[left_index + 1:]:
-                right_key = _duplicate_key(right)
+        for left_index, left in enumerate(safe_entries):
+            left_key = _review_key(left)
+            for right in safe_entries[left_index + 1:]:
+                right_key = _review_key(right)
                 shorter_length = min(len(left_key), len(right_key))
                 if shorter_length < _REVIEW_MIN_KEY_LENGTH:
                     continue
@@ -670,8 +684,8 @@ class MemoryStore:
         candidates.sort(
             key=lambda candidate: (
                 -candidate[0],
-                _duplicate_key(candidate[1]),
-                _duplicate_key(candidate[2]),
+                _review_key(candidate[1]),
+                _review_key(candidate[2]),
             )
         )
         omitted_candidate_count = max(0, len(candidates) - _REVIEW_MAX_CANDIDATES)
@@ -691,9 +705,11 @@ class MemoryStore:
             "similar_entries": similar_entries,
             "has_more": omitted_candidate_count > 0,
             "omitted_candidate_count": omitted_candidate_count,
+            "excluded_unsafe_entry_count": excluded_unsafe_entry_count,
             "note": (
                 "Candidates are advisory only. Use one atomic operations batch to "
-                "replace/remove entries you confirm overlap; distinct facts must remain separate."
+                "replace/remove entries you confirm overlap; distinct facts must remain separate. "
+                "Entries blocked by the memory threat scanner are omitted."
             ),
         }
 
