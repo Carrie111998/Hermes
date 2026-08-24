@@ -76,6 +76,38 @@ class TestCollectInventory:
         assert plan.updatable_in_place is False
         assert "docker pull" in plan.update_mechanism
 
+    def test_managed_marker_drives_update_command_and_capability(self, fleet, monkeypatch):
+        """A managed marker overrides both the displayed method and update policy."""
+        requested_methods = []
+        monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: "nixos")
+        monkeypatch.setattr(
+            "hermes_cli.config.recommended_update_command_for_method",
+            lambda method: requested_methods.append(method) or f"update:{method}",
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.install_method == "nixos"
+        assert plan.updatable_in_place is False
+        assert plan.update_mechanism == "update:nixos"
+        assert requested_methods == ["nixos"]
+
+    def test_managed_marker_blocks_self_update_even_if_named_git(self, fleet, monkeypatch):
+        """Any managed marker retains the legacy no-self-mutation boundary."""
+        monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a, **k: "unknown")
+        monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: "git")
+        monkeypatch.setattr(
+            "hermes_cli.config.recommended_update_command_for_method",
+            lambda method: f"update:{method}",
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.install_method == "git"
+        assert plan.updatable_in_place is False
+        assert plan.update_mechanism == "update:git"
+
     def test_dead_pids_excluded(self, fleet, monkeypatch):
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         plan = ui.collect_runtime_inventory()
