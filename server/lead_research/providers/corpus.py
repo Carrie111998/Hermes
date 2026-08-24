@@ -95,3 +95,12 @@ class CorpusProvider(CatalogProvider):
             sources=[source],
             independent_source_count=0 if official else 1,
         )
+
+    def research_fields(
+        self,
+        company: CandidateRecord,
+        fields: frozenset[str],
+        query: DiscoveryQuery,
+    ) -> VerificationBundle:
+        del fields
+        return self.verify(query, company)

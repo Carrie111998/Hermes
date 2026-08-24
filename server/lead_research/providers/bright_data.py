@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -19,6 +20,9 @@ from ..models import (
     DatasetDefinition,
     DiscoveryQuery,
     ProviderHealth,
+    RawPage,
+    RawRecord,
+    SnapshotRef,
     VerificationBundle,
     VerificationSource,
 )
@@ -45,7 +49,7 @@ def bright_data_definition() -> DatasetDefinition:
         homepage="https://brightdata.com/products/web-unlocker",
         access_tier="credentialed_public",
         entity_levels=["named_company"],
-        capabilities=["candidate_verification", "web_evidence"],
+        capabilities=["candidate_discovery", "candidate_verification", "web_evidence"],
         emits=[
             "company_name", "country", "domain", "buyer_role", "product_term",
             "lifecycle_status",
@@ -196,6 +200,51 @@ class BrightDataVerifier(CatalogProvider):
     def health(self) -> ProviderHealth:
         return ProviderHealth(status="active", message="Candidate verifier is configured")
 
+    def discover_candidates(
+        self,
+        query: DiscoveryQuery,
+        cursor: str | None = None,
+    ) -> RawPage:
+        del cursor
+        terms = _clean_terms([
+            *(query.product_terms or query.sector_ids or query.hs_codes),
+            *query.buyer_types,
+            *query.target_countries,
+        ])
+        query_text = " ".join(terms)
+        search_url = f"https://www.google.com/search?{urlencode({'q': query_text})}"
+        markdown, _ = self._fetch_markdown(search_url)
+        records: list[RawRecord] = []
+        seen_domains: set[str] = set()
+        for match in MARKDOWN_LINK.finditer(markdown):
+            provenance = _result_url(match.group(2))
+            domain = _normalized_domain(provenance)
+            title = " ".join(match.group(1).split())
+            if not provenance or not domain or domain in seen_domains or len(title) < 2:
+                continue
+            seen_domains.add(domain)
+            record_id = hashlib.sha256(provenance.encode()).hexdigest()[:24]
+            records.append(RawRecord(source_record_id=record_id, payload={
+                "record_type": "lead_candidate",
+                "company_name": title,
+                "country": query.target_countries[0] if query.target_countries else "",
+                "domain": domain,
+                "categories": query.product_terms or query.sector_ids,
+                "provenance_url": provenance,
+            }))
+            if len(records) >= query.max_records:
+                break
+        snapshot_id = "snap_" + hashlib.sha256(markdown.encode()).hexdigest()[:20]
+        return RawPage(
+            snapshot=SnapshotRef(
+                snapshot_id=snapshot_id,
+                source_id=self.definition.source_id,
+                retrieved_at=datetime.now(timezone.utc),
+            ),
+            records=records,
+            source_reported_total=len(records),
+        )
+
     def _fetch_markdown(self, url: str) -> tuple[str, int]:
         """Fetch one page, and report how many requests that took.
 
@@ -341,6 +390,15 @@ class BrightDataVerifier(CatalogProvider):
             independent_source_count=len(independent_domains - {None}),
             requests=requests,
         )
+
+    def research_fields(
+        self,
+        company: CandidateRecord,
+        fields: frozenset[str],
+        query: DiscoveryQuery,
+    ) -> VerificationBundle:
+        del fields
+        return self.verify(query, company)
 
     @staticmethod
     def _source(

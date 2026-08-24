@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from ..models import (
     DatasetDefinition,
@@ -13,7 +13,9 @@ from ..models import (
     ProviderHealth,
     RawPage,
     RawRecord,
+    VerificationBundle,
 )
+from ..candidates import CandidateRecord
 
 
 class Provider(Protocol):
@@ -24,6 +26,27 @@ class Provider(Protocol):
     def normalize(self, record: RawRecord, snapshot) -> list[EvidenceEnvelope]: ...
     def checkpoint(self, page: RawPage) -> str | None: ...
     def health(self) -> ProviderHealth: ...
+
+
+@runtime_checkable
+class CandidateSource(Protocol):
+    definition: DatasetDefinition
+
+    def discover_candidates(
+        self, query: DiscoveryQuery, cursor: str | None = None,
+    ) -> RawPage: ...
+
+
+@runtime_checkable
+class StructuredFactSource(Protocol):
+    definition: DatasetDefinition
+
+    def research_fields(
+        self,
+        company: CandidateRecord,
+        fields: frozenset[str],
+        query: DiscoveryQuery,
+    ) -> VerificationBundle: ...
 
 
 class CatalogProvider:

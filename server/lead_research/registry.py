@@ -6,6 +6,7 @@ import yaml
 from ..config import Settings
 from .models import DatasetDefinition
 from .providers.base import CatalogProvider, Provider
+from .providers.base import CandidateSource, StructuredFactSource
 from .providers.bright_data import BrightDataVerifier
 from .providers.corpus import CorpusProvider
 from .providers.ted import TedVerifier
@@ -35,6 +36,33 @@ class ProviderRegistry:
 
     def list(self) -> list[DatasetDefinition]:
         return sorted(self.definitions.values(), key=lambda item: item.display_name.lower())
+
+    def customer_catalog(self) -> list[dict]:
+        result = []
+        for definition in self.list():
+            provider = self.get(definition.source_id)
+            executable = isinstance(provider, (CandidateSource, StructuredFactSource)) or callable(
+                getattr(provider, "verify", None)
+            )
+            health = provider.health()
+            if not executable or health.status not in {"active", "degraded"}:
+                continue
+            result.append({
+                "id": definition.source_id,
+                "display_name": definition.display_name,
+                "runnable": True,
+                "capabilities": list(definition.capabilities),
+            })
+        return result
+
+    def admin_setup_catalog(self) -> list[dict]:
+        runnable = {item["id"] for item in self.customer_catalog()}
+        return [{
+            "id": definition.source_id,
+            "display_name": definition.display_name,
+            "runnable": definition.source_id in runnable,
+            "adapter_mode": definition.adapter_mode,
+        } for definition in self.list()]
 
     def ensure_tenant(self, db, company_id: str, stamp: float) -> None:
         from ..db import json_dump

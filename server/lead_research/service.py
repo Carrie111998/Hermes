@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from ..db import json_dump, json_load, new_id, now
 from .candidates import CandidateRecord, CandidateRepository
 from .enrichment import FeaturePlanner, satisfied_playbook_fields
+from .discovery import CandidateDiscoveryService
 from .identity import IdentityResolver
 from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
 from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchReadiness, ResearchResultData
@@ -54,6 +55,7 @@ class LeadResearchService:
         self.db = db
         self.registry = registry or build_registry()
         self.candidates = CandidateRepository(db)
+        self.discovery = CandidateDiscoveryService(db, self.registry)
         self._planner = FeaturePlanner()
         # A campaign is minutes-to-hours of blocking HTTP: three Web Unlocker
         # fetches per candidate, hundreds of candidates. It cannot run inside a
@@ -272,7 +274,11 @@ class LeadResearchService:
                 available, reason = False, "retired"
             elif health.status == "unavailable":
                 available, reason = False, health.reason or "unavailable"
-            elif not callable(getattr(provider, "verify", None)):
+            elif not (
+                callable(getattr(provider, "verify", None))
+                or callable(getattr(provider, "research_fields", None))
+                or callable(getattr(provider, "discover_candidates", None))
+            ):
                 available = False
                 reason = (
                     "credential_required"
@@ -681,7 +687,17 @@ class LeadResearchService:
                 continue
             try:
                 with self._source_gate(source_id):
-                    bundle = providers[source_id].verify(query, candidate)
+                    provider = providers[source_id]
+                    research = getattr(provider, "research_fields", None)
+                    bundle = (
+                        research(
+                            candidate,
+                            frozenset(self.registry.definitions[source_id].emits),
+                            query,
+                        )
+                        if callable(research)
+                        else provider.verify(query, candidate)
+                    )
                 if bundle.candidate_source_record_id != candidate.source_record_id:
                     raise ValueError("verifier returned evidence for a different candidate")
                 # Counted before anything decides whether to keep the bundle: an
@@ -1173,13 +1189,28 @@ class LeadResearchService:
             for country in config.target_countries:
                 if cancelled:
                     break
-                candidates = self.candidates.select(
-                    company_id=company_id,
-                    countries=[country],
+                query = DiscoveryQuery(
+                    campaign_id=campaign_id,
+                    seller_countries=config.seller_countries,
+                    target_countries=[country],
+                    sector_ids=config.sector_ids,
+                    hs_codes=config.hs_codes,
                     product_terms=product_terms,
-                    limit=config.max_qualified_leads_per_country * 3,
-                    exclude=settled,
+                    buyer_types=config.buyer_types,
+                    max_records=config.max_qualified_leads_per_country * 3,
                 )
+                supply = self.discovery.supply(
+                    company_id,
+                    query,
+                    config.max_qualified_leads_per_country * 3,
+                    exclude=settled,
+                    repository=self.candidates,
+                )
+                candidates = supply.candidates
+                for key, value in supply.counts.items():
+                    metrics[f"candidate_supply_{key}"] = (
+                        metrics.get(f"candidate_supply_{key}", 0) + value
+                    )
                 if not candidates:
                     # A market that selected nothing is indistinguishable from a
                     # market with no buyers in it unless the run says which it
@@ -1207,16 +1238,6 @@ class LeadResearchService:
                 for source_id in config.enabled_source_ids:
                     partitions[(source_id, country)]["selected"] = len(candidates)
 
-                query = DiscoveryQuery(
-                    campaign_id=campaign_id,
-                    seller_countries=config.seller_countries,
-                    target_countries=[country],
-                    sector_ids=config.sector_ids,
-                    hs_codes=config.hs_codes,
-                    product_terms=product_terms,
-                    buyer_types=config.buyer_types,
-                    max_records=config.max_qualified_leads_per_country * 3,
-                )
                 available_source_ids = [
                     source_id for source_id in config.enabled_source_ids
                     if partitions[(source_id, country)]["available"]

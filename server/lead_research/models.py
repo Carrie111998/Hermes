@@ -121,6 +121,25 @@ class DatasetDefinition(ApiModel):
         return self
 
 
+class SourceCapability(ApiModel):
+    source_id: str
+    candidate_discovery: bool = False
+    emitted_fields: frozenset[str] = Field(default_factory=frozenset)
+    countries: frozenset[str] = Field(default_factory=frozenset)
+    sector_ids: frozenset[str] = Field(default_factory=frozenset)
+    access_class: Literal["public", "customer_upload", "licensed", "credentialed"]
+    freshness_days: dict[str, int] = Field(default_factory=dict)
+    max_concurrency: int = Field(default=1, ge=1)
+    authority: Literal["official", "registry", "credible", "customer", "licensed"]
+    redistributable: bool = False
+    executable: bool = False
+
+
+class CandidateSupply(ApiModel):
+    candidates: list[Any] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
 class DiscoveryQuery(ApiModel):
     campaign_id: str
     seller_countries: list[str]
