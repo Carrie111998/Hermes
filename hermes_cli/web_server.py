@@ -8346,8 +8346,11 @@ def _custom_endpoint_reasoning(entry: Any) -> Tuple[str, str]:
 def _sync_custom_endpoint_reasoning_override(
     cfg: Dict[str, Any], previous_entry: Any, active_entry: Any
 ) -> None:
-    """Replace only the active endpoint reasoning override owned by its metadata."""
-    previous_model, previous_effort = _custom_endpoint_reasoning(previous_entry)
+    """Restore prior user state, then install the active endpoint's override."""
+    previous_state = (
+        previous_entry.get("_reasoning_override_state")
+        if isinstance(previous_entry, dict) else None
+    )
     active_model, active_effort = _custom_endpoint_reasoning(active_entry)
     agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
     overrides = agent_cfg.get("reasoning_overrides")
@@ -8356,13 +8359,27 @@ def _sync_custom_endpoint_reasoning_override(
     else:
         overrides = dict(overrides)
 
-    if previous_model and previous_effort and overrides.get(previous_model) == previous_effort:
-        overrides.pop(previous_model, None)
+    if isinstance(previous_state, dict):
+        previous_model = str(previous_state.get("model") or "").strip()
+        applied = previous_state.get("applied")
+        if previous_model and overrides.get(previous_model) == applied:
+            if previous_state.get("had_previous"):
+                overrides[previous_model] = previous_state.get("previous")
+            else:
+                overrides.pop(previous_model, None)
+        previous_entry.pop("_reasoning_override_state", None)
     if active_model and active_effort:
         from hermes_constants import parse_reasoning_effort
 
         parsed_effort = parse_reasoning_effort(active_effort)
         if parsed_effort and parsed_effort.get("enabled"):
+            if isinstance(active_entry, dict):
+                active_entry["_reasoning_override_state"] = {
+                    "model": active_model,
+                    "applied": active_effort,
+                    "had_previous": active_model in overrides,
+                    "previous": overrides.get(active_model),
+                }
             overrides[active_model] = active_effort
 
     if overrides:
@@ -8556,6 +8573,11 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     # UI) still just ensures the named default is present.
     existing_models = entry.get("models")
     models_map: Dict[str, Any] = dict(existing_models) if isinstance(existing_models, dict) else {}
+    if body.model_details is not None:
+        for existing_metadata in models_map.values():
+            if isinstance(existing_metadata, dict):
+                for field in _CUSTOM_ENDPOINT_MODEL_METADATA:
+                    existing_metadata.pop(field, None)
     selected_metadata: Dict[str, Any] = {}
     candidates = body.model_details if body.model_details is not None else (body.models or ())
     for candidate in candidates:
@@ -8570,9 +8592,6 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
             continue
         current = models_map.get(model_id)
         merged = dict(current) if isinstance(current, dict) else {}
-        if body.model_details is not None:
-            for field in _CUSTOM_ENDPOINT_MODEL_METADATA:
-                merged.pop(field, None)
         merged.update(model_metadata)
         models_map[model_id] = merged
         if model_id == model:

@@ -1739,6 +1739,25 @@ class TestWebServerEndpoints:
         metadata = load_config()["providers"]["responses-proxy"]["models"]["gpt-high"]
         assert "reasoning_effort" not in metadata
 
+    def test_rediscovery_neutralizes_omitted_alias_metadata(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://old.example/v1", "model": "old-high",
+            "model_details": [{"id": "old-high", "canonical_model": "gpt", "reasoning_effort": "high"}],
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        payload.update({
+            "base_url": "https://new.example/v1", "model": "new-low",
+            "model_details": [{"id": "new-low", "canonical_model": "gpt", "reasoning_effort": "low"}],
+            "make_default": True,
+        })
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        cfg = load_config()
+        assert cfg["providers"]["responses-proxy"]["models"]["old-high"] == {}
+        assert cfg["agent"]["reasoning_overrides"]["gpt"] == "low"
+
     def test_active_endpoint_reasoning_override_follows_activation_and_delete(self):
         """Generated reasoning state follows the endpoint's active lifecycle."""
         from hermes_cli.config import load_config
@@ -1764,6 +1783,25 @@ class TestWebServerEndpoints:
             "DELETE", "/api/providers/custom-endpoints/responses-proxy"
         ).status_code == 200
         assert not (load_config().get("agent") or {}).get("reasoning_overrides")
+
+    def test_endpoint_reasoning_restores_preexisting_user_override(self):
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg.setdefault("agent", {})["reasoning_overrides"] = {"gpt": "low"}
+        save_config(cfg)
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [{"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"}],
+            "make_default": True,
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "high"
+        assert self.client.request(
+            "DELETE", "/api/providers/custom-endpoints/responses-proxy"
+        ).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "low"
 
     def test_custom_endpoint_legacy_edit_preserves_explicit_transport(self):
         """An older Desktop payload must not reset a transport it cannot display."""

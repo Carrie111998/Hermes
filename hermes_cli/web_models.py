@@ -64,7 +64,8 @@ class CustomEndpointUpdate(BaseModel):
     model: str
     api_key: Optional[str] = None
     api_mode: Optional[Literal[
-        "auto", "chat_completions", "codex_responses", "anthropic_messages"
+        "auto", "chat_completions", "codex_responses", "anthropic_messages",
+        "bedrock_converse", "codex_app_server",
     ]] = None
     context_length: Optional[int] = None
     discover_models: bool = True

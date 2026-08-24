@@ -354,6 +354,8 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                   <SelectItem value="chat_completions">Chat Completions</SelectItem>
                   <SelectItem value="codex_responses">Responses API</SelectItem>
                   <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+                  <SelectItem value="bedrock_converse">Bedrock Converse</SelectItem>
+                  <SelectItem value="codex_app_server">Codex App Server</SelectItem>
                 </SelectContent>
               </Select>
             </label>
