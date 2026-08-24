@@ -58,6 +58,11 @@ def _write_plugin(hermes_home: Path) -> None:
         "    )\n"
         "    ctx.register_hook('pre_tool_call', _hook)\n"
         "    ctx.register_middleware('tool_request', _middleware)\n"
+        "    ctx.register_aux_provider(\n"
+        "        'ledger_probe_provider',\n"
+        "        lambda model=None, *, task=None: (None, None),\n"
+        "        aliases=('ledger-probe-alias',),\n"
+        "    )\n"
         "    ctx.register_auxiliary_task(\n"
         "        key='ledger_probe_task',\n"
         "        display_name='Ledger probe task',\n"
@@ -118,6 +123,7 @@ def test_load_force_reload_and_unload_remove_every_manager_registration(
 ):
     """A real temporary plugin has one live registration after each reload."""
     import hermes_cli.plugins as plugins_mod
+    from agent import auxiliary_client
     from gateway.platform_registry import platform_registry
     from hermes_cli.plugins import PluginManager
     from tools.registry import registry
@@ -154,6 +160,7 @@ def test_load_force_reload_and_unload_remove_every_manager_registration(
         "hook",
         "middleware",
         "auxiliary_task",
+        "aux_provider",
         "skill",
         "tool_override_policy",
         "system_prompt_section",
@@ -186,6 +193,10 @@ def test_load_force_reload_and_unload_remove_every_manager_registration(
 
     assert manager.unload("ledger_probe") is True
     assert registry.get_entry("ledger_probe_tool") is None
+    assert auxiliary_client.resolve_provider_client(
+        "ledger_probe_provider", model="m"
+    ) == (None, None)
+    assert "ledger-probe-alias" not in auxiliary_client._PROVIDER_ALIASES
     assert not platform_registry.is_registered("ledger_probe_platform")
     assert "pre_tool_call" not in manager._hooks
     assert "tool_request" not in manager._middleware
