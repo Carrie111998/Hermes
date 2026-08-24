@@ -1,15 +1,33 @@
 ---
-name: coinbase-cli
-description: Trade, manage portfolios, and pay x402 resources.
-version: 0.1.0
-author: Ethan Oroshiba (ethanoroshiba), Hermes Agent
-license: MIT
-platforms: [linux, macos]
-metadata:
-  hermes:
-    tags: [Payments, Coinbase, Crypto, Trading, x402]
-    related_skills: [mpp-agent]
+title: "Coinbase Cli — Trade, manage portfolios, and pay x402 resources"
+sidebar_label: "Coinbase Cli"
+description: "Trade, manage portfolios, and pay x402 resources"
 ---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Coinbase Cli
+
+Trade, manage portfolios, and pay x402 resources.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Optional — install with `hermes skills install official/payments/coinbase-cli` |
+| Path | `optional-skills/payments/coinbase-cli` |
+| Version | `0.1.0` |
+| Author | Ethan Oroshiba (ethanoroshiba), Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos |
+| Tags | `Payments`, `Coinbase`, `Crypto`, `Trading`, `x402` |
+| Related skills | [`mpp-agent`](/docs/user-guide/skills/optional/payments/payments-mpp-agent) |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
 
 # Coinbase CLI Skill
 
