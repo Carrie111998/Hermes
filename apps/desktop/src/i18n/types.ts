@@ -2353,6 +2353,8 @@ export interface Translations {
       editModels: string
       refreshModels: string
       fast: string
+      free: string
+      price: (input: string, output: string) => string
     }
     modelOptions: {
       noOptions: string

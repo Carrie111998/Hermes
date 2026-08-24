@@ -2200,7 +2200,9 @@ export const ar = defineLocale({
       noModels: 'لا توجد نماذج',
       editModels: 'تحرير النماذج',
       refreshModels: 'تحديث النماذج',
-      fast: 'سريع'
+      fast: 'سريع',
+      free: 'مجاني',
+      price: (input, output) => `${input} إدخال / ${output} إخراج لكل مليون رمز`
     },
     modelOptions: {
       noOptions: 'لا توجد خيارات لهذا النموذج',

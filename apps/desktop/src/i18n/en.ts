@@ -2785,7 +2785,9 @@ export const en: Translations = {
       noModels: 'No models found',
       editModels: 'Edit Models…',
       refreshModels: 'Refresh Models',
-      fast: 'Fast'
+      fast: 'Fast',
+      free: 'Free',
+      price: (input, output) => `${input} in / ${output} out per Mtok`
     },
     modelOptions: {
       noOptions: 'No options for this model',

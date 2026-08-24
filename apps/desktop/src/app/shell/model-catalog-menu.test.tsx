@@ -106,3 +106,33 @@ describe('the catalog owns model curation', () => {
     expect($modelVisibilityOpen.get()).toBe(true)
   })
 })
+
+// #93360 — the picker in model-picker.tsx already shows $/Mtok pricing; the
+// catalog menu (the composer's model pill, a different surface reachable
+// while typing) had no pricing at all, so a price-sensitive pick meant
+// switching to the settings picker just to compare cost.
+describe('pricing', () => {
+  it('shows $/Mtok pricing on a row when the catalog carries it', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          models: ['gemini-3.1-pro', 'gemini-2.5-flash'],
+          name: 'Google',
+          pricing: { 'gemini-3.1-pro': { cache: null, free: false, input: '$3.00', output: '$15.00' } },
+          slug: 'google'
+        }
+      ]
+    })
+
+    renderMenu()
+
+    await screen.findByText(/\$3\.00 in \/ \$15\.00 out per Mtok/)
+  })
+
+  it('renders no price text for a model with no pricing data', async () => {
+    renderMenu()
+
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+    expect(screen.queryByText(/per Mtok/)).toBeNull()
+  })
+})
