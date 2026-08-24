@@ -6406,19 +6406,36 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = hermes_xai_default_headers()
         else:
-            # No URL-specific headers — check profile.default_headers before clearing.
-            _ph_headers = None
-            try:
-                from providers import get_provider_profile as _gpf2
-                _ph2 = _gpf2(self.provider)
-                if _ph2 and _ph2.default_headers:
-                    _ph_headers = dict(_ph2.default_headers)
-            except Exception:
-                pass
-            if _ph_headers:
-                self._client_kwargs["default_headers"] = _ph_headers
+            from hermes_cli.models import (
+                OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
+                opencode_zen_free_headers,
+            )
+
+            _oc_key = str(
+                self._client_kwargs.get("api_key") or getattr(self, "api_key", "") or ""
+            )
+            if (
+                _oc_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
+                or (getattr(self, "provider", "") or "") == "opencode-free"
+            ):
+                # Keyless Zen free-tier: keep the empty Authorization
+                # header. Profile attribution headers (or a pop) would
+                # let the SDK send Bearer <placeholder> (#93890).
+                self._client_kwargs["default_headers"] = opencode_zen_free_headers()
             else:
-                self._client_kwargs.pop("default_headers", None)
+                # No URL-specific headers — check profile.default_headers before clearing.
+                _ph_headers = None
+                try:
+                    from providers import get_provider_profile as _gpf2
+                    _ph2 = _gpf2(self.provider)
+                    if _ph2 and _ph2.default_headers:
+                        _ph_headers = dict(_ph2.default_headers)
+                except Exception:
+                    pass
+                if _ph_headers:
+                    self._client_kwargs["default_headers"] = _ph_headers
+                else:
+                    self._client_kwargs.pop("default_headers", None)
 
         # User-configured overrides win over URL/profile defaults for the same
         # route. A credential swap to another endpoint must not inherit them.
