@@ -8384,7 +8384,12 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 # semaphore caps in-flight calls so retry amplification stays bounded.
 
 _aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
-_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+# Value shape: (limit, semaphore, weakref.ref(loop)). id(loop) alone is an
+# address-like identity valid only while the loop is alive (#93772) — after a
+# loop is closed and collected the allocator can hand its address to a NEW
+# loop, which would otherwise inherit the dead loop's (possibly exhausted)
+# semaphore. The weakref proves the cached entry still belongs to this loop.
+_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any, Any]] = {}
 _aux_sem_lock = threading.Lock()
 
 
@@ -8419,11 +8424,21 @@ def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.Bound
 
 
 def _acquire_async_aux_semaphore(task: Optional[str]):
-    """Get a per-task, per-event-loop async semaphore after config lookup."""
+    """Get a per-task, per-event-loop async semaphore after config lookup.
+
+    The cache is keyed by ``(task, id(loop))`` but entries are validated
+    through a weakref to the loop itself (#93772): when a loop is closed and
+    collected, its id can be reused by a new loop — the stale entry (with
+    possibly exhausted permits) must not leak into it. Dead entries for the
+    same task are pruned opportunistically so the cache stays bounded across
+    many short-lived loops.
+    """
     limit = _get_task_max_concurrency(task)
     if limit is None:
         return None
     import asyncio
+    import weakref
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -8431,11 +8446,24 @@ def _acquire_async_aux_semaphore(task: Optional[str]):
     key = (task, id(loop))
     with _aux_sem_lock:
         entry = _aux_async_semaphores.get(key)
-        if entry is None or entry[0] != limit:
+        if entry is not None and entry[2]() is not loop:
+            # Dead loop's address recycled by this new loop, or limit drift.
+            entry = None
+        if entry is not None and entry[0] != limit:
+            entry = None
+        if entry is None:
             semaphore = asyncio.Semaphore(limit)
-            _aux_async_semaphores[key] = (limit, semaphore)
-            return semaphore
-        return entry[1]
+            _aux_async_semaphores[key] = (limit, semaphore, weakref.ref(loop))
+        else:
+            semaphore = entry[1]
+        # Opportunistic pruning: drop entries whose owning loop is gone.
+        dead = [
+            k for k, v in _aux_async_semaphores.items()
+            if v[2]() is None
+        ]
+        for k in dead:
+            _aux_async_semaphores.pop(k, None)
+        return semaphore
 
 
 def _reset_aux_semaphores() -> None:
