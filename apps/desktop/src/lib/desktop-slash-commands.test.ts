@@ -168,8 +168,8 @@ describe('desktop slash command curation', () => {
   })
 
   it('surfaces /review in the popover and routes it through the slash worker', () => {
-    // Backend /review (#93339) is live on tui_gateway; Desktop just needs the
-    // curated allowlist entry so autocomplete + /help show it.
+    // Backend /review (#93339) is live on tui_gateway. Curating the row makes
+    // it a first-class Command with free-text arg expansion (not a no-arg skill chip).
     expect(isDesktopSlashSuggestion('/review')).toBe(true)
     expect(isDesktopSlashCommand('/review')).toBe(true)
     expect(resolveDesktopCommand('/review')?.surface).toEqual({ kind: 'exec' })
