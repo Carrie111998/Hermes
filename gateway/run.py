@@ -18373,7 +18373,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if (
+            _is_shared_multi_user
+            and source.user_name
+            and not (event.internal and not message_text.strip())
+        ):
+            # Internal empty events are gateway-synthesized control turns (for
+            # example restart recovery), not new speaker messages. Keeping them
+            # empty lets the resume path append its structured checkpoint instead
+            # of misclassifying ``[sender]`` as newer user input.
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
