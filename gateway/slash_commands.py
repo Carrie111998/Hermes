@@ -4654,6 +4654,7 @@ class GatewaySlashCommandsMixin:
         if source.thread_id:
             try:
                 binding = await self._session_db.get_telegram_topic_binding(
+                    profile=getattr(source, "profile", None) or "default",
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )

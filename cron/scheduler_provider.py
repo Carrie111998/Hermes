@@ -665,17 +665,17 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry
-                        profile_name = entry[0] if isinstance(entry, tuple) else "default"
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
                                 profile_adapters_map = {}
-                                if profile_adapters:
+                                if profile_adapters and profile_name:
                                     profile_adapters_map = profile_adapters.get(
                                         profile_name
                                     ) or {}
                                 tick_adapters = profile_adapters_map or (
-                                    adapters if profile_name == "default" else None
+                                    adapters if profile_name in ("default", None) else None
                                 )
                                 cron_tick(
                                     verbose=False,

@@ -13348,6 +13348,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           v1 — initial shape (no ON DELETE CASCADE on session_id FK)
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
+          v3 — primary key widened to (profile, chat_id, thread_id) so
+               multiplexed Telegram bots never collide on shared chat/thread IDs.
         """
         def _do(conn):
             conn.executescript(
@@ -13364,76 +13366,128 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     intro_message_id TEXT,
                     pinned_message_id TEXT
                 );
-
-                CREATE TABLE IF NOT EXISTS telegram_dm_topic_bindings (
-                    profile TEXT NOT NULL DEFAULT 'default',
-                    chat_id TEXT NOT NULL,
-                    thread_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    session_key TEXT NOT NULL,
-                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    managed_mode TEXT NOT NULL DEFAULT 'auto',
-                    linked_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (profile, chat_id, thread_id)
-                );
-
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
-                ON telegram_dm_topic_bindings(session_id);
-
-                CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
-                ON telegram_dm_topic_bindings(profile, user_id, chat_id);
                 """
             )
 
-            # v1 → v2: rebuild telegram_dm_topic_bindings if its session_id FK
-            # lacks ON DELETE CASCADE. SQLite can't ALTER a foreign key, so we
-            # rebuild the table. Only runs once per DB (version gate).
+            # Check existing version and columns before creating/migrating bindings
             current = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ?",
                 ("telegram_dm_topic_schema_version",),
             ).fetchone()
             current_version = int(current[0]) if current and str(current[0]).isdigit() else 0
-            if current_version < 2:
-                fk_rows = conn.execute(
-                    "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
-                ).fetchall()
-                needs_rebuild = any(
-                    row[2] == "sessions" and (row[6] or "") != "CASCADE"
-                    for row in fk_rows
+
+            # Inspect if telegram_dm_topic_bindings already exists
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_dm_topic_bindings'"
+            ).fetchone() is not None
+
+            if not table_exists:
+                conn.executescript(
+                    """
+                    CREATE TABLE telegram_dm_topic_bindings (
+                        profile TEXT NOT NULL DEFAULT 'default',
+                        chat_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        session_key TEXT NOT NULL,
+                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        managed_mode TEXT NOT NULL DEFAULT 'auto',
+                        linked_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (profile, chat_id, thread_id)
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
+                    ON telegram_dm_topic_bindings(session_id);
+
+                    CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
+                    ON telegram_dm_topic_bindings(profile, user_id, chat_id);
+                    """
                 )
-                if needs_rebuild:
-                    conn.executescript(
-                        """
-                        CREATE TABLE telegram_dm_topic_bindings_new (
-                            chat_id TEXT NOT NULL,
-                            thread_id TEXT NOT NULL,
-                            user_id TEXT NOT NULL,
-                            session_key TEXT NOT NULL,
-                            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                            managed_mode TEXT NOT NULL DEFAULT 'auto',
-                            linked_at REAL NOT NULL,
-                            updated_at REAL NOT NULL,
-                            PRIMARY KEY (chat_id, thread_id)
-                        );
-                        INSERT INTO telegram_dm_topic_bindings_new
-                            SELECT chat_id, thread_id, user_id, session_key,
-                                   session_id, managed_mode, linked_at, updated_at
-                            FROM telegram_dm_topic_bindings;
-                        DROP TABLE telegram_dm_topic_bindings;
-                        ALTER TABLE telegram_dm_topic_bindings_new
-                            RENAME TO telegram_dm_topic_bindings;
-                        CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
-                            ON telegram_dm_topic_bindings(session_id);
-                        CREATE INDEX idx_telegram_dm_topic_bindings_user
-                            ON telegram_dm_topic_bindings(user_id, chat_id);
-                        """
+            else:
+                # v1 → v2: rebuild telegram_dm_topic_bindings if its session_id FK
+                # lacks ON DELETE CASCADE. SQLite can't ALTER a foreign key, so we
+                # rebuild the table. Only runs once per DB (version gate).
+                if current_version < 2:
+                    fk_rows = conn.execute(
+                        "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+                    ).fetchall()
+                    needs_rebuild = any(
+                        row[2] == "sessions" and (row[6] or "") != "CASCADE"
+                        for row in fk_rows
                     )
+                    if needs_rebuild:
+                        conn.executescript(
+                            """
+                            CREATE TABLE telegram_dm_topic_bindings_new (
+                                chat_id TEXT NOT NULL,
+                                thread_id TEXT NOT NULL,
+                                user_id TEXT NOT NULL,
+                                session_key TEXT NOT NULL,
+                                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                                linked_at REAL NOT NULL,
+                                updated_at REAL NOT NULL,
+                                PRIMARY KEY (chat_id, thread_id)
+                            );
+                            INSERT INTO telegram_dm_topic_bindings_new
+                                SELECT chat_id, thread_id, user_id, session_key,
+                                       session_id, managed_mode, linked_at, updated_at
+                                FROM telegram_dm_topic_bindings;
+                            DROP TABLE telegram_dm_topic_bindings;
+                            ALTER TABLE telegram_dm_topic_bindings_new
+                                RENAME TO telegram_dm_topic_bindings;
+                            CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
+                                ON telegram_dm_topic_bindings(session_id);
+                            CREATE INDEX idx_telegram_dm_topic_bindings_user
+                                ON telegram_dm_topic_bindings(user_id, chat_id);
+                            """
+                        )
+
+                # v2 → v3: add profile column and widen PK to (profile, chat_id, thread_id)
+                if current_version < 3:
+                    cols = {
+                        row[1]
+                        for row in conn.execute(
+                            "PRAGMA table_info('telegram_dm_topic_bindings')"
+                        ).fetchall()
+                    }
+                    if "profile" not in cols:
+                        conn.executescript(
+                            """
+                            CREATE TABLE telegram_dm_topic_bindings_v3_new (
+                                profile TEXT NOT NULL DEFAULT 'default',
+                                chat_id TEXT NOT NULL,
+                                thread_id TEXT NOT NULL,
+                                user_id TEXT NOT NULL,
+                                session_key TEXT NOT NULL,
+                                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                                linked_at REAL NOT NULL,
+                                updated_at REAL NOT NULL,
+                                PRIMARY KEY (profile, chat_id, thread_id)
+                            );
+                            INSERT INTO telegram_dm_topic_bindings_v3_new (
+                                profile, chat_id, thread_id, user_id, session_key,
+                                session_id, managed_mode, linked_at, updated_at
+                            )
+                                SELECT 'default', chat_id, thread_id, user_id, session_key,
+                                       session_id, managed_mode, linked_at, updated_at
+                                FROM telegram_dm_topic_bindings;
+                            DROP TABLE telegram_dm_topic_bindings;
+                            ALTER TABLE telegram_dm_topic_bindings_v3_new
+                                RENAME TO telegram_dm_topic_bindings;
+                            CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
+                                ON telegram_dm_topic_bindings(session_id);
+                            CREATE INDEX idx_telegram_dm_topic_bindings_user
+                                ON telegram_dm_topic_bindings(profile, user_id, chat_id);
+                            """
+                        )
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "2"),
+                ("telegram_dm_topic_schema_version", "3"),
             )
         self._execute_write(_do)
 
@@ -13540,7 +13594,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def get_telegram_topic_binding(
         self,
         *,
-        profile: str = "default",
+        profile: str,
         chat_id: str,
         thread_id: str,
     ) -> Optional[Dict[str, Any]]:
@@ -13552,7 +13606,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     SELECT * FROM telegram_dm_topic_bindings
                     WHERE profile = ? AND chat_id = ? AND thread_id = ?
                     """,
-                    (str(profile or "default"), str(chat_id), str(thread_id)),
+                    (str(profile), str(chat_id), str(thread_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return None
@@ -13561,7 +13615,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def list_telegram_topic_bindings_for_chat(
         self,
         *,
-        profile: str = "default",
+        profile: str,
         chat_id: str,
     ) -> List[Dict[str, Any]]:
         """All Telegram DM topic bindings for one chat, newest first.
@@ -13574,7 +13628,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 rows = self._conn.execute(
                     "SELECT * FROM telegram_dm_topic_bindings "
                     "WHERE profile = ? AND chat_id = ? ORDER BY updated_at DESC",
-                    (str(profile or "default"), str(chat_id)),
+                    (str(profile), str(chat_id)),
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []
@@ -13607,7 +13661,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def delete_telegram_topic_binding(
         self,
         *,
-        profile: str = "default",
+        profile: str,
         chat_id: str,
         thread_id: str,
     ) -> int:
@@ -13638,7 +13692,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         migrated yet — both are silent no-ops; we never raise from
         a cleanup hot path).
         """
-        profile = str(profile or "default")
+        profile = str(profile)
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         deleted = {"count": 0}
@@ -13686,7 +13740,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def bind_telegram_topic(
         self,
         *,
-        profile: str = "default",
+        profile: str,
         chat_id: str,
         thread_id: str,
         user_id: str,
@@ -13702,7 +13756,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self.apply_telegram_topic_migration()
         now = time.time()
-        profile = str(profile or "default")
+        profile = str(profile)
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         user_id = str(user_id)

@@ -1681,9 +1681,10 @@ class TestSchemaInit:
             user_id="208214988",
         )
 
-        assert db.get_telegram_topic_binding(chat_id="208214988", thread_id="17585") is None
+        assert db.get_telegram_topic_binding(profile="default", chat_id="208214988", thread_id="17585") is None
 
         db.bind_telegram_topic(
+            profile="default",
             chat_id="208214988",
             thread_id="17585",
             user_id="208214988",
@@ -1691,14 +1692,15 @@ class TestSchemaInit:
             session_id="topic-session",
         )
 
-        binding = db.get_telegram_topic_binding(chat_id="208214988", thread_id="17585")
+        binding = db.get_telegram_topic_binding(profile="default", chat_id="208214988", thread_id="17585")
         assert binding is not None
+        assert binding["profile"] == "default"
         assert binding["chat_id"] == "208214988"
         assert binding["thread_id"] == "17585"
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "2"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
         db.close()
 
 
@@ -1706,6 +1708,48 @@ class TestSchemaInit:
 
 
 
+
+    def test_telegram_topic_migration_v2_to_v3_rebuilds_schema(self, tmp_path):
+        """v2 databases without the profile column must rebuild to v3 on migration."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        # Manually create a v2 schema table
+        db._conn.executescript(
+            """
+            CREATE TABLE telegram_dm_topic_bindings (
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                linked_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, thread_id)
+            );
+            """
+        )
+        db.set_meta("telegram_dm_topic_schema_version", "2")
+        db.create_session("v2-session", source="telegram", user_id="208214988")
+        db._conn.execute(
+            """
+            INSERT INTO telegram_dm_topic_bindings (
+                chat_id, thread_id, user_id, session_key, session_id,
+                managed_mode, linked_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("208214988", "17585", "208214988", "k", "v2-session", "auto", 100.0, 100.0),
+        )
+        db._conn.commit()
+
+        # Run migration
+        db.apply_telegram_topic_migration()
+
+        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
+        binding = db.get_telegram_topic_binding(profile="default", chat_id="208214988", thread_id="17585")
+        assert binding is not None
+        assert binding["profile"] == "default"
+        assert binding["session_id"] == "v2-session"
+        db.close()
 
     def test_schema_sql_is_source_of_truth(self, db):
         """Every column in SCHEMA_SQL exists in the live database.

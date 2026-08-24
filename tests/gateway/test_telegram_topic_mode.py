@@ -295,6 +295,7 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
         user_id="208214988",
     )
     session_db.bind_telegram_topic(
+        profile="default",
         chat_id="208214988",
         thread_id="17585",
         user_id="208214988",
@@ -345,7 +346,7 @@ async def test_telegram_group_prompt_is_not_topic_lobby_even_when_dm_topic_mode_
 
     assert result == "group agent response"
     runner._handle_message_with_agent.assert_awaited_once()
-    assert session_db.get_telegram_topic_binding(chat_id="-100123", thread_id="555") is None
+    assert session_db.get_telegram_topic_binding(profile="default", chat_id="-100123", thread_id="555") is None
 
 
 @pytest.mark.asyncio
@@ -408,6 +409,7 @@ async def test_new_inside_telegram_topic_rewrites_binding_to_new_session(tmp_pat
     topic_source = _make_source(thread_id="17585")
     topic_key = build_session_key(topic_source)
     session_db.bind_telegram_topic(
+        profile="default",
         chat_id="208214988",
         thread_id="17585",
         user_id="208214988",
@@ -443,6 +445,7 @@ async def test_new_inside_telegram_topic_rewrites_binding_to_new_session(tmp_pat
     await runner._handle_message(_make_event("/new", thread_id="17585"))
 
     binding = session_db.get_telegram_topic_binding(
+        profile="default",
         chat_id="208214988", thread_id="17585",
     )
     assert binding is not None
@@ -481,6 +484,7 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     topic_key = build_session_key(topic_source)
     # Pre-bug binding: topic still pointed at the pre-compression parent.
     session_db.bind_telegram_topic(
+        profile="default",
         chat_id="208214988",
         thread_id="17585",
         user_id="208214988",
@@ -526,6 +530,7 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     # The binding row was rewritten to point at the descendant so future
     # inbound messages skip the tip walk and resolve directly.
     refreshed = session_db.get_telegram_topic_binding(
+        profile="default",
         chat_id="208214988", thread_id="17585",
     )
     assert refreshed is not None
@@ -553,6 +558,7 @@ async def test_topic_root_command_lists_unlinked_sessions_for_restore(tmp_path, 
     )
     session_db.set_session_title("already-linked", "Already linked")
     session_db.bind_telegram_topic(
+        profile="default",
         chat_id="208214988",
         thread_id="11111",
         user_id="208214988",
@@ -608,6 +614,7 @@ async def test_first_message_inside_topic_records_topic_binding(tmp_path, monkey
     runner._record_telegram_topic_binding(source, entry)
 
     binding = session_db.get_telegram_topic_binding(
+        profile="default",
         chat_id="208214988",
         thread_id="17585",
     )
@@ -666,6 +673,7 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
     db.apply_telegram_topic_migration()
     db.create_session("sess-topic", source="telegram", user_id="208214988")
     db.bind_telegram_topic(
+        profile="default",
         chat_id="208214988",
         thread_id="42",
         user_id="208214988",
@@ -736,6 +744,7 @@ def _seed_two_topic_bindings(session_db):
     # Old topic A first, then current topic B (so B is "most recent").
     src_a = _make_source(thread_id="111")
     session_db.bind_telegram_topic(
+        profile="default",
         chat_id=src_a.chat_id,
         thread_id=src_a.thread_id,
         user_id=src_a.user_id,
@@ -744,6 +753,7 @@ def _seed_two_topic_bindings(session_db):
     )
     src_b = _make_source(thread_id="222")
     session_db.bind_telegram_topic(
+        profile="default",
         chat_id=src_b.chat_id,
         thread_id=src_b.thread_id,
         user_id=src_b.user_id,
@@ -776,6 +786,7 @@ def test_recover_returns_none_for_brand_new_topic(tmp_path):
     db.create_session(session_id="sess-old", source="telegram", user_id="208214988")
     src_old = _make_source(thread_id="12345")
     db.bind_telegram_topic(
+        profile="default",
         chat_id=src_old.chat_id,
         thread_id=src_old.thread_id,
         user_id=src_old.user_id,
@@ -791,7 +802,7 @@ def test_recover_returns_none_for_brand_new_topic(tmp_path):
 def test_list_telegram_topic_bindings_for_chat_no_table(tmp_path):
     # Missing topic-mode tables → [] without auto-migrating.
     db = SessionDB(db_path=tmp_path / "state.db")
-    assert db.list_telegram_topic_bindings_for_chat(chat_id="208214988") == []
+    assert db.list_telegram_topic_bindings_for_chat(profile="default", chat_id="208214988") == []
     tables = {
         row[0]
         for row in db._conn.execute(
@@ -811,6 +822,7 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
     db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
     db.create_session(session_id="sess-27166", source="telegram", user_id="208214988")
     db.bind_telegram_topic(
+        profile="default",
         chat_id="208214988",
         thread_id="17585",
         user_id="208214988",

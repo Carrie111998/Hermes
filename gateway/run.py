@@ -7847,16 +7847,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _telegram_topic_binding_profile(self, source: SessionSource) -> str:
         """Return the bot/profile namespace for Telegram topic persistence."""
+        if hasattr(self, "_adapter_for_source"):
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    gateway_profile = getattr(adapter, "_gateway_profile_name", None)
+                    if isinstance(gateway_profile, str) and gateway_profile.strip():
+                        return gateway_profile.strip()
+            except Exception:
+                pass
         profile = str(getattr(source, "profile", None) or "").strip()
         if profile:
             return profile
-        if getattr(self.config, "multiplex_profiles", False):
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-
-                return get_active_profile_name() or "default"
-            except Exception:
-                pass
         return "default"
 
     # Telegram's General (pinned top) topic in forum-enabled private chats.
@@ -7944,8 +7946,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_db is None or not source.chat_id or not source.thread_id:
             return
         # Runs off-loop (always via asyncio.to_thread); use the sync handle.
-        session_db = getattr(session_db, "_db", session_db)
-        session_db.bind_telegram_topic(
+        sync_db = getattr(session_db, "_db", session_db)
+        sync_db.bind_telegram_topic(
             profile=self._telegram_topic_binding_profile(source),
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
@@ -19129,6 +19131,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
+                    profile=self._telegram_topic_binding_profile(source),
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )) if self._session_db else None
@@ -23286,6 +23289,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_db is not None:
             try:
                 binding = await session_db.get_telegram_topic_binding(
+                    profile=self._telegram_topic_binding_profile(source),
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )
@@ -23532,6 +23536,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         linked = await self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
         current_binding = await self._session_db.get_telegram_topic_binding(
+            profile=self._telegram_topic_binding_profile(source),
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
         )
@@ -23542,6 +23547,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key = self._session_key_for_source(source)
         try:
             await self._session_db.bind_telegram_topic(
+                profile=self._telegram_topic_binding_profile(source),
                 chat_id=str(source.chat_id),
                 thread_id=str(source.thread_id),
                 user_id=str(source.user_id),

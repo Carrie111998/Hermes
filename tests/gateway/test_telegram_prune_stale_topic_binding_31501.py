@@ -42,6 +42,7 @@ from hermes_state import SessionDB
 def _seed_binding(
     db: SessionDB,
     *,
+    profile: str = "default",
     chat_id: str = "5595856929",
     thread_id: str = "15287",
     user_id: str = "5595856929",
@@ -53,6 +54,7 @@ def _seed_binding(
         user_id=user_id,
     )
     db.bind_telegram_topic(
+        profile=profile,
         chat_id=chat_id,
         thread_id=thread_id,
         user_id=user_id,
@@ -67,16 +69,22 @@ class TestDeleteTelegramTopicBinding:
         _seed_binding(db, thread_id="15287")
         # Sanity check — binding present before prune.
         assert db.get_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         ) is not None
 
         removed = db.delete_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         )
 
         assert removed == 1
         assert db.get_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         ) is None
         db.close()
 
@@ -90,16 +98,22 @@ class TestDeleteTelegramTopicBinding:
         _seed_binding(db, thread_id="15418", session_id="sess-fresh")
 
         removed = db.delete_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         )
         assert removed == 1
 
         # Stale binding is gone; the fresh one survives.
         assert db.get_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         ) is None
         assert db.get_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15418",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15418",
         ) is not None
         db.close()
 
@@ -108,7 +122,8 @@ class TestPruneClearsTopicModeWhenLastBindingGone:
     """Proactive cleanup (#31501 follow-up): pruning the chat's final
     binding must also flip ``telegram_dm_topic_mode.enabled`` to 0 so
     recovery fully stands down — covers the user who disabled topics in
-    the Telegram client without ever running ``/topic off``."""
+    the Telegram client without ever running ``/topic off``.
+    """
 
     def test_clears_enabled_when_last_binding_pruned(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -121,7 +136,9 @@ class TestPruneClearsTopicModeWhenLastBindingGone:
         ) is True
 
         removed = db.delete_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         )
 
         assert removed == 1
@@ -163,7 +180,9 @@ class TestPruneStaleDmTopicBindingHelper:
         adapter._prune_stale_dm_topic_binding("5595856929", 15287)
 
         assert db.get_telegram_topic_binding(
-            chat_id="5595856929", thread_id="15287",
+            profile="default",
+            chat_id="5595856929",
+            thread_id="15287",
         ) is None
         db.close()
 
@@ -274,6 +293,7 @@ class TestRecoveryAfterPrune:
                 user_id="5595856929",
             )
             db.bind_telegram_topic(
+                profile="default",
                 chat_id="5595856929",
                 thread_id=thread,
                 user_id="5595856929",
@@ -296,6 +316,7 @@ class TestRecoveryAfterPrune:
         )
         runner._session_db = db
         runner._telegram_topic_mode_enabled = lambda _src: True
+        runner._adapter_for_source = lambda _src: None
 
         # Sanity: before the prune, recovery picks "222" (newest).
         # Recovery only fires for a lobby-shaped inbound (omitted
@@ -314,6 +335,7 @@ class TestRecoveryAfterPrune:
 
         # User deletes topic 222 in Telegram → adapter prunes.
         db.delete_telegram_topic_binding(
+            profile="default",
             chat_id="5595856929", thread_id="222",
         )
 
