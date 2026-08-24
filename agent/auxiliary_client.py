@@ -8608,7 +8608,7 @@ def _build_call_kwargs(
             _cfg_effort = _get_auxiliary_task_config(task).get("reasoning_effort")
         except Exception:
             _cfg_effort = None
-        if _cfg_effort is not None and _cfg_effort is not True:
+        if _cfg_effort is not None:
             from hermes_constants import parse_reasoning_effort
 
             _task_reasoning = parse_reasoning_effort(_cfg_effort)
@@ -8794,7 +8794,11 @@ def _build_call_kwargs(
         and reasoning_config
         and isinstance(reasoning_config, dict)
         and "reasoning" in merged_extra
+        and "reasoning" in profile_reasoning_extra
     ):
+        # Gate on the profile being the SOURCE of the generic object: a
+        # caller-supplied extra_body.reasoning alongside a reasoning-aware
+        # profile keeps the "explicit wire control wins" contract.
         merged_extra.pop("reasoning", None)
     if (
         reasoning_config
@@ -8861,10 +8865,15 @@ def _build_call_kwargs(
         _task_reasoning_from_config
         and reasoning_config
         and isinstance(reasoning_config, dict)
-        and reasoning_config.get("enabled") is False
         and not profile_handles_reasoning
     ):
-        kwargs["reasoning_effort"] = "none"
+        # Config-pinned intent on a profile-less backend: emit the operator's
+        # actual level ("none" when disabled, the configured effort otherwise)
+        # so a pinned level is never silently dropped on the wire.
+        if reasoning_config.get("enabled") is False:
+            kwargs["reasoning_effort"] = "none"
+        elif reasoning_config.get("effort"):
+            kwargs["reasoning_effort"] = reasoning_config["effort"]
 
     return kwargs
 
