@@ -110,8 +110,15 @@ def _chain_ending_at(boots: List[float], ts: float, gap: float) -> List[float]:
     prev = ts
     for t in sorted(boots, reverse=True):
         if t > ts:
-            # Clock moved backwards (NTP step, restored state file). Treat the
-            # future entry as adjacent rather than dropping the whole chain.
+            # Clock moved backwards (NTP step, restored state file). Treat a
+            # *recent* future entry as adjacent rather than dropping the whole
+            # chain — but bound it by ``gap`` like any other link. Without a
+            # bound here, an arbitrarily old entry (weeks back) chains in
+            # after one large backward step and trips the breaker on
+            # unrelated history, turning the documented fail-open contract
+            # into fail-closed.
+            if t - ts > gap:
+                break
             chain.append(t)
             continue
         if prev - t > gap:
