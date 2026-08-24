@@ -169,6 +169,80 @@ class TestBoundedMediaToolResult:
         assert result["submission"]["status_url"].startswith("https://example.test/workloads/status/prompt-123")
         assert result["submission"]["job"]["status_url"].startswith("https://example.test/workloads/status/prompt-123")
 
+    def test_compact_fallback_is_remeasured_and_never_exceeds_cap(self):
+        # 20 artifacts x ~2KB truncated strings each: the full allowlist
+        # projection is over budget, and the compact fallback (all 20
+        # artifacts) is also over budget.  The re-measure loop must shrink
+        # the artifact list until the payload fits the cap.
+        big_inline = "![image.png](https://example.test/workloads/artifact/abc123/0?sig=signed)" + ("x" * 2_048)
+        artifacts = [
+            {
+                "artifact_id": f"abc123:{i}",
+                "filename": f"image-{i}.png",
+                "mime_type": "image/png",
+                "url": f"https://example.test/workloads/artifact/abc123/{i}?sig=signed",
+                "download_url": f"https://example.test/workloads/artifact/abc123/{i}?download=1&sig=signed",
+                "inline_markdown": big_inline,
+            }
+            for i in range(20)
+        ]
+        result = _bounded_media_tool_result(
+            "media_generate",
+            json.dumps({
+                "success": True,
+                "status": {
+                    "media_artifacts": artifacts,
+                    "media_artifact_contract": {"version": 1, "primary_field": "inline_markdown"},
+                },
+            }),
+        )
+
+        assert result is not None
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        assert len(encoded.encode("utf-8")) <= 16_384
+        assert result["truncated"] is True
+        assert len(result.get("media_artifacts", [])) < 20
+        # First artifacts are kept; the tail was dropped.
+        assert result["media_artifacts"][0]["artifact_id"] == "abc123:0"
+
+    def test_compact_fallback_drops_artifacts_when_single_one_still_exceeds_cap(self):
+        # A single artifact whose truncated strings still push the compact
+        # fallback over the cap must be dropped entirely, leaving a bounded
+        # marker payload.  clean() truncates each string to ~2KB, so an
+        # artifact with all 13 allowlisted fields long is ~26KB after
+        # truncation — over the cap even as a single-item compact fallback.
+        art = {
+            "artifact_id": "a" * 5_000,
+            "kind": "k" * 5_000,
+            "mime_type": "m" * 5_000,
+            "filename": "f" * 5_000,
+            "url": "u" * 5_000,
+            "preview_url": "p" * 5_000,
+            "download_url": "d" * 5_000,
+            "inline_markdown": "i" * 5_000,
+            "created_at": "c" * 5_000,
+            "state": "s" * 5_000,
+            "width": "w" * 5_000,
+            "height": "h" * 5_000,
+            "source": "src" * 5_000,
+        }
+        result = _bounded_media_tool_result(
+            "media_generate",
+            json.dumps({
+                "success": True,
+                "status": {
+                    "media_artifacts": [art],
+                },
+            }),
+        )
+
+        assert result is not None
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        assert len(encoded.encode("utf-8")) <= 16_384
+        assert result["truncated"] is True
+        # The oversized artifact was dropped from the manifest.
+        assert not result.get("media_artifacts")
+
 
 # ---------------------------------------------------------------------------
 # ResponseStore

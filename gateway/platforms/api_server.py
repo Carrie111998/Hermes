@@ -285,7 +285,14 @@ def _parse_tool_result_json(value: Any) -> Any:
 
 
 def _has_media_artifact_payload(value: Any, *, _depth: int = 0) -> bool:
-    """Return True when a result appears to contain renderable media metadata."""
+    """Return True when a result appears to contain renderable media metadata.
+
+    Heuristic by design: it only decides whether an unknown tool's result is
+    worth the bounded allowlist pass in ``_bounded_media_tool_result``.  The
+    string-marker branch scans raw text, so results that merely mention those
+    paths (e.g. a shell command echoing a workloads URL) can be false positives;
+    the allowlist projection still strips anything outside the media contract.
+    """
     if _depth > 6:
         return False
     value = _parse_tool_result_json(value)
@@ -406,16 +413,36 @@ def _bounded_media_tool_result(function_name: str, function_result: Any) -> Opti
     encoded = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
     if len(encoded.encode("utf-8")) <= _MEDIA_TOOL_RESULT_MAX_BYTES:
         return bounded
-    compact = {
+
+    # Over budget: build the compact fallback and re-measure it.  The fallback
+    # itself can exceed the cap on large artifact lists (up to 20 items x
+    # ~2KB truncated strings), so shrink artifacts until it fits; if a single
+    # artifact still does not fit, drop it entirely rather than forward an
+    # unbounded payload.
+    def _encoded_size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    artifacts = (
+        bounded.get("media_artifacts")
+        or (bounded.get("status") or {}).get("media_artifacts")
+        or (((bounded.get("status") or {}).get("job") or {}).get("artifacts"))
+    )
+    compact: dict[str, Any] = {
         "success": bounded.get("success"),
-        "media_artifacts": (
-            bounded.get("media_artifacts")
-            or (bounded.get("status") or {}).get("media_artifacts")
-            or (((bounded.get("status") or {}).get("job") or {}).get("artifacts"))
-        ),
-        "media_artifact_contract": bounded.get("media_artifact_contract") or (bounded.get("status") or {}).get("media_artifact_contract"),
         "truncated": True,
     }
+    if artifacts is not None:
+        compact["media_artifacts"] = list(artifacts)
+    contract = bounded.get("media_artifact_contract") or (bounded.get("status") or {}).get("media_artifact_contract")
+    if contract is not None:
+        compact["media_artifact_contract"] = contract
+
+    while _encoded_size(compact) > _MEDIA_TOOL_RESULT_MAX_BYTES and len(compact.get("media_artifacts", [])) > 0:
+        compact["media_artifacts"].pop()
+    if _encoded_size(compact) > _MEDIA_TOOL_RESULT_MAX_BYTES:
+        compact.pop("media_artifacts", None)
+    if _encoded_size(compact) > _MEDIA_TOOL_RESULT_MAX_BYTES:
+        compact = {"truncated": True}
     return {key: value for key, value in compact.items() if value is not None}
 
 
