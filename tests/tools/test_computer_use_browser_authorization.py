@@ -358,6 +358,67 @@ def test_unrestricted_daemon_serve_command_unchanged(monkeypatch):
     assert "--capability-manifest" not in command
 
 
+def test_daemon_probe_timeout_scales_past_two_seconds(monkeypatch):
+    """A healthy probe needing >2s (cua-driver 0.21 attestation) must not be
+    killed at a hardcoded 2s deadline (#93312)."""
+    daemon = _EmbeddedCuaDaemon("cua-driver", "unrestricted")
+
+    class _FakeProc:
+        stderr = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(cb.subprocess, "Popen", lambda command, **kw: _FakeProc())
+    monkeypatch.setattr(cb, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+
+    captured_timeouts = []
+
+    def _fake_run(command, **kwargs):
+        captured_timeouts.append(kwargs["timeout"])
+
+        class _Probe:
+            returncode = 0
+            stderr = ""
+
+        return _Probe()
+
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run)
+
+    daemon.start()
+
+    assert captured_timeouts[0] > 2.0
+
+
+def test_daemon_startup_error_names_last_probe_failure(monkeypatch):
+    """The startup error must say why the probe kept failing, not just report
+    daemon stderr as if the daemon itself never came up (#93312)."""
+    daemon = _EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    monkeypatch.setattr(daemon, "_START_TIMEOUT_SECONDS", 0.25)
+
+    class _FakeProc:
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(cb.subprocess, "Popen", lambda command, **kw: _FakeProc())
+    monkeypatch.setattr(cb, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+
+    def _fake_run(command, **kwargs):
+        if command[1] == "status":
+            raise cb.subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return None
+
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="last probe: status probe timed out"):
+        daemon.start()
+
+
 # ── standard-mode --grant existing-profile ──────────────────────────────
 
 
