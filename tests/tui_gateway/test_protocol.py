@@ -567,6 +567,67 @@ def test_clarify_block_helper_builds_batch_payload(capture):
     assert "clarify_tool_id" not in server._sessions["s1"]
 
 
+def test_concurrent_clarify_calls_keep_execution_local_tool_ids_and_serialize(capture):
+    """Parallel clarify workers must not share one session-wide physical ID.
+
+    Only one prompt is exposed at a time so reconnect's singular
+    ``pending_clarify`` snapshot remains complete.
+    """
+    server, buf = capture
+    server._sessions["s1"] = {"history": []}
+    started = threading.Barrier(3)
+    results = {}
+
+    def run(call_id, question):
+        server._on_tool_start("s1", call_id, "clarify", {})
+        started.wait()
+        results[call_id] = server._clarify_block("s1", question, ["yes", "no"])
+        server._on_tool_complete("s1", call_id, "clarify", {}, "{}")
+
+    threads = [
+        threading.Thread(target=run, args=("call-a", "Question A?"), daemon=True),
+        threading.Thread(target=run, args=("call-b", "Question B?"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    started.wait()
+
+    observed = []
+    handled = set()
+    for answer in ("first", "second"):
+        deadline = time.monotonic() + 2
+        pending = []
+        while time.monotonic() < deadline:
+            with server._prompt_lock:
+                pending = [
+                    (rid, dict(payload))
+                    for rid, (event, payload) in server._pending_prompt_payloads.items()
+                    if event == "clarify.request" and rid not in handled
+                ]
+            if pending:
+                break
+            time.sleep(0.01)
+        assert len(pending) == 1
+        rid, payload = pending[0]
+        handled.add(rid)
+        observed.append((payload["question"], payload["tool_id"]))
+        server.handle_request({
+            "id": answer,
+            "method": "clarify.respond",
+            "params": {"request_id": rid, "answer": answer},
+        })
+
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert set(observed) == {
+        ("Question A?", "call-a"),
+        ("Question B?", "call-b"),
+    }
+    assert set(results.values()) == {"first", "second"}
+
+
 def test_approval_pending_replays_unresolved_requests(server, monkeypatch):
     from tools import approval
 
