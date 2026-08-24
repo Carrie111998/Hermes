@@ -1283,13 +1283,12 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``interactive`` is retained for adapter API compatibility. Empty synthesized
+    startup events now behave the same on every platform: there is no newer
+    human instruction to prioritize, so the resumed turn reviews the preserved
+    transcript and continues the interrupted work. This avoids abandoning work
+    behind a "session restored" acknowledgement on interactive platforms while
+    preserving the duplicate-tool-call guard (#57056).
     """
     reason_phrase = (
         "a gateway restart"
@@ -1307,21 +1306,12 @@ def build_resume_recovery_note(
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
         )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion."
+            "There is no newer user message attached to this recovery event, "
+            "so do NOT emit a 'session restored' acknowledgement or ask what "
+            "to do next. Review the conversation history and CONTINUE the "
+            "interrupted task to completion."
         )
         tail_guidance = (
             "Do NOT re-run tool calls whose results already "

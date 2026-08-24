@@ -301,11 +301,14 @@ class TestResumePendingSystemNote:
         )
 
 
-    def test_empty_message_noninteractive_note_continues_task(self):
-        """Non-interactive platforms (webhook, API server): nobody can answer
-        'what next?', so the resumed turn must complete the interrupted work
-        instead of acknowledging (#57056)."""
-        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
+    @pytest.mark.parametrize("interactive", [True, False])
+    def test_empty_message_note_continues_task_on_every_platform(self, interactive):
+        """A synthesized startup resume has no new user instruction, so both
+        interactive and non-interactive platforms must recover the transcript
+        and finish the interrupted work instead of asking what to do next."""
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=interactive
+        )
         assert "CONTINUE the interrupted task" in note
         assert "session was restored" not in note
         assert "ask what they would like to do next" not in note
