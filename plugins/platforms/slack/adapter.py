@@ -2768,7 +2768,9 @@ class SlackAdapter(BasePlatformAdapter):
             # chat.startStream stream and this send carries its final
             # content, seal the stream instead of posting a duplicate
             # message (the streamed message IS the final message).
-            stream_result = await self._try_finalize_stream(chat_id, content)
+            stream_result = await self._try_finalize_stream(
+                chat_id, content, metadata=metadata
+            )
             if stream_result is not None:
                 return stream_result
 
@@ -3304,6 +3306,7 @@ class SlackAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[SendResult]:
         """Finalize an active native stream with the turn-final content.
 
@@ -3316,6 +3319,11 @@ class SlackAdapter(BasePlatformAdapter):
         stream = self._active_streams.get(chat_id)
         if stream is None:
             return None
+        # Commentary/status sends are allowed to happen while the answer is
+        # streaming. They must never claim the native stream, even when their
+        # text happens to share a prefix with the answer.
+        if metadata and metadata.get("_interim_send"):
+            return None
         sent = stream.get("sent", "")
         text = self._strip_stream_cursor(content)
         # Only treat this send as the stream's finalization when it extends
@@ -3323,6 +3331,30 @@ class SlackAdapter(BasePlatformAdapter):
         # commentary) pass through. An empty ``sent`` prefix would match
         # everything, so require substance before claiming the send.
         if not sent or not text.startswith(sent):
+            # A turn-final payload can legitimately differ from the streamed
+            # draft after markdown conversion, verifier/footer augmentation,
+            # or a final answer rewrite. Keep delivery on the already-created
+            # Slack message: stop the append-only stream, then replace its
+            # contents with the authoritative final text. Plain/interim sends
+            # still pass through without touching the live stream.
+            if not metadata or not metadata.get("notify"):
+                return None
+            self._active_streams.pop(chat_id, None)
+            ts = stream["ts"]
+            if not await self._seal_stream(chat_id, stream):
+                # The stream may still be live; let the normal send path make
+                # a best-effort delivery rather than swallowing the answer.
+                return None
+            replaced = await self.edit_message(
+                chat_id,
+                ts,
+                text,
+                finalize=True,
+                metadata=metadata,
+            )
+            if replaced.success:
+                await self.stop_typing(chat_id)
+                return replaced
             return None
         self._active_streams.pop(chat_id, None)
         ts = stream["ts"]
