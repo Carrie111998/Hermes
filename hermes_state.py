@@ -12371,6 +12371,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         preserve_compaction_handoff: bool = False,
         expected_active_ids: Optional[List[int]] = None,
         expected_target_content: Any = None,
+        include_rewound_messages: bool = False,
     ) -> Dict[str, Any]:
         """Soft-delete all messages with id >= ``target_message_id`` in *session_id*.
 
@@ -12397,7 +12398,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         ``expected_active_ids`` optionally pins the ordered active row set.
         ``expected_target_content`` additionally pins the selected canonical
-        live-user payload.  Both checks run inside the write transaction before
+        live-user payload. ``include_rewound_messages`` opts callers such as
+        Telegram ``/undo`` into the archived row metadata needed for visible
+        message cleanup without changing the default result contract.
+        Both checks run inside the write transaction before
         any row or counter mutation.  Presentation-only metadata changes (for
         example Desktop reactions) deliberately do not invalidate a rewind.
         A live cross-process turn lease always refuses the rewind; expired or
@@ -12536,7 +12540,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
         if preserve_compaction_handoff:
             result["replacement_message_id"] = replacement_message_id
-        result["rewound_messages"] = rewound
+        if include_rewound_messages:
+            result["rewound_messages"] = rewound
         return result
 
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:

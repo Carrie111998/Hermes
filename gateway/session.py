@@ -4162,6 +4162,7 @@ class SessionStore:
                     preserve_compaction_handoff=handoff is not None,
                     expected_active_ids=expected_active_ids,
                     expected_target_content=target_view.get("content"),
+                    include_rewound_messages=True,
                 )
             except ValueError as e:
                 logger.debug("rewind_session: %s", e)
