@@ -14,6 +14,9 @@ from hermes_cli import linux_desktop_entry as lde
 def xdg_home(tmp_path, monkeypatch) -> Path:
     data_home = tmp_path / "xdg-data"
     monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    # Isolate the known-wrapper probe too: tests must never see the real
+    # ~/.local/bin/hermes on the dev machine.
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(lde.sys, "platform", "linux")
     return data_home
 
@@ -270,17 +273,16 @@ def test_exec_keeps_resolver_fallback_when_no_wrapper_on_path(
 
     _argv0_context(monkeypatch, str(repo_script))
     monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     def fake_resolve():
         # Mirror resolve_hermes_bin's chain: argv[0] → relative → PATH → None.
+        # Injected through the REAL wrapper (resolve_fn parameter) via
+        # resolve_exec_command's plumbing, so the rerouted-None →
+        # keep-primary branch runs for real instead of being stubbed out.
         return sys.argv[0] if sys.argv[0] else None
 
-    monkeypatch.setattr(
-        lde,
-        "_resolve_hermes_bin_for_desktop_entry",
-        lambda resolve_fn=None, checkout_root=None: fake_resolve(),
-    )
-    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
 
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
