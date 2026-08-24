@@ -122,12 +122,6 @@ def _load_hermes_env_vars() -> dict[str, str]:
 # can technically contain other characters; sanitize defensively.
 _LABEL_VALUE_OK_RE = re.compile(r"[^A-Za-z0-9_.-]")
 _TASK_IDENTITY_LABEL_KEY = "hermes-task-key"
-_WINDOWS_PATH_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_WINDOWS_RESERVED_PATH_STEMS = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{i}" for i in range(1, 10)}
-    | {f"LPT{i}" for i in range(1, 10)}
-)
 
 
 def _sanitize_label_value(value: str) -> str:
