@@ -93,7 +93,10 @@ def _coerce_queueable_spotify_uri(value: str) -> str:
     item_type = spotify_uri_type(value) or "track"
     if item_type.lower() not in _QUEUEABLE_TYPES:
         raise SpotifyError(f"Spotify can only queue a track or an episode, got {item_type}.")
-    return _coerce_spotify_uri(value, item_type)
+    # Pass the canonical lower-case type on: Spotify's own types are lower-case, so
+    # an oddly-cased one has to fail here with a clear message rather than be
+    # forwarded as `spotify:EPISODE:<id>` for the API to reject as a Bad URI.
+    return _coerce_spotify_uri(value, item_type.lower())
 
 
 def _describe_empty_playback(payload: Any, *, action: str) -> dict | None:

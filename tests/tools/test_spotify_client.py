@@ -424,6 +424,35 @@ def test_handle_spotify_queue_add_rejects_unqueueable_type(
     assert seen_uris == []
 
 
+@pytest.mark.parametrize(
+    "raw_uri",
+    [
+        "spotify:EPISODE:512ojhOuo1ktJprKbVcKyQ",
+        "https://open.spotify.com/Track/7ouMYWpwJ422jRcDASZB7P",
+    ],
+)
+def test_handle_spotify_queue_add_rejects_miscased_type(
+    monkeypatch: pytest.MonkeyPatch, raw_uri: str
+) -> None:
+    """A queueable type in the wrong case fails locally, not as a Bad URI."""
+    seen_uris: list[str] = []
+
+    class _QueueStub:
+        def add_to_queue(self, *, uri, device_id=None):
+            seen_uris.append(uri)
+            return {"snapshot_id": "snap-1"}
+
+    monkeypatch.setattr(spotify_tool, "_spotify_client", lambda: _QueueStub())
+    response = json.loads(
+        spotify_tool._handle_spotify_queue(
+            {"action": "add", "uri": raw_uri, "device_id": "dev-1"}
+        )
+    )
+    assert "error" in response
+    assert "Expected a Spotify" in response["error"]
+    assert seen_uris == []
+
+
 def test_spotify_uri_type_reads_type_from_uri_and_url() -> None:
     assert spotify_mod.spotify_uri_type("spotify:episode:abc") == "episode"
     assert spotify_mod.spotify_uri_type("https://open.spotify.com/track/abc?si=x") == "track"
