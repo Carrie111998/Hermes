@@ -22,6 +22,43 @@ interface SlotEntry {
   component: React.ComponentType;
 }
 
+/** Slot names the shell currently renders a `<PluginSlot>` for. The registry
+ *  itself accepts any string — this list is discoverability only, kept in
+ *  sync by hand with the `<PluginSlot name="...">` call sites. */
+export const KNOWN_SLOT_NAMES = [
+  "analytics:bottom",
+  "analytics:top",
+  "backdrop",
+  "chat:bottom",
+  "chat:top",
+  "config:bottom",
+  "config:top",
+  "cron:bottom",
+  "cron:top",
+  "docs:bottom",
+  "docs:top",
+  "env:bottom",
+  "env:top",
+  "files:bottom",
+  "files:top",
+  "header-banner",
+  "header-left",
+  "header-right",
+  "logs:bottom",
+  "logs:top",
+  "models:bottom",
+  "models:top",
+  "overlay",
+  "plugins:bottom",
+  "plugins:top",
+  "post-main",
+  "pre-main",
+  "sessions:bottom",
+  "sessions:top",
+  "skills:bottom",
+  "skills:top",
+] as const;
+
 /** Map<slotName, SlotEntry[]>. Entries are appended in registration order. */
 const _slotRegistry: Map<string, SlotEntry[]> = new Map();
 const _slotListeners: Set<SlotListener> = new Set();
