@@ -772,12 +772,11 @@ def build_turn_context(
 
     active_system_prompt = agent._cached_system_prompt
 
-    # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat"
-    # session on Bot-Mode-managed installs (same gate as the protocol
-    # section above). The gate is stable for a session's lifetime, so the
-    # tool list is byte-identical every turn: prompt-cache safe. Every
-    # other session (CLI, gateway chats, group-room member sessions, cron,
-    # subagents) fails the gate and never sees the schema.
+    # Bot Mode DM tool — injected only into an authorized canonical Bot Chat
+    # or top-level Desktop chat on Bot-Mode-managed installs. The source/title
+    # gate is stable for a session's lifetime, so the tool list is byte-identical
+    # every turn and prompt-cache safe. CLI/gateway/cron, group-room plumbing,
+    # and subagents fail closed.
     try:
         from tools.bot_mode_dm import ensure_message_agent_tool
 

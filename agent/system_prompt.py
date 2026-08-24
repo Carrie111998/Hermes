@@ -626,9 +626,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # "Bot Chat" session (the conversation teammate bots message into via
     # `hermes -p <bot> chat --in ~ -c "Bot Chat"` and the desktop pins), on
     # installs where Bot Mode manages profiles (ui_meta['hermes-bots']).
-    # Regular sessions never carry it — the desktop's composer middleware
-    # owns the @mention send path. Title is read once at first build and the
-    # rendered prompt is cached + DB-restored, so this is cache-safe.
+    # Regular sessions never carry the protocol text: Desktop mention
+    # middleware identifies the target and the session-gated message_agent
+    # schema supplies the structured send path. Title is read once at first
+    # build and the rendered prompt is cached + DB-restored, so this is
+    # cache-safe.
     # Gated by config.yaml ``agent.bot_mode_protocol`` (default True).
     if getattr(agent, "_bot_mode_protocol", True):
         try:

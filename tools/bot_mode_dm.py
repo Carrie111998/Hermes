@@ -1,6 +1,6 @@
 """Bot Mode agent-to-agent DM tool — ``message_agent``.
 
-A structured, Bot-Chat-only tool that lets a Bot Mode agent message a
+A structured, capability-bound tool that lets a Bot Mode agent message a
 teammate agent (another Hermes profile on this install, or an agent on a
 registered peer gateway) WITHOUT hand-assembling shell commands.
 
@@ -16,15 +16,15 @@ existing background-process notification path (fire-and-forget, never
 blocks the sender's turn).
 
 Containment contract (MUST hold — reviewers check all three):
-- The tool schema is injected ONLY into a bot's canonical "Bot Chat"
-  session on Bot-Mode-managed installs — the exact same gate as the
-  protocol section in ``tools/bot_mode_probe.py``. It is NOT registered in
-  the global tool registry, is NOT part of any toolset, and never appears
-  in CLI sessions, ordinary gateway chats, group-room member sessions
-  (titled "Group: …"), cron agents, or subagents.
-- Dispatch is title-gated again at execution time (defense in depth): a
-  forged call from a session that shouldn't have the tool returns a
-  structured error instead of delivering.
+- The tool schema is injected ONLY into a bot's canonical "Bot Chat" or a
+  top-level Desktop chat on a Bot-Mode-managed install. Desktop authority is
+  the session's source-bound ``platform``, not a process env var. It is NOT
+  registered in the global tool registry, is NOT part of any toolset, and
+  never appears in CLI/gateway/cron sessions, Bot Mode plumbing sessions, or
+  subagents.
+- Dispatch repeats the same capability gate (defense in depth): a forged call
+  from a session that shouldn't have the tool returns a structured error
+  instead of delivering.
 - Everything here is additive. The legacy protocol transports
   (``hermes -p`` / ``hermes peer dm``) keep working for older prompts.
 
@@ -70,6 +70,8 @@ _DM_STALE_SECONDS = 24 * 60 * 60
 
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_BOT_MODE_PLUMBING_TITLES = frozenset({"Agent Inbox"})
+_BOT_MODE_GROUP_PREFIX = "Group: "
 
 
 def message_agent_tool_schema() -> dict:
@@ -126,19 +128,41 @@ def message_agent_tool_schema() -> dict:
     }
 
 
+def _authorized_message_agent_session(agent: Any) -> bool:
+    """Return whether this session may expose and execute ``message_agent``.
+
+    Canonical Bot Chats remain transport-authorized on every host because local
+    and relay deliveries intentionally enter them through CLI one-shot agents.
+    Regular chats require the session-scoped Desktop source established by the
+    GUI gateway. Bot Mode's hidden plumbing sessions and delegated children are
+    never promoted merely because they originated from a Desktop turn.
+    """
+    if agent is None or not getattr(agent, "_bot_mode_protocol", True):
+        return False
+
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    title = _session_title(agent)
+    if title == BOT_CHAT_TITLE:
+        return True
+    if str(getattr(agent, "platform", "") or "").strip().lower() != "desktop":
+        return False
+    if int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
+        return False
+    return title not in _BOT_MODE_PLUMBING_TITLES and not title.startswith(
+        _BOT_MODE_GROUP_PREFIX
+    )
+
+
 def ensure_message_agent_tool(agent: Any) -> bool:
-    """Inject the ``message_agent`` schema into a Bot Chat agent's tool list.
+    """Inject ``message_agent`` into an authorized Bot Mode session.
 
     Called once per turn from the conversation loop. Idempotent and
-    deterministic for the life of a session: the gate (canonical Bot Chat
-    title on a Bot-Mode-managed install) is stable from the session's first
-    turn, so the tool list is byte-identical across turns — prompt-cache
-    safe. Every non-Bot-Chat session fails the gate on every turn and never
-    sees the schema. Never raises.
+    deterministic for the life of a session: canonical title or the
+    session-bound Desktop source is stable from the first turn, so the tool
+    list is byte-identical across turns and prompt-cache safe. Never raises.
     """
     try:
-        if not getattr(agent, "_bot_mode_protocol", True):
-            return False
         tools = getattr(agent, "tools", None)
         if tools:
             for tool in tools:
@@ -147,9 +171,9 @@ def ensure_message_agent_tool(agent: Any) -> bool:
                     and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
                 ):
                     return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_mode_managed
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
+        if not _authorized_message_agent_session(agent):
             return False
         # Managed-install check, NOT section non-emptiness: a profile whose
         # SOUL.md carries the legacy plugin-appended protocol text gets an
@@ -250,16 +274,15 @@ def message_agent_tool(
     the Bot Chat gate, the sender identity, and the session key so the
     spawned transport is tracked against the right session.
     """
-    # ── defense-in-depth gate: only a canonical Bot Chat may deliver ──
+    # ── defense-in-depth gate: repeat the session capability check ──
     home = _agent_home(agent)
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_mode_managed
 
-        title = _session_title(agent)
-        if title != BOT_CHAT_TITLE:
+        if not _authorized_message_agent_session(agent):
             return _err(
-                "message_agent is only available in a Bot Mode 'Bot Chat' session. "
-                "This session is not one; do not retry."
+                "message_agent is only available in a Bot Mode 'Bot Chat' or an "
+                "authorized top-level Desktop chat. This session is neither; do not retry."
             )
         if not is_bot_mode_managed(home):
             return _err(

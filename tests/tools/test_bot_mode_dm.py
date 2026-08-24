@@ -61,11 +61,20 @@ class _FakeDB:
 
 
 class _FakeAgent:
-    def __init__(self, home: Path, title: str = "Bot Chat"):
+    def __init__(
+        self,
+        home: Path,
+        title: str = "Bot Chat",
+        *,
+        platform: str = "cli",
+        delegate_depth: int = 0,
+    ):
         self._session_db = _FakeDB(home, title)
         self.session_id = "sess-1"
         self._session_title_hint = None
         self._bot_mode_protocol = True
+        self.platform = platform
+        self._delegate_depth = delegate_depth
         self.tools: list = []
         self.valid_tool_names: set = set()
 
@@ -86,6 +95,16 @@ def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
     assert len(agent.tools) == 1
 
 
+def test_injects_into_regular_desktop_chat_on_managed_install(tmp_path):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Project planning", platform="desktop")
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    assert [t["function"]["name"] for t in agent.tools] == [
+        bot_mode_dm.MESSAGE_AGENT_TOOL_NAME
+    ]
+
+
 @pytest.mark.parametrize(
     "title",
     ["", "My research chat", "Group: room-abc123", "handoff-12ab34cd"],
@@ -97,6 +116,28 @@ def test_never_injects_outside_bot_chat(tmp_path, title):
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
     assert agent.tools == []
     assert agent.valid_tool_names == set()
+
+
+@pytest.mark.parametrize("title", ["Agent Inbox", "Group: room-abc123"])
+def test_desktop_bot_plumbing_sessions_stay_tool_free(tmp_path, title):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title=title, platform="desktop")
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+
+
+def test_delegated_desktop_agent_stays_tool_free(tmp_path):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(
+        home,
+        title="Project planning",
+        platform="desktop",
+        delegate_depth=1,
+    )
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
 
 
 def test_never_injects_on_unmanaged_install(tmp_path):
@@ -138,6 +179,48 @@ def test_tool_refuses_outside_bot_chat(tmp_path):
     )
     assert "error" in result
     assert "Bot Chat" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("title", "platform", "delegate_depth"),
+    [
+        ("Project planning", "cli", 0),
+        ("Project planning", "cron", 0),
+        ("Group: room-abc123", "desktop", 0),
+        ("Agent Inbox", "desktop", 0),
+        ("Project planning", "desktop", 1),
+    ],
+)
+def test_dispatch_gate_rejects_unauthorized_session_shapes(
+    tmp_path, title, platform, delegate_depth
+):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(
+        home,
+        title=title,
+        platform=platform,
+        delegate_depth=delegate_depth,
+    )
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+    )
+
+    assert "error" in result
+    assert "authorized top-level Desktop chat" in result["error"]
+
+
+def test_regular_desktop_chat_can_deliver_to_local_bot(tmp_path, monkeypatch):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Project planning", platform="desktop")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="researcher", message="review this", agent=agent)
+    )
+
+    assert result["status"] == "sent"
+    assert len(calls) == 1
 
 
 def test_tool_refuses_on_unmanaged_install(tmp_path):

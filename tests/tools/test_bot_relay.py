@@ -240,11 +240,13 @@ class _FakeDB:
 
 
 class _FakeAgent:
-    def __init__(self, home, title="Bot Chat"):
+    def __init__(self, home, title="Bot Chat", *, platform="cli"):
         self._session_db = _FakeDB(home, title)
         self.session_id = "sess-1"
         self._session_title_hint = None
         self._bot_mode_protocol = True
+        self.platform = platform
+        self._delegate_depth = 0
         self.tools: list = []
         self.valid_tool_names: set = set()
 
@@ -303,6 +305,39 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     assert pending[0]["message"].startswith("Message from 🤖 hermes (@hermes): ping")
     # waiter watches this envelope's reply file
     assert pending[0]["id"] in spawned["command"]
+
+
+def test_regular_desktop_chat_can_relay_to_connected_bot(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path)
+    bot_relay.write_remote_roster(
+        home,
+        [
+            {
+                "profile": "default",
+                "handle": "hermes",
+                "connection_id": "cloud-1",
+                "connection_label": "Hermes Cloud",
+                "title": "Moxie",
+            }
+        ],
+    )
+    spawned = {}
+
+    def _fake_spawn(command, label, *, task_id, agent):
+        spawned["command"] = command
+        spawned["label"] = label
+        return json.dumps({"status": "sent", "to": label})
+
+    monkeypatch.setattr("tools.bot_mode_dm._spawn_delivery", _fake_spawn)
+    agent = _FakeAgent(home, title="Project planning", platform="desktop")
+
+    out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
+
+    assert out["status"] == "sent"
+    assert "Hermes Cloud" in spawned["label"]
+    pending = bot_relay.claim_pending_envelopes(home)
+    assert len(pending) == 1
+    assert pending[0]["target_connection"] == "cloud-1"
 
 
 def test_relay_route_ambiguous_target_errors_with_forms(tmp_path, monkeypatch):
