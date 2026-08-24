@@ -95,7 +95,7 @@ def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
     if uv_bin:
         from hermes_constants import project_venv_dir
 
-        env = {**os.environ, "VIRTUAL_ENV": str(project_venv_dir(root) or root / "venv")}
+        env = {**os.environ, "VIRTUAL_ENV": str(project_venv_dir(root) or root / ".venv")}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -325,6 +325,42 @@ def ensure_windows_bin_launchers(
                 file=sys.stderr,
             )
     return restored
+
+
+def reconcile_venv_layout(root) -> Path | None:
+    """Retire a stale sibling venv when both ``venv`` and ``.venv`` exist.
+
+    Two layouts are in the wild (installers historically created ``venv``;
+    ``uv venv`` defaults to ``.venv``) and nothing used to remove the loser,
+    so a checkout could run two full environments side by side -- with
+    different package sets -- and different subsystems (launcher heal vs
+    gateway import shim vs updater) could resolve to different ones. When
+    both exist and the resolved (active/canonical) venv has a usable
+    interpreter, the OTHER sibling is parked (renamed
+    ``<name>.legacy-<timestamp>``): atomic, recoverable, and it makes every
+    resolver agree immediately. stdlib-only on purpose (boot path); never
+    raises. Returns the parked path, or None when there is nothing to retire.
+    """
+    from hermes_constants import project_venv_dir, venv_python_path
+
+    root = Path(root)
+    present = [name for name in (".venv", "venv") if (root / name).is_dir()]
+    if len(present) < 2:
+        return None
+    active = project_venv_dir(root)
+    if active is None:
+        return None
+    legacy = (root / "venv") if active == root / ".venv" else root / ".venv"
+    if not venv_python_path(active, windows=_is_windows()).exists():
+        return None  # resolved venv unusable: leave the mix alone
+    parked = root / f"{legacy.name}.legacy-{time.strftime('%Y%m%d-%H%M%S')}"
+    if parked.exists():
+        return None
+    try:
+        legacy.rename(parked)
+    except OSError:
+        return None
+    return parked
 
 
 def _read_user_path_raw() -> tuple[list[str], int]:

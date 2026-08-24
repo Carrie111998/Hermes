@@ -459,6 +459,18 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+def _resolve_project_venv(project_root) -> Optional[Path]:
+    """Canonical project venv for import-injection paths (update-boundary safe)."""
+    try:
+        from hermes_constants import project_venv_dir
+    except ImportError:
+        return None
+    try:
+        return project_venv_dir(project_root)
+    except Exception:
+        return None
+
+
 def _ensure_windows_gateway_venv_imports() -> None:
     """Make detached Windows gateway runs see the Hermes venv packages.
 
@@ -476,7 +488,10 @@ def _ensure_windows_gateway_venv_imports() -> None:
     candidates: list[Path] = []
     if os.environ.get("VIRTUAL_ENV"):
         candidates.append(Path(os.environ["VIRTUAL_ENV"]))
-    candidates.append(project_root / "venv")
+    _project_venv = _resolve_project_venv(project_root)
+    if _project_venv is not None:
+        candidates.append(_project_venv)
+    candidates.append(project_root / "venv")  # legacy-layout fallback
 
     seen: set[str] = set()
     for venv_dir in candidates:
@@ -11530,7 +11545,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a console-less watcher forces every console-subsystem
             # descendant to allocate a visible conhost (#54220/#56747).
             watcher_python = sys.executable
-            venv_dir = Path(watcher_env.get("VIRTUAL_ENV") or project_root / "venv")
+            venv_dir = Path(
+                watcher_env.get("VIRTUAL_ENV")
+                or _resolve_project_venv(project_root)
+                or project_root / "venv"
+            )
             site_packages = venv_dir / "Lib" / "site-packages"
             if site_packages.exists():
                 watcher_env["VIRTUAL_ENV"] = str(venv_dir)

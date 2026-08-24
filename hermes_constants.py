@@ -1639,16 +1639,38 @@ def venv_bin_dir(venv_dir, *, windows: bool | None = None) -> Path:
     return Path(venv_dir) / ("Scripts" if windows else "bin")
 
 
-def project_venv_dir(project_root) -> Path | None:
-    """The project's venv directory, ``venv`` or ``.venv``, when one exists.
+#: Canonical project venv names, in resolution order: ``.venv`` (uv default /
+#: new installs) first, ``venv`` (legacy installer layout) second.
+_PROJECT_VENV_NAMES = (".venv", "venv")
 
-    ``uv venv`` defaults to ``.venv`` while our installers create ``venv``, so
-    both layouts are in the wild. Call sites that only knew about ``venv``
-    silently no-oped on a ``.venv`` install — that is how the Windows
-    shim-lock preflight skipped itself entirely (#79542). ``venv`` wins when
-    both exist, matching what the installers write.
+
+def project_venv_dir(project_root) -> Path | None:
+    """The project's venv directory, ``.venv`` or ``venv``, when one exists.
+
+    ``.venv`` is the canonical layout: ``uv venv`` defaults to it, and new
+    installs create it.  Older installs created ``venv``, so both layouts are
+    in the wild.  Call sites that only knew about ``venv`` silently no-oped on
+    a ``.venv`` install — that is how the Windows shim-lock preflight skipped
+    itself entirely (#79542).
+
+    Resolution order:
+    1. the venv the CURRENT interpreter is running from (``sys.prefix``), when
+       that venv lives inside *project_root* — this keeps every subsystem
+       attached to the environment the active process actually uses, even when
+       a stale sibling layout exists;
+    2. ``.venv`` (canonical);
+    3. ``venv`` (legacy installs).
     """
-    for name in ("venv", ".venv"):
+    try:
+        running = Path(getattr(sys, "prefix", "") or "").resolve()
+        root = Path(project_root).resolve()
+        if running.name in _PROJECT_VENV_NAMES and os.path.normcase(
+            str(running.parent)
+        ) == os.path.normcase(str(root)):
+            return Path(sys.prefix)
+    except OSError:
+        pass  # unresolvable prefix/root: fall through to name probing
+    for name in _PROJECT_VENV_NAMES:
         candidate = Path(project_root) / name
         if candidate.is_dir():
             return candidate

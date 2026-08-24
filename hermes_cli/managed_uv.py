@@ -8,7 +8,7 @@ at ``$HERMES_HOME/bin`` so the installer writes directly there — no PATH
 probing, no conda guards, no multi-location resolution chains.
 
 The Python backing the install is different: it is shared by every Hermes
-profile because the checkout's ``venv`` is shared.  Runtime repair therefore
+profile because the checkout's project venv (``.venv``) is shared.  Runtime repair therefore
 uses an install-scoped store under ``<checkout>/.hermes-runtime/python``. A
 vulnerable interpreter is never reinstalled in place. We provision a new
 immutable Python generation, build and smoke-test a relocatable sibling venv,
@@ -41,8 +41,8 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _RUNTIME_DIR_NAME = ".hermes-runtime"
-_VENV_NAME = "venv"
-_ALT_VENV_NAME = ".venv"
+_VENV_NAME = ".venv"
+_ALT_VENV_NAME = "venv"
 _REPAIR_LOCK_NAME = "runtime-repair.lock"
 
 # ---------------------------------------------------------------------------

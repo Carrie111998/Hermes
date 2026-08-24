@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import project_venv_dir, venv_python_path
 
 logger = logging.getLogger(__name__)
 
@@ -476,7 +476,8 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
         interpreter = sys.executable
         try:
             venv_python = venv_python_path(
-                Path(root) / "venv", windows=_m()._is_windows()
+                project_venv_dir(root) or Path(root) / ".venv",
+                windows=_m()._is_windows(),
             )
             if venv_python.exists():
                 interpreter = str(venv_python)
@@ -1580,8 +1581,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                     extracted = candidate
                     break
 
-        # Copy updated files over existing installation, preserving venv/node_modules/.git
-        preserve = {"venv", "node_modules", ".git", ".env"}
+        # Copy updated files over existing installation, preserving venv layouts/node_modules/.git
+        preserve = {"venv", ".venv", "node_modules", ".git", ".env"}
         entries = [i for i in os.listdir(extracted) if i not in preserve]
 
         # Two-phase replace (#76104). Phase 1 copies every entry — directories
@@ -1733,7 +1734,9 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         from hermes_cli.managed_uv import managed_python_env
 
         uv_env = managed_python_env()
-        uv_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
+        uv_env["VIRTUAL_ENV"] = str(
+            project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / ".venv"
+        )
         if _m()._is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
@@ -3908,7 +3911,7 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     Returns ``(healthy, detail)``. Never raises; unknown states report
     healthy so a probe failure can't force needless reinstalls.
     """
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / ".venv"
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
     if not venv_python.exists():
         # No venv interpreter at all. In a dev checkout that's normal (the
@@ -3986,7 +3989,7 @@ def _detect_venv_python_processes(
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / ".venv"
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
@@ -4407,7 +4410,7 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / ".venv"
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
@@ -6403,13 +6406,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # recreated before dependencies can be installed into it.
                 venv_python_missing = not (
                     venv_python_path(
-                        _m().PROJECT_ROOT / "venv", windows=_m()._is_windows()
+                        project_venv_dir(_m().PROJECT_ROOT)
+                        or _m().PROJECT_ROOT / ".venv",
+                        windows=_m()._is_windows(),
                     )
                 ).exists()
                 if venv_python_missing and repair_uv:
                     print("→ Recreating virtual environment...")
                     subprocess.run(
-                        [repair_uv, "venv", "venv"],
+                        [repair_uv, "venv", ".venv"],
                         cwd=_m().PROJECT_ROOT,
                         check=False,
                     )
@@ -6419,7 +6424,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     from hermes_cli.managed_uv import managed_python_env
 
                     repair_env = managed_python_env()
-                    repair_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
+                    repair_env["VIRTUAL_ENV"] = str(
+                        project_venv_dir(_m().PROJECT_ROOT)
+                        or _m().PROJECT_ROOT / ".venv"
+                    )
                     _m()._install_python_dependencies_with_optional_fallback(
                         [repair_uv, "pip"], env=repair_env, group="all"
                     )
@@ -6763,7 +6771,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             from hermes_cli.managed_uv import managed_python_env
 
             uv_env = managed_python_env()
-            uv_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
+            uv_env["VIRTUAL_ENV"] = str(
+                project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / ".venv"
+            )
             if _m()._is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)

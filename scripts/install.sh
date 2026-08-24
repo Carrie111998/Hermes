@@ -1537,25 +1537,25 @@ setup_venv() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Creating virtual environment with Termux Python..."
 
-        if [ -d "venv" ]; then
+        if [ -d ".venv" ] || [ -d "venv" ]; then
             log_info "Virtual environment already exists, recreating..."
-            rm -rf venv
+            rm -rf .venv venv
         fi
 
-        "$PYTHON_PATH" -m venv venv
-        log_success "Virtual environment ready ($(./venv/bin/python --version 2>/dev/null))"
+        "$PYTHON_PATH" -m venv .venv
+        log_success "Virtual environment ready ($(./.venv/bin/python --version 2>/dev/null))"
         return 0
     fi
 
     log_info "Creating virtual environment with Python $PYTHON_VERSION..."
 
-    if [ -d "venv" ]; then
+    if [ -d ".venv" ] || [ -d "venv" ]; then
         log_info "Virtual environment already exists, recreating..."
-        rm -rf venv
+        rm -rf .venv venv
     fi
 
     # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    $UV_CMD venv .venv --python "$PYTHON_VERSION"
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the
@@ -1564,8 +1564,8 @@ setup_venv() {
     # version — building Rust transitives that have no wheel for that
     # version from source via maturin, which fails. Pinning UV_PYTHON to the
     # interpreter we just created forces every subsequent uv command onto it.
-    if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
-        export UV_PYTHON="$INSTALL_DIR/venv/bin/python"
+    if [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
+        export UV_PYTHON="$INSTALL_DIR/.venv/bin/python"
     fi
 
     log_success "Virtual environment ready (Python $PYTHON_VERSION)"
@@ -1580,14 +1580,14 @@ install_deps() {
     # python-deps invocation. Re-deriving it here covers that path. Without it,
     # an inherited UV_PYTHON=3.14 makes the uv sync/pip tiers below recreate the
     # venv at 3.14 and fail the maturin source build (no cp314 wheels yet).
-    if [ "$DISTRO" != "termux" ] && [ -x "$INSTALL_DIR/venv/bin/python" ]; then
-        export UV_PYTHON="$INSTALL_DIR/venv/bin/python"
+    if [ "$DISTRO" != "termux" ] && [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
+        export UV_PYTHON="$INSTALL_DIR/.venv/bin/python"
     fi
 
     if [ "$DISTRO" = "termux" ]; then
         if [ "$USE_VENV" = true ]; then
-            export VIRTUAL_ENV="$INSTALL_DIR/venv"
-            PIP_PYTHON="$INSTALL_DIR/venv/bin/python"
+            export VIRTUAL_ENV="$INSTALL_DIR/.venv"
+            PIP_PYTHON="$INSTALL_DIR/.venv/bin/python"
         else
             PIP_PYTHON="$PYTHON_PATH"
         fi
@@ -1641,7 +1641,7 @@ install_deps() {
 
     if [ "$USE_VENV" = true ]; then
         # Tell uv to install into our venv (no need to activate)
-        export VIRTUAL_ENV="$INSTALL_DIR/venv"
+        export VIRTUAL_ENV="$INSTALL_DIR/.venv"
     fi
 
     # On Debian/Ubuntu (including WSL), some Python packages need build tools.
@@ -1709,7 +1709,7 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/.venv" $UV_CMD sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -1829,7 +1829,7 @@ setup_path() {
     log_info "Setting up hermes command..."
 
     if [ "$USE_VENV" = true ]; then
-        HERMES_BIN="$INSTALL_DIR/venv/bin/python"
+        HERMES_BIN="$INSTALL_DIR/.venv/bin/python"
         HERMES_ENTRYPOINT="$INSTALL_DIR/hermes"
     else
         HERMES_BIN="$(which hermes 2>/dev/null || echo "")"
@@ -2109,7 +2109,7 @@ SOUL_EOF
         log_info "  Future 'hermes update' runs will not inject bundled skills. Delete the marker to opt back in."
     else
         log_info "Syncing bundled skills to ~/.hermes/skills/ ..."
-        if "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" 2>/dev/null; then
+        if "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" 2>/dev/null; then
             log_success "Skills synced to ~/.hermes/skills/"
         else
             # Fallback: simple directory copy if Python sync fails
@@ -2707,7 +2707,7 @@ run_setup_wizard() {
     # Run hermes setup using the venv Python directly (no activation needed).
     # Redirect stdin from /dev/tty so interactive prompts work when piped from curl.
     if [ "$USE_VENV" = true ]; then
-        "$INSTALL_DIR/venv/bin/python" -m hermes_cli.main setup < /dev/tty
+        "$INSTALL_DIR/.venv/bin/python" -m hermes_cli.main setup < /dev/tty
     else
         python -m hermes_cli.main setup < /dev/tty
     fi
@@ -3190,7 +3190,7 @@ install_desktop_voice_deps() {
     # for anything this best-effort step fails to fetch.
     local _prev_venv="${VIRTUAL_ENV:-}"
     if [ "$USE_VENV" = true ]; then
-        export VIRTUAL_ENV="$INSTALL_DIR/venv"
+        export VIRTUAL_ENV="$INSTALL_DIR/.venv"
     fi
     if [ -z "${UV_CMD:-}" ]; then
         install_uv || true
@@ -3397,7 +3397,7 @@ install_desktop() {
     # strip + deep ad-hoc repair so a broken venv never leaves the bundle
     # unsigned/unlaunchable.
     if [ "$OS" = "macos" ] && [ -z "${CSC_LINK:-}" ] && [ -z "${APPLE_SIGNING_IDENTITY:-}" ] && command -v codesign >/dev/null 2>&1; then
-        local config_python="$INSTALL_DIR/venv/bin/python"
+        local config_python="$INSTALL_DIR/.venv/bin/python"
         local fixup_ok=""
         if [ -x "$config_python" ]; then
             if HERMES_HOME="$HERMES_HOME" "$config_python" - "$desktop_dir" <<'PYEOF'

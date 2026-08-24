@@ -151,7 +151,7 @@ packages.
 
 Create the venv **outside** the cloned source tree. A venv that lives inside
 the directory the agent operates from can be wiped by a relative-path command
-the agent runs against its own checkout (`rm -rf venv`, `uv venv venv`, etc.),
+the agent runs against its own checkout (`rm -rf .venv`, `uv venv .venv`, etc.),
 which silently destroys the running runtime mid-session. Keeping it outside the
 tree means no relative path from the workspace resolves to it.
 

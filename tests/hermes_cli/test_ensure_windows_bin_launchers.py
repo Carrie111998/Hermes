@@ -150,6 +150,41 @@ def test_noop_on_posix(managed_install):
     assert not (home / "bin").exists()
 
 
+def test_dual_layout_launchers_come_from_canonical_venv(tmp_path, monkeypatch):
+    """Both venv and .venv present → launchers resolve from .venv (canonical).
+
+    The legacy venv may be relocatable while the canonical .venv is a normal
+    venv; the healed launcher form must follow the CANONICAL one, otherwise
+    the bin dir would carry .cmd delegators into the stale environment.
+    """
+    home = tmp_path / "hermes"
+    root = home / "hermes-agent"
+    # legacy, relocatable
+    legacy = root / "venv" / "Scripts"
+    legacy.mkdir(parents=True)
+    (root / "venv" / "pyvenv.cfg").write_text(
+        "home = X\nrelocatable = true\n", encoding="utf-8"
+    )
+    for name in _WINDOWS_BIN_LAUNCHERS:
+        (legacy / f"{name}.exe").write_bytes(b"MZ legacy: " + name.encode())
+    # canonical, normal venv
+    canonical = root / ".venv" / "Scripts"
+    canonical.mkdir(parents=True)
+    (root / ".venv" / "pyvenv.cfg").write_text("home = X\n", encoding="utf-8")
+    for name in _WINDOWS_BIN_LAUNCHERS:
+        (canonical / f"{name}.exe").write_bytes(b"MZ canonical: " + name.encode())
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    restored = ensure_windows_bin_launchers(root, windows=True, user_path_entries=[])
+
+    assert {Path(p).suffix for p in restored} == {".exe"}
+    for name in _WINDOWS_BIN_LAUNCHERS:
+        assert (home / "bin" / f"{name}.exe").read_bytes() == (
+            root / ".venv" / "Scripts" / f"{name}.exe"
+        ).read_bytes()
+        assert not (home / "bin" / f"{name}.cmd").exists()
+
+
 def test_profile_session_still_heals_the_shared_bin(tmp_path, monkeypatch):
     """Under ``hermes -p <name>`` HERMES_HOME points inside profiles/<name>;
     the launcher dir is per-machine, so the heal must anchor on the default

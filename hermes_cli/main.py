@@ -707,6 +707,7 @@ if sys.platform == "win32":
         from hermes_cli import _install_repair as _install_repair_mod
 
         _install_repair_mod.ensure_windows_bin_launchers(_bootstrap_root)
+        _install_repair_mod.reconcile_venv_layout(_bootstrap_root)
     except Exception:
         pass
 
@@ -6121,7 +6122,7 @@ def _nixos_build_env() -> dict[str, str] | None:
         return None
 
     # Tier 1: fast path — hermes venv python3, no nix-shell overhead
-    for venv_name in ("venv", ".venv"):
+    for venv_name in (".venv", "venv"):
         venv_python = PROJECT_ROOT / venv_name / "bin" / "python3"
         if venv_python.exists():
             return {**os.environ, "PYTHON": str(venv_python)}
@@ -8942,7 +8943,7 @@ def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     if uv_bin:
         from hermes_constants import project_venv_dir
 
-        venv_dir = project_venv_dir(PROJECT_ROOT) or PROJECT_ROOT / "venv"
+        venv_dir = project_venv_dir(PROJECT_ROOT) or PROJECT_ROOT / ".venv"
         env = {**os.environ, "VIRTUAL_ENV": str(venv_dir)}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)

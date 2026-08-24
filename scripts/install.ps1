@@ -2444,7 +2444,11 @@ function Install-Venv {
     $venvBackupName = $null
     $venvParked = $false
     try {
-    if (Test-Path -LiteralPath "venv") {
+    $existingVenvDirs = @()
+    foreach ($vn in @(".venv", "venv")) {
+        if (Test-Path -LiteralPath $vn) { $existingVenvDirs += $vn }
+    }
+    if ($existingVenvDirs.Count -gt 0) {
         $venvHadExistingVenv = $true
         Write-Info "Virtual environment already exists, recreating..."
         # On Windows, native Python extensions (e.g. _bcrypt.pyd, tornado's
@@ -2508,13 +2512,13 @@ function Install-Venv {
             # the window between one kill pass and venv parking. Each pass re-
             # enumerates; three consecutive clean passes (or the attempt cap)
             # ends the loop.
-            $venvPrefix = [System.IO.Path]::GetFullPath((Join-Path $InstallDir "venv")).TrimEnd('\') + '\'
+            $venvPrefixRe = '^(?:' + (($existingVenvDirs | ForEach-Object { [regex]::Escape(([System.IO.Path]::GetFullPath((Join-Path $InstallDir $_))).TrimEnd('\') + '\') }) -join '|') + ')'
             $cleanPasses = 0
             for ($sweep = 0; $sweep -lt 10 -and $cleanPasses -lt 3; $sweep++) {
                 $found = 0
                 try {
                     Get-CimInstance Win32_Process -ErrorAction Stop |
-                        Where-Object { $_.ProcessId -ne $myPid -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($venvPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
+                        Where-Object { $_.ProcessId -ne $myPid -and $_.ExecutablePath -and $_.ExecutablePath -match $venvPrefixRe } |
                         ForEach-Object {
                             $found++
                             $treePid = [string]$_.ProcessId
@@ -2536,18 +2540,24 @@ function Install-Venv {
         # then fail on one locked .pyd, leaving a gutted venv with no usable
         # interpreter and no rollback source. Abort with the previous install
         # intact so the user can close holders and retry.
-        $venvBackupName = "venv.stale.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
-        try {
-            Rename-Item -LiteralPath "venv" -NewName $venvBackupName -ErrorAction Stop
-            $venvParked = $true
-        } catch {
-            $renameErr = $_.Exception.Message
-            throw (
-                "Could not move the existing venv aside ($renameErr). " +
-                "A process still has the install directory open (often a non-Hermes " +
-                "python.exe that resolved into this venv via PATH). Close those " +
-                "processes and retry - the previous install was left intact."
-            )
+        $venvParkedMap = @{}
+        $venvBackupName = $null
+        foreach ($vn in @("venv", ".venv")) {
+            if ($existingVenvDirs -notcontains $vn) { continue }
+            $venvBackupName = "$vn.stale.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
+            try {
+                Rename-Item -LiteralPath $vn -NewName $venvBackupName -ErrorAction Stop
+                $venvParkedMap[$venvBackupName] = $vn
+                $venvParked = $true
+            } catch {
+                $renameErr = $_.Exception.Message
+                throw (
+                    "Could not move the existing venv aside ($renameErr). " +
+                    "A process still has the install directory open (often a non-Hermes " +
+                    "python.exe that resolved into this venv via PATH). Close those " +
+                    "processes and retry - the previous install was left intact."
+                )
+            }
         }
     }
     
@@ -2555,7 +2565,7 @@ function Install-Venv {
     # normal progress such as "Using CPython ..." on stderr; under Windows
     # PowerShell 5.1 with EAP=Stop that stderr is a NativeCommandError unless
     # we temporarily relax EAP and trust $LASTEXITCODE for real failures.
-    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv .venv --python $PythonVersion }
     # Relaxing EAP above means a *genuine* uv-venv failure (exit != 0) no longer
     # aborts on its own. Capture $LASTEXITCODE immediately and fail fast, so the
     # `venv` stage can't falsely report success (and Invoke-Stage can't emit
@@ -2568,7 +2578,7 @@ function Install-Venv {
     # uv can return success without leaving the interpreter expected by the
     # installer (for example after an interrupted filesystem operation). Treat
     # that as a failed transaction so the previous venv can be restored.
-    $venvPythonExe = Join-Path $InstallDir "venv\Scripts\python.exe"
+    $venvPythonExe = Join-Path $InstallDir ".venv\Scripts\python.exe"
     if (-not (Test-Path -LiteralPath $venvPythonExe -PathType Leaf)) {
         throw "uv reported success but venv interpreter is missing at $venvPythonExe"
     }
@@ -2580,7 +2590,9 @@ function Install-Venv {
     # succeeds. Record the parked backup so the dependency stage can restore
     # it on failure and commit its cleanup only after validation (#83149).
     if ($venvParked) {
-        Set-Content -LiteralPath (Join-Path $InstallDir "venv.pending-backup") -Value $venvBackupName -Encoding ascii
+        $pendingTarget = "venv"
+        if ($existingVenvDirs -contains ".venv") { $pendingTarget = ".venv" }
+        Set-Content -LiteralPath (Join-Path $InstallDir "venv.pending-backup") -Value @($venvBackupName, $pendingTarget) -Encoding ascii
         Write-Info "Previous venv parked at $venvBackupName until the dependency install is verified"
     }
 
@@ -2588,8 +2600,8 @@ function Install-Venv {
     # been released. Best-effort -- a still-held tree just stays for next time.
     # The backup parked THIS run is excluded: it is the rollback source until
     # Install-Dependencies commits the transaction.
-    Get-ChildItem -Directory -Filter "venv.stale.*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne $venvBackupName } | ForEach-Object {
+    Get-ChildItem -Directory -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Name -like "venv.stale.*" -or $_.Name -like ".venv.stale.*") -and $_.Name -ne $venvBackupName } | ForEach-Object {
             Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
         }
 
@@ -2605,14 +2617,18 @@ function Install-Venv {
         $originalError = $_
         $rollbackError = $null
 
-        if ($venvParked -and $venvBackupName -and (Test-Path -LiteralPath $venvBackupName)) {
+        if ($venvParked -and $venvParkedMap.Count -gt 0) {
             try {
-                if (Test-Path -LiteralPath "venv") {
-                    $failedVenvName = "venv.failed.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
-                    Rename-Item -LiteralPath "venv" -NewName $failedVenvName -ErrorAction Stop
-                    Write-Warn "Failed replacement parked at $failedVenvName"
+                foreach ($vn in @(".venv", "venv")) {
+                    if (Test-Path -LiteralPath $vn) {
+                        $failedVenvName = "$vn.failed.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
+                        Rename-Item -LiteralPath $vn -NewName $failedVenvName -ErrorAction Stop
+                        Write-Warn "Failed replacement parked at $failedVenvName"
+                    }
                 }
-                Rename-Item -LiteralPath $venvBackupName -NewName "venv" -ErrorAction Stop
+                foreach ($parkedName in $venvParkedMap.Keys) {
+                    Rename-Item -LiteralPath $parkedName -NewName $venvParkedMap[$parkedName] -ErrorAction Stop
+                }
                 Write-Warn "Restored previous virtual environment after failed recreate"
             } catch {
                 $rollbackError = $_.Exception.Message
@@ -2621,13 +2637,17 @@ function Install-Venv {
             if ($rollbackError) {
                 throw "Virtual environment recreate failed: $($originalError.Exception.Message). Rollback failed: $rollbackError. Previous venv remains at $venvBackupName."
             }
-        } elseif (-not $venvHadExistingVenv -and (Test-Path -LiteralPath "venv")) {
+        } elseif (-not $venvHadExistingVenv) {
             # Preserve a partial first install too. This branch must not touch a
             # pre-existing venv whose move-aside failed above.
             try {
-                $failedVenvName = "venv.failed.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
-                Rename-Item -LiteralPath "venv" -NewName $failedVenvName -ErrorAction Stop
-                Write-Warn "Partial virtual environment parked at $failedVenvName"
+                foreach ($vn in @(".venv", "venv")) {
+                    if (Test-Path -LiteralPath $vn) {
+                        $failedVenvName = "$vn.failed.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
+                        Rename-Item -LiteralPath $vn -NewName $failedVenvName -ErrorAction Stop
+                        Write-Warn "Partial virtual environment parked at $failedVenvName"
+                    }
+                }
             } catch {
                 $rollbackError = $_.Exception.Message
             }
@@ -2672,6 +2692,18 @@ function Get-PendingVenvBackup {
     return $name
 }
 
+function Get-PendingVenvRestoreTarget {
+    # Original directory name of the parked venv (the restore target). Legacy
+    # single-line markers restore to "venv"; new markers carry the target on
+    # the second line so a canonical ".venv" park restores to ".venv".
+    $markerPath = Join-Path $InstallDir "venv.pending-backup"
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { return "venv" }
+    $target = (Get-Content -LiteralPath $markerPath -ErrorAction SilentlyContinue | Select-Object -Skip 1 -First 1)
+    if ($target) { $target = $target.Trim() }
+    if (-not $target) { return "venv" }
+    return $target
+}
+
 function Complete-VenvTransaction {
     # Commit: dependency install + baseline imports passed, so the previous
     # venv is no longer needed as a rollback source. Best-effort delete; a
@@ -2692,13 +2724,14 @@ function Restore-VenvBackup {
     # venv so Hermes (and the venv-blocker probe) stay usable (#83149).
     $backupName = Get-PendingVenvBackup
     if (-not $backupName) { return }
+    $restoreTarget = Get-PendingVenvRestoreTarget
     try {
-        if (Test-Path -LiteralPath (Join-Path $InstallDir "venv")) {
-            $failedVenvName = "venv.failed.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
-            Rename-Item -LiteralPath (Join-Path $InstallDir "venv") -NewName $failedVenvName -ErrorAction Stop
+        if (Test-Path -LiteralPath (Join-Path $InstallDir $restoreTarget)) {
+            $failedVenvName = "$restoreTarget.failed.{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), ([Guid]::NewGuid().ToString("N"))
+            Rename-Item -LiteralPath (Join-Path $InstallDir $restoreTarget) -NewName $failedVenvName -ErrorAction Stop
             Write-Warn "Failed replacement parked at $failedVenvName"
         }
-        Rename-Item -LiteralPath (Join-Path $InstallDir $backupName) -NewName "venv" -ErrorAction Stop
+        Rename-Item -LiteralPath (Join-Path $InstallDir $backupName) -NewName $restoreTarget -ErrorAction Stop
         Remove-Item -LiteralPath (Join-Path $InstallDir "venv.pending-backup") -Force -ErrorAction SilentlyContinue
         Write-Warn "Restored previous virtual environment after failed dependency install"
     } catch {
@@ -2713,7 +2746,7 @@ function Install-Dependencies {
     
     if (-not $NoVenv) {
         # Tell uv to install into our venv (no activation needed)
-        $env:VIRTUAL_ENV = "$InstallDir\venv"
+        $env:VIRTUAL_ENV = "$InstallDir\.venv"
     }
 
     # Re-pin UV_PYTHON to the venv interpreter. Install-Venv already does this,
@@ -2724,7 +2757,7 @@ function Install-Dependencies {
     # tiers below recreate the venv at 3.14 and fail the maturin source build
     # (no cp314 wheels yet).
     if (-not $NoVenv) {
-        $venvPythonExe = Join-Path $InstallDir "venv\Scripts\python.exe"
+        $venvPythonExe = Join-Path $InstallDir ".venv\Scripts\python.exe"
         if (Test-Path $venvPythonExe) {
             $env:UV_PYTHON = $venvPythonExe
         }
@@ -2762,7 +2795,7 @@ function Install-Dependencies {
         # empty and producing the broken state where `hermes.exe` exists
         # in the wrong directory and imports fail with ModuleNotFoundError.
         # (Mirrors the same flag in scripts/install.sh::install_deps.)
-        $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
+        $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\.venv"
         Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync --extra all --locked }
         if ($LASTEXITCODE -eq 0) {
             Write-Success "Main package installed (hash-verified via uv.lock)"
@@ -2800,7 +2833,7 @@ function Install-Dependencies {
 
     # Parse [project.optional-dependencies].all from pyproject.toml.
     # tomllib is stdlib on Python 3.11+ which the bootstrap guarantees.
-    $pythonExeForParse = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
+    $pythonExeForParse = if (-not $NoVenv) { "$InstallDir\.venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
     $allExtras = @()
     if (Test-Path $pythonExeForParse) {
         $parsed = & $pythonExeForParse -c @"
@@ -2860,7 +2893,7 @@ except Exception:
     # We probe via the venv's own python so a misdirected sync is caught
     # here, not 30 seconds later when the user runs `hermes`.
     if (-not $NoVenv) {
-        $venvPython = "$InstallDir\venv\Scripts\python.exe"
+        $venvPython = "$InstallDir\.venv\Scripts\python.exe"
         if (-not (Test-Path $venvPython)) {
             throw "Install reported success but $venvPython does not exist. The dependency sync likely landed in a sibling .venv\ directory. Re-run the installer; if it persists, close Hermes processes and preserve existing venv directories before retrying. Do not delete venv in place."
         }
@@ -2905,7 +2938,7 @@ except Exception:
         # materialise the .exe (file lock during self-update, distlib edge case).
         # Catch it here so a fresh install/update does not finish with a broken
         # `hermes` command while hermes-agent.exe / hermes-acp.exe exist
-        $scriptsDir = Join-Path $InstallDir "venv\Scripts"
+        $scriptsDir = Join-Path $InstallDir ".venv\Scripts"
         $pythonExe = Join-Path $scriptsDir "python.exe"
         if ((Test-Path $scriptsDir) -and (Test-Path $pythonExe)) {
             $scriptNames = & $pythonExe -c @"
@@ -2924,7 +2957,7 @@ print(','.join(scripts))
                 if ($missing.Count -gt 0) {
                     Write-Warn "Console entry point(s) missing: $($missing -join ', ')"
                     Write-Info "Reinstalling entry points..."
-                    $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
+                    $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\.venv"
                     Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install --reinstall -e . }
                     $stillMissing = @()
                     foreach ($name in $expected) {
@@ -2946,7 +2979,7 @@ print(','.join(scripts))
     # users hit and lazy-import errors from `hermes dashboard` are confusing.
     # If tier 1 failed (the common case), [web] was still picked up by tiers
     # 2-3; only tier 4 leaves you without it.
-    $pythonExe = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
+    $pythonExe = if (-not $NoVenv) { "$InstallDir\.venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
     if (Test-Path $pythonExe) {
         $webOk = $false
         $webServerSyntaxOk = $false
@@ -2997,7 +3030,7 @@ function Install-HermesCommandLaunchers {
     # silently hijacks the `python` command in every terminal (#83797).
     # Requiring hermes.exe before creating the destination keeps the PATH
     # stage from reporting success with an unusable command (PR #92092).
-    $scriptsDir = Join-Path $Root "venv\Scripts"
+    $scriptsDir = Join-Path $Root ".venv\Scripts"
     $requiredSource = Join-Path $scriptsDir "hermes.exe"
     if (-not (Test-Path -LiteralPath $requiredSource -PathType Leaf)) {
         throw "Cannot set up the hermes command: required launcher not found: $requiredSource"
@@ -3012,7 +3045,8 @@ function Install-HermesCommandLaunchers {
     # --relocatable) resolves relative to its own location, and a copy
     # dies with 'uv trampoline failed to canonicalize script path' --
     # those get a .cmd delegator invoking the in-venv exe instead.
-    $pyvenvCfg = Join-Path $Root "venv\pyvenv.cfg"
+    $pyvenvCfg = Join-Path $Root ".venv\pyvenv.cfg"
+    if (-not (Test-Path -LiteralPath $pyvenvCfg)) { $pyvenvCfg = Join-Path $Root "venv\pyvenv.cfg" }
     $venvRelocatable = $false
     if (Test-Path -LiteralPath $pyvenvCfg) {
         $venvRelocatable = [bool](Select-String -Path $pyvenvCfg -Pattern '^\s*relocatable\s*=\s*true\s*$' -Quiet)
@@ -3249,7 +3283,7 @@ You are Hermes Agent, an intelligent AI assistant created by Nous Research. You 
     
     # Seed bundled skills into $HermesHome\skills (manifest-based, one-time per skill)
     Write-Info "Syncing bundled skills to $HermesHome\skills ..."
-    $pythonExe = "$InstallDir\venv\Scripts\python.exe"
+    $pythonExe = "$InstallDir\.venv\Scripts\python.exe"
     if (Test-Path $pythonExe) {
         try {
             # Force the child python.exe to emit UTF-8 on its stdout/stderr.
@@ -4250,7 +4284,7 @@ function Install-PlatformSdks {
         return
     }
 
-    $pythonExe = "$InstallDir\venv\Scripts\python.exe"
+    $pythonExe = "$InstallDir\.venv\Scripts\python.exe"
     if (-not (Test-Path $pythonExe)) {
         Write-Warn "Skipping platform-SDK verification: $pythonExe not found"
         return
@@ -4360,7 +4394,7 @@ function Invoke-SetupWizard {
 
     # Run hermes setup using the venv Python directly (no activation needed)
     if (-not $NoVenv) {
-        & ".\venv\Scripts\python.exe" -m hermes_cli.main setup
+        & ".\.venv\Scripts\python.exe" -m hermes_cli.main setup
     } else {
         python -m hermes_cli.main setup
     }
@@ -4381,7 +4415,7 @@ function Start-GatewayIfConfigured {
 
     if (-not $hasMessaging) { return }
 
-    $hermesCmd = "$InstallDir\venv\Scripts\hermes.exe"
+    $hermesCmd = "$InstallDir\.venv\Scripts\hermes.exe"
     if (-not (Test-Path $hermesCmd)) {
         $hermesCmd = "hermes"
     }
