@@ -1,5 +1,6 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
+import hashlib
 import shutil
 import json
 import os
@@ -21,6 +22,16 @@ from tools.skills_sync import (
     reset_bundled_skill,
     restore_official_optional_skill,
 )
+
+
+def _legacy_cache_inclusive_hash(directory: Path) -> str:
+    """Reproduce the pre-cache-filter bundled manifest hash algorithm."""
+    hasher = hashlib.md5()
+    for fpath in sorted(directory.rglob("*")):
+        if fpath.is_file():
+            hasher.update(str(fpath.relative_to(directory)).encode("utf-8"))
+            hasher.update(fpath.read_bytes())
+    return hasher.hexdigest()
 
 
 class TestReadWriteManifest:
@@ -535,6 +546,178 @@ class TestSyncSkills:
             result2 = sync_skills(quiet=True)
             assert "new-skill" in result2["copied"]
             assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
+
+
+class TestLegacyCacheInclusiveManifest:
+    """Compatibility for manifests written before Python caches were ignored."""
+
+    def _skill(self, root, rel="category/demo", body="version one\n"):
+        skill = root / rel
+        cache = skill / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: demo\n---\n{body}", encoding="utf-8"
+        )
+        (cache / "helper.cpython-313.pyc").write_bytes(b"original-cache")
+        return skill
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(
+            patch("tools.skills_sync._get_bundled_dir", return_value=bundled)
+        )
+        stack.enter_context(
+            patch(
+                "tools.skills_sync._get_optional_dir",
+                return_value=bundled.parent / "optional-skills",
+            )
+        )
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(
+            patch("tools.skills_sync.MANIFEST_FILE", manifest_file)
+        )
+        return stack
+
+    def _legacy_copy(self, tmp_path):
+        bundled = tmp_path / "bundled"
+        bundled_skill = self._skill(bundled)
+        skills_dir = tmp_path / "user_skills"
+        dest = skills_dir / "category" / "demo"
+        dest.parent.mkdir(parents=True)
+        shutil.copytree(bundled_skill, dest)
+        manifest_file = skills_dir / ".bundled_manifest"
+        manifest_file.write_text(
+            f"demo:{_legacy_cache_inclusive_hash(bundled_skill)}\n",
+            encoding="utf-8",
+        )
+        return bundled, bundled_skill, skills_dir, dest, manifest_file
+
+    def test_cache_only_drift_is_not_listed_or_protected_as_user_edit(self, tmp_path):
+        from tools.skills_sync import list_user_modified_bundled_skills
+
+        bundled, bundled_skill, skills_dir, dest, manifest_file = self._legacy_copy(
+            tmp_path
+        )
+        (dest / "scripts" / "__pycache__" / "helper.cpython-313.pyc").write_bytes(
+            b"regenerated-cache"
+        )
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            assert list_user_modified_bundled_skills() == []
+            result = sync_skills(quiet=True)
+            manifest = _read_manifest()
+
+        assert result["user_modified"] == []
+        assert manifest["demo"] == _dir_hash(bundled_skill)
+        assert (dest / "SKILL.md").exists()
+
+    def test_pristine_legacy_copy_receives_real_upstream_update(self, tmp_path):
+        bundled, bundled_skill, skills_dir, dest, manifest_file = self._legacy_copy(
+            tmp_path
+        )
+        (bundled_skill / "SKILL.md").write_text(
+            "---\nname: demo\n---\nversion two upstream\n", encoding="utf-8"
+        )
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+            manifest = _read_manifest()
+
+        assert result["updated"] == ["demo"]
+        assert result["user_modified"] == []
+        assert "version two upstream" in (dest / "SKILL.md").read_text()
+        assert manifest["demo"] == _dir_hash(bundled_skill)
+
+    def test_corrupt_origin_does_not_auto_rebaseline(self, tmp_path):
+        from tools.skills_sync import list_user_modified_bundled_skills
+
+        bundled, _bundled_skill, skills_dir, dest, manifest_file = self._legacy_copy(
+            tmp_path
+        )
+        corrupt_origin = "0" * 32
+        manifest_file.write_text(f"demo:{corrupt_origin}\n", encoding="utf-8")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+            modified = list_user_modified_bundled_skills()
+            manifest = _read_manifest()
+
+        assert result["updated"] == []
+        assert result["user_modified"] == ["demo"]
+        assert [entry["name"] for entry in modified] == ["demo"]
+        assert manifest["demo"] == corrupt_origin
+        assert (dest / "SKILL.md").exists()
+
+    def test_legacy_origin_recovers_an_upstream_rename(self, tmp_path):
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        old = self._skill(skills_dir, rel="old-category/demo")
+        manifest_file = skills_dir / ".bundled_manifest"
+        manifest_file.write_text(
+            f"demo:{_legacy_cache_inclusive_hash(old)}\n", encoding="utf-8"
+        )
+        new_source = self._skill(
+            bundled, rel="new-category/demo", body="version two upstream\n"
+        )
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        new = skills_dir / "new-category" / "demo"
+        assert result["relocated"] == ["demo"]
+        assert result["updated"] == ["demo"]
+        assert not old.exists()
+        assert "version two upstream" in (new / "SKILL.md").read_text()
+        assert _dir_hash(new) == _dir_hash(new_source)
+
+    def test_legacy_origin_allows_pristine_removal(self, tmp_path):
+        from tools.skills_sync import remove_pristine_bundled_skills
+
+        bundled, _bundled_skill, skills_dir, dest, manifest_file = self._legacy_copy(
+            tmp_path
+        )
+        (dest / "scripts" / "__pycache__" / "helper.cpython-313.pyc").write_bytes(
+            b"regenerated-cache"
+        )
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = remove_pristine_bundled_skills()
+
+        assert result["removed"] == ["demo"]
+        assert result["skipped"] == []
+        assert not dest.exists()
+
+    def test_real_content_edit_remains_protected(self, tmp_path):
+        from tools.skills_sync import (
+            list_user_modified_bundled_skills,
+            remove_pristine_bundled_skills,
+        )
+
+        bundled, bundled_skill, skills_dir, dest, manifest_file = self._legacy_copy(
+            tmp_path
+        )
+        (dest / "SKILL.md").write_text(
+            "---\nname: demo\n---\nmy genuine edit\n", encoding="utf-8"
+        )
+        (bundled_skill / "SKILL.md").write_text(
+            "---\nname: demo\n---\nnew upstream content\n", encoding="utf-8"
+        )
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            modified = list_user_modified_bundled_skills()
+            synced = sync_skills(quiet=True)
+            removed = remove_pristine_bundled_skills()
+
+        assert [entry["name"] for entry in modified] == ["demo"]
+        assert synced["user_modified"] == ["demo"]
+        assert synced["updated"] == []
+        assert removed["removed"] == []
+        assert removed["skipped"] == [
+            {"name": "demo", "reason": "user-modified (kept)"}
+        ]
+        assert "my genuine edit" in (dest / "SKILL.md").read_text()
 
 
 class TestGetBundledDir:
