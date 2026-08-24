@@ -568,6 +568,12 @@ class ProcessRegistry:
                         # Promote to notify_on_complete so the agent still gets
                         # exactly one notification when the process actually ends.
                         session.notify_on_complete = True
+                        # Undo any consume-mark wait()/read_log() may already have
+                        # applied while the flag was still False — a promoted
+                        # notify_on_complete must still deliver even if the agent
+                        # consumed a completion under the old flag (AI review on
+                        # #93368, point 1).
+                        self._completion_consumed.discard(session.id)
                         should_disable = True
                 return_early = True
             else:
