@@ -7843,7 +7843,30 @@ def _register_linux_desktop_entry() -> None:
 
 
 def cmd_gui(args: argparse.Namespace):
-    """Build and launch the native Electron desktop GUI."""
+    """Serialize the mutable Desktop preflight, then build and launch it."""
+    from hermes_cli.desktop_build_lock import DesktopBuildLock
+
+    build_lock = DesktopBuildLock(PROJECT_ROOT)
+    try:
+        acquired = build_lock.acquire()
+    except OSError as exc:
+        print(f"✗ Could not create the Desktop build lock: {exc}")
+        print("  Refusing to run npm without serialization; check the checkout permissions and retry.")
+        sys.exit(1)
+
+    if not acquired:
+        print("✗ Another Hermes Desktop dependency install or package build is already running.")
+        print("  Wait for that launch/build to finish, then retry.")
+        sys.exit(2)
+
+    try:
+        return _cmd_gui_impl(args, build_lock=build_lock)
+    finally:
+        build_lock.release()
+
+
+def _cmd_gui_impl(args: argparse.Namespace, *, build_lock=None):
+    """Build and launch Desktop under ``build_lock`` when a build is allowed."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
@@ -8096,6 +8119,10 @@ def cmd_gui(args: argparse.Namespace):
 
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")
+        # Electron is the long-lived handoff.  Release immediately before it
+        # starts so an open Desktop window never blocks a future rebuild.
+        if build_lock is not None:
+            build_lock.release()
         launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
         sys.exit(launch_result.returncode)
 
@@ -8114,6 +8141,11 @@ def cmd_gui(args: argparse.Namespace):
 
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
+    # Keep serialization through the Linux sandbox permission fixup above;
+    # that still mutates the packaged tree.  Only the Electron handoff is
+    # outside the build lock.
+    if build_lock is not None:
+        build_lock.release()
     launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
     sys.exit(launch_result.returncode)
 
