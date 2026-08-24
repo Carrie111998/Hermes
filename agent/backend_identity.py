@@ -87,17 +87,22 @@ def _norm_base_url(value: Optional[str]) -> str:
 def credential_fingerprint(secret: Optional[str]) -> str:
     """Stable non-reversible fingerprint of one explicit credential.
 
-    Call sites pass the resolved api_key (or any stable per-credential
-    token, e.g. the key_env name when the key itself is unavailable).
-    The fingerprint is safe to keep on a frozen identity (never logged,
-    never compared to the raw secret elsewhere). Empty input -> empty
-    fingerprint ("unknown", non-distinguishing).
+    Call sites pass the RESOLVED api_key only. A key that cannot be resolved
+    contributes no fingerprint (empty = "unknown", non-distinguishing):
+    hashing a stand-in token such as the key_env NAME would put two
+    different namespaces on the same axis and make skip decisions unstable
+    across evaluations (review finding on the first iteration of this PR).
+    Format follows agent.credential_persistence._fingerprint_value
+    ("sha256:" + first 16 hex, surrogatepass-safe) so the repo carries ONE
+    secret-fingerprint convention. Lazy import: credential_persistence keeps
+    its own import graph cycle-free and must not gain a dependency on this
+    module's consumers. Never logged, never compared to the raw secret.
     """
-    import hashlib
-
     if not secret:
         return ""
-    return "sha:" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
+    from agent.credential_persistence import _fingerprint_value
+
+    return _fingerprint_value(secret) or ""
 
 
 @dataclass(frozen=True)

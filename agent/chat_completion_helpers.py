@@ -2519,8 +2519,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
     _current_key = getattr(agent, "api_key", "")
     _current_cred = _current_key if isinstance(_current_key, str) else ""
-    _fb_cred = resolve_entry_api_key(fb) or str(fb.get("key_env")
-                                        or fb.get("api_key_env") or "")
+    # RESOLVED keys only: an unresolvable entry contributes no fingerprint
+    # (unknown = non-distinguishing) rather than hashing the key_env NAME,
+    # which mixes two namespaces on one axis and made skip decisions
+    # unstable across evaluations (review finding on iteration 1).
+    _fb_cred = resolve_entry_api_key(fb) or ""
     current_ident = BackendIdentity.build(
         provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""),
