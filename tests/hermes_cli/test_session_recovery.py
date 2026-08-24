@@ -300,6 +300,42 @@ def _corrupt_table_root(path: Path, root_page: int) -> None:
     path.write_bytes(data)
 
 
+def test_recovery_preserves_cold_archive_tombstone_fence(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    db = SessionDB(db_path=source)
+    try:
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "terminal", "f" * 64, 123.0),
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["copy"]["cold_archive_tombstones"]["status"] == "complete"
+    assert report["verification"]["table_counts"]["cold_archive_tombstones"] == 1
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered._conn is not None
+        row = recovered._conn.execute(
+            "SELECT terminal_id, source_fingerprint, deleted_at "
+            "FROM cold_archive_tombstones WHERE session_id = ?",
+            ("cold-purged",),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("terminal", "f" * 64, 123.0)
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+        assert recovered.get_session("cold-purged") is None
+    finally:
+        recovered.close()
+
+
 def test_snapshot_blocks_connections_opened_during_the_copy(
     tmp_path: Path,
 ) -> None:

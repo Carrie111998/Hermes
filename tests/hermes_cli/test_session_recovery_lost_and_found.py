@@ -426,6 +426,12 @@ def _make_synthetic_lost_and_found(
 def test_classify_lost_and_found_row_sentinels() -> None:
     assert (
         classify_lost_and_found_row(
+            4, ("cold-purged", "terminal", "b" * 64, 123.0)
+        )
+        == "cold_archive_tombstones"
+    )
+    assert (
+        classify_lost_and_found_row(
             23, (None, "20260101_010101_aaa001", "user", "hi")
         )
         == "messages"
@@ -464,6 +470,72 @@ def test_classify_lost_and_found_row_sentinels() -> None:
         classify_lost_and_found_row(23, (None, "sess", "not-a-role", "x")) is None
     )
     assert classify_lost_and_found_row(0, ()) is None
+
+
+def test_mapper_preserves_unattributed_cold_archive_tombstones(
+    tmp_path: Path,
+) -> None:
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    lf_conn.execute(
+        "CREATE TABLE lost_and_found ("
+        "rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, "
+        "c0, c1, c2, c3)"
+    )
+    lf_conn.execute(
+        "INSERT INTO lost_and_found VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (1, 2, 4, 9, "cold-purged", "terminal", "c" * 64, 789.0),
+    )
+    output = tmp_path / "mapped-unattributed.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        assert mapping["mapped"]["cold_archive_tombstones"] == 1
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered = SessionDB(db_path=output)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+        assert recovered.get_session("cold-purged") is None
+    finally:
+        recovered.close()
+
+
+def test_mapper_preserves_attributed_cold_archive_tombstones(
+    tmp_path: Path,
+) -> None:
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    lf_conn.execute(
+        "CREATE TABLE cold_archive_tombstones ("
+        "session_id TEXT PRIMARY KEY, "
+        "terminal_id TEXT NOT NULL, "
+        "source_fingerprint TEXT NOT NULL, "
+        "deleted_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO cold_archive_tombstones VALUES (?, ?, ?, ?)",
+        ("cold-purged", "terminal", "a" * 64, 456.0),
+    )
+    output = tmp_path / "mapped.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        assert mapping["direct_table_rows"]["cold_archive_tombstones"] == 1
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered = SessionDB(db_path=output)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+        assert recovered.get_session("cold-purged") is None
+    finally:
+        recovered.close()
 
 
 def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(

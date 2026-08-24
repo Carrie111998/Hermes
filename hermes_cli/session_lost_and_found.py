@@ -28,6 +28,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+from math import isfinite
 from pathlib import Path
 from typing import Any, Optional
 
@@ -251,8 +252,22 @@ def classify_lost_and_found_row(
 ) -> Optional[str]:
     """Classify one lost_and_found record by field count + sentinel values.
 
-    Returns 'sessions', 'messages', 'session_model_usage', or None.
+    Returns a recognized canonical table name or None.
     """
+
+    if (
+        nfield == 4
+        and len(cells) == 4
+        and isinstance(cells[0], str)
+        and bool(cells[0])
+        and isinstance(cells[1], str)
+        and bool(cells[1])
+        and isinstance(cells[2], str)
+        and re.fullmatch(r"[0-9a-f]{64}", cells[2]) is not None
+        and type(cells[3]) in {int, float}
+        and isfinite(float(cells[3]))
+    ):
+        return "cold_archive_tombstones"
 
     if len(cells) >= 3 and cells[0] is None:
         # Rowid-alias tables store their INTEGER PRIMARY KEY as NULL in the
@@ -331,6 +346,7 @@ def _copy_direct_tables(
         "sessions",
         "messages",
         "session_model_usage",
+        "cold_archive_tombstones",
         "compression_locks",
         "gateway_routing",
         "async_delegations",
@@ -370,7 +386,12 @@ def map_lost_and_found_rows(
 
     report: dict[str, Any] = {
         "direct_table_rows": {},
-        "mapped": {"sessions": 0, "messages": 0, "session_model_usage": 0},
+        "mapped": {
+            "sessions": 0,
+            "messages": 0,
+            "session_model_usage": 0,
+            "cold_archive_tombstones": 0,
+        },
         "legacy_minimal_sessions": 0,
         "unmapped_rows": 0,
         "insert_conflicts": 0,
@@ -384,6 +405,7 @@ def map_lost_and_found_rows(
         sessions_columns = _table_columns(dest, "sessions")
         messages_columns = _table_columns(dest, "messages")
         usage_columns = _table_columns(dest, "session_model_usage")
+        tombstone_columns = _table_columns(dest, "cold_archive_tombstones")
         sessions_defaults = _notnull_defaults(dest, "sessions")
         messages_defaults = _notnull_defaults(dest, "messages")
         usage_defaults = _notnull_defaults(dest, "session_model_usage")
@@ -425,7 +447,14 @@ def map_lost_and_found_rows(
                     report["unmapped_rows"] += 1
                     continue
                 try:
-                    if kind == "messages":
+                    if kind == "cold_archive_tombstones":
+                        inserted = _insert_prefix_row(
+                            dest,
+                            "cold_archive_tombstones",
+                            tombstone_columns,
+                            list(cells),
+                        )
+                    elif kind == "messages":
                         values = [lf_rowid, *cells[1 : min(nfield, len(messages_columns))]]
                         inserted = _insert_prefix_row(
                             dest, "messages", messages_columns, values,
