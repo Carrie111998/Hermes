@@ -4587,7 +4587,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         def _after(error):
             if error:
-                logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
+                logger.error(
+                    "Voice mixer stream error (guild=%d): %s",
+                    guild_id,
+                    _redact_discord_error_text(error),
+                )
 
         if vc.is_playing():
             vc.stop()
@@ -4835,7 +4839,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 def _after(error):
                     if error:
-                        logger.error("Voice playback error: %s", error)
+                        logger.error(
+                            "Voice playback error: %s",
+                            _redact_discord_error_text(error),
+                        )
                     loop.call_soon_threadsafe(done.set)
 
                 # Prepend a short lead of silence so the voice socket's warm-up
