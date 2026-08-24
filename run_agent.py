@@ -6406,22 +6406,27 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = hermes_xai_default_headers()
         else:
-            from hermes_cli.models import (
-                OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
-                opencode_zen_free_headers,
-            )
+            # This else also runs for every host without a dedicated branch.
+            # Guard the OpenCode import so a models-import failure cannot
+            # raise out of other providers' profile-header / pop path.
+            _oc_headers = None
+            try:
+                from hermes_cli.models import is_opencode_keyless, opencode_zen_free_headers
 
-            _oc_key = str(
-                self._client_kwargs.get("api_key") or getattr(self, "api_key", "") or ""
-            )
-            if (
-                _oc_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
-                or (getattr(self, "provider", "") or "") == "opencode-free"
-            ):
-                # Keyless Zen free-tier: keep the empty Authorization
-                # header. Profile attribution headers (or a pop) would
-                # let the SDK send Bearer <placeholder> (#93890).
-                self._client_kwargs["default_headers"] = opencode_zen_free_headers()
+                if is_opencode_keyless(
+                    getattr(self, "provider", ""),
+                    self._client_kwargs.get("api_key") or getattr(self, "api_key", ""),
+                ):
+                    # Replace, do not merge: this method assigns the route's
+                    # header set, same as the host-specific branches above.
+                    # The keyless dict already includes attribution; leftover
+                    # keys from a prior route must not survive the rebuild.
+                    _oc_headers = opencode_zen_free_headers()
+            except Exception:
+                _oc_headers = None
+
+            if _oc_headers is not None:
+                self._client_kwargs["default_headers"] = _oc_headers
             else:
                 # No URL-specific headers — check profile.default_headers before clearing.
                 _ph_headers = None

@@ -2837,16 +2837,16 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # "opencode-free", so a provider-id-only gate misses those rebuilds
     # and the SDK emits Bearer opencode-zen-free-keyless (#93890).
     try:
-        from hermes_cli.models import (
-            OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
-            opencode_zen_free_headers,
-        )
+        from hermes_cli.models import is_opencode_keyless, opencode_zen_free_headers
 
-        _oc_key = str(client_kwargs.get("api_key") or getattr(agent, "api_key", "") or "")
-        if (
-            getattr(agent, "provider", "") == "opencode-free"
-            or _oc_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
+        if is_opencode_keyless(
+            getattr(agent, "provider", ""),
+            client_kwargs.get("api_key") or getattr(agent, "api_key", ""),
         ):
+            # Merge: this chokepoint only overlays the keyless Auth/attribution
+            # keys. Unlike `_apply_client_headers_for_base_url` (which assigns
+            # the whole route set), a later client rebuild must not drop
+            # headers another path already placed on client_kwargs.
             _existing = dict(client_kwargs.get("default_headers") or {})
             _existing.update(opencode_zen_free_headers())
             client_kwargs["default_headers"] = _existing

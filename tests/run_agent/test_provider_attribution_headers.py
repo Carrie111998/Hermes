@@ -180,6 +180,28 @@ def test_opencode_zen_keyless_placeholder_keeps_empty_authorization(mock_openai)
 
 
 @patch("run_agent.OpenAI")
+def test_opencode_zen_keyed_client_does_not_blank_authorization(mock_openai):
+    """A real Zen key must keep a non-empty Authorization after rebuild.
+    The keyless placeholder gate must not fire for a paid session."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="sk-real-opencode",
+        base_url="https://opencode.ai/zen/v1",
+        model="claude-sonnet-4-5",
+        provider="opencode-zen",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._client_kwargs["default_headers"] = {"Authorization": "Bearer sk-real-opencode"}
+    agent._apply_client_headers_for_base_url("https://opencode.ai/zen/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers.get("Authorization") != ""
+    assert headers["X-Title"] == "Hermes Agent"
+
+
+@patch("run_agent.OpenAI")
 def test_routed_client_preserves_openai_sdk_custom_headers(mock_openai):
     mock_openai.return_value = MagicMock()
     routed_client = SimpleNamespace(
