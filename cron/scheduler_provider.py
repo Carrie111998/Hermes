@@ -511,6 +511,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -535,6 +536,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -606,6 +608,7 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -662,12 +665,21 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        profile_name = entry[0] if isinstance(entry, tuple) else "default"
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                profile_adapters_map = {}
+                                if profile_adapters:
+                                    profile_adapters_map = profile_adapters.get(
+                                        profile_name
+                                    ) or {}
+                                tick_adapters = profile_adapters_map or (
+                                    adapters if profile_name == "default" else None
+                                )
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

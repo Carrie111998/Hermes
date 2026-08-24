@@ -7845,6 +7845,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # opt into topic mode) means topic mode is off for this chat.
         return raw is True
 
+    def _telegram_topic_binding_profile(self, source: SessionSource) -> str:
+        """Return the bot/profile namespace for Telegram topic persistence."""
+        profile = str(getattr(source, "profile", None) or "").strip()
+        if profile:
+            return profile
+        if getattr(self.config, "multiplex_profiles", False):
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                return get_active_profile_name() or "default"
+            except Exception:
+                pass
+        return "default"
+
     # Telegram's General (pinned top) topic in forum-enabled private chats.
     # Bot API behavior varies: some clients omit message_thread_id for
     # General, others send "1". Treat both as "root" for lobby/lane purposes.
@@ -7932,6 +7946,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Runs off-loop (always via asyncio.to_thread); use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         session_db.bind_telegram_topic(
+            profile=self._telegram_topic_binding_profile(source),
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
             user_id=str(source.user_id or ""),
@@ -8003,6 +8018,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(session_db, "_db", session_db)
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
+                profile=self._telegram_topic_binding_profile(source),
                 chat_id=str(source.chat_id),
             )
         except Exception:
@@ -15624,6 +15640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile-scoped.  Preserve both dimensions in the key so dashboard
         # and NAS health aggregation can see which secondary profile failed.
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
+        adapter._gateway_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -31044,6 +31061,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                if getattr(runner, "_profile_adapters", None):
+                    cron_start_kwargs["profile_adapters"] = runner._profile_adapters
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),

@@ -745,6 +745,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
+        # Set by the multiplex runner for secondary bots. This namespace is
+        # persisted with DM-topic bindings so identical Telegram chat/thread
+        # ids from different bot accounts cannot collide.
+        self._gateway_profile_name: str = "default"
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
@@ -1703,7 +1707,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         try:
             removed = db.delete_telegram_topic_binding(
-                chat_id=str(chat_id), thread_id=str(thread_id),
+                profile=getattr(self, "_gateway_profile_name", "default"),
+                chat_id=str(chat_id),
+                thread_id=str(thread_id),
             )
         except Exception:
             logger.debug(

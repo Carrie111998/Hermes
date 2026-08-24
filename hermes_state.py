@@ -13366,6 +13366,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 );
 
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_bindings (
+                    profile TEXT NOT NULL DEFAULT 'default',
                     chat_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
@@ -13374,14 +13375,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    PRIMARY KEY (chat_id, thread_id)
+                    PRIMARY KEY (profile, chat_id, thread_id)
                 );
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
                 ON telegram_dm_topic_bindings(session_id);
 
                 CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
-                ON telegram_dm_topic_bindings(user_id, chat_id);
+                ON telegram_dm_topic_bindings(profile, user_id, chat_id);
                 """
             )
 
@@ -13539,6 +13540,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def get_telegram_topic_binding(
         self,
         *,
+        profile: str = "default",
         chat_id: str,
         thread_id: str,
     ) -> Optional[Dict[str, Any]]:
@@ -13548,9 +13550,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 row = self._conn.execute(
                     """
                     SELECT * FROM telegram_dm_topic_bindings
-                    WHERE chat_id = ? AND thread_id = ?
+                    WHERE profile = ? AND chat_id = ? AND thread_id = ?
                     """,
-                    (str(chat_id), str(thread_id)),
+                    (str(profile or "default"), str(chat_id), str(thread_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return None
@@ -13559,6 +13561,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def list_telegram_topic_bindings_for_chat(
         self,
         *,
+        profile: str = "default",
         chat_id: str,
     ) -> List[Dict[str, Any]]:
         """All Telegram DM topic bindings for one chat, newest first.
@@ -13570,8 +13573,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 rows = self._conn.execute(
                     "SELECT * FROM telegram_dm_topic_bindings "
-                    "WHERE chat_id = ? ORDER BY updated_at DESC",
-                    (str(chat_id),),
+                    "WHERE profile = ? AND chat_id = ? ORDER BY updated_at DESC",
+                    (str(profile or "default"), str(chat_id)),
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []
@@ -13604,6 +13607,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def delete_telegram_topic_binding(
         self,
         *,
+        profile: str = "default",
         chat_id: str,
         thread_id: str,
     ) -> int:
@@ -13634,6 +13638,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         migrated yet — both are silent no-ops; we never raise from
         a cleanup hot path).
         """
+        profile = str(profile or "default")
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         deleted = {"count": 0}
@@ -13643,9 +13648,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 cursor = conn.execute(
                     """
                     DELETE FROM telegram_dm_topic_bindings
-                    WHERE chat_id = ? AND thread_id = ?
+                    WHERE profile = ? AND chat_id = ? AND thread_id = ?
                     """,
-                    (chat_id, thread_id),
+                    (profile, chat_id, thread_id),
                 )
                 deleted["count"] = cursor.rowcount or 0
             except sqlite3.OperationalError:
@@ -13681,6 +13686,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def bind_telegram_topic(
         self,
         *,
+        profile: str = "default",
         chat_id: str,
         thread_id: str,
         user_id: str,
@@ -13696,6 +13702,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self.apply_telegram_topic_migration()
         now = time.time()
+        profile = str(profile or "default")
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         user_id = str(user_id)
@@ -13709,20 +13716,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 WHERE session_id = ?
                 """,
                 (session_id,),
-            ).fetchone()
-            if existing_session is not None:
-                linked_chat = existing_session["chat_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[0]
-                linked_thread = existing_session["thread_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[1]
+            )
+            existing_row = existing_session.fetchone()
+            if existing_row is not None:
+                linked_chat = existing_row["chat_id"] if isinstance(existing_row, sqlite3.Row) else existing_row[0]
+                linked_thread = existing_row["thread_id"] if isinstance(existing_row, sqlite3.Row) else existing_row[1]
                 if str(linked_chat) != chat_id or str(linked_thread) != thread_id:
                     raise ValueError("session is already linked to another Telegram topic")
 
             conn.execute(
                 """
                 INSERT INTO telegram_dm_topic_bindings (
-                    chat_id, thread_id, user_id, session_key, session_id,
+                    profile, chat_id, thread_id, user_id, session_key, session_id,
                     managed_mode, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile, chat_id, thread_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     session_key = excluded.session_key,
                     session_id = excluded.session_id,
@@ -13730,12 +13738,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     updated_at = excluded.updated_at
                 """,
                 (
+                    profile,
                     chat_id,
                     thread_id,
                     user_id,
                     session_key,
                     session_id,
-                    managed_mode,
+                    str(managed_mode or "auto"),
                     now,
                     now,
                 ),
