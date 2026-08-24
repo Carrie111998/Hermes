@@ -495,7 +495,7 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
 
 
 def _codex_usage_window_used(snapshot: Any, label: str) -> Optional[float]:
-    """Return used_percent for a named usage window ("Session"/"Weekly")."""
+    """Return used_percent for a named usage window ("Session"/"Weekly"/"Monthly")."""
     if snapshot is None:
         return None
     for window in getattr(snapshot, "windows", ()) or ():
@@ -1921,23 +1921,28 @@ class CredentialPool:
     ) -> List[PooledCredential]:
         """Rank cooldown-available openai-codex entries by cached usage windows.
 
-        Returns Weekly+Session-room entries (and entries with no usage data)
-        first, then Session-exhausted (short reset), then Weekly-exhausted (long
-        reset), preserving priority order within each group.  Cache-only (no I/O)
-        so it is safe under the pool lock.
+        Returns Monthly+Weekly+Session-room entries (and entries with no usage data)
+        first, then Session-exhausted (short reset ~hours), then Weekly-exhausted
+        (medium reset ~days), then Monthly-exhausted (long reset ~weeks),
+        preserving priority order within each group. Cache-only (no I/O) so it is
+        safe under the pool lock.
         """
         has_room: List[PooledCredential] = []
         unknown: List[PooledCredential] = []
         session_dead: List[PooledCredential] = []
         weekly_dead: List[PooledCredential] = []
+        monthly_dead: List[PooledCredential] = []
         for entry in available:
             snapshot = _cached_codex_usage(entry.id)
             if snapshot is None:
                 unknown.append(entry)
                 continue
+            monthly_used = _codex_usage_window_used(snapshot, "Monthly")
             weekly_used = _codex_usage_window_used(snapshot, "Weekly")
             session_used = _codex_usage_window_used(snapshot, "Session")
-            if weekly_used is not None and weekly_used >= USAGE_EXHAUSTED_PCT:
+            if monthly_used is not None and monthly_used >= USAGE_EXHAUSTED_PCT:
+                monthly_dead.append(entry)
+            elif weekly_used is not None and weekly_used >= USAGE_EXHAUSTED_PCT:
                 weekly_dead.append(entry)
             elif session_used is not None and session_used >= USAGE_EXHAUSTED_PCT:
                 session_dead.append(entry)
@@ -1950,6 +1955,8 @@ class CredentialPool:
             return session_dead
         if weekly_dead:
             return weekly_dead
+        if monthly_dead:
+            return monthly_dead
         return available
 
     def select(self) -> Optional[PooledCredential]:

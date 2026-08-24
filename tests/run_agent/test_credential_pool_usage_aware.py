@@ -25,12 +25,14 @@ def _entry(idx: int, label: str) -> PooledCredential:
     )
 
 
-def _snap(session_used, weekly_used):
+def _snap(session_used=None, weekly_used=None, monthly_used=None):
     windows = []
     if session_used is not None:
         windows.append(SimpleNamespace(label="Session", used_percent=session_used))
     if weekly_used is not None:
         windows.append(SimpleNamespace(label="Weekly", used_percent=weekly_used))
+    if monthly_used is not None:
+        windows.append(SimpleNamespace(label="Monthly", used_percent=monthly_used))
     return SimpleNamespace(windows=tuple(windows), available=True)
 
 
@@ -58,8 +60,14 @@ _LOOKUP = {}
 def _register(pool, usage_by_label):
     _LOOKUP.clear()
     by_label = {e.label: e for e in pool.entries()}
-    for label, (su, wu) in usage_by_label.items():
-        _LOOKUP[by_label[label].id] = _snap(su, wu)
+    for label, val in usage_by_label.items():
+        if isinstance(val, tuple):
+            if len(val) == 2:
+                _LOOKUP[by_label[label].id] = _snap(session_used=val[0], weekly_used=val[1])
+            elif len(val) == 3:
+                _LOOKUP[by_label[label].id] = _snap(session_used=val[0], weekly_used=val[1], monthly_used=val[2])
+        elif isinstance(val, dict):
+            _LOOKUP[by_label[label].id] = _snap(**val)
 
 
 def test_skips_session_exhausted_and_picks_room():
@@ -77,6 +85,33 @@ def test_skips_weekly_exhausted():
     with _with_usage(_LOOKUP):
         chosen = pool.select()
     assert chosen.label == "c_plus"  # both team weekly-exhausted → skipped
+
+
+def test_skips_monthly_exhausted_free_account_and_picks_room():
+    # neo and llgap are Free accounts with 100% Monthly used, zeo has Weekly room
+    pool = _pool(["neo_free", "llgap_free", "zeo_team"])
+    _register(pool, {
+        "neo_free": (None, None, 100.0),
+        "llgap_free": (None, None, 100.0),
+        "zeo_team": (10.0, 36.0, None),
+    })
+    with _with_usage(_LOOKUP):
+        chosen = pool.select()
+    assert chosen is not None
+    assert chosen.label == "zeo_team"  # monthly-exhausted free accounts are skipped
+
+
+def test_all_weekly_exhausted_prefers_weekly_over_monthly_exhausted():
+    # If all paid accounts are weekly-exhausted (days reset), prefer them over monthly-exhausted (weeks reset)
+    pool = _pool(["neo_free", "zeo_team"])
+    _register(pool, {
+        "neo_free": (None, None, 100.0),
+        "zeo_team": (10.0, 100.0, None),
+    })
+    with _with_usage(_LOOKUP):
+        chosen = pool.select()
+    assert chosen is not None
+    assert chosen.label == "zeo_team"
 
 
 def test_all_session_exhausted_returns_least_bad_not_none():
