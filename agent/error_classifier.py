@@ -1656,6 +1656,18 @@ def _classify_400(
             should_fallback=False,
         )
 
+    # Tripwire: a 400 that still carries both the ``signature`` and
+    # ``reasoning`` fields but fell through the exact-phrase match above means
+    # Moonshot likely rewrote the error wording — the guard is coupled to the
+    # exact phrasing, so this fires before the incident silently degrades back
+    # to a non-retryable format_error and reproduces undiagnosed.
+    if "signature" in error_msg and "reasoning" in error_msg:
+        logger.warning(
+            "Kimi K3 400 carried both 'signature' and 'reasoning' but did not "
+            "match the replay-signature phrase; classification may have "
+            "drifted (check upstream error wording)",
+        )
+
     # Request-validation errors (unsupported / unknown parameter) MUST be
     # checked BEFORE context_overflow.  A GPT-5 model rejecting max_tokens
     # returns:
