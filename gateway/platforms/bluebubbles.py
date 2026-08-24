@@ -570,10 +570,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
                 "message": chunk,
             }
-            if reply_to and self._private_api_enabled and self._helper_connected:
+            if self._private_api_enabled and self._helper_connected:
+                # The server treats an omitted ``method`` as "apple-script",
+                # which drives Messages.app through AppleScript and needs the
+                # helper's macOS user to hold an active GUI session. Private
+                # API sends also work from a fast-user-switched or otherwise
+                # backgrounded login, so prefer it whenever the helper is
+                # connected -- replies already did, and reactions, typing
+                # indicators and read receipts require the helper anyway.
                 payload["method"] = "private-api"
-                payload["selectedMessageGuid"] = reply_to
-                payload["partIndex"] = 0
+                if reply_to:
+                    payload["selectedMessageGuid"] = reply_to
+                    payload["partIndex"] = 0
             try:
                 res = await self._api_post("/api/v1/message/text", payload)
                 data = res.get("data") or {}

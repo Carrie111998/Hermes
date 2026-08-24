@@ -151,6 +151,8 @@ Some features require the BlueBubbles [Private API helper](https://docs.bluebubb
 - Read receipts
 - Creating new chats by address
 
+When the helper is connected, outbound text is also sent through the Private API. That keeps sends working when the macOS user running BlueBubbles is not the active login (fast user switching, a headless Mac mini), where the server's default AppleScript send path cannot drive Messages.app.
+
 Without the Private API, basic text messaging and media still work.
 
 ## Troubleshooting

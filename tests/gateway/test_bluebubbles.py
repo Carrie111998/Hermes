@@ -315,6 +315,63 @@ class TestBlueBubblesAttachmentSend:
         assert captured["data"]["chatGuid"] == "iMessage;+;chat-guid"
 
 
+class TestBlueBubblesTextSend:
+    @staticmethod
+    def _capture_send(monkeypatch, adapter):
+        captured = {}
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;+15551234567"
+
+        async def fake_api_post(path, payload):
+            captured.update(path=path, payload=payload)
+            return {"status": 200, "data": {"guid": "message-guid"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_send_uses_private_api_when_helper_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        captured = self._capture_send(monkeypatch, adapter)
+
+        result = await adapter.send("+15551234567", "hello")
+
+        assert result.success is True
+        assert captured["path"] == "/api/v1/message/text"
+        assert captured["payload"]["method"] == "private-api"
+        assert "selectedMessageGuid" not in captured["payload"]
+
+    @pytest.mark.asyncio
+    async def test_send_omits_method_when_helper_not_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = False
+        captured = self._capture_send(monkeypatch, adapter)
+
+        result = await adapter.send("+15551234567", "hello")
+
+        assert result.success is True
+        assert "method" not in captured["payload"]
+
+    @pytest.mark.asyncio
+    async def test_reply_keeps_selected_message_guid(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        captured = self._capture_send(monkeypatch, adapter)
+
+        await adapter.send("+15551234567", "hello", reply_to="orig-guid")
+
+        payload = captured["payload"]
+        assert payload["method"] == "private-api"
+        assert payload["selectedMessageGuid"] == "orig-guid"
+        assert payload["partIndex"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Webhook registration
 # ---------------------------------------------------------------------------
