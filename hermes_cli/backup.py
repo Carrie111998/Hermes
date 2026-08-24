@@ -94,6 +94,11 @@ _EXCLUDED_DIRS = {
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    # JS runtime caches — populated when terminal.home_mode places a
+    # profile-local HOME under HERMES_HOME; each npm/npx/bun invocation
+    # writes hundreds of MB here.  Regenerable via reinstall.
+    ".bun",
+    ".npm",
 }
 
 # File-name suffixes to skip
