@@ -950,7 +950,7 @@ def _make_callback_waiter(
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
+        if dashboard_flow is not None and not dashboard_flow.use_loopback_callback:
             # The dashboard flow still speaks the legacy tuple; normalize it
             # here so both callback sources hand the SDK one shape.
             dash_code, dash_state = await dashboard_flow.wait_for_callback()
@@ -1472,12 +1472,10 @@ def _maybe_use_cimd(
     if (cfg.get("token_endpoint_auth_method") or "none") != "none":
         return None
 
-    # Dashboard/desktop flows redirect to the server's own externally
-    # reachable URL (``/api/mcp/oauth/callback/<name>``), which is
-    # deployment-specific and can never appear in a static document.
     from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
-    if get_dashboard_oauth_flow() is not None:
+    dashboard_flow = get_dashboard_oauth_flow()
+    if dashboard_flow is not None and not dashboard_flow.use_loopback_callback:
         return None
 
     if cfg.get("redirect_uri") or cfg.get("redirect_port"):
@@ -1563,7 +1561,7 @@ def _configure_callback_port(
     from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
     dashboard_flow = get_dashboard_oauth_flow()
-    if dashboard_flow is not None:
+    if dashboard_flow is not None and not dashboard_flow.use_loopback_callback:
         cfg["_resolved_port"] = 0
         cfg["redirect_uri"] = cfg.get("redirect_uri") or dashboard_flow.redirect_uri
         return 0
