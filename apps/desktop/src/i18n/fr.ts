@@ -81,6 +81,8 @@ export const fr: Translations = {
       backendStopped: 'Backend arrêté',
       desktopBootFailed: 'Échec du démarrage',
       gatewayConnectionLost: 'Connexion au gateway perdue',
+      gatewayConnectionLostDetail:
+        "Nouvelle tentative en arrière-plan. Vous pouvez continuer à lire et rédiger — ouvrez les paramètres du gateway si le problème persiste.",
       gatewaySignInRequired: 'Connexion au gateway requise',
       ipcBridgeUnavailable: 'Le pont IPC du desktop est indisponible.'
     },
@@ -161,7 +163,9 @@ export const fr: Translations = {
       microphonePermission: "L'autorisation du microphone a été refusée.",
       openaiRejectedApiKey: 'OpenAI a rejeté la clé API.',
       openaiRejectedApiKeyWithStatus: status => `OpenAI a rejeté la clé API (${status} invalid_api_key).`,
-      openaiTtsNeedsKey: 'TTS OpenAI nécessite VOICE_TOOLS_OPENAI_KEY ou OPENAI_API_KEY.'
+      openaiTtsNeedsKey: 'TTS OpenAI nécessite VOICE_TOOLS_OPENAI_KEY ou OPENAI_API_KEY.',
+      codeSkewRestartRequired:
+        "Ce backend exécute encore l'ancien code après une mise à jour. Redémarrez-le pour charger le nouveau code."
     },
     voice: {
       configureSpeechToText: 'Configurez la reconnaissance vocale pour utiliser le mode vocal.',
@@ -251,6 +255,7 @@ export const fr: Translations = {
     openStarmap: 'Ouvrir le graphe de mémoire',
     enterHud: 'Mode HUD',
     exitHud: 'Quitter le mode HUD',
+    resetHudLayout: 'Réinitialiser la taille et la position du HUD',
     layoutEditor: 'Éditeur de disposition',
     layoutEditorTitle: mod => `Éditeur de disposition — ${mod}-clic réinitialise la disposition`
   },
@@ -392,6 +397,7 @@ export const fr: Translations = {
       providerAccounts: 'Comptes',
       providerApiKeys: 'Clés API',
       providerCustomEndpoints: 'Points de terminaison personnalisés',
+      providerLocalModels: 'Modèles locaux',
       gateway: 'Gateway',
       apiKeys: 'Outils et clés',
       keybinds: 'Raccourcis clavier',
@@ -467,6 +473,24 @@ export const fr: Translations = {
       saving: 'Enregistrement…',
       cancel: 'Annuler',
       empty: 'Aucune connexion enregistrée.'
+    },
+    managedUpdates: {
+      title: 'Mises à jour gérées',
+      intro:
+        'Mettez à jour de manière transactionnelle les installations SSH gérées par le Desktop : les sessions actives sont laissées se terminer, le dépôt distant est mis à jour, puis chaque profil est restauré avec un reçu corrélé.',
+      sshConnection: 'Installation SSH gérée par le Desktop',
+      update: 'Mettre à jour',
+      updating: 'Mise à jour…',
+      progress: 'Fin des sessions actives, mise à jour de l’installation distante et restauration des profils…',
+      updated: 'Mise à jour terminée',
+      partial: 'Mise à jour terminée — échec de la restauration',
+      refused: 'Refusée',
+      failed: 'Échec de la mise à jour',
+      alreadyRunning: 'Une mise à jour est déjà en cours',
+      receipt: (id: string, outcome: string) => `Reçu ${id} · ${outcome}`,
+      receiptVersions: (pre: string, post: string) => `${pre} → ${post}`,
+      scopesRestored: (profiles: string) => `Profils restaurés : ${profiles}`,
+      scopeNotRestored: (profile: string, error: string) => `Profil « ${profile} » non restauré : ${error}`
     },
     plugins: {
       title: 'Plugins du desktop',
@@ -656,8 +680,18 @@ export const fr: Translations = {
       introSplashDesc: "Le logo et l'invite affichés dans une conversation vide.",
       reactionsTitle: 'Réactions aux messages',
       reactionsDesc: 'Réactions emoji façon iMessage — réagissez aux messages, et Hermes peut réagir aux vôtres.',
+      tipsTitle: "Astuces dans l'application",
+      tipsDesc:
+        "Une petite bulle désigne occasionnellement une partie de l'application lorsque vous êtes inactif ou lorsque Hermes peut vous aider. Fermer une astuce la masque définitivement.",
+      tipsReset: (count: number) =>
+        `Réafficher ${count} astuce${count === 1 ? '' : 's'} fermée${count === 1 ? '' : 's'}`,
+      toursTitle: 'Visites guidées',
+      toursDesc: "Laissez Hermes vous guider dans l'application en assombrissant l'écran et en mettant chaque étape en évidence.",
       composerPopoutTitle: 'Détacher la zone de saisie',
       composerPopoutDesc: "Autoriser la zone de saisie à s'ouvrir dans une fenêtre flottante distincte.",
+      vibeHeartsTitle: "Cœurs d'ambiance",
+      vibeHeartsDesc:
+        "Des cœurs flottants apparaissent lorsque vous dites merci, « je t'aime », « good bot » ou envoyez un cœur. Cette option est indépendante des réactions aux messages ci-dessus.",
       embedsTitle: 'Intégrations en ligne',
       embedsDesc:
         "Les aperçus enrichis se chargent depuis des sites tiers (YouTube, X, …). Demander affiche un espace réservé jusqu'à ce que vous autorisiez chacun ; Toujours les charge automatiquement ; Désactivé conserve les liens simples.",
@@ -666,6 +700,9 @@ export const fr: Translations = {
       embedsOff: 'Désactivé',
       embedsReset: (count: number) =>
         `Réinitialiser ${count} ${count === 1 ? 'service autorisé' : 'services autorisés'}`,
+      resumeLastSessionTitle: 'Rouvrir la dernière conversation au lancement',
+      resumeLastSessionDesc:
+        "Lorsque cette option est activée, l'application rouvre votre conversation la plus récente après un démarrage à froid. Désactivez-la pour toujours commencer par une nouvelle conversation.",
       product: 'Produit',
       productDesc: 'Activité des outils lisible avec des résumés concis.',
       technical: 'Technique',
@@ -991,6 +1028,10 @@ export const fr: Translations = {
       bundleOutOfSyncDesc:
         "Le runtime Hermes a été mis à jour, mais l'application Desktop utilise encore une ancienne version. Les nouvelles fonctions de l'interface, comme le mode Bot, resteront absentes jusqu'à sa mise à jour. Lancez la mise à jour ci-dessous pour reconstruire l'application. Si cet avertissement persiste, réinstallez-la avec le dernier installateur Desktop.",
       bundleOutOfSyncAction: "Obtenir l'installateur",
+      bundleSwapPending: 'Redémarrez pour terminer la mise à jour',
+      bundleSwapPendingDesc:
+        "L'application mise à jour est déjà installée — Hermes doit seulement redémarrer pour la charger. Vos conversations et paramètres sont préservés.",
+      bundleSwapPendingAction: 'Redémarrer Hermes',
       updateReady: count => `Une nouvelle mise à jour est prête (${count} changement${count === 1 ? '' : 's'} inclus).`,
       updateReadyUnknown: 'Une nouvelle mise à jour est prête.',
       lastChecked: age => `Dernière vérification ${age}`,
@@ -1148,6 +1189,10 @@ export const fr: Translations = {
       plainTextStoredTitle: 'Jeton stocké en clair',
       plainTextStoredDesc:
         "Le stockage sécurisé est indisponible. Le jeton enregistré est donc stocké sans chiffrement dans le fichier des paramètres de connexion de l'application sur cette machine. Installez ou activez GNOME Keyring ou KWallet pour le chiffrer.",
+      keychainEncryptionTitle: 'Chiffrer les secrets enregistrés avec le trousseau du système',
+      keychainEncryptionDesc:
+        "Désactivé par défaut. Une fois activé, les jetons du gateway et les identifiants de connexion sont chiffrés avec le trousseau du système (Trousseaux d'accès, GNOME Keyring ou Windows DPAPI) ; le système peut demander une autorisation ou un mot de passe. Sinon, ils sont stockés dans des fichiers ordinaires lisibles uniquement par votre compte utilisateur.",
+      keychainEncryptionFailed: "Impossible de modifier le chiffrement des secrets",
       testRemote: 'Tester le distant',
       saveForRestart: 'Enregistrer pour le prochain redémarrage',
       saveAndReconnect: 'Enregistrer et se reconnecter',
@@ -1329,6 +1374,12 @@ export const fr: Translations = {
       reasoning: 'Raisonnement',
       reasoningOff: 'Désactivé',
       defaultsFailed: "Échec de l'enregistrement des modèles par défaut",
+      loadFailed: 'Impossible de charger les modèles',
+      restartRequired:
+        "Ce backend exécute encore l'ancien code après une mise à jour. Redémarrez-le pour charger le nouveau code.",
+      restartBackend: 'Redémarrer le backend',
+      restartingBackend: 'Redémarrage du backend...',
+      restartFailed: 'Impossible de redémarrer le backend',
       auxiliaryTitle: 'Modèles auxiliaires',
       resetAllToMain: 'Tout réinitialiser au principal',
       auxiliaryDesc:
@@ -1351,6 +1402,125 @@ export const fr: Translations = {
         title_generation: { label: 'Génération de titre', hint: 'Titres de session' },
         curator: { label: 'Curateur', hint: "Revue d'utilisation des skills" }
       }
+    },
+    localModels: {
+      title: 'Modèles locaux',
+      runtimeTitle: 'Moteur local',
+      runtimeReady: backend => `Prêt · ${backend}`,
+      serverRunning: 'En cours',
+      runtimeInstalled: 'Moteur llama.cpp installé',
+      runtimeInstalledDetail: (tag, backend) =>
+        `Build ${tag}, backend ${backend}. Hermes démarre et gère le serveur pour vous.`,
+      installTitle: 'Installer le moteur local',
+      installDetail:
+        "Télécharge le moteur d'inférence llama.cpp (quelques centaines de Mo). Les modèles téléchargés s'exécutent entièrement sur cette machine : aucun compte requis et aucune donnée ne quitte votre ordinateur.",
+      installAction: 'Installer le moteur',
+      installing: 'Installation du moteur…',
+      installFailed: "Échec de l'installation du moteur",
+      hardwareTitle: 'Cette machine',
+      hardwareLoading: 'Analyse de votre matériel…',
+      vram: label => `${label} de mémoire GPU`,
+      ram: label => `${label} de RAM`,
+      unifiedMemory: 'Mémoire unifiée',
+      modelsTitle: 'Modèles',
+      recommended: 'Recommandé',
+      recommendedReason: {
+        'best-quality-resident':
+          "Le modèle de meilleure qualité qui tient entièrement dans votre GPU et s'exécute à pleine vitesse. La sélection équilibre qualité et vitesse prévue sur ce matériel.",
+        'speed-gated-quality':
+          "Un modèle de meilleure qualité tient sur cette machine, mais sa bande passante mémoire le rendrait trop lent. Celui-ci est le meilleur modèle qui reste rapide.",
+        'fastest-resident':
+          "Aucun modèle n'atteint sa pleine vitesse sur ce matériel. Celui-ci s'en approche le plus tout en tenant entièrement dans la mémoire GPU.",
+        'least-painful-spilled':
+          "Aucun modèle ne tient entièrement dans la mémoire GPU de cette machine. Celui-ci offre le meilleur fonctionnement depuis la RAM système."
+      } as Record<string, string>,
+      downloaded: 'Téléchargé',
+      downloadAction: size => `Télécharger · ${size}`,
+      downloadProgress: (done, total) => `Téléchargement de ${done} sur ${total}`,
+      downloadDoneToast: model => `${model} est prêt.`,
+      installDoneToast: 'Le moteur local est installé et prêt.',
+      quickstartTitle: 'Exécuter un modèle sur cette machine',
+      quickstartDetail: (model, size) =>
+        `Un clic configure tout : le moteur local, ${model} (téléchargement de ${size}) et votre modèle par défaut pour les nouvelles conversations. Aucune donnée ne quitte cet ordinateur.`,
+      quickstartDetailReady: model =>
+        `Un clic définit ${model} comme modèle par défaut pour les nouvelles conversations. Tout s'exécute sur cette machine.`,
+      quickstartAction: 'Configurer pour moi',
+      quickstartConfigure: 'Configuration…',
+      quickstartDoneToast: model => `${model} est configuré : les nouvelles conversations s'exécutent sur cette machine.`,
+      quickstartFailed: 'Échec de la configuration du modèle local',
+      quickstartStageEngine: 'Moteur',
+      quickstartStageModel: 'Modèle',
+      quickstartStageFinish: 'Terminer',
+      useAction: 'Utiliser',
+      activePill: 'Par défaut',
+      updateTitle: 'Mise à jour du moteur disponible',
+      updateDetail: (next, current) =>
+        `Une nouvelle build llama.cpp (${next}) est prête à être installée. Vous utilisez ${current}. Les modèles continuent de fonctionner pendant le téléchargement.`,
+      updateAction: 'Mettre à jour le moteur',
+      updating: 'Mise à jour du moteur…',
+      upToDateTitle: 'Moteur à jour',
+      upToDateDetail: (tag, backend) =>
+        `llama.cpp ${tag} (${backend}) est en cours d'exécution : il s'agit de la dernière build fournie par Hermes.`,
+      updateToast: next =>
+        `Une nouvelle build du moteur local (${next}) est disponible. Mettez-la à jour depuis Paramètres → Modèles locaux.`,
+      activeDetail: "Les nouvelles conversations utilisent ce modèle. Il se charge lors de l'envoi de votre premier message.",
+      activeNotLoaded: 'Se charge avec votre premier message',
+      loadedPill: 'En mémoire',
+      placementResident: 'entièrement sur le GPU',
+      placementSpilled: 'partiellement dans la RAM',
+      placementResidentTip:
+        'S’exécute entièrement dans la mémoire GPU avec cette fenêtre de contexte, à pleine vitesse.',
+      placementSpilledTip:
+        'Une partie de ce modèle s’exécute depuis la RAM système. Il fonctionne, mais plus lentement. Une build plus compacte ou un contexte plus petit tiendrait entièrement dans le GPU.',
+      loadingPill: 'Chargement…',
+      ejectTip: 'Libérer la mémoire GPU (le modèle se rechargera au prochain message)',
+      ejected: 'Modèle déchargé : mémoire GPU libérée.',
+      ejectFailed: 'Impossible de décharger le modèle',
+      stopServer: 'Désactiver',
+      startServer: 'Activer',
+      runtimeRunningDetail:
+        "Le serveur local est en cours d'exécution. Le désactiver libère toute la mémoire GPU et empêche les nouvelles conversations d'utiliser les modèles locaux jusqu'à sa réactivation.",
+      serverStopped: 'Serveur local arrêté : mémoire GPU libérée.',
+      serverStarted: 'Serveur local en cours d’exécution.',
+      serverStopFailed: "Impossible d'arrêter le serveur local",
+      serverStartFailed: 'Impossible de démarrer le serveur local',
+      activating: 'Démarrage…',
+      activateFailed: model => `Impossible de passer à ${model}`,
+      activateDoneToast: model => `Les nouvelles conversations utilisent ${model}.`,
+      downloadFailed: model => `Échec du téléchargement de ${model}`,
+      pillFitsGpu: 'Tient dans votre GPU',
+      pillUsesRam: 'Utilise la RAM système',
+      pillTooBig: 'Trop volumineux pour cette machine',
+      browseTitle: 'Trouver davantage de modèles',
+      browseHint:
+        "Recherchez dans tout Hugging Face. La taille des modèles téléchargés ici est automatiquement adaptée à votre machine, mais ils ne sont pas testés par notre équipe.",
+      browsePlaceholder: 'Rechercher un modèle par nom ou auteur…',
+      browseSearching: 'Recherche dans Hugging Face',
+      browseListing: 'Lecture des fichiers du modèle',
+      browseShowFiles: 'Afficher les fichiers',
+      browseRefresh: 'Actualiser',
+      browseDownloads: 'téléchargements',
+      browseLikes: "mentions J'aime",
+      browseGated: 'nécessite une connexion à Hugging Face',
+      browseNoGguf: 'Aucun fichier de modèle compatible trouvé.',
+      browseFitUnknown: 'Compatibilité inconnue',
+      browseAlreadyDownloaded: 'Déjà téléchargé.',
+      addedByYou: 'Ajouté par vous',
+      browseDownloadStarted: 'Téléchargement de {name}',
+      browseDownloadAria: 'Télécharger {name}',
+      sideloadButton: 'Ajouter un fichier de modèle',
+      sideloadTitle: 'Choisir un fichier de modèle GGUF',
+      sideloadDone: '{name} ajouté.',
+      sideloadAlreadyPresent: 'Déjà présent dans votre bibliothèque.',
+      pillFullContext: max => `Contexte complet de ${max}`,
+      pillFullContextTip: 'Utilise dès le départ la fenêtre de contexte complète du modèle',
+      pillUpTo: max => `Contexte jusqu’à ${max}`,
+      pillGrowsTip: 'Augmente automatiquement lorsque votre conversation a besoin de plus de place',
+      pillVision: 'Comprend les images',
+      deleteAction: 'Supprimer le modèle',
+      deleteConfirm: model => `Supprimer ${model} du disque ?`,
+      deleted: model => `${model} supprimé.`,
+      deleteFailed: 'Échec de la suppression'
     },
     providers: {
       connectAccount: 'Connecter un compte',
@@ -1495,6 +1665,29 @@ export const fr: Translations = {
         failedSelect: backend => `Échec de la sélection de ${backend}`,
         needsSetupHint:
           "Vous pouvez sélectionner ce backend maintenant — les commandes échoueront jusqu'à ce que la configuration soit terminée."
+      },
+      browserRealProfile: {
+        label: 'Utiliser mon profil de navigateur réel',
+        description:
+          "Copie les identifiants de connexion et les cookies de votre navigateur par défaut dans un instantané géré que l'agent utilise pour naviguer. Votre profil actif n'est jamais ouvert directement. S'applique aux nouvelles sessions.",
+        enabledTitle: 'Navigation avec le profil réel activée',
+        enabledMessage:
+          'Les nouvelles sessions utiliseront un instantané de votre profil de navigateur par défaut.',
+        disabledTitle: 'Navigation avec le profil réel désactivée',
+        disabledMessage:
+          'L\'instantané du profil sera supprimé ; les nouvelles sessions utiliseront un navigateur vierge.',
+        failedSave: "Impossible d'enregistrer le paramètre du profil réel",
+        prompt: {
+          title: 'Restez connecté à vos sites',
+          body:
+            "Autorisez Hermes à naviguer avec un instantané de votre profil de navigateur par défaut afin que les sites s'ouvrent avec vos sessions déjà connectées.",
+          bulletSnapshot: 'Les cookies et identifiants de connexion sont copiés dans un instantané géré.',
+          bulletLiveProfile: "Votre profil de navigateur actif n'est jamais ouvert directement.",
+          bulletLocal: 'Rien ne quitte cet ordinateur.',
+          dontShowAgain: 'Ne plus afficher',
+          notNow: 'Pas maintenant',
+          enable: 'Utiliser mon profil'
+        }
       }
     }
   },
@@ -1556,6 +1749,8 @@ export const fr: Translations = {
     archive: 'Archiver',
     skillArchivedTitle: 'Skill archivé',
     skillArchivedMessage: 'Restaurable via hermes curator restore.',
+    officialCatalog: "Disponibles à l'installation",
+    officialPill: 'Officiel',
     hub: {
       alreadyInstalled: name => `« ${name} » est déjà installé`,
       pickerTitle: 'Hub de skills',
@@ -2104,6 +2299,7 @@ export const fr: Translations = {
     newProfile: 'Nouveau profil',
     importProfile: 'Importer un profil…',
     exportProfile: 'Exporter le profil…',
+    exportMenu: 'Exporter',
     imported: 'Profil importé',
     exported: 'Profil exporté',
     failedImport: "Échec de l'importation du profil",
@@ -2114,6 +2310,14 @@ export const fr: Translations = {
     switchToConnection: name => `Basculer vers ${name}`,
     switchConnectionFailed: name => `Impossible de se connecter à ${name}`,
     manageProfiles: 'Gérer les profils…',
+    fleet: {
+      allOnGateway: 'Tous les profils de cette gateway',
+      gateway: gateway => `Profils sur ${gateway}`,
+      gatewayUnreachable: gateway => `${gateway} · inaccessible`,
+      onGateway: (name, gateway) => `${name} · ${gateway}`,
+      switchTo: (name, gateway) => `Basculer vers ${name} sur ${gateway}`,
+      deleteOn: gateway => ` sur ${gateway}`
+    },
     remoteOverride: {
       menuItem: 'Se connecter à un hôte distant…',
       badge: (host: string) => `S'exécute sur ${host}`,
@@ -2226,7 +2430,12 @@ export const fr: Translations = {
           : `${count} tâches planifiées seront ignorées jusqu'à ce que vous vérifiiez leurs paramètres de modèle.`,
       detailMore: (names, remaining) => `${names} et ${remaining} autre${remaining === 1 ? '' : 's'}`,
       review: 'Vérifier les tâches planifiées',
-      saveFailed: "Hermes n'a pas enregistré ce changement de modèle."
+      saveFailed: "Hermes n'a pas enregistré ce changement de modèle.",
+      confirmTitle: 'Avertissement sur la sélection du modèle',
+      confirmDetail: 'Confirmez uniquement si vous acceptez ce compromis.',
+      confirmAction: 'Confirmer',
+      declined:
+        "Changement de modèle annulé — vous avez refusé l'avertissement concernant l'offre avec entraînement sur les données."
     },
     search: 'Rechercher des tâches cron...',
     loading: 'Chargement des tâches cron...',
@@ -3037,6 +3246,8 @@ export const fr: Translations = {
     connected: 'Connecté',
     featuredPitch: 'Un abonnement, 300+ modèles de pointe — la méthode recommandée pour exécuter Hermes',
     fireworksPitch: 'API de modèles directe — modèles de pointe hébergés par Fireworks',
+    localModelsTitle: 'Exécuter des modèles en local',
+    localModelsPitch: 'Aucun compte requis — téléchargez un modèle et exécutez-le sur cette machine',
     openRouterPitch: 'Une clé, des centaines de modèles — une valeur par défaut solide',
     apiKeyOptions: {
       fireworks: {
@@ -3075,6 +3286,8 @@ export const fr: Translations = {
     connectedProvider: provider => `${provider} connecté`,
     connectedPicking: provider => `${provider} connecté. Choix d'un modèle par défaut...`,
     signInFailed: 'Échec de la connexion. Réessayez.',
+    signInExpired:
+      "La connexion a expiré dans l'attente de l'autorisation. Cela signifie généralement que la page de connexion s'est figée dans l'onglet ouvert (problème côté serveur) — terminez la connexion dans cet onglet, puis réessayez. Si le problème persiste, utilisez plutôt une clé API ou la solution de secours en ligne de commande.",
     pickDifferentProvider: 'Choisissez un autre fournisseur',
     signInWith: provider => `Se connecter avec ${provider}`,
     openedBrowser: provider => `Nous avons ouvert ${provider} dans votre navigateur.`,
@@ -3110,6 +3323,9 @@ export const fr: Translations = {
     noModels: 'Aucun modèle trouvé.',
     addProvider: 'Ajouter un fournisseur',
     loadFailed: 'Impossible de charger les modèles',
+    loadingIntoMemory: 'Chargement en mémoire',
+    downloading: 'Téléchargement',
+    localDownloadsHeading: 'Local',
     noAuthenticatedProviders: 'Aucun fournisseur authentifié.',
     pro: 'Pro',
     proNeedsSubscription: 'Les modèles Pro nécessitent un abonnement payant Nous.',
@@ -3204,6 +3420,7 @@ export const fr: Translations = {
       gateway: 'Gateway',
       gatewayReady: 'prêt',
       gatewayNeedsSetup: 'nécessite une configuration',
+      gatewayUnavailable: 'inférence indisponible',
       gatewayChecking: 'vérification',
       gatewayConnecting: 'connexion',
       gatewayOffline: 'hors ligne',
@@ -3214,13 +3431,19 @@ export const fr: Translations = {
       resetStatusbar: 'Réinitialiser les valeurs par défaut',
       toggleApprovalMode: 'Approbations',
       toggleBackendVersion: 'Version du backend',
+      toggleCacheHitRate: 'Taux de cache',
       toggleCommandCenter: 'Centre de commandes',
       toggleContextUsage: 'Jauge de contexte',
       toggleRunningTimer: 'Minuteur de tour',
       toggleSessionTimer: 'Minuteur de session',
       toggleTerminal: 'Terminal',
+      toggleTokensPerSecond: 'Tokens par seconde',
       toggleVersion: 'Version et mises à jour',
       toggleWorkspace: 'Espace de travail',
+      cacheHitRateTitle:
+        'Taux de cache des prompts pour cette session — les tokens en cache coûtent moins cher, un taux élevé est donc plus économique',
+      tokensPerSecondTitle:
+        'Tokens de sortie par seconde, moyenne calculée sur les 10 derniers appels au modèle',
       agents: 'Agents',
       closeAgents: 'Fermer les agents',
       openAgents: 'Ouvrir les agents',
@@ -3235,6 +3458,15 @@ export const fr: Translations = {
       openStarmap: 'Ouvrir le graphique de mémoire',
       turnRunning: 'En cours',
       contextUsage: 'Utilisation du contexte',
+      systemResources: {
+        title: 'Ressources système',
+        loading: 'Ressources…',
+        gpuUtilization: 'Utilisation du GPU',
+        gpuMemory: 'Mémoire GPU',
+        ram: 'RAM',
+        unifiedNote: 'Mémoire unifiée — le GPU et le système partagent cet espace.',
+        toggle: 'Ressources système'
+      },
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
@@ -3312,6 +3544,9 @@ export const fr: Translations = {
     hide: 'Masquer',
     openPreview: "Ouvrir l'aperçu",
     openInBrowser: 'Ouvrir dans le navigateur',
+    openInExternal: 'Ouvrir dans une application externe',
+    popIn: 'Réintégrer',
+    popOut: 'Détacher',
     linkHint: "⌘/Ctrl-clic pour le panneau d'aperçu",
     sourceLineTitle: 'Clic pour sélectionner · shift-clic pour étendre · glisser vers le compositeur',
     source: 'SOURCE',
@@ -3398,7 +3633,17 @@ export const fr: Translations = {
       loadFailedConsole: (code, message) => `Échec du chargement${code ? ` (${code})` : ''} : ${message}`,
       unreachableDescription: "La page d'aperçu n'a pas pu être atteinte.",
       openTarget: url => `Ouvrir ${url}`,
-      fallbackTitle: 'Aperçu'
+      fallbackTitle: 'Aperçu',
+      annotate: 'Annoter',
+      annotateOn: "Arrêter l'annotation",
+      annotateNeedPage: "Ouvrez d'abord une page dans le navigateur intégré.",
+      annotateFailed: "Impossible de démarrer le mode d'annotation",
+      commenting: 'Ajout de commentaires',
+      addComments: count => (count === 1 ? 'Ajouter 1 commentaire' : `Ajouter ${count} commentaires`),
+      commentPlaceholder: 'Ajouter un commentaire...',
+      commentTitle: n => `Commentaire ${n}`,
+      saveComment: 'Enregistrer',
+      cancelComment: 'Annuler le commentaire'
     }
   },
 
@@ -3422,6 +3667,7 @@ export const fr: Translations = {
     closeToRight: 'Fermer à droite',
     closeAll: 'Tout fermer',
     newSessionTab: 'Nouvel onglet de session',
+    newTab: 'Nouvel onglet',
     pluginDisabled: pluginId => `Plugin « ${pluginId} » désactivé`,
     pluginDisabledBody: 'Réactivez-le dans Paramètres → Plugins pour faire revenir le panneau.',
     missingPane: paneId => `panneau manquant : ${paneId}`,
@@ -3482,6 +3728,8 @@ export const fr: Translations = {
       loadingSession: 'Chargement de la session',
       showEarlier: 'Afficher les messages précédents',
       loadingResponse: 'Hermes charge une réponse',
+      loadingLocalModel: model => `Chargement de ${model} en mémoire`,
+      processingPrompt: "Traitement de l'invite",
       resumeWhenBackgroundDone: count =>
         count === 1
           ? 'Reprendra une fois la tâche en arrière-plan terminée'
@@ -3792,6 +4040,11 @@ export const fr: Translations = {
     editTurnUnavailable:
       "Ce tour ne figure plus dans l'historique du serveur (il a peut-être été supprimé lors de la compaction).",
     resumeFailed: 'Échec de la reprise',
+    readOnlyTranscriptTitle: 'Ouverte en lecture seule',
+    readOnlyTranscriptBody:
+      "Aucun backend connecté ne revendique encore cette ancienne conversation ; elle est donc ouverte comme transcription en lecture seule. Son historique est intact, mais l'envoi reste désactivé jusqu'à ce qu'un backend la prenne en charge.",
+    readOnlyTranscriptSendBlocked:
+      "Cette conversation est ouverte comme transcription en lecture seule — l'envoi est désactivé.",
     resumeStrandedTitle: 'Impossible de charger cette session',
     resumeStrandedBody:
       "La connexion à cette session a échoué et les nouvelles tentatives automatiques ont été abandonnées. Vérifiez que la Gateway est en cours d'exécution, puis réessayez.",
@@ -3810,6 +4063,7 @@ export const fr: Translations = {
     cwdStagedTitle: "Répertoire de travail en attente d'application",
     cwdStagedMessage: 'Redémarrez le backend desktop pour appliquer les modifications de cwd à cette session active.',
     modelSwitchFailed: 'Échec du changement de modèle',
+    hydrationSyncing: (profile: string) => `Synchronisation de ${profile}…`,
     sessionExported: 'Session exportée',
     sessionExportFailed: "Impossible d'exporter la session",
     imageSaved: 'Image enregistrée',
@@ -3835,6 +4089,53 @@ export const fr: Translations = {
       systemNote: platform => `↻ Transféré vers ${platform} — reprenez ici à tout moment.`,
       failed: error => `Échec du transfert : ${error}`,
       timedOut: "Délai d'expiration en attendant la Gateway. `hermes gateway` est-il en cours d'exécution ?"
+    }
+  },
+
+  tips: {
+    close: 'Ne plus afficher cette astuce',
+    items: {
+      'new-session': {
+        title: 'Repartir de zéro',
+        text: 'Une nouvelle conversation dispose de son propre contexte, terminal et dossier de travail.'
+      },
+      skills: {
+        title: 'Apprenez-lui une seule fois',
+        text: "Les compétences sont des dossiers d'instructions que Hermes charge lorsque le travail le nécessite."
+      },
+      messaging: {
+        title: 'Hermes loin de votre bureau',
+        text: 'Connectez Telegram, Discord, Slack et plus encore : même agent, même mémoire.'
+      },
+      artifacts: {
+        title: 'Tout ce que Hermes a créé',
+        text: 'Images, fichiers et liens de chaque session, indexés au même endroit.'
+      },
+      cron: {
+        title: "Du travail qui s'exécute tout seul",
+        text: 'Planifiez une invite toutes les heures, chaque nuit ou avec une expression cron.'
+      },
+      'command-palette': {
+        title: 'Une seule zone pour tout faire',
+        text: 'Sessions, paramètres, compétences et commandes sont accessibles depuis la palette.'
+      },
+      profiles: {
+        title: 'Les profils sont séparés',
+        text: 'Chacun possède son propre Hermes, avec ses clés, sa mémoire et ses sessions.'
+      },
+      'composer-mentions': {
+        title: 'Joindre et commander',
+        text: 'Saisissez @ pour joindre un fichier à la conversation, ou / pour exécuter une commande.'
+      },
+      'local-setup': {
+        title: 'Cette machine peut exécuter des modèles en local',
+        text: 'Votre matériel peut servir un modèle local. Les conversations restent sur votre ordinateur et ne coûtent rien.',
+        action: 'Configurer'
+      },
+      'right-pane': {
+        title: 'Le volet de travail',
+        text: "Les fichiers, le terminal, la revue et le navigateur intégré partagent le côté droit de l'application."
+      }
     }
   },
 
