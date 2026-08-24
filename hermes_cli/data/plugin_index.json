@@ -70,7 +70,7 @@
       "author": "Kame696",
       "tags": ["api", "rate-limiting", "reliability", "keys", "rotation"],
       "repo": "Kame696/kame-api-rotation-for-hermes",
-      "ref": "70abb1baf472e3c209fa0d5abee94c29052a0923",
+      "ref": "f4e22346b262c2c8354b250177d9cefe1015824e",
       "subdir": "hermes-kame-api-rotation",
       "homepage": "https://github.com/Kame696/kame-api-rotation-for-hermes",
       "capabilities": ["commands", "dashboard"],
