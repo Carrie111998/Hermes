@@ -266,6 +266,11 @@ import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
+import {
+  createStartupServiceLedger,
+  LOCAL_PRIMARY_BACKEND_SERVICE,
+  REMOTE_PRIMARY_BACKEND_SERVICE
+} from './startup-service-gate'
 import { createStreamThrottle } from './stream-throttle'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
@@ -1337,6 +1342,13 @@ let desktopLogFlushTimer = null
 let desktopLogFlushPromise = Promise.resolve()
 let nativeThemeListenerInstalled = false
 
+// What the primary backend's OWN authoritative probes observed this boot (port
+// announcement, the /api/health ladder, dashboard-token adoption, the WebSocket
+// session-token handshake). The renderer's startup-service gate reads these
+// records off the boot-progress payload instead of re-running the same checks
+// against the same endpoints — main stays the single owner of those probes.
+const startupServiceLedger = createStartupServiceLedger()
+
 let bootProgressState = {
   error: null,
   fakeMode: BOOT_FAKE_MODE,
@@ -1345,6 +1357,7 @@ let bootProgressState = {
   progress: 0,
   retryable: false,
   running: false,
+  startupServices: startupServiceLedger.rows(),
   timestamp: Date.now()
 }
 
@@ -1916,6 +1929,9 @@ function updateBootProgress(update, options: { allowDecrease?: boolean } = {}) {
       update.retryable === undefined
         ? update.error === undefined && Boolean(bootProgressState.retryable)
         : Boolean(update.retryable),
+    // Always the live ledger, never whatever the caller passed: these rows are
+    // main's own probe evidence and must not be forgeable through an update.
+    startupServices: startupServiceLedger.rows(),
     timestamp: Date.now()
   }
 
@@ -10339,6 +10355,12 @@ async function startHermes() {
 
   const connectionAttempt = backendConnectionState.startAttempt()
 
+  // A new attempt invalidates the previous attempt's probe evidence. Without
+  // this, a stale `ready` row would let the renderer's gate accept a backend
+  // this attempt has not actually brought up (and a stale `failed` row would
+  // out-live a successful repair).
+  startupServiceLedger.clear()
+
   // Classify this boot BEFORE the throwing resolve/mint runs: a remote failure
   // must NOT latch (it's transient — see shouldLatchBackendStartFailure), while
   // a local failure latches to break install-restart loops.
@@ -10361,6 +10383,15 @@ async function startHermes() {
       if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
         throw new Error('Hermes backend start was superseded by a newer connection attempt.')
       }
+
+      startupServiceLedger.record({
+        detail: null,
+        id: REMOTE_PRIMARY_BACKEND_SERVICE,
+        label: 'Remote Hermes gateway',
+        owner: 'main:startHermes',
+        status: 'ready',
+        via: `${remote.baseUrl}/api/health readiness ladder`
+      })
 
       updateBootProgress({
         phase: 'backend.ready',
@@ -10590,6 +10621,15 @@ async function startHermes() {
       )
     }
 
+    startupServiceLedger.record({
+      detail: null,
+      id: LOCAL_PRIMARY_BACKEND_SERVICE,
+      label: 'Local Hermes backend',
+      owner: 'main:startHermes',
+      status: 'ready',
+      via: `${baseUrl}/api/health ladder + /api/ws session-token probe`
+    })
+
     updateBootProgress({
       phase: 'backend.ready',
       message: 'Hermes backend is ready. Finalizing desktop startup',
@@ -10644,6 +10684,18 @@ async function startHermes() {
     if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
       remoteReauthFailure = error instanceof Error ? error : new Error(message)
     }
+
+    // Record the failure against the row this mode actually requires, so the
+    // renderer's gate names the failed service instead of reporting a generic
+    // "backend didn't start".
+    startupServiceLedger.record({
+      detail: message,
+      id: attemptedRemote ? REMOTE_PRIMARY_BACKEND_SERVICE : LOCAL_PRIMARY_BACKEND_SERVICE,
+      label: attemptedRemote ? 'Remote Hermes gateway' : 'Local Hermes backend',
+      owner: 'main:startHermes',
+      status: 'failed',
+      via: 'main:startHermes'
+    })
 
     updateBootProgress(
       {

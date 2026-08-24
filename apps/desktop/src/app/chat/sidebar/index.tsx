@@ -283,6 +283,7 @@ function searchResultToSession(result: SessionSearchResult): SessionInfo {
     model: result.model ?? null,
     output_tokens: 0,
     preview: stripFtsMarkers(result.snippet ?? '').trim() || null,
+    profile: result.profile,
     source: result.source ?? null,
     started_at: ts,
     title: null,
@@ -566,10 +567,10 @@ export function ChatSidebar({
     () =>
       resolvePinnedSessions(pinnedSessionIds, sessionByAnyId, [
         ...visibleSessions,
-        ...cronSessions,
-        ...messagingSessions
+        ...visibleCronSessions,
+        ...visibleMessagingSessions
       ]),
-    [pinnedSessionIds, sessionByAnyId, visibleSessions, cronSessions, messagingSessions]
+    [pinnedSessionIds, sessionByAnyId, visibleSessions, visibleCronSessions, visibleMessagingSessions]
   )
 
   // Every id a pin is reachable under: the raw stored ids, plus BOTH identities
@@ -607,8 +608,11 @@ export function ChatSidebar({
   // anything the active filters exclude, so filtering works the same whether
   // you're looking at the flat list or the lanes.
   const isHiddenFromProjects = useCallback(
-    (session: SessionInfo) => isPinnedSession(session) || (filtersNarrow && !sessionMatchesFilters(session)),
-    [isPinnedSession, filtersNarrow, sessionMatchesFilters]
+    (session: SessionInfo) =>
+      (profileScope !== ALL_PROFILES && normalizeProfileKey(session.profile) !== normalizeProfileKey(profileScope)) ||
+      isPinnedSession(session) ||
+      (filtersNarrow && !sessionMatchesFilters(session)),
+    [profileScope, isPinnedSession, filtersNarrow, sessionMatchesFilters]
   )
 
   // Full-text search across *all* sessions (not just the loaded page) so 699
@@ -624,10 +628,15 @@ export function ChatSidebar({
 
     let cancelled = false
 
+    // A scope transition must not keep painting the previous profile's FTS
+    // response while the new authoritative request is in flight.
+    setServerMatches([])
     setSearchPending(true)
 
     const id = window.setTimeout(() => {
-      void searchSessions(trimmedQuery)
+      const searchProfile = sidebarProfileForScope(profileScope)
+
+      void searchSessions(trimmedQuery, searchProfile)
         .then(res => {
           if (!cancelled) {
             setServerMatches(res.results)
@@ -645,7 +654,7 @@ export function ChatSidebar({
       cancelled = true
       window.clearTimeout(id)
     }
-  }, [trimmedQuery])
+  }, [trimmedQuery, profileScope])
 
   const searchResults = useMemo(() => {
     if (!trimmedQuery) {
@@ -653,24 +662,34 @@ export function ChatSidebar({
     }
 
     const out = new Map<string, SessionInfo>()
+    const searchScope = sidebarProfileForScope(profileScope)
+    const keyFor = (profile: null | string | undefined, id: string) => `${normalizeProfileKey(profile)}/${id}`
 
     for (const s of sortedSessions) {
       if (sessionMatchesSearch(s, trimmedQuery)) {
-        out.set(s.id, s)
+        out.set(keyFor(s.profile, s.id), s)
       }
     }
 
     for (const match of serverMatches) {
-      if (out.has(match.session_id)) {
+      if (searchScope !== 'all' && normalizeProfileKey(match.profile) !== normalizeProfileKey(searchScope)) {
         continue
       }
 
-      const loaded = sessionByAnyId.get(match.session_id)
-      out.set(match.session_id, loaded ?? searchResultToSession(match))
+      const key = keyFor(match.profile, match.session_id)
+
+      if (out.has(key)) {
+        continue
+      }
+
+      const loaded = [...sortedSessions, ...visibleCronSessions, ...visibleMessagingSessions].find(
+        session => normalizeProfileKey(session.profile) === normalizeProfileKey(match.profile) && session.id === match.session_id
+      )
+      out.set(key, loaded ?? searchResultToSession(match))
     }
 
     return [...out.values()]
-  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
+  }, [trimmedQuery, sortedSessions, serverMatches, profileScope, visibleCronSessions, visibleMessagingSessions])
 
   const unpinnedAgentSessions = useMemo(
     () => sortedSessions.filter(s => !isPinnedSession(s)),
