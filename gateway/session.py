@@ -28,6 +28,12 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _gateway_session_cwd() -> str:
+    """Return the workspace persisted for gateway-created session rows."""
+    configured = (os.environ.get("TERMINAL_CWD") or "").strip()
+    return os.path.expanduser(configured) if configured else str(Path.home())
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -2318,6 +2324,7 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
+                cwd=_gateway_session_cwd(),
                 display_name=display_name or source.chat_name,
                 origin_json=origin_json,
                 include_compression_ancestors=include_compression_ancestors,
@@ -2932,6 +2939,7 @@ class SessionStore:
                     "chat_id": source.chat_id,
                     "chat_type": source.chat_type,
                     "thread_id": source.thread_id,
+                    "cwd": _gateway_session_cwd(),
                     "profile_name": source.profile,
                     # Identity lands atomically in the INSERT (#82616): a
                     # crash after this write can no longer strand the row
@@ -3444,6 +3452,7 @@ class SessionStore:
                 "chat_id": old_entry.origin.chat_id if old_entry.origin else None,
                 "chat_type": old_entry.origin.chat_type if old_entry.origin else None,
                 "thread_id": old_entry.origin.thread_id if old_entry.origin else None,
+                "cwd": _gateway_session_cwd(),
                 "profile_name": old_entry.origin.profile if old_entry.origin else None,
                 # Identity + lineage land atomically in the INSERT (#82616,
                 # #12857) — see the get_or_create twin path.

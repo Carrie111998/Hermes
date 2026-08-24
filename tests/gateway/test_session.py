@@ -433,6 +433,64 @@ class TestSessionStoreRewriteTranscript:
         assert reloaded[1]["content"] == "hi"
 
 
+class TestGatewaySessionCwdPersistence:
+    @pytest.fixture()
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        return SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+
+    @staticmethod
+    def _source():
+        return SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+        )
+
+    def test_new_gateway_session_records_configured_terminal_cwd(
+        self, store, tmp_path, monkeypatch
+    ):
+        configured_cwd = tmp_path / "workspace"
+        monkeypatch.setenv("TERMINAL_CWD", str(configured_cwd))
+
+        entry = store.get_or_create_session(self._source())
+
+        assert store._db.get_session(entry.session_id)["cwd"] == str(configured_cwd)
+
+    def test_new_gateway_session_falls_back_to_home(self, store, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.setattr("gateway.session.Path.home", lambda: home)
+
+        entry = store.get_or_create_session(self._source())
+
+        assert store._db.get_session(entry.session_id)["cwd"] == str(home)
+
+    def test_peer_refresh_heals_blank_cwd_without_overwriting_explicit_cwd(
+        self, store, tmp_path
+    ):
+        healed_cwd = str(tmp_path / "workspace")
+        db = store._db
+        db.create_session("blank", source="slack", session_key="blank-key", cwd="")
+        db.create_session(
+            "explicit", source="slack", session_key="explicit-key", cwd="/original"
+        )
+
+        for session_id, session_key in (("blank", "blank-key"), ("explicit", "explicit-key")):
+            db.record_gateway_session_peer(
+                session_id,
+                source="slack",
+                session_key=session_key,
+                cwd=healed_cwd,
+            )
+
+        assert db.get_session("blank")["cwd"] == healed_cwd
+        assert db.get_session("explicit")["cwd"] == "/original"
+
+
 class TestLoadTranscriptDBOnly:
     """After spec 002, load_transcript reads only from state.db."""
 
