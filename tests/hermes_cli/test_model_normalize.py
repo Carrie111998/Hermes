@@ -187,3 +187,47 @@ class TestIssue78796NvidiaPrefixRepair:
             == "anthropic/claude-sonnet-4.6"
         )
 
+
+class TestForeignVendorSlugStrippedOnNativeProviders:
+    """An aggregator-namespaced id must lose its vendor slug on a native
+    provider (#93980): `glm-5.2` becomes `z-ai/glm-5.2` for OpenRouter, and
+    switching the provider hands the prefixed form to ollama-cloud, which
+    only serves the bare id — HTTP 404 otherwise, auto-pausing the goal
+    judge with a misleading config message."""
+
+    def test_zai_prefix_stripped_for_ollama_cloud(self):
+        assert (
+            normalize_model_for_provider("z-ai/glm-5.2", "ollama-cloud")
+            == "glm-5.2"
+        )
+
+    def test_foreign_prefix_stripped_for_matching_strip_providers(self):
+        assert normalize_model_for_provider("openai/gpt-5.4", "zai") == "gpt-5.4"
+        assert (
+            normalize_model_for_provider("anthropic/claude-sonnet-4.6", "gemini")
+            == "claude-sonnet-4.6"
+        )
+
+    def test_bare_and_matching_forms_unchanged(self):
+        assert normalize_model_for_provider("glm-5.2", "ollama-cloud") == "glm-5.2"
+        assert (
+            normalize_model_for_provider("ollama-cloud/glm-5.2", "ollama-cloud")
+            == "glm-5.2"
+        )
+
+    def test_non_vendor_prefix_passes_through(self):
+        # A proxy-required routing prefix is not a vendor slug — it must
+        # survive (LiteLLM `ollama/glm-5.2` on a custom endpoint).
+        assert (
+            normalize_model_for_provider("ollama/glm-5.2", "custom")
+            == "ollama/glm-5.2"
+        )
+
+    def test_aggregator_still_namespaces_bare_glm(self):
+        # The OpenRouter direction is untouched: bare glm still gains the
+        # z-ai/ prefix for the aggregator.
+        assert (
+            normalize_model_for_provider("glm-5.2", "openrouter")
+            == "z-ai/glm-5.2"
+        )
+

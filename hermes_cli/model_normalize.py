@@ -73,6 +73,12 @@ _AGGREGATOR_PROVIDERS: frozenset[str] = frozenset({
     "kilocode",
 })
 
+# Vendor slugs the aggregator namespacing can stamp onto a model id (the
+# values of _VENDOR_PREFIXES, e.g. the `z-ai` of `z-ai/glm-5.2`). On a
+# native provider such a prefix is never a legal model name — only the bare
+# id is served — so _MATCHING_PREFIX_STRIP_PROVIDERS strips it (#93980).
+_KNOWN_VENDOR_SLUGS: frozenset[str] = frozenset(set(_VENDOR_PREFIXES.values()))
+
 # Providers that want bare names with dots replaced by hyphens.
 _DOT_TO_HYPHEN_PROVIDERS: frozenset[str] = frozenset({
     "anthropic",
@@ -559,6 +565,20 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     # --- Direct providers: repair matching provider prefixes only ---
     if provider in _MATCHING_PREFIX_STRIP_PROVIDERS:
         result = _strip_matching_provider_prefix(name, provider)
+        # A foreign vendor slug can also arrive here: `glm-5.2` gains the
+        # `z-ai/` prefix when normalized for an aggregator (OpenRouter
+        # namespacing), and switching the provider later hands the
+        # prefixed form to a native API that only serves the bare id —
+        # ollama.com answers `z-ai/glm-5.2` with HTTP 404 (#93980).
+        # Strip the prefix only when it is a known vendor slug; other
+        # slash-bearing names keep passing through untouched, so a
+        # proxy-required routing prefix (e.g. LiteLLM's `ollama/glm-5.2`
+        # on a custom endpoint — see _strip_matching_provider_prefix)
+        # is never mangled.
+        if "/" in result:
+            _prefix, _bare = result.split("/", 1)
+            if _bare.strip() and _prefix.strip().lower() in _KNOWN_VENDOR_SLUGS:
+                result = _bare.strip()
         # Some providers require lowercase model IDs (e.g. Xiaomi's API
         # rejects "MiMo-V2.5-Pro" but accepts "mimo-v2.5-pro").
         if provider in _LOWERCASE_MODEL_PROVIDERS:
