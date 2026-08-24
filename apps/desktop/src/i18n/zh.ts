@@ -101,6 +101,8 @@ export const zh: Translations = {
       ipcBridgeTitle: '桌面 IPC 桥接不可用',
       ipcBridgeDescription: '桌面 IPC 桥接加载失败——通常是因为中断的更新导致应用包损坏。请重启 Hermes；若仍失败，请修复安装。',
       ipcBridgeHint: '重启 Hermes（重试会重新加载窗口）。若桥接仍不可用，请在终端中修复安装：运行 hermes desktop --force-build，或重新运行 hermes update。',
+      rpcProbeFailedHint: '安装可能因更新中断而损坏——请在终端中修复：运行 hermes desktop --force-build，或重新运行 hermes update。',
+      rpcProbeUnavailableHint: '当前运行时无法打开 WebSocket 以验证后端。请重启 Hermes；若问题持续，说明运行时缺少 WebSocket 支持。',
       remoteSignInHint: signInLabel =>
         `先退出已保存的远程浏览器会话，然后打开${signInLabel}。也可以使用本地网关切换到随应用提供的后端。`,
       signOutAndSignIn: '退出并重新登录',

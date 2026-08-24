@@ -144,6 +144,19 @@ export function primaryRuntimeConnectionId(connection: Pick<HermesConnection, 'c
 // so the first dead boot re-arms once via reload; a second consecutive dead
 // boot is terminal and surfaces the ipc-bridge failure kind. The key is
 // cleared as soon as any boot runs with the bridge present.
+//
+// Ledger scoping: `localStorage` is shared per-origin, so every renderer
+// window reads the SAME key — two windows booting concurrently against a
+// dead bridge share this ledger, and the second one can observe the first's
+// spent re-arm and go straight to the terminal failure without spending a
+// reload of its own. That is deliberate rather than a race to fix: the
+// desktop boots a single window (helper windows only open after the primary
+// boot has a live bridge), both windows run the same bundle/preload against
+// the same backend, and the terminal overlay's Retry IS a plain reload — so
+// a window that lands terminal still has a one-click path to the re-arm. We
+// deliberately keep the ledger in localStorage (not sessionStorage or a
+// per-window key) so it survives app restarts: a persistently torn bundle
+// must not be made to waste a reload on every launch.
 export const IPC_BRIDGE_RELOAD_ATTEMPT_KEY = 'hermes.desktop.ipc-bridge-reload-attempt'
 
 interface GatewayBootOptions {

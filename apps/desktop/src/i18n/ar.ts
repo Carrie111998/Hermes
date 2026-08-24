@@ -122,6 +122,10 @@ export const ar = defineLocale({
         'فشل تحميل جسر IPC لسطح المكتب — عادةً ما تكون حزمة التطبيق تالفة بسبب تحديث متقطع. أعد تشغيل Hermes؛ وإن استمر ذلك، فأصلح التثبيت.',
       ipcBridgeHint:
         'أعد تشغيل Hermes (إعادة المحاولة تعيد تحميل النافذة). إذا ظل الجسر غير متاح، فأصلح التثبيت من الطرفية: شغّل hermes desktop --force-build أو أعد تشغيل hermes update.',
+      rpcProbeFailedHint:
+        'قد يكون التثبيت تالفًا بسبب تحديث متقطع — أصلحه من الطرفية: شغّل hermes desktop --force-build أو أعد تشغيل hermes update.',
+      rpcProbeUnavailableHint:
+        'لا يمكن لبيئة التشغيل هذه فتح WebSocket للتحقق من الخادم الخلفي. أعد تشغيل Hermes؛ إذا استمرت المشكلة، فإن بيئة التشغيل تفتقر إلى دعم WebSocket.',
       remoteSignInHint: signInLabel =>
         `يسجّل الخروج من جلسة المتصفح البعيدة المحفوظة، ثم يفتح ${signInLabel}. استخدم البوابة المحلية للتبديل إلى الخلفية المضمنة.`,
       signOutAndSignIn: 'تسجيل الخروج وإعادة تسجيل الدخول',

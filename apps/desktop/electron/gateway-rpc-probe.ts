@@ -41,6 +41,12 @@ export interface GatewayRpcProbeOptions {
 interface ProbeResult {
   ok: boolean
   reason?: string
+  /**
+   * Machine-readable failure class. `websocket-unavailable` marks a
+   * CAPABILITY problem (the runtime has no WebSocket constructor), which must
+   * never be reported as a torn install — see rpcProbeBootError().
+   */
+  code?: 'websocket-unavailable'
 }
 
 /**
@@ -58,6 +64,7 @@ function probeGatewayRpc(wsUrl: string, options: GatewayRpcProbeOptions = {}): P
   if (typeof WebSocketImpl !== 'function') {
     return Promise.resolve({
       ok: false,
+      code: 'websocket-unavailable',
       reason: 'WebSocket is not available in this runtime.'
     })
   }
@@ -232,4 +239,54 @@ function addListener(socket: any, type: string, handler: (event: any) => void) {
   }
 }
 
-export { DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_REPLY_TIMEOUT_MS, PROBE_REQUEST_ID, probeGatewayRpc }
+// Stable failure codes attached to the boot error (and carried to the
+// renderer as DesktopBootProgress.errorCode, see src/global.d.ts) so the
+// recovery overlay can key on the code instead of string-matching the
+// message — the same structured-classification pattern as
+// isCloudBackendDown (#85335).
+export const RPC_PROBE_FAILED_ERROR_CODE = 'gateway.rpc-probe-failed'
+export const RPC_PROBE_UNAVAILABLE_ERROR_CODE = 'gateway.rpc-unavailable'
+
+// SINGLE SOURCE for the repair guidance both local boot paths surface when
+// the backend is reachable but its JSON-RPC dispatcher never answered
+// (#92927: an interrupted `hermes update` can leave the dispatcher dead while
+// HTTP/WS readiness still passes). Both call sites in main.ts build their
+// boot error through rpcProbeBootError() so this copy cannot drift between
+// the pool-spawn boot and the primary boot.
+const TORN_INSTALL_REPAIR_GUIDANCE =
+  'The install may be broken by an interrupted update — repair with: hermes desktop --force-build, or re-run: hermes update'
+
+/**
+ * Build the boot error for a failed gateway RPC probe. One message shape for
+ * every failure (reachable backend, dead dispatcher), except the
+ * `websocket-unavailable` case: a missing WebSocket constructor is a
+ * CAPABILITY problem, not a torn install, so it gets a distinct message and
+ * a distinct stable code — no `hermes update` advice for a problem the
+ * updater cannot fix.
+ */
+export function rpcProbeBootError(backendLabel: string, probe: ProbeResult): Error & { code: string } {
+  if (probe.code === 'websocket-unavailable') {
+    const error = new Error(
+      `${backendLabel} is reachable but this runtime cannot open a WebSocket to verify its JSON-RPC gateway (${probe.reason ?? 'WebSocket is not available in this runtime.'}).`
+    ) as Error & { code: string }
+    error.code = RPC_PROBE_UNAVAILABLE_ERROR_CODE
+
+    return error
+  }
+
+  const error = new Error(
+    `${backendLabel} is reachable but its JSON-RPC gateway did not answer (${probe.reason ?? 'no reply received'}). ` +
+      TORN_INSTALL_REPAIR_GUIDANCE
+  ) as Error & { code: string }
+  error.code = RPC_PROBE_FAILED_ERROR_CODE
+
+  return error
+}
+
+export {
+  DEFAULT_CONNECT_TIMEOUT_MS,
+  DEFAULT_REPLY_TIMEOUT_MS,
+  PROBE_REQUEST_ID,
+  probeGatewayRpc,
+  type ProbeResult
+}

@@ -259,6 +259,16 @@ export function BootFailureOverlay() {
   // that works bridgeless) and say what actually repairs the install.
   const ipcBridgeDown = boot.errorKind === 'ipc-bridge'
 
+  // A reachable backend whose JSON-RPC dispatcher never answered (#92927) —
+  // or a runtime that cannot open the verifying WebSocket. main classifies
+  // these and attaches a stable code (see DesktopBootProgress.errorCode), so
+  // the overlay keys on the code instead of string-matching the message —
+  // the same pattern as isCloudBackendDown. Both are local failures: the
+  // full local recovery set stays, only the hint carries the specific
+  // localized guidance.
+  const rpcProbeFailed = boot.errorCode === 'gateway.rpc-probe-failed'
+  const rpcProbeUnavailable = boot.errorCode === 'gateway.rpc-unavailable'
+
   if (ipcBridgeDown) {
     actions = [retryAction]
     hint = copy.ipcBridgeHint
@@ -318,7 +328,7 @@ export function BootFailureOverlay() {
       },
       { ...settingsAction, variant: 'ghost' }
     ]
-    hint = copy.repairHint
+    hint = rpcProbeFailed ? copy.rpcProbeFailedHint : rpcProbeUnavailable ? copy.rpcProbeUnavailableHint : copy.repairHint
   }
 
   if (view === 'connect') {

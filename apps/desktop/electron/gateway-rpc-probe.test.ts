@@ -13,9 +13,14 @@
 
 import assert from 'node:assert/strict'
 
-import { test } from 'vitest'
+import { describe, test } from 'vitest'
 
-import { probeGatewayRpc } from './gateway-rpc-probe'
+import {
+  probeGatewayRpc,
+  rpcProbeBootError,
+  RPC_PROBE_FAILED_ERROR_CODE,
+  RPC_PROBE_UNAVAILABLE_ERROR_CODE
+} from './gateway-rpc-probe'
 
 // Minimal WebSocket double: records listeners synchronously and exposes emit()
 // plus a sent-frames log so tests can replay the server's side.
@@ -205,8 +210,51 @@ test('probe fails gracefully when the constructor throws', async () => {
   assert.match(result.reason, /boom/)
 })
 
-test('probe fails when WebSocket is unavailable in the runtime', async () => {
+test('probe fails with a distinct code when WebSocket is unavailable in the runtime', async () => {
   const result = await probeGatewayRpc('ws://host/api/ws?token=t', {})
   assert.equal(result.ok, false)
   assert.match(result.reason, /not available/)
+  // The call sites must be able to tell a CAPABILITY problem from a torn
+  // install — the unavailable case never gets the `hermes update` advice.
+  assert.equal(result.code, 'websocket-unavailable')
+})
+
+describe('rpcProbeBootError (#92927 review: distinct capability message, single-source copy)', () => {
+  test('a missing WebSocket is a capability message with its own code — never torn-install repair advice', () => {
+    const error = rpcProbeBootError('Local Hermes backend', {
+      ok: false,
+      code: 'websocket-unavailable',
+      reason: 'WebSocket is not available in this runtime.'
+    })
+
+    assert.equal(error.code, RPC_PROBE_UNAVAILABLE_ERROR_CODE)
+    assert.match(error.message, /cannot open a WebSocket/)
+    assert.ok(!error.message.includes('interrupted update'))
+    assert.ok(!error.message.includes('force-build'))
+    assert.ok(!error.message.includes('hermes update'))
+  })
+
+  test('a dead dispatcher carries the shared torn-install guidance with the stable failed code', () => {
+    const error = rpcProbeBootError('Hermes backend for profile "default"', {
+      ok: false,
+      reason: 'Timed out after 8000ms waiting for a JSON-RPC reply to "session.list".'
+    })
+
+    assert.equal(error.code, RPC_PROBE_FAILED_ERROR_CODE)
+    assert.match(error.message, /profile "default"/)
+    assert.match(error.message, /JSON-RPC gateway did not answer/)
+    assert.match(error.message, /interrupted update/)
+    assert.match(error.message, /hermes desktop --force-build/)
+  })
+
+  test('both backend labels build byte-identical guidance from the single constant', () => {
+    const pool = rpcProbeBootError('Hermes backend for profile "work"', { ok: false, reason: 'x' })
+    const primary = rpcProbeBootError('Local Hermes backend', { ok: false, reason: 'x' })
+
+    const guidanceOf = (error: Error) =>
+      error.message.slice(error.message.indexOf('The install may be broken'))
+
+    assert.equal(guidanceOf(pool), guidanceOf(primary))
+    assert.match(guidanceOf(pool), /^The install may be broken by an interrupted update/)
+  })
 })

@@ -210,4 +210,59 @@ describe('BootFailureOverlay', () => {
     expect(screen.queryByRole('button', { name: /gateway settings/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /open logs/i })).toBeNull()
   })
+
+  it('rpc-probe failure (#92927): keys the torn-install hint on the stable errorCode', () => {
+    $desktopBoot.set({
+      error: 'Local Hermes backend is reachable but its JSON-RPC gateway did not answer (Timed out after 8000ms waiting for a JSON-RPC reply to "session.list".).',
+      errorCode: 'gateway.rpc-probe-failed',
+      fakeMode: false,
+      message: 'boot failed',
+      phase: 'renderer.error',
+      progress: 40,
+      running: false,
+      timestamp: Date.now(),
+      visible: true
+    })
+
+    render(<BootFailureOverlay />)
+
+    // The localized torn-install guidance replaces the generic repair hint,
+    // keyed on the stable code (not string-matching the message).
+    expect(screen.getByText(/repair it from a terminal/i)).toBeTruthy()
+    expect(screen.getByText(/hermes desktop --force-build/i)).toBeTruthy()
+    // The bridge is alive here, so the full local recovery set stays.
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /repair install/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /gateway settings/i })).toBeTruthy()
+  })
+
+  it('rpc-probe unavailable (#92927): keys the capability hint on the stable errorCode', () => {
+    $desktopBoot.set({
+      error: 'Local Hermes backend is reachable but this runtime cannot open a WebSocket to verify its JSON-RPC gateway.',
+      errorCode: 'gateway.rpc-unavailable',
+      fakeMode: false,
+      message: 'boot failed',
+      phase: 'renderer.error',
+      progress: 40,
+      running: false,
+      timestamp: Date.now(),
+      visible: true
+    })
+
+    render(<BootFailureOverlay />)
+
+    // A capability problem, not a broken install: the hint says so, and the
+    // torn-install repair commands must NOT appear.
+    expect(screen.getByText(/missing WebSocket support/i)).toBeTruthy()
+    expect(screen.queryByText(/hermes desktop --force-build/i)).toBeNull()
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+  })
+
+  it('a generic local failure without an errorCode keeps the generic repair hint', () => {
+    render(<BootFailureOverlay />)
+
+    expect(screen.getByText(/re-runs the installer/i)).toBeTruthy()
+    expect(screen.queryByText(/repair it from a terminal/i)).toBeNull()
+    expect(screen.queryByText(/missing WebSocket support/i)).toBeNull()
+  })
 })

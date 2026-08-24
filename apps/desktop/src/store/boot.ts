@@ -45,10 +45,16 @@ export function applyDesktopBootProgress(progress: DesktopBootProgress) {
   // boot failure — failDesktopBoot is terminal for this boot cycle.
   const error = progress.error ?? (current.running ? null : current.error)
 
+  // The stable main-process failure code (see DesktopBootProgress.errorCode)
+  // latches exactly like `error`: cleared by progress updates while running,
+  // preserved after a terminal failure so the overlay keeps its guidance.
+  const errorCode = progress.errorCode ?? (current.running ? null : current.errorCode)
+
   $desktopBoot.set({
     ...current,
     ...progress,
     error,
+    errorCode,
     progress: mergedProgress,
     visible: progress.running || mergedProgress < 100 || Boolean(error)
   })
@@ -87,6 +93,8 @@ export function resumeDesktopBootForRetry(message: string) {
   $desktopBoot.set({
     ...current,
     error: null,
+    // Lifting the error for the bounded retry lifts its code too.
+    errorCode: undefined,
     errorKind: undefined,
     message,
     phase: 'renderer.boot.retry',
@@ -101,6 +109,8 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
   $desktopBoot.set({
     ...current,
     error: null,
+    // The failure code latches with `error`; a completed boot clears both.
+    errorCode: undefined,
     errorKind: undefined,
     message,
     phase: 'renderer.ready',
@@ -116,6 +126,9 @@ export function failDesktopBoot(message: string, errorKind?: DesktopBootState['e
   $desktopBoot.set({
     ...current,
     error: message,
+    // A renderer-side failure has no main-process code; drop any stale one so
+    // the overlay can't key a new failure on an old classification.
+    errorCode: undefined,
     errorKind,
     message: translateNow('boot.desktopBootFailedWithMessage', message),
     phase: 'renderer.error',

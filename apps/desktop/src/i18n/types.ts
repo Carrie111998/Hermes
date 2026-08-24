@@ -146,6 +146,8 @@ export interface Translations {
       ipcBridgeTitle: string
       ipcBridgeDescription: string
       ipcBridgeHint: string
+      rpcProbeFailedHint: string
+      rpcProbeUnavailableHint: string
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
       remoteFailureHint: string
