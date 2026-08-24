@@ -138,7 +138,8 @@ class ClaudeMirrorFloatWorker:
     record exists. This worker, for every visible mirror:
 
     - writes a registry record if none references the mirror's Claude UUID
-      (idempotent; the desktop picks new records up on its next launch), and
+      (idempotent; the desktop discovers new records live, within minutes,
+      no relaunch required), and
     - floats both the transcript file mtime (CLI resume picker ordering) and
       the record's ``lastActivityAt`` (desktop sidebar ordering) to the
       source session's ``last_active``.
@@ -147,6 +148,12 @@ class ClaudeMirrorFloatWorker:
     idempotent; the minimum interval bounds write churn for continuously
     active sources. Only marker-owned visibility mirrors are ever touched,
     and every per-mirror failure is contained as a skip.
+
+    ``isArchived`` is honored at CREATION time only: the desktop app
+    snapshots it into its own index when it first discovers the file and
+    ignores later edits to the JSON, even across app restarts (verified
+    2026-08-23). Get the flag right in the record this worker writes; a
+    post-hoc file edit cannot change the app's view.
     """
 
     def __init__(
