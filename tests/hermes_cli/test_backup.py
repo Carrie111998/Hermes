@@ -146,6 +146,22 @@ class TestShouldExclude:
         # The live DB is still backed up.
         assert not _should_exclude(Path("state.db"))
 
+    def test_excludes_package_manager_caches(self):
+        """npm/bun caches land under HERMES_HOME whenever a profile's subprocess
+        HOME resolves to ``{HERMES_HOME}/home`` and the agent shells out to
+        npm/npx/bun. They're regeneratable like ``.cache``, and dwarf everything
+        else in the archive if walked."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("profiles/coder/home/.bun/install/cache/lodash@4.17.21"))
+        assert _should_exclude(Path("profiles/coder/home/.npm/_cacache/index-v5/00/ab/deadbeef"))
+        assert _should_exclude(Path("profiles/coder/home/.npm/_npx/1a2b3c/node_modules/x/index.js"))
+        # Also at the root profile, not just named ones.
+        assert _should_exclude(Path("home/.bun/install/cache/pkg"))
+        assert _should_exclude(Path("home/.npm/_cacache/tmp/x"))
+        # A skill or memory that merely mentions the tools is still backed up.
+        assert not _should_exclude(Path("skills/dev/npm-workflow/SKILL.md"))
+        assert not _should_exclude(Path("memories/bun-notes.md"))
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state

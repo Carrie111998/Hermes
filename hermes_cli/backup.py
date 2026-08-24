@@ -89,6 +89,13 @@ _EXCLUDED_DIRS = {
     "site-packages",
     # Tool / build caches — all regeneratable.
     ".cache",
+    # Package-manager caches. These land under HERMES_HOME whenever a profile's
+    # subprocess HOME resolves to ``{HERMES_HOME}/home`` (see
+    # ``terminal.home_mode``) and the agent shells out to npm/npx/bun, so they
+    # are the same class as ``.cache`` above — and by far the largest: on the
+    # host that reported this they were 82% of the archive.
+    ".bun",             # bun's install cache — refetched on demand
+    ".npm",             # npm/npx cache (_cacache, _npx) — refetched on demand
     ".tox",
     ".nox",
     ".pytest_cache",
