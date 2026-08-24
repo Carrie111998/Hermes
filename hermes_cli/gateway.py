@@ -5506,6 +5506,41 @@ def wait_for_launchd_gateway_supervision(
         time.sleep(max(poll_interval, 0.01))
 
 
+def _pid_is_descendant(pid: int | None, ancestor_pid: int | None, max_depth: int = 32) -> bool:
+    """Return True if *pid* is *ancestor_pid* or a descendant of it.
+
+    launchd supervises ``hermes_cli.stderr_timestamp`` which in turn spawns
+    the gateway (``hermes_cli.main gateway run``). The PID in the launchd
+    plist therefore differs from the gateway PID, so an equality check never
+    fires. Walking the parent chain covers the wrapper case (#94050).
+    """
+    if pid is None or ancestor_pid is None:
+        return False
+    if pid == ancestor_pid:
+        return True
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        proc = psutil.Process(pid)
+    except Exception:
+        return False
+    for _ in range(max_depth):
+        try:
+            parent = proc.parent()
+        except Exception:
+            return False
+        if parent is None:
+            return False
+        if parent.pid == ancestor_pid:
+            return True
+        if parent.pid == 1:
+            return False
+        proc = parent
+    return False
+
+
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
@@ -5533,10 +5568,11 @@ def launchd_status(deep: bool = False):
     from gateway.status import get_running_pid
     fallback_pid = get_running_pid(cleanup_stale=False)
 
-    # Avoid double-counting: when launchd IS supervising, fallback_pid and
-    # launchd_pid point at the same process (the gateway writes both the
-    # launchd PID and the Hermes PID file).
-    if launchd_pid is not None and fallback_pid == launchd_pid:
+    # Avoid double-counting: when launchd IS supervising, fallback_pid is
+    # either the same process or a child of it (stderr_timestamp wrapper
+    # spawns the gateway, so PIDs differ). Check ancestry, not just equality
+    # (#94050).
+    if launchd_pid is not None and _pid_is_descendant(fallback_pid, launchd_pid):
         fallback_pid = None
 
     # Persistent marker written when launchd bootstrap/kickstart fails with
