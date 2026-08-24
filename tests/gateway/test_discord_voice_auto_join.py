@@ -41,6 +41,13 @@ def _make_member(user_id, guild, *, name="testuser", bot=False):
 
 
 async def _connect_adapter(monkeypatch, adapter):
+    # connect() refreshes the adapter's config-derived authorization state.
+    # Preserve per-test overrides so the captured event handler is exercised
+    # against the intended auto-join policy rather than the test process config.
+    auto_join_cfg = dict(adapter._voice_auto_join_cfg)
+    allowed_user_ids = set(adapter._allowed_user_ids)
+    allowed_role_ids = set(adapter._allowed_role_ids)
+
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
@@ -61,6 +68,9 @@ async def _connect_adapter(monkeypatch, adapter):
 
     ok = await adapter.connect()
     assert ok is True
+    adapter._voice_auto_join_cfg = auto_join_cfg
+    adapter._allowed_user_ids = allowed_user_ids
+    adapter._allowed_role_ids = allowed_role_ids
     return created["bot"]
 
 
