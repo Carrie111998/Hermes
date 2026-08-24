@@ -1,8 +1,8 @@
 """Tests for the Kanban tool surface (tools/kanban_tools.py).
 
 Verifies:
-  - Tools are gated on HERMES_KANBAN_TASK: a normal chat session sees
-    zero kanban tools in its schema; a worker session sees the kanban set.
+  - Tools are available to dispatcher workers via HERMES_KANBAN_TASK and to
+    profiles that explicitly enable the kanban toolset, but not ordinary chat.
   - Each handler's happy path.
   - Error paths (missing required args, bad metadata type, etc).
 """
@@ -552,9 +552,9 @@ def test_worker_lifecycle_through_tools(worker_env):
 
 
 def test_kanban_guidance_prompt_size_bounded():
-    """KANBAN_GUIDANCE is injected into every kanban-capable process's system
-    prompt and resolved once at agent init, so its size is a per-worker token
-    tax paid on every spawn. Bound it as an invariant, not a change-detector:
+    """KANBAN_GUIDANCE is injected into each dispatcher worker's system prompt
+    and resolved once at agent init, so its size is a per-worker token tax paid
+    on every spawn. Bound it as an invariant, not a change-detector:
     the ceiling (8000 chars, roughly 2000 tokens) leaves headroom above the
     current ~6.2k chars for tight additions, while catching accidental bloat
     (pasted docs, duplicated sections) before it ships to every worker.

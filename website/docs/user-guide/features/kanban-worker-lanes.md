@@ -85,7 +85,7 @@ The dashboard renders run history with summaries, metadata blocks, and exit-stat
 
 The shape every kanban worker takes today: the assignee is a profile name, the dispatcher spawns `hermes -p <profile>`, the worker gets the `KANBAN_GUIDANCE` system-prompt block injected automatically, and uses the `kanban_*` tools to terminate the run. No setup beyond defining the profile.
 
-When you create profiles for your fleet, choose names that match the *role* you want the orchestrator to route to. The orchestrator (when there is one) discovers your profile names via `hermes profile list` — there's no fixed roster the system assumes (the orchestrator side of the contract is part of the injected `KANBAN_GUIDANCE`).
+When you create profiles for your fleet, choose names that match the *role* you want the orchestrator to route to. The orchestrator (when there is one) discovers your profile names via `hermes profile list` — there's no fixed roster the system assumes. A profile that explicitly enables the `kanban` toolset outside a dispatcher task receives the shorter `KANBAN_ORCHESTRATOR_GUIDANCE`, not the worker lifecycle contract.
 
 ### Orchestrator profile lane
 
@@ -114,4 +114,4 @@ So lane authors don't have to reimplement these:
 
 - [Kanban overview](./kanban) — the user-facing intro.
 - [Kanban tutorial](./kanban-tutorial) — walkthrough with the dashboard open.
-- [`KANBAN_GUIDANCE`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py) — the worker + orchestrator lifecycle injected into every kanban worker's system prompt.
+- [`KANBAN_GUIDANCE` and `KANBAN_ORCHESTRATOR_GUIDANCE`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py) — separate task-worker and board-orchestrator prompt contracts.

@@ -980,7 +980,79 @@ class TestBuildSystemPrompt:
         assert MEMORY_GUIDANCE not in prompt
         assert USER_PROFILE_GUIDANCE in prompt
 
+    @staticmethod
+    def _agent_with_tools(*tool_names: str) -> AIAgent:
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs(*tool_names),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            return AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
 
+    def test_kanban_worker_guidance_requires_task_and_loaded_tools(self, monkeypatch):
+        from agent.prompt_builder import (
+            KANBAN_GUIDANCE,
+            KANBAN_ORCHESTRATOR_GUIDANCE,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        prompt_without_tools = self._agent_with_tools("web_search")._build_system_prompt()
+        assert KANBAN_GUIDANCE not in prompt_without_tools
+        assert KANBAN_ORCHESTRATOR_GUIDANCE not in prompt_without_tools
+
+        agent = self._agent_with_tools(
+            "kanban_show", "kanban_complete", "kanban_block"
+        )
+        # Init-time resolution keeps prompt rebuilding cache-stable even if the
+        # process environment changes after this conversation starts.
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        prompt = agent._build_system_prompt()
+
+        assert KANBAN_GUIDANCE in prompt
+        assert KANBAN_ORCHESTRATOR_GUIDANCE not in prompt
+
+    def test_kanban_toolset_without_task_gets_orchestrator_guidance(self, monkeypatch):
+        from agent.prompt_builder import (
+            KANBAN_GUIDANCE,
+            KANBAN_ORCHESTRATOR_GUIDANCE,
+        )
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = self._agent_with_tools(
+            "kanban_list", "kanban_create", "kanban_show"
+        )
+        prompt = agent._build_system_prompt()
+
+        assert KANBAN_ORCHESTRATOR_GUIDANCE in prompt
+        assert KANBAN_GUIDANCE not in prompt
+        assert "You have been assigned ONE task" not in prompt
+        assert "kanban_show() first" not in prompt
+        assert "$HERMES_KANBAN_WORKSPACE" not in prompt
+        assert "kanban_complete" not in KANBAN_ORCHESTRATOR_GUIDANCE
+        assert "kanban_block" not in KANBAN_ORCHESTRATOR_GUIDANCE
+
+    def test_chat_without_kanban_tools_or_task_gets_no_kanban_guidance(
+        self, monkeypatch
+    ):
+        from agent.prompt_builder import (
+            KANBAN_GUIDANCE,
+            KANBAN_ORCHESTRATOR_GUIDANCE,
+        )
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        prompt = self._agent_with_tools("web_search")._build_system_prompt()
+
+        assert KANBAN_GUIDANCE not in prompt
+        assert KANBAN_ORCHESTRATOR_GUIDANCE not in prompt
 
     def test_datetime_is_date_only_not_minute_precision(self, agent):
         """Timestamp must be date-only (no HH:MM) so the system prompt

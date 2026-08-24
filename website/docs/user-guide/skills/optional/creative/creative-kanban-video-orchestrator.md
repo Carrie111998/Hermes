@@ -187,8 +187,8 @@ task graphs. See **[references/examples.md](https://github.com/NousResearch/herm
    file` toolset, the director's `SOUL.md` rules forbid it from executing
    work itself. It decomposes and routes only — every concrete task becomes
    a `hermes kanban create` call to a specialist profile. The kanban
-   orchestration guidance auto-injected into every kanban worker's system
-   prompt spells this out further.
+   orchestration guidance injected for kanban-enabled orchestrator chats
+   spells this out further.
 
 7. **Don't over-decompose.** A 30-second product video does NOT need 20 tasks.
    Aim for the smallest task graph that still parallelizes well and exposes the
