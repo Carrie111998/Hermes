@@ -231,6 +231,50 @@ class TestApplyUpdate:
             '    return result + 1'
         )
 
+    def test_rejects_unique_markdown_anchor_with_weak_middle(self):
+        """A real V4A hunk must not rewrite a weak same-boundary block."""
+        patch = """\
+*** Begin Patch
+*** Update File: tasks.md
+@@ Publish report @@
+ - [ ] Publish report
+   - Source: [pdf](https://files.test/final.pdf)
+   - Status: complete
+   - Reviewer: Bob
+   - Notes: add download
+-  <!-- task-end -->
++  - PDF: [download](https://files.test/final.pdf)
++  <!-- task-end -->
+*** End Patch"""
+        operations, err = parse_v4a_patch(patch)
+        assert err is None
+
+        original = (
+            "# Tasks\n\n"
+            "- [ ] Publish report\n"
+            "  - Source: [paper](https://example.com/source)\n"
+            "  - Status: queued\n"
+            "  - Owner: Alice\n"
+            "  - Notes: preserve metadata\n"
+            "  <!-- task-end -->\n"
+        )
+
+        class FakeFileOps:
+            written = None
+
+            def read_file_raw(self, path):
+                return SimpleNamespace(content=original, error=None)
+
+            def write_file(self, path, content, pre_content=None):
+                self.written = content
+                return SimpleNamespace(error=None)
+
+        file_ops = FakeFileOps()
+        result = apply_v4a_operations(operations, file_ops)
+
+        assert result.success is False
+        assert file_ops.written is None
+
 
 class TestAdditionOnlyHunks:
     """Regression tests for #3081 — addition-only hunks were silently dropped."""
