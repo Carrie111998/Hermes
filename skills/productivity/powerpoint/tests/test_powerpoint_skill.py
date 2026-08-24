@@ -304,6 +304,46 @@ def test_create_overflow_is_backward_compatible(workdir):
     assert "overflow" in result  # new field always present
 
 
+def test_create_single_long_wrapping_bullet_reports_overflow(workdir):
+    """A single long bullet that wraps to many visual lines must overflow.
+
+    The estimator counts word-wrap, not just paragraph count: one ~1200-char
+    bullet at 18pt wraps to ~20 visual lines, which is more than the ~16 that
+    fit inside the ~4.95\" body. Under the old per-paragraph counting this was
+    a single line and passed silently (the false-negative the reviewer
+    flagged). Regression test for that.
+    """
+    spec_path = workdir / "long.json"
+    write_json(spec_path, {"slide_size": "16:9", "slides": [
+        {"layout": "title_content", "title": "Long",
+         "bullets": ["word " * 200]}]})  # ~1200 chars, wraps to many lines
+    out = workdir / "long.pptx"
+    result = run("pptx_create.py", str(spec_path), str(out))
+    assert result["ok"]
+    assert any(entry["slide"] == 0 for entry in result["overflow"])
+
+
+def test_create_no_body_height_skips_overflow(workdir):
+    """A body placeholder with no explicit height must NOT report overflow.
+
+    A layout without an explicit body height means we can't compute available
+    space, so the slide is skipped — never flagged as guaranteed overflow.
+    Pins the skip-vs-zero decision from review point 2.
+    """
+    # Use a custom layout that has no body placeholder height, or build a
+    # spec with bullets on a slide whose body reports height=None.
+    spec_path = workdir / "noheight.json"
+    write_json(spec_path, {"slide_size": "16:9", "slides": [
+        {"layout": "title_only", "title": "No Body",
+         "bullets": ["x" * 500]}]})
+    out = workdir / "noheight.pptx"
+    result = run("pptx_create.py", str(spec_path), str(out))
+    assert result["ok"]
+    # No slide with an available height of 0 / no height should be flagged.
+    assert all(entry.get("available_inches", 0) > 0
+               for entry in result["overflow"])
+
+
 
 # ---------------------------------------------------------------------------
 # parity features: render, run-merge replace, chart ops, duplication,
