@@ -179,7 +179,7 @@ def test_hydration_bounds_and_trim():
     adapter = _make_adapter()
     for i in range(600):
         adapter._remember_outbound_snippet(str(i), f"msg {i}")
-    assert len(adapter._reaction_targets) <= 512
+    assert len(adapter._reaction_targets) == 512
     assert adapter._lookup_outbound_snippet("0") is None      # oldest evicted
     assert adapter._lookup_outbound_snippet("599") == "msg 599"
 
@@ -188,3 +188,17 @@ def test_hydration_snippet_capped_at_200_chars():
     adapter = _make_adapter()
     adapter._remember_outbound_snippet("222", "x" * 500)
     assert len(adapter._lookup_outbound_snippet("222")) == 200
+
+
+def test_hydration_reremember_refreshes_recency_and_overwrites():
+    adapter = _make_adapter()
+    adapter._remember_outbound_snippet("1", "old")
+    adapter._remember_outbound_snippet("2", "two")
+    adapter._remember_outbound_snippet("1", "new")
+    # overwrite wins
+    assert adapter._lookup_outbound_snippet("1") == "new"
+    # recency refresh: inserting up to the cap evicts "2" (older), not "1"
+    for i in range(511):
+        adapter._remember_outbound_snippet(str(1000 + i), f"m{i}")
+    assert adapter._lookup_outbound_snippet("1") == "new"
+    assert adapter._lookup_outbound_snippet("2") is None

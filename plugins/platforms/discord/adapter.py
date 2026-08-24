@@ -3372,7 +3372,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """Parse DISCORD_REACTION_TRIGGERS into (enabled, allowlist).
 
         unset/''/false-ish -> (False, None); true-ish -> (True, None) meaning ALL
-        emoji; anything else -> (True, {names}) allowlist.
+        emoji; anything else -> (True, {names}) allowlist. An allowlist string
+        that parses to zero names (e.g. ',,,') counts as disabled.
         """
         raw = str(self._gate_raw("reaction_triggers", "DISCORD_REACTION_TRIGGERS") or "").strip()
         if not raw or raw.lower() in {"false", "0", "no", "off"}:
@@ -3765,6 +3766,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
+        self._remember_outbound_snippet(message_id, kwargs.get("content"))
 
         if file is not None or files:
             attachments = getattr(starter_msg, "attachments", None) or []
@@ -4211,7 +4213,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    msg = await channel.send(content=content, files=files)
+                    self._remember_outbound_snippet(msg, content)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
@@ -5523,6 +5526,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     content=caption if caption else None,
                     file=file,
                 )
+                self._remember_outbound_snippet(msg, caption)
                 return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
@@ -5595,6 +5599,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     content=caption if caption else None,
                     file=file,
                 )
+                self._remember_outbound_snippet(msg, caption)
                 return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
