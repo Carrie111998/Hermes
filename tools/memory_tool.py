@@ -21,6 +21,8 @@ Design:
 - replace/remove use short unique substring matching (not full text or IDs)
 - Behavioral guidance lives in the tool schema description
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
+- Presentation-equivalent entries added by external editors are coalesced on the
+  next tool write; the first spelling and formatting are retained
 """
 
 import copy
@@ -78,6 +80,13 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Fuzzy scores are too noisy to drive maintenance suggestions for short facts;
+# presentation-equivalent short entries are already handled by key deduplication.
+_REVIEW_MIN_KEY_LENGTH = 24
+# Keep overlap review conservative: candidates below this score are more likely
+# to be distinct facts that merely share common memory phrasing.
+_REVIEW_SIMILARITY_THRESHOLD = 0.72
 
 
 def _duplicate_key(content: str) -> str:
@@ -569,7 +578,12 @@ class MemoryStore:
             self._set_entries(target, test_entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        message = (
+            "Entry removed: consolidated with an identical existing entry."
+            if duplicate_exists
+            else "Entry replaced."
+        )
+        return self._success_response(target, message)
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -626,10 +640,19 @@ class MemoryStore:
             left_key = _duplicate_key(left)
             for right in entries[left_index + 1:]:
                 right_key = _duplicate_key(right)
-                if min(len(left_key), len(right_key)) < 24:
+                shorter_length = min(len(left_key), len(right_key))
+                if shorter_length < _REVIEW_MIN_KEY_LENGTH:
+                    continue
+                # SequenceMatcher's matched characters cannot exceed the
+                # shorter input, so this ratio is an upper bound. Skip pairs
+                # that cannot possibly reach the reporting threshold.
+                if (
+                    2 * shorter_length
+                    < _REVIEW_SIMILARITY_THRESHOLD * (len(left_key) + len(right_key))
+                ):
                     continue
                 similarity = SequenceMatcher(None, left_key, right_key).ratio()
-                if similarity >= 0.72:
+                if similarity >= _REVIEW_SIMILARITY_THRESHOLD:
                     similar_entries.append({
                         "entries": [left, right],
                         "similarity": round(similarity, 2),
@@ -644,7 +667,6 @@ class MemoryStore:
             "entry_count": len(entries),
             "usage": f"{current:,}/{limit:,}",
             "similar_entries": similar_entries,
-            "current_entries": entries,
             "note": (
                 "Candidates are advisory only. Use one atomic operations batch to "
                 "replace/remove entries you confirm overlap; distinct facts must remain separate."
@@ -687,6 +709,7 @@ class MemoryStore:
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
             limit = self._char_limit(target)
+            consolidated_replacements = 0
 
             for i, op in enumerate(operations):
                 op = op or {}
@@ -726,6 +749,7 @@ class MemoryStore:
                         for other_index, entry in enumerate(working)
                     ):
                         working.pop(match_index)
+                        consolidated_replacements += 1
                     else:
                         working[match_index] = content
 
@@ -767,7 +791,14 @@ class MemoryStore:
             self._set_entries(target, working)
             self.save_to_disk(target)
 
-        return self._success_response(target, f"Applied {len(operations)} operation(s).")
+        message = f"Applied {len(operations)} operation(s)."
+        if consolidated_replacements:
+            noun = "entry" if consolidated_replacements == 1 else "entries"
+            message += (
+                f" Removed {consolidated_replacements} {noun} consolidated "
+                "with identical existing entries."
+            )
+        return self._success_response(target, message)
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""

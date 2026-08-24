@@ -185,6 +185,9 @@ class TestMemoryStoreReplace:
         )
 
         assert result["success"] is True
+        assert result["message"] == (
+            "Entry removed: consolidated with an identical existing entry."
+        )
         assert store.memory_entries == ["User prefers concise replies."]
 
 
@@ -368,8 +371,24 @@ class TestMemoryToolDispatcher:
         candidate = result["similar_entries"][0]
         assert candidate["entries"] == [first, second]
         assert candidate["similarity"] >= 0.72
-        assert result["current_entries"] == [first, second]
+        assert "current_entries" not in result
         assert store.memory_entries == [first, second]
+
+    def test_review_skips_pairs_that_cannot_reach_similarity_threshold(
+        self, store, monkeypatch
+    ):
+        store.add("memory", "A" * 24)
+        store.add("memory", "B" * 100)
+
+        def unexpected_matcher(*_args, **_kwargs):
+            raise AssertionError("length upper bound should skip SequenceMatcher")
+
+        monkeypatch.setattr("tools.memory_tool.SequenceMatcher", unexpected_matcher)
+
+        result = json.loads(memory_tool(action="review", target="memory", store=store))
+
+        assert result["success"] is True
+        assert result["similar_entries"] == []
 
 
 class TestMemoryBatch:
@@ -459,6 +478,7 @@ class TestMemoryBatch:
         ))
 
         assert result["success"] is True
+        assert "Removed 1 entry consolidated" in result["message"]
         assert store.memory_entries == ["User prefers concise replies."]
 
     def test_batch_injection_blocked_rejects_whole_batch(self, store):
