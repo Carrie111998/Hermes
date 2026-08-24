@@ -1,5 +1,7 @@
 """Tests for the fuzzy matching module."""
 
+from difflib import SequenceMatcher
+
 from tools.fuzzy_match import IDENTICAL_STRINGS_ERROR, fuzzy_find_and_replace
 
 
@@ -380,6 +382,35 @@ class TestEscapeDriftGuard:
         new, count, strategy, err = fuzzy_find_and_replace(content, old_string, new_string)
         assert count == 0
         assert err is not None and "Escape-drift" in err
+
+    def test_backslash_doubling_diagnosed_for_weak_block_candidate(self):
+        """A rejected weak anchor still supplies escape-drift diagnostics."""
+        content_middle = (
+            "path_a = C:\\Users\\alice\n"
+            "path_b = D:\\Temp\\cache\n"
+            "mode = production"
+        )
+        old_middle = (
+            "first = C:\\\\Users\\\\alice\n"
+            "second = D:\\\\Temp\\\\cache\n"
+            "requested = staging"
+        )
+        similarity = SequenceMatcher(None, content_middle, old_middle).ratio()
+        assert 0.50 <= similarity < 0.70
+
+        content = f"settings:\n{content_middle}\nend settings"
+        old_string = f"settings:\n{old_middle}\nend settings"
+        new_string = old_string.replace("staging", "complete")
+
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, old_string, new_string
+        )
+
+        assert count == 0
+        assert strategy is None
+        assert new == content
+        assert err is not None
+        assert "Escape-drift detected: every backslash run" in err
 
     def test_drift_allowed_when_file_genuinely_has_backslash_escapes(self):
         """If the file already contains \\' (e.g. inside an existing escaped

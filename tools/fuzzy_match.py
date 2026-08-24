@@ -259,8 +259,7 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
     # A weak block-anchor candidate is no longer safe to replace, but it can
     # still provide the matched file region needed for the more actionable
     # escape-drift diagnostic. Never apply this candidate.
-    if (("\\'" in old_string and "\\'" in new_string)
-            or ('\\"' in old_string and '\\"' in new_string)):
+    if "\\" in old_string:
         weak_matches = _strategy_block_anchor(content, old_string, threshold=0.50)
         if weak_matches:
             drift_err = _detect_escape_drift(
