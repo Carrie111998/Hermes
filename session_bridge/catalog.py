@@ -11,7 +11,7 @@ from hermes_state import SessionDB
 from tools.session_search_tool import _format_timestamp, _shape_message
 
 from .models import MirrorJobState, OriginKind, Provider, Relation
-from .store import SessionBridgeStore
+from .store import SessionBridgeStore, _dedupe_native_session_copies
 
 
 _MAX_LIMIT = 100
@@ -113,6 +113,25 @@ _BASE_COLUMNS = f"""
       ORDER BY preview.id
       LIMIT 1) AS preview
 """
+
+
+
+def _result_message_count(result: Mapping[str, Any]) -> int:
+    """How much transcript a catalog result actually carries.
+
+    Read results report the live count from ``_bounded_read``; scroll results
+    only carry the ``sessions`` row's cached column. Either is enough to tell
+    a real copy of a session from the stub the root/profile split left behind.
+    """
+
+    total = result.get("message_count")
+    if not isinstance(total, int) or isinstance(total, bool):
+        session = result.get("session")
+        total = session.get("message_count") if isinstance(session, Mapping) else None
+    try:
+        return int(total or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class UnifiedCatalog:
@@ -242,8 +261,16 @@ class UnifiedCatalog:
                 matches.append((profile, result))
         if not matches:
             raise KeyError(session_id)
-        if len(matches) != 1:
-            raise ValueError("duplicate native Hermes session identity across profiles")
+        # The root/profile split routinely materialises one session in both the
+        # root database and a profile database, and the two copies are not
+        # identical -- one side often holds the transcript while the other is a
+        # stub row. Return the copy that has the messages rather than refusing
+        # to read the session at all; the root copy still wins a tie.
+        matches = _dedupe_native_session_copies(
+            matches,
+            identity=lambda match: session_id,
+            richness=lambda match: _result_message_count(match[1]),
+        )
         return matches[0][1]
 
     def _merge_profile_results(
@@ -283,9 +310,16 @@ class UnifiedCatalog:
                     result["profile"] = profile
                     self._overlay_root_relationships([result])
                     results.append(result)
-        identities = [result["session_id"] for result in results]
-        if len(identities) != len(set(identities)):
-            raise ValueError("duplicate native Hermes session identity across profiles")
+        # Merging the root page with each profile page re-surfaces every
+        # session the root/profile split wrote twice. Raising here made
+        # session_search fail on EVERY query, because 3,190 of the 5,543
+        # sessions in profiles/main are also in the root database. Keep the
+        # copy carrying the most transcript, root-first on a tie.
+        results = _dedupe_native_session_copies(
+            results,
+            identity=lambda result: str(result["session_id"]),
+            richness=lambda result: _result_message_count(result),
+        )
         results.sort(
             key=lambda result: (
                 -float(result.get("last_active") or 0.0),

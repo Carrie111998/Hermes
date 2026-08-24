@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, TypeVar, cast
 
 if sys.platform == "win32":
     import msvcrt
@@ -712,6 +712,52 @@ def _canonical_snapshot_value(value: object) -> list[Any]:
     if isinstance(value, Sequence):
         return ["sequence", [_canonical_snapshot_value(item) for item in value]]
     raise TypeError(f"unsupported native snapshot value: {type(value).__name__}")
+
+
+_NativeCopy = TypeVar("_NativeCopy")
+
+
+def _dedupe_native_session_copies(
+    items: Sequence[_NativeCopy],
+    *,
+    identity: Callable[[_NativeCopy], str],
+    richness: Callable[[_NativeCopy], float] | None = None,
+) -> list[_NativeCopy]:
+    """Keep one copy per native Hermes session identity.
+
+    One Hermes session legitimately lives in more than one database: the
+    root/profile split writes the same session to this store's own database
+    and to a profile database. Measured 2026-08-23 on the live box, 3,190 of
+    the 5,543 sessions in ``profiles/main/state.db`` are also in the root
+    ``state.db`` -- so this is the normal shape of the catalog, not damage.
+    Every call site here used to raise ``duplicate native Hermes session
+    identity across profiles`` instead, which took the whole lane down rather
+    than one row: ``session_search`` failed on every query, ``session_get``
+    failed on all 3,202 duplicated ids, and the sidebar candidate page failed
+    above a limit of roughly 50.
+
+    First occurrence wins, and ``_native_hermes_databases()`` yields this
+    store's own database first, so the root copy is canonical on a tie. The
+    two copies are frequently NOT identical -- one side often carries the
+    transcript while the other holds a stub row -- so callers that return
+    transcript content to a reader pass ``richness`` to keep the copy that
+    actually has the messages. Callers whose result is joined back against
+    root-owned tables (worktree snapshots, blocked ids, reconciliation
+    proofs) leave ``richness`` unset and take the root copy unconditionally,
+    because a profile copy would not resolve against those joins.
+    """
+
+    chosen: dict[str, _NativeCopy] = {}
+    order: list[str] = []
+    for item in items:
+        key = identity(item)
+        current = chosen.get(key)
+        if current is None:
+            chosen[key] = item
+            order.append(key)
+        elif richness is not None and richness(item) > richness(current):
+            chosen[key] = item
+    return [chosen[key] for key in order]
 
 
 def _native_session_snapshot_identity(
@@ -4367,22 +4413,14 @@ class SessionBridgeStore:
                 )
         # One Hermes session can legitimately appear in more than one database:
         # the root/profile split writes some sessions to both this store's own
-        # database and a profile database. Keep the first occurrence --
-        # _native_hermes_databases() yields this store's own database first, so
-        # the primary copy wins, and that is also the copy
-        # _recorded_worktree_snapshots() resolves against. Raising here instead
-        # let 7 duplicated identities out of 20,846 sources disable the entire
-        # Claude visibility lane, because the caller reports any exception from
-        # this path as a generic provider_degraded.
-        deduped: list[SidebarSource] = []
-        seen_identities: set[str] = set()
-        for source in sources:
-            identity = source.source_session_id
-            if identity in seen_identities:
-                continue
-            seen_identities.add(identity)
-            deduped.append(source)
-        sources = deduped
+        # database and a profile database. Keep the primary copy -- it is the
+        # one _recorded_worktree_snapshots() resolves against. Raising here
+        # instead let 7 duplicated identities out of 20,846 sources disable the
+        # entire Claude visibility lane, because the caller reports any
+        # exception from this path as a generic provider_degraded.
+        sources = _dedupe_native_session_copies(
+            sources, identity=lambda source: source.source_session_id
+        )
         identities = [source.source_session_id for source in sources]
         snapshots = self._recorded_worktree_snapshots(identities)
         sources = [
@@ -5074,9 +5112,13 @@ class SessionBridgeStore:
                 sources.extend(profile_sources)
                 profile_has_more = profile_has_more or more
 
-        identities = [source.source_session_id for source in sources]
-        if len(identities) != len(set(identities)):
-            raise ValueError("duplicate native Hermes session identity across profiles")
+        # Same root/profile overlap as the Claude visibility lane above. The
+        # root copy wins unconditionally: _blocked_sidebar_source_ids() and the
+        # placement/reconciliation tables this page feeds are all root-owned,
+        # so a profile copy would not resolve against them.
+        sources = _dedupe_native_session_copies(
+            sources, identity=lambda source: source.source_session_id
+        )
         sources.sort(
             key=lambda source: (
                 -source.projection.last_active,
@@ -5378,10 +5420,14 @@ class SessionBridgeStore:
                 matches.append((profile, database, session_row, message_rows))
             if not matches:
                 raise KeyError(normalized_session_id)
-            if len(matches) != 1:
-                raise ValueError(
-                    "duplicate native Hermes session identity across profiles"
-                )
+            # Continuation digests the transcript, so when the root/profile
+            # split left a copy in both databases keep the one that actually
+            # holds the messages; the root copy still wins a tie.
+            matches = _dedupe_native_session_copies(
+                matches,
+                identity=lambda match: normalized_session_id,
+                richness=lambda match: len(match[3]),
+            )
             profile, database, session_row, message_rows = matches[0]
             if session_row["external_session_id"] is not None:
                 return None
