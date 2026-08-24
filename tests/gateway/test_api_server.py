@@ -312,6 +312,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_get("/api/sessions/{session_id}/context", adapter._handle_session_context)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -2865,4 +2866,122 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/sessions/{session_id}/context — context occupancy endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestSessionContextEndpoint:
+    """Cover the distinguishable branches of _handle_session_context."""
+
+    @pytest.mark.asyncio
+    async def test_requires_auth(self, auth_adapter):
+        """Auth rejection returns 401."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/sessions/s1/context")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_404(self, adapter):
+        """Unknown session_id → 404."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_get_existing_session_or_404",
+                return_value=(None, web.json_response({"error": "not found"}, status=404)),
+            ):
+                resp = await cli.get("/api/sessions/nonexistent/context")
+                assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_estimate_branch(self, adapter):
+        """No active agent → measured=false, falls back to estimate."""
+        fake_session = {"id": "s1", "model": "test-model", "billing_base_url": ""}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter, "_get_existing_session_or_404",
+                    return_value=(fake_session, None),
+                ),
+                patch.object(
+                    adapter, "_conversation_history_for_session",
+                    return_value=[{"role": "user", "content": "hello"}],
+                ),
+                patch("agent.model_metadata.get_model_context_length", return_value=8000),
+                patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500),
+            ):
+                adapter._active_run_agents = {}
+                resp = await cli.get("/api/sessions/s1/context")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["measured"] is False
+                assert data["context_used"] == 500
+                assert data["conversation_tokens"] == 500
+                assert data["context_max"] == 8000
+                assert data["model"] == "test-model"
+                assert 0 < data["context_percent"] <= 100
+
+    @pytest.mark.asyncio
+    async def test_measured_branch(self, adapter):
+        """Active agent with last_prompt_tokens > 0 → measured=true."""
+        fake_session = {"id": "s1", "model": "test-model", "billing_base_url": ""}
+        # Fake agent whose compressor reports last_prompt_tokens
+        fake_compressor = types.SimpleNamespace(
+            last_prompt_tokens=3000,
+            session_id="s1",
+        )
+        fake_agent = types.SimpleNamespace(
+            context_compressor=fake_compressor,
+            session_id="s1",
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter, "_get_existing_session_or_404",
+                    return_value=(fake_session, None),
+                ),
+                patch.object(
+                    adapter, "_conversation_history_for_session",
+                    return_value=[{"role": "user", "content": "hello"}],
+                ),
+                patch("agent.model_metadata.get_model_context_length", return_value=8000),
+                patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500),
+            ):
+                adapter._active_run_agents = {"run-1": fake_agent}
+                resp = await cli.get("/api/sessions/s1/context")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["measured"] is True
+                assert data["context_used"] == 3000
+                assert data["conversation_tokens"] == 500
+
+    @pytest.mark.asyncio
+    async def test_context_max_zero_clamps_percent(self, adapter):
+        """context_max == 0 → context_percent == 0 (divide-by-zero guard)."""
+        fake_session = {"id": "s1", "model": "test-model", "billing_base_url": ""}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter, "_get_existing_session_or_404",
+                    return_value=(fake_session, None),
+                ),
+                patch.object(
+                    adapter, "_conversation_history_for_session",
+                    return_value=[{"role": "user", "content": "hello"}],
+                ),
+                patch("agent.model_metadata.get_model_context_length", return_value=0),
+                patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500),
+            ):
+                adapter._active_run_agents = {}
+                resp = await cli.get("/api/sessions/s1/context")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["context_max"] == 0
+                assert data["context_percent"] == 0
 

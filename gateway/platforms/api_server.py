@@ -3639,11 +3639,13 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_session_context(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions/{session_id}/context — 会话上下文占用估算.
+        """GET /api/sessions/{session_id}/context — context occupancy estimate.
 
-        返回该会话当前上下文使用情况:模型窗口上限、已用 token(优先实测值,
-        否则按 DB 历史消息估算)、占用百分比、模型名。WebUI 用它显示真实
-        上下文占用,替代 SSE 拦截的虚高累加值。
+        Returns the session's current context usage: model window limit,
+        tokens used (preferring a measured value from an active agent,
+        otherwise estimated from DB history), occupancy percentage, and
+        model name.  WebUI uses this to display real context occupancy,
+        replacing the inflated cumulative value intercepted from SSE.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -3655,24 +3657,27 @@ class APIServerAdapter(BasePlatformAdapter):
         model = session.get("model") or self._model_name or ""
         base_url = session.get("billing_base_url") or ""
 
-        # 模型窗口上限(不抛异常,拿不到就用 0)
+        # Model context window limit (best-effort; 0 when unknown).
         context_max = 0
         try:
             from agent.model_metadata import get_model_context_length
             context_max = get_model_context_length(model, base_url=base_url) or 0
         except Exception:
+            logger.debug("get_model_context_length failed for %s", model, exc_info=True)
             context_max = 0
 
-        # 对话历史估算
+        # Conversation history token estimate.
         conversation_tokens = 0
         try:
             history = await self._conversation_history_for_session(session_id)
             from agent.model_metadata import estimate_messages_tokens_rough
             conversation_tokens = estimate_messages_tokens_rough(history) or 0
         except Exception:
+            logger.debug("estimate_messages_tokens_rough failed for %s", session_id, exc_info=True)
             conversation_tokens = 0
 
-        # 实测值:若该会话有活 agent 在跑,用其 last_prompt_tokens
+        # Measured value: if an active agent is running for this session,
+        # use its context_compressor.last_prompt_tokens.
         measured = 0
         try:
             for agent in list(self._active_run_agents.values()):
@@ -3683,6 +3688,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     measured = int(getattr(comp, "last_prompt_tokens", 0) or 0)
                     break
         except Exception:
+            logger.debug("active-agent token lookup failed for %s", session_id, exc_info=True)
             measured = 0
 
         context_used = measured if measured > 0 else conversation_tokens
