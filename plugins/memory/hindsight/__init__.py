@@ -410,14 +410,22 @@ UPDATE_MEMORY_SCHEMA = {
         "to fix the stored content. Only world/experience facts can be curated — "
         "observations are derived and regenerate from their sources, so updating "
         "one has no effect. Timestamps are ISO-8601 strings; pass an empty string "
-        "to clear a field, omit a field to leave it unchanged."
+        "to clear a field, omit a field to leave it unchanged.\n\n"
+        "Resolving relative times: compute against the current prompt time, not "
+        "the memory's original write time. Roughly: 'yesterday' -> minus 24 "
+        "hours, 'last week' -> minus 7 days, 'two hours ago' -> minus 2 hours, "
+        "and so on for other relative phrasing. If the fact describes a single "
+        "moment (an event, a discrete observation) rather than a span, set "
+        "occurred_start and occurred_end to the same resolved timestamp. If it "
+        "describes a duration, set occurred_start and occurred_end to the "
+        "actual distinct start and end times — they don't have to match."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "memory_id": {"type": "string", "description": "ID of the memory to update, as returned by hindsight_recall."},
-            "occurred_start": {"type": "string", "description": "ISO-8601 timestamp for when the fact started/occurred. Empty string clears it."},
-            "occurred_end": {"type": "string", "description": "ISO-8601 timestamp for when the fact ended. Empty string clears it."},
+            "occurred_start": {"type": "string", "description": "ISO-8601 timestamp for when the fact started/occurred. For a point-in-time fact, same value as occurred_end. Empty string clears it."},
+            "occurred_end": {"type": "string", "description": "ISO-8601 timestamp for when the fact ended. For a point-in-time fact, same value as occurred_start. Empty string clears it."},
             "text": {"type": "string", "description": "Corrected memory text, replacing the stored fact."},
             "context": {"type": "string", "description": "Corrected short label for the memory."},
         },

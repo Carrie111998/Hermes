@@ -255,6 +255,15 @@ class TestSchemas:
         assert set(props) == {"memory_id", "occurred_start", "occurred_end", "text", "context"}
         assert UPDATE_MEMORY_SCHEMA["parameters"]["required"] == ["memory_id"]
 
+    def test_update_memory_schema_documents_relative_time_resolution(self):
+        # Guidance the model needs to resolve "yesterday"/"last week"/etc.
+        # against the current prompt time, and to distinguish point-in-time
+        # facts (start == end) from durations (distinct start/end).
+        description = UPDATE_MEMORY_SCHEMA["description"]
+        for phrase in ("yesterday", "last week", "two hours ago"):
+            assert phrase in description
+        assert "current prompt time" in description
+
 
 # ---------------------------------------------------------------------------
 # Config tests
