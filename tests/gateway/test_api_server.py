@@ -609,6 +609,11 @@ class TestDisconnectedAgentReap:
         agent = MagicMock()
         _publish_turn_process_ownership(agent, "run-stop-sess")
         adapter._active_run_agents["run_x"] = agent
+        # Run-scoped routes are gated on the creating profile, and a run whose
+        # ownership is unstamped fails closed. Both creation sites claim before
+        # registering any run-keyed state, so a real run always carries this;
+        # the hand-built state above has to say so too.
+        adapter._claim_run_owner("run_x", None)
 
         request = MagicMock()
         request.match_info = {"run_id": "run_x"}

@@ -7493,18 +7493,44 @@ class APIServerAdapter(BasePlatformAdapter):
             run_id, self._normalized_profile(profile)
         )
 
+    def _run_state_exists(self, run_id: str) -> bool:
+        """Whether any run-keyed state survives under *run_id*.
+
+        The single definition of "this run is a thing", shared by the
+        visibility rule and the ownership-release rule so the two cannot
+        drift: an owner is released exactly when this returns False, and an
+        id that has state but no owner is exactly the case that must fail
+        closed.
+        """
+        return (
+            run_id in self._run_statuses
+            or run_id in self._active_run_agents
+            or run_id in self._active_run_tasks
+            or run_id in self._run_streams
+            or run_id in self._run_approval_sessions
+        )
+
     def _run_visible_to_caller(self, run_id: str) -> bool:
         """Whether the in-flight request may see or control *run_id*.
 
-        Unowned runs stay visible: ownership is stamped at creation, so a
-        record without one predates this state (or came from a path that
-        never registered), and refusing it would break runs that are nobody's
-        to steal. Anything with a recorded owner must match exactly.
+        A recorded owner must match exactly. With no owner recorded, the
+        answer turns on whether the run exists at all:
+
+        - No run-keyed state — an id that names nothing. Admitted, because
+          ``/events`` deliberately lets a client subscribe in the moment
+          before its run is registered. Nothing is disclosed by proceeding:
+          the caller waits on state that does not exist, and the wait
+          condition re-tests ownership once it does.
+        - Run state present but unstamped. Refused. Missing provenance on a
+          real run is not "nobody's to steal" — it is an unanswered
+          authorization question, and answering it "yes" would make the
+          boundary allow-all for every served profile precisely when the
+          metadata that decides it is absent.
         """
         owner = self._run_owner_profiles.get(run_id)
-        if owner is None:
-            return True
-        return owner == self._caller_profile()
+        if owner is not None:
+            return owner == self._caller_profile()
+        return not self._run_state_exists(run_id)
 
     def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         """Drop ownership only once nothing keyed by *run_id* survives.
@@ -7512,20 +7538,16 @@ class APIServerAdapter(BasePlatformAdapter):
         Ownership has to outlive every surface it protects, and the sweeps
         retire those surfaces on different clocks: statuses on
         ``_RUN_STATUS_TTL``, transports on ``_RUN_STREAM_TTL``, and the
-        agent/task refs not until the task is actually done. Reclaiming the
-        owner with the status alone would leave a live agent ref reachable
-        through ``/stop`` by anyone — ``_run_visible_to_caller`` fails open
-        with no owner — and the "stopping" status write that follows would
-        re-stamp the run to whoever asked, write-once, locking the real owner
-        out for good.
+        agent/task refs not until the task is actually done. Releasing on the
+        status alone would leave a live agent ref reachable through ``/stop``
+        and the "stopping" status write that follows would re-stamp the run
+        to whoever asked, write-once, locking the real owner out for good.
+
+        Releasing only when no state remains also keeps
+        ``_run_visible_to_caller`` from ever seeing a stateful id with no
+        owner, which it treats as fail-closed rather than as a run to serve.
         """
-        if (
-            run_id in self._run_statuses
-            or run_id in self._active_run_agents
-            or run_id in self._active_run_tasks
-            or run_id in self._run_streams
-            or run_id in self._run_approval_sessions
-        ):
+        if self._run_state_exists(run_id):
             return
         self._run_owner_profiles.pop(run_id, None)
 

@@ -1088,12 +1088,76 @@ class TestRunProfileScoping:
 
         assert adapter._run_owner_profiles["run_x"] == "alpha"
 
-    def test_an_unowned_run_stays_visible(self, adapter):
-        """The deliberate fail-open branch. A run nobody claimed is nobody's
-        to steal, and refusing it would break any path that never registered."""
-        adapter._run_statuses["run_orphan"] = {"status": "running"}
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler_name", [
+        "_handle_get_run", "_handle_run_events",
+        "_handle_run_approval", "_handle_steer_run", "_handle_stop_run",
+    ])
+    @pytest.mark.parametrize("caller", ["beta", "alpha", "default", None])
+    async def test_an_existing_run_without_an_owner_stamp_is_refused(
+        self, adapter, handler_name, caller
+    ):
+        """Missing provenance on a real run is an unanswered authorization
+        question, not permission.
 
-        assert adapter._run_visible_to_caller("run_orphan") is True
+        Serving it would turn the boundary allow-all for every served profile
+        exactly when the metadata that decides it is absent — so it is refused
+        for *every* caller, not merely a foreign one. Nothing on the ordinary
+        creation paths loses the stamp today; this pins the invariant rather
+        than a reachable path.
+        """
+        adapter._run_statuses["run_ghost"] = {"status": "running", "session_id": "s"}
+        adapter._active_run_agents["run_ghost"] = MagicMock()
+        adapter._run_streams["run_ghost"] = asyncio.Queue()
+        assert "run_ghost" not in adapter._run_owner_profiles
+
+        response = await self._as_profile(
+            adapter, caller, getattr(adapter, handler_name), "run_ghost"
+        )
+
+        assert response.status == 404
+        assert "run_ghost" not in adapter._stopping_run_ids
+        assert adapter._run_statuses["run_ghost"]["status"] == "running"
+
+    @pytest.mark.parametrize("surface", [
+        "_run_statuses", "_active_run_agents", "_active_run_tasks",
+        "_run_streams", "_run_approval_sessions",
+    ])
+    def test_any_surviving_surface_closes_an_unstamped_run(
+        self, adapter, surface
+    ):
+        """Each surface independently, so the rule cannot be satisfied by the
+        status dict alone while a live agent ref stays reachable."""
+        getattr(adapter, surface)["run_ghost"] = MagicMock()
+
+        assert adapter._run_visible_to_caller("run_ghost") is False
+
+    def test_an_id_that_names_nothing_is_not_refused(self, adapter):
+        """The complement, and the reason the rule is about state rather than
+        about ownership alone: /events deliberately admits a caller in the
+        moment before its run is registered."""
+        assert adapter._run_state_exists("run_unknown") is False
+        assert adapter._run_visible_to_caller("run_unknown") is True
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_id_still_enters_the_events_wait(
+        self, adapter, monkeypatch
+    ):
+        """Fail-closed must not collapse the subscribe-early window: an id
+        with no state waits, it is not refused up front."""
+        slept = []
+
+        async def _fake_sleep(delay):
+            slept.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+        response = await self._as_profile(
+            adapter, "beta", adapter._handle_run_events, "run_unknown"
+        )
+
+        assert response.status == 404
+        assert len(slept) > 0
 
     @pytest.mark.parametrize(
         "raw,expected",
