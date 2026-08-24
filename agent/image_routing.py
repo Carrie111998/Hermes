@@ -555,16 +555,13 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     # BMP: "BM"
     if raw.startswith(b"BM"):
         return "image/bmp"
-    # ISO-BMFF family (HEIC/HEIF/AVIF): bytes 4..8 == 'ftyp', major brand at 8..12
-    if len(raw) >= 12 and raw[4:8] == b"ftyp":
-        brand = raw[8:12]
-        if brand in {b"avif", b"avis"}:
-            return "image/avif"
-        if brand in {
-            b"heic", b"heix", b"hevc", b"hevx",
-            b"mif1", b"msf1", b"heim", b"heis",
-        }:
-            return "image/heic"
+    # ISO-BMFF family (HEIC/HEIF/AVIF): scan ftyp brands
+    from tools.image_formats import sniff_isobmff_image_brand
+    isobmff_brand = sniff_isobmff_image_brand(raw)
+    if isobmff_brand == "avif":
+        return "image/avif"
+    if isobmff_brand == "heic":
+        return "image/heic"
     # TIFF: II*\0 (little-endian) or MM\0* (big-endian)
     if raw[:4] in {b"II*\x00", b"MM\x00*"}:
         return "image/tiff"

@@ -249,32 +249,8 @@ def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
     SVG, which has no magic bytes. The resolver special-cases SVG (sniffs
     ``<svg``) and passes it through for rasterization at the call sites.
     """
-    header = data[:64]
-    if header.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if header.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if header.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if header.startswith(b"BM"):
-        return "image/bmp"
-    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-        return "image/webp"
-    # ISO-BMFF image containers used by iPhones and other mobile cameras.
-    # WebUI may preserve the upload bytes while assigning a .jpg filename.
-    if len(header) >= 12 and header[4:8] == b"ftyp":
-        brands = {
-            header[offset:offset + 4]
-            for offset in range(8, len(header) - 3, 4)
-        }
-        if brands & {
-            b"heic", b"heix", b"hevc", b"hevx",
-            b"mif1", b"msf1", b"heim", b"heis",
-        }:
-            return "image/heic"
-        if brands & {b"avif", b"avis"}:
-            return "image/avif"
-    return None
+    from tools.image_formats import sniff_image_mime
+    return sniff_image_mime(data)
 
 
 # Media types the major vision providers (Anthropic in particular) accept for
@@ -372,10 +348,10 @@ def _normalize_to_supported_image(
             "(`pip install cairosvg`) — then re-run vision_analyze on the PNG.",
         )
 
-    # Register HEIF support before Pillow opens an iPhone image. WebUI uploads
-    # may carry HEIC bytes under a .jpg filename. The codec is lazy-installed
-    # only when needed, so ordinary PNG/JPEG vision calls do not incur a setup
-    # cost; prompt=False prevents an interactive install prompt mid-session.
+    # Register HEIF/AVIF support before Pillow opens an iPhone or modern mobile image.
+    # WebUI uploads may carry HEIC bytes under a .jpg filename. The codec is
+    # lazy-installed only when needed, so ordinary PNG/JPEG vision calls do not incur
+    # a setup cost; prompt=False prevents an interactive install prompt mid-session.
     if detected_mime in {"image/heic", "image/avif"}:
         try:
             import pillow_heif  # type: ignore
@@ -386,8 +362,12 @@ def _normalize_to_supported_image(
                 _ensure_dep("tool.vision", prompt=False)
                 import pillow_heif  # type: ignore
                 pillow_heif.register_heif_opener()
-            except Exception:
-                pass
+            except Exception as _codec_err:
+                logger.warning(
+                    "Detected %s image but failed to initialize pillow-heif codec: %s. "
+                    "Install with `pip install pillow-heif` for HEIC/AVIF image support.",
+                    detected_mime, _codec_err,
+                )
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(image_path) as _img:

@@ -2479,22 +2479,6 @@ _CHAT_IMAGE_ALLOWED_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
     ".heic", ".heif", ".avif",
 })
-_CHAT_IMAGE_ISOBMFF_BRANDS = frozenset({
-    # HEIF/HEIC brands. ``mif1``/``msf1`` are generic HEIF brands and may
-    # appear as the major brand even when a compatible brand identifies HEIC.
-    b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis",
-    b"mif1", b"msf1",
-    # AVIF is also an ISO-BMFF image and is handled by the same local
-    # Pillow/pillow-heif normalization path before the provider call.
-    b"avif", b"avis",
-})
-_CHAT_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", ".png"),
-    (b"\xff\xd8\xff", ".jpg"),
-    (b"GIF87a", ".gif"),
-    (b"GIF89a", ".gif"),
-    (b"BM", ".bmp"),
-)
 
 
 def _sanitize_chat_image_filename(filename: str | None) -> str:
@@ -2505,25 +2489,8 @@ def _sanitize_chat_image_filename(filename: str | None) -> str:
 
 
 def _chat_image_extension(data: bytes) -> str | None:
-    head = data[:16]
-    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
-        return ".webp"
-    # HEIC/HEIF/AVIF are ISO Base Media File Format images. Do not trust the
-    # browser filename: iOS/WebUI can hand us HEIC bytes named ``.jpg``.
-    # Check the major brand and aligned compatible-brand slots in the ftyp
-    # box, since some cameras use the generic ``mif1`` major brand.
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        brands = {
-            data[offset:offset + 4]
-            for offset in range(8, min(len(data), 128) - 3, 4)
-        }
-        for brand in brands:
-            if brand in _CHAT_IMAGE_ISOBMFF_BRANDS:
-                return ".avif" if brand in {b"avif", b"avis"} else ".heic"
-    for sig, ext in _CHAT_IMAGE_MAGIC:
-        if head.startswith(sig):
-            return ext
-    return None
+    from tools.image_formats import sniff_image_extension
+    return sniff_image_extension(data)
 
 
 def _decode_chat_image_upload(payload: ChatImageUpload) -> tuple[bytes, str, str]:
