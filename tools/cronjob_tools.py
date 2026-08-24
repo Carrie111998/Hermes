@@ -341,7 +341,7 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
                 "Cron origin captured thread_id=%s for %s:%s",
                 thread_id, origin_platform, origin_chat_id,
             )
-        return {
+        origin = {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
@@ -363,6 +363,13 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # snapshots; None for platforms without scope.
             "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
         }
+        if origin_platform.lower() == "feishu":
+            # Feishu topic delivery requires replying to an om_* message;
+            # omt_* is routing context, not a valid create-message recipient.
+            origin["message_id"] = (
+                get_session_env("HERMES_SESSION_MESSAGE_ID") or None
+            )
+        return origin
     return None
 
 
