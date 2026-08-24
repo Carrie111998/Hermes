@@ -78,9 +78,14 @@ function fakeSsh(rules: any[] = []) {
         return 'CLEAR'
       }
 
-      const applicableRules = cmd.includes('marker_clear()')
-        ? rules.filter(([matcher]) => !(matcher instanceof RegExp && /kill -0/.test(matcher.source)))
-        : rules
+      const mutexWrapped = cmd.includes('fcntl.flock(fd,fcntl.LOCK_EX)')
+      const applicableRules = rules.filter(([matcher]) => {
+        if (cmd.includes('marker_clear()') && matcher instanceof RegExp && /kill -0/.test(matcher.source)) {
+          return false
+        }
+
+        return !(mutexWrapped && matcher instanceof RegExp && /python3 -c/.test(matcher.source))
+      })
 
       if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) || cmd.includes('printf TERMINATED')) {
         return 'TERMINATED'
@@ -655,6 +660,9 @@ test('buildSpawnCommand atomically reserves the ownership slot through spawn and
   })
 
   assert.ok(cmd.includes('.connect.lock'))
+  assert.ok(cmd.includes('.hermes-update-in-progress.mutex'))
+  assert.match(cmd, /fcntl\.flock\(fd,fcntl\.LOCK_EX\)/)
+  assert.match(cmd, /os\.set_inheritable\(fd,True\)/)
   assert.ok(cmd.includes('backend.lock.json'))
   assert.match(cmd, /lock_json/)
   assert.match(cmd, /trap .*rm -rf/)
@@ -1066,6 +1074,9 @@ test('managed update drain refuses a PID whose identity changes at the atomic si
     false,
     'the final signal must stay inside the identity-checking helper'
   )
+  const termination = ssh.calls.find(command => command.includes('identity_before_signal'))
+  assert.match(termination, /live_creation,live_args=identity_before_signal\(\)/)
+  assert.match(termination, /bound_creation,bound_args=identity_before_signal\(\)/)
 })
 
 test('connect() respawns when the dashboard is wedged (alive pid, probe fails)', async () => {
@@ -1286,7 +1297,7 @@ test('spawnRemoteDashboard streams the token over stdin, not argv/env', async ()
         return 'YES\n'
       }
 
-      if (/python3 -c/.test(cmd)) {
+      if (/python3 -c/.test(cmd) && !/fcntl\.flock/.test(cmd)) {
         return ''
       }
 
@@ -1333,7 +1344,7 @@ test('spawnRemoteDashboard upload uses exclusive-create and O_NOFOLLOW', async (
         return 'YES\n'
       }
 
-      if (/python3 -c/.test(cmd)) {
+      if (/python3 -c/.test(cmd) && !/fcntl\.flock/.test(cmd)) {
         return ''
       }
 
@@ -1355,7 +1366,7 @@ test('spawnRemoteDashboard upload uses exclusive-create and O_NOFOLLOW', async (
     token: 'tk',
     ownershipId: OWNERSHIP_ID
   })
-  const uploadCmd = calls.find(c => /python3 -c/.test(c))
+  const uploadCmd = calls.find(c => /python3 -c/.test(c) && !/fcntl\.flock/.test(c))
   assert.ok(uploadCmd, 'must use python3 -c for token upload')
   assert.match(uploadCmd, /O_EXCL/, 'upload must use O_EXCL to reject existing files')
   assert.match(uploadCmd, /O_NOFOLLOW/, 'upload must use O_NOFOLLOW to reject symlinks')

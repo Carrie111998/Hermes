@@ -3187,31 +3187,72 @@ function writeBackendOwnership(contents) {
   }
 }
 
+const WINDOWS_FILETIME_EPOCH_TICKS = 621_355_968_000_000_000n
+const UNKNOWN_BACKEND_OWNERSHIP_LOCK_GRACE_MS = 1_000
+
+function normalizeBackendOwnershipLockStartMarker(marker) {
+  if (!IS_WINDOWS || typeof marker !== 'string' || !marker.startsWith('win:')) {
+    return marker
+  }
+
+  try {
+    const ticks = BigInt(marker.slice('win:'.length))
+
+    if (ticks < WINDOWS_FILETIME_EPOCH_TICKS) {
+      return marker
+    }
+
+    return `winms:${((ticks - WINDOWS_FILETIME_EPOCH_TICKS) / 10_000n).toString()}`
+  } catch {
+    return marker
+  }
+}
+
 // Ownership is shared by every Electron interpreter for this userData tree.
 // Atomic rename protects individual writes, but not read/merge/write: two
 // interpreters can still overwrite each other's claims. Hold a sidecar lock
 // across the complete transaction. Acquisition is asynchronous so a contending
 // Electron instance never blocks the main thread. The sidecar records the
 // owner's PID and start marker; a dead owner can be recovered after a crash.
+// Windows sidecar markers are normalized to winms: so Electron's own creation
+// time and PowerShell's process probe use one comparable wire format.
 async function withBackendOwnershipLock(operation) {
   const lockPath = `${DESKTOP_BACKEND_OWNERSHIP_PATH}.lock`
   await fs.promises.mkdir(path.dirname(lockPath), { recursive: true })
   const deadline = Date.now() + 30_000
   let handle: any
   let contents = ''
+  let malformedLockSince: number | null = null
+  let observedMalformedContents: string | null = null
 
   for (;;) {
+    let published = false
+
     try {
-      handle = await fs.promises.open(lockPath, 'wx', 0o600)
-      const startMarker = await processStartMarker(process.pid)
+      const startMarker = normalizeBackendOwnershipLockStartMarker(await processStartMarker(process.pid))
       contents = JSON.stringify({ pid: process.pid, startMarker, createdAt: Date.now() })
-      await handle.writeFile(`${contents}\n`, { encoding: 'utf8' })
+      // wx + write publishes the owner record as one filesystem operation from
+      // the caller's perspective, avoiding the ordinary create-then-publish
+      // window. The malformed-lock recovery below still handles a crash inside
+      // the underlying system call.
+      await fs.promises.writeFile(lockPath, `${contents}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+      published = true
+      handle = await fs.promises.open(lockPath, 'r')
       break
     } catch (error) {
       if (handle) {
         await handle.close().catch(() => {})
         handle = undefined
-        await fs.promises.unlink(lockPath).catch(() => {})
+      }
+
+      if (published) {
+        try {
+          if ((await fs.promises.readFile(lockPath, 'utf8')).trim() === contents) {
+            await fs.promises.unlink(lockPath)
+          }
+        } catch {
+          void 0
+        }
       }
 
       if (error?.code !== 'EEXIST' || Date.now() >= deadline) {
@@ -3219,17 +3260,89 @@ async function withBackendOwnershipLock(operation) {
       }
 
       let owner
+      let rawOwner: string | null = null
+      let malformed = false
+
       try {
-        owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'))
+        rawOwner = await fs.promises.readFile(lockPath, 'utf8')
+        owner = JSON.parse(rawOwner)
       } catch {
-        owner = null
+        malformed = true
       }
 
-      if (owner && Number.isInteger(owner.pid) && typeof owner.startMarker === 'string' && owner.startMarker) {
+      if (!owner || !Number.isInteger(owner.pid) || typeof owner.startMarker !== 'string' || !owner.startMarker) {
+        malformed = true
+      }
+
+      if (malformed) {
+        const now = Date.now()
+
+        if (malformedLockSince === null || rawOwner !== observedMalformedContents) {
+          observedMalformedContents = rawOwner
+          malformedLockSince = now
+        } else if (malformedLockSince !== null && now - malformedLockSince >= UNKNOWN_BACKEND_OWNERSHIP_LOCK_GRACE_MS) {
+          // Re-read immediately before stealing so a delayed metadata write
+          // cannot turn a now-valid live owner into a stale-looking lock.
+          let latest: string | null = null
+
+          try {
+            latest = await fs.promises.readFile(lockPath, 'utf8')
+          } catch {
+            latest = null
+          }
+
+          let latestOwner
+          let latestMalformed = latest === null
+
+          if (latest !== null) {
+            try {
+              latestOwner = JSON.parse(latest)
+            } catch {
+              latestMalformed = true
+            }
+
+            if (
+              !latestOwner ||
+              !Number.isInteger(latestOwner.pid) ||
+              typeof latestOwner.startMarker !== 'string' ||
+              !latestOwner.startMarker
+            ) {
+              latestMalformed = true
+            }
+          }
+
+          if (latest !== null && latestMalformed && latest === rawOwner) {
+            try {
+              await fs.promises.unlink(lockPath)
+            } catch (unlinkError) {
+              if (unlinkError?.code !== 'ENOENT') {
+                throw unlinkError
+              }
+            }
+          }
+
+          malformedLockSince = null
+          observedMalformedContents = null
+          continue
+        }
+      } else {
+        malformedLockSince = null
+        observedMalformedContents = null
+      }
+
+      if (
+        !malformed &&
+        owner &&
+        Number.isInteger(owner.pid) &&
+        typeof owner.startMarker === 'string' &&
+        owner.startMarker
+      ) {
         let ownerMatches: boolean | undefined
 
         try {
-          ownerMatches = (await processStartMarker(owner.pid)) === owner.startMarker
+          ownerMatches =
+            normalizeBackendOwnershipLockStartMarker(await processStartMarker(owner.pid)) ===
+            normalizeBackendOwnershipLockStartMarker(owner.startMarker)
         } catch (probeError) {
           ownerMatches = probeError?.code === 'ENOENT' || probeError?.code === 'ESRCH' ? false : undefined
         }

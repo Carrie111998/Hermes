@@ -38,28 +38,28 @@ export function windowsProcessSnapshotScript(pids: readonly number[]): string {
     `$requested = @(${processIds})`,
     '$processes = @{}',
     '$unknown = @{}',
-    '$requested | ForEach-Object { try { $processes[[int]$_] = Get-Process -Id $_ -ErrorAction Stop } catch { $unknown[[int]$_] = $true } }',
+    '$requested | ForEach-Object { $requestedPid = [int]$_; try { $processes[$requestedPid] = Get-Process -Id $requestedPid -ErrorAction Stop } catch { $unknown[$requestedPid] = $true } }',
     `$rows = @(Get-CimInstance Win32_Process -Filter '${filter}' -ErrorAction Stop)`,
     '$commands = @{}',
     '$rowsByPid = @{}',
     '$rows | ForEach-Object { $rowsByPid[[int]$_.ProcessId] = $true }',
     '$rows | ForEach-Object { $commands[[int]$_.ProcessId] = [string]$_.CommandLine }',
     '$items = @($requested | ForEach-Object {',
-    '  $pid = [int]$_',
-    '  if($unknown.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="unknown"; command=$null; ticks=$null; milliseconds=$null }; return }',
-    '  if(-not $processes.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="absent"; command=$null; ticks=$null; milliseconds=$null }; return }',
-    '  $process = $processes[$pid]',
+    '  $requestedPid = [int]$_',
+    '  if($unknown.ContainsKey($requestedPid)){ [PSCustomObject]@{ pid=$requestedPid; state="unknown"; command=$null; ticks=$null; milliseconds=$null }; return }',
+    '  if(-not $processes.ContainsKey($requestedPid)){ [PSCustomObject]@{ pid=$requestedPid; state="absent"; command=$null; ticks=$null; milliseconds=$null }; return }',
+    '  $process = $processes[$requestedPid]',
     '  $ticks = $process.StartTime.ToUniversalTime().Ticks',
     '  [PSCustomObject]@{',
-    '    pid = $pid',
+    '    pid = $requestedPid',
     '    state = "present"',
     '    ticks = [string]$ticks',
     `    milliseconds = [string][math]::Floor(([decimal]$ticks - ${WINDOWS_EPOCH_TICKS}) / 10000)`,
-    '    command = if ($commands.ContainsKey($pid)) { [string]$commands[$pid] } else { $null }',
+    '    command = if ($commands.ContainsKey($requestedPid)) { [string]$commands[$requestedPid] } else { $null }',
     '  }',
     '})',
     'ConvertTo-Json -InputObject @($items) -Compress'
-  ].join('; ')
+  ].join('\n')
 }
 
 export function parseWindowsProcessSnapshot(stdout: unknown): Map<number, BackendProcessSnapshot> {

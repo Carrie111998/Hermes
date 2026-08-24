@@ -776,6 +776,13 @@ try:
  live_creation,live_args=identity_before_signal()
  if live_creation!=expected_creation or not owned(live_args):
   print("REFUSED");sys.exit(3)
+ if sys.platform=="darwin":
+  # There is no pidfd-style signal binding on Darwin. Re-read the complete
+  # identity immediately before os.kill, with no intervening await or remote
+  # round trip, and refuse if the PID or argv changed at that boundary.
+  bound_creation,bound_args=identity_before_signal()
+  if bound_creation!=expected_creation or not owned(bound_args):
+   print("REFUSED");sys.exit(3)
  try:
   if pidfd is not None:signal.pidfd_send_signal(pidfd,signal.SIGTERM)
   else:os.kill(pid,signal.SIGTERM)
@@ -797,6 +804,27 @@ finally:
 `.trim()
 
   return `python3 -c ${shq(script)}`
+}
+
+// The updater's Python _MarkerMutex uses the marker's .mutex sidecar and an
+// advisory flock. Keep that same descriptor locked while the remote shell does
+// the marker check, spawns the backend, and publishes its initial lockfile.
+// Python execs the shell with the descriptor inheritable so the flock survives
+// the interpreter handoff and is released only when the command exits.
+function withRemoteUpdateMutex(command, mutexPath) {
+  const script = `
+import fcntl,os,sys
+mutex_path=sys.argv[1]
+payload=sys.argv[2]
+parent=os.path.dirname(mutex_path)
+if parent:os.makedirs(parent,exist_ok=True)
+fd=os.open(mutex_path,os.O_RDWR|os.O_CREAT,0o600)
+os.set_inheritable(fd,True)
+fcntl.flock(fd,fcntl.LOCK_EX)
+os.execvp("sh",["sh","-c",payload])
+`.trim()
+
+  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
 }
 
 /**
@@ -920,6 +948,9 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const ownerArg = opts.spawnNonce ? ` --ssh-owner-nonce ${validateSpawnNonce(opts.spawnNonce)}` : ''
   const subCmd = `serve --isolated --host 127.0.0.1 --port 0${tokenArg}${ownerArg}`
   const marker = expandRemotePath(`${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress`)
+  const updateMutex = expandRemotePath(
+    `${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress.mutex`
+  )
   // The marker probe, ownership reservation, process creation, and initial
   // lockfile publication must be one remote command. A second Desktop process
   // can therefore never observe an empty lock and spawn before this one records
@@ -936,11 +967,12 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
     `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
 
   if (!opts.ownershipId || !opts.lockMetadata) {
-    return (
+    return withRemoteUpdateMutex(
       `${markerClear}; marker_clear || exit 75; ` +
-      `mkdir -p "$(dirname ${logPath})" && ` +
-      `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
-      `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; echo "$child"`
+        `mkdir -p "$(dirname ${logPath})" && ` +
+        `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
+        `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; echo "$child"`,
+      updateMutex
     )
   }
 
@@ -951,27 +983,28 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const metadata = JSON.stringify({ schemaVersion: LOCKFILE_SCHEMA_VERSION, ...opts.lockMetadata, pid: '__PID__' })
   const reservationNonce = validateSpawnNonce(opts.reservationNonce || crypto.randomBytes(8).toString('hex'))
 
-  return (
+  return withRemoteUpdateMutex(
     `umask 077 && mkdir -p "$(dirname ${reservation})"; ` +
-    `reservation=${shq(reservation)}; lock=${shq(lockPath)}; owner_file=${shq(ownerPath)}; ` +
-    `reservation_nonce=${shq(reservationNonce)}; ` +
-    `i=0; while ! mkdir "$reservation" 2>/dev/null; do ` +
-    `owner_data=$(cat "$owner_file" 2>/dev/null || true); owner_pid=${'${owner_data%%:*}'}; ` +
-    `case "$owner_pid" in ''|*[!0-9]*) ;; *) kill -0 "$owner_pid" 2>/dev/null || { rm -rf "$reservation"; continue; };; esac; ` +
-    `i=$((i+1)); [ "$i" -ge 600 ] && exit 75; sleep 0.05; done; ` +
-    `printf '%s:%s' "$$" "$reservation_nonce" > "$owner_file"; ` +
-    `trap 'rm -rf "$reservation"' EXIT; ` +
-    `if [ -f "$lock" ]; then ` +
-    `existing_pid=$(sed -n 's/.*"pid":\\([0-9][0-9]*\\).*/\\1/p' "$lock" | head -n 1); ` +
-    `case "$existing_pid" in ''|*[!0-9]*) rm -f "$lock";; *) ` +
-    `if kill -0 "$existing_pid" 2>/dev/null; then ${tokenPath ? `rm -f ${tokenPath}; ` : ''}printf EXISTING; exit 0; fi; rm -f "$lock";; esac; fi; ` +
-    `${markerClear}; marker_clear || exit 75; mkdir -p "$(dirname ${logPath})" && ` +
-    `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
-    `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; ` +
-    `lock_json=${shq(metadata)}; lock_json=\${lock_json//__PID__/$child}; ` +
-    `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
-    `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
-    `echo "$child"`
+      `reservation=${shq(reservation)}; lock=${shq(lockPath)}; owner_file=${shq(ownerPath)}; ` +
+      `reservation_nonce=${shq(reservationNonce)}; ` +
+      `i=0; while ! mkdir "$reservation" 2>/dev/null; do ` +
+      `owner_data=$(cat "$owner_file" 2>/dev/null || true); owner_pid=${'${owner_data%%:*}'}; ` +
+      `case "$owner_pid" in ''|*[!0-9]*) ;; *) kill -0 "$owner_pid" 2>/dev/null || { rm -rf "$reservation"; continue; };; esac; ` +
+      `i=$((i+1)); [ "$i" -ge 600 ] && exit 75; sleep 0.05; done; ` +
+      `printf '%s:%s' "$$" "$reservation_nonce" > "$owner_file"; ` +
+      `trap 'rm -rf "$reservation"' EXIT; ` +
+      `if [ -f "$lock" ]; then ` +
+      `existing_pid=$(sed -n 's/.*"pid":\\([0-9][0-9]*\\).*/\\1/p' "$lock" | head -n 1); ` +
+      `case "$existing_pid" in ''|*[!0-9]*) rm -f "$lock";; *) ` +
+      `if kill -0 "$existing_pid" 2>/dev/null; then ${tokenPath ? `rm -f ${tokenPath}; ` : ''}printf EXISTING; exit 0; fi; rm -f "$lock";; esac; fi; ` +
+      `${markerClear}; marker_clear || exit 75; mkdir -p "$(dirname ${logPath})" && ` +
+      `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
+      `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; ` +
+      `lock_json=${shq(metadata)}; lock_json=\${lock_json//__PID__/$child}; ` +
+      `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
+      `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
+      `echo "$child"`,
+    updateMutex
   )
 }
 
