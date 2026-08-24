@@ -273,6 +273,15 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'mixed'
   },
+  // /review ships on CLI/gateway/TUI via agent/review_engine.py (#93339) but
+  // Desktop keeps its own allowlist — without this entry the slash popover and
+  // /help hide it even though tui_gateway live-dispatches the command.
+  {
+    name: '/review',
+    description: 'Spawn an independent reviewer subagent for the work just discussed',
+    surface: exec(),
+    argumentMode: 'text'
+  },
   {
     name: '/personality',
     description: 'Switch personality for this session',
