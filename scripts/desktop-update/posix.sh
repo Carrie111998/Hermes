@@ -506,22 +506,28 @@ if [ "$HANDOFF_DAEMONIZED" -ne 1 ]; then
   # as a flag. Appending here previously left HANDOFF_DAEMONIZED unset on
   # every re-exec, causing this block to re-fire forever (self-exec loop,
   # unbounded argv growth) whenever relaunch args were present.
+  BASH_BIN="$(command -v bash 2>/dev/null || true)"
+  SETSID_BIN="$(command -v setsid 2>/dev/null || true)"
   NOHUP_BIN="$(command -v nohup 2>/dev/null || true)"
   PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-  if [ -z "$NOHUP_BIN" ] || [ -z "$PYTHON_BIN" ]; then
-    echo "update hand-off requires nohup and python3 (or python) on PATH" >&2
+  if [ -z "$BASH_BIN" ] || {
+    [ -z "$SETSID_BIN" ] && { [ -z "$NOHUP_BIN" ] || [ -z "$PYTHON_BIN" ]; }
+  }; then
+    echo "update hand-off requires bash and either setsid or nohup plus python3 (or python) on PATH" >&2
     exit 127
   fi
-  "$NOHUP_BIN" "$PYTHON_BIN" -c '
-import os, shutil, sys
+  if [ -n "$SETSID_BIN" ]; then
+    "$SETSID_BIN" "$BASH_BIN" "$SCRIPT_DIR/posix.sh" --daemonized "${ORIGINAL_ARGS[@]}" >/dev/null 2>&1 &
+  else
+    "$NOHUP_BIN" "$PYTHON_BIN" -c '
+import os, sys
 
 env = os.environ.copy()
 os.setsid()
-bash = shutil.which("bash")
-if not bash:
-    raise SystemExit("update hand-off requires bash on PATH")
-os.execve(bash, [bash, sys.argv[1], *sys.argv[2:]], env)
-' "$SCRIPT_DIR/posix.sh" --daemonized "${ORIGINAL_ARGS[@]}" >/dev/null 2>&1 &
+bash = sys.argv[1]
+os.execve(bash, [bash, sys.argv[2], *sys.argv[3:]], env)
+' "$BASH_BIN" "$SCRIPT_DIR/posix.sh" --daemonized "${ORIGINAL_ARGS[@]}" >/dev/null 2>&1 &
+  fi
   exit 0
 fi
 
