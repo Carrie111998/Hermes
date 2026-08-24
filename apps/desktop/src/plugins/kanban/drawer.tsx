@@ -809,9 +809,12 @@ export function TaskDrawer({
             <TabsTrigger value="execution" variant="line">
               {k.tabExecution}
               {tabStats.executionLive ? (
-                <span aria-label={k.working} className="text-[0.625rem] text-(--ui-accent)">
-                  ●
-                </span>
+                <>
+                  <span aria-hidden="true" className="text-[0.625rem] text-(--ui-accent)">
+                    ●
+                  </span>
+                  <span className="sr-only">{k.working}</span>
+                </>
               ) : tabStats.executionCount > 0 ? (
                 <span className="text-[0.625rem] font-normal text-(--ui-text-quaternary)">
                   {tabStats.executionCount}
