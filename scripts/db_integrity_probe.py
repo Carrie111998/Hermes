@@ -29,12 +29,16 @@ import sys
 
 def probe(db_path: str) -> str:
     p = pathlib.Path(db_path)
+    conn = None
 
     try:
         conn = sqlite3.connect(f"{p.as_uri()}?mode=ro", uri=True, timeout=5)
         rows = [str(r[0]) for r in conn.execute("PRAGMA integrity_check")]
     except sqlite3.OperationalError as exc:
         return f"UNVERIFIED: read-only open failed: {exc}"
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not rows:
         return "UNVERIFIED: integrity_check returned no rows"

@@ -3578,6 +3578,14 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // ── Pre-flight state.db integrity guard (#68474) ─────────────────
     // Emergency backup and header verification before the update touches
     // anything.  Runs while the backend is still alive.
+    // Reuses the 'restart' stage already emitted above (no title flicker) —
+    // only the message changes — so the up-to-30s probe below doesn't leave
+    // the overlay looking frozen after promising an imminent restart.
+    emitUpdateProgress({
+      stage: 'restart',
+      message: 'Checking the local database before continuing…',
+      percent: 100
+    })
     await preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
 
     // Stop our own backend(s) and wait for the venv shim to unlock BEFORE we
@@ -3981,7 +3989,7 @@ async function preflightStateDb(hermesHome, rememberLog, updateRoot) {
           if (lines.length === 1 && lines[0] === 'ok') {
             integrityVerdict = 'ok'
             integrityProblem = ''
-          } else if (lines.length === 1 && lines[0].startsWith('UNVERIFIED:')) {
+          } else if (lines.length > 0 && lines[0].startsWith('UNVERIFIED:')) {
             integrityProblem = lines[0].slice('UNVERIFIED:'.length).trim()
           } else {
             integrityVerdict = 'corrupt'
@@ -4107,6 +4115,16 @@ async function applyUpdatesPosixHandoff(opts: any) {
   }
 
   // ── Pre-flight state.db integrity guard (#68474) ──
+  // No prior progress event exists on this path yet ('restart' isn't emitted
+  // until the hand-off script is actually spawned below) — reuse the
+  // existing 'prepare' stage instead of inventing a new one, so the overlay
+  // shows activity during the up-to-30s probe without touching the renderer
+  // stage/label plumbing.
+  emitUpdateProgress({
+    stage: 'prepare',
+    message: 'Checking the local database before continuing…',
+    percent: null
+  })
   await preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
 
   // Branch-pin so a non-main checkout doesn't get switched to main (and
