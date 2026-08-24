@@ -374,6 +374,61 @@ def _copy_direct_tables(
     return copied
 
 
+def reconcile_cold_archive_tombstones(
+    destination: sqlite3.Connection,
+) -> dict[str, int]:
+    """Remove recovered hot rows whose IDs carry cold-archive authority."""
+
+    result = {
+        "sessions_removed": 0,
+        "sessions_parent_cleared": 0,
+        "messages_removed": 0,
+        "session_model_usage_removed": 0,
+        "compression_locks_removed": 0,
+        "telegram_dm_topic_bindings_removed": 0,
+    }
+    if not _table_columns(destination, "cold_archive_tombstones"):
+        return result
+
+    destination.execute("SAVEPOINT reconcile_cold_archive_tombstones")
+    try:
+        parent_cursor = destination.execute(
+            "UPDATE sessions SET parent_session_id = NULL "
+            "WHERE parent_session_id IN ("
+            "SELECT session_id FROM cold_archive_tombstones)"
+        )
+        result["sessions_parent_cleared"] = parent_cursor.rowcount
+
+        for table, report_key in (
+            ("messages", "messages_removed"),
+            ("session_model_usage", "session_model_usage_removed"),
+            ("compression_locks", "compression_locks_removed"),
+            (
+                "telegram_dm_topic_bindings",
+                "telegram_dm_topic_bindings_removed",
+            ),
+        ):
+            if not _table_columns(destination, table):
+                continue
+            cursor = destination.execute(
+                f'DELETE FROM "{table}" WHERE session_id IN ('
+                "SELECT session_id FROM cold_archive_tombstones)"
+            )
+            result[report_key] = cursor.rowcount
+
+        sessions_cursor = destination.execute(
+            "DELETE FROM sessions WHERE id IN ("
+            "SELECT session_id FROM cold_archive_tombstones)"
+        )
+        result["sessions_removed"] = sessions_cursor.rowcount
+        destination.execute("RELEASE SAVEPOINT reconcile_cold_archive_tombstones")
+    except BaseException:
+        destination.execute("ROLLBACK TO SAVEPOINT reconcile_cold_archive_tombstones")
+        destination.execute("RELEASE SAVEPOINT reconcile_cold_archive_tombstones")
+        raise
+    return result
+
+
 def map_lost_and_found_rows(
     lf_conn: sqlite3.Connection,
     dest: sqlite3.Connection,
@@ -503,6 +558,7 @@ def map_lost_and_found_rows(
                     ] += 1
                 else:
                     report["insert_conflicts"] += 1
+        report["tombstone_reconciliation"] = reconcile_cold_archive_tombstones(dest)
         dest.execute("COMMIT")
     except BaseException:
         dest.execute("ROLLBACK")

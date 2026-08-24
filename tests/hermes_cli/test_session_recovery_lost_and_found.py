@@ -472,10 +472,33 @@ def test_classify_lost_and_found_row_sentinels() -> None:
     assert classify_lost_and_found_row(0, ()) is None
 
 
+def _add_direct_session_conflicting_with_tombstone(
+    lf_conn: sqlite3.Connection,
+) -> None:
+    lf_conn.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?)",
+        ("cold-purged", "cli", 123.0),
+    )
+    lf_conn.execute(
+        "CREATE TABLE messages ("
+        "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, "
+        "content TEXT, timestamp REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+        (1, "cold-purged", "user", "stale hot row", 124.0),
+    )
+
+
 def test_mapper_preserves_unattributed_cold_archive_tombstones(
     tmp_path: Path,
 ) -> None:
     lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    _add_direct_session_conflicting_with_tombstone(lf_conn)
     lf_conn.execute(
         "CREATE TABLE lost_and_found ("
         "rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, "
@@ -491,12 +514,16 @@ def test_mapper_preserves_unattributed_cold_archive_tombstones(
     try:
         mapping = map_lost_and_found_rows(lf_conn, dest)
         assert mapping["mapped"]["cold_archive_tombstones"] == 1
+        assert mapping["tombstone_reconciliation"]["sessions_removed"] == 1
+        assert mapping["tombstone_reconciliation"]["messages_removed"] == 1
+        assert stub_missing_parent_sessions(dest)["sessions_stubbed"] == 0
     finally:
         lf_conn.close()
         dest.close()
 
     recovered = SessionDB(db_path=output)
     try:
+        assert recovered.get_messages("cold-purged") == []
         with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
             recovered.create_session("cold-purged", source="recovery-test")
         assert recovered.get_session("cold-purged") is None
@@ -508,6 +535,7 @@ def test_mapper_preserves_attributed_cold_archive_tombstones(
     tmp_path: Path,
 ) -> None:
     lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    _add_direct_session_conflicting_with_tombstone(lf_conn)
     lf_conn.execute(
         "CREATE TABLE cold_archive_tombstones ("
         "session_id TEXT PRIMARY KEY, "
@@ -525,12 +553,16 @@ def test_mapper_preserves_attributed_cold_archive_tombstones(
     try:
         mapping = map_lost_and_found_rows(lf_conn, dest)
         assert mapping["direct_table_rows"]["cold_archive_tombstones"] == 1
+        assert mapping["tombstone_reconciliation"]["sessions_removed"] == 1
+        assert mapping["tombstone_reconciliation"]["messages_removed"] == 1
+        assert stub_missing_parent_sessions(dest)["sessions_stubbed"] == 0
     finally:
         lf_conn.close()
         dest.close()
 
     recovered = SessionDB(db_path=output)
     try:
+        assert recovered.get_messages("cold-purged") == []
         with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
             recovered.create_session("cold-purged", source="recovery-test")
         assert recovered.get_session("cold-purged") is None

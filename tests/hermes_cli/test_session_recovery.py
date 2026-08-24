@@ -336,6 +336,48 @@ def test_recovery_preserves_cold_archive_tombstone_fence(tmp_path: Path) -> None
         recovered.close()
 
 
+def test_recovery_removes_rows_that_conflict_with_cold_archive_tombstones(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-conflict.db"
+    output = tmp_path / "recovered-conflict.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("cold-purged", source="cli")
+        db.append_message("cold-purged", role="user", content="stale hot row")
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "terminal", "e" * 64, 321.0),
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["tombstone_reconciliation"] == {
+        "sessions_removed": 1,
+        "sessions_parent_cleared": 0,
+        "messages_removed": 1,
+        "session_model_usage_removed": 0,
+        "compression_locks_removed": 0,
+        "telegram_dm_topic_bindings_removed": 0,
+    }
+    assert report["verification"]["healthy"] is True
+    assert report["verification"]["table_counts"]["sessions"] == 0
+    assert report["verification"]["table_counts"]["messages"] == 0
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered.get_session("cold-purged") is None
+        assert recovered.get_messages("cold-purged") == []
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+    finally:
+        recovered.close()
+
+
 def test_snapshot_blocks_connections_opened_during_the_copy(
     tmp_path: Path,
 ) -> None:
