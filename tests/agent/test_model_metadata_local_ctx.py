@@ -776,3 +776,43 @@ class TestQueryLocalContextLengthMaxTokensNotContext:
             result = _query_local_context_length("mystery-model", "http://127.0.0.1:8080/v1")
 
         assert result is None
+
+    def test_probe_honors_module_key_vocabulary(self):
+        """Invariant: the probe's context-window candidates are a subset of the
+        module's context vocabulary, and never include an output-cap key.
+
+        ``_CONTEXT_LENGTH_KEYS`` / ``_MAX_COMPLETION_KEYS`` are the module's
+        single source of truth for this distinction. This test anchors the
+        relation between the probe's hardcoded candidate tuples and that
+        vocabulary (rather than freezing a snapshot of values): if a new
+        context key is added, the probe candidates must keep honoring it; if a
+        completion key is ever misclassified as a window, this turns red.
+        """
+        from agent import model_metadata as mm
+
+        # max_tokens is an output cap, never a context window.
+        assert "max_tokens" in mm._MAX_COMPLETION_KEYS
+        assert "max_tokens" not in mm._CONTEXT_LENGTH_KEYS
+        # The two vocabularies are disjoint — no key is both a window and a cap.
+        assert not (set(mm._CONTEXT_LENGTH_KEYS) & set(mm._MAX_COMPLETION_KEYS))
+
+        # The probe's two hardcoded candidate sets (detail + list branches of
+        # _query_local_context_length_uncached) must be subsets of the context
+        # vocabulary and disjoint from the completion vocabulary.
+        detail_branch_keys = {
+            "max_model_len", "context_length", "context_size",
+            "max_input_tokens", "max_context_length",
+        }
+        list_branch_keys = {
+            "n_ctx", "context_length", "context_size", "context_window",
+            "max_model_len", "max_context_length", "max_input_tokens",
+            "n_ctx_train",
+        }
+        for key in detail_branch_keys | list_branch_keys:
+            assert key in mm._CONTEXT_LENGTH_KEYS, (
+                f"probe candidate {key!r} is not a recognized context key"
+            )
+        for key in mm._MAX_COMPLETION_KEYS:
+            assert key not in detail_branch_keys and key not in list_branch_keys, (
+                f"output-cap key {key!r} must not be a probe context candidate"
+            )
