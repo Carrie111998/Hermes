@@ -153,6 +153,25 @@ class TestFeishuExecApproval:
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_rejects_empty_or_whitespace_chat_id_before_sending(self, chat_id):
+        adapter = _make_adapter()
+
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+        ) as mock_send:
+            result = await adapter.send_exec_approval(
+                chat_id=chat_id,
+                command="echo test",
+                session_key="my-session-key",
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        assert adapter._approval_state == {}
+
 
 # ===========================================================================
 # send_update_prompt — interactive card with buttons

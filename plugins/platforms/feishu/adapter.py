@@ -2068,6 +2068,9 @@ class FeishuAdapter(BasePlatformAdapter):
         ``_handle_card_action_event`` can intercept them and call
         ``resolve_gateway_approval()`` to unblock the waiting agent thread.
         """
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -2108,7 +2111,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
             payload = json.dumps(card, ensure_ascii=False)
             response = await self._feishu_send_with_retry(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 msg_type="interactive",
                 payload=payload,
                 reply_to=None,
@@ -2120,7 +2123,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._approval_state[approval_id] = {
                     "session_key": session_key,
                     "message_id": result.message_id or "",
-                    "chat_id": chat_id,
+                    "chat_id": normalized_chat_id,
                 }
             return result
         except Exception as exc:
