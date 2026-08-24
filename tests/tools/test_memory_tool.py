@@ -8,6 +8,8 @@ from tools.memory_tool import (
     ENTRY_DELIMITER,
     MemoryStore,
     _REVIEW_MAX_CANDIDATES,
+    _REVIEW_MAX_COMPARISONS,
+    _REVIEW_MAX_ENTRIES,
     memory_tool,
     _scan_memory_content,
 )
@@ -464,6 +466,39 @@ class TestMemoryToolDispatcher:
 
         assert [entries[-2], entries[-1]] in reported_pairs
         assert [entries[0], entries[1]] not in reported_pairs
+
+    def test_review_bounds_pairwise_work_for_external_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        entries = [
+            f"Durable externally edited memory entry number {index:03d}."
+            for index in range(100)
+        ]
+        (tmp_path / "MEMORY.md").write_text(
+            ENTRY_DELIMITER.join(entries),
+            encoding="utf-8",
+        )
+        store = MemoryStore(memory_char_limit=100_000)
+        matcher_calls = 0
+
+        class CountingMatcher:
+            def __init__(self, _junk, _left, _right):
+                pass
+
+            def ratio(self):
+                nonlocal matcher_calls
+                matcher_calls += 1
+                return 0.9
+
+        monkeypatch.setattr("tools.memory_tool.SequenceMatcher", CountingMatcher)
+
+        result = json.loads(memory_tool(action="review", target="memory", store=store))
+
+        assert result["reviewed_entry_count"] == _REVIEW_MAX_ENTRIES
+        assert result["omitted_entry_count"] == 50
+        assert result["comparison_count"] == _REVIEW_MAX_COMPARISONS
+        assert result["comparison_truncated"] is True
+        assert result["has_more"] is True
+        assert matcher_calls == _REVIEW_MAX_COMPARISONS
 
 
 class TestMemoryBatch:

@@ -92,6 +92,10 @@ _REVIEW_SIMILARITY_THRESHOLD = 0.72
 # prevents mutually similar stores from producing a response larger than the
 # bounded memory itself.
 _REVIEW_MAX_CANDIDATES = 20
+# External editors can bypass configured character limits, so bound both the
+# number of entries entering the quadratic loop and expensive matcher calls.
+_REVIEW_MAX_ENTRIES = 50
+_REVIEW_MAX_COMPARISONS = 1_000
 
 
 def _duplicate_key(content: str) -> str:
@@ -661,10 +665,14 @@ class MemoryStore:
                 continue
             safe_entries.append(entry)
 
+        omitted_entry_count = max(0, len(safe_entries) - _REVIEW_MAX_ENTRIES)
+        review_entries = safe_entries[:_REVIEW_MAX_ENTRIES]
         candidates = []
-        for left_index, left in enumerate(safe_entries):
+        comparison_count = 0
+        comparison_truncated = False
+        for left_index, left in enumerate(review_entries):
             left_key = _review_key(left)
-            for right in safe_entries[left_index + 1:]:
+            for right in review_entries[left_index + 1:]:
                 right_key = _review_key(right)
                 shorter_length = min(len(left_key), len(right_key))
                 if shorter_length < _REVIEW_MIN_KEY_LENGTH:
@@ -677,9 +685,15 @@ class MemoryStore:
                     < _REVIEW_SIMILARITY_THRESHOLD * (len(left_key) + len(right_key))
                 ):
                     continue
+                if comparison_count >= _REVIEW_MAX_COMPARISONS:
+                    comparison_truncated = True
+                    break
+                comparison_count += 1
                 similarity = SequenceMatcher(None, left_key, right_key).ratio()
                 if similarity >= _REVIEW_SIMILARITY_THRESHOLD:
                     candidates.append((similarity, left, right))
+            if comparison_truncated:
+                break
 
         candidates.sort(
             key=lambda candidate: (
@@ -703,13 +717,22 @@ class MemoryStore:
             "entry_count": len(entries),
             "usage": f"{current:,}/{limit:,}",
             "similar_entries": similar_entries,
-            "has_more": omitted_candidate_count > 0,
+            "has_more": (
+                omitted_candidate_count > 0
+                or omitted_entry_count > 0
+                or comparison_truncated
+            ),
             "omitted_candidate_count": omitted_candidate_count,
+            "reviewed_entry_count": len(review_entries),
+            "omitted_entry_count": omitted_entry_count,
+            "comparison_count": comparison_count,
+            "comparison_truncated": comparison_truncated,
             "excluded_unsafe_entry_count": excluded_unsafe_entry_count,
             "note": (
                 "Candidates are advisory only. Use one atomic operations batch to "
                 "replace/remove entries you confirm overlap; distinct facts must remain separate. "
-                "Entries blocked by the memory threat scanner are omitted."
+                "Entries blocked by the memory threat scanner and entries beyond the reported "
+                "review limit are omitted."
             ),
         }
 
