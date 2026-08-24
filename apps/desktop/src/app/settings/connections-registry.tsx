@@ -28,7 +28,6 @@ import {
   Monitor,
   Pencil,
   Plus,
-  RefreshCw,
   SearchIcon,
   Terminal,
   Trash2
