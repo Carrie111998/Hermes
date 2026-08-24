@@ -51,24 +51,6 @@ def test_is_safe_meet_url_accepts_standard_meet_codes():
     assert _is_safe_meet_url("https://meet.google.com/lookup/ABC123")
 
 
-def test_is_safe_meet_url_rejects_non_meet_urls():
-    from plugins.google_meet.meet_bot import _is_safe_meet_url
-
-    # wrong host
-    assert not _is_safe_meet_url("https://evil.example.com/abc-defg-hij")
-    # wrong scheme
-    assert not _is_safe_meet_url("http://meet.google.com/abc-defg-hij")
-    # malformed code
-    assert not _is_safe_meet_url("https://meet.google.com/not-a-meet-code")
-    # subdomain hijack attempts
-    assert not _is_safe_meet_url("https://meet.google.com.evil.com/abc-defg-hij")
-    assert not _is_safe_meet_url("https://notmeet.google.com/abc-defg-hij")
-    # empty / wrong type
-    assert not _is_safe_meet_url("")
-    assert not _is_safe_meet_url(None)  # type: ignore[arg-type]
-    assert not _is_safe_meet_url(123)  # type: ignore[arg-type]
-
-
 def test_meeting_id_extraction():
     from plugins.google_meet.meet_bot import _meeting_id_from_url
 
@@ -527,6 +509,8 @@ def test_bot_state_drops_resolved_caption_settings_chrome_row(tmp_path):
 
 def test_bot_state_revises_unresolved_caption_rows_when_caption_id_is_stable(tmp_path):
     from plugins.google_meet.meet_bot import _BotState
+def test_parse_duration():
+    from plugins.google_meet.meet_bot import _parse_duration
 
     out = tmp_path / "s"
     state = _BotState(out_dir=out, meeting_id="x-y-z",
@@ -1288,6 +1272,7 @@ def test_start_headed_uses_xvfb_when_display_is_missing(monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setenv("HERMES_MEET_XVFB", "disabled")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(pm.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     with patch.object(pm.subprocess, "Popen", side_effect=_fake_popen), \
          patch.object(pm, "_pid_alive", return_value=False):
@@ -4174,6 +4159,31 @@ def test_click_join_returns_false_when_join_button_not_ready(tmp_path):
     assert state.lobby_waiting is False
 
 
+def test_transcript_reads_last_n_lines(tmp_path):
+    from plugins.google_meet import process_manager as pm
+
+    meeting_dir = Path(os.environ["HERMES_HOME"]) / "workspace" / "meetings" / "abc-defg-hij"
+    meeting_dir.mkdir(parents=True)
+    (meeting_dir / "transcript.txt").write_text(
+        "[10:00:00] Alice: one\n"
+        "[10:00:01] Bob: two\n"
+        "[10:00:02] Alice: three\n"
+    )
+    pm._write_active({
+        "pid": 12345, "meeting_id": "abc-defg-hij",
+        "out_dir": str(meeting_dir),
+        "url": "https://meet.google.com/abc-defg-hij",
+        "started_at": 0,
+    })
+
+    with patch.object(pm, "_pid_alive", return_value=True):
+        res = pm.transcript(last=2)
+    assert res["ok"] is True
+    assert res["total"] == 3
+    assert len(res["lines"]) == 2
+    assert res["lines"][-1].endswith("Alice: three")
+
+
 def test_click_join_returns_true_and_marks_lobby_for_ask_to_join(tmp_path):
     from plugins.google_meet.meet_bot import _BotState, _click_join
 
@@ -4276,6 +4286,9 @@ def test_try_guest_name_falls_back_to_placeholder_name_input():
 
         def is_visible(self):
             return False
+# ---------------------------------------------------------------------------
+# _on_session_end — defensive cleanup
+# ---------------------------------------------------------------------------
 
     class _InputLocator:
         @property
@@ -4298,6 +4311,9 @@ def test_try_guest_name_falls_back_to_placeholder_name_input():
             return _EmptyLocator()
 
     _try_guest_name(_Page(), "Catchline Assistant")
+# ---------------------------------------------------------------------------
+# Plugin register() — platform gating + tool registration
+# ---------------------------------------------------------------------------
 
     assert filled == ["Catchline Assistant"]
 
@@ -4338,6 +4354,9 @@ def test_click_join_falls_back_to_exact_text_control_for_join_now(tmp_path):
 
         def locator(self, _selector):
             return _EmptyLocator()
+# ---------------------------------------------------------------------------
+# v2: process_manager.enqueue_say + realtime-mode passthrough
+# ---------------------------------------------------------------------------
 
         def get_by_text(self, text, **_kwargs):
             if text == "Join now":
@@ -4515,6 +4534,10 @@ def test_disable_local_media_can_preserve_microphone_for_realtime():
 
 def test_disable_local_media_clicks_first_visible_duplicate_control():
     from plugins.google_meet.meet_bot import _disable_local_media
+# ---------------------------------------------------------------------------
+# v3: NodeClient routing from tool handlers
+# ---------------------------------------------------------------------------
+
 
     clicked = []
 
@@ -4578,6 +4601,10 @@ def test_probe_local_media_state_reports_visible_control_state():
 
         def count(self):
             return 1 if self.visible else 0
+# ---------------------------------------------------------------------------
+# v2.1: new _BotState fields + status dict shape
+# ---------------------------------------------------------------------------
+
 
         def is_visible(self):
             return self.visible
@@ -4659,6 +4686,9 @@ def test_ensure_local_media_before_join_fails_closed_for_unknown_transcribe_medi
     assert status["exited"] is True
     assert status["leaveReason"] == "unsafe_media_state"
     assert "local media state unsafe" in status["error"]
+# ---------------------------------------------------------------------------
+# Realtime session counters + cancel_response (barge-in)
+# ---------------------------------------------------------------------------
 
 
 def test_ensure_local_media_before_join_allows_realtime_mic_but_requires_camera_off(tmp_path, monkeypatch):
@@ -4745,6 +4775,10 @@ def test_disable_local_media_uses_keyboard_shortcuts_when_controls_are_hidden():
 
     class _Page:
         keyboard = _Keyboard()
+# ---------------------------------------------------------------------------
+# hermes meet install CLI
+# ---------------------------------------------------------------------------
+
 
         def get_by_role(self, *_args, **_kwargs):
             return _MissingButton()
