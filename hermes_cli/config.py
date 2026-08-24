@@ -1017,6 +1017,70 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
+def _split_dotted_key(dotted_key: str) -> list:
+    """Split a dotted config key into segments, honoring quoted segments.
+
+    A segment wrapped in single or double quotes keeps its dots literally
+    (#91607): ``model_overrides.zai."glm-5.3".supports_reasoning`` splits to
+    ``["model_overrides", "zai", "glm-5.3", "supports_reasoning"]`` instead
+    of shredding the model ID into ``glm-5`` / ``3``. Unquoted segments
+    split on dots as before.
+    """
+    segments: list = []
+    buf: list = []
+    quote: Optional[str] = None
+    just_closed = False  # suppress the separator dot right after a close quote
+    for ch in dotted_key:
+        if quote:
+            if ch == quote:
+                # End of quoted segment — flush it even if empty.
+                segments.append("".join(buf))
+                buf = []
+                quote = None
+                just_closed = True
+            else:
+                buf.append(ch)
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            if buf:
+                # Quote mid-segment (unquoted text before the quote) is not
+                # a supported escape — keep legacy split behavior for it.
+                segments.extend("".join(buf).split("."))
+                buf = []
+            continue
+        if ch == ".":
+            if just_closed:
+                just_closed = False
+                continue
+            segments.append("".join(buf))
+            buf = []
+            continue
+        just_closed = False
+        buf.append(ch)
+    tail = "".join(buf)
+    if quote:
+        # Unclosed quote: treat the rest literally, legacy-style.
+        segments.extend((tail or "").split("."))
+    elif tail or not segments:
+        segments.append(tail)
+    return segments
+
+
+def _iter_key_candidates(parts: list):
+    """Yield ``(consume_count, literal_key)`` candidates longest-first.
+
+    Used by the nested walkers to prefer an EXISTING literal key that spans
+    several dot-separated segments (#91607): when ``glm-5.3`` already exists
+    as one YAML key, the path ``zai.glm-5.3.supports_reasoning`` must
+    descend through it instead of creating nested ``glm-5`` / ``3`` maps.
+    Only existing keys are matched — creation stays per-segment unless the
+    caller used an explicit quoted segment.
+    """
+    for k in range(len(parts), 0, -1):
+        yield k, ".".join(parts[:k])
+
+
 def _set_nested(config, dotted_key: str, value):
     """Set a value at an arbitrarily nested dotted key path.
 
@@ -1039,9 +1103,11 @@ def _set_nested(config, dotted_key: str, value):
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
     """
-    parts = dotted_key.split(".")
+    parts = _split_dotted_key(dotted_key)
     current = config
-    for part in parts[:-1]:
+    i = 0
+    while i < len(parts) - 1:
+        part = parts[i]
         if isinstance(current, list):
             try:
                 idx = int(part)
@@ -1051,16 +1117,28 @@ def _set_nested(config, dotted_key: str, value):
                     f"segment {part!r} is not a numeric index"
                 )
             current = current[idx]
-        elif isinstance(current, dict):
-            existing = current.get(part)
-            # Preserve dicts and lists; replace missing/scalar with a fresh dict.
-            if part not in current or not isinstance(existing, (dict, list)):
-                current[part] = {}
-            current = current[part]
-        else:
-            raise TypeError(
-                f"Cannot navigate into {type(current).__name__} at key {dotted_key!r}"
-            )
+            i += 1
+            continue
+        if isinstance(current, dict):
+            # Prefer an existing literal key spanning several segments
+            # (dotted model IDs like ``glm-5.3``, #91607).
+            matched = False
+            for consume, literal in _iter_key_candidates(parts[i:-1]):
+                if consume < 2:
+                    break
+                if literal in current and isinstance(current[literal], (dict, list)):
+                    current = current[literal]
+                    i += consume
+                    matched = True
+                    break
+            if matched:
+                continue
+        existing = current.get(part)
+        # Preserve dicts and lists; replace missing/scalar with a fresh dict.
+        if part not in current or not isinstance(existing, (dict, list)):
+            current[part] = {}
+        current = current[part]
+        i += 1
     last = parts[-1]
     if isinstance(current, list):
         current[int(last)] = value
@@ -1099,44 +1177,97 @@ _MISSING = object()
 
 
 def _get_nested(config, dotted_key: str):
-    """Return a dotted-path value from nested dict/list config data."""
+    """Return a dotted-path value from nested dict/list config data.
+
+    Prefers existing literal keys spanning several segments (dotted model
+    IDs, #91607) so set/get round-trips resolve the same location.
+    """
+    parts = _split_dotted_key(dotted_key)
     current = config
-    for part in dotted_key.split("."):
+    i = 0
+    while i < len(parts):
+        part = parts[i]
         if isinstance(current, list):
             try:
                 current = current[int(part)]
             except (TypeError, ValueError, IndexError):
                 return _MISSING
         elif isinstance(current, dict):
+            matched = False
+            for consume, literal in _iter_key_candidates(parts[i:]):
+                if consume < 2:
+                    break
+                if literal in current:
+                    current = current[literal]
+                    i += consume
+                    matched = True
+                    break
+            if matched:
+                continue
             if part not in current:
                 return _MISSING
             current = current[part]
         else:
             return _MISSING
+        i += 1
     return current
 
 
 def _unset_nested(config, dotted_key: str) -> bool:
-    """Remove a dotted-path value from nested dict/list config data."""
-    parts = dotted_key.split(".")
+    """Remove a dotted-path value from nested dict/list config data.
+
+    Prefers existing literal keys spanning several segments (#91607), the
+    same resolution ``_set_nested``/``_get_nested`` use.
+    """
+    parts = _split_dotted_key(dotted_key)
     if not parts:
         return False
 
     parents = []
     current = config
-    for part in parts[:-1]:
-        parents.append((current, part))
+    i = 0
+    while i < len(parts) - 1:
+        part = parts[i]
         if isinstance(current, list):
+            try:
+                idx = int(part)
+            except (TypeError, ValueError):
+                return False
+            try:
+                current = current[idx]
+            except IndexError:
+                return False
+            parents.append((current, part))
+            i += 1
+            continue
+        if isinstance(current, dict):
+            matched = False
+            for consume, literal in _iter_key_candidates(parts[i:-1]):
+                if consume < 2:
+                    break
+                if literal in current and isinstance(current[literal], (dict, list)):
+                    parents.append((current, literal))
+                    current = current[literal]
+                    i += consume
+                    matched = True
+                    break
+            if matched:
+                continue
+        else:
+            return False
+        if isinstance(current, dict):
+            if part not in current:
+                return False
+            parents.append((current, part))
+            current = current[part]
+        elif isinstance(current, list):
             try:
                 current = current[int(part)]
             except (TypeError, ValueError, IndexError):
                 return False
-        elif isinstance(current, dict):
-            if part not in current:
-                return False
-            current = current[part]
         else:
             return False
+        i += 1
 
     last = parts[-1]
     removed = False
