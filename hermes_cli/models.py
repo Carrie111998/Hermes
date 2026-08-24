@@ -580,6 +580,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Synced against https://opencode.ai/docs/go/ + live GET /zen/go/v1/models
     # (2026-08-20).
     "opencode-go": [
+        "ox-alpha-free",  # ponytail: stealth free variant, live /models key
         "kimi-k3",
         "kimi-k2.7-code",
         "kimi-k2.6",
@@ -5538,6 +5539,10 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             # All Qwen models on Go (qwen3.7-max, qwen3.7-plus, qwen3.6-plus)
             # are served via /v1/messages per the published Go endpoint table.
             return "anthropic_messages"
+        if normalized.startswith("muse-spark"):
+            # muse-spark moved to /v1/responses on Go — /chat/completions
+            # returns 500 (gh: anomalyco/opencode#44659, #44627)
+            return "codex_responses"
         return "chat_completions"
 
     if family == "opencode-zen":
