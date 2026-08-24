@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from agent.anthropic_adapter import (
     _is_oauth_token,
@@ -982,6 +982,23 @@ def _fetch_anthropic_usage_with_token(
 def _fetch_anthropic_account_usage(
     *, timeout: float = _DEFAULT_USAGE_TIMEOUT
 ) -> Optional[AccountUsageSnapshot]:
+    """Primary subscription's usage.
+
+    Prefers the PINNED isolated profile ``~/.claude-anthropic1`` when it
+    exists. ``resolve_anthropic_token()`` ultimately reads ``~/.claude``, which
+    follows whichever account the desktop app is signed into -- so this row
+    used to change subject on every account switch. On 2026-08-23 14:18 the
+    primary flipped from diegodearagao to diegodearagaous and this row silently
+    became a duplicate of "Claude 2". Pinning fixes the subject; the fallback
+    keeps the row working on a box that has never created the profile.
+    """
+    if _read_anthropic1_credentials() is not None:
+        return _fetch_pinned_profile_usage(
+            "anthropic",
+            read=lambda: _read_anthropic1_credentials(),
+            write=lambda *a, **kw: _write_anthropic1_credentials(*a, **kw),
+            timeout=timeout,
+        )
     token = (resolve_anthropic_token() or "").strip()
     if not token:
         return None
@@ -995,7 +1012,34 @@ def _fetch_anthropic_account_usage(
     return _fetch_anthropic_usage_with_token(token, timeout=timeout)
 
 
+# Isolated login profiles, one per tracked subscription. ~/.claude is NOT used
+# for either row's identity: it follows whichever account the desktop app is
+# signed into, so a row sourced from it changes subject on every account switch.
+_ANTHROPIC1_CONFIG_DIR = Path.home() / ".claude-anthropic1"
 _ANTHROPIC2_CONFIG_DIR = Path.home() / ".claude-anthropic2"
+
+
+def _read_anthropic1_credentials(
+    config_dir: Optional[Path] = None,
+) -> Optional[dict]:
+    """OAuth credentials for the PRIMARY subscription's pinned profile."""
+    return _read_profile_credentials(config_dir or _ANTHROPIC1_CONFIG_DIR)
+
+
+def _write_anthropic1_credentials(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+) -> None:
+    _write_profile_credentials(
+        _ANTHROPIC1_CONFIG_DIR,
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        scopes=scopes,
+    )
 
 
 def _read_anthropic2_credentials(
@@ -1010,7 +1054,16 @@ def _read_anthropic2_credentials(
 
     Returns {accessToken, refreshToken, expiresAt, scopes} or None.
     """
-    cred_path = (config_dir or _ANTHROPIC2_CONFIG_DIR) / ".credentials.json"
+    return _read_profile_credentials(config_dir or _ANTHROPIC2_CONFIG_DIR)
+
+
+def _read_profile_credentials(config_dir: Path) -> Optional[dict]:
+    """Read an isolated Claude Code profile's OAuth block, or None.
+
+    Returns {accessToken, refreshToken, expiresAt, scopes}. A missing or
+    unreadable profile is None (unconfigured row), never an exception.
+    """
+    cred_path = config_dir / ".credentials.json"
     try:
         data = json.loads(cred_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1025,35 +1078,40 @@ def _read_anthropic2_credentials(
     return oauth
 
 
-def _fetch_anthropic2_account_usage(
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+def _fetch_pinned_profile_usage(
+    provider: str,
     *,
+    read: Callable[[], Optional[dict]],
+    write: Callable[..., None],
     timeout: float = _DEFAULT_USAGE_TIMEOUT,
 ) -> Optional[AccountUsageSnapshot]:
-    """Second Anthropic subscription (diegodearagaous@gmail.com).
+    """Usage for one Anthropic account PINNED to an isolated login profile.
 
-    Credential source: the isolated login profile at
-    ``~/.claude-anthropic2/.credentials.json`` (one-time
-    ``CLAUDE_CONFIG_DIR=... claude auth login``), NOT an env token --
+    Credential source: an isolated ``CLAUDE_CONFIG_DIR`` profile's
+    ``.credentials.json`` (one-time ``claude /login``), NOT an env token --
     `claude setup-token` tokens are inference-only and get 403 on the usage
     endpoint (verified live 2026-08-23). Missing profile → None, so the row
     degrades to unconfigured rather than erroring every cycle.
+
+    Pinning is the point: ``~/.claude`` follows whichever account the desktop
+    app is currently signed into, so a row sourced from it silently changes
+    subject on every account switch (observed 2026-08-23 14:18, when the
+    primary flipped from diegodearagao to diegodearagaous and collapsed onto
+    the "Claude 2" row). An isolated profile keeps one row on one account.
 
     Expired access tokens are refreshed in place with the profile's own
     refresh token. Refresh tokens are SINGLE-USE rotating: a successful
     refresh invalidates the old one, so the new pair is written back to the
     profile file immediately -- losing it would force a manual re-login.
     """
-    del base_url  # dispatcher passes it; this fetcher has no alternate host
-    creds = _read_anthropic2_credentials()
+    creds = read()
     if creds is None:
         return None
 
     token = str(creds.get("accessToken") or "").strip()
     if not _is_oauth_token(token):
         return AccountUsageSnapshot(
-            provider="anthropic2",
+            provider=provider,
             source="oauth_usage_api",
             fetched_at=_utc_now(),
             unavailable_reason="Isolated profile credential is not an OAuth token; re-run the one-time `claude auth login` for this account.",
@@ -1068,7 +1126,7 @@ def _fetch_anthropic2_account_usage(
         refresh_token = str(creds.get("refreshToken") or "").strip()
         if not refresh_token:
             return AccountUsageSnapshot(
-                provider="anthropic2",
+                provider=provider,
                 source="oauth_usage_api",
                 fetched_at=_utc_now(),
                 unavailable_reason="Access token expired and the isolated profile holds no refresh token; re-run the one-time `claude auth login`.",
@@ -1076,9 +1134,9 @@ def _fetch_anthropic2_account_usage(
         try:
             refreshed = refresh_anthropic_oauth_pure(refresh_token)
         except Exception as exc:
-            logger.debug("anthropic2 token refresh failed: %s", exc)
+            logger.debug("%s token refresh failed: %s", provider, exc)
             return AccountUsageSnapshot(
-                provider="anthropic2",
+                provider=provider,
                 source="oauth_usage_api",
                 fetched_at=_utc_now(),
                 unavailable_reason="Token refresh failed (refresh token may have been rotated elsewhere); re-run the one-time `claude auth login`.",
@@ -1088,14 +1146,31 @@ def _fetch_anthropic2_account_usage(
         # the POST, so a crash between refresh and write would strand the
         # profile. Scopes are preserved from the existing file when the
         # response omits them (Claude Code gates on user:inference there).
-        _write_anthropic2_credentials(
+        write(
             refreshed["access_token"],
             refreshed["refresh_token"],
             refreshed["expires_at_ms"],
             scopes=creds.get("scopes"),
         )
 
-    return _fetch_anthropic_usage_with_token(token, timeout=timeout, provider="anthropic2")
+    return _fetch_anthropic_usage_with_token(token, timeout=timeout, provider=provider)
+
+
+def _fetch_anthropic2_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
+) -> Optional[AccountUsageSnapshot]:
+    """Second Anthropic subscription, pinned to ``~/.claude-anthropic2``."""
+    del base_url  # dispatcher passes it; this fetcher has no alternate host
+    # Late-bound through the module globals so tests can monkeypatch either.
+    return _fetch_pinned_profile_usage(
+        "anthropic2",
+        read=lambda: _read_anthropic2_credentials(),
+        write=lambda *a, **kw: _write_anthropic2_credentials(*a, **kw),
+        timeout=timeout,
+    )
 
 
 def _write_anthropic2_credentials(
@@ -1111,7 +1186,25 @@ def _write_anthropic2_credentials(
     anthropic_adapter._write_claude_code_credentials but against the isolated
     config dir. Existing non-oauth top-level fields are preserved.
     """
-    cred_path = _ANTHROPIC2_CONFIG_DIR / ".credentials.json"
+    _write_profile_credentials(
+        _ANTHROPIC2_CONFIG_DIR,
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        scopes=scopes,
+    )
+
+
+def _write_profile_credentials(
+    config_dir: Path,
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+) -> None:
+    """Atomically write a rotated OAuth pair into an isolated profile."""
+    cred_path = config_dir / ".credentials.json"
     existing: dict = {}
     try:
         if cred_path.exists():
@@ -1131,7 +1224,7 @@ def _write_anthropic2_credentials(
     existing["claudeAiOauth"] = oauth_data
 
     payload = json.dumps(existing, indent=2)
-    _ANTHROPIC2_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = cred_path.with_suffix(".json.tmp")
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:

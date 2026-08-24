@@ -139,3 +139,44 @@ def test_identity_failure_never_costs_the_usage_numbers():
 
     client = _FakeClient(_FakeResponse({}, status_ok=False))
     assert _fetch_anthropic_account_identity(client, {}) == (None, None)
+
+
+def test_primary_row_prefers_the_pinned_profile_over_the_live_login(monkeypatch):
+    """~/.claude follows the desktop app's current account; the row must not.
+
+    Regression for 2026-08-23 14:18, when the primary profile was switched from
+    diegodearagao to diegodearagaous and the "Claude" row silently became a
+    duplicate of "Claude 2".
+    """
+    from agent import account_usage
+
+    pinned = {"accessToken": "sk-ant-oat01-pinned", "expiresAt": 1 << 62}
+    monkeypatch.setattr(account_usage, "_read_anthropic1_credentials", lambda: pinned)
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_anthropic_token",
+        lambda: (_ for _ in ()).throw(AssertionError("must not read the live login")),
+    )
+    seen = {}
+
+    def fake_fetch(token, *, timeout=None, provider="anthropic"):
+        seen["token"] = token
+        seen["provider"] = provider
+        return "snapshot"
+
+    monkeypatch.setattr(account_usage, "_fetch_anthropic_usage_with_token", fake_fetch)
+    assert account_usage._fetch_anthropic_account_usage() == "snapshot"
+    assert seen == {"token": "sk-ant-oat01-pinned", "provider": "anthropic"}
+
+
+def test_primary_row_falls_back_to_the_live_login_when_unpinned(monkeypatch):
+    from agent import account_usage
+
+    monkeypatch.setattr(account_usage, "_read_anthropic1_credentials", lambda: None)
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "sk-ant-oat01-live")
+    monkeypatch.setattr(
+        account_usage,
+        "_fetch_anthropic_usage_with_token",
+        lambda token, *, timeout=None, provider="anthropic": ("fallback", token),
+    )
+    assert account_usage._fetch_anthropic_account_usage() == ("fallback", "sk-ant-oat01-live")
