@@ -455,6 +455,195 @@ _PASSWORD_FORM_SCRIPT = """\
 """
 
 
+_AUTH_ERROR_HTML_TEMPLATE = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign-in failed — Hermes Agent</title>
+<style>
+  @font-face {{
+    font-family: 'Collapse';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
+  }}
+  @font-face {{
+    font-family: 'Collapse';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('/fonts/Collapse-Bold.woff2') format('woff2');
+  }}
+  @font-face {{
+    font-family: 'Rules Compressed';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
+  }}
+  :root {{
+    --background-base: #170d02;
+    --midground: #ffac02;
+    --foreground: #ffffff;
+    --hairline: color-mix(in srgb, #ffac02 18%, transparent);
+    --error: #ff6b6b;
+  }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  html, body {{
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
+    background: var(--background-base);
+    color: var(--foreground);
+    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }}
+  body {{
+    display: grid;
+    place-items: center;
+    padding: clamp(1.5rem, 6vh, 6rem) 1.25rem;
+  }}
+  main {{
+    width: 100%;
+    max-width: 26rem;
+    animation: slide-up 0.6s ease-out both;
+  }}
+  @keyframes slide-up {{
+    from {{ opacity: 0; transform: translateY(6px); }}
+    to   {{ opacity: 1; transform: translateY(0); }}
+  }}
+  @media (prefers-reduced-motion: reduce) {{
+    main {{ animation: none; }}
+  }}
+  .brand {{
+    text-align: center;
+    margin-bottom: 1.75rem;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
+    font-weight: 600;
+    font-size: 1.05rem;
+    letter-spacing: 0.32em;
+    text-transform: uppercase;
+    color: var(--midground);
+  }}
+  .brand .dot {{
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    background: var(--midground);
+    margin: 0 0.55em 0.18em;
+    vertical-align: middle;
+    border-radius: 1px;
+  }}
+  .card {{
+    padding: 2.25rem 2rem 2rem;
+    background: color-mix(in srgb, #ffffff 2%, var(--background-base));
+    border: 1px solid var(--hairline);
+    box-shadow:
+      inset 1px 1px 0 0 color-mix(in srgb, #ffffff 5%, transparent),
+      inset -1px -1px 0 0 rgba(0, 0, 0, 0.4),
+      0 24px 60px -20px rgba(0, 0, 0, 0.6);
+  }}
+  .icon {{
+    width: 2.5rem;
+    height: 2.5rem;
+    margin: 0 0 1.25rem;
+    border: 1px solid var(--error);
+    color: var(--error);
+    display: grid;
+    place-items: center;
+    font-family: 'Rules Compressed', sans-serif;
+    font-weight: 600;
+    font-size: 1.3rem;
+  }}
+  h1 {{
+    margin: 0 0 0.75rem;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
+    font-weight: 600;
+    font-size: 1.6rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--foreground);
+  }}
+  .message {{
+    margin: 0 0 1.75rem;
+    color: color-mix(in srgb, var(--foreground) 75%, transparent);
+    font-size: 0.92rem;
+    word-break: break-word;
+  }}
+  .retry-btn {{
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.95rem 1rem;
+    text-align: center;
+    background: var(--midground);
+    color: var(--background-base);
+    font-family: 'Collapse', sans-serif;
+    font-weight: 700;
+    font-size: 0.78rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    text-decoration: none;
+    border: 0;
+    border-radius: 0;
+    box-shadow:
+      inset 1px 1px 0 0 rgba(255, 255, 255, 0.5),
+      inset -1px -1px 0 0 rgba(0, 0, 0, 0.5);
+    transition: filter 0.12s ease-out;
+  }}
+  .retry-btn:hover {{ filter: brightness(1.08); }}
+  .retry-btn:active {{ filter: invert(1); }}
+  .retry-btn:focus-visible {{
+    outline: 2px solid var(--midground);
+    outline-offset: 3px;
+  }}
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">Nous<span class="dot"></span>Research</div>
+  <div class="card">
+    <div class="icon">!</div>
+    <h1>Sign-in failed</h1>
+    <p class="message">{message}</p>
+    <a class="retry-btn" href="/login">Back to sign in</a>
+  </div>
+</main>
+</body>
+</html>
+"""
+
+
+def render_auth_error_html(*, message: str) -> str:
+    """Render the HTML page shown for a failed ``/auth/callback`` request.
+
+    ``/auth/callback`` is the OAuth 2.0 / OpenID Connect redirection
+    endpoint (RFC 6749 §3.1.2, RFC 6749 §4.1.2) that the identity
+    provider (IDP) navigates the *top-level browser window* to — it is
+    never called via ``fetch``/XHR. Returning a FastAPI ``HTTPException``
+    on that endpoint therefore renders its JSON body directly as page
+    content instead of a document, which is what this function replaces.
+    It reuses :func:`render_login_html`'s visual language (same design
+    tokens, fonts, and card layout) so a failed callback still looks like
+    part of the app, with a link back to ``/login`` to retry.
+
+    Security note: ``message`` may echo back caller-controlled text (an
+    IDP-supplied ``error_description``, or a provider exception message)
+    and is HTML-escaped via :func:`html.escape` before interpolation into
+    the template — the standard mitigation for reflected XSS when
+    untrusted text is embedded in an HTML response (OWASP XSS Prevention
+    Cheat Sheet, rule #1: HTML-entity-encode untrusted data before
+    inserting it into HTML element content).
+    """
+    return _AUTH_ERROR_HTML_TEMPLATE.format(message=html.escape(message))
+
+
 def render_login_html(*, next_path: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 

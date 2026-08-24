@@ -46,7 +46,10 @@ from hermes_cli.dashboard_auth.cookies import (
     set_pkce_cookie,
     set_session_cookies,
 )
-from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.login_page import (
+    render_auth_error_html,
+    render_login_html,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -431,6 +434,38 @@ async def auth_callback(
     error: str = "",
     error_description: str = "",
 ):
+    """OAuth 2.0 / OIDC redirection endpoint (RFC 6749 §4.1.2).
+
+    The identity provider (IDP) navigates the browser here after the
+    user authenticates, with ``code`` + ``state`` (success) or ``error``
+    (+ ``error_description``, per RFC 6749 §4.1.2.1) on failure. This
+    completes the Authorization Code Grant:
+
+      1. **CSRF protection** (RFC 6749 §10.12 / OAuth 2.0 Security BCP
+         §4.7.1): the ``state`` value returned by the IDP is compared
+         against the one this app generated and stored server-side in
+         the PKCE cookie at ``/auth/login`` — a mismatch means the
+         request did not originate from a login flow we started.
+      2. **PKCE** (RFC 7636): the ``code_verifier`` stashed in that same
+         cookie is handed to ``complete_login`` for the token exchange,
+         proving this callback is being redeemed by the same client
+         that initiated the authorization request (mitigates
+         authorization-code interception).
+      3. **RFC 8252** (OAuth 2.0 for Native Apps): if the PKCE cookie
+         carries a ``broker=`` marker, this call originated from
+         ``/auth/native/authorize`` and completes via a loopback
+         redirect instead of setting browser session cookies — see the
+         ``broker_state`` branch below.
+
+    Because this route is only ever reached via a full top-level
+    browser navigation (never fetch/XHR), every failure branch returns
+    an :class:`~fastapi.responses.HTMLResponse` rendered by
+    :func:`~hermes_cli.dashboard_auth.login_page.render_auth_error_html`
+    rather than raising :class:`~fastapi.HTTPException` — an
+    ``HTTPException`` would otherwise dump raw JSON as the page body.
+    Each failure is also recorded via :func:`audit_log` before the
+    response is built.
+    """
     pkce_raw = read_pkce_cookie(request)
     if not pkce_raw:
         audit_log(
@@ -438,9 +473,12 @@ async def auth_callback(
             reason="missing_pkce_cookie",
             ip=_client_ip(request),
         )
-        raise HTTPException(
+        return HTMLResponse(
+            render_auth_error_html(
+                message="Missing sign-in state cookie. Your browser may be "
+                "blocking cookies, or the link expired — please try again."
+            ),
             status_code=400,
-            detail="Missing PKCE state cookie",
         )
 
     # Parse ``provider=...;state=...;verifier=...;next=...`` — the
@@ -466,9 +504,12 @@ async def auth_callback(
 
     p = get_provider(provider_name)
     if p is None:
-        raise HTTPException(
+        return HTMLResponse(
+            render_auth_error_html(
+                message=f"Unknown sign-in provider: {provider_name!r}. "
+                "Please start over."
+            ),
             status_code=400,
-            detail=f"Unknown provider in cookie: {provider_name!r}",
         )
 
     if error:
@@ -479,9 +520,12 @@ async def auth_callback(
             error=error,
             ip=_client_ip(request),
         )
-        raise HTTPException(
+        detail = f"{error} ({error_description})" if error_description else error
+        return HTMLResponse(
+            render_auth_error_html(
+                message=f"Sign-in was cancelled or failed: {detail}"
+            ),
             status_code=400,
-            detail=f"OAuth error from provider: {error} ({error_description})",
         )
 
     if not state or state != expected_state:
@@ -491,9 +535,12 @@ async def auth_callback(
             reason="state_mismatch",
             ip=_client_ip(request),
         )
-        raise HTTPException(
+        return HTMLResponse(
+            render_auth_error_html(
+                message="Sign-in state check failed (possible expired or "
+                "replayed link). Please try signing in again."
+            ),
             status_code=400,
-            detail="OAuth state mismatch (CSRF check failed)",
         )
 
     try:
@@ -510,7 +557,10 @@ async def auth_callback(
             reason="invalid_code",
             ip=_client_ip(request),
         )
-        raise HTTPException(status_code=400, detail=f"Invalid code: {e}")
+        return HTMLResponse(
+            render_auth_error_html(message=str(e)),
+            status_code=400,
+        )
     except ProviderError as e:
         audit_log(
             AuditEvent.LOGIN_FAILURE,
@@ -518,9 +568,11 @@ async def auth_callback(
             reason="provider_unreachable",
             ip=_client_ip(request),
         )
-        raise HTTPException(
+        return HTMLResponse(
+            render_auth_error_html(
+                message=f"Sign-in provider is temporarily unavailable: {e}"
+            ),
             status_code=503,
-            detail=f"Provider unreachable: {e}",
         )
 
     audit_log(
@@ -556,9 +608,12 @@ async def auth_callback(
                 reason="pending_not_found",
                 ip=_client_ip(request),
             )
-            raise HTTPException(
+            return HTMLResponse(
+                render_auth_error_html(
+                    message="Native login expired or unknown; please "
+                    "restart sign-in from the app."
+                ),
                 status_code=400,
-                detail="Native login expired or unknown; restart sign-in.",
             )
         from urllib.parse import urlencode
 
