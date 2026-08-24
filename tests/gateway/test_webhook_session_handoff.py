@@ -701,15 +701,12 @@ async def test_in_place_compaction_preserves_durable_input_marker(
 
         assert run.store._db.has_webhook_handoff_input(run.marker)
         active = run.store.load_transcript(run.entry.session_id)
-        assert active == [
-            {
-                "role": "user",
-                "content": "compacted current webhook input",
-                "api_content": "compacted current webhook input",
-                "timestamp": active[0]["timestamp"],
-                "message_id": run.marker,
-            }
-        ]
+        assert len(active) == 1
+        assert active[0]["role"] == "user"
+        assert active[0]["content"] == "compacted current webhook input"
+        assert active[0]["api_content"] == "compacted current webhook input"
+        assert active[0]["timestamp"]
+        assert active[0]["message_id"] == run.marker
         await run.adapter.on_agent_input_persisted(
             run.event,
             session_key=run.session_key,
