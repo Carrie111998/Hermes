@@ -1444,7 +1444,19 @@ def resolve_anthropic_token() -> Optional[str]:
     def _read_creds() -> Optional[Dict[str, Any]]:
         nonlocal creds, creds_loaded
         if not creds_loaded:
-            creds = read_claude_code_credentials()
+            try:
+                from hermes_cli.auth import is_source_suppressed
+
+                claude_code_suppressed = is_source_suppressed(
+                    "anthropic", "claude_code"
+                )
+            except Exception:
+                logger.debug(
+                    "Unable to read Claude Code suppression state; skipping credential access",
+                    exc_info=True,
+                )
+                claude_code_suppressed = True
+            creds = None if claude_code_suppressed else read_claude_code_credentials()
             creds_loaded = True
         return creds
 

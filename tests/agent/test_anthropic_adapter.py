@@ -376,6 +376,44 @@ class TestResolveAnthropicToken:
         assert resolve_anthropic_token() == "pool-oauth-token"
         assert captured == {"clear_expired": False, "refresh": False}
 
+    def test_suppression_lookup_failure_does_not_read_claude_code_credentials(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "«redacted:sk-…»")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+        def _raise_suppression_error(_provider, _source):
+            raise OSError("auth store unavailable")
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_source_suppressed",
+            _raise_suppression_error,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            self._assert_not_called,
+        )
+
+        assert resolve_anthropic_token() == "«redacted:sk-…»"
+
+    def test_suppressed_claude_code_source_is_not_read_for_static_anthropic_token(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "«redacted:sk-…»")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_source_suppressed",
+            lambda provider, source: provider == "anthropic" and source == "claude_code",
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            self._assert_not_called,
+        )
+
+        assert resolve_anthropic_token() == "«redacted:sk-…»"
+
     def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
