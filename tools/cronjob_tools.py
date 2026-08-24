@@ -1664,6 +1664,28 @@ def cronjob(
                 if job.get("state") != "paused":
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
+                    # Re-arming a consumed finite one-shot must reset the
+                    # spent quota. The terminal record keeps
+                    # repeat.completed >= repeat.times; re-enabling without
+                    # resetting makes the edit report success with a future
+                    # next_run_at, then the due scan's dispatch-limit guard
+                    # removes the job at the new fire time without firing
+                    # — the rescheduled run silently never happens (#93524).
+                    # Consumption is judged on the STORED record (not the
+                    # merged quota — a --repeat bump in the same edit that
+                    # leaves completed < times is not a consumed record).
+                    if parsed_schedule.get("kind") == "once":
+                        stored_repeat = dict(job.get("repeat") or {})
+                        if (
+                            (stored_repeat.get("times") or 0) > 0
+                            and stored_repeat.get("completed", 0)
+                            >= stored_repeat["times"]
+                        ):
+                            repeat_state = dict(
+                                updates.get("repeat") or stored_repeat
+                            )
+                            repeat_state["completed"] = 0
+                            updates["repeat"] = repeat_state
             if not updates:
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
