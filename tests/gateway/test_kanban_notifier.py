@@ -1,11 +1,14 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
+    _format_kanban_event_message,
+    _localized_kanban_status,
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
@@ -79,6 +82,18 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_localized_kanban_status_known_and_unknown_are_safe(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+
+    assert _localized_kanban_status("ready") == "대기"
+    unknown = _localized_kanban_status("mystery<script>상태" + "x" * 100)
+
+    assert unknown.startswith("알 수 없는 상태 (mysteryscript상태")
+    assert "gateway.kanban.status." not in unknown
+    assert "<" not in unknown and ">" not in unknown
+    assert len(unknown) <= 48
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
@@ -499,6 +514,96 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     wake_key = build_session_key(adapter.handled[0].source)
     assert wake_key == "agent:main:telegram:dm:chat-dm"
     assert ":group:" not in wake_key
+
+
+def test_korean_notices_distinguish_budget_and_runtime_timeout(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+    sub = {"task_id": "t_budget"}
+    task = SimpleNamespace(title="긴 작업", assignee="worker", status="ready")
+
+    budget_text = _format_kanban_event_message(
+        sub,
+        task,
+        SimpleNamespace(
+            kind="timed_out",
+            payload={"budget_used": 100, "budget_max": 100, "retry_status": "ready"},
+        ),
+        "default",
+    )
+    runtime_text = _format_kanban_event_message(
+        sub,
+        task,
+        SimpleNamespace(
+            kind="timed_out",
+            payload={
+                "elapsed_seconds": 61,
+                "limit_seconds": 60,
+                "retry_status": "ready",
+            },
+        ),
+        "default",
+    )
+
+    assert "반복 예산 소진" in budget_text
+    assert "100/100" in budget_text
+    assert "max_runtime=0s" not in budget_text
+    assert "실행 시간 초과" in runtime_text
+    assert "max_runtime=60s" in runtime_text
+    assert "재시도합니다" in budget_text
+    assert "재시도합니다" in runtime_text
+
+
+def test_retry_notice_requires_confirmed_retry_state(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+    sub = {"task_id": "t_stopped"}
+    task = SimpleNamespace(title="멈춘 작업", assignee="worker", status="blocked")
+
+    text = _format_kanban_event_message(
+        sub,
+        task,
+        SimpleNamespace(
+            kind="crashed",
+            payload={"retry_status": "ready"},
+        ),
+        "default",
+    )
+
+    assert "작업자 프로세스가 종료" in text
+    assert "재시도" not in text
+
+
+def test_gave_up_budget_notice_is_not_spawn_failure(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+    text = _format_kanban_event_message(
+        {"task_id": "t_done"},
+        SimpleNamespace(title="예산 작업", assignee="worker", status="blocked"),
+        SimpleNamespace(
+            kind="gave_up",
+            payload={
+                "trigger_outcome": "timed_out",
+                "budget_used": 100,
+                "budget_max": 100,
+                "error": "Iteration budget exhausted",
+            },
+        ),
+        "default",
+    )
+
+    assert "반복 예산을 소진해 중단" in text
+    assert "100/100" in text
+    assert "실행 실패" not in text
+
+
+def test_english_completed_notice_preserves_existing_text(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    text = _format_kanban_event_message(
+        {"task_id": "t_done"},
+        SimpleNamespace(title="notify once", assignee="worker", status="done", result=None),
+        SimpleNamespace(kind="completed", payload={"summary": "done once"}),
+        "default",
+    )
+
+    assert text == "✔ [default] @worker Kanban t_done done — notify once\ndone once"
 
 
 def _unseen_terminal_events_for(tid, chat_id):

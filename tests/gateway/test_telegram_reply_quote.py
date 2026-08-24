@@ -66,8 +66,10 @@ def test_native_partial_quote_used_as_reply_to_text():
         quote_text="Item B: rotate keys",
     )
 
-    event = adapter._build_message_event(msg, MessageType.TEXT)
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=7001)
 
+    assert event.message_id == "1001"
+    assert event.platform_update_id == 7001
     assert event.reply_to_text == "Item B: rotate keys"
     assert event.reply_to_message_id == "42"
 

@@ -146,6 +146,11 @@ gateway:
     invalid:               "Geçersiz hedef: {error}"
     set:                   "⊙ Hedef ayarlandı ({budget} turluk bütçe): {goal}\nHedef tamamlanana, siz duraklatana/temizleyene veya bütçe tükenene kadar çalışmaya devam edeceğim.\nKontroller: /goal status · /goal pause · /goal resume · /goal clear"
 
+    busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
+    busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+    busy_identity_missing: "The current work is still in progress. The new Telegram request was not added because it has no durable delivery identity."
+    busy_already_handled:  "The current work is still in progress. This request was already handled. Task ID: {task_id}, final status: {status}."
+
   help:
     header:                "📖 **Hermes Komutları**\n"
     skill_header:          "\n⚡ **Skill Komutları** ({count} aktif):"
@@ -156,10 +161,37 @@ gateway:
     error:                 "Analiz oluşturulurken hata: {error}"
 
   kanban:
+    unknown_status:        "unknown status ({status})"
     error_prefix:          "⚠ kanban hatası: {error}"
     subscribed_suffix:     "(abone olundu — {task_id} tamamlandığında veya engellendiğinde bildirim alacaksınız)"
     truncated_suffix:      "… (kısaltıldı; tam çıktı için terminalinizde `hermes kanban …` komutunu kullanın)"
     no_output:             "(çıktı yok)"
+    status:
+      triage:              "triage"
+      todo:                "waiting for dependencies"
+      scheduled:           "scheduled"
+      ready:               "ready"
+      running:             "running"
+      blocked:             "blocked"
+      review:              "in review"
+      done:                "done"
+      archived:            "archived"
+    notice:
+      retry:               "; dispatcher will retry"
+      completed:           "✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+      blocked:             "⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+      gave_up:             "✖ {board_tag}{tag}Kanban {task_id} gave up{error}"
+      gave_up_spawn:       "✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{error}"
+      gave_up_budget:      "✖ {board_tag}{tag}Kanban {task_id} gave up after exhausting the iteration budget ({used}/{max}){error}"
+      gave_up_timeout:     "✖ {board_tag}{tag}Kanban {task_id} gave up after runtime timeout (max_runtime={limit}s, elapsed={elapsed}s){error}"
+      gave_up_worker:      "✖ {board_tag}{tag}Kanban {task_id} gave up after the worker exited{error}"
+      worker_exited:       "✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone){retry}"
+      budget_exhausted:    "⏱ {board_tag}{tag}Kanban {task_id} iteration budget exhausted ({used}/{max}){retry}"
+      runtime_timeout:     "⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s, elapsed={elapsed}s){retry}"
+      status:              "🔄 {board_tag}{tag}Kanban {task_id} → {status}"
+      review:              "👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+      block_loop_count:    " (blocked {count}x for the same cause)"
+      block_loop:          "🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — needs a human decision{count}{reason}"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

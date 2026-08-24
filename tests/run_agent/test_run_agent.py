@@ -4618,6 +4618,10 @@ class TestRunConversation:
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
+        assert call.kwargs.get("event_payload_extra") == {
+            "budget_used": 2,
+            "budget_max": 2,
+        }
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
