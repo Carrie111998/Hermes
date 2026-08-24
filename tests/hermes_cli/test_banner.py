@@ -122,6 +122,34 @@ def test_explicit_empty_toolsets_do_not_advertise_tools_or_skills(
     assert "Skills toolset disabled" in out
 
 
+def test_unrestricted_toolsets_keep_global_unavailable_tools(tmp_path, monkeypatch):
+    """Omitting the selector keeps the unrestricted availability display."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    unavailable = [{"id": "web", "name": "web", "tools": ["web_search"]}]
+
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=([], unavailable),
+        ),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(
+            console=console,
+            model="test-model",
+            cwd="/tmp/project",
+            tools=[],
+            enabled_toolsets=None,
+        )
+
+    assert "web_search" in console.export_text()
+
+
 def test_banner_snapshot_distinguishes_unrestricted_from_explicit_empty(
     tmp_path, monkeypatch
 ):

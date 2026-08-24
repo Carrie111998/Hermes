@@ -962,10 +962,9 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     tools = tools or []
     unrestricted_toolsets = enabled_toolsets is None
-    enabled_toolsets = enabled_toolsets or []
-
     if availability is None:
         availability = compute_toolset_availability(enabled_toolsets)
+    enabled_toolsets = enabled_toolsets or []
     unavailable_toolsets = availability.get("unavailable_toolsets", [])
     lazy_tools = set(availability.get("lazy_tools", []))
     disabled_tools = set(availability.get("disabled_tools", []))
