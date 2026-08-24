@@ -113,6 +113,8 @@ BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
+DEFAULT_CONTEXT_MESSAGE_BUDGET = 8
+MAX_CONTEXT_MESSAGE_BUDGET = 10
 
 
 def _is_stale_session_ret(
@@ -1227,6 +1229,17 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
+        try:
+            configured_context_budget = int(
+                extra.get("context_message_budget", DEFAULT_CONTEXT_MESSAGE_BUDGET)
+            )
+        except (TypeError, ValueError):
+            configured_context_budget = DEFAULT_CONTEXT_MESSAGE_BUDGET
+        self._context_message_budget = min(
+            MAX_CONTEXT_MESSAGE_BUDGET,
+            max(1, configured_context_budget),
+        )
+        self._context_send_counts: Dict[str, int] = {}
         self._dm_policy = str(extra.get("dm_policy") or _wx_secret("WEIXIN_DM_POLICY", "pairing")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or _wx_secret("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1498,6 +1511,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
+            self._record_fresh_context(context_token)
             self._token_store.set(self._account_id, sender_id, context_token)
         asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
 
@@ -1758,6 +1772,61 @@ class WeixinAdapter(BasePlatformAdapter):
             content, self.MAX_MESSAGE_LENGTH, self._split_multiline_messages,
         )
 
+    def _record_fresh_context(self, context_token: str) -> None:
+        """Reset the local outbound allowance after a fresh inbound turn."""
+        if context_token:
+            self._context_send_counts[context_token] = 0
+
+    def _ensure_context_budget(self, context_token: Optional[str]) -> None:
+        if not context_token:
+            return
+        if self._context_send_counts.get(context_token, 0) < self._context_message_budget:
+            return
+        raise RuntimeError(
+            "Weixin outbound safety budget exhausted for this context; "
+            "wait for a fresh inbound message before sending more bubbles"
+        )
+
+    def _record_context_send(self, context_token: Optional[str]) -> None:
+        if context_token:
+            self._context_send_counts[context_token] = (
+                self._context_send_counts.get(context_token, 0) + 1
+            )
+
+    def _log_send_response(
+        self,
+        response: Dict[str, Any],
+        *,
+        client_id: str,
+        context_token: Optional[str],
+        attempt: int,
+    ) -> None:
+        """Log iLink acceptance fields without claiming downstream delivery."""
+        ret = response.get("ret")
+        errcode = response.get("errcode")
+        accepted = ret in {0, None} and errcode in {0, None}
+        errmsg = re.sub(
+            r"[\x00-\x1f\x7f]+",
+            " ",
+            str(response.get("errmsg") or response.get("msg") or ""),
+        ).strip()[:160]
+        logger.info(
+            "[%s] sendmessage response path=live endpoint=%s ret=%s errcode=%s "
+            "errmsg=%r client=%s context=%s attempt=%d/%d circuit=%s "
+            "acceptance=%s delivery_ack=unavailable",
+            self.name,
+            EP_SEND_MESSAGE,
+            ret,
+            errcode,
+            errmsg,
+            _safe_id(client_id, keep=20),
+            str(bool(context_token)).lower(),
+            attempt + 1,
+            self._send_chunk_retries + 1,
+            "open" if self._rate_limit_cooldown_remaining() > 0 else "closed",
+            "accepted" if accepted else "rejected",
+        )
+
     def _rate_limit_cooldown_remaining(self) -> float:
         return max(0.0, self._rate_limit_circuit_until - time.monotonic())
 
@@ -1823,6 +1892,7 @@ class WeixinAdapter(BasePlatformAdapter):
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
         retried_without_token = False
+        self._ensure_context_budget(context_token)
         for attempt in range(self._send_chunk_retries + 1):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
@@ -1836,6 +1906,13 @@ class WeixinAdapter(BasePlatformAdapter):
                     context_token=context_token,
                     client_id=client_id,
                 )
+                if isinstance(resp, dict):
+                    self._log_send_response(
+                        resp,
+                        client_id=client_id,
+                        context_token=context_token,
+                        attempt=attempt,
+                    )
                 # Check iLink response for session-expired error
                 if resp and isinstance(resp, dict):
                     ret = resp.get("ret")
@@ -1887,6 +1964,7 @@ class WeixinAdapter(BasePlatformAdapter):
                         raise RuntimeError(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
+                self._record_context_send(context_token)
                 self._reset_rate_limit_circuit()
                 return
             except Exception as exc:

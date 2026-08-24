@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -269,6 +270,72 @@ class TestWeixinChunkDelivery:
         # rest of the current chunk and follow-up sends fail fast.
         assert send_message_mock.await_count == 2
         assert sleep_mock.await_count == 1
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_logs_api_acceptance_without_claiming_delivery(
+        self, send_message_mock, caplog,
+    ):
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = {
+            "ret": 0,
+            "errcode": 0,
+            "errmsg": "ok\nignored-control-line",
+        }
+
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.weixin"):
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        [record] = [
+            record for record in caplog.records
+            if "sendmessage response" in record.getMessage()
+        ]
+        message = record.getMessage()
+        assert "path=live" in message
+        assert "ret=0" in message
+        assert "errcode=0" in message
+        assert "context=true" in message
+        assert "acceptance=accepted" in message
+        assert "delivery_ack=unavailable" in message
+        assert "ignored-control-line" in message
+        assert "\n" not in message
+        assert "wxid_test123" not in message
+        assert "ctx-token" not in message
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_context_budget_blocks_excess_bubbles_until_fresh_inbound(
+        self, send_message_mock,
+    ):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "context_message_budget": 2,
+                },
+            )
+        )
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        send_message_mock.return_value = {"ret": 0, "errcode": 0}
+
+        first = asyncio.run(adapter.send("wxid_test123", "first"))
+        second = asyncio.run(adapter.send("wxid_test123", "second"))
+        blocked = asyncio.run(adapter.send("wxid_test123", "third"))
+
+        assert first.success is True
+        assert second.success is True
+        assert blocked.success is False
+        assert "fresh inbound message" in (blocked.error or "")
+        assert send_message_mock.await_count == 2
+
+        adapter._record_fresh_context("ctx-token")
+        recovered = asyncio.run(adapter.send("wxid_test123", "after inbound"))
+
+        assert recovered.success is True
+        assert send_message_mock.await_count == 3
 
 
 class TestWeixinOutboundMedia:
