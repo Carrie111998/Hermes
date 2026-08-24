@@ -121,6 +121,15 @@ def test_triggers_allowlist_parsed(monkeypatch):
     assert allowlist == {"👍", "paw", "✅"}
 
 
+def test_triggers_empty_allowlist_is_disabled(monkeypatch):
+    # ",,," parses to an EMPTY allowlist -> must be (False, None), never
+    # (True, set()): an inverted signal would read as "enabled for ALL emoji"
+    # under the Slack-style convention where empty set == allow-all.
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", ",,,")
+    assert adapter._reaction_trigger_config() == (False, None)
+
+
 def test_yaml_list_maps_to_comma_env(monkeypatch):
     # exercise _apply_yaml_config the way cli-config loads it
     import os
@@ -137,3 +146,24 @@ def test_yaml_list_maps_to_comma_env(monkeypatch):
         # _apply_yaml_config writes os.environ DIRECTLY, which monkeypatch
         # does not track — pop manually or the value leaks into later tests.
         os.environ.pop("DISCORD_REACTION_TRIGGERS", None)
+
+
+def test_yaml_bridge_skips_env_write_under_profile_scope(monkeypatch):
+    # Multiplex profile loads (#72348) must seed PlatformConfig.extra WITHOUT
+    # writing process-global env: a secondary profile's gates can never become
+    # another profile's policy. Simulate _profile_scoped_config_load() -> True
+    # and assert seed lands while env stays unset.
+    import os
+
+    import plugins.platforms.discord.adapter as m
+
+    monkeypatch.delenv("DISCORD_REACTION_TRIGGERS", raising=False)
+    monkeypatch.setattr(m, "_profile_scoped_config_load", lambda: True)
+    yaml_cfg = {"discord": {"reaction_triggers": ["👍"]}}
+    try:
+        seeded = m._apply_yaml_config(yaml_cfg, yaml_cfg["discord"])
+        assert os.getenv("DISCORD_REACTION_TRIGGERS") is None
+    finally:
+        os.environ.pop("DISCORD_REACTION_TRIGGERS", None)
+    assert seeded is not None
+    assert seeded.get("reaction_triggers") == "👍"

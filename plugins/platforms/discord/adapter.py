@@ -3380,7 +3380,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if raw.lower() in {"true", "1", "yes", "on"}:
             return True, None
         names = {part.strip() for part in raw.split(",") if part.strip()}
-        return bool(names), names
+        if not names:
+            return False, None
+        return True, names
 
     def _normalize_reaction_emoji(self, emoji) -> str:
         return normalize_reaction_emoji(emoji)
