@@ -354,6 +354,14 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban board orchestration\n"
+    "No task is implicitly assigned to this chat. Use `kanban_list` to inspect "
+    "board state, `kanban_show(task_id=...)` to inspect a specific card, and "
+    "`kanban_create(...)` to create explicitly requested or agreed work. Only "
+    "act on task ids supplied by the user or returned by board tools."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
