@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { ErrorBanner } from '@/components/ui/error-state'
 import { useI18n } from '@/i18n'
-import { refreshProjects, refreshProjectTree, renameProjectsMany } from '@/store/projects'
+import { withActiveProjectsContext } from '@/store/projects'
 
 import {
   buildProjectGroupRenamePlan,
@@ -30,6 +30,28 @@ function createOperationId(): string {
 
 function uniqueMemberIds(group: ProjectGroupDescriptor): string[] {
   return [...new Set(group.projectIds.map(id => id.trim()).filter(Boolean))]
+}
+
+function reviewKey(group: ProjectGroupDescriptor): string {
+  return JSON.stringify([group.id, group.label, uniqueMemberIds(group).sort()])
+}
+
+interface ProjectGroupDeleteReview {
+  readonly group: ProjectGroupDescriptor
+  readonly key: string
+  readonly operationId: string
+}
+
+function createReview(group: ProjectGroupDescriptor): ProjectGroupDeleteReview {
+  const frozenGroup = { ...group, projectIds: [...group.projectIds] }
+
+  return { group: frozenGroup, key: reviewKey(frozenGroup), operationId: createOperationId() }
+}
+
+function createReviewFromKey(key: string): ProjectGroupDeleteReview {
+  const [id, label, projectIds] = JSON.parse(key) as [string, string, string[]]
+
+  return createReview({ id, label, projectIds })
 }
 
 export function ProjectGroupDeleteDialog({
@@ -50,9 +72,11 @@ export function ProjectGroupDeleteDialog({
   const [prependGroupName, setPrependGroupName] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [operationId, setOperationId] = useState(createOperationId)
+  const [review, setReview] = useState(() => createReview(group))
   const deleteButtonRef = useRef<HTMLButtonElement>(null)
-  const memberIds = useMemo(() => uniqueMemberIds(group), [group])
+  const liveReviewKey = reviewKey(group)
+  const reviewChanged = review.key !== liveReviewKey
+  const memberIds = useMemo(() => uniqueMemberIds(review.group), [review.group])
   const projectsById = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects])
   const memberProjects = memberIds.map(id => projectsById.get(id)).filter(Boolean) as ProjectGroupDeleteProject[]
   const missingMember = memberProjects.length !== memberIds.length
@@ -63,17 +87,19 @@ export function ProjectGroupDeleteDialog({
     }
 
     try {
-      return buildProjectGroupRenamePlan(group, projects)
+      return buildProjectGroupRenamePlan(review.group, projects)
     } catch (reason) {
       return reason
     }
-  }, [group, missingMember, prependGroupName, projects])
+  }, [missingMember, prependGroupName, projects, review.group])
 
-  const validationError = missingMember
-    ? new ProjectGroupDeleteValidationError('stale', 'A Project is missing from the deletion review')
-    : renamePlan instanceof ProjectGroupDeleteValidationError
-      ? renamePlan
-      : null
+  const validationError = reviewChanged
+    ? new ProjectGroupDeleteValidationError('stale', 'The Project group changed since the deletion review')
+    : missingMember
+      ? new ProjectGroupDeleteValidationError('stale', 'A Project is missing from the deletion review')
+      : renamePlan instanceof ProjectGroupDeleteValidationError
+        ? renamePlan
+        : null
 
   useEffect(() => {
     if (!open) {
@@ -81,10 +107,15 @@ export function ProjectGroupDeleteDialog({
     }
 
     setPrependGroupName(false)
-    setPending(false)
     setError(null)
-    setOperationId(createOperationId())
-  }, [open, group.id])
+    setReview(createReviewFromKey(liveReviewKey))
+  }, [liveReviewKey, open])
+
+  useEffect(() => {
+    if (open) {
+      setPending(false)
+    }
+  }, [open])
 
   const errorMessage = (reason: unknown): string => {
     if (reason instanceof ProjectGroupDeleteCompensationError) {
@@ -99,17 +130,17 @@ export function ProjectGroupDeleteDialog({
   }
 
   const performDelete = async (prepend: boolean) => {
-    await deleteProjectGroup({
-      contribution,
-      group,
-      operationId,
-      prependGroupName: prepend,
-      projects,
-      reconcile: async () => {
-        await Promise.all([refreshProjects(), refreshProjectTree()])
-      },
-      renameMany: renameProjectsMany
-    })
+    await withActiveProjectsContext(({ reconcile, renameMany }) =>
+      deleteProjectGroup({
+        contribution,
+        group: review.group,
+        operationId: review.operationId,
+        prependGroupName: prepend,
+        projects,
+        reconcile,
+        renameMany
+      })
+    )
   }
 
   if (memberIds.length === 0) {
@@ -127,7 +158,7 @@ export function ProjectGroupDeleteDialog({
           }
         }}
         open={open}
-        title={p.deleteGroupTitle(group.label.trim())}
+        title={p.deleteGroupTitle(review.group.label.trim())}
       />
     )
   }
@@ -166,7 +197,7 @@ export function ProjectGroupDeleteDialog({
         }}
       >
         <DialogHeader>
-          <DialogTitle>{p.deleteGroupTitle(group.label.trim())}</DialogTitle>
+          <DialogTitle>{p.deleteGroupTitle(review.group.label.trim())}</DialogTitle>
           <DialogDescription>{p.deleteGroupMoveDescription}</DialogDescription>
         </DialogHeader>
 
@@ -187,7 +218,7 @@ export function ProjectGroupDeleteDialog({
               </h3>
               <ul aria-label={p.deleteGroupPreviewBefore} className="text-sm" role="tree">
                 <li aria-expanded="true" role="treeitem">
-                  <span className="font-medium">{group.label.trim()}</span>
+                  <span className="font-medium">{review.group.label.trim()}</span>
                   <ul className="ml-4 mt-1 grid gap-1" role="group">
                     {memberProjects.map(project => (
                       <li key={project.id} role="treeitem">

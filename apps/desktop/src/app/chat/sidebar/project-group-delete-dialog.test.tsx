@@ -37,9 +37,15 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('@/store/projects', () => ({
-  refreshProjectTree: vi.fn().mockResolvedValue(undefined),
-  refreshProjects: vi.fn().mockResolvedValue(undefined),
-  renameProjectsMany: vi.fn().mockResolvedValue([])
+  withActiveProjectsContext: vi.fn(
+    (
+      operation: (operations: { reconcile: () => Promise<void>; renameMany: () => Promise<never[]> }) => Promise<void>
+    ) =>
+      operation({
+        reconcile: vi.fn().mockResolvedValue(undefined),
+        renameMany: vi.fn().mockResolvedValue([])
+      })
+  )
 }))
 
 const projects = [
@@ -185,5 +191,70 @@ describe('ProjectGroupDeleteDialog', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('provider unavailable')
     expect(checkbox.getAttribute('data-state')).toBe('checked')
     expect(screen.getByRole('group', { name: 'Project rename preview' })).toBeTruthy()
+  })
+
+  it('resets the review and operation identity when the live label or exact member set changes', async () => {
+    let liveGroup = { id: 'work', label: 'CUE++', projectIds: ['p_alpha'] }
+    const deleteGroup = vi.fn().mockRejectedValueOnce(new Error('retry review')).mockResolvedValue(undefined)
+
+    const contribution = {
+      deleteGroup,
+      getSnapshot: () => ({ groups: [liveGroup] }),
+      subscribe: () => () => undefined
+    } satisfies ProjectsGroupingContribution
+
+    const onOpenChange = vi.fn()
+
+    const { rerender } = render(
+      <ProjectGroupDeleteDialog
+        contribution={contribution}
+        group={liveGroup}
+        onOpenChange={onOpenChange}
+        open
+        projects={projects}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete group' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('retry review')
+    const firstOperationId = deleteGroup.mock.calls[0][0].operationId
+
+    liveGroup = { ...liveGroup, label: 'Renamed group' }
+    rerender(
+      <ProjectGroupDeleteDialog
+        contribution={contribution}
+        group={liveGroup}
+        onOpenChange={onOpenChange}
+        open
+        projects={projects}
+      />
+    )
+
+    await waitFor(() => expect(screen.getByRole('checkbox').getAttribute('data-state')).toBe('unchecked'))
+    expect(screen.queryByRole('group', { name: 'Project rename preview' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('checkbox'))
+    liveGroup = { ...liveGroup, projectIds: ['p_alpha', 'p_beta'] }
+    rerender(
+      <ProjectGroupDeleteDialog
+        contribution={contribution}
+        group={liveGroup}
+        onOpenChange={onOpenChange}
+        open
+        projects={projects}
+      />
+    )
+
+    await waitFor(() => expect(screen.getByRole('checkbox').getAttribute('data-state')).toBe('unchecked'))
+    expect(screen.queryByRole('group', { name: 'Project rename preview' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Delete group' }))
+
+    await waitFor(() => expect(deleteGroup).toHaveBeenCalledTimes(2))
+    expect(deleteGroup.mock.calls[1][0]).toMatchObject({
+      expectedProjectIds: ['p_alpha', 'p_beta'],
+      groupId: 'work'
+    })
+    expect(deleteGroup.mock.calls[1][0].operationId).not.toBe(firstOperationId)
   })
 })

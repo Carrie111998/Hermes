@@ -60,9 +60,12 @@ function sanitizeSnapshot(value: unknown): ProjectsGroupingSnapshot | null {
   const groups: ProjectGroupDescriptor[] = []
 
   for (const raw of (value as { groups: readonly unknown[] }).groups) {
-    if (!raw || typeof raw !== 'object') return null
+    if (!raw || typeof raw !== 'object') {
+      return null
+    }
 
     const group = raw as Partial<ProjectGroupDescriptor>
+
     if (
       typeof group.id !== 'string' ||
       !group.id.trim() ||
@@ -94,10 +97,14 @@ function readValidProvider(): {
 } | null {
   for (const entry of registry.getArea(PROJECTS_GROUPING_AREA)) {
     const contribution = entry.data as Partial<ProjectsGroupingContribution> | undefined
-    if (typeof contribution?.getSnapshot !== 'function' || typeof contribution.subscribe !== 'function') continue
+
+    if (typeof contribution?.getSnapshot !== 'function' || typeof contribution.subscribe !== 'function') {
+      continue
+    }
 
     try {
       const snapshot = sanitizeSnapshot(contribution.getSnapshot())
+
       if (snapshot) {
         return { contribution: contribution as ProjectsGroupingContribution, snapshot }
       }
@@ -105,11 +112,13 @@ function readValidProvider(): {
       // A malformed provider must not suppress a valid lower-priority provider.
     }
   }
+
   return null
 }
 
 export function resolveProjectsGrouping(projects: readonly SidebarProjectTree[]): PresentedProjectsGrouping | null {
   const active = readValidProvider()
+
   return active ? resolveProjectsGroupingFrom(active.contribution, active.snapshot, projects) : null
 }
 
@@ -128,19 +137,35 @@ function resolveProjectsGroupingFrom(
   for (const raw of snapshot.groups) {
     const id = typeof raw?.id === 'string' ? raw.id.trim() : ''
     const label = typeof raw?.label === 'string' ? raw.label.trim() : ''
-    if (!id || !label || groupIds.has(id) || !Array.isArray(raw?.projectIds)) continue
+
+    if (!id || !label || groupIds.has(id) || !Array.isArray(raw?.projectIds)) {
+      continue
+    }
 
     groupIds.add(id)
     const groupProjects: SidebarProjectTree[] = []
+
     for (const rawProjectId of raw.projectIds) {
-      if (typeof rawProjectId !== 'string') continue
+      if (typeof rawProjectId !== 'string') {
+        continue
+      }
+
       const projectId = rawProjectId.trim()
-      if (!projectId || claimed.has(projectId)) continue
+
+      if (!projectId || claimed.has(projectId)) {
+        continue
+      }
+
       const project = byId.get(projectId)
-      if (!project) continue
+
+      if (!project) {
+        continue
+      }
+
       claimed.add(projectId)
       groupProjects.push(project)
     }
+
     groups.push({ collapsed: raw.collapsed === true, id, label, projects: groupProjects })
   }
 
@@ -157,7 +182,10 @@ const EMPTY_SUBSCRIBE = () => () => undefined
 const NULL_SNAPSHOT = () => null
 
 function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingSnapshot): boolean {
-  if (left === right) return true
+  if (left === right) {
+    return true
+  }
+
   if (
     left.revision !== right.revision ||
     !Array.isArray(left.groups) ||
@@ -169,12 +197,17 @@ function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingS
 
   const leftGroups = left.groups as readonly ProjectGroupDescriptor[]
   const rightGroups = right.groups as readonly ProjectGroupDescriptor[]
+
   return leftGroups.every((group, index) => {
     const other = rightGroups[index]
-    if (!group || !other || !Array.isArray(group.projectIds) || !Array.isArray(other.projectIds)) return false
+
+    if (!group || !other || !Array.isArray(group.projectIds) || !Array.isArray(other.projectIds)) {
+      return false
+    }
 
     const projectIds = group.projectIds as readonly string[]
     const otherProjectIds = other.projectIds as readonly string[]
+
     return (
       group.id === other.id &&
       group.label === other.label &&
@@ -198,8 +231,12 @@ function createStoreAdapter(contribution: ProjectsGroupingContribution, initialS
         // Keep the last safe value if an accepted provider later misbehaves.
       }
 
-      if (!snapshot || snapshotsEqual(cachedSnapshot, snapshot)) return cachedSnapshot
+      if (!snapshot || snapshotsEqual(cachedSnapshot, snapshot)) {
+        return cachedSnapshot
+      }
+
       cachedSnapshot = snapshot
+
       return snapshot
     },
     subscribe: (listener: () => void) => contribution.subscribe(listener)
@@ -210,10 +247,12 @@ function useProjectsGroupingStore() {
   useContributions(PROJECTS_GROUPING_AREA)
   const active = readValidProvider()
   const contribution = active?.contribution ?? null
+
   const store = useMemo(
     () => (contribution && active ? createStoreAdapter(contribution, active.snapshot) : null),
     [contribution]
   )
+
   const snapshot = useSyncExternalStore(
     store?.subscribe ?? EMPTY_SUBSCRIBE,
     store?.getSnapshot ?? NULL_SNAPSHOT,
@@ -225,6 +264,7 @@ function useProjectsGroupingStore() {
 
 export function useProjectsGrouping(projects: readonly SidebarProjectTree[]): PresentedProjectsGrouping | null {
   const active = useProjectsGroupingStore()
+
   return active ? resolveProjectsGroupingFrom(active.contribution, active.snapshot, projects) : null
 }
 

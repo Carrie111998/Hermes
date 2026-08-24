@@ -886,11 +886,30 @@ const reconcileProjects = (): void => {
   void refreshProjectTree()
 }
 
-const reconcileProjectsOn = (context: ActiveProjectsContext): void => {
-  if (!stillOnProjectsContext(context)) return
+async function reconcileProjectsOn(context: ActiveProjectsContext, reportErrors = false): Promise<void> {
+  if (stillOnProjectsContext(context)) {
+    await Promise.all([refreshProjectsOn(context), refreshProjectTreeOn(context)])
 
-  void refreshProjectsOn(context)
-  void refreshProjectTreeOn(context)
+    return
+  }
+
+  // A transaction may finish after the foreground moved elsewhere. Reconcile
+  // the authority it mutated without advancing foreground generations or
+  // publishing that old source into the new source's caches.
+  const requests = [
+    gatewayRequestOn<ProjectsPayload>(context.gateway, 'projects.list', projectParams({}, context.profile)),
+    gatewayRequestOn<ProjectTreePayload>(
+      context.gateway,
+      'projects.tree',
+      projectParams({ preview_limit: PROJECT_TREE_PREVIEW_LIMIT }, context.profile)
+    )
+  ]
+
+  if (reportErrors) {
+    await Promise.all(requests)
+  } else {
+    await Promise.allSettled(requests)
+  }
 }
 
 // Map a ProjectInfo (list shape) onto a minimal overview tree node so a created
@@ -988,21 +1007,19 @@ export interface ProjectNameCAS {
 // The backend validates the whole CAS batch and returns every authoritative
 // Project record. Renderer caches publish only after that complete response is
 // validated, so a rejected batch cannot paint a partial rename.
-export async function renameProjectsMany(renames: readonly ProjectNameCAS[]): Promise<ProjectInfo[]> {
-  if ($projectsRpcAvailable.get() === false) {
-    throw projectsStaleBackendError()
-  }
-
+async function renameProjectsManyOn(
+  context: ActiveProjectsContext,
+  renames: readonly ProjectNameCAS[]
+): Promise<ProjectInfo[]> {
   let response: { projects: ProjectInfo[] }
 
   try {
-    response = await gatewayRequest<{ projects: ProjectInfo[] }>(
+    response = await gatewayRequestOn<{ projects: ProjectInfo[] }>(
+      context.gateway,
       'projects.rename_many',
-      projectParams({ renames: [...renames] })
+      projectParams({ renames: [...renames] }, context.profile)
     )
   } catch (error) {
-    markProjectsRpcFailure(error)
-
     if (isMissingRpcMethod(error)) {
       throw projectsStaleBackendError()
     }
@@ -1019,25 +1036,52 @@ export async function renameProjectsMany(renames: readonly ProjectNameCAS[]): Pr
     returnedIds.size !== requestedIds.size ||
     [...requestedIds].some(id => !returnedIds.has(id))
   ) {
-    reconcileProjects()
+    void reconcileProjectsOn(context)
     throw new Error('projects.rename_many returned an incomplete Project set')
   }
 
-  const byId = new Map(response.projects.map(project => [project.id, project]))
-  batch(() => {
-    $projects.set($projects.get().map(project => byId.get(project.id) ?? project))
-    $projectTree.set(
-      $projectTree.get().map(project => {
-        const renamed = byId.get(project.id)
+  if (stillOnProjectsContext(context)) {
+    const byId = new Map(response.projects.map(project => [project.id, project]))
+    batch(() => {
+      $projects.set($projects.get().map(project => byId.get(project.id) ?? project))
+      $projectTree.set(
+        $projectTree.get().map(project => {
+          const renamed = byId.get(project.id)
 
-        return renamed ? { ...project, label: renamed.name } : project
-      })
-    )
-  })
+          return renamed ? { ...project, label: renamed.name } : project
+        })
+      )
+    })
 
-  markProjectsRpcSuccess()
+    markProjectsRpcSuccess()
+  }
 
   return response.projects
+}
+
+export async function renameProjectsMany(renames: readonly ProjectNameCAS[]): Promise<ProjectInfo[]> {
+  if ($projectsRpcAvailable.get() === false) {
+    throw projectsStaleBackendError()
+  }
+
+  return renameProjectsManyOn(await activeProjectsContext(), renames)
+}
+
+export interface ActiveProjectsOperations {
+  readonly reconcile: () => Promise<void>
+  readonly renameMany: (renames: readonly ProjectNameCAS[]) => Promise<ProjectInfo[]>
+}
+
+/** Keep every leg of a cross-authority operation on one gateway/profile pair. */
+export async function withActiveProjectsContext<T>(
+  operation: (operations: ActiveProjectsOperations) => Promise<T>
+): Promise<T> {
+  const context = await activeProjectsContext()
+
+  return operation({
+    reconcile: () => reconcileProjectsOn(context, true),
+    renameMany: renames => renameProjectsManyOn(context, renames)
+  })
 }
 
 // Patch top-level project fields (name / appearance). Optimistic: the cached
@@ -1114,12 +1158,16 @@ async function authoritativeProjectForPath(context: ActiveProjectsContext, path:
     'projects.list',
     projectParams({}, context.profile)
   )
+
   if (stillOnProjectsContext(context)) {
     markProjectsRpcSuccess()
   }
+
   const listed = findProjectByPath(payload.projects ?? [], path)
 
-  if (!listed) return null
+  if (!listed) {
+    return null
+  }
 
   const { project } = await gatewayRequestOn<{ project: ProjectInfo | null }>(
     context.gateway,
@@ -1132,9 +1180,12 @@ async function authoritativeProjectForPath(context: ActiveProjectsContext, path:
 
 function reconcileMaterializedProjectTree(source: AutoProjectIdentity, project: ProjectInfo): void {
   const tree = $projectTree.get()
+
   const transientMatches = (node: SidebarProjectTree): boolean =>
     node.id === source.id || Boolean(node.isAuto && node.path && source.path && samePath(node.path, source.path))
+
   const carried = tree.find(node => node.id === project.id) ?? tree.find(transientMatches)
+
   const stable = carried
     ? {
         ...carried,
@@ -1147,6 +1198,7 @@ function reconcileMaterializedProjectTree(source: AutoProjectIdentity, project: 
         path: project.primary_path ?? project.folders?.[0]?.path ?? null
       }
     : projectInfoToTreeNode(project)
+
   const next: SidebarProjectTree[] = []
   let inserted = false
 
@@ -1175,7 +1227,9 @@ function cacheMaterializedProject(
   source: AutoProjectIdentity,
   project: ProjectInfo
 ): void {
-  if (!stillOnProjectsContext(context)) return
+  if (!stillOnProjectsContext(context)) {
+    return
+  }
 
   const cached = $projects.get()
   const index = cached.findIndex(candidate => candidate.id === project.id)
@@ -1210,16 +1264,22 @@ async function createMaterializedProject(
       if (stillOnProjectsContext(context)) {
         $projectsRpcAvailable.set(false)
       }
+
       throw projectsStaleBackendError()
     }
 
-    if (!isDuplicatePrimaryProjectError(error)) throw error
+    if (!isDuplicatePrimaryProjectError(error)) {
+      throw error
+    }
 
     // Another renderer/process won the create race after our first list.
     // Reconcile once; if the row still is not visible, preserve the original
     // rejection instead of looping or disguising an inconsistent backend.
     const raced = await authoritativeProjectForPath(context, project.path!)
-    if (!raced) throw error
+
+    if (!raced) {
+      throw error
+    }
 
     return raced
   }
@@ -1227,6 +1287,7 @@ async function createMaterializedProject(
   if (stillOnProjectsContext(context)) {
     markProjectsRpcSuccess()
   }
+
   return response.project
 }
 
@@ -1236,12 +1297,14 @@ async function resolveMaterializedAutoProject(
 ): Promise<ProjectInfo | null> {
   try {
     const existing = await authoritativeProjectForPath(context, project.path!)
+
     return existing ?? createMaterializedProject(context, project)
   } catch (error) {
     if (isMissingRpcMethod(error)) {
       if (stillOnProjectsContext(context)) {
         $projectsRpcAvailable.set(false)
       }
+
       throw projectsStaleBackendError()
     }
 
@@ -1282,7 +1345,10 @@ export async function materializeAutoProject(
   project: AutoProjectIdentity,
   patch: ProjectAppearancePatch = {}
 ): Promise<ProjectInfo | null> {
-  if (!project.isAuto || !project.path) return null
+  if (!project.isAuto || !project.path) {
+    return null
+  }
+
   const context = await activeProjectsContext()
   const key = autoProjectMaterializationKey(context.profile, project.path)
   let pendingByPath = materializingAutoProjects.get(context.gateway)
@@ -1294,6 +1360,7 @@ export async function materializeAutoProject(
 
   let pending = pendingByPath.get(key)
   let ownsMaterialization = false
+
   if (!pending) {
     ownsMaterialization = true
     pending = resolveMaterializedAutoProject(context, project).finally(() => {
@@ -1303,9 +1370,13 @@ export async function materializeAutoProject(
   }
 
   let materialized = await pending
-  if (!materialized) return null
+
+  if (!materialized) {
+    return null
+  }
 
   cacheMaterializedProject(context, project, materialized)
+
   if (stillOnProjectsContext(context)) {
     setSidebarAgentsGrouped(true)
   }
@@ -1316,7 +1387,7 @@ export async function materializeAutoProject(
   }
 
   if (ownsMaterialization) {
-    reconcileProjectsOn(context)
+    void reconcileProjectsOn(context)
   }
 
   return materialized
