@@ -11256,6 +11256,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 asyncio.run_coroutine_threadsafe(_run_setup(), app_loop).result()
             else:
                 _setup()
+        except KeyboardInterrupt:
+            _cprint("  Custom endpoint setup cancelled.")
+            self._invalidate(min_interval=0.0)
+            return
         except Exception as exc:
             _cprint(f"  ✗ Custom endpoint setup failed: {exc}")
             self._invalidate(min_interval=0.0)
@@ -11264,10 +11268,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         config = load_config()
         model_cfg = config.get("model")
         if not isinstance(model_cfg, dict):
+            _cprint("  No custom endpoint configured.")
+            self._invalidate(min_interval=0.0)
             return
         model = str(model_cfg.get("default") or "").strip()
         base_url = str(model_cfg.get("base_url") or "").strip()
         if model_cfg.get("provider") != "custom" or not model or not base_url:
+            _cprint("  No custom endpoint configured.")
+            self._invalidate(min_interval=0.0)
             return
 
         from hermes_cli.model_switch import switch_model

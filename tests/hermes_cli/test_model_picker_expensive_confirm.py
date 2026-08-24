@@ -169,7 +169,7 @@ def test_custom_endpoint_picker_setup_applies_saved_route(monkeypatch):
     )
 
     _bound(cli_mod.HermesCLI._configure_custom_endpoint_from_picker, self_)(
-        {"slug": "custom"}, []
+        {"slug": "custom"}, [{"name": "Stale endpoint"}]
     )
 
     assert calls["setup_config"] is configured
@@ -179,6 +179,53 @@ def test_custom_endpoint_picker_setup_applies_saved_route(monkeypatch):
     assert calls["switch"]["current_api_key"] == "local-key"
     assert calls["apply"][0] == (result, True)
     assert calls["apply"][1]["custom_providers"] == [{"name": "TrueNAS local"}]
+
+
+def test_custom_endpoint_picker_setup_handles_keyboard_interrupt(monkeypatch):
+    import cli as cli_mod
+
+    output = []
+    invalidations = []
+    monkeypatch.setattr(
+        "hermes_cli.main._model_flow_custom",
+        lambda _config: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {}})
+    monkeypatch.setattr(cli_mod, "_cprint", output.append)
+
+    self_ = SimpleNamespace(
+        _app=None,
+        _invalidate=lambda **kwargs: invalidations.append(kwargs),
+    )
+
+    _bound(cli_mod.HermesCLI._configure_custom_endpoint_from_picker, self_)(
+        {"slug": "custom"}, []
+    )
+
+    assert output == ["  Custom endpoint setup cancelled."]
+    assert invalidations == [{"min_interval": 0.0}]
+
+
+def test_custom_endpoint_picker_setup_reports_missing_route(monkeypatch):
+    import cli as cli_mod
+
+    output = []
+    invalidations = []
+    monkeypatch.setattr("hermes_cli.main._model_flow_custom", lambda _config: None)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {}})
+    monkeypatch.setattr(cli_mod, "_cprint", output.append)
+
+    self_ = SimpleNamespace(
+        _app=None,
+        _invalidate=lambda **kwargs: invalidations.append(kwargs),
+    )
+
+    _bound(cli_mod.HermesCLI._configure_custom_endpoint_from_picker, self_)(
+        {"slug": "custom"}, []
+    )
+
+    assert output == ["  No custom endpoint configured."]
+    assert invalidations == [{"min_interval": 0.0}]
 
 
 def test_custom_endpoint_picker_setup_leaves_prompt_toolkit_loop(monkeypatch):
