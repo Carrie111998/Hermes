@@ -583,6 +583,17 @@ class TestProbeEnvResolution:
         finally:
             mt._servers.pop("slack", None)
 
+    def test_wait_on_mcp_loop_does_not_sleep(self, monkeypatch):
+        """Probe wait must not block-sleep if invoked on the MCP event loop."""
+        import hermes_cli.mcp_config as mc
+
+        slept: list[float] = []
+        monkeypatch.setattr("tools.mcp_tool.mcp_event_loop_is_current", lambda: True)
+        monkeypatch.setattr("tools.mcp_tool.snapshot_live_mcp_tools", lambda name: None)
+        monkeypatch.setattr(mc.time, "sleep", lambda seconds: slept.append(seconds))
+        assert mc._wait_for_live_mcp_tools("slack", 30.0, wait_for_claim=True) is None
+        assert slept == []
+
 
 class TestProbeCapabilityGating:
     """The ``details`` probe must not fire prompts/list or resources/list at
