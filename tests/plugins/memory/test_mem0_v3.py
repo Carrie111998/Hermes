@@ -260,6 +260,18 @@ class TestMem0V3Config:
         assert "mem0_profile" not in block
         assert "mem0_conclude" not in block
 
+    def test_system_prompt_has_search_circuit_breaker(self):
+        # Regression for #93485: the old wording ("Keep searching until you
+        # have every fact") gave the agent no exit condition, so low-relevance
+        # results (e.g. semantic false positives) triggered unbounded
+        # mem0_search retries even after the user said to stop.
+        provider = Mem0MemoryProvider()
+        provider._user_id = "test"
+        block = provider.system_prompt_block()
+        assert "keep searching until" not in block.lower()
+        assert "after 2 attempts" in block
+        assert "stop" in block.lower()
+
 
 class TestMem0ModeSwitch:
 
