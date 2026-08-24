@@ -103,6 +103,19 @@ import sys
 logger = logging.getLogger(__name__)
 
 
+def _normalize_provider_failure(
+    payload: Dict[str, Any], *, provider_name: str, operation: str
+) -> Dict[str, Any]:
+    """Keep provider diagnostics out of model-visible web tool results."""
+    error = payload.get("error")
+    if not error:
+        return payload
+    logger.debug("Web %s provider %s failed: %s", operation, provider_name, error)
+    normalized = dict(payload)
+    normalized["error"] = f"Web {operation} provider '{provider_name}' failed"
+    return normalized
+
+
 def _web_extract_url(value: Any) -> Optional[str]:
     """Return a usable URL from a model-supplied extract item.
 
@@ -987,6 +1000,12 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                         query,
                         limit,
                     )
+                if not response_data.get("success"):
+                    response_data = _normalize_provider_failure(
+                        response_data,
+                        provider_name=provider.name,
+                        operation="search",
+                    )
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -996,8 +1015,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return result_json
 
     except Exception as e:
-        error_msg = f"Error searching web: {str(e)}"
-        logger.debug("%s", error_msg)
+        error_msg = f"Web search failed: {type(e).__name__}"
+        logger.debug("Web search failed", exc_info=True)
 
         debug_call_data["error"] = error_msg
         _debug.log_call("web_search_tool", debug_call_data)
@@ -1262,6 +1281,17 @@ async def web_extract_tool(
                         _rescue_extract, provider.name, safe_urls, results
                     )
 
+            results = [
+                _normalize_provider_failure(
+                    result,
+                    provider_name=provider.name,
+                    operation="extract",
+                )
+                if result.get("error")
+                else result
+                for result in results
+            ]
+
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
         # order of the safe URL list they receive.
@@ -1355,8 +1385,8 @@ async def web_extract_tool(
         return cleaned_result
             
     except Exception as e:
-        error_msg = f"Error extracting content: {str(e)}"
-        logger.debug("%s", error_msg)
+        error_msg = f"Web extract failed: {type(e).__name__}"
+        logger.debug("Web extract failed", exc_info=True)
         
         debug_call_data["error"] = error_msg
         _debug.log_call("web_extract_tool", debug_call_data)
