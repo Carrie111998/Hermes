@@ -177,6 +177,45 @@ _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextV
 # Skip tokens accepted at the paste prompt — exit OAuth without auth.
 _SKIP_TOKENS = frozenset({"skip", "cancel", "s", "n", "no", "q", "quit"})
 
+# ---------------------------------------------------------------------------
+# Provider-specific authorization parameters
+# ---------------------------------------------------------------------------
+
+# Some OAuth providers require extra parameters in the authorization URL that
+# the MCP SDK doesn't include by default.  Zoho, for instance, needs
+# ``access_type=offline`` to return a refresh token; without it only a short-
+# lived access token is issued and the SDK opens a browser on every expiry.
+#
+# Keys are substrings matched (case-insensitive) against the MCP server URL.
+# The first match wins.  Values are dicts of extra query parameters merged
+# into the authorization request.
+_PROVIDER_AUTH_PARAMS: dict[str, dict[str, str]] = {
+    "zohomcp.eu": {"access_type": "offline"},
+    "zohomcp.com": {"access_type": "offline"},
+}
+
+
+def _extract_extra_auth_params(
+    server_url: str,
+    user_config: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return extra authorization parameters for *server_url*.
+
+    Built-in provider defaults (``_PROVIDER_AUTH_PARAMS``) are merged with
+    any ``user_config`` overrides (which win on conflict).  Returns an empty
+    dict when no match is found.
+    """
+    url_lower = server_url.lower()
+    result: dict[str, str] = {}
+    for pattern, params in _PROVIDER_AUTH_PARAMS.items():
+        if pattern in url_lower:
+            result.update(params)
+            break
+    if user_config:
+        result.update(user_config)
+    return result
+
+
 # Sentinel value written to result["error"] when the user skipped via stdin.
 # _wait_for_callback maps this to OAuthNonInteractiveError ("user_skipped")
 # so the MCP setup path treats it as a non-fatal "continue without this
@@ -1188,12 +1227,75 @@ def _get_hermes_oauth_provider_class() -> type | None:
         def __init__(self, *args: Any, token_user_agent: "str | None" = None, **kwargs: Any):
             super().__init__(*args, **kwargs)
             self._hermes_token_user_agent = token_user_agent
+            self._hermes_extra_auth_params: dict[str, str] = kwargs.pop("extra_auth_params", None) or {}
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
             if ua:
                 request.headers["User-Agent"] = ua
             return request
+
+        async def _perform_authorization_code_grant(self) -> "tuple[str, str]":
+            """Inject provider-specific extra params into the authorization URL.
+
+            Overrides the SDK method to merge ``_hermes_extra_auth_params``
+            (e.g. ``access_type=offline`` for Zoho) into the authorization
+            query string before the browser redirect.
+            """
+            import secrets as _secrets
+            from urllib.parse import urlencode
+
+            from mcp.shared.auth import PKCEParameters
+
+            if (
+                self.context.oauth_metadata
+                and self.context.oauth_metadata.authorization_endpoint
+            ):
+                auth_endpoint = str(self.context.oauth_metadata.authorization_endpoint)
+            else:
+                auth_base_url = self.context.get_authorization_base_url(
+                    self.context.server_url
+                )
+                auth_endpoint = f"{auth_base_url}/authorize"
+
+            if not self.context.client_info:
+                raise Exception("No client info available for authorization")
+
+            pkce_params = PKCEParameters.generate()
+            state = _secrets.token_urlsafe(32)
+
+            auth_params: dict[str, str] = {
+                "response_type": "code",
+                "client_id": self.context.client_info.client_id,
+                "redirect_uri": str(self.context.client_metadata.redirect_uris[0]),
+                "state": state,
+                "code_challenge": pkce_params.code_challenge,
+                "code_challenge_method": "S256",
+            }
+
+            if self.context.should_include_resource_param(self.context.protocol_version):
+                auth_params["resource"] = self.context.get_resource_url()
+
+            if self.context.client_metadata.scope:
+                auth_params["scope"] = self.context.client_metadata.scope
+                if "offline_access" in self.context.client_metadata.scope.split():
+                    auth_params["prompt"] = "consent"
+
+            # Inject provider-specific extra authorization parameters
+            if self._hermes_extra_auth_params:
+                auth_params.update(self._hermes_extra_auth_params)
+
+            authorization_url = f"{auth_endpoint}?{urlencode(auth_params)}"
+            await self.context.redirect_handler(authorization_url)
+
+            result = await self.context.callback_handler()
+
+            if result.state is None or not _secrets.compare_digest(result.state, state):
+                raise Exception(
+                    f"State parameter mismatch: {result.state} != {state}"
+                )
+
+            return result.code, pkce_params.code_verifier
 
         def _coerce_client_secret_post(self) -> None:
             info = getattr(self.context, "client_info", None)
@@ -1942,6 +2044,12 @@ def build_oauth_auth(
         )
         return None
 
+    # Provider-specific extra authorization parameters (e.g. access_type=offline
+    # for Zoho).  Merges built-in defaults with any user-provided overrides.
+    extra_auth = _extract_extra_auth_params(
+        server_url, user_config=cfg.get("extra_auth_params")
+    )
+
     return provider_class(
         server_url=server_url,
         client_metadata=client_metadata,
@@ -1952,5 +2060,6 @@ def build_oauth_auth(
         # where the browser round-trip is actually awaited.
         callback_handler=callback_handler,
         token_user_agent=token_request_user_agent(cfg),
+        extra_auth_params=extra_auth or None,
         **cimd_provider_kwargs(cfg),
     )
