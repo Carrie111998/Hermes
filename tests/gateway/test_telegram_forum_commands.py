@@ -18,6 +18,7 @@ def _make_test_adapter():
     adapter.config = PlatformConfig(enabled=True, token="***", extra={})
     # ``name`` is a property derived from platform.value.title()
     adapter._bot = MagicMock()
+    adapter._bot.get_my_commands = AsyncMock(return_value=[])
     adapter._bot.set_my_commands = AsyncMock()
     adapter._forum_command_registered = set()
     adapter._forum_lock = asyncio.Lock()
@@ -83,3 +84,17 @@ async def test_ensure_forum_commands_race_safety():
 
     # The lock should make this exactly 1 call, not 2.
     assert adapter._bot.set_my_commands.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_forum_commands_preserves_existing_chat_menu():
+    """A deliberate chat-scoped menu must survive a gateway restart."""
+    adapter = _make_test_adapter()
+    adapter._bot.get_my_commands = AsyncMock(return_value=[MagicMock()])
+    msg = _forum_message(chat_id=-456, is_forum=True)
+
+    await adapter._ensure_forum_commands(msg)
+
+    assert -456 in adapter._forum_command_registered
+    adapter._bot.get_my_commands.assert_awaited_once()
+    adapter._bot.set_my_commands.assert_not_awaited()
