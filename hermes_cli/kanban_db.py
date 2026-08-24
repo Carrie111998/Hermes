@@ -4909,6 +4909,44 @@ def claim_task(
     return claimed
 
 
+def _review_routing_reviewer(
+    routing: sqlite3.Row,
+    actor_profile: Optional[str],
+) -> Optional[str]:
+    """Return the authenticated reviewer iff routing is claimable.
+
+    Shared by admission and capacity planning so malformed Review rows cannot
+    reserve dispatcher slots.
+    """
+    native_v2 = routing["review_protocol"] != "legacy"
+    try:
+        effective_reviewer = _canonical_assignee(
+            routing["review_assignee"] if native_v2
+            else (routing["review_assignee"] or routing["assignee"])
+        )
+        writer = _canonical_assignee(routing["assignee"])
+        actor = (
+            _canonical_assignee(actor_profile)
+            if isinstance(actor_profile, str) and actor_profile.strip()
+            else None
+        )
+    except (TypeError, ValueError):
+        return None
+    if native_v2:
+        if actor is None or actor != effective_reviewer or actor == writer:
+            return None
+        try:
+            frozen = json.loads(routing["review_artifacts"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        canonical_frozen, artifact_error = _validate_frozen_review_artifacts(frozen)
+        if artifact_error or canonical_frozen != frozen:
+            return None
+    elif actor is not None and actor != effective_reviewer:
+        return None
+    return effective_reviewer
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4940,33 +4978,8 @@ def claim_review_task(
         ).fetchone()
         if routing is None:
             return None
-        native_v2 = routing["review_protocol"] != "legacy"
-        try:
-            effective_reviewer = _canonical_assignee(
-                routing["review_assignee"] if native_v2
-                else (routing["review_assignee"] or routing["assignee"])
-            )
-            writer = _canonical_assignee(routing["assignee"])
-            actor = (
-                _canonical_assignee(actor_profile)
-                if isinstance(actor_profile, str) and actor_profile.strip()
-                else None
-            )
-        except (TypeError, ValueError):
-            return None
-        if native_v2:
-            # Native reviewer authority is never inferred from an omitted
-            # argument, the writer identity, or legacy assignee routing.
-            if actor is None or actor != effective_reviewer or actor == writer:
-                return None
-            try:
-                frozen = json.loads(routing["review_artifacts"])
-            except (json.JSONDecodeError, TypeError):
-                return None
-            canonical_frozen, artifact_error = _validate_frozen_review_artifacts(frozen)
-            if artifact_error or canonical_frozen != frozen:
-                return None
-        elif actor is not None and actor != effective_reviewer:
+        effective_reviewer = _review_routing_reviewer(routing, actor_profile)
+        if effective_reviewer is None:
             return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -5055,21 +5068,44 @@ def _retry_status_for_run(
             (task_id,),
         ).fetchone()
         run_id = row["current_run_id"] if row else None
-    if run_id is None:
-        return "ready"
-    event = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id, int(run_id)),
+    if run_id is not None:
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        try:
+            payload = json.loads(event["payload"]) if event and event["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("source_status") == "review":
+            return "review"
+
+    # A missing/stale current_run_id must not erase durable review provenance.
+    # The latest lifecycle marker still distinguishes an interrupted reviewer
+    # from an ordinary writer retry after changes were requested.
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('claimed', 'review_requested', 'changes_requested', "
+        "             'review_passed') ORDER BY id DESC LIMIT 1",
+        (task_id,),
     ).fetchone()
-    try:
-        payload = json.loads(event["payload"]) if event and event["payload"] else {}
-    except (json.JSONDecodeError, TypeError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    return "review" if payload.get("source_status") == "review" else "ready"
+    if latest is None:
+        return "ready"
+    if latest["kind"] == "review_requested":
+        return "review"
+    if latest["kind"] == "claimed":
+        try:
+            latest_payload = json.loads(latest["payload"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            latest_payload = {}
+        if (
+            isinstance(latest_payload, dict)
+            and latest_payload.get("source_status") == "review"
+        ):
+            return "review"
+    return "ready"
 
 
 def goal_run_status(
@@ -9111,8 +9147,8 @@ def reconcile_orphaned_running(
     ``detect_stale_running`` is disabled by default — so the card shows
     Running forever (a zombie).
 
-    This pass finds those orphans, requeues them to ``ready`` with an
-    explanatory comment, closes any leaked run, and appends a
+    This pass finds those orphans, restores them to their durable source phase
+    with an explanatory comment, closes any leaked run, and appends a
     ``reconciled`` event. If the orphan row still records a live PID on
     this host, requeueing is deferred to a later tick so we never spawn a
     duplicate beside a possibly-alive worker.
@@ -9140,13 +9176,14 @@ def reconcile_orphaned_running(
             )
             continue
         with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (retry_status, tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -9159,6 +9196,7 @@ def reconcile_orphaned_running(
                 ),
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
+                "retry_status": retry_status,
             }
             run_id = _end_run(
                 conn, tid,
@@ -9174,15 +9212,16 @@ def reconcile_orphaned_running(
                 (
                     tid, "dispatcher",
                     "reconciliation: card was 'running' with no valid claim "
-                    "(dead/gone worker) — requeued to ready",
+                    "(dead/gone worker) — requeued to " + retry_status,
                     now,
                 ),
             )
             _append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
         _log.info(
-            "kanban reconcile: requeued orphaned running task %s "
-            "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
+            "kanban reconcile: restored orphaned running task %s to %s "
+            "(claim_lock=%r, worker_pid=%r)",
+            tid, retry_status, row["claim_lock"], pid,
         )
     return reconciled
 
@@ -10035,9 +10074,13 @@ def native_scheduling_enabled() -> bool:
     """Fail closed until an operator explicitly activates native scheduling."""
     try:
         from hermes_cli.config import load_config
-        return bool(
-            (load_config() or {}).get("kanban", {}).get("native_scheduling", False)
-        )
+        config = load_config()
+        if not isinstance(config, dict):
+            return False
+        kanban_config = config.get("kanban")
+        if not isinstance(kanban_config, dict):
+            return False
+        return kanban_config.get("native_scheduling") is True
     except Exception:
         return False
 
@@ -10479,11 +10522,21 @@ def _dispatch_once_locked(
     # budget split below can see whether review work exists at all.
     review_rows = []
     if review_dispatch_enabled():
-        review_rows = conn.execute(
-            "SELECT id, COALESCE(review_assignee, assignee) AS assignee "
+        routing_rows = conn.execute(
+            "SELECT id, assignee, review_assignee, review_protocol, review_artifacts "
             "FROM tasks WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
+        review_rows = []
+        for routing in routing_rows:
+            actor = (
+                routing["review_assignee"]
+                if routing["review_protocol"] != "legacy"
+                else (routing["review_assignee"] or routing["assignee"])
+            )
+            reviewer = _review_routing_reviewer(routing, actor)
+            if reviewer is not None and _parents_satisfied(conn, routing["id"]):
+                review_rows.append({"id": routing["id"], "assignee": reviewer})
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work

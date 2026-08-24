@@ -486,6 +486,108 @@ def test_dispatcher_does_not_claim_review_until_explicitly_enabled(
     assert kb.latest_run(conn, task_id).profile == "reviewer"
 
 
+@pytest.mark.parametrize("provenance", ["missing", "stale"])
+def test_review_reclaim_without_current_run_fails_closed_to_review(
+    conn, provenance: str,
+) -> None:
+    task_id = kb.create_task(conn, title="lost review bookkeeping", assignee="writer")
+    writer_run = kb.claim_task(conn, task_id)
+    assert writer_run is not None
+    assert kb.request_review(
+        conn, task_id, reviewer="reviewer", artifacts=_frozen(),
+        actor_profile="writer", expected_run_id=writer_run.current_run_id,
+    )
+    assert kb.claim_review_task(conn, task_id, actor_profile="reviewer") is not None
+    with kb.write_txn(conn):
+        current_run_id = None if provenance == "missing" else writer_run.current_run_id
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (current_run_id, task_id),
+        )
+
+    assert kb.reclaim_task(conn, task_id, reason="repair missing run")
+    recovered = kb.get_task(conn, task_id)
+    assert recovered is not None
+    assert recovered.status == "review"
+    assert recovered.assignee == "writer"
+    assert recovered.review_assignee == "reviewer"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "review_assignee = NULL",
+        "review_assignee = 'writer'",
+        "review_artifacts = NULL",
+        "review_artifacts = '{\"commit\":\"bad\"}'",
+    ],
+)
+def test_malformed_review_cannot_reserve_capacity_ahead_of_valid_ready(
+    conn, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    from hermes_cli import config as cfgmod
+    from hermes_cli import profiles
+
+    malformed = kb.create_task(
+        conn, title="malformed review", assignee="writer", priority=100
+    )
+    writer_run = kb.claim_task(conn, malformed)
+    assert writer_run is not None
+    assert kb.request_review(
+        conn, malformed, reviewer="reviewer", artifacts=_frozen(),
+        actor_profile="writer", expected_run_id=writer_run.current_run_id,
+    )
+    with kb.write_txn(conn):
+        conn.execute(f"UPDATE tasks SET {mutation} WHERE id = ?", (malformed,))
+    valid = kb.create_task(conn, title="valid work", assignee="worker", priority=1)
+    malformed_events = _event_count(conn, malformed)
+    spawned = []
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda: {"kanban": {"review_dispatch": True}}
+    )
+    monkeypatch.setattr(
+        profiles, "profile_exists", lambda profile: profile in {"reviewer", "worker"}
+    )
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace: spawned.append(task.id) or 123,
+        max_spawn=1,
+    )
+
+    assert [item[0] for item in result.spawned] == [valid]
+    assert spawned == [valid]
+    assert kb.get_task(conn, malformed).status == "review"
+    assert _event_count(conn, malformed) == malformed_events
+
+
+@pytest.mark.parametrize(
+    ("config_value", "expected"),
+    [
+        ({}, False),
+        ({"kanban": {}}, False),
+        ({"kanban": {"native_scheduling": None}}, False),
+        ({"kanban": {"native_scheduling": False}}, False),
+        ({"kanban": {"native_scheduling": 0}}, False),
+        ({"kanban": {"native_scheduling": 1}}, False),
+        ({"kanban": {"native_scheduling": "false"}}, False),
+        ({"kanban": {"native_scheduling": "true"}}, False),
+        ({"kanban": {"native_scheduling": []}}, False),
+        ({"kanban": {"native_scheduling": {}}}, False),
+        ({"kanban": {"native_scheduling": True}}, True),
+        ({"kanban": []}, False),
+        ([], False),
+    ],
+)
+def test_native_scheduling_gate_requires_explicit_boolean_true(
+    monkeypatch: pytest.MonkeyPatch, config_value, expected: bool,
+) -> None:
+    from hermes_cli import config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda: config_value)
+    assert kb.native_scheduling_enabled() is expected
+
+
 def test_generic_complete_cannot_approve_malformed_native_review(conn) -> None:
     """The generic-complete gate keys off protocol, not nullable artifacts."""
     task_id = kb.create_task(conn, title="malformed native review", assignee="writer")
