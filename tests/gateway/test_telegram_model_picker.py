@@ -374,7 +374,7 @@ class TestTelegramModelPicker:
             call_log.append(dict(kwargs))
             if kwargs.get("message_thread_id") is not None:
                 raise FakeBadRequest("Message thread not found")
-            return SimpleNamespace(message_id=99)
+            return SimpleNamespace(message_id=99, message_thread_id=None)
 
         adapter._bot.send_message = AsyncMock(side_effect=mock_send_message)
 
@@ -392,6 +392,23 @@ class TestTelegramModelPicker:
         assert len(call_log) == 2
         assert call_log[0]["message_thread_id"] == 99999
         assert "message_thread_id" not in call_log[1] or call_log[1]["message_thread_id"] is None
+
+        query = AsyncMock()
+        query.message = SimpleNamespace(
+            chat_id=12345,
+            message_id=99,
+            message_thread_id=None,
+        )
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "mx", "12345")
+
+        query.edit_message_text.assert_awaited_once_with(
+            text="Model selection cancelled.",
+            reply_markup=None,
+        )
+        assert "12345:99" not in adapter._model_picker_state
 
     @pytest.mark.asyncio
     async def test_matching_message_and_thread_callback_switches_model(self, monkeypatch):

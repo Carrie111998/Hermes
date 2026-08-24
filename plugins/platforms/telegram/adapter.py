@@ -6598,7 +6598,10 @@ class TelegramAdapter(BasePlatformAdapter):
             state = {
                 "chat_id": str(chat_id),
                 "msg_id": msg.message_id,
-                "thread_id": self._normalize_model_picker_thread_id(thread_id),
+                "thread_id": self._model_picker_message_thread_id(
+                    msg,
+                    fallback=thread_id,
+                ),
                 "providers": providers,
                 "session_key": session_key,
                 "on_model_selected": on_model_selected,
@@ -6772,14 +6775,27 @@ class TelegramAdapter(BasePlatformAdapter):
         return cls._coerce_callback_id(getattr(message, "message_id", None))
 
     @classmethod
-    def _model_picker_query_thread_id(cls, query) -> Optional[str]:
-        message = getattr(query, "message", None)
-        thread_id = getattr(message, "message_thread_id", None)
-        if thread_id is None and message is not None:
+    def _model_picker_message_thread_id(
+        cls,
+        message,
+        *,
+        fallback=None,
+    ) -> Optional[str]:
+        if message is None:
+            return cls._normalize_model_picker_thread_id(fallback)
+        if hasattr(message, "message_thread_id"):
+            thread_id = getattr(message, "message_thread_id", None)
+        else:
+            thread_id = fallback
+        if thread_id is None:
             direct_topic = getattr(message, "direct_messages_topic", None)
             if direct_topic is not None:
                 thread_id = getattr(direct_topic, "topic_id", None)
         return cls._normalize_model_picker_thread_id(thread_id)
+
+    @classmethod
+    def _model_picker_query_thread_id(cls, query) -> Optional[str]:
+        return cls._model_picker_message_thread_id(getattr(query, "message", None))
 
     def _lookup_model_picker_state(self, chat_id: str, query) -> tuple[Optional[str], Optional[dict]]:
         message_id = self._model_picker_query_message_id(query)
