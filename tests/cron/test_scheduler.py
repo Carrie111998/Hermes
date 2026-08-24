@@ -648,6 +648,21 @@ class TestRunJobSessionPersistence:
             "memory toolset must not be policy-denied in cron"
         )
 
+    def test_run_job_enforces_per_job_turn_cap(self, tmp_path):
+        job = {
+            "id": "bounded-job",
+            "name": "bounded",
+            "prompt": "hello",
+            "max_turns": 12,
+        }
+        with self._run_job_patches(tmp_path) as (_, mock_agent_cls):
+            run_job(job)
+
+        agent = mock_agent_cls.return_value
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 12
+        assert agent.strict_iteration_limit is True
+        assert agent.cron_max_turns == 12
+
     def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
         """A per-job enabled_toolsets naming memory keeps it."""
         job = {
