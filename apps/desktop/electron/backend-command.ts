@@ -18,14 +18,21 @@
 export function serveBackendArgs(profile?: string) {
   const head = profile ? ['--profile', profile] : []
 
-  return [...head, 'serve', '--host', '127.0.0.1', '--port', '0']
+  // Desktop owns this child and needs its announced ephemeral port. Make the
+  // per-process topology explicit instead of relying on HERMES_DESKTOP to
+  // bypass the CLI's named-profile routing to the machine-level server. That
+  // keeps startup away from the shared 9119 bind even across version-skewed
+  // runtimes and the legacy dashboard fallback.
+  return [...head, 'serve', '--isolated', '--host', '127.0.0.1', '--port', '0']
 }
 
 /**
  * Rewrite a resolved backend argv from `serve` to the legacy
- * `dashboard --no-open` form, preserving every other argument (incl. a leading
- * `-m hermes_cli.main` and any `--profile <name>`). Returns a copy; if there is
- * no `serve` token the argv is returned unchanged.
+ * `dashboard --no-open` form, preserving the common arguments (incl. a leading
+ * `-m hermes_cli.main` and any `--profile <name>`). The newer `--isolated`
+ * flag is removed because runtimes old enough to lack `serve` may predate that
+ * dashboard flag too. Returns a copy; if there is no `serve` token the argv is
+ * returned unchanged.
  */
 export function dashboardFallbackArgs(args) {
   const i = args.indexOf('serve')
@@ -34,7 +41,7 @@ export function dashboardFallbackArgs(args) {
     return args.slice()
   }
 
-  return [...args.slice(0, i), 'dashboard', '--no-open', ...args.slice(i + 1)]
+  return [...args.slice(0, i), 'dashboard', '--no-open', ...args.slice(i + 1).filter(arg => arg !== '--isolated')]
 }
 
 /**
