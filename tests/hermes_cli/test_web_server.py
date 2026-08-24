@@ -1848,6 +1848,45 @@ class TestWebServerEndpoints:
         ).status_code == 200
         assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "low"
 
+    def test_model_set_resolves_selected_custom_reasoning_alias(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [
+                {"id": "gpt-low", "canonical_model": "gpt", "reasoning_effort": "low"},
+                {"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"},
+            ],
+            "make_default": True,
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        response = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main", "provider": "responses-proxy", "model": "gpt-low",
+                "confirm_expensive_model": True,
+            },
+        )
+        assert response.status_code == 200
+        cfg = load_config()
+        assert cfg["model"]["default"] == "gpt"
+        assert cfg["providers"]["responses-proxy"]["_selected_model_alias"] == "gpt-low"
+        assert cfg["agent"]["reasoning_overrides"]["gpt"] == "low"
+
+    def test_custom_endpoint_preserves_unknown_transport(self):
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "future", "name": "Future",
+                "base_url": "https://future.example/v1", "model": "m",
+                "api_mode": "plugin_future_transport",
+            },
+        )
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "future")
+        assert endpoint["api_mode"] == "plugin_future_transport"
+
     def test_endpoint_reasoning_none_disables_reasoning(self):
         from hermes_cli.config import load_config
 

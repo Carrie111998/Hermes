@@ -155,13 +155,7 @@ export interface MemoryProviderConfig {
   name: string
 }
 
-export type CustomEndpointApiMode =
-  | 'anthropic_messages'
-  | 'auto'
-  | 'bedrock_converse'
-  | 'chat_completions'
-  | 'codex_app_server'
-  | 'codex_responses'
+export type CustomEndpointApiMode = string
 
 export interface CustomEndpointModel {
   canonical_model?: string

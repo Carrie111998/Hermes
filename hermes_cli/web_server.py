@@ -7629,6 +7629,16 @@ def _apply_model_assignment_sync(
         provider, model = _normalize_main_model_assignment(provider, model)
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+        if isinstance(provider_entry, dict):
+            provider_models = provider_entry.get("models")
+            selected_metadata = (
+                provider_models.get(model)
+                if isinstance(provider_models, dict) else None
+            )
+            if isinstance(selected_metadata, dict):
+                provider_entry["_selected_model_alias"] = model
+                model = str(selected_metadata.get("canonical_model") or model).strip()
+                provider_entry["model"] = model
         current_model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         current_provider = str(current_model_cfg.get("provider") or "").strip().lower()
         previous_entry = (
