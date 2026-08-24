@@ -5166,6 +5166,7 @@ def _restart_macos_launchd_gateways(
         get_launchd_plist_path,
         launchd_restart,
         launchd_gateway_labels_for_install,
+        launchd_agent_dependent_labels_for_install,
         _graceful_restart_via_sigusr1,
         _launchd_kickstart,
         _launchd_service_registered,
@@ -5224,10 +5225,25 @@ def _restart_macos_launchd_gateways(
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # --- Sibling profiles ---------------------------------------------------
+    # --- Sibling profiles and Agent-dependent companion services ------------
+    # Gateways support SIGUSR1 drain semantics; companion launchd services
+    # (notably Hermes WebUI) do not necessarily implement the gateway protocol
+    # but still import this checkout into long-lived Python processes, so they
+    # must be hard-kickstarted after an Agent HEAD move.
+    seen_labels = {current_label}
+    labels_to_restart: list[tuple[str, bool]] = []
     for label in launchd_gateway_labels_for_install():
-        if label == current_label:
+        if label in seen_labels:
             continue
+        seen_labels.add(label)
+        labels_to_restart.append((label, True))
+    for label in launchd_agent_dependent_labels_for_install():
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        labels_to_restart.append((label, False))
+
+    for label, drain_supported in labels_to_restart:
         try:
             # Locate = liveness + domain in one domain-explicit probe; the
             # kickstart and fresh-PID verification below reuse the located
@@ -5239,7 +5255,7 @@ def _restart_macos_launchd_gateways(
                 # mid-way) — nothing is running old code here.
                 continue
             graceful_ok = False
-            if old_pid is not None and old_pid > 0:
+            if drain_supported and old_pid is not None and old_pid > 0:
                 print(f"  → {label}: draining (up to {int(drain_budget)}s)...")
                 graceful_ok = _graceful_restart_via_sigusr1(
                     old_pid, drain_timeout=drain_budget

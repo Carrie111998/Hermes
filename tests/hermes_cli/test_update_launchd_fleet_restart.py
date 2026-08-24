@@ -20,6 +20,7 @@ in a domain it does not live in.
 
 from __future__ import annotations
 
+import plistlib
 import subprocess
 import sys
 
@@ -106,6 +107,49 @@ class TestLaunchdGatewayLabelsForInstall:
     def test_no_profiles_means_no_fleet(self, monkeypatch):
         monkeypatch.setattr(hermes_cli.profiles, "list_profiles", lambda: [])
         assert launchd_gateway_labels_for_install() == []
+
+
+class TestLaunchdAgentDependentLabelsForInstall:
+    def test_discovers_webui_plist_bound_to_this_agent_checkout(self, monkeypatch, tmp_path):
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        agent_root = tmp_path / "hermes-agent"
+        venv_python = agent_root / "venv" / "bin" / "python"
+        webui_plist = launch_agents / "com.parantoux.hermes-webui.plist"
+        webui_plist.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.parantoux.hermes-webui",
+                    "KeepAlive": True,
+                    "ProgramArguments": [str(venv_python), "/tmp/webui/bootstrap.py"],
+                    "EnvironmentVariables": {
+                        "HERMES_WEBUI_AGENT_DIR": str(agent_root),
+                    },
+                }
+            )
+        )
+        gateway_plist = launch_agents / "ai.hermes.gateway-zero.plist"
+        gateway_plist.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "ai.hermes.gateway-zero",
+                    "ProgramArguments": [str(venv_python), "-m", "hermes_cli.main"],
+                }
+            )
+        )
+        unrelated_plist = launch_agents / "com.example.other.plist"
+        unrelated_plist.write_bytes(
+            plistlib.dumps(
+                {"Label": "com.example.other", "ProgramArguments": ["/usr/bin/true"]}
+            )
+        )
+
+        monkeypatch.setattr(gw, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gw, "PROJECT_ROOT", agent_root)
+
+        assert gw.launchd_agent_dependent_labels_for_install() == [
+            "com.parantoux.hermes-webui"
+        ]
 
 
 class TestParseLaunchdPidFromPrintOutput:
@@ -288,6 +332,7 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     monkeypatch.setattr(gw, "get_launchd_label", lambda: current)
     monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: list(labels))
+    monkeypatch.setattr(gw, "launchd_agent_dependent_labels_for_install", lambda: [])
     monkeypatch.setattr(gw, "_locate_launchd_gateway_service", fake_locate)
     monkeypatch.setattr(gw, "_launchd_service_registered", fake_registered)
     monkeypatch.setattr(
@@ -328,6 +373,37 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
 
 class TestRestartMacosLaunchdGateways:
+    def test_restarts_non_gateway_launchd_services_bound_to_agent_checkout(
+        self, monkeypatch, tmp_path
+    ):
+        """WebUI is not a gateway, but it imports Hermes Agent into a
+        long-lived launchd process. Agent HEAD changes must kickstart it too,
+        or api.agent_runtime's HEAD guard trips on the next WebUI action."""
+        rec = _fleet(
+            monkeypatch,
+            tmp_path,
+            current="ai.hermes.gateway-zero",
+            labels=["ai.hermes.gateway-zero"],
+            located={
+                "ai.hermes.gateway-zero": (f"gui/{UID}", 100),
+                "com.parantoux.hermes-webui": (f"gui/{UID}", 8787),
+            },
+        )
+        monkeypatch.setattr(
+            gw,
+            "launchd_agent_dependent_labels_for_install",
+            lambda: ["com.parantoux.hermes-webui"],
+        )
+        restarted: list[str] = []
+        failed: list[str] = []
+
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0)
+
+        assert f"gui/{UID}/com.parantoux.hermes-webui" in rec.kickstarts
+        assert "com.parantoux.hermes-webui" in restarted
+        assert 8787 not in rec.drains
+        assert failed == []
+
     def test_current_delegates_and_siblings_kickstart_in_own_domains(
         self, monkeypatch, tmp_path
     ):

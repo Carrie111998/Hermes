@@ -3174,6 +3174,114 @@ def launchd_gateway_labels_for_install() -> list[str]:
     return root_label + sorted(profile_labels)
 
 
+def _launchd_plist_strings(value) -> list[str]:
+    """Flatten launchd plist values into strings for dependency matching."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        strings: list[str] = []
+        for item in value.values():
+            strings.extend(_launchd_plist_strings(item))
+        return strings
+    if isinstance(value, (list, tuple)):
+        strings: list[str] = []
+        for item in value:
+            strings.extend(_launchd_plist_strings(item))
+        return strings
+    return []
+
+
+def _text_references_path_under_project(text: str, project_root: Path) -> bool:
+    """Return True if *text* names PROJECT_ROOT or a path inside it.
+
+    LaunchAgent plists commonly store either a direct ProgramArgument such as
+    ``.../hermes-agent/venv/bin/python`` or an env var/PATH-like string.  Check
+    both raw substrings and resolved path segments so local symlinks such as
+    ``~/.hermes/hermes-agent -> ~/personal-projects/hermes-agent`` still match.
+    """
+    if not text:
+        return False
+    raw_root = str(project_root)
+    resolved_root = project_root.resolve()
+    if raw_root in text or str(resolved_root) in text:
+        return True
+
+    # PATH-style variables are common in launchd plists. Split on os.pathsep
+    # first, then also consider the full value for ordinary single paths.
+    parts = [text]
+    if os.pathsep in text:
+        parts.extend(part for part in text.split(os.pathsep) if part)
+    for part in parts:
+        if not part.startswith(("/", "~")):
+            continue
+        try:
+            candidate = Path(part).expanduser().resolve(strict=False)
+            candidate.relative_to(resolved_root)
+            return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def launchd_agent_dependent_labels_for_install() -> list[str]:
+    """Return non-gateway launchd labels that load this Hermes Agent checkout.
+
+    Some local surfaces are not Hermes gateways but still import Hermes Agent
+    into a long-lived launchd process.  Hermes WebUI is the concrete macOS
+    failure mode: its LaunchAgent runs this checkout's venv Python plus the
+    WebUI bootstrap, so when ``hermes update`` moves the Agent HEAD, WebUI must
+    be kickstarted too or ``api.agent_runtime`` correctly refuses the next
+    action with "Hermes Agent was updated while Hermes WebUI was running".
+
+    Scope this to KeepAlive LaunchAgents whose executable/env explicitly
+    references this exact checkout (including symlink-resolved paths), and
+    exclude ``ai.hermes.gateway*`` labels because the gateway fleet path already
+    handles those deliberately.  Timer-only helpers that merely put the venv on
+    ``PATH`` are skipped: they are not long-lived old-code processes, and
+    kickstarting them would trigger unrelated scheduled work during updates.
+    Best-effort and read-only: malformed plists or unreadable files are skipped.
+    """
+    if not sys.platform == "darwin":
+        return []
+    launch_agents = _launchd_user_home() / "Library" / "LaunchAgents"
+    if not launch_agents.is_dir():
+        return []
+
+    labels: list[str] = []
+    try:
+        import plistlib
+
+        for plist_path in sorted(launch_agents.glob("*.plist")):
+            try:
+                with plist_path.open("rb") as fh:
+                    payload = plistlib.load(fh)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            label = payload.get("Label")
+            if not isinstance(label, str) or not label:
+                continue
+            if label.startswith("ai.hermes.gateway"):
+                continue
+            if not payload.get("KeepAlive"):
+                continue
+            values = []
+            for key in ("Program", "ProgramArguments"):
+                values.extend(_launchd_plist_strings(payload.get(key)))
+            env = payload.get("EnvironmentVariables")
+            if isinstance(env, dict):
+                for key, value in env.items():
+                    if str(key).upper() == "PATH":
+                        continue
+                    values.extend(_launchd_plist_strings(value))
+            if any(_text_references_path_under_project(value, PROJECT_ROOT) for value in values):
+                labels.append(label)
+    except Exception as exc:
+        logger.debug("Launchd Agent-dependent service scan failed: %s", exc)
+    return labels
+
+
 def _detect_venv_dir() -> Path | None:
     """Detect the active virtualenv directory.
 
