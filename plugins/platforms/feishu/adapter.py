@@ -4852,6 +4852,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("chat_id is required")
         effective_reply_to = reply_to
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
@@ -5028,6 +5031,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("chat_id is required")
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
         for attempt in range(_FEISHU_SEND_ATTEMPTS):

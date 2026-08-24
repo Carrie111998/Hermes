@@ -713,6 +713,22 @@ class TestFeishuOutboundChatIdValidation:
         assert result.error == "chat_id is required"
         mock_download.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_raw_transport_rejects_whitespace_chat_id_before_network(self):
+        adapter = _make_adapter()
+
+        with patch.object(adapter, "_run_blocking", new_callable=AsyncMock) as mock_blocking:
+            with pytest.raises(ValueError, match="chat_id is required"):
+                await adapter._send_raw_message(
+                    chat_id=" \t\n",
+                    msg_type="text",
+                    payload=json.dumps({"text": "hello"}),
+                    reply_to=None,
+                    metadata=None,
+                )
+
+        mock_blocking.assert_not_called()
+
 
 class TestResolveUpdatePrompt:
     """Test update prompt resolution persists the response file."""
