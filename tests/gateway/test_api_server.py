@@ -2592,6 +2592,57 @@ class TestModelRoutesAgentCreation:
         assert captured["api_key"] == "sk-session"
 
 
+    def test_session_model_override_falls_back_through_configured_default(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "model": {
+                    "default": "global/model",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(
+                lambda: [{"provider": "nous", "model": "Hermes-4"}]
+            ),
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(
+            adapter,
+            "_session_model_override_for",
+            lambda _key: {
+                "model": "session/override-model",
+                "provider": "sessionprov",
+                "api_key": "sk-session",
+                "base_url": "https://session.example/v1",
+            },
+        )
+
+        agent = adapter._create_agent(session_id="s1")
+
+        assert captured["fallback_model"] == [
+            {
+                "provider": "openrouter",
+                "model": "global/model",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+            {"provider": "nous", "model": "Hermes-4"},
+        ]
+        assert agent._configured_default_route == captured["fallback_model"][0]
+
+
 class TestStoredSessionModelFilter:
     """A session row that persisted the advertised virtual model must read as
     "no stored model" — replaying "hermes-agent" upstream 400s. Found live

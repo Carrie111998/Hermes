@@ -66,7 +66,11 @@ from agent.turn_context import (
     compression_made_progress,
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import (
+    compose_fallback_chain,
+    get_configured_default_route,
+    get_fallback_chain,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -5520,6 +5524,13 @@ class TurnRunner:
             )
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        _fallback_primary_route = {
+            "provider": turn_route["runtime"].get("requested_provider")
+            or turn_route["runtime"].get("provider"),
+            "model": turn_route["model"],
+            "base_url": turn_route["runtime"].get("base_url"),
+        }
+        _configured_default_route = turn_route.get("configured_default_route")
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -5726,8 +5737,13 @@ class TurnRunner:
         # must reach the next turn (#60955).  Per-session turn
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
+            agent._configured_default_route = _configured_default_route
             self._runner._apply_fallback_chain_to_agent(
-                agent, self._runner._refresh_fallback_model(),
+                agent,
+                self._runner._refresh_fallback_model(
+                    primary_route=_fallback_primary_route,
+                    configured_default_route=_configured_default_route,
+                ),
             )
 
         # Lock released — now schedule cleanup of any cross-process-evicted
@@ -5784,7 +5800,10 @@ class TurnRunner:
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(),
+                fallback_model=self._runner._refresh_fallback_model(
+                    primary_route=_fallback_primary_route,
+                    configured_default_route=_configured_default_route,
+                ),
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
@@ -5802,6 +5821,8 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        agent._configured_default_route = _configured_default_route
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -8068,6 +8089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        configured_default_route = get_configured_default_route(user_config)
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
         _override_state = (
@@ -8098,6 +8120,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     resolved_session_key or "", model, override_model,
                     override_runtime.get("provider"),
                 )
+                if configured_default_route:
+                    override_runtime["_configured_default_route"] = configured_default_route
                 return override_model, override_runtime
             # Override exists but has no api_key — fall through to env-based
             # resolution and apply model/provider from the override on top.
@@ -8117,6 +8141,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+        configured_default_route = get_configured_default_route(
+            user_config,
+            runtime=runtime_kwargs,
+        )
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -8213,6 +8241,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
 
+        if configured_default_route:
+            runtime_kwargs["_configured_default_route"] = configured_default_route
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
@@ -8239,6 +8269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route = {
             "model": model,
             "runtime": runtime,
+            "configured_default_route": runtime_kwargs.get("_configured_default_route"),
             "signature": (
                 model,
                 runtime["provider"],
@@ -9847,7 +9878,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         return None
 
-    def _refresh_fallback_model(self) -> list | None:
+    def _refresh_fallback_model(
+        self,
+        *,
+        primary_route: dict | None = None,
+        configured_default_route: dict | None = None,
+    ) -> list | None:
         """Re-read fallback_providers from disk for the next agent create/reuse.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway
@@ -9866,7 +9902,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
-                return self._fallback_model
+                return compose_fallback_chain(
+                    None,
+                    primary=primary_route,
+                    configured_default=configured_default_route,
+                ) or None
             # Raw primitive (raises on parse failure) is required here: the
             # canonical fail-open loader would return {} on a torn mid-edit
             # write and WIPE the last known-good chain. The overlay/expansion
@@ -9890,9 +9930,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "fallback_providers refresh: config.yaml read failed; "
                 "keeping last known-good chain", exc_info=True,
             )
-            return self._fallback_model
+            return compose_fallback_chain(
+                self._fallback_model,
+                primary=primary_route,
+                configured_default=configured_default_route,
+            ) or None
         self._fallback_model = get_fallback_chain(cfg) or None
-        return self._fallback_model
+        return compose_fallback_chain(
+            self._fallback_model,
+            primary=primary_route,
+            configured_default=configured_default_route,
+        ) or None
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
@@ -22716,6 +22764,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            _fallback_primary_route = {
+                "provider": turn_route["runtime"].get("requested_provider")
+                or turn_route["runtime"].get("provider"),
+                "model": turn_route["model"],
+                "base_url": turn_route["runtime"].get("base_url"),
+            }
+            _configured_default_route = turn_route.get("configured_default_route")
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -22764,8 +22819,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=self._refresh_fallback_model(
+                        primary_route=_fallback_primary_route,
+                        configured_default_route=_configured_default_route,
+                    ),
                 )
+                agent._configured_default_route = _configured_default_route
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,

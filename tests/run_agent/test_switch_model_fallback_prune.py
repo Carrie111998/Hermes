@@ -69,6 +69,28 @@ def test_switch_drops_old_primary_from_fallback_chain():
     assert agent._fallback_model == {"provider": "nous", "model": "hermes-4"}
 
 
+def test_switch_retains_configured_default_as_first_fallback():
+    default = {
+        "provider": "openrouter",
+        "model": "x-ai/grok-4",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    agent = _make_agent([
+        default,
+        {"provider": "nous", "model": "hermes-4"},
+        default.copy(),
+    ])
+    agent._configured_default_route = default
+
+    _switch_to_anthropic(agent)
+
+    assert agent._fallback_chain == [
+        default,
+        {"provider": "nous", "model": "hermes-4"},
+    ]
+    assert agent._fallback_model == default
+
+
 def test_switch_with_empty_chain_stays_empty():
     agent = _make_agent([])
 

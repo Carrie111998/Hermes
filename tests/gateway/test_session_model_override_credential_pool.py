@@ -35,3 +35,38 @@ def test_fast_session_override_includes_credential_pool(monkeypatch):
     assert runtime.get("credential_pool") is fake_pool
 
 
+def test_fast_session_override_carries_configured_default_route(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    override = {
+        "model": "override-model",
+        "provider": "openrouter",
+        "api_key": "sk-test",
+    }
+    runner._session_model_overrides = {"sess-1": override}
+    monkeypatch.setattr(
+        "gateway.run._credential_pool_for_provider",
+        lambda _provider: None,
+    )
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        session_key="sess-1",
+        user_config={
+            "model": {
+                "default": "model-a",
+                "provider": "commandcode",
+                "base_url": "https://commandcode.ai/v1",
+            }
+        },
+    )
+
+    assert model == override["model"]
+    assert runtime["_configured_default_route"] == {
+        "provider": "commandcode",
+        "model": "model-a",
+        "base_url": "https://commandcode.ai/v1",
+    }
+    route = runner._resolve_turn_agent_config("hello", model, runtime)
+    assert route["configured_default_route"] == runtime["_configured_default_route"]
+    assert "_configured_default_route" not in route["runtime"]
+
+

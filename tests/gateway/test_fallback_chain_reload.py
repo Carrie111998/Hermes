@@ -70,33 +70,27 @@ def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
     assert agent._fallback_activated is True
 
 
-def test_background_and_main_agent_paths_call_refresh():
-    """Both AIAgent construction sites must pass a refreshed chain, not the
-    startup snapshot, and the cached-agent reuse path must apply the refreshed
-    chain. Source-level invariant for call sites that resist unit testing.
-    """
-    from pathlib import Path
+def test_refresh_composes_configured_default_for_session_override(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
 
-    source = (
-        Path(__file__).resolve().parent.parent.parent / "gateway" / "run.py"
-    ).read_text(encoding="utf-8")
-    # The agent-construction site inside TurnRunner.run_sync (extracted from
-    # the old _run_agent_inner closure) references the runner as
-    # ``self._runner``; the background-agent site still uses bare ``self``.
-    _refresh_calls = (
-        source.count("fallback_model=self._refresh_fallback_model()")
-        + source.count("fallback_model=self._runner._refresh_fallback_model()")
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: openai-codex\n"
+        "    model: gpt-5.6-luna\n"
     )
-    assert _refresh_calls >= 2
-    # The cached-agent reuse path (the load-bearing fix for a long-lived
-    # session in a running gateway) must apply the refreshed chain.
-    assert (
-        "self._apply_fallback_chain_to_agent(" in source
-        or "self._runner._apply_fallback_chain_to_agent(" in source
+    runner = SimpleNamespace(_fallback_model=None)
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+
+    chain = bound(
+        primary_route={"provider": "openrouter", "model": "override-model"},
+        configured_default_route={"provider": "commandcode", "model": "model-a"},
     )
-    # The stale startup-snapshot form must not remain at create sites.
-    assert "fallback_model=self._fallback_model," not in source
-    assert "fallback_model=self._runner._fallback_model," not in source
+
+    assert chain == [
+        {"provider": "commandcode", "model": "model-a"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+    ]
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):
