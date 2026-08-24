@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,9 +53,33 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+# Read-before-write marks for the background-review (curator) fork.
+#
+# NOT a ContextVar: every tool call runs on its own worker thread via
+# ``tools.thread_context.propagate_context_to_thread``, which does a
+# ``contextvars.copy_context()``.  A ContextVar written inside skill_view's
+# worker lands in that worker's *copy* and is discarded when the call returns,
+# so the later skill_manage worker — running off its own fresh copy — never
+# saw the mark and the guard below refused every single write.  That made the
+# curator loop forever: read the skill, try to patch it, get refused, retry.
+#
+# The mark therefore lives in a plain dict keyed by review-run id, guarded by
+# a lock, so it survives the thread hop while still being scoped to one review
+# run (a new run starts with an empty set).
+_background_review_read_lock = threading.Lock()
+_background_review_read_paths: Dict[str, set] = {}
+
+
+def _background_review_run_key() -> str:
+    """Identify the current review run so marks never leak between runs."""
+    try:
+        from tools.skill_provenance import current_background_review_id
+        rid = current_background_review_id()
+        if rid:
+            return str(rid)
+    except Exception:
+        pass
+    return "default"
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -77,9 +102,14 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    key = _background_review_run_key()
+    with _background_review_read_lock:
+        # Bound the table: a long-lived process runs many review turns and
+        # each one would otherwise leave its set behind forever.
+        if len(_background_review_read_paths) > 32:
+            for stale in list(_background_review_read_paths)[:-8]:
+                _background_review_read_paths.pop(stale, None)
+        _background_review_read_paths.setdefault(key, set()).add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +117,17 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    key = _background_review_run_key()
+    with _background_review_read_lock:
+        return resolved in _background_review_read_paths.get(key, ())
 
 
 def _reset_background_review_read_marks() -> None:
     """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    key = _background_review_run_key()
+    with _background_review_read_lock:
+        _background_review_read_paths.pop(key, None)
+
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.

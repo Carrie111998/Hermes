@@ -1073,6 +1073,19 @@ def _run_review_in_thread(
         finish_background_review_run(agent, review_run)
         return
 
+    # Identify this review turn so the skill read-before-write guard can scope
+    # its marks to it: a skill_view here must authorise a skill_manage here,
+    # and nothing in a later review run. Bound on the worker thread, which is
+    # the context every tool call for this review is copied from.
+    _turn_token = None
+    try:
+        from tools.skill_provenance import begin_review_turn
+        _turn_token = begin_review_turn(
+            f"{id(review_run)}-{threading.get_ident()}-{id(messages_snapshot)}"
+        )
+    except Exception:
+        logger.debug("Could not bind review turn id", exc_info=True)
+
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
@@ -1590,6 +1603,21 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+        # Drop this review turn's read-before-write marks and unbind its id,
+        # so a recycled worker thread cannot inherit either.
+        try:
+            from tools.skill_manager_tool import (
+                _reset_background_review_read_marks,
+            )
+            _reset_background_review_read_marks()
+        except Exception:
+            pass
+        if _turn_token is not None:
+            try:
+                from tools.skill_provenance import reset_review_turn
+                reset_review_turn(_turn_token)
+            except Exception:
+                pass
 
 
 def spawn_background_review_thread(

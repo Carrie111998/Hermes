@@ -76,3 +76,32 @@ def is_background_review() -> bool:
     """Convenience: True iff the current write origin is the background
     review fork."""
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+# --- Review-turn identity -------------------------------------------------
+#
+# The read-before-write guard in skill_manager_tool needs to know *which*
+# review turn is running, so a skill_view in turn N cannot authorise a write
+# in turn N+1. This is a ContextVar and is only ever READ from worker threads
+# (contextvars.copy_context() copies current values in, so reads are correct);
+# the guard's own bookkeeping must not live in a ContextVar because writes
+# made inside a worker's copied context are discarded when that tool call
+# returns. See the comment on _background_review_read_paths.
+_review_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "skill_review_turn_id",
+    default="",
+)
+
+
+def begin_review_turn(turn_id: str) -> contextvars.Token[str]:
+    """Bind an identifier for the review turn about to run."""
+    return _review_turn_id.set(turn_id or "")
+
+
+def reset_review_turn(token: contextvars.Token[str]) -> None:
+    _review_turn_id.reset(token)
+
+
+def current_background_review_id() -> str:
+    """Identifier of the active review turn ("" when not in one)."""
+    return _review_turn_id.get()
