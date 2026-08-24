@@ -1176,6 +1176,7 @@ class ClaudeNativeRegistrar:
                 process.write(_interactive_prompt_frame(prompt))
                 self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
                 paste_auto_submitted = False
+                submission_unverified = False
                 try:
                     prompt_input = process.read_until_prompt_input(
                         min(
@@ -1187,7 +1188,14 @@ class ClaudeNativeRegistrar:
                 except _PtyResponseTimeout as exc:
                     if exc.reason != "terminal_input_disabled":
                         raise
-                    paste_auto_submitted = True
+                    # The last-resort branch of _prompt_input_timeout_reason,
+                    # reached only once every positive test has already
+                    # failed -- which is no evidence the paste self-submitted.
+                    # Measured live 2026-08-24: withholding the CR here leaves
+                    # the paste in the input box and no transcript is ever
+                    # written, while a redundant CR into an already-emptied
+                    # box is a no-op. So submit, and stay retryable below.
+                    submission_unverified = True
                     prompt_input = ""
                 prompt_response_observed, prompt_response = (
                     _prompt_input_registered_response(
@@ -1230,7 +1238,7 @@ class ClaudeNativeRegistrar:
                             "Claude provider limit interrupted authentication recovery",
                         )
                     elif not _has_exact_registered_response(output, prompt):
-                        if paste_auto_submitted:
+                        if paste_auto_submitted or submission_unverified:
                             pending = (
                                 "creation_ambiguous",
                                 "recovery result ambiguous",
@@ -1515,6 +1523,7 @@ class ClaudeNativeRegistrar:
                 process.write(_interactive_prompt_frame(prompt))
                 self._wait_or_cancel(stop, _PROMPT_SUBMIT_DELAY_SECONDS)
                 paste_auto_submitted = False
+                submission_unverified = False
                 try:
                     prompt_input = process.read_until_prompt_input(
                         min(
@@ -1526,7 +1535,14 @@ class ClaudeNativeRegistrar:
                 except _PtyResponseTimeout as exc:
                     if exc.reason != "terminal_input_disabled":
                         raise
-                    paste_auto_submitted = True
+                    # The last-resort branch of _prompt_input_timeout_reason,
+                    # reached only once every positive test has already
+                    # failed -- which is no evidence the paste self-submitted.
+                    # Measured live 2026-08-24: withholding the CR here leaves
+                    # the paste in the input box and no transcript is ever
+                    # written, while a redundant CR into an already-emptied
+                    # box is a no-op. So submit, and stay retryable below.
+                    submission_unverified = True
                     prompt_input = ""
                 prompt_response_observed, prompt_response = (
                     _prompt_input_registered_response(
@@ -1575,7 +1591,7 @@ class ClaudeNativeRegistrar:
                             "Claude provider limit interrupted registration",
                         )
                     elif not _has_exact_registered_response(output, prompt):
-                        if paste_auto_submitted:
+                        if paste_auto_submitted or submission_unverified:
                             pending = (
                                 "retry",
                                 "creation_ambiguous",
