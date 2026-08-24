@@ -160,7 +160,9 @@ For caller-managed conversation state, send `include: ["conversation_history"]`
 when creating a run. The terminal event and pollable status return Hermes'
 effective post-run history, including a compressed transcript when context
 compression fired. Persist that value as the next request's baseline instead
-of rebuilding the entire conversation from an external message archive.
+of rebuilding the entire conversation from an external message archive. The
+same payload exposes this state as the public `compressed` boolean; the
+underscore-prefixed marker Hermes uses internally is never serialized.
 
 ---
 

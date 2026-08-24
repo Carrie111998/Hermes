@@ -465,7 +465,10 @@ same `conversation_history`. When context compression occurs during the turn,
 this is the compressed effective transcript rather than the uncompressed
 input plus a summary. Submit it unchanged with the next user message;
 structured tool-call fields are preserved so recent tool calls and results
-remain paired.
+remain paired. The adjacent `compressed` boolean tells the caller whether
+Hermes replaced the baseline during this turn. Unknown `include` values are
+ignored for forward compatibility and recorded at debug level to diagnose
+misspelled field names.
 
 ### GET /v1/runs/\{run_id\}
 
@@ -479,6 +482,7 @@ Poll the current run state. This is useful for dashboards that need status witho
   "session_id": "space-session",
   "model": "hermes-agent",
   "output": "Done.",
+  "compressed": true,
   "conversation_history": [
     {"role": "user", "content": "[Compressed summary of earlier turns]"},
     {"role": "user", "content": "What should I investigate next?"},

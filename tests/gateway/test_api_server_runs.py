@@ -174,6 +174,18 @@ class TestStartRun:
                     }
                 ],
                 "reasoning": "I should inspect the schema first.",
+                "reasoning_content": "provider reasoning carrier",
+                "reasoning_details": [{"type": "summary", "text": "inspect schema"}],
+                "codex_reasoning_items": [
+                    {"type": "reasoning", "encrypted_content": "opaque"}
+                ],
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "checking"}],
+                    }
+                ],
             },
             {
                 "role": "tool",
@@ -208,6 +220,44 @@ class TestStartRun:
         assert passed_history == history
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["user", "system", "tool"])
+    async def test_start_does_not_forward_null_content_outside_structured_assistant(
+        self,
+        adapter,
+        role,
+    ):
+        app = _create_runs_app(adapter)
+        entry = {"role": role, "content": None}
+        if role == "tool":
+            entry["tool_call_id"] = "call_123"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "conversation_history": [entry]},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        passed_history = mock_agent.run_conversation.call_args.kwargs[
+            "conversation_history"
+        ]
+        assert passed_history[0]["role"] == role
+        assert passed_history[0]["content"] == "None"
+
+    @pytest.mark.asyncio
     async def test_start_rejects_non_array_include(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -220,6 +270,35 @@ class TestStartRun:
         assert resp.status == 400
         assert "array of strings" in data["error"]["message"]
         assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_logs_unknown_include_values(self, adapter, caplog):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                with caplog.at_level(
+                    "DEBUG", logger="gateway.platforms.api_server"
+                ):
+                    resp = await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello", "include": ["conversation_histroy"]},
+                    )
+                    run_id = (await resp.json())["run_id"]
+                    for _ in range(40):
+                        if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                            break
+                        await asyncio.sleep(0.05)
+
+        assert resp.status == 202
+        assert "conversation_histroy" in caplog.text
+        assert "Ignoring unsupported /v1/runs include" in caplog.text
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -429,6 +508,8 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
         assert status["conversation_history"] == compacted_history
+        assert status["compressed"] is True
+        assert "_compressed" not in status
         assert not any(message in status["conversation_history"] for message in prior_history)
 
     @pytest.mark.asyncio
@@ -460,6 +541,8 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
         assert "conversation_history" not in status
+        assert "compressed" not in status
+        assert "_compressed" not in status
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +607,8 @@ class TestRunEvents:
                 "content": "done",
                 "_db_persisted": True,
                 "_api_content": "private cache payload",
+                "_compressed_summary": True,
+                "unregistered_provider_field": "private by default",
             },
         ]
         public_history = [
@@ -561,7 +646,21 @@ class TestRunEvents:
                     break
         assert completed is not None
         assert completed["conversation_history"] == public_history
+        assert completed["compressed"] is False
+        assert "_compressed" not in completed
+        assert not any(
+            key in message
+            for message in completed["conversation_history"]
+            for key in (
+                "_db_persisted",
+                "_api_content",
+                "_compressed_summary",
+                "unregistered_provider_field",
+            )
+        )
         assert adapter._run_statuses[run_id]["conversation_history"] == public_history
+        assert adapter._run_statuses[run_id]["compressed"] is False
+        assert "_compressed" not in adapter._run_statuses[run_id]
 
 
     @pytest.mark.asyncio
