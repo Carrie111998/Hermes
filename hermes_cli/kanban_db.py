@@ -5875,6 +5875,58 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+#: Files below this size in a scratch workspace about to be removed are
+#: considered trivial scaffolding and never trigger the discard signal
+#: (#93164). Threshold kept identical to operator-deployed parachutes.
+WORKSPACE_DISCARD_SIGNAL_MIN_BYTES = 64
+#: How many file names the warning/event carries; the rest is a count.
+WORKSPACE_DISCARD_SIGNAL_MAX_NAMES = 10
+
+
+def _warn_undeclared_workspace_content(
+    conn: sqlite3.Connection, task_id: str, wp: Path
+) -> None:
+    """Before rmtree, surface non-trivial undeclared content (#93164).
+
+    Declared artifacts are already preserved by ``complete_task`` (copied to
+    the board attachment store, #63619); anything still sitting in the
+    workspace at cleanup time is undeclared and is about to be destroyed.
+    Fires on every ``_cleanup_workspace`` path that rmtree's a scratch dir
+    (task completion and archive). Best-effort like the rest of cleanup: a
+    scan failure never blocks the rmtree, and the signal is a WARNING + task
+    event, not a preservation.
+    """
+    try:
+        files = []
+        for f in sorted(wp.rglob("*")):
+            if not f.is_file():
+                continue
+            size = f.stat().st_size  # one stat per file, reused below
+            if size >= WORKSPACE_DISCARD_SIGNAL_MIN_BYTES:
+                files.append((str(f.relative_to(wp)), size))
+    except OSError:
+        return
+    if not files:
+        return
+    names = [name for name, _ in files[:WORKSPACE_DISCARD_SIGNAL_MAX_NAMES]]
+    total = sum(size for _, size in files)
+    _log.warning(
+        "Removing scratch workspace for task %s with %d undeclared file(s) "
+        "(%d bytes) not listed in kanban_complete artifacts: %s%s — declared "
+        "artifacts are already preserved; these files will be deleted.",
+        task_id, len(files), total, ", ".join(names),
+        f" (+{len(files) - len(names)} more)" if len(files) > len(names) else "",
+    )
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "workspace_discarded_content",
+                {"files": names, "file_count": len(files), "total_bytes": total},
+            )
+    except Exception:  # noqa: BLE001 — signal is best-effort, never blocks cleanup
+        _log.debug("workspace_discarded_content event append failed", exc_info=True)
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -5933,6 +5985,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
+                _warn_undeclared_workspace_content(conn, task_id, wp)
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Removed scratch workspace: %s", wp)
             else:
@@ -6059,6 +6112,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
+                _warn_undeclared_workspace_content(conn, parent_id, wp)
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
