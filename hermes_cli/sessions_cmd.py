@@ -23,6 +23,8 @@ import os
 import sys
 from pathlib import Path
 
+from hermes_cli.session_listing import AUTOMATION_SOURCES
+
 
 def _m():
     """Lazy ``hermes_cli.main`` reference (call-time, keeps patches working)."""
@@ -232,9 +234,10 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"Error: Could not open session database: {e}")
         return
 
-    # Hide third-party tool sessions by default, but honour explicit --source
+    # Hide automation-source sessions (cron/tool/kanban/subagent) by default,
+    # but honour explicit --source
     _source = getattr(args, "source", None)
-    _exclude = None if _source else ["tool"]
+    _exclude = None if _source else sorted(AUTOMATION_SOURCES)
 
     if action == "list":
         from hermes_state import workspace_key as _ws_key
@@ -983,7 +986,7 @@ def cmd_sessions(args, sessions_parser=None):
     elif action == "browse":
         limit = getattr(args, "limit", 500) or 500
         source = getattr(args, "source", None)
-        _browse_exclude = None if source else ["tool"]
+        _browse_exclude = None if source else sorted(AUTOMATION_SOURCES)
         sessions = db.list_sessions_rich(
             source=source, exclude_sources=_browse_exclude, limit=limit
         )

@@ -205,3 +205,53 @@ class TestAutomationSourcesDenyList:
         assert ids.isdisjoint(
             {"a_cron", "a_tool", "a_kanban", "a_sub"}
         )
+
+
+class TestSessionsCmdDenyList:
+    """``hermes sessions list`` shares the AUTOMATION_SOURCES deny-list.
+
+    The CLI listing used to hardcode ``["tool"]``, so cron/kanban/subagent
+    runs leaked into the default listing while every picker hid them.
+    """
+
+    def _seed(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session("human_session", "cli")
+        db.set_session_title("human_session", "Human chat")
+        for source in ("cron", "tool", "kanban", "subagent"):
+            sid = f"{source}_session"
+            db.create_session(sid, source)
+            db.set_session_title(sid, f"Machine run {source}")
+        db.close()
+
+    def _list(self, capsys, source=None):
+        import argparse
+
+        from hermes_cli.sessions_cmd import cmd_sessions
+
+        # Same shape the ``sessions list`` subparser in main.py produces.
+        args = argparse.Namespace(
+            sessions_action="list", source=source, limit=50, workspace=None
+        )
+        cmd_sessions(args)
+        return capsys.readouterr().out
+
+    def test_list_without_source_hides_automation(self, capsys):
+        self._seed()
+
+        out = self._list(capsys)
+
+        assert "human_session" in out
+        for source in ("cron", "tool", "kanban", "subagent"):
+            assert f"{source}_session" not in out, source
+
+    def test_explicit_source_overrides_deny_list(self, capsys):
+        """``--source cron`` keeps `_exclude` None so any source is listable."""
+        self._seed()
+
+        out = self._list(capsys, source="cron")
+
+        assert "cron_session" in out
+        assert "human_session" not in out

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Literal, NoReturn, Sequence
 
+from hermes_cli.session_listing import AUTOMATION_SOURCES
 from tools.ansi_strip import strip_ansi as _strip_ansi
 
 
@@ -1324,7 +1325,7 @@ def _sessions_list(_engine: HermesConsoleEngine, args: list[str]) -> str:
     db = SessionDB()
     try:
         sessions = db.list_sessions_rich(
-            exclude_sources=["kanban", "tool"],
+            exclude_sources=sorted(AUTOMATION_SOURCES),
             limit=ns.limit,
             order_by_last_active=True,
         )
@@ -1340,7 +1341,9 @@ def _sessions_stats(_engine: HermesConsoleEngine, args: list[str]) -> str:
     db = SessionDB()
     try:
         total = db.session_count()
-        listable = db.session_count(exclude_children=True, exclude_sources=["kanban", "tool"])
+        listable = db.session_count(
+            exclude_children=True, exclude_sources=sorted(AUTOMATION_SOURCES)
+        )
         messages = db.message_count()
         lines = [
             f"Total sessions: {total}",

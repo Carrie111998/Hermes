@@ -262,6 +262,48 @@ def test_sessions_list_and_stats_use_isolated_session_store(_isolate_hermes_home
     assert "Listable sessions: 1" in stats.output
 
 
+def test_sessions_list_excludes_automation_sources(_isolate_hermes_home):
+    """sessions list shares the AUTOMATION_SOURCES deny-list, not just tool/kanban."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        db.create_session("human-session", source="cli", model="test/model")
+        db.set_session_title("human-session", "Human chat")
+        for source in ("cron", "tool", "kanban", "subagent"):
+            sid = f"{source}-session"
+            db.create_session(sid, source=source, model="test/model")
+            db.set_session_title(sid, f"Machine run {source}")
+    finally:
+        db.close()
+
+    listed = HermesConsoleEngine().execute("sessions list --limit 50")
+
+    assert listed.status == "ok"
+    assert "human-session" in listed.output
+    for source in ("cron", "tool", "kanban", "subagent"):
+        assert f"{source}-session" not in listed.output, source
+
+
+def test_sessions_stats_listable_excludes_automation_sources(_isolate_hermes_home):
+    """Listable count drops every automation source, not just tool/kanban."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        db.create_session("human-session", source="cli", model="test/model")
+        for source in ("cron", "tool", "kanban", "subagent"):
+            db.create_session(f"{source}-session", source=source, model="test/model")
+    finally:
+        db.close()
+
+    stats = HermesConsoleEngine().execute("sessions stats")
+
+    assert stats.status == "ok"
+    assert "Total sessions: 5" in stats.output
+    assert "Listable sessions: 1" in stats.output
+
+
 def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
     from cron.jobs import create_job, get_job
 
