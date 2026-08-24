@@ -10273,6 +10273,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Soft-delete the truncated rows on disk so re-prompts and search
         # see the clean transcript while the rows survive for audit.
         rewound_rows = 0
+        # True once the on-disk transcript is known to agree with the
+        # in-memory truncation above — either because there is no DB to
+        # diverge from, or because the soft-delete actually ran. Gates the
+        # flush-cursor reset below: advancing that cursor while the DB
+        # still holds the "undone" rows as active lets a later flush
+        # append new rows alongside them instead of replacing them, so the
+        # undone content resurfaces on the next reload/resume/crash and
+        # stays a hit in FTS search.
+        db_reconciled = self._session_db is None or not self.session_id
         if self._session_db is not None and self.session_id:
             try:
                 recents = self._session_db.list_recent_user_messages(
@@ -10285,6 +10294,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self.session_id, target_id
                     )
                     rewound_rows = result.get("rewound_count", 0)
+                    db_reconciled = True
                     # Prefer the DB's decoded target text for the prefill —
                     # it's the canonical persisted copy.
                     db_text = self._undo_content_to_text(
@@ -10292,12 +10302,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     if db_text:
                         removed_text = db_text
+                # else: no recent user messages on disk to rewind against —
+                # leave db_reconciled False rather than assume agreement.
             except ValueError as e:
                 # Non-user target / cross-session — keep the in-memory undo
-                # but skip the soft-delete; surface a debug-level note.
-                logger.debug("undo: soft-delete skipped: %s", e)
+                # visible (unchanged from the original design), but do not
+                # let the flush cursor advance past on-disk rows that are
+                # still active — see db_reconciled above.
+                logger.warning(
+                    "undo: soft-delete skipped for session %s: %s — shown "
+                    "as undone in this session only; it may reappear after "
+                    "a resume",
+                    self.session_id, e,
+                )
             except Exception as e:
-                logger.debug("undo: soft-delete failed: %s", e)
+                logger.warning(
+                    "undo: soft-delete failed for session %s: %s — shown "
+                    "as undone in this session only; it may reappear after "
+                    "a resume",
+                    self.session_id, e,
+                )
 
         # Agent surgery: invalidate the system-prompt cache and reset the
         # flush index so the next turn re-flushes from the truncated head.
@@ -10307,7 +10331,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.agent._invalidate_system_prompt()
                 except Exception:
                     pass
-            if hasattr(self.agent, "_last_flushed_db_idx"):
+            if db_reconciled and hasattr(self.agent, "_last_flushed_db_idx"):
                 try:
                     self.agent._last_flushed_db_idx = len(self.conversation_history)
                 except Exception:
@@ -10334,6 +10358,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         remaining = len(self.conversation_history)
         print(f"  {remaining} message(s) remaining in history.")
+        if not db_reconciled:
+            print(
+                "  (!) Could not confirm this on disk — it's undone here, "
+                "but may reappear after a resume."
+            )
 
         # Pre-fill the composer with the backed-up message so the user can
         # edit and resubmit (Claude-Code-style). Editable, not auto-sent.
