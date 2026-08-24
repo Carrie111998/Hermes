@@ -19,6 +19,12 @@ const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
 const CONTEXT_REF_RE = /@(file|folder|url|image|tool|terminal):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
 
+// Must match the complete sentinel emitted from
+// agent/conversation_loop.py:INTERRUPT_WAITING_FOR_MODEL_PREFIX. Keep this
+// structural and exact: prefix matching can hide legitimate assistant prose.
+const INTERRUPT_WAITING_FOR_MODEL_RE =
+  /^Operation interrupted: waiting for model response \(\d+(?:\.\d+)?s elapsed\)\.$/
+
 function displayContentForMessage(role: SessionMessage['role'], content: unknown): string {
   const textContent = textFromUnknown(content)
 
@@ -53,7 +59,18 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   return [missing.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
 }
 
-function transcriptContent(displayKind: SessionMessage['display_kind'], content: string): string | null {
+function transcriptContent(
+  role: SessionMessage['role'],
+  displayKind: SessionMessage['display_kind'],
+  content: string
+): string | null {
+  // This persisted cancellation sentinel is transport metadata, not assistant
+  // prose. The live gateway suppresses it; hydration must do the same or a
+  // reconnect paints the metadata as a fresh assistant card.
+  if (role === 'assistant' && INTERRUPT_WAITING_FOR_MODEL_RE.test(content.trim())) {
+    return null
+  }
+
   return displayKind === 'hidden' ? null : content
 }
 
@@ -195,6 +212,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         : message.content || message.text || message.context || message.name
 
     const rawDisplayContent = transcriptContent(
+      message.role,
       message.display_kind,
       timelineDisplayContent(message, displayContentForMessage(message.role, content))
     )
