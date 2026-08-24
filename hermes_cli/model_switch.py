@@ -3964,7 +3964,11 @@ def list_picker_providers(
         for_picker=True,
         excluded_providers=excluded_providers,
     )
-    if include_moa:
+    # The virtual MoA row is prepended outside the exclusion-filtered
+    # ``list_authenticated_providers`` path, so it needs its own membership
+    # check against the same normalized ``excluded_providers`` set (#94068).
+    _excluded_moa = {str(p).strip().lower() for p in (excluded_providers or []) if p}
+    if include_moa and "moa" not in _excluded_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
     filtered: List[dict] = []

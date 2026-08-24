@@ -232,3 +232,68 @@ def test_distinct_kimi_china_credential_still_listed(monkeypatch):
     assert slugs.count("kimi-coding") == 1
     assert "kimi" not in slugs          # alias collapsed into the canonical row
     assert "kimi-coding-cn" in slugs    # distinct China endpoint preserved
+
+
+# ── Virtual MoA row vs model_catalog.excluded_providers (#94068) ──
+
+
+def _patch_moa_prepend(monkeypatch):
+    """Isolate the picker from the inventory: fixed virtual MoA row."""
+    moa_row = _make_provider("moa", name="Mixture of Agents", models=["balanced", "deep"])
+
+    def _prepend(providers, current_provider=""):
+        return [moa_row] + [p for p in providers if str(p.get("slug", "")).lower() != "moa"]
+
+    def _base(**kw):
+        excluded = {str(p).strip().lower() for p in (kw.get("excluded_providers") or []) if p}
+        rows = [_make_provider("openai", models=["gpt-x"])]
+        return [r for r in rows if r["slug"] not in excluded]
+
+    monkeypatch.setattr(model_switch, "_prepend_moa_picker_provider", _prepend)
+    monkeypatch.setattr(model_switch, "list_authenticated_providers", _base)
+
+
+def test_moa_row_hidden_when_excluded(monkeypatch):
+    """The gateway picker passes include_moa=True unconditionally; the virtual
+    row must still honor model_catalog.excluded_providers (#94068)."""
+    _patch_moa_prepend(monkeypatch)
+
+    rows = model_switch.list_picker_providers(
+        include_moa=True, excluded_providers=["moa"]
+    )
+
+    assert "moa" not in [r["slug"] for r in rows]
+    assert "openai" in [r["slug"] for r in rows]
+
+
+def test_moa_row_hidden_with_case_and_whitespace_variant(monkeypatch):
+    """Exclusion matching normalizes like list_authenticated_providers."""
+    _patch_moa_prepend(monkeypatch)
+
+    rows = model_switch.list_picker_providers(
+        include_moa=True, excluded_providers=["  MOA "]
+    )
+
+    assert "moa" not in [r["slug"] for r in rows]
+
+
+def test_moa_row_present_without_exclusion(monkeypatch):
+    """Default: the virtual row is still prepended first for gateway pickers."""
+    _patch_moa_prepend(monkeypatch)
+
+    rows = model_switch.list_picker_providers(include_moa=True)
+
+    assert rows[0]["slug"] == "moa"
+
+
+def test_moa_row_survives_other_provider_exclusion(monkeypatch):
+    """Excluding an unrelated provider must not hide the MoA row."""
+    _patch_moa_prepend(monkeypatch)
+
+    rows = model_switch.list_picker_providers(
+        include_moa=True, excluded_providers=["openai"]
+    )
+
+    slugs = [r["slug"] for r in rows]
+    assert "moa" in slugs
+    assert "openai" not in slugs
