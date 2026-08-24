@@ -1830,6 +1830,20 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_max_turns(value: Any) -> Optional[int]:
+    """Return a positive per-job turn cap, or None when unset."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        raise ValueError("max_turns must be a positive integer")
+    if not isinstance(value, (int, str)) or not str(value).strip().isdigit():
+        raise ValueError("max_turns must be a positive integer")
+    turns = int(value)
+    if turns <= 0:
+        raise ValueError("max_turns must be a positive integer")
+    return turns
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1933,6 +1947,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2000,6 +2015,8 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        max_turns: Optional positive per-run model-call cap. A lower global
+                agent.max_turns still clamps this value at fire time.
 
     Returns:
         The created job dict
@@ -2033,6 +2050,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_max_turns = _normalize_max_turns(max_turns)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2149,6 +2167,8 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    if normalized_max_turns is not None:
+        job["max_turns"] = normalized_max_turns
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2263,6 +2283,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+            if "max_turns" in updates:
+                updates["max_turns"] = _normalize_max_turns(updates["max_turns"])
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

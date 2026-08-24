@@ -120,6 +120,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--max-turns",
+        type=int,
+        help="Maximum model calls for each run of this job.",
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -253,6 +258,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
         ),
+    )
+    cron_edit.add_argument(
+        "--max-turns",
+        type=int,
+        help="Set the per-run model-call cap.",
     )
 
     # lifecycle actions

@@ -161,6 +161,10 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
+    # Trusted host metadata is transported outside model-authored arguments.
+    "mcp_request_metadata",
+    # Raw MCP result metadata may request a machine stop before another turn.
+    "mcp_tool_result",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
@@ -393,6 +397,8 @@ VALID_HOOKS: Set[str] = {
 # have its output silently ignored — registration is refused loudly instead.
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "mcp_request_metadata",
+    "mcp_tool_result",
     "transform_api_error_classification",
 }
 

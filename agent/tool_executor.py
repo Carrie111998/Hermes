@@ -1958,6 +1958,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     def _run_agent_tool_execution_middleware(agent, **kwargs):
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
+    def _record_mcp_stop(result: Any) -> Any:
+        try:
+            from tools.mcp_tool import consume_mcp_runtime_stop
+            directive = consume_mcp_runtime_stop()
+            if directive and agent._runtime_stop_reason is None:
+                agent._runtime_stop_reason = directive["reason"]
+        except Exception:
+            pass
+        return result
+
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         tool_call_id = _pairing_tool_call_id(tool_call)
         if getattr(agent, "_incremental_persistence_failed", False):
@@ -2505,7 +2515,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                        return _record_mcp_stop(_ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2525,7 +2535,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                        )
+                        ))
 
                 (
                     function_result,
@@ -2587,7 +2597,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                        return _record_mcp_stop(_ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2607,7 +2617,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                        )
+                        ))
 
                 (
                     function_result,

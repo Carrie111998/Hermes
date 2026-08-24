@@ -121,6 +121,17 @@ from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
 
+_mcp_runtime_stop: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+    contextvars.ContextVar("mcp_runtime_stop", default=None)
+)
+
+
+def consume_mcp_runtime_stop() -> Optional[Dict[str, str]]:
+    """Consume the trusted stop directive produced by the last MCP call."""
+    directive = _mcp_runtime_stop.get()
+    _mcp_runtime_stop.set(None)
+    return directive
+
 
 # Hard allocation ceiling for a single MCP text payload (chars). This is the
 # FIRST line of defense against a buggy or malicious MCP server returning
@@ -5776,6 +5787,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        _mcp_runtime_stop.set(None)
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -5843,7 +5855,33 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        request_meta: Dict[str, Any] = {}
+        try:
+            from hermes_cli.plugins import invoke_hook
+            for value in invoke_hook(
+                "mcp_request_metadata",
+                server_name=server_name,
+                tool_name=tool_name,
+                session_id=str(kwargs.get("session_id") or ""),
+                task_id=str(kwargs.get("task_id") or ""),
+            ):
+                supplied = value.get("meta") if isinstance(value, dict) else None
+                if not isinstance(supplied, dict):
+                    continue
+                overlap = request_meta.keys() & supplied.keys()
+                if overlap:
+                    return tool_error(
+                        "Conflicting trusted MCP metadata keys: "
+                        + ", ".join(sorted(overlap))
+                    )
+                request_meta.update(supplied)
+        except Exception as exc:
+            return tool_error(f"Trusted MCP metadata failed: {type(exc).__name__}")
+
+        response_meta: Any = None
+
         async def _call():
+            nonlocal response_meta
             _mark_server_call_started(server)
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
@@ -5852,7 +5890,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs = {"arguments": args}
+                    if request_meta:
+                        call_kwargs["meta"] = request_meta
+                    result = await server.session.call_tool(tool_name, **call_kwargs)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5963,7 +6004,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _structured_json = None
                 if _structured_json is not None and len(_structured_json) > _MCP_HARD_RESULT_CAP_CHARS:
                     structured = _truncate_mcp_text_result(_structured_json)
-            meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
+            response_meta = mcp_field(result, "meta", "meta")
+            meta = _strip_reserved_meta_keys(response_meta)
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
                 if text_result:
@@ -5988,6 +6030,26 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
+        def _record_runtime_stop(result: str) -> str:
+            try:
+                from hermes_cli.plugins import invoke_hook
+                decisions = invoke_hook(
+                    "mcp_tool_result",
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    session_id=str(kwargs.get("session_id") or ""),
+                    task_id=str(kwargs.get("task_id") or ""),
+                    meta=response_meta,
+                )
+                for decision in decisions:
+                    if isinstance(decision, dict) and decision.get("action") == "stop":
+                        reason = str(decision.get("reason") or "mcp_result")
+                        _mcp_runtime_stop.set({"reason": reason})
+                        break
+            except Exception:
+                logger.warning("MCP result hook failed", exc_info=True)
+            return result
+
         try:
             result = _call_once()
             # Check if the MCP tool itself returned an error
@@ -5999,7 +6061,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
-            return result
+            return _record_runtime_stop(result)
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
@@ -6011,7 +6073,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
-                return recovered
+                return _record_runtime_stop(recovered)
 
             # Transport session expiry (#13383): same reconnect flow
             # but skips OAuth recovery because the access token is
@@ -6021,7 +6083,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
-                return recovered
+                return _record_runtime_stop(recovered)
 
             _bump_server_error(server_name)
             logger.error(

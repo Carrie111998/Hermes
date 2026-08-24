@@ -10,6 +10,23 @@ from tools.cronjob_tools import (
 )
 
 
+def test_per_job_max_turns_persists_and_validates(tmp_path, monkeypatch):
+    import cron.jobs as jobs
+    from tools.cronjob_tools import CRONJOB_SCHEMA, _format_job
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path)
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "outputs")
+
+    created = jobs.create_job("work", "every 1h", max_turns=12)
+    assert jobs.get_job(created["id"])["max_turns"] == 12
+    assert _format_job(created)["max_turns"] == 12
+    assert "max_turns" not in CRONJOB_SCHEMA["parameters"]["properties"]
+    assert jobs.update_job(created["id"], {"max_turns": 7})["max_turns"] == 7
+    with pytest.raises(ValueError, match="positive integer"):
+        jobs.update_job(created["id"], {"max_turns": 0})
+
+
 # =========================================================================
 # Cron prompt scanning
 # =========================================================================

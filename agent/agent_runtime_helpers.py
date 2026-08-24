@@ -3440,12 +3440,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 **dispatch_kwargs,
             )
 
+    def _record_mcp_stop(result: Any) -> Any:
+        try:
+            from tools.mcp_tool import consume_mcp_runtime_stop
+            directive = consume_mcp_runtime_stop()
+            if directive and agent._runtime_stop_reason is None:
+                agent._runtime_stop_reason = directive["reason"]
+        except Exception:
+            pass
+        return result
+
     if skip_tool_execution_middleware:
-        return _execute(function_args)
+        return _record_mcp_stop(_execute(function_args))
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
-    return run_tool_execution_middleware(
+    return _record_mcp_stop(run_tool_execution_middleware(
         function_name,
         function_args,
         lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
@@ -3455,7 +3465,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         tool_call_id=tool_call_id or "",
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
+    ))
 
 
 

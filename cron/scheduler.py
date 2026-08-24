@@ -5735,6 +5735,15 @@ def run_job(
         if _mt is None:
             _mt = _cfg.get("max_turns")
         max_iterations = _resolve_turn_limit(_mt)
+        if job.get("max_turns") is not None:
+            from cron.jobs import _normalize_max_turns
+            job_max_turns = _normalize_max_turns(job["max_turns"])
+            if job_max_turns is None:
+                raise ValueError("max_turns must be a positive integer")
+            max_iterations = min(
+                max_iterations,
+                job_max_turns,
+            )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -6096,6 +6105,10 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        agent.strict_iteration_limit = job.get("max_turns") is not None
+        agent.cron_job_id = job_id
+        agent.cron_job_name = job_name
+        agent.cron_max_turns = job.get("max_turns")
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -6413,6 +6426,18 @@ def run_job(
                 _terminal_cwd_lock.release_write()
             else:
                 _terminal_cwd_lock.release_read()
+        if agent is not None:
+            try:
+                from hermes_cli.lifecycle import finalize_session
+                finalize_session(
+                    session_id=getattr(agent, "session_id", None) or _cron_session_id,
+                    platform="cron",
+                    cron_job_id=job_id,
+                    cron_job_name=job_name,
+                    cron_max_turns=job.get("max_turns"),
+                )
+            except (Exception, KeyboardInterrupt) as exc:
+                logger.warning("Job '%s': session finalizer failed: %s", job_id, exc)
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.

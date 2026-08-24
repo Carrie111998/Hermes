@@ -1046,14 +1046,23 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
+        _session_start_results = _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            cron_job_id=getattr(agent, "cron_job_id", None),
+            cron_job_name=getattr(agent, "cron_job_name", None),
+            cron_max_turns=getattr(agent, "cron_max_turns", None),
         )
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
+        _session_start_results = []
+    for _decision in _session_start_results:
+        if isinstance(_decision, dict) and _decision.get("action") == "block":
+            raise RuntimeError(
+                str(_decision.get("reason") or "Session blocked by runtime policy")
+            )
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -1879,6 +1888,7 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    agent._runtime_stop_reason = None
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -7454,6 +7464,11 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                if agent._runtime_stop_reason is not None:
+                    _turn_exit_reason = f"runtime_stop({agent._runtime_stop_reason})"
+                    final_response = ""
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:
