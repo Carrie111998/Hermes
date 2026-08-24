@@ -1224,12 +1224,30 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         if not _directory_entry_matches(snapshot_parent_fd, staging_name, staging_fd):
             raise ValueError("unsafe cold-store staging directory")
         stale_name = _move_current_snapshot_aside(snapshot_parent_fd, snapshot_name)
-        os.rename(
-            staging_name,
-            snapshot_name,
-            src_dir_fd=snapshot_parent_fd,
-            dst_dir_fd=snapshot_parent_fd,
-        )
+        try:
+            os.rename(
+                staging_name,
+                snapshot_name,
+                src_dir_fd=snapshot_parent_fd,
+                dst_dir_fd=snapshot_parent_fd,
+            )
+        except BaseException:
+            if stale_name is not None:
+                try:
+                    os.rename(
+                        stale_name,
+                        snapshot_name,
+                        src_dir_fd=snapshot_parent_fd,
+                        dst_dir_fd=snapshot_parent_fd,
+                    )
+                    os.fsync(snapshot_parent_fd)
+                    stale_name = None
+                except BaseException as restore_exc:
+                    raise RuntimeError(
+                        "cold-store snapshot publication failed and the previous "
+                        f"snapshot remains displaced as {stale_name}"
+                    ) from restore_exc
+            raise
         published = True
         os.fsync(snapshot_parent_fd)
         if stale_name is not None:

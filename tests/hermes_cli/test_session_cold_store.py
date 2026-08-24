@@ -1,5 +1,6 @@
 """Contract tests for the first Store-only cold archive slice."""
 
+import errno
 import json
 from datetime import UTC, datetime
 import os
@@ -879,6 +880,57 @@ def test_store_replaces_current_snapshot_when_archived_source_changes(
             "metadata.json",
             "session.jsonl",
         }
+    finally:
+        db.close()
+
+
+def test_store_restores_current_snapshot_when_replacement_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="original")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        first = store_archived_lineage(db, "terminal", archive_root)
+        original_payload = (first.snapshot_dir / "session.jsonl").read_bytes()
+
+        db.append_message("terminal", role="assistant", content="changed")
+        changed_messages = db.get_messages("terminal")
+        real_rename = os.rename
+
+        def fail_staging_publication(
+            src: str,
+            dst: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            if src.startswith(".staging-") and dst == first.snapshot_dir.name:
+                raise OSError(errno.EIO, "injected snapshot publication failure")
+            real_rename(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        monkeypatch.setattr(os, "rename", fail_staging_publication)
+
+        with pytest.raises(OSError, match="injected snapshot publication failure"):
+            store_archived_lineage(db, "terminal", archive_root)
+
+        assert first.snapshot_dir.is_dir()
+        assert (first.snapshot_dir / "session.jsonl").read_bytes() == original_payload
+        assert db.get_messages("terminal") == changed_messages
+        leftovers = {
+            path.name
+            for path in first.snapshot_dir.parent.iterdir()
+            if path.name.startswith((".stale-", ".staging-"))
+        }
+        assert leftovers == set()
     finally:
         db.close()
 
