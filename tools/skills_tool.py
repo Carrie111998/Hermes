@@ -1889,6 +1889,7 @@ def skill_view(
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
+            "reasoning": _skill_reasoning_effort(frontmatter),
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
@@ -2160,6 +2161,95 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
             _skill_view_tracker.pop(str(task_id), None)
 
 
+# ── Active-skill reasoning registry ──────────────────────────────────
+# Records which skill(s) were viewed this turn and the reasoning effort
+# each declares, in view order. The reasoning resolver reads the most
+# recent entry to answer "is the plan skill active right now?". This is
+# deliberately separate from the dedup tracker: a re-view that returns a
+# dedup stub still counts as "the skill is active this turn".
+_active_skill_reasoning: Dict[str, List[Tuple[str, Optional[str]]]] = {}
+_active_skill_reasoning_lock = threading.Lock()
+
+
+def record_active_skill(
+    task_id: str | None, skill_name: str, reasoning: Optional[str]
+) -> None:
+    """Record a skill viewed this turn, with its optional reasoning effort.
+
+    Keeps a per-task list in view order so the resolver can take the most
+    recent. ``reasoning`` is the already-validated effort (None when the
+    skill declares none). Wrapped by :func:`_record_active_skill_from_payload`
+    at the serve site.
+    """
+    if not task_id or not skill_name:
+        return
+    with _active_skill_reasoning_lock:
+        task_list = _active_skill_reasoning.setdefault(str(task_id), [])
+        task_list.append((skill_name, reasoning))
+        # Bound the per-task list (a very long turn could view many skills).
+        if len(task_list) > 200:
+            del task_list[: len(task_list) - 200]
+
+
+def active_skill_reasoning(task_id: str | None) -> Optional[Tuple[str, Optional[str]]]:
+    """Return the most recently viewed (skill_name, reasoning) for a task.
+
+    None when no skill has been viewed this turn (or task_id is unset).
+    """
+    if not task_id:
+        return None
+    with _active_skill_reasoning_lock:
+        task_list = _active_skill_reasoning.get(str(task_id))
+    if not task_list:
+        return None
+    return task_list[-1]
+
+
+def reset_active_skill_reasoning(task_id: str | None = None) -> None:
+    """Clear the active-skill registry (all tasks when task_id is None)."""
+    with _active_skill_reasoning_lock:
+        if task_id is None:
+            _active_skill_reasoning.clear()
+        else:
+            _active_skill_reasoning.pop(str(task_id), None)
+
+
+def _record_active_skill_from_view(task_id, name, parsed_payload: dict) -> None:
+    """Record the active skill + reasoning from a successful skill_view payload."""
+    if not isinstance(parsed_payload, dict) or not parsed_payload.get("success"):
+        return
+    resolved = parsed_payload.get("name") or name
+    if not resolved:
+        return
+    reasoning = parsed_payload.get("reasoning")
+    record_active_skill(task_id, str(resolved), reasoning)
+
+
+def _active_skill_payload_keep_reasoning(
+    task_id: str | None, name: str
+) -> dict:
+    """Return a minimal success payload preserving the last known reasoning.
+
+    Used on the dedup-stub path, where the stub carries no ``reasoning``:
+    look up the effort already recorded for this skill in this task and
+    echo it back so the re-record keeps the correct suggestion instead of
+    clobbering it with None.
+    """
+    if not task_id:
+        return {"success": True, "name": name, "reasoning": None}
+    last = active_skill_reasoning(task_id)
+    if last and str(last[0]) == str(name):
+        reasoning = last[1]
+    else:
+        # Find the latest recorded reasoning for this exact skill name.
+        with _active_skill_reasoning_lock:
+            task_list = list(_active_skill_reasoning.get(str(task_id), []))
+        reasoning = next(
+            (r for s, r in reversed(task_list) if str(s) == str(name)), None
+        )
+    return {"success": True, "name": name, "reasoning": reasoning}
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
@@ -2177,6 +2267,12 @@ def _skill_view_with_bump(args, **kw):
     # so a post-compression re-view returns full content again.
     stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
     if stub is not None:
+        # A dedup re-view still means the skill is active this turn, but the
+        # stub payload carries no `reasoning` — preserve the effort already
+        # recorded for this skill in this task so a re-view can't clobber it.
+        _record_active_skill_from_view(
+            task_id, name, _active_skill_payload_keep_reasoning(task_id, name)
+        )
         return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id
@@ -2185,6 +2281,7 @@ def _skill_view_with_bump(args, **kw):
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
             _record_skill_view(task_id, name, args.get("file_path"), parsed)
+            _record_active_skill_from_view(task_id, name, parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
