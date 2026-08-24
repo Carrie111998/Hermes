@@ -233,6 +233,34 @@ describe('Enter submission and latch behavior', () => {
     })
   })
 
+  it('cancels the submitting latch timer when the edit composer unmounts', async () => {
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+    const clearTimeoutSpy = vi.spyOn(window, 'clearTimeout')
+
+    try {
+      const onEdit = vi.fn(async () => {})
+      const view = render(<IncrementalHarness onEdit={onEdit} />)
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+
+      const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+      editor.textContent = 'submit before unmount'
+      fireEvent.input(editor)
+      fireEvent.keyDown(editor, { key: 'Enter' })
+
+      await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1))
+      const timerIndex = setTimeoutSpy.mock.calls.map(([, delay]) => delay).lastIndexOf(200)
+      const timerId = setTimeoutSpy.mock.results[timerIndex]?.value
+
+      expect(timerIndex).toBeGreaterThanOrEqual(0)
+      view.unmount()
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(timerId)
+    } finally {
+      setTimeoutSpy.mockRestore()
+      clearTimeoutSpy.mockRestore()
+    }
+  })
+
   it('inserts a newline on Shift+Enter without submitting', async () => {
     const onEdit = vi.fn(async () => {})
     render(<IncrementalHarness onEdit={onEdit} />)
