@@ -89,6 +89,29 @@ class TestExtractCronSummary:
         summary, _ = _extract_cron_summary("[summary] fine.\n\nrest")
         assert summary == "fine."
 
+    # Lightweight decoration tolerance (review round: models bold/quote the
+    # marker despite the hint; an unrecognized marker meant data loss on the
+    # silence carve-out and a raw token at the channel root).
+
+    def test_bold_decorated_marker(self):
+        summary, body = _extract_cron_summary("**[SUMMARY]** All green.\n\nDetail.")
+        assert summary == "All green."
+        assert body == "All green.\n\nDetail."
+
+    def test_blockquote_decorated_marker(self):
+        summary, _ = _extract_cron_summary("> [SUMMARY] All green.\n\nDetail.")
+        assert summary == "All green."
+
+    def test_italic_colon_decorated_marker(self):
+        summary, _ = _extract_cron_summary("*[SUMMARY]:* All green.\n\nDetail.")
+        assert summary == "All green."
+
+    def test_decoration_eating_stops_at_whitespace(self):
+        """The trailing decoration class must not consume summary text that
+        merely STARTS with emphasis — whitespace terminates it."""
+        summary, _ = _extract_cron_summary("[SUMMARY] *emphasis* lead.\n\nDetail.")
+        assert summary == "*emphasis* lead."
+
     def test_leading_whitespace_before_marker(self):
         summary, body = _extract_cron_summary("\n  [SUMMARY] Ship it.\n\nBody")
         assert summary == "Ship it."
@@ -242,17 +265,22 @@ class TestOpenContinuableThreadSeed:
 
             return _coro()
 
-    class _AlwaysTypeErrorAdapter:
-        """A genuinely broken adapter: every awaited call raises TypeError."""
+    _KWARG_MSG = "create_handoff_thread() got an unexpected keyword argument 'seed_text'"
 
-        def __init__(self):
+    class _AlwaysTypeErrorAdapter:
+        """Every awaited call raises TypeError with the given message —
+        the retry gate keys on the message, so it controls whether the
+        failure reads as a legacy-kwarg miss or a genuine internal bug."""
+
+        def __init__(self, message):
+            self.message = message
             self.calls = []
 
         def create_handoff_thread(self, *args, **kwargs):
             self.calls.append((args, kwargs))
 
             async def _coro():
-                raise TypeError("genuine bug inside the adapter")
+                raise TypeError(self.message)
 
             return _coro()
 
@@ -274,7 +302,7 @@ class TestOpenContinuableThreadSeed:
     def test_await_time_type_error_without_seed_yields_none(self):
         """A genuine adapter TypeError on a NO-seed call is not a kwarg
         problem: no retry, propagates to the outer handler, returns None."""
-        adapter = self._AlwaysTypeErrorAdapter()
+        adapter = self._AlwaysTypeErrorAdapter("genuine bug inside the adapter")
         with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=self._run_coro):
             tid = _open_continuable_cron_thread(
                 self.JOB, adapter, "123", loop=MagicMock(), seed_text=None
@@ -283,15 +311,30 @@ class TestOpenContinuableThreadSeed:
         assert len(adapter.calls) == 1  # exactly one attempt, no retry
 
     def test_await_time_type_error_on_both_attempts_yields_none(self):
-        """Seed call AND its 2-arg retry both raise: exactly two attempts,
-        then None — the retry never loops."""
-        adapter = self._AlwaysTypeErrorAdapter()
+        """Kwarg-shaped seed failure AND its 2-arg retry both raise: exactly
+        two attempts, then None — the retry never loops."""
+        adapter = self._AlwaysTypeErrorAdapter(self._KWARG_MSG)
         with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=self._run_coro):
             tid = _open_continuable_cron_thread(
                 self.JOB, adapter, "123", loop=MagicMock(), seed_text="TLDR line"
             )
         assert tid is None
         assert len(adapter.calls) == 2
+
+    def test_genuine_type_error_with_seed_does_not_retry(self):
+        """REGRESSION (tightened gate): the retry fires only when the
+        TypeError message names the kwarg. A genuine internal TypeError in a
+        modern adapter — which may already have POSTED its seed before
+        raising — must propagate, not re-run the adapter (double seed post)."""
+        adapter = self._AlwaysTypeErrorAdapter(
+            "unsupported operand type(s) for +: 'int' and 'str'"
+        )
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=self._run_coro):
+            tid = _open_continuable_cron_thread(
+                self.JOB, adapter, "123", loop=MagicMock(), seed_text="TLDR line"
+            )
+        assert tid is None
+        assert len(adapter.calls) == 1  # no retry: the bug is not the kwarg
 
 
 class TestDeliverResultChannelSummaryGate:
@@ -681,6 +724,14 @@ class TestCronSilenceSuppressesDeliveryPredicate:
     def test_non_silent_response_never_suppressed(self):
         assert _cron_silence_suppresses_delivery(
             self.FLAGGED, "[SUMMARY] x\n\nreport"
+        ) is False
+
+    def test_decorated_marker_with_stray_silent_delivers(self):
+        """The carve-out recognizes the decorated marker too — a bolded
+        [SUMMARY] plus stray trailing [SILENT] was the review's data-loss
+        mode (unrecognized marker -> whole report swallowed)."""
+        assert _cron_silence_suppresses_delivery(
+            self.FLAGGED, "**[SUMMARY]** All green.\n\nDetail.\n\n[SILENT]"
         ) is False
 
 

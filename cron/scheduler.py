@@ -589,7 +589,17 @@ def _is_cron_silence_response(text: str) -> bool:
 # chars the "summary" is a report, and the channel-root line falls back to
 # the fixed handoff label rather than flooding the channel the feature
 # exists to keep tidy.
-_CRON_SUMMARY_MARKER_RE = re.compile(r"^\[summary\]:?[ \t]*", re.IGNORECASE)
+#
+# Lightweight decoration around the token is tolerated ("**[SUMMARY]**",
+# "> [SUMMARY]", "*[SUMMARY]:*") — models pattern-match the taught format
+# with markdown emphasis, and a decorated lead missing the match would also
+# miss the stray-[SILENT] carve-out in _cron_silence_suppresses_delivery,
+# turning a cosmetic miss into a swallowed report.  The trailing class eats
+# only characters adjacent to "]" (whitespace terminates it), so an
+# undecorated summary's own text is never consumed.
+_CRON_SUMMARY_MARKER_RE = re.compile(
+    r"^(?:>[ \t]*)?[*_]{0,3}\[summary\][*_:]{0,4}[ \t]*", re.IGNORECASE
+)
 _CRON_SUMMARY_MAX_LINES = 2
 _CRON_SUMMARY_MAX_CHARS = 400
 
@@ -1871,15 +1881,18 @@ def _open_continuable_cron_thread(
             return None
         try:
             new_thread_id = future.result(timeout=30)
-        except TypeError:
+        except TypeError as e:
             # A *args/**kwargs-forwarding wrapper around a legacy 2-arg
             # implementation binds ``seed_text`` fine and raises only when the
             # coroutine actually runs — same degradation contract as the
             # bind-time retry above: open the thread with the fixed label
-            # rather than losing it. Gated on the seed kwarg so a genuine
-            # adapter TypeError on a 2-arg call still reaches the outer
-            # handler.
-            if not used_seed_kwarg:
+            # rather than losing it. Gated on the seed kwarg AND the error
+            # naming it (CPython spells the bind failure "... got an
+            # unexpected keyword argument 'seed_text'"), so a genuine
+            # TypeError inside a modern adapter's body reaches the outer
+            # handler instead of being masked — and, worse, re-running an
+            # adapter that already posted its seed before raising.
+            if not (used_seed_kwarg and "seed_text" in str(e)):
                 raise
             future = safe_schedule_threadsafe(
                 create_thread(str(chat_id), thread_name), loop
@@ -4517,6 +4530,8 @@ def _build_job_prompt(
             "full report threaded under it, and YOU write that line. Begin "
             "your final response with \"[SUMMARY] <one or two short "
             "sentences>\" followed by a blank line, then the full report. "
+            "Use the plain marker exactly as shown — no bold, quote, or "
+            "other decoration around it. "
             "Keep the summary a genuine TL;DR of this run's findings. "
             "If there is nothing to report, respond [SILENT] as above — "
             "never combine [SUMMARY] with [SILENT].]\n\n"
