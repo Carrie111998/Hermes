@@ -111,6 +111,11 @@ class _Interceptor:
     def __init__(self, ws) -> None:
         self._ws = ws
         self._next_id = 0
+        # Events that arrived while a command reply was in flight. Dropping a
+        # Fetch.requestPaused here loses the response we came for AND strands
+        # that request paused forever, which stalls the page's lazy RPC chain
+        # -- the "wedged tab" of 2026-08-23 was this, not a browser fault.
+        self._events: list = []
 
     def call(self, method: str, params: dict | None = None, *, timeout: float = 10.0) -> dict:
         self._next_id += 1
@@ -120,14 +125,24 @@ class _Interceptor:
         for _ in range(deadline_guard):
             frame = self._recv()
             message = json.loads(frame)
-            if isinstance(message, dict) and message.get("id") == msg_id:
+            if not isinstance(message, dict):
+                continue
+            if message.get("id") == msg_id:
                 if "error" in message:
                     raise RuntimeError(f"CDP error: {message['error']}")
                 return message.get("result") or {}
+            if "method" in message:
+                self._events.append(message)
         raise RuntimeError(f"CDP response timeout: {method}")
 
     def recv_event(self, seconds: float) -> Optional[dict]:
-        """Next protocol event within ``seconds``, else None."""
+        """Next protocol event within ``seconds``, else None.
+
+        Events queued by ``call`` are served first, oldest first, so a pause
+        that landed mid-round-trip is processed rather than lost.
+        """
+        if self._events:
+            return self._events.pop(0)
         end = time.time() + seconds
         while time.time() < end:
             remaining = max(0.05, end - time.time())

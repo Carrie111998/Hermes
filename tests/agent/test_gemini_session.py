@@ -256,3 +256,117 @@ def test_success_on_existing_tab_never_retries_or_closes(monkeypatch):
     # One attempt only; nothing opened, nothing to close.
     assert len(_FirstTryOk.instances) == 1
     assert closed == []
+
+
+# --- interleaved-event survival ----------------------------------------------
+#
+# Production incident 2026-08-23 (second defect, same feature): _Interceptor.call
+# read frames until it found ITS reply and threw everything else away. Any
+# Fetch.requestPaused arriving inside a command round-trip was therefore lost --
+# and a lost response-stage pause is never continued, so that request hangs
+# forever and stalls the page lazy chain. Measured on the live apikey page the
+# usage RPC lands ~10s in, well after a dozen other pauses have each cost one or
+# two round-trips, so the event most likely to be swallowed is the only one we
+# actually need. These tests pin that events survive a round-trip.
+
+
+def _paused_frame(request_id, tail):
+    import json as _json
+
+    return _json.dumps(
+        {
+            "method": "Fetch.requestPaused",
+            "params": {
+                "requestId": request_id,
+                "request": {"url": f"https://x/{tail}"},
+            },
+        }
+    )
+
+
+class _ScriptedWS:
+    """Serves replies AND injects events while a reply is still in flight."""
+
+    def __init__(self):
+        self._out = []
+        self.sent = []
+
+    def send(self, raw):
+        import json as _json
+
+        msg = _json.loads(raw)
+        msg_id, method = msg["id"], msg["method"]
+        params = msg.get("params") or {}
+        self.sent.append(method)
+        if method == "Page.navigate":
+            self._out.append(_paused_frame("req-1", "ListImportedProjects"))
+            self._out.append(_json.dumps({"id": msg_id, "result": {}}))
+        elif method == "Fetch.getResponseBody":
+            if params.get("requestId") == "req-1":
+                # The REAL usage pause lands while this reply is in flight.
+                self._out.append(
+                    _paused_frame("req-2", "BatchGetProjectUsageLimits")
+                )
+                body = _IMPORTED_PROJECTS_BODY
+            else:
+                body = _USAGE_LIMITS_BODY
+            self._out.append(
+                _json.dumps(
+                    {"id": msg_id, "result": {"body": body, "base64Encoded": False}}
+                )
+            )
+        else:
+            self._out.append(_json.dumps({"id": msg_id, "result": {}}))
+
+    def settimeout(self, seconds):
+        pass
+
+    def recv(self):
+        if not self._out:
+            raise RuntimeError("scripted socket exhausted")
+        return self._out.pop(0)
+
+    def close(self):
+        pass
+
+
+def test_call_queues_events_arriving_mid_round_trip():
+    ws = _ScriptedWS()
+    ws._out = [
+        _paused_frame("swallowed", "BatchGetProjectUsageLimits"),
+        '{"id": 1, "result": {"ok": true}}',
+    ]
+    interceptor = gs._Interceptor(ws)
+    assert interceptor.call("Page.enable", {}, timeout=5.0) == {"ok": True}
+    # The event arrived first; it must still be retrievable afterwards.
+    event = interceptor.recv_event(0.2)
+    assert event is not None, "interleaved Fetch.requestPaused was dropped"
+    assert event["params"]["requestId"] == "swallowed"
+
+
+def test_queued_events_drain_before_the_socket_is_read():
+    ws = _ScriptedWS()
+    ws._out = [
+        _paused_frame("first", "ListImportedProjects"),
+        _paused_frame("second", "BatchGetProjectUsageLimits"),
+        '{"id": 1, "result": {}}',
+    ]
+    interceptor = gs._Interceptor(ws)
+    interceptor.call("Page.enable", {}, timeout=5.0)
+    assert interceptor.recv_event(0.2)["params"]["requestId"] == "first"
+    assert interceptor.recv_event(0.2)["params"]["requestId"] == "second"
+
+
+def test_usage_rpc_paused_during_a_round_trip_still_yields_limits(monkeypatch):
+    """End-to-end through the REAL _Interceptor over a scripted socket."""
+    _patch_discovery(monkeypatch)
+    monkeypatch.setattr(
+        "websocket.create_connection", lambda *a, **k: _ScriptedWS()
+    )
+    monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.5)
+    # Budget deliberately too small to cover a fresh-tab retry, so this asserts
+    # the FIRST attempt succeeds rather than being rescued by the retry.
+    assert gs.fetch_gemini_budget_usage(timeout=5.0, budget_seconds=5.0) == (
+        14.9896,
+        250.0,
+    )
