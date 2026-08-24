@@ -1,11 +1,16 @@
 """Discord music queue and playback-control behavior."""
 
+import asyncio
+import threading
+import time
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from plugins.platforms.discord.music import (
+    BufferedAudioSource,
     DiscordMusicManager,
     MusicControlView,
     MusicResolutionError,
@@ -202,7 +207,9 @@ def test_text_search_queues_one_result_but_keeps_playback_fallback_candidates():
     assert tracks[0].lookup == "ytsearch5:requested song"
 
 
-def test_ytdlp_prefers_low_bandwidth_hls_and_enables_packaged_js_runtime(monkeypatch):
+def test_ytdlp_prefers_audio_or_bounded_quality_hls_and_enables_packaged_js_runtime(
+    monkeypatch,
+):
     captured = {}
 
     class FakeYoutubeDL:
@@ -227,7 +234,11 @@ def test_ytdlp_prefers_low_bandwidth_hls_and_enables_packaged_js_runtime(monkeyp
         flat=False,
     )
 
-    assert captured["format"] == "worst[protocol^=m3u8][acodec!=none]"
+    assert captured["format"] == (
+        "bestaudio[protocol^=m3u8]/"
+        "best[protocol^=m3u8][acodec!=none][height<=480]/"
+        "worst[protocol^=m3u8][acodec!=none]"
+    )
     assert captured["ignoreerrors"] is True
     assert "node" in captured["js_runtimes"]
 
@@ -272,18 +283,171 @@ def test_youtube_hls_is_limited_to_provider_controlled_manifest_host():
 
 
 def test_ffmpeg_source_restricts_nested_network_protocols(monkeypatch):
-    ffmpeg = MagicMock(return_value="source")
+    upstream = MagicMock()
+    ffmpeg = MagicMock(return_value=upstream)
     monkeypatch.setattr("discord.FFmpegPCMAudio", ffmpeg)
 
     source = DiscordMusicManager._default_audio_source(
         "https://manifest.googlevideo.com/audio.m3u8"
     )
 
-    assert source == "source"
+    assert isinstance(source, BufferedAudioSource)
+    assert source.source is upstream
     before_options = ffmpeg.call_args.kwargs["before_options"]
+    options = ffmpeg.call_args.kwargs["options"]
     assert ffmpeg.call_args.kwargs["executable"]
     assert "-protocol_whitelist http,https,tcp,tls,crypto" in before_options
     assert "file" not in before_options
+    assert "aresample=48000" in options
+    assert "resampler=soxr" not in options
+    source.cleanup()
+
+
+def test_buffered_audio_source_returns_silence_instead_of_blocking_on_underflow():
+    first = b"a" * BufferedAudioSource.FRAME_SIZE
+    second = b"b" * BufferedAudioSource.FRAME_SIZE
+    release_second = threading.Event()
+
+    class StallingSource:
+        def __init__(self):
+            self.reads = 0
+            self.cleaned = False
+
+        def read(self):
+            self.reads += 1
+            if self.reads == 1:
+                return first
+            if self.reads == 2:
+                release_second.wait(timeout=2)
+                return second
+            return b""
+
+        def cleanup(self):
+            self.cleaned = True
+
+        def is_opus(self):
+            return False
+
+    upstream = StallingSource()
+    source = BufferedAudioSource(
+        upstream,
+        prebuffer_frames=1,
+        max_buffer_frames=4,
+    )
+    assert source.wait_until_ready(timeout=1)
+    assert source.read() == first
+
+    started = time.perf_counter()
+    assert source.read() == BufferedAudioSource.SILENCE_FRAME
+    assert time.perf_counter() - started < 0.05
+
+    release_second.set()
+    deadline = time.monotonic() + 1
+    frame = BufferedAudioSource.SILENCE_FRAME
+    while frame == BufferedAudioSource.SILENCE_FRAME and time.monotonic() < deadline:
+        time.sleep(0.01)
+        frame = source.read()
+    assert frame == second
+
+    source.cleanup()
+    assert upstream.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_startup_cancellation_cleans_buffered_source():
+    release_read = threading.Event()
+
+    class BlockingSource:
+        cleaned = False
+
+        def read(self):
+            release_read.wait(timeout=2)
+            return b""
+
+        def cleanup(self):
+            self.cleaned = True
+            release_read.set()
+
+    upstream = BlockingSource()
+    source = BufferedAudioSource(upstream, prebuffer_frames=1, max_buffer_frames=2)
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    adapter = SimpleNamespace(_voice_clients={7: vc})
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: source,
+    )
+    session = MusicSession(guild_id=7, queue=deque([_track("cancelled")]))
+
+    task = asyncio.create_task(manager._start_next(session))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        assert upstream.cleaned is True
+    finally:
+        source.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_startup_decoder_error_is_reported_instead_of_buffer_timeout():
+    class BrokenSource:
+        def read(self):
+            raise RuntimeError("decoder exploded")
+
+        def cleanup(self):
+            return None
+
+    source = BufferedAudioSource(BrokenSource(), prebuffer_frames=1)
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+    )
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: source,
+    )
+    session = MusicSession(guild_id=7, queue=deque([_track("broken")]))
+    session.panel_message = SimpleNamespace(edit=AsyncMock())
+    session.text_channel = SimpleNamespace()
+
+    await manager._start_next(session)
+
+    assert session.last_error is not None
+    assert "decoder exploded" in session.last_error
+
+
+@pytest.mark.asyncio
+async def test_missing_voice_connection_is_rejected_before_audio_source_creation():
+    factory = MagicMock()
+    adapter = SimpleNamespace(
+        _voice_clients={},
+        _voice_receivers={},
+        _voice_mixers={},
+    )
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    manager = DiscordMusicManager(adapter, resolver=resolver, audio_source_factory=factory)
+    session = MusicSession(guild_id=7, queue=deque([_track("disconnected")]))
+    session.panel_message = SimpleNamespace(edit=AsyncMock())
+    session.text_channel = SimpleNamespace()
+
+    await manager._start_next(session)
+
+    factory.assert_not_called()
+    assert session.last_error is not None
+    assert "voice connection was lost" in session.last_error.lower()
 
 
 def test_spotify_http_uses_connect_time_ssrf_safe_client(monkeypatch):
@@ -421,6 +585,8 @@ async def test_add_joins_requesters_vc_starts_fifo_playback_and_updates_public_p
     )
     voice_client.play.assert_called_once()
     assert voice_client.play.call_args.args[0] is source
+    assert voice_client.play.call_args.kwargs["bitrate"] == 192
+    assert voice_client.play.call_args.kwargs["signal_type"] == "music"
     assert manager.sessions[7].current is track
     text_channel.send.assert_awaited_once()
     panel.edit.assert_awaited()

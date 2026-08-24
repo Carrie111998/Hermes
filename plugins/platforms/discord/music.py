@@ -10,11 +10,18 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import queue
 import re
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Iterable, Optional
 from urllib.parse import urlparse
+
+try:
+    import discord
+except ImportError:  # pragma: no cover - Discord adapter is unavailable too
+    discord = None
 
 
 class MusicResolutionError(RuntimeError):
@@ -236,6 +243,8 @@ class TrackResolver:
                 None
                 if flat
                 else (
+                    "bestaudio[protocol^=m3u8]/"
+                    "best[protocol^=m3u8][acodec!=none][height<=480]/"
                     "worst[protocol^=m3u8][acodec!=none]"
                     if is_youtube
                     else "bestaudio/best"
@@ -387,6 +396,110 @@ class MusicSession:
 logger = logging.getLogger(__name__)
 
 
+if discord is None:
+
+    class _AudioSourceBase:
+        pass
+
+else:
+
+    class _AudioSourceBase(discord.AudioSource):
+        pass
+
+
+class BufferedAudioSource(_AudioSourceBase):
+    """Read FFmpeg ahead so network stalls never make Discord burst packets.
+
+    discord.py reads one 20 ms PCM frame at a time from its audio sender thread.
+    A blocking network-backed source makes that thread fall behind; its scheduler
+    then sends later frames without delay to catch up, which sounds like random
+    speed-ups.  This wrapper decouples FFmpeg from the sender with a bounded
+    read-ahead queue and emits silence during a rare buffer underrun instead of
+    blocking the sender.
+    """
+
+    FRAME_SIZE = 3840  # 48 kHz * 2 channels * 2 bytes * 20 ms
+    SILENCE_FRAME = b"\x00" * FRAME_SIZE
+
+    def __init__(
+        self,
+        source,
+        *,
+        prebuffer_frames: int = 100,
+        max_buffer_frames: int = 500,
+    ) -> None:
+        self.source = source
+        self._prebuffer_frames = max(1, int(prebuffer_frames))
+        capacity = max(self._prebuffer_frames, int(max_buffer_frames))
+        self._frames: queue.Queue[bytes] = queue.Queue(maxsize=capacity)
+        self._ready = threading.Event()
+        self._finished = threading.Event()
+        self._stop = threading.Event()
+        self._cleanup_lock = threading.Lock()
+        self._cleaned = False
+        self._current_error = None
+        self._producer = threading.Thread(
+            target=self._fill,
+            name="discord-music-buffer",
+            daemon=True,
+        )
+        self._producer.start()
+
+    def _fill(self) -> None:
+        try:
+            while not self._stop.is_set():
+                frame = self.source.read()
+                if not frame:
+                    self._current_error = getattr(
+                        self.source, "_current_error", None
+                    )
+                    break
+                if len(frame) < self.FRAME_SIZE:
+                    frame += b"\x00" * (self.FRAME_SIZE - len(frame))
+                while not self._stop.is_set():
+                    try:
+                        self._frames.put(frame, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                if self._frames.qsize() >= self._prebuffer_frames:
+                    self._ready.set()
+        except Exception as exc:
+            self._current_error = exc
+        finally:
+            self._finished.set()
+            self._ready.set()
+
+    def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        """Wait for the startup cushion without blocking the asyncio loop."""
+        if not self._ready.wait(timeout=max(0.0, float(timeout))):
+            return False
+        return not self._frames.empty()
+
+    def read(self) -> bytes:
+        try:
+            return self._frames.get_nowait()
+        except queue.Empty:
+            if self._finished.is_set():
+                return b""
+            return self.SILENCE_FRAME
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        with self._cleanup_lock:
+            if self._cleaned:
+                return
+            self._cleaned = True
+            self._stop.set()
+            try:
+                self.source.cleanup()
+            finally:
+                if self._producer is not threading.current_thread():
+                    self._producer.join(timeout=1.0)
+
+
 class DiscordMusicManager:
     """Own one visible FIFO player per Discord guild."""
 
@@ -413,14 +526,18 @@ class DiscordMusicManager:
 
         from plugins.platforms.discord.ffmpeg_utils import resolve_ffmpeg_executable
 
-        return discord.FFmpegPCMAudio(
-            stream_url,
-            executable=resolve_ffmpeg_executable(),
-            before_options=(
-                "-protocol_whitelist http,https,tcp,tls,crypto "
-                "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-            ),
-            options="-vn -loglevel warning",
+        return BufferedAudioSource(
+            discord.FFmpegPCMAudio(
+                stream_url,
+                executable=resolve_ffmpeg_executable(),
+                before_options=(
+                    "-protocol_whitelist http,https,tcp,tls,crypto "
+                    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+                ),
+                options=(
+                    "-vn -af aresample=48000 -loglevel warning"
+                ),
+            )
         )
 
     async def add(self, interaction, query: str) -> None:
@@ -507,11 +624,24 @@ class DiscordMusicManager:
             session.current = track
             source = None
             try:
+                vc = self.adapter._voice_clients.get(session.guild_id)
+                if vc is None or not vc.is_connected():
+                    raise MusicResolutionError("The voice connection was lost.")
                 stream_url = await asyncio.to_thread(
                     self.resolver.resolve_stream, track
                 )
                 source = self._audio_source_factory(stream_url)
-                vc = self.adapter._voice_clients.get(session.guild_id)
+                if isinstance(source, BufferedAudioSource):
+                    ready = await asyncio.to_thread(source.wait_until_ready, 10.0)
+                    if not ready:
+                        startup_error = getattr(source, "_current_error", None)
+                        if startup_error is not None:
+                            raise MusicResolutionError(
+                                f"The audio decoder failed: {startup_error}"
+                            )
+                        raise MusicResolutionError(
+                            "The audio stream did not buffer enough to start reliably."
+                        )
                 if vc is None or not vc.is_connected():
                     raise MusicResolutionError("The voice connection was lost.")
                 self.adapter._cancel_voice_timeout(session.guild_id)
@@ -536,10 +666,20 @@ class DiscordMusicManager:
                         )
                     )
 
-                vc.play(source, after=_after)
+                vc.play(
+                    source,
+                    after=_after,
+                    bitrate=192,
+                    signal_type="music",
+                )
                 session.last_error = None
                 await self._update_panel(session)
                 return
+            except asyncio.CancelledError:
+                cleanup = getattr(source, "cleanup", None)
+                if callable(cleanup):
+                    await asyncio.to_thread(cleanup)
+                raise
             except Exception as exc:
                 logger.warning(
                     "Skipping unplayable Discord music track %r in guild %s: %s",
@@ -547,8 +687,9 @@ class DiscordMusicManager:
                     session.guild_id,
                     exc,
                 )
-                if source is not None and hasattr(source, "cleanup"):
-                    source.cleanup()
+                cleanup = getattr(source, "cleanup", None)
+                if callable(cleanup):
+                    await asyncio.to_thread(cleanup)
                 session.last_error = f"Skipped **{track.title}**: {exc}"
                 session.current = None
                 await self._update_panel(session)
@@ -762,12 +903,6 @@ class DiscordMusicManager:
         reset_timeout = getattr(self.adapter, "_reset_voice_timeout", None)
         if callable(reset_timeout):
             reset_timeout(guild_id)
-
-
-try:
-    import discord
-except ImportError:  # pragma: no cover - Discord adapter is unavailable too
-    discord = None
 
 
 if discord is not None:
