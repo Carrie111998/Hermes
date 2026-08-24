@@ -279,14 +279,46 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             self.require_mention = os.getenv("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
 
-        # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
+        # Reaction allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
         # (reactions fire before run.py's auth gate, so without this check
         # every inbound DM from any contact gets a 👀 reaction).
         # "*" means all users allowed (open mode); empty means no restriction
         # recorded at adapter level (run.py still enforces auth separately).
         dm_allowed_str = os.getenv("SIGNAL_ALLOWED_USERS", "*")
-        self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
+        self.reaction_allow_from = set(_parse_comma_list(dm_allowed_str))
+
+        # DM policy — mirrors the dm_policy surface other adapters expose
+        # (WhatsApp/Weixin/Yuanbao/...):
+        #   "open"      (default) delegates DM auth to the gateway allowlist
+        #               (SIGNAL_ALLOWED_USERS in run.py)
+        #   "allowlist" restricts DMs at intake to SIGNAL_DM_ALLOW_FROM
+        #               (falls back to SIGNAL_ALLOWED_USERS when unset)
+        #   "disabled"  drops ALL direct messages at intake so the bot only
+        #               ever responds in allowlisted groups
+        # Read from config extra first, then SIGNAL_DM_POLICY env var.
+        _dm_cfg = extra.get("dm_policy")
+        if _dm_cfg is not None:
+            self.dm_policy = str(_dm_cfg).strip().lower()
+        else:
+            self.dm_policy = os.getenv("SIGNAL_DM_POLICY", "open").strip().lower()
+        if self.dm_policy not in ("open", "allowlist", "disabled"):
+            logger.warning(
+                "Signal: unknown dm_policy %r — falling back to 'open'", self.dm_policy
+            )
+            self.dm_policy = "open"
+        # DM sender allowlist enforced at intake when dm_policy=allowlist.
+        # Defaults to SIGNAL_ALLOWED_USERS so allowlist mode with no explicit
+        # list matches the gateway's own DM auth (current behavior). Distinct
+        # from reaction_allow_from so group reactions keep honoring the
+        # gateway auth list even when DMs are narrowed further.
+        _dm_allow_cfg = extra.get("dm_allow_from")
+        if _dm_allow_cfg is not None:
+            self.dm_allow_from = set(_parse_comma_list(str(_dm_allow_cfg)))
+        else:
+            self.dm_allow_from = set(
+                _parse_comma_list(os.getenv("SIGNAL_DM_ALLOW_FROM", "") or dm_allowed_str)
+            )
 
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
@@ -595,6 +627,20 @@ class SignalAdapter(BasePlatformAdapter):
         group_info = data_message.get("groupInfo")
         group_id = group_info.get("groupId") if group_info else None
         is_group = bool(group_id)
+
+        # DM policy — when "disabled" or "allowlist", direct messages are
+        # gated at intake so the bot only responds to approved senders (or,
+        # for "disabled", nowhere at all). Note-to-Self is handled earlier
+        # and is unaffected. (Group message filtering below.)
+        if not is_group:
+            if self.dm_policy == "disabled":
+                logger.debug("Signal: ignoring DM (SIGNAL_DM_POLICY=disabled)")
+                return
+            if self.dm_policy == "allowlist" and not self._is_dm_allowed(sender):
+                logger.debug(
+                    "Signal: ignoring DM from non-allowlisted sender (dm_policy=allowlist)"
+                )
+                return
 
         # Group message filtering — derived from SIGNAL_GROUP_ALLOWED_USERS:
         # - No env var set → groups disabled (default safe behavior)
@@ -1630,12 +1676,28 @@ class SignalAdapter(BasePlatformAdapter):
             return None
         return (author, ts)
 
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Whether a DM sender passes the dm_policy=allowlist intake gate.
+
+        Matches on the same identifier run.py's SIGNAL_ALLOWED_USERS check
+        sees (the event's user_id = sourceNumber-or-sourceUuid). "*" in the
+        allowlist opens DMs to everyone.
+        """
+        if not sender_id:
+            return False
+        if "*" in self.dm_allow_from:
+            return True
+        return sender_id in self.dm_allow_from
+
     def _reactions_enabled(self, event: "MessageEvent" = None) -> bool:
         """Check if message reactions are enabled for this event.
 
-        Two gates:
+        Three gates:
         1. SIGNAL_REACTIONS env var — set to false/0/no to disable globally.
-        2. DM allowlist — if SIGNAL_ALLOWED_USERS is set, only react to
+        2. DM policy — when SIGNAL_DM_POLICY=disabled, never react in DMs
+           (the bot must not signal its presence in private conversations);
+           group reactions still fire.
+        3. Reaction allowlist — if SIGNAL_ALLOWED_USERS is set, only react to
            messages from senders in that list.  This prevents unauthorized
            contacts from seeing the 👀 reaction (which fires before run.py's
            auth gate and would otherwise reveal that a bot is listening).
@@ -1643,8 +1705,15 @@ class SignalAdapter(BasePlatformAdapter):
         if os.getenv("SIGNAL_REACTIONS", "true").lower() in {"false", "0", "no"}:
             return False
         if event is not None:
+            chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+            if (
+                self.dm_policy == "disabled"
+                and chat_id
+                and not str(chat_id).startswith("group:")
+            ):
+                return False
             sender = getattr(getattr(event, "source", None), "user_id", None)
-            if sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from:
+            if sender and "*" not in self.reaction_allow_from and sender not in self.reaction_allow_from:
                 return False
         return True
 
