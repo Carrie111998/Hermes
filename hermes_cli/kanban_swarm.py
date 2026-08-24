@@ -71,6 +71,7 @@ def _swarm_context(root_id: str, goal: str) -> str:
         "- Put machine-readable facts in completion metadata.\n"
         "- Put cross-worker notes on the root task using structured comments.\n"
         f"- Goal: {goal.strip()}\n"
+        "- IMPORTANT: this is a SWARM task. The verifier card (child of this graph) is your reviewer. When your work is done, call `kanban_complete(summary=..., metadata={...})` with full handoff metadata — do NOT `kanban_block(reason=\"review-required: ...\")`. Blocking stalls the swarm: the verifier only promotes when workers complete. Block ONLY for genuine blockers (missing deps, unanswerable questions, capability gaps).\n"
     )
 
 
@@ -135,6 +136,8 @@ def create_swarm(
     root_title: Optional[str] = None,
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
+    verifier_skills: Optional[list[str]] = None,
+    synthesizer_skills: Optional[list[str]] = None,
     tenant: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
@@ -301,7 +304,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["requesting-code-review"],
+        skills=verifier_skills if verifier_skills is not None else ["requesting-code-review"],
     )
 
     synthesizer_body = (
@@ -320,7 +323,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["humanizer"],
+        skills=synthesizer_skills or None,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)

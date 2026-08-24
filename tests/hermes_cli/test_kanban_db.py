@@ -96,7 +96,9 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     Covers all four indexes that sit on additive columns:
     - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
     - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
-    - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
+    - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency_unique`` (partial
+      unique index replacing the non-unique ``idx_tasks_idempotency``, #17805;
+      Wave 2 closes the duplicate-key race the old index allowed)
     - ``task_events.run_id``     -> ``idx_events_run``          (#17805)
     """
     db_path = tmp_path / "legacy-kanban.db"
@@ -162,7 +164,9 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
-    assert "idx_tasks_idempotency" in indexes
+    # The old non-unique index is gone; the partial unique index replaced it.
+    assert "idx_tasks_idempotency" not in indexes
+    assert "idx_tasks_idempotency_unique" in indexes
     assert "idx_events_run" in indexes
 
 
@@ -1093,6 +1097,8 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
         CREATE TABLE tasks (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
+            status TEXT,
+            created_at INTEGER NOT NULL,
             tenant TEXT,
             result TEXT,
             idempotency_key TEXT,
@@ -1126,6 +1132,135 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
 
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Idempotency key: in-txn dedup + partial unique index (Wave 2)
+# ---------------------------------------------------------------------------
+
+def test_create_task_same_idempotency_key_returns_existing(kanban_home):
+    """A second create_task with the same key returns the first task's id."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="a", assignee="w", idempotency_key="k1")
+        second = kb.create_task(conn, title="b", assignee="w", idempotency_key="k1")
+        assert second == first
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = 'k1'"
+        ).fetchone()
+        assert n == 1
+
+
+def test_create_task_idempotency_key_reusable_after_archive(kanban_home):
+    """Archival frees the key (partial index excludes archived rows)."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="a", assignee="w", idempotency_key="k2")
+        assert kb.archive_task(conn, first)
+        second = kb.create_task(conn, title="b", assignee="w", idempotency_key="k2")
+        assert second != first
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = 'k2'"
+        ).fetchone()[0] == 2
+
+
+def test_create_task_idempotency_key_concurrent_race(kanban_home):
+    """Two concurrent creators with the same key must land on ONE task.
+
+    The lookup now runs inside write_txn, so the second writer sees the
+    first's row instead of both inserting (the partial unique index is the
+    backstop; the IntegrityError handler converts a violation into the
+    existing-task return).
+    """
+    import concurrent.futures
+
+    key = "race-key"
+
+    def _create(_):
+        with kb.connect() as conn:
+            return kb.create_task(conn, title="x", assignee="w", idempotency_key=key)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_create, range(2)))
+    assert results[0] == results[1]
+    with kb.connect() as conn:
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        assert n == 1
+
+
+def test_migration_dedupes_duplicate_idempotency_keys(tmp_path):
+    """Pre-index duplicates are collapsed before the unique index is created.
+
+    The race the partial unique index closes could already have produced
+    duplicate non-NULL keys; CREATE UNIQUE INDEX aborts on them. The
+    migration must keep the NEWEST active row per key, NULL the key on
+    older duplicates, leave archived rows' keys alone (they're excluded
+    from the partial index), and end with a unique partial index in place
+    of the old non-unique one.
+    """
+    db_path = tmp_path / "dup-keys.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            idempotency_key TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    # Duplicate active keys (newest = 'new-a' at t=300), plus an archived
+    # row sharing the same key — its key must survive untouched.
+    conn.executemany(
+        "INSERT INTO tasks (id, title, status, created_at, idempotency_key) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            ("old-a", "a1", "ready", 100, "dup-a"),
+            ("mid-a", "a2", "ready", 200, "dup-a"),
+            ("new-a", "a3", "ready", 300, "dup-a"),
+            ("arch-a", "a4", "archived", 250, "dup-a"),
+            ("solo", "s1", "ready", 150, "solo-key"),
+        ],
+    )
+    conn.commit()
+
+    kb._migrate_add_optional_columns(conn)
+    rows = {
+        r["id"]: r["idempotency_key"]
+        for r in conn.execute("SELECT id, idempotency_key FROM tasks")
+    }
+    assert rows["new-a"] == "dup-a"      # newest active keeps the key
+    assert rows["old-a"] is None         # older actives NULLed
+    assert rows["mid-a"] is None
+    assert rows["arch-a"] == "dup-a"     # archived excluded from dedupe
+    assert rows["solo"] == "solo-key"    # singletons untouched
+
+    indexes = {
+        r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    assert "idx_tasks_idempotency" not in indexes
+    assert "idx_tasks_idempotency_unique" in indexes
+    (sql,) = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'idx_tasks_idempotency_unique'"
+    ).fetchone()
+    assert "UNIQUE" in sql.upper() and "WHERE" in sql.upper()
     conn.close()
 
 

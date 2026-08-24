@@ -84,11 +84,17 @@ import sys
 import threading
 import logging
 import time
+import yaml
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli.routing_contract import (
+    ROUTING_CONTRACT_VERSION,
+    RoutingContractError,
+    parse_routing_envelope,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -101,6 +107,46 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# ---------------------------------------------------------------------------
+# Wave 2 §7: State machine — TRANSITIONS adjacency map (documentation +
+# assertion, NOT a refactor of every mutator). The real enforcement for
+# pathological loops stays with the existing circuit breaker
+# (_record_task_failure L9061) + block_task recurrence breaker (L6165) +
+# check_respawn_guard. This map is a debug assertion that catches illegal
+# edges (e.g. done→ready via raw SQL) during development; it is OFF in the
+# production hot path — _assert_transition is a no-op unless assertions are
+# enabled (python -O strips it).
+TRANSITIONS: dict[str, set[str]] = {
+    "triage":    {"todo", "archived"},
+    "todo":      {"scheduled", "ready", "archived"},
+    "scheduled": {"ready", "todo", "archived"},
+    "ready":     {"running", "todo", "archived"},
+    "running":   {"blocked", "review", "done", "crashed", "timed_out", "ready"},
+    "blocked":   {"ready", "todo", "archived"},
+    "review":    {"running", "done", "ready"},
+    "done":      {"archived", "ready"},  # ready = reopen
+    "archived":  {"todo"},               # un-archive
+}
+
+
+def _assert_transition(old: str, new: str) -> None:
+    """Debug assertion for state transitions.
+
+    Emits a warning on illegal edges. No-op when assertions are disabled
+    (``python -O``). This is NOT the enforcement mechanism — the existing
+    circuit breaker, block_task recurrence breaker, and check_respawn_guard
+    handle pathological loops in production. This map exists for development-
+    time visibility into illegal transitions.
+    """
+    if __debug__ and new not in TRANSITIONS.get(old, set()):
+        import warnings
+        warnings.warn(
+            f"Kanban illegal transition: {old}→{new} "
+            f"(legal: {TRANSITIONS.get(old, set()) or 'none'})",
+            stacklevel=3,
+            category=RuntimeWarning,
+        )
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1474,7 +1520,19 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Wave 2 routing snapshot: resolved routing decision captured at claim
+    -- time so the spawn path uses an immutable per-run snapshot instead of
+    -- the mutable task row. All nullable; legacy/pre-enforcement runs keep
+    -- NULLs (spawn falls back to task pins / profile defaults).
+    routing_role        TEXT,     -- resolved role name (from roles.yaml)
+    routing_model       TEXT,     -- resolved model ID
+    routing_provider    TEXT,     -- resolved provider
+    routing_contract    INTEGER,  -- routing_contract_version (see §3)
+    routing_reason      TEXT,     -- why this route (audit)
+    roster_digest       TEXT,     -- sha256 of roles.yaml at resolution time
+    routing_policy      TEXT,     -- JSON {invocation, may_edit} ONLY — NOT skills/effort
+    ac_revision         TEXT      -- digest of the AC set at claim (see §5)
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2546,9 +2604,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
-    # ``idx_tasks_idempotency`` is created unconditionally below alongside
-    # the other additive-column indexes — see the block after the
-    # legacy-column migration. Creating it here too would be redundant.
+    # ``idx_tasks_idempotency_unique`` (partial unique index) is created
+    # unconditionally below alongside the other additive-column indexes —
+    # see the block after the legacy-column migration. Creating it here
+    # too would be redundant.
 
     # Refresh after early additive migrations above. Some existing DBs were
     # partially migrated in older releases and can already contain the later
@@ -2687,8 +2746,36 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # is cheap thanks to ``IF NOT EXISTS`` and stays correct on fresh DBs
     # (where the columns already exist from SCHEMA_SQL).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
+    # Idempotency index upgrade: the old non-unique index (plus the pre-txn
+    # lookup it served) left a race — two concurrent creators with the same
+    # key could both pass the lookup and insert duplicates. Replace it with
+    # a PARTIAL UNIQUE index covering only active tasks, which preserves the
+    # documented archive-reuse semantics of create_task's ``status !=
+    # 'archived'`` lookup (a key is reusable after its task is archived).
+    # A unique index aborts on the first duplicate, so dedupe any rows the
+    # race already produced BEFORE creating it: keep the newest row per key,
+    # NULL the key on older duplicates (NULLs are excluded from the partial
+    # index). The pass is idempotent — once the unique index exists there
+    # are no duplicate non-NULL keys to find.
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
+    dup_rows = conn.execute(
+        """
+        SELECT idempotency_key, GROUP_CONCAT(id ORDER BY created_at DESC) AS ids
+        FROM tasks
+        WHERE idempotency_key IS NOT NULL AND status != 'archived'
+        GROUP BY idempotency_key
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for dup in dup_rows:
+        for stale_id in dup["ids"].split(",")[1:]:
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = NULL WHERE id = ?", (stale_id,)
+            )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_unique "
+        "ON tasks(idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL AND status != 'archived'"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
@@ -2707,6 +2794,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    # task_runs routing-snapshot columns (Wave 2 enforcement). Each run
+    # freezes the resolved routing decision at claim time: role, model,
+    # provider, contract version, why, roles.yaml digest, and the policy
+    # subset {invocation, may_edit} ONLY — deliberately NOT skills or
+    # reasoning_effort, which stay live task fields (the review lane
+    # mutates claimed.skills after claim, so a frozen copy would strip the
+    # review skill). All columns nullable; legacy runs keep NULLs. Guarded
+    # by a table-exists check so direct calls against synthetic schemas
+    # without task_runs (tests, partial stores) stay no-ops.
+    runs_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "routing_role" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "routing_role", "routing_role TEXT")
+        if "routing_model" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "routing_model", "routing_model TEXT")
+        if "routing_provider" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "routing_provider", "routing_provider TEXT")
+        if "routing_contract" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "routing_contract", "routing_contract INTEGER")
+        if "routing_reason" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "routing_reason", "routing_reason TEXT")
+        if "roster_digest" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "roster_digest", "roster_digest TEXT")
+        if "routing_policy" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "routing_policy", "routing_policy TEXT")
+        if "ac_revision" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "ac_revision", "ac_revision TEXT")
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3393,20 +3511,11 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    # Idempotency check happens INSIDE the write transaction below so the
+    # lookup + INSERT are atomic — the pre-txn lookup this replaces left a
+    # race window where two concurrent creators with the same key could
+    # both pass the check and insert duplicates (now also backstopped by
+    # the partial unique index ``idx_tasks_idempotency_unique``).
 
     now = int(time.time())
 
@@ -3438,6 +3547,23 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # Idempotency — return the existing active task instead of
+                # creating a duplicate. INSIDE the write transaction so the
+                # lookup + INSERT are atomic: concurrent creators with the
+                # same key serialize on the write lock, so the second sees
+                # the first's row here. The partial unique index
+                # (idx_tasks_idempotency_unique) is the backstop if a race
+                # still slips through; the IntegrityError handler below
+                # converts that into the same existing-task return.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3556,10 +3682,26 @@ def create_task(
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if "idempotency" in str(e) or "idx_tasks_idempotency_unique" in str(e):
+                # Unique-key violation on the partial idempotency index —
+                # another creator won the race between our in-txn lookup and
+                # the INSERT. Return the existing active task instead of
+                # retrying with a fresh id (a retry would just re-collide on
+                # the same key and fail). Fail-closed if the row is gone.
+                existing = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    return existing["id"]
+                raise
             if attempt == 1:
                 raise
-            # Retry with a fresh id.
+            # Non-idempotency IntegrityError (e.g. a task-id PK collision):
+            # retry once with a fresh id.
             continue
     raise RuntimeError("unreachable")
 
@@ -4614,6 +4756,159 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+# ---------------------------------------------------------------------------
+# Wave 2 routing snapshot (Step 2b)
+# ---------------------------------------------------------------------------
+
+#: Roster cache keyed by (resolved path, mtime) -> (data, digest). Keying on
+#: the path as well as the mtime means switching HERMES_HOME (tests, profile
+#: activation) can never serve a stale roster, while repeated claims against
+#: an unchanged file are pure cache hits — no file I/O inside the claim txn.
+_roster_cache: dict = {}
+
+
+def _load_roster() -> tuple:
+    """Load ``~/.hermes/routing/roles.yaml``, cached by (path, mtime).
+
+    Returns ``(data, digest)`` where ``data`` is the parsed YAML mapping and
+    ``digest`` is sha256 of the raw file content. Raises
+    :class:`RoutingContractError` on any load / parse failure so the claim
+    transaction can emit ``preflight_rejected`` and leave the task ready.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        path = Path(get_hermes_home()) / "routing" / "roles.yaml"
+        mtime = path.stat().st_mtime
+    except OSError as exc:
+        raise RoutingContractError(f"roles.yaml unavailable: {exc}") from exc
+    key = (str(path), mtime)
+    if key in _roster_cache:
+        return _roster_cache[key]
+    try:
+        content = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(content)
+    except (OSError, yaml.YAMLError) as exc:
+        raise RoutingContractError(f"roles.yaml parse failure: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("roles"), dict):
+        raise RoutingContractError("roles.yaml missing 'roles' mapping")
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    _roster_cache[key] = (data, digest)
+    return data, digest
+
+
+#: Roles allowed to claim the review phase. ``reviewer`` is the dedicated
+#: default; ``main_coder`` is the roster's other review-capable role ("thinks
+#: / plans / reviews / owns finish line"). Implement-only roles (executor,
+#: debugger, orchestrator) never review — a review-phase envelope that names
+#: one falls back to ``reviewer``.
+_REVIEW_CAPABLE_ROLES = frozenset({"reviewer", "main_coder"})
+
+
+def _extract_ac_text(body: str, ac_ids: list) -> str:
+    """Concatenate the text of each AC ID found in the task body.
+
+    Matches ``AC-1: <text>`` (optionally bulleted) anywhere in the body.
+    IDs that are not found are represented by the bare ID so the digest still
+    reflects the claimed set deterministically.
+    """
+    chunks = []
+    for ac_id in ac_ids:
+        m = re.search(
+            rf"(?im)^\s*(?:[-*]\s*)?{re.escape(ac_id)}\s*[:：]\s*(.+?)\s*$",
+            body or "",
+        )
+        chunks.append(f"{ac_id}: {m.group(1).strip()}" if m else ac_id)
+    return "\n".join(chunks)
+
+
+def _resolve_routing_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    trow: sqlite3.Row,
+    phase: str,  # "implement" | "review"
+) -> dict:
+    """Resolve the Wave 2 routing snapshot for a claim, inside the txn.
+
+    Called from ``claim_task`` / ``claim_review_task`` BEFORE the status CAS
+    flips to ``running``. Returns the dict of snapshot columns to write on
+    the new ``task_runs`` row:
+
+    - No v1 envelope or ``enforcement_required: false`` → all-None dict
+      (unenforced; ``_default_spawn`` falls back to task pins / profile
+      defaults).
+    - Enforced → role resolved from roles.yaml (``reviewer`` for the review
+      phase unless the envelope names a review-capable role), model/provider
+      from the roster entry, ``roster_digest`` = sha256(roles.yaml),
+      ``ac_revision`` = sha256 of the concatenated AC text when ``ac_ids`` is
+      present, and ``routing_policy`` = JSON ``{invocation, may_edit}`` —
+      never skills or reasoning_effort, which stay live task fields.
+
+    Raises :class:`RoutingContractError` on any roster failure; callers emit
+    ``preflight_rejected`` and return None (task stays ready).
+    """
+    body = None
+    if trow is not None and "body" in trow.keys():
+        body = trow["body"]
+    if body is None:
+        row = conn.execute(
+            "SELECT body FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        body = row["body"] if row is not None else None
+    try:
+        parsed = parse_routing_envelope(body or "")
+    except RoutingContractError:
+        # Malformed envelope: fail closed — emit preflight_rejected upstream.
+        raise
+    if not parsed or not parsed.get("enforcement_required"):
+        # Unenforced (no envelope, Wave 1 envelope, or enforcement off):
+        # backfill NULLs so spawn falls back to task pins / profile defaults.
+        return {
+            "routing_role": None,
+            "routing_model": None,
+            "routing_provider": None,
+            "routing_contract": None,
+            "routing_reason": None,
+            "roster_digest": None,
+            "routing_policy": None,
+            "ac_revision": None,
+        }
+    data, roster_digest = _load_roster()
+    roles = data.get("roles") or {}
+    if phase == "review":
+        env_role = parsed.get("role")
+        role = env_role if env_role in _REVIEW_CAPABLE_ROLES else "reviewer"
+    else:
+        role = parsed.get("role")
+    entry = roles.get(role)
+    if not isinstance(entry, dict):
+        raise RoutingContractError(f"role {role!r} not found in roles.yaml")
+    model = entry.get("model")
+    if not model:
+        raise RoutingContractError(f"role {role!r} has no model in roles.yaml")
+    provider = entry.get("provider") or data.get("provider")
+    # Roster policy only — invocation/may_edit. Skills and reasoning_effort
+    # are deliberately NOT frozen: they stay live task fields.
+    routing_policy = json.dumps(
+        {"invocation": entry.get("invocation"), "may_edit": entry.get("may_edit")},
+        sort_keys=True,
+    )
+    ac_revision = None
+    ac_ids = parsed.get("ac_ids")
+    if ac_ids:
+        ac_text = _extract_ac_text(body or "", ac_ids)
+        ac_revision = hashlib.sha256(ac_text.encode("utf-8")).hexdigest()
+    return {
+        "routing_role": role,
+        "routing_model": model,
+        "routing_provider": provider,
+        "routing_contract": ROUTING_CONTRACT_VERSION,
+        "routing_reason": parsed.get("reason"),
+        "roster_digest": roster_digest,
+        "routing_policy": routing_policy,
+        "ac_revision": ac_revision,
+    }
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4655,6 +4950,26 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # Wave 2 routing snapshot (Step 2b): resolve the immutable routing
+        # decision BEFORE the CAS flips ready→running. On roster failure we
+        # emit preflight_rejected and return None — the only write in this
+        # txn is the event row, so the task stays ready and the dispatch
+        # loop's circuit breaker decides the next move. No silent loop.
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key, body "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        try:
+            routing_snapshot = _resolve_routing_snapshot(
+                conn, task_id, trow, phase="implement"
+            )
+        except RoutingContractError as exc:
+            _append_event(
+                conn, task_id, "preflight_rejected",
+                {"reason": str(exc), "phase": "implement"},
+            )
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4678,32 +4993,28 @@ def claim_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
+              SET status        = 'running',
+                  claim_lock    = ?,
+                  claim_expires = ?,
+                  started_at    = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status = 'ready'
+              AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
             return None
-        # Look up the current task row so we can populate the run with
-        # its assignee / step / runtime cap.
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at,
+                routing_role, routing_model, routing_provider,
+                routing_contract, routing_reason, roster_digest,
+                routing_policy, ac_revision
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4713,6 +5024,14 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                routing_snapshot["routing_role"],
+                routing_snapshot["routing_model"],
+                routing_snapshot["routing_provider"],
+                routing_snapshot["routing_contract"],
+                routing_snapshot["routing_reason"],
+                routing_snapshot["roster_digest"],
+                routing_snapshot["routing_policy"],
+                routing_snapshot["ac_revision"],
             ),
         )
         run_id = run_cur.lastrowid
@@ -4775,33 +5094,50 @@ def claim_review_task(
                     },
                 )
             return None
+        # Wave 2 routing snapshot (Step 2b): same pre-CAS resolution as
+        # claim_task, but phase="review" → resolves the reviewer role. On
+        # roster failure emit preflight_rejected and return None; the task
+        # stays in review and the dispatch loop's circuit breaker decides.
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key, body "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        try:
+            routing_snapshot = _resolve_routing_snapshot(
+                conn, task_id, trow, phase="review"
+            )
+        except RoutingContractError as exc:
+            _append_event(
+                conn, task_id, "preflight_rejected",
+                {"reason": str(exc), "phase": "review"},
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
+              SET status        = 'running',
+                  claim_lock    = ?,
+                  claim_expires = ?,
+                  started_at    = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status = 'review'
+              AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
             return None
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at,
+                routing_role, routing_model, routing_provider,
+                routing_contract, routing_reason, roster_digest,
+                routing_policy, ac_revision
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4811,6 +5147,14 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                routing_snapshot["routing_role"],
+                routing_snapshot["routing_model"],
+                routing_snapshot["routing_provider"],
+                routing_snapshot["routing_contract"],
+                routing_snapshot["routing_reason"],
+                routing_snapshot["roster_digest"],
+                routing_snapshot["routing_policy"],
+                routing_snapshot["ac_revision"],
             ),
         )
         run_id = run_cur.lastrowid
@@ -5349,6 +5693,66 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+#: Keys inside a verdict map that are not AC verdicts (see
+#: ``_read_completion_verdict`` / ``_verdict_all_pass``).
+_VERDICT_EVIDENCE_KEYS = frozenset({"evidence"})
+
+
+def _read_completion_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """Return the AC verdict map for this completion attempt, or None.
+
+    Wave 2 Step 2e: the reviewer writes the verdict via ``complete_task``'s
+    existing ``metadata`` parameter — ``{"verdict": {"AC-1": "pass", ...,
+    "evidence": "..."}}``. The current call's metadata is authoritative;
+    as a fallback the most recently closed ``completed`` run is consulted
+    (covers flows where the review run was already ended before the task
+    reached ``review``). Malformed JSON, a missing ``verdict`` key, or a
+    non-dict verdict all yield None — callers treat that as "not reviewed".
+    """
+    if isinstance(metadata, dict):
+        verdict = metadata.get("verdict")
+        if isinstance(verdict, dict):
+            return verdict
+    row = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["metadata"]:
+        return None
+    try:
+        parsed = json.loads(row["metadata"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    verdict = parsed.get("verdict")
+    return verdict if isinstance(verdict, dict) else None
+
+
+def _verdict_all_pass(verdict: dict) -> bool:
+    """True when every non-``n/a`` AC verdict is ``pass``.
+
+    * Any AC key with value ``fail`` → False (gate refuses completion).
+    * Any AC key with a value outside ``{pass, fail, n/a}`` → False
+      (fail-closed — a malformed verdict must not sail through).
+    * No AC entries at all (empty map or evidence-only) → False — an
+      enforced task with nothing verified is treated as unreviewed.
+    """
+    entries = [
+        value for key, value in verdict.items()
+        if key not in _VERDICT_EVIDENCE_KEYS
+    ]
+    if not entries:
+        return False
+    return all(value == "pass" or value == "n/a" for value in entries)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5359,6 +5763,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    review_override: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5391,8 +5796,37 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    Wave 2 Step 2e — AC verdict gate: when the task's current run carries
+    a routing snapshot with ``ac_revision`` (enforcement was required at
+    claim time), ``done`` is reachable only from ``review`` with a verdict
+    map on the review metadata (``{"verdict": {"AC-1": "pass", ...,
+    "evidence": "..."}}``) whose non-``n/a`` ACs all pass. Direct
+    ``running/ready/blocked -> done`` for such tasks is refused with a
+    ``completion_blocked_review_required`` event. Tasks with no snapshot
+    (``ac_revision`` NULL — legacy / unenforced) are unaffected.
+
+    ``review_override`` is the admin escape hatch: ``{"by": str,
+    "reason": str}`` with both fields non-empty bypasses the verdict gate
+    and records a ``completion_override`` event with the attribution.
+    An invalid override (missing/empty fields) is treated as absent, so
+    the gate still applies.
     """
     now = int(time.time())
+    # Wave 2 Step 2e admin override: valid only when both ``by`` and
+    # ``reason`` are non-empty strings. Anything else is treated as "no
+    # override" so the AC verdict gate still applies (fail-closed).
+    override_by: Optional[str] = None
+    override_reason: Optional[str] = None
+    if isinstance(review_override, dict):
+        _by = review_override.get("by")
+        _reason = review_override.get("reason")
+        if (
+            isinstance(_by, str) and _by.strip()
+            and isinstance(_reason, str) and _reason.strip()
+        ):
+            override_by = _by.strip()
+            override_reason = _reason.strip()
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5439,6 +5873,65 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Wave 2 Step 2e — AC verdict gate. Keys off the run snapshot
+        # (ac_revision non-NULL) captured at claim time — never a re-read
+        # of the mutable body. Enforced tasks may reach 'done' only via
+        # 'review' with an all-pass verdict, or via an explicit admin
+        # override. Runs with NULL ac_revision (legacy / unenforced) pass
+        # through untouched — no stranding.
+        run_row = conn.execute(
+            "SELECT id, ac_revision FROM task_runs "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (task_id,),
+        ).fetchone()
+        gate_run_id = int(run_row["id"]) if run_row else None
+        ac_revision = run_row["ac_revision"] if run_row else None
+        if ac_revision is not None and override_by is None:
+            blocked_payload = {
+                "reason": "review_required",
+                "ac_revision": ac_revision,
+                "prior_status": prior_status,
+            }
+            # The review lane claims ``review -> running``, so the task's
+            # status is 'running' while the reviewer works. Discriminate via
+            # the run's claimed event (source_status=review) — the same
+            # signal _retry_status_for_run uses — so a reviewer completing
+            # without a verdict is refused, not mistaken for a direct
+            # implementer completion.
+            is_review_approval = (
+                prior_status == "review"
+                or _retry_status_for_run(conn, task_id, gate_run_id) == "review"
+            )
+            if is_review_approval:
+                # Review lane: 'done' requires a verdict map on the review
+                # metadata with every non-n/a AC passing. No verdict, a
+                # 'fail', or a malformed entry all refuse completion.
+                verdict = _read_completion_verdict(conn, task_id, metadata)
+                if verdict is None or not _verdict_all_pass(verdict):
+                    _append_event(
+                        conn, task_id, "completion_blocked_review_required",
+                        blocked_payload, run_id=gate_run_id,
+                    )
+                    return False
+            else:
+                # running/ready/blocked -> done without review: refused.
+                _append_event(
+                    conn, task_id, "completion_blocked_review_required",
+                    blocked_payload, run_id=gate_run_id,
+                )
+                return False
+        elif override_by is not None:
+            # Admin escape hatch (ships WITH the gate): explicit, attributed
+            # bypass — recorded so the override is auditable.
+            _append_event(
+                conn, task_id, "completion_override",
+                {
+                    "by": override_by,
+                    "reason": override_reason,
+                    "ac_revision": ac_revision,
+                },
+                run_id=gate_run_id,
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -10857,7 +11350,37 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
+    # Wave 2 routing (Step 2b): NULL-fallback chain for model/provider —
+    # snapshot (enforced, immutable) → task.model_override (legacy / Wave 1
+    # pin) → profile default (no override). The snapshot is read from the
+    # current task_runs row, where claim_task/claim_review_task froze it.
+    # WITHOUT the middle leg, Wave 1 model pins silently die the moment 2b
+    # lands, because every pre-enforcement run has NULL snapshot columns.
+    # Skills and reasoning_effort are NOT read from the snapshot — they stay
+    # live task fields handled by the blocks below.
+    snapshot_model = snapshot_provider = None
+    if task.current_run_id is not None:
+        try:
+            with contextlib.closing(connect()) as _snap_conn:
+                run_row = _snap_conn.execute(
+                    "SELECT routing_model, routing_provider "
+                    "FROM task_runs WHERE id = ?",
+                    (task.current_run_id,),
+                ).fetchone()
+            if run_row is not None:
+                snapshot_model = run_row["routing_model"]
+                snapshot_provider = run_row["routing_provider"]
+        except Exception as exc:  # noqa: BLE001 -- best-effort advisory read
+            # A snapshot-read hiccup must never kill the spawn: fall back to
+            # the task pin (Wave 1 behavior) instead of failing the worker.
+            _log.debug("kanban spawn: snapshot read failed, falling back to "
+                       "task pin (%s)", exc)
+    if snapshot_model:
+        # Enforced: use the immutable snapshot captured at claim time.
+        cmd.extend(["-m", snapshot_model])
+        if snapshot_provider:
+            cmd.extend(["--provider", snapshot_provider])
+    elif task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -10865,6 +11388,7 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
+    # else: profile default (no override)
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
