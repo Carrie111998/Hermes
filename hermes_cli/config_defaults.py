@@ -2818,6 +2818,14 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Maximum number of terminal execution-ledger rows (completed /
+        # failed / unknown) kept in cron/executions.db; the oldest rows
+        # beyond the cap are pruned on write. In-flight (claimed/running)
+        # attempts are never pruned. Must be a whole number from 1 through
+        # SQLite's signed 64-bit maximum — an invalid value skips pruning
+        # entirely (fail closed) instead of deleting history with a wrong cap.
+        # Default 1000.
+        "max_terminal_executions": 1000,
         # Timeout (seconds) for a no-agent cron script. Also overridable via
         # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
