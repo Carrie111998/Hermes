@@ -121,8 +121,11 @@ SEARCH_SCHEMA = {
         "relevance. Use this before answering any question that may depend on "
         "what you know about the user (preferences, facts, history, people, "
         "projects, past decisions). For multi-part or multi-hop questions, "
-        "call it several times — vary the wording and run follow-up searches "
-        "on what earlier results reveal; one search is rarely enough."
+        "run a few searches with different wording/angles and follow-up "
+        "searches on what earlier results reveal. If results stay "
+        "low-relevance or unrelated after 2 attempts, stop and answer from "
+        "other sources instead. Always stop immediately if the user says to "
+        "skip or stop searching memory."
     ),
     "parameters": {
         "type": "object",

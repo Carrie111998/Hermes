@@ -272,6 +272,23 @@ class TestMem0V3Config:
         assert "after 2 attempts" in block
         assert "stop" in block.lower()
 
+    def test_search_schema_has_search_circuit_breaker(self):
+        # Regression for #93485 follow-up: SEARCH_SCHEMA["description"] is
+        # sent to the model on every turn mem0_search is offered, independent
+        # of whether system_prompt_block() is in context. It used to say
+        # "call it several times... one search is rarely enough" with no cap
+        # — the same unbounded-retry guidance the bug report blamed — so
+        # fixing only system_prompt_block left contradictory instructions in
+        # the same prompt payload. Assert the tool schema itself carries the
+        # cap/stop-on-request wording, not just the system prompt text.
+        provider = Mem0MemoryProvider()
+        schemas = provider.get_tool_schemas()
+        search_schema = next(s for s in schemas if s["name"] == "mem0_search")
+        description = search_schema["description"].lower()
+        assert "one search is rarely enough" not in description
+        assert "after 2 attempts" in description
+        assert "stop" in description
+
 
 class TestMem0ModeSwitch:
 
