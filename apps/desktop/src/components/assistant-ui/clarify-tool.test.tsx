@@ -157,6 +157,33 @@ describe('ClarifyTool live card stays mounted across settle', () => {
 })
 
 describe('ClarifyTool choice selection', () => {
+  it('keeps a pending gateway question interactive after message hydration settles', () => {
+    assistantUiState.messageRunning = false
+
+    renderLiveClarify()
+
+    expect(screen.getByText('Which deployment target?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /staging/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /production/ })).toBeTruthy()
+  })
+
+  it('does not revive an older question when another gateway request is pending', () => {
+    assistantUiState.messageRunning = false
+    $activeSessionId.set('session-1')
+    setClarifyRequest({
+      choices: ['yes', 'no'],
+      multiSelect: false,
+      question: 'Continue with the newer request?',
+      requestId: 'req-newer',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    expect(screen.queryByText('Which deployment target?')).toBeNull()
+    expect(screen.queryByRole('button', { name: /staging/ })).toBeNull()
+  })
+
   it('selects independently, deselects and submits multi-select choices as a JSON array', async () => {
     const { request } = renderLiveClarify({ multiSelect: true })
     const staging = screen.getByRole('button', { name: /staging/ })

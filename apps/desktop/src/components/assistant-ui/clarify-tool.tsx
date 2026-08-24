@@ -286,6 +286,40 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
     return <ClarifyToolSettled {...props} />
   }
 
+  return <ClarifyToolLive {...props} />
+}
+
+function ClarifyToolLive(props: ToolCallMessagePartProps) {
+  const messageRunning = useAuiState(selectMessageRunning)
+  const sessionId = useStore(useSessionView().$runtimeId)
+  const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
+  const request = useStore($request)
+  const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
+  const requestMatches = useMemo(() => {
+    if (!request) {
+      return false
+    }
+
+    if (fromArgs.questions?.length) {
+      return (
+        request.questions?.length === fromArgs.questions.length &&
+        fromArgs.questions.every((question, index) => question.question === request.questions?.[index]?.question)
+      )
+    }
+
+    if (request.questions?.length) {
+      return false
+    }
+
+    return !fromArgs.question || !request.question || fromArgs.question === request.question
+  }, [fromArgs.question, fromArgs.questions, request])
+
+  // A hydrated message may already be marked complete while the gateway still
+  // owns this exact live request. A newer request must not revive an older card.
+  if (!messageRunning && !requestMatches) {
+    return <ToolFallback {...props} />
+  }
+
   return <ClarifyToolPending {...props} />
 }
 
