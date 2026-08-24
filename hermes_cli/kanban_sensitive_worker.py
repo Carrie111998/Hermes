@@ -1,10 +1,15 @@
 """Sanitize all output from a sensitive Kanban worker before durable logging."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
-from hermes_cli.kanban_sensitive import active_secret_values, redact_exact_secrets
+from hermes_cli.kanban_sensitive import (
+    active_secret_values,
+    build_sensitive_worker_env,
+    redact_exact_secrets,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=build_sensitive_worker_env(os.environ),
         check=False,
         shell=False,
     )

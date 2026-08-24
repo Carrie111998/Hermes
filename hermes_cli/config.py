@@ -2629,13 +2629,25 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
+def _config_env_value(name: str) -> Optional[str]:
+    """Resolve config env refs from sensitive scope without ambientizing them."""
+    if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+        try:
+            from agent.secret_scope import get_secret
+
+            return get_secret(name)
+        except Exception:
+            return None
+    return os.environ.get(name)
+
+
 def _env_expand_match(m: re.Match) -> str:
     """Expand one ``${...}`` config reference.
 
     Two accepted shapes, matching what MCP server config already resolves
     (``tools/mcp_tool.py::_env_ref_name``):
 
-    * ``${VAR}`` — legacy bare name, resolved via ``os.environ``.
+    * ``${VAR}`` — legacy bare name, normally resolved via ``os.environ``.
     * ``${env:VAR}`` — Cursor-style SecretRef, same resolution after the
       ``env:`` prefix is stripped.  Before this, the prefixed form worked in
       MCP config but stayed a literal string in config.yaml — a confusing
@@ -2653,7 +2665,7 @@ def _env_expand_match(m: re.Match) -> str:
         name = inner[len("env:"):].strip()
         if not name:
             return raw
-        val = os.environ.get(name)
+        val = _config_env_value(name)
         if val is not None:
             return val
         logger.warning(
@@ -2674,7 +2686,8 @@ def _env_expand_match(m: re.Match) -> str:
         )
         return raw
     # Legacy ``${VAR}`` — bare name.
-    return os.environ.get(inner, raw)
+    val = _config_env_value(inner)
+    return val if val is not None else raw
 
 
 def _env_ref_var_name(ref: str) -> Optional[str]:
@@ -2694,8 +2707,9 @@ def _expand_env_vars(obj):
     values.
 
     Only string values are processed; dict keys, numbers, booleans, and
-    None are left untouched.  Unresolved references (variable not in
-    ``os.environ``) are kept verbatim so callers can detect them.
+    None are left untouched. Sensitive Kanban workers resolve references from
+    their process-private credential scope; other callers use ``os.environ``.
+    Unresolved references are kept verbatim so callers can detect them.
     """
     if isinstance(obj, str):
         return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
@@ -2708,7 +2722,7 @@ def _expand_env_vars(obj):
 
 def _env_ref_snapshot(obj, snapshot=None):
     """Map every ``${VAR}`` / ``${env:VAR}`` name referenced in config values
-    to its current ``os.environ`` value (``None`` when unset).
+    to its current runtime value (``None`` when unset).
 
     Stored alongside cached ``load_config()`` results so a cache hit can
     detect that the cached expansion was made against a *different*
@@ -2727,7 +2741,7 @@ def _env_ref_snapshot(obj, snapshot=None):
         for raw in re.findall(r"\${([^}]+)}", obj):
             name = _env_ref_var_name(raw)
             if name is not None:
-                snapshot[name] = os.environ.get(name)
+                snapshot[name] = _config_env_value(name)
     elif isinstance(obj, dict):
         for value in obj.values():
             _env_ref_snapshot(value, snapshot)

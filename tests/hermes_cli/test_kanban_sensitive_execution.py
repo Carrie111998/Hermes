@@ -5,6 +5,8 @@ import contextlib
 import json
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -111,6 +113,235 @@ def test_sensitive_mode_does_not_bypass_generic_protected_read(monkeypatch, tmp_
     error = get_read_block_error(str(profile_home / ".env"))
     assert error is not None
     assert "blocked" in error.lower() or "denied" in error.lower()
+
+
+def test_sensitive_worker_actual_spawn_startup_and_terminal_env_are_isolated(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "elias"
+    profile_home.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile_home.joinpath(".env").write_text(
+        "CANARY_PROVIDER_API_KEY=synthetic-canary-never-real\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("CANARY_PROVIDER_API_KEY", "synthetic-canary-never-real")
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    real_popen = subprocess.Popen
+    captured = {}
+
+    class FakeProc:
+        pid = 4247
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = kb.Task(
+        id="t_sensitive_startup",
+        title="sensitive startup",
+        body=None,
+        assignee="elias",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        claim_lock="lock",
+        claim_expires=None,
+        tenant=None,
+        current_run_id=7,
+        sensitive_execution=True,
+        sensitive_runner_id="fixed-v1",
+    )
+    assert kb._default_spawn(task, str(workspace)) == 4247
+    monkeypatch.setattr(subprocess, "Popen", real_popen)
+    child_env = captured["env"]
+    assert "CANARY_PROVIDER_API_KEY" not in child_env
+    assert captured["cmd"][1:4] == [
+        "-m", "hermes_cli.kanban_sensitive_worker", "--"
+    ]
+    probe = """
+import os
+import subprocess
+import sys
+from pathlib import Path
+from agent.secret_scope import get_secret, load_env_file
+from tools.environments.local import _make_run_env
+
+key = "CANARY_PROVIDER_API_KEY"
+expected = load_env_file(Path(os.environ["HERMES_HOME"]) / ".env")[key]
+import run_agent  # noqa: F401 - exercise the real worker startup dotenv path
+if key in os.environ:
+    raise SystemExit(10)
+if get_secret(key) != expected:
+    raise SystemExit(11)
+terminal_env = _make_run_env({
+    **os.environ,
+    key: expected,
+    "UNRELATED_AMBIENT_VALUE": "must-not-cross",
+})
+if key in terminal_env or "UNRELATED_AMBIENT_VALUE" in terminal_env:
+    raise SystemExit(12)
+terminal_probe = subprocess.run(
+    [sys.executable, "-c", "import os; raise SystemExit('CANARY_PROVIDER_API_KEY' in os.environ)"],
+    env=terminal_env,
+    check=False,
+)
+if terminal_probe.returncode != 0:
+    raise SystemExit(13)
+print("sensitive-startup-ok")
+"""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.kanban_sensitive_worker",
+            "--",
+            sys.executable,
+            "-c",
+            probe,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=child_env,
+        check=False,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert "sensitive-startup-ok" in proc.stdout
+    assert "synthetic-canary-never-real" not in proc.stdout
+
+
+def test_sensitive_worker_credentials_use_scope_without_populating_environ(
+    monkeypatch, tmp_path
+):
+    from agent.secret_scope import get_secret, reset_secret_scope
+    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.kanban_sensitive import activate_sensitive_worker_credentials
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    profile_home.joinpath(".env").write_text(
+        "CANARY_PROVIDER_API_KEY=synthetic-profile-canary-never-real\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_SENSITIVE", "1")
+    monkeypatch.delenv("CANARY_PROVIDER_API_KEY", raising=False)
+
+    token = activate_sensitive_worker_credentials(profile_home)
+    try:
+        assert get_secret("CANARY_PROVIDER_API_KEY") == (
+            "synthetic-profile-canary-never-real"
+        )
+        assert _expand_env_vars("${env:CANARY_PROVIDER_API_KEY}") == (
+            "synthetic-profile-canary-never-real"
+        )
+        assert "CANARY_PROVIDER_API_KEY" not in os.environ
+    finally:
+        reset_secret_scope(token)
+
+
+def test_sensitive_worker_resolves_model_auth_without_ambient_key(
+    monkeypatch, tmp_path
+):
+    from agent.secret_scope import reset_secret_scope
+    from hermes_cli.kanban_sensitive import activate_sensitive_worker_credentials
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    profile_home.joinpath(".env").write_text(
+        "OPENROUTER_API_KEY=synthetic-model-auth-canary-never-real\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    token = activate_sensitive_worker_credentials(profile_home)
+    try:
+        runtime = resolve_runtime_provider(requested="openrouter")
+        assert runtime["api_key"] == "synthetic-model-auth-canary-never-real"
+        assert "OPENROUTER_API_KEY" not in os.environ
+    finally:
+        reset_secret_scope(token)
+
+
+def test_sensitive_dotenv_reload_keeps_profile_credentials_out_of_environ(
+    monkeypatch, tmp_path
+):
+    from agent.secret_scope import reset_secret_scope
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from hermes_cli.kanban_sensitive import activate_sensitive_worker_credentials
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    profile_home.joinpath(".env").write_text(
+        "CANARY_PROVIDER_API_KEY=synthetic-profile-canary-never-real\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_SENSITIVE", "1")
+    monkeypatch.delenv("CANARY_PROVIDER_API_KEY", raising=False)
+
+    token = activate_sensitive_worker_credentials(profile_home)
+    try:
+        assert load_hermes_dotenv(hermes_home=profile_home) == []
+        assert "CANARY_PROVIDER_API_KEY" not in os.environ
+    finally:
+        reset_secret_scope(token)
+
+
+def test_sensitive_terminal_child_environment_is_deny_by_default(monkeypatch):
+    from tools.environments.local import _sanitize_subprocess_env
+
+    monkeypatch.setenv("HERMES_KANBAN_SENSITIVE", "1")
+    child_env = _sanitize_subprocess_env({
+        "Path": "/usr/bin",
+        "HOME": "/tmp/synthetic-home",
+        "HERMES_KANBAN_SENSITIVE": "1",
+        "HERMES_KANBAN_TASK": "t_12345678",
+        "CANARY_PROVIDER_API_KEY": "synthetic-canary-never-real",
+        "UNRELATED_AMBIENT_VALUE": "must-not-cross",
+    })
+
+    assert child_env["Path"] == "/usr/bin"
+    assert child_env["HERMES_KANBAN_TASK"] == "t_12345678"
+    assert "CANARY_PROVIDER_API_KEY" not in child_env
+    assert "UNRELATED_AMBIENT_VALUE" not in child_env
+
+
+def test_sensitive_runner_environment_keeps_windows_runtime_without_credentials():
+    from hermes_cli.kanban_sensitive import build_sensitive_runner_env
+
+    child_env = build_sensitive_runner_env(
+        {"resource-a": "/protected/exact"},
+        {
+            "SystemRoot": r"C:\Windows",
+            "ComSpec": r"C:\Windows\System32\cmd.exe",
+            "CANARY_PROVIDER_API_KEY": "synthetic-canary-never-real",
+        },
+    )
+
+    assert child_env == {
+        "SystemRoot": r"C:\Windows",
+        "ComSpec": r"C:\Windows\System32\cmd.exe",
+        "HERMES_KANBAN_SENSITIVE_RESOURCES": json.dumps(
+            {"resource-a": "/protected/exact"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
 
 
 def test_fixed_runner_uses_declared_argv_and_resources_only(monkeypatch, capsys):

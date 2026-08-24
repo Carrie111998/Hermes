@@ -4,13 +4,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from agent.redact import redact_sensitive_text
-from agent.secret_scope import build_profile_secret_scope, current_secret_scope
+from agent.secret_scope import (
+    build_profile_secret_scope,
+    current_secret_scope,
+    set_secret_scope,
+)
 from hermes_constants import get_hermes_home
 
 _MIN_SECRET_LENGTH = 8
@@ -21,10 +26,119 @@ _SECRET_NAME_RE = re.compile(
 _REDACTED_SENTINELS = ("«redacted", "[REDACTED", "***")
 _BLOCK_MESSAGE = "Sensitive execution blocked a tool call containing credential material"
 _FAIL_CLOSED_MESSAGE = "Sensitive execution policy failed closed"
+_TERMINAL_BLOCK_MESSAGE = (
+    "Sensitive execution permits only the fixed no-argument runner through terminal"
+)
+_UNMEDIATED_EXECUTION_BLOCK_MESSAGE = (
+    "Sensitive execution blocked an unmediated execution capability"
+)
+_UNMEDIATED_EXECUTION_TOOLS = frozenset({
+    "browser_exec",
+    "computer_use",
+    "cronjob",
+    "delegate_task",
+    "execute_code",
+    "kanban_create",
+    "tool_call",
+})
+
+# A sensitive model worker starts with process/runtime coordinates only. Profile
+# credentials remain in the profile's protected stores and are resolved inside
+# Hermes; they never need to be ambient child-process variables.
+_SENSITIVE_WORKER_RUNTIME_ENV = frozenset({
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PYTHONUTF8",
+    "PYTHONIOENCODING",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+})
+_SENSITIVE_WORKER_CONTEXT_ENV = frozenset({
+    "HERMES_HOME",
+    "HERMES_PROFILE",
+    "HERMES_TENANT",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_SENSITIVE",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_BOARD",
+    "TERMINAL_CWD",
+    "TERMINAL_TIMEOUT",
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+})
 
 
 def sensitive_mode_enabled() -> bool:
     return os.environ.get("HERMES_KANBAN_SENSITIVE") == "1"
+
+
+def build_sensitive_worker_env(source: Mapping[str, Any]) -> dict[str, str]:
+    """Return the deny-by-default environment for a sensitive model worker."""
+    allowed = _SENSITIVE_WORKER_RUNTIME_ENV | _SENSITIVE_WORKER_CONTEXT_ENV
+    return {
+        key: str(value)
+        for key, value in source.items()
+        if key.upper() in allowed and value is not None
+    }
+
+
+def build_sensitive_runner_env(
+    granted: Mapping[str, str], source: Mapping[str, Any]
+) -> dict[str, str]:
+    """Return fixed-runner resources plus Windows process essentials only."""
+    windows_runtime = {"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
+    child_env = {
+        key: str(value)
+        for key, value in source.items()
+        if key.upper() in windows_runtime and value is not None
+    }
+    child_env["HERMES_KANBAN_SENSITIVE_RESOURCES"] = json.dumps(
+        dict(granted), sort_keys=True, separators=(",", ":")
+    )
+    return child_env
+
+
+def activate_sensitive_worker_credentials(hermes_home: Path) -> Any:
+    """Install profile credentials in process-private scope, never environ."""
+    home = Path(hermes_home)
+    try:
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+        hydrate_profile_secret_sources(home)
+    except Exception:
+        # The ordinary secret-source path is fail-open too. A missing model
+        # credential will fail provider resolution without widening ambient env.
+        pass
+    return set_secret_scope(build_profile_secret_scope(home))
 
 
 def _usable_secret(value: Any) -> Optional[str]:
@@ -102,6 +216,22 @@ def validate_final_tool_args(*, tool_name: str, args: Mapping[str, Any], **_cont
     serialized = json.dumps(args, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     if any(secret in serialized for secret in active_secret_values()):
         return _BLOCK_MESSAGE
+    if tool_name in _UNMEDIATED_EXECUTION_TOOLS:
+        return _UNMEDIATED_EXECUTION_BLOCK_MESSAGE
+    if tool_name == "process":
+        return _TERMINAL_BLOCK_MESSAGE
+    if tool_name == "terminal":
+        if set(args) - {"command"}:
+            return _TERMINAL_BLOCK_MESSAGE
+        command = args.get("command")
+        if not isinstance(command, str):
+            return _TERMINAL_BLOCK_MESSAGE
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            return _TERMINAL_BLOCK_MESSAGE
+        if tokens != ["hermes", "kanban", "sensitive-run"]:
+            return _TERMINAL_BLOCK_MESSAGE
     return None
 
 
@@ -186,12 +316,9 @@ def run_sensitive_runner() -> int:
         granted[resource_id] = str(Path(raw_path))
 
     # The runner's executable and arguments are fixed in policy, so it needs
-    # no ambient process state. Pass only the task-scoped resource grant.
-    child_env = {
-        "HERMES_KANBAN_SENSITIVE_RESOURCES": json.dumps(
-            granted, sort_keys=True, separators=(",", ":")
-        )
-    }
+    # no ambient process state. Pass only the task-scoped resource grant plus
+    # the Windows variables required to start a subprocess at all.
+    child_env = build_sensitive_runner_env(granted, os.environ)
     proc = subprocess.run(
         list(argv),
         stdin=subprocess.DEVNULL,

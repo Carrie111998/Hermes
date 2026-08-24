@@ -490,6 +490,15 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
+    if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+        # Sensitive model workers resolve provider credentials from a private
+        # profile scope. Loading either profile or project dotenv into environ
+        # would make those values available to model-controlled subprocesses.
+        from hermes_cli.kanban_sensitive import activate_sensitive_worker_credentials
+
+        activate_sensitive_worker_credentials(home_path)
+        return []
+
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
     if user_env.exists():
         _sanitize_env_file_if_needed(user_env)

@@ -35,7 +35,7 @@ def test_sensitive_validator_blocks_exact_secret_in_terminal_web_and_write(monke
         assert CANARY not in message
 
 
-def test_sensitive_validator_allows_secret_free_args(monkeypatch):
+def test_sensitive_validator_blocks_secret_free_arbitrary_terminal_command(monkeypatch):
     from hermes_cli.kanban_sensitive import validate_final_tool_args
 
     monkeypatch.setattr(
@@ -44,6 +44,67 @@ def test_sensitive_validator_allows_secret_free_args(monkeypatch):
     )
     assert validate_final_tool_args(
         tool_name="terminal", args={"command": "printf safe"}
+    ) == "Sensitive execution permits only the fixed no-argument runner through terminal"
+
+
+def test_sensitive_validator_blocks_indirect_terminal_environment_expansion(monkeypatch):
+    from hermes_cli.kanban_sensitive import validate_final_tool_args
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_sensitive.active_secret_values",
+        lambda: (CANARY,),
+    )
+    message = validate_final_tool_args(
+        tool_name="terminal",
+        args={
+            "command": (
+                "python -c \"import os; send(os.environ['CANARY_PROVIDER_API_KEY'])\""
+            )
+        },
+    )
+    assert message == (
+        "Sensitive execution permits only the fixed no-argument runner through terminal"
+    )
+    assert CANARY not in message
+
+
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("execute_code", {"code": "open('/profile/.env').read()"}),
+        ("browser_exec", {"code": "open('/profile/.env').read()"}),
+        ("delegate_task", {"goal": "inspect the profile credential store"}),
+        ("cronjob", {"action": "create", "prompt": "inspect credentials"}),
+        ("computer_use", {"action": "type", "text": "inspect credentials"}),
+        ("kanban_create", {"title": "inspect credentials", "assignee": "worker"}),
+        ("tool_call", {"name": "deferred_tool", "arguments": {}}),
+    ],
+)
+def test_sensitive_validator_blocks_capabilities_that_escape_process_policy(
+    monkeypatch, tool_name, args
+):
+    from hermes_cli.kanban_sensitive import validate_final_tool_args
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_sensitive.active_secret_values",
+        lambda: (CANARY,),
+    )
+
+    message = validate_final_tool_args(tool_name=tool_name, args=args)
+
+    assert message == "Sensitive execution blocked an unmediated execution capability"
+    assert CANARY not in message
+
+
+def test_sensitive_validator_allows_only_fixed_no_argument_runner(monkeypatch):
+    from hermes_cli.kanban_sensitive import validate_final_tool_args
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_sensitive.active_secret_values",
+        lambda: (CANARY,),
+    )
+    assert validate_final_tool_args(
+        tool_name="terminal", args={"command": "hermes kanban sensitive-run"}
     ) is None
 
 

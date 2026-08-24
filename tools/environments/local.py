@@ -469,6 +469,13 @@ def _inject_session_context_env(env: dict) -> None:
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
+    if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+        from hermes_cli.kanban_sensitive import build_sensitive_worker_env
+
+        source = dict(base_env or {})
+        source.update(extra_env or {})
+        return build_sensitive_worker_env(source)
+
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -1282,6 +1289,11 @@ def _path_env_key(run_env: dict) -> str | None:
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
+    if os.environ.get("HERMES_KANBAN_SENSITIVE") == "1":
+        from hermes_cli.kanban_sensitive import build_sensitive_worker_env
+
+        return build_sensitive_worker_env(dict(os.environ | env))
+
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,

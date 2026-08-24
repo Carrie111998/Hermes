@@ -11764,6 +11764,9 @@ def _default_spawn(
         # The wrapper holds raw child output only in memory and emits the
         # exact-value + pattern-redacted form to the durable worker log.
         cmd = [sys.executable, "-m", "hermes_cli.kanban_sensitive_worker", "--", *cmd]
+        from hermes_cli.kanban_sensitive import build_sensitive_worker_env
+
+        env = build_sensitive_worker_env(env)
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

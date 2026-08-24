@@ -139,6 +139,7 @@ def test_sensitive_worker_spawn_uses_output_redaction_wrapper(monkeypatch, tmp_p
     (root / "profiles" / "elias").mkdir(parents=True)
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("CANARY_PROVIDER_API_KEY", "synthetic-canary-never-real")
 
     from hermes_cli import kanban_db as kb
 
@@ -162,10 +163,38 @@ def test_sensitive_worker_spawn_uses_output_redaction_wrapper(monkeypatch, tmp_p
 
     assert kb._default_spawn(task, str(workspace)) == 4245
     assert captured["env"]["HERMES_KANBAN_SENSITIVE"] == "1"
+    assert "CANARY_PROVIDER_API_KEY" not in captured["env"]
     assert captured["cmd"][1:4] == [
         "-m", "hermes_cli.kanban_sensitive_worker", "--"
     ]
     assert "hermes" in captured["cmd"]
+
+
+def test_ordinary_worker_spawn_preserves_ambient_environment(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("ORDINARY_WORKER_MARKER", "preserved")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(_cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace)) == 4246
+    assert captured["env"]["ORDINARY_WORKER_MARKER"] == "preserved"
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
