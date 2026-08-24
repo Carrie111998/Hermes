@@ -315,6 +315,9 @@ class TestSafeRestore:
     """
 
     def _checkpoint(self, mgr, work_dir):
+        # Safe restore records writes against a discovered project root. Keep
+        # this fixture rooted locally on every platform.
+        (work_dir / ".git").mkdir(exist_ok=True)
         assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
         mgr.new_turn()
         cps = mgr.list_checkpoints(str(work_dir))
@@ -393,6 +396,166 @@ class TestSafeRestore:
         assert "README.md" in result["skipped_user_edits"]
         assert "agent.txt" in result["restored_files"]
 
+    def test_safe_restore_fails_loudly_when_created_file_cannot_be_removed(self, mgr, work_dir, monkeypatch):
+        """A deletion failure must never produce a successful rollback claim."""
+        base = self._checkpoint(mgr, work_dir)
+        created = work_dir / "agent.txt"
+        created.write_text("agent file\n")
+        mgr.record_agent_write(str(created))
+
+        from tools import checkpoint_manager
+
+        real_run_git = checkpoint_manager._run_git
+
+        def cat_file_reports_absent(command, *args, **kwargs):
+            if command[:2] == ["cat-file", "-e"]:
+                return False, "", ""
+            return real_run_git(command, *args, **kwargs)
+
+        monkeypatch.setattr(checkpoint_manager, "_run_git", cat_file_reports_absent)
+
+        real_unlink = Path.unlink
+        unlink_calls = []
+
+        def locked_unlink(path, *args, **kwargs):
+            if path.name == "agent.txt":
+                unlink_calls.append(str(path))
+                raise PermissionError("simulated Windows sharing violation")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", locked_unlink)
+
+        result = mgr.restore(str(work_dir), base, safe=True)
+
+        assert unlink_calls == [str(created)]
+        assert result["success"] is False
+        assert str(created) in result["error"]
+        assert created.exists()
+        assert "restored_to" not in result
+        assert "restored_files" not in result
+
+    def test_safe_restore_reports_partial_deletions_without_success_fields(
+        self, mgr, work_dir, monkeypatch,
+    ):
+        """A multi-target delete failure reports both completed and untouched paths."""
+        base = self._checkpoint(mgr, work_dir)
+        created = []
+        for name in ("a-agent.txt", "b-agent.txt", "c-agent.txt"):
+            path = work_dir / name
+            path.write_text(f"{name}\n")
+            mgr.record_agent_write(str(path))
+            created.append(path)
+
+        from tools import checkpoint_manager
+
+        real_run_git = checkpoint_manager._run_git
+
+        def cat_file_reports_absent(command, *args, **kwargs):
+            if command[:2] == ["cat-file", "-e"]:
+                return False, "", ""
+            return real_run_git(command, *args, **kwargs)
+
+        monkeypatch.setattr(checkpoint_manager, "_run_git", cat_file_reports_absent)
+        real_unlink = Path.unlink
+        unlink_calls = []
+
+        def fail_second_unlink(path, *args, **kwargs):
+            unlink_calls.append(path.name)
+            if path.name == "b-agent.txt":
+                raise PermissionError("internal sharing diagnostic")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_second_unlink)
+
+        result = mgr.restore(str(work_dir), base, safe=True)
+
+        assert result == {
+            "success": False,
+            "error": f"Restore failed: could not remove '{created[1]}'",
+            "removed_targets": ["a-agent.txt"],
+            "not_attempted_targets": ["c-agent.txt"],
+        }
+        assert unlink_calls == ["a-agent.txt", "b-agent.txt"]
+        assert not created[0].exists()
+        assert created[1].exists()
+        assert created[2].exists()
+        assert "internal sharing diagnostic" not in result["error"]
+        assert len(mgr.list_checkpoints(str(work_dir))) == 2
+
+    def test_safe_restore_treats_unlink_race_as_already_removed(
+        self, mgr, work_dir, monkeypatch,
+    ):
+        """A file disappearing during unlink already satisfies the rollback."""
+        base = self._checkpoint(mgr, work_dir)
+        created = work_dir / "agent.txt"
+        created.write_text("agent file\n")
+        mgr.record_agent_write(str(created))
+
+        from tools import checkpoint_manager
+
+        real_run_git = checkpoint_manager._run_git
+
+        def cat_file_reports_absent(command, *args, **kwargs):
+            if command[:2] == ["cat-file", "-e"]:
+                return False, "", ""
+            return real_run_git(command, *args, **kwargs)
+
+        monkeypatch.setattr(checkpoint_manager, "_run_git", cat_file_reports_absent)
+        real_unlink = Path.unlink
+
+        def disappears_during_unlink(path, *args, **kwargs):
+            if path == created:
+                real_unlink(path, *args, **kwargs)
+                raise FileNotFoundError(path)
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", disappears_during_unlink)
+
+        result = mgr.restore(str(work_dir), base, safe=True)
+
+        assert result["success"] is True
+        assert result["restored_files"] == ["agent.txt"]
+        assert not created.exists()
+
+    def test_safe_restore_discloses_nonempty_directory_replacing_agent_file(
+        self, mgr, work_dir,
+    ):
+        """A replacement directory with user content is preserved and disclosed."""
+        base = self._checkpoint(mgr, work_dir)
+        created = work_dir / "agent.txt"
+        created.write_text("agent file\n")
+        mgr.record_agent_write(str(created))
+        created.unlink()
+        created.mkdir()
+        user_file = created / "user-content.txt"
+        user_file.write_text("user content\n")
+
+        result = mgr.restore(str(work_dir), base, safe=True)
+
+        assert result["success"] is True
+        assert result["restored_files"] == []
+        assert result["skipped_user_edits"] == ["agent.txt/user-content.txt"]
+        assert user_file.read_text() == "user content\n"
+
+    def test_safe_restore_reports_empty_directory_replacing_agent_file(
+        self, mgr, work_dir,
+    ):
+        """An empty replacement dir is explicit benign leftover, never a restored file."""
+        base = self._checkpoint(mgr, work_dir)
+        created = work_dir / "agent.txt"
+        created.write_text("agent file\n")
+        mgr.record_agent_write(str(created))
+        created.unlink()
+        created.mkdir()
+
+        result = mgr.restore(str(work_dir), base, safe=True)
+
+        assert result["success"] is True
+        assert result["restored_files"] == []
+        assert result["benign_empty_directories"] == ["agent.txt"]
+        assert created.is_dir()
+        assert "agent.txt" not in result["restored_files"]
+
     def test_unsafe_restore_overwrites_everything(self, mgr, work_dir):
         base = self._checkpoint(mgr, work_dir)
         (work_dir / "main.py").write_text("agent version\n")
@@ -446,8 +609,8 @@ class TestWorkingDirResolution:
         _real_exists = _pl.Path.exists
 
         def _guarded_exists(self):
-            s = str(self)
-            stop = str(tmp_path)
+            s = self.as_posix()
+            stop = tmp_path.as_posix()
             if not s.startswith(stop) and any(
                 s.endswith("/" + m) or s == "/" + m
                 for m in (".git", "pyproject.toml", "package.json",
@@ -486,7 +649,7 @@ class TestGitEnvIsolation:
         env = _git_env(
             store, str(work), index_file=store / "indexes" / "abc",
         )
-        assert env["GIT_INDEX_FILE"].endswith("indexes/abc")
+        assert env["GIT_INDEX_FILE"].endswith(str(Path("indexes") / "abc"))
 
         # ~ in the work tree is expanded.
         tilde_work = fake_home / "work"
@@ -498,6 +661,31 @@ class TestGitEnvIsolation:
 # =========================================================================
 # Error resilience
 # =========================================================================
+
+class TestRetryRemoveReadonly:
+    def test_preserves_existing_permission_bits_when_adding_owner_write(
+        self, monkeypatch,
+    ):
+        from tools import checkpoint_manager
+
+        original_mode = 0o454
+        chmod_modes = []
+        retried = []
+        from types import SimpleNamespace
+
+        fake_os = SimpleNamespace(
+            stat=lambda _path: SimpleNamespace(st_mode=original_mode),
+            chmod=lambda _path, mode: chmod_modes.append(mode),
+        )
+        monkeypatch.setattr(checkpoint_manager, "os", fake_os)
+
+        checkpoint_manager._retry_remove_readonly(
+            lambda path: retried.append(path), "checkpoint-object", None,
+        )
+
+        assert chmod_modes == [original_mode | checkpoint_manager.stat.S_IWRITE]
+        assert retried == ["checkpoint-object"]
+
 
 class TestErrorResilience:
     def test_run_git_allows_expected_nonzero_without_error_log(

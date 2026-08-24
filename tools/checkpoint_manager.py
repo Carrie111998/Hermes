@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -830,7 +831,7 @@ class CheckpointManager:
         """Classify files changed since ``commit_hash`` for a safe restore.
 
         Returns ``{"success", "restore": [rel...], "skipped": [rel...],
-        "error"?}`` where ``restore`` lists files whose current content
+        "benign_empty_directories": [rel...], "error"?}`` where ``restore`` lists files whose current content
         still matches what Hermes last wrote (per the agent-write ledger)
         and ``skipped`` lists files the user hand-edited after Hermes'
         last write or that Hermes never wrote at all.
@@ -891,7 +892,27 @@ class CheckpointManager:
                 restore.append(rel)
             else:
                 skipped.append(rel)
-        return {"success": True, "restore": restore, "skipped": skipped}
+        empty_directories: List[str] = []
+        root = Path(abs_dir)
+        for path_string in ledger:
+            path = Path(path_string)
+            try:
+                rel = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if path.is_dir() and not path.is_symlink():
+                try:
+                    next(path.iterdir())
+                except StopIteration:
+                    empty_directories.append(rel)
+                except OSError:
+                    continue
+        return {
+            "success": True,
+            "restore": restore,
+            "skipped": skipped,
+            "benign_empty_directories": empty_directories,
+        }
 
     def ensure_checkpoint(self, working_dir: str, reason: str = "auto") -> bool:
         """Take a checkpoint if enabled and not already done this turn.
@@ -1076,6 +1097,10 @@ class CheckpointManager:
         hand-edited after Hermes' last write — per the agent-write ledger —
         are left untouched, and only Hermes-authored changes are reverted.
         The result gains ``skipped_user_edits`` listing the preserved paths.
+        Empty directories replacing an agent-written file are benign untracked
+        leftovers and are listed as ``benign_empty_directories``; they are not
+        reported as restored files.  Unsafe restores use Git checkout and do
+        not remove post-checkpoint untracked files or empty directories.
         """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1101,6 +1126,7 @@ class CheckpointManager:
                     "debug": err or None}
 
         skipped_user_edits: List[str] = []
+        benign_empty_directories: List[str] = []
         restore_paths: Optional[List[str]] = None
         if safe and not file_path:
             plan = self.safe_restore_plan(abs_dir, commit_hash)
@@ -1113,8 +1139,9 @@ class CheckpointManager:
             else:
                 restore_paths = plan["restore"]
                 skipped_user_edits = plan["skipped"]
+                benign_empty_directories = plan.get("benign_empty_directories", [])
                 if not restore_paths:
-                    return {
+                    result = {
                         "success": True,
                         "restored_to": commit_hash[:8],
                         "reason": "nothing to restore (all changed files were user-edited)",
@@ -1122,6 +1149,9 @@ class CheckpointManager:
                         "restored_files": [],
                         "skipped_user_edits": skipped_user_edits,
                     }
+                    if benign_empty_directories:
+                        result["benign_empty_directories"] = benign_empty_directories
+                    return result
 
         # Take a pre-rollback snapshot so you can undo the undo.
         self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
@@ -1140,13 +1170,24 @@ class CheckpointManager:
                     store, abs_dir, allowed_returncodes={1, 128},
                 )
                 (checkout_targets if ok_in_commit else delete_targets).append(rel)
-            for rel in delete_targets:
+            removed_targets: List[str] = []
+            for index, rel in enumerate(delete_targets):
+                target = Path(abs_dir) / rel
                 try:
-                    target = Path(abs_dir) / rel
                     if target.is_file() or target.is_symlink():
                         target.unlink()
+                    removed_targets.append(rel)
+                except FileNotFoundError:
+                    # The desired rollback state is already absent.
+                    removed_targets.append(rel)
                 except OSError as exc:
                     logger.debug("Safe restore: could not remove %s: %s", rel, exc)
+                    return {
+                        "success": False,
+                        "error": f"Restore failed: could not remove '{target}'",
+                        "removed_targets": removed_targets,
+                        "not_attempted_targets": delete_targets[index + 1:],
+                    }
             if not checkout_targets:
                 ok, stdout, err = True, "", ""
             else:
@@ -1182,6 +1223,8 @@ class CheckpointManager:
         if restore_paths is not None:
             result["restored_files"] = restore_paths
             result["skipped_user_edits"] = skipped_user_edits
+            if benign_empty_directories:
+                result["benign_empty_directories"] = benign_empty_directories
         return result
 
     def get_working_dir_for_path(self, file_path: str) -> str:
@@ -2123,6 +2166,12 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     return out
 
 
+def _retry_remove_readonly(func, path, exc_info) -> None:
+    """Retry a failed removal after adding Windows' owner-write permission."""
+    os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+    func(path)
+
+
 def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     """Nuke the entire checkpoint base (store + legacy).  Irreversible.
 
@@ -2134,7 +2183,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
         return out
     size = _dir_size_bytes(base)
     try:
-        shutil.rmtree(base)
+        shutil.rmtree(base, onerror=_retry_remove_readonly)
         out["bytes_freed"] = size
         out["deleted"] = True
     except OSError as exc:
