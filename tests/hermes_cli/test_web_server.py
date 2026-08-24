@@ -4848,6 +4848,47 @@ class TestServeIndexMissingIndex:
         assert "SPA-rebuilt" in resp.text
 
 
+class TestHeadlessServeTokenPage:
+    """`hermes serve` (headless) must serve a minimal token page at `/` in
+    loopback (non-gated) mode so the Desktop renderer can extract
+    ``window.__HERMES_SESSION_TOKEN__`` for its WebSocket auth, while keeping
+    every other path (and the gated/remote case) a JSON 404. (#62666)"""
+
+    @staticmethod
+    def _headless_client(monkeypatch, *, auth_required):
+        import json
+
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("HERMES_SERVE_HEADLESS", "1")
+        spa_app = FastAPI()
+        spa_app.state.auth_required = auth_required
+        ws.mount_spa(spa_app)
+        return TestClient(spa_app), json.dumps(ws._SESSION_TOKEN)
+
+    def test_root_serves_token_page_in_loopback(self, monkeypatch):
+        client, token_json = self._headless_client(monkeypatch, auth_required=False)
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert f"window.__HERMES_SESSION_TOKEN__={token_json}" in resp.text
+        assert 'window.__HERMES_AUTH_REQUIRED__="false"' in resp.text
+
+    def test_root_is_json_404_when_auth_gated(self, monkeypatch):
+        client, _ = self._headless_client(monkeypatch, auth_required=True)
+        resp = client.get("/")
+        assert resp.status_code == 404
+        assert "web UI disabled" in resp.json()["error"]
+
+    def test_other_paths_stay_json_404(self, monkeypatch):
+        client, _ = self._headless_client(monkeypatch, auth_required=False)
+        for route in ("/chat", "/api/status", "/assets/app.js"):
+            resp = client.get(route)
+            assert resp.status_code == 404
+            assert "web UI disabled" in resp.json()["error"]
+
+
 class TestHashedAssetCacheHeaders:
     """Hashed /assets/* responses must be immutable-cacheable; index.html
     must stay no-store so it always references the current hashes

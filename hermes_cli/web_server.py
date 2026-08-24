@@ -17760,6 +17760,28 @@ def mount_spa(application: FastAPI):
             else "Frontend not built. Run: cd web && npm run build"
         )
 
+        if _headless:
+            # The Desktop renderer loads `/` to extract
+            # ``window.__HERMES_SESSION_TOKEN__`` for its WebSocket auth, even
+            # though `serve` never mounts the SPA. Serve a minimal token-only
+            # HTML page at the exact root path in non-gated (loopback) mode so
+            # the Desktop can authenticate without shipping the full SPA. Every
+            # other path stays JSON 404 — only the JSON-RPC/WS/API surface is
+            # reachable. When the auth gate is on (non-loopback/remote serve),
+            # dispense nothing: the token must not leak past the loopback
+            # boundary. (#62666 — replaces the getBackendArgsForRuntime →
+            # `dashboard --no-open` workaround.)
+            @application.get("/")
+            async def headless_token_page():
+                if getattr(application.state, "auth_required", False):
+                    return JSONResponse({"error": _msg}, status_code=404)
+                return HTMLResponse(
+                    "<!doctype html><html><head>"
+                    f"<script>window.__HERMES_SESSION_TOKEN__={json.dumps(_SESSION_TOKEN)};"
+                    f'window.__HERMES_AUTH_REQUIRED__="false";'
+                    "</script></head><body></body></html>"
+                )
+
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
             return JSONResponse({"error": _msg}, status_code=404)
