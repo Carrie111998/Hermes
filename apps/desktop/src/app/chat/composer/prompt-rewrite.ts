@@ -29,13 +29,33 @@ const MAX_TOKENS: Record<PromptRewriteMode, number> = {
 // The backend timeout is explicit and bounded; keep the RPC alive slightly
 // longer so it can return the answer (or the real provider error).
 const PROMPT_REWRITE_MODEL_TIMEOUT_SECONDS = 180
-const PROMPT_REWRITE_RPC_TIMEOUT_MS = 195_000
+const PROMPT_REWRITE_RPC_GRACE_MS = 15_000
+
+const PROMPT_REWRITE_RPC_TIMEOUT_MS =
+  PROMPT_REWRITE_MODEL_TIMEOUT_SECONDS * 1_000 + PROMPT_REWRITE_RPC_GRACE_MS
+
+const PROJECT_FACT_ENTRY_LIMIT = 160
 
 interface ProjectFacts {
   contextFiles?: unknown
   manifests?: unknown
   packageManagers?: unknown
   verifyCommands?: unknown
+}
+
+function boundedProjectFact(value: string): string {
+  const normalized = value.trim().replace(/\s+/g, ' ')
+
+  return normalized.length <= PROJECT_FACT_ENTRY_LIMIT
+    ? normalized
+    : `${normalized.slice(0, PROJECT_FACT_ENTRY_LIMIT - 1)}…`
+}
+
+function cleanRewriteResult(value: string): string {
+  const trimmed = value.trim()
+  const outerFence = /^```[^\r\n]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed)
+
+  return (outerFence?.[1] ?? trimmed).trim()
 }
 
 function projectFactsContext(facts: ProjectFacts | null | undefined): string {
@@ -57,6 +77,7 @@ function projectFactsContext(facts: ProjectFacts | null | undefined): string {
 
     const entries = value
       .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+      .map(boundedProjectFact)
       .slice(0, 12)
 
     return entries.length > 0 ? [`- ${label}: ${entries.join(', ')}`] : []
@@ -121,5 +142,5 @@ export async function requestPromptRewrite({
     PROMPT_REWRITE_RPC_TIMEOUT_MS
   )
 
-  return (result?.text ?? '').trim()
+  return cleanRewriteResult(result?.text ?? '')
 }

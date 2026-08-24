@@ -124,6 +124,8 @@ describe('PromptRewriteMenu', () => {
   })
 
   it('adds detected project facts to Enhance when they are available', async () => {
+    const longVerifyCommand = `npm run verify -- ${'unsafe-context'.repeat(20)}`
+
     const request = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
       method === 'project.facts'
         ? {
@@ -132,7 +134,7 @@ describe('PromptRewriteMenu', () => {
               manifests: ['package.json'],
               packageManagers: ['npm'],
               root: '/private/repo',
-              verifyCommands: ['npm run test']
+              verifyCommands: ['npm run test', longVerifyCommand]
             }
           }
         : { text: 'Codebase-aware rewrite' }
@@ -153,6 +155,17 @@ describe('PromptRewriteMenu', () => {
       195_000
     )
     expect(request.mock.calls[1]?.[1]?.instructions).not.toContain('/private/repo')
+    expect(request.mock.calls[1]?.[1]?.instructions).not.toContain(longVerifyCommand)
+    expect(request.mock.calls[1]?.[1]?.instructions).toContain('…')
+  })
+
+  it('removes an accidental outer code fence from the model result', async () => {
+    const request = vi.fn(async () => ({ text: '```markdown\nRewritten prompt\n```' }))
+    const { onRewrite } = renderMenu({ request })
+
+    await choose(/Basic rewrite/)
+
+    await waitFor(() => expect(onRewrite).toHaveBeenCalledWith('Rewritten prompt'))
   })
 
   it('enhances a first prompt without a session or selected project', async () => {

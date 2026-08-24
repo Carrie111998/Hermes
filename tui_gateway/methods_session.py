@@ -1525,10 +1525,18 @@ def _(rid, params: dict) -> dict:
     # the profile/bot's configured model is part of the request contract.
     session_id = str(params.get("session_id") or "").strip()
     session = _sessions.get(session_id)
+    generation_timeout = timeout
     if session and session.get("agent") is None:
+        deadline = time.monotonic() + timeout
         _start_agent_build(session_id, session)
-        if init_err := _wait_agent(session, rid, timeout=120.0):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _err(rid, 5032, "agent initialization timed out")
+        if init_err := _wait_agent(session, rid, timeout=remaining):
             return init_err
+        generation_timeout = deadline - time.monotonic()
+        if generation_timeout <= 0:
+            return _err(rid, 5030, "one-shot generation timed out before provider request")
     main_runtime = _main_runtime_from_agent(session.get("agent")) if session else None
 
     try:
@@ -1542,7 +1550,7 @@ def _(rid, params: dict) -> dict:
             task=task,
             max_tokens=max_tokens,
             temperature=temperature if temperature is not None else 0.3,
-            timeout=timeout,
+            timeout=generation_timeout,
             main_runtime=main_runtime,
         )
     except KeyError as e:
