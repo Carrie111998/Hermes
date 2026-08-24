@@ -644,6 +644,14 @@ export function useVoiceConversation({
         return
       }
 
+      // Typing a space into the composer (or any editable field / input) must
+      // never be hijacked as "end turn" — otherwise the spacebar goes dead
+      // whenever the mic is live. Only bare presses on the page count.
+      const target = event.target
+      if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+        return
+      }
+
       if (statusRef.current !== 'listening') {
         return
       }
