@@ -9,7 +9,7 @@ carry ONE thing on top of it: the ATM injection patch stack (see
 | Thing | Role |
 |---|---|
 | `main` | upstream/main + the ATM patch stack, advanced only by reviewed PR |
-| `atm/stack` branch | the patch stack (3 code commits + this docs commit), rebased onto upstream daily; force-push allowed HERE, never on main |
+| `atm/stack` branch | the patch stack (3 code commits + this docs commit), rebased onto upstream daily; advanced by delete + recreate — NEVER force-push (force-push needs interactive user auth; the pipeline runs unattended) |
 | `sync/candidate-YYYYMMDD` branches | daily PR candidates produced by the cron |
 | `runtime-*` tags | sources of built runtimes (see `~/.hermes/RUNTIME-PLAN.md` on the gateway host) |
 | `~/Documents/forks/hermes-agent` (host) | integration WORKSPACE only — nothing executes from it (enforced by runtime-audit) |
@@ -44,7 +44,7 @@ unit-tested, idempotent — safe to re-run after any failure) in a scratch clone
    (`gh pr merge --merge --admin`; enforce_admins is off). The 1-approval branch
    protection stays as a guard against accidental non-admin pushes, not as a
    working review gate
-   (`git push origin +<candidate>:atm/stack`). **Loki** (frontier, expensive) is
+   (`git push origin --delete atm/stack && git push origin <candidate>:refs/heads/atm/stack`). **Loki** (frontier, expensive) is
    NOT in the routine path — non-trivial PRs, reviewer disagreement, or anything
    unexpected → level 2.
 
@@ -53,7 +53,7 @@ failure, or reviewer rejection. The escalation agent is **loki** (hermes-agent-a
 maintainer, frontier model; workspace `hendrix/loki/`, reachable via
 `atm send loki`). Loki receives `PATCH-REQUIREMENTS.md`
 and follows its "How to update the patch" procedure. Its output is an updated
-`atm/stack` + a PR — never a direct push to main, never a force-push of main, never
+`atm/stack` + a PR — never a direct push to main, never a force-push of anything, never
 a branch-protection change. If the contract can't be met, it stops and reports to
 Rand with analysis.
 

@@ -78,7 +78,7 @@ Current stack shape (3 commits + this doc commit):
 ## How to update the patch (escalation procedure)
 
 1. Work in a scratch clone. NEVER in `~/Documents/forks/hermes-agent` directly,
-   never force-push `main`, never touch branch protection.
+   never force-push anything (force-push needs interactive user auth — you run unattended), never touch branch protection.
 2. `git fetch upstream main`; start from `upstream/main`; attempt
    `git rebase upstream/main` of the `atm/stack` branch.
 3. Resolve conflicts per the contract above — the contract, not the old diff, is the
