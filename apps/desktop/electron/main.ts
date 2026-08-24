@@ -14068,7 +14068,7 @@ async function handleHermesApiRequest(request) {
     const url = `${connection.baseUrl}${apiRoute.requestPath}`
     const host = new URL(connection.baseUrl).hostname
     const loopbackOAuth = request?.desktopLoopbackOAuth && (
-      host === '127.0.0.1' || host === '::1' || host === 'localhost'
+      host === '127.0.0.1' || host === '[::1]' || host === 'localhost'
     )
 
     // OAuth gateways authenticate REST via EITHER a native bearer token
