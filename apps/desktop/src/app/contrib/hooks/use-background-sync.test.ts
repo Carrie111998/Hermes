@@ -49,13 +49,16 @@ function makeRefresh(resolveSession: ActiveTranscriptRefreshDeps['resolveSession
   const signatureRef = { current: new Map<string, string>() }
   const state = createClientSessionState(ACTIVE_STORED_ID)
   const states = new Map([[ACTIVE_RUNTIME_ID, state]])
+  const updateSessionStateRef = {
+    updateSessionState: vi.fn((sessionId: string, updater: (value: typeof state) => typeof state) => {
+      const next = updater(states.get(sessionId) ?? createClientSessionState(ACTIVE_STORED_ID))
+      states.set(sessionId, next)
 
-  const updateSessionState = vi.fn((sessionId: string, updater: (value: typeof state) => typeof state) => {
-    const next = updater(states.get(sessionId) ?? createClientSessionState(ACTIVE_STORED_ID))
-    states.set(sessionId, next)
+      return next
+    })
+  }
+  const { updateSessionState } = updateSessionStateRef
 
-    return next
-  })
 
   const refresh = () =>
     reconcileActiveTranscript({
@@ -82,6 +85,12 @@ function useSyncHarness({
   activeStoredSessionId: string | null
   refreshActiveTranscript: () => Promise<void>
 }) {
+  const updateSessionState: Parameters<typeof useBackgroundSync>[0]['updateSessionState'] = vi.fn(
+    (sessionId, updater) => {
+      const current = {} as Parameters<typeof updater>[0]
+      return updater(current)
+    }
+  )
   useBackgroundSync({
     activeConnectionId: 'local',
     activeGatewayProfile: 'default',
@@ -96,7 +105,8 @@ function useSyncHarness({
     refreshHermesConfig: vi.fn(),
     refreshMessagingSessions: vi.fn(),
     refreshSessions: vi.fn(),
-    requestGateway: vi.fn(async () => ({ sessions: [] })) as never
+    updateSessionState,
+      requestGateway: vi.fn(async () => ({ sessions: [] })) as never
   })
 }
 
