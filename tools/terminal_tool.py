@@ -1515,6 +1515,16 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         container_key = _resolve_container_alias(task_id)
     else:
         container_key = "default"
+
+    _ensure_terminal_env_bridged()
+    if os.getenv("TERMINAL_ENV", "local") == "e2b":
+        from hermes_constants import hermes_home_key
+
+        profile_prefix = f"e2b:{hermes_home_key()}:"
+        if task_id and task_id.startswith(profile_prefix):
+            return task_id
+        return f"{profile_prefix}{container_key}"
+
     # Per-session isolation: when a session key is present (the WebUI streaming
     # layer sets it per-session, the gateway per-message via contextvars), scope
     # the container to it so switching profiles can't reuse a previous profile's
@@ -1557,14 +1567,6 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         if shared:
             container_key = f"shared:{shared}"
 
-    _ensure_terminal_env_bridged()
-    if os.getenv("TERMINAL_ENV", "local") == "e2b":
-        from hermes_constants import hermes_home_key
-
-        profile_prefix = f"e2b:{hermes_home_key()}:"
-        if task_id and task_id.startswith(profile_prefix):
-            return task_id
-        return f"{profile_prefix}{container_key}"
     return container_key
 
 

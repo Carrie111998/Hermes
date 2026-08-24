@@ -199,15 +199,19 @@ def e2b_backend(monkeypatch):
     service = SandboxService()
 
     e2b_root = types.ModuleType("e2b")
-    e2b_root.Sandbox = SimpleNamespace(create=service.create, connect=service.connect)
+    setattr(
+        e2b_root,
+        "Sandbox",
+        SimpleNamespace(create=service.create, connect=service.connect),
+    )
     exceptions = types.ModuleType("e2b.exceptions")
-    exceptions.SandboxNotFoundException = SandboxMissing
-    exceptions.RateLimitException = ApiRateLimited
-    exceptions.FileNotFoundException = RemoteFileMissing
-    exceptions.SandboxException = SandboxFailure
-    exceptions.AuthenticationException = AuthenticationFailed
+    setattr(exceptions, "SandboxNotFoundException", SandboxMissing)
+    setattr(exceptions, "RateLimitException", ApiRateLimited)
+    setattr(exceptions, "FileNotFoundException", RemoteFileMissing)
+    setattr(exceptions, "SandboxException", SandboxFailure)
+    setattr(exceptions, "AuthenticationException", AuthenticationFailed)
     command_handle = types.ModuleType("e2b.sandbox.commands.command_handle")
-    command_handle.CommandExitException = CommandFailed
+    setattr(command_handle, "CommandExitException", CommandFailed)
 
     monkeypatch.setitem(sys.modules, "e2b", e2b_root)
     monkeypatch.setitem(sys.modules, "e2b.exceptions", exceptions)
@@ -487,6 +491,11 @@ def test_e2b_file_transport_uses_bulk_bytes_and_idempotent_delete(
 
 
 def test_config_bridge_and_profile_scoped_cache_keys(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools import terminal_tool
 
@@ -504,19 +513,123 @@ def test_config_bridge_and_profile_scoped_cache_keys(monkeypatch):
     assert config["e2b_template"] == "team-template"
     assert config["cwd"] == "/home/user"
 
-    token_a = set_hermes_home_override(home / "profile-a")
+    session_tokens = set_session_vars(session_key="gateway-session")
     try:
-        key_a = terminal_tool._resolve_container_task_id(None)
+        token_a = set_hermes_home_override(home / "profile-a")
+        try:
+            key_a = terminal_tool._resolve_container_task_id(None)
+        finally:
+            reset_hermes_home_override(token_a)
+        token_b = set_hermes_home_override(home / "profile-b")
+        try:
+            key_b = terminal_tool._resolve_container_task_id(None)
+        finally:
+            reset_hermes_home_override(token_b)
     finally:
-        reset_hermes_home_override(token_a)
-    token_b = set_hermes_home_override(home / "profile-b")
-    try:
-        key_b = terminal_tool._resolve_container_task_id(None)
-    finally:
-        reset_hermes_home_override(token_b)
+        clear_session_vars(session_tokens)
+        reset_session_vars()
     assert key_a != key_b
     assert key_a.endswith(":default")
     assert key_b.endswith(":default")
+
+
+def test_e2b_cache_key_is_stable_across_gateway_sessions(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+    from hermes_constants import hermes_home_key
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    expected = f"e2b:{hermes_home_key()}:default"
+    resolved = []
+
+    try:
+        for session_key in ("gateway-session-a", "gateway-session-b"):
+            tokens = set_session_vars(session_key=session_key)
+            try:
+                parent_key = terminal_tool._resolve_container_task_id(None)
+                child_key = terminal_tool._resolve_container_task_id("subagent-task")
+            finally:
+                clear_session_vars(tokens)
+            resolved.append(parent_key)
+            assert child_key == parent_key
+    finally:
+        reset_session_vars()
+
+    assert resolved == [expected, expected]
+
+
+def test_e2b_isolation_override_wins_without_losing_profile_scope(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+    from hermes_constants import hermes_home_key
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    terminal_tool.register_task_env_overrides("benchmark-task", {"env_type": "e2b"})
+    tokens = set_session_vars(session_key="gateway-session")
+    try:
+        assert terminal_tool._resolve_container_task_id("benchmark-task") == (
+            f"e2b:{hermes_home_key()}:benchmark-task"
+        )
+    finally:
+        clear_session_vars(tokens)
+        reset_session_vars()
+        terminal_tool.clear_task_env_overrides("benchmark-task")
+
+
+def test_gateway_sessions_reuse_e2b_environment_and_cleanup_after_context_clears(
+    monkeypatch,
+):
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    env = CleanupRecorder()
+    created_task_ids = []
+
+    def create_environment(**kwargs):
+        created_task_ids.append(kwargs["task_id"])
+        return env
+
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_create_environment", create_environment)
+
+    try:
+        for session_key in ("gateway-session-a", "gateway-session-b"):
+            tokens = set_session_vars(session_key=session_key)
+            try:
+                assert terminal_tool.ensure_task_env(None) is env
+            finally:
+                clear_session_vars(tokens)
+    finally:
+        reset_session_vars()
+
+    scoped_key = terminal_tool._resolve_container_task_id(None)
+    assert created_task_ids == [scoped_key]
+    assert terminal_tool._active_environments == {scoped_key: env}
+
+    terminal_tool.cleanup_vm("gateway-session-b")
+
+    assert env.cleanup_calls == 1
+    assert terminal_tool._active_environments == {}
+    assert terminal_tool._last_activity == {}
 
 
 def test_cleanup_vm_resolves_config_only_e2b_key(monkeypatch):
