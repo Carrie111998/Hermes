@@ -298,6 +298,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'text'
   },
+  {
+    name: '/refine',
+    description: 'Review this conversation now, save lessons to memory/skills',
+    surface: exec(),
+    argumentMode: 'text'
+  },
   { name: '/retry', description: 'Retry the last user message', surface: exec() },
   { name: '/rollback', description: 'List or restore filesystem checkpoints', surface: exec() },
   {

@@ -14538,6 +14538,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "history",
         "models",
         "prompt",
+        "refine",
         "rename",
         "review",
         "status",
@@ -14590,6 +14591,62 @@ def _format_live_review_output(session: Optional[dict], arg: str) -> str:
     except Exception as exc:
         return f"/review failed to start: {exc}"
     return format_dispatch_note(result, arg or "")
+
+
+def _format_live_refine_output(session: Optional[dict], arg: str) -> str:
+    """Dispatch /refine against the live TUI/desktop session's agent.
+
+    Runs the memory/skill review fork (``AIAgent._spawn_background_review``)
+    on a snapshot of the live conversation — the same machinery as the
+    automatic post-turn review, but user-triggered with optional focus
+    instructions. Writes go to the memory + skill stores in a background
+    thread; the live conversation and prompt cache are untouched.
+
+    Without this branch, ``/refine`` falls through to the slash-worker
+    subprocess, whose bare ``HermesCLI`` never constructs an AIAgent for
+    pure slash commands — so it always answered "Nothing to refine yet"
+    even mid-conversation. ``/review`` needed the identical treatment.
+    """
+    if session is None:
+        return "Nothing to refine yet — send a message first."
+    if _session_uses_compute_host(session):
+        return (
+            "/refine runs on the local agent only for now — this session's "
+            "agent lives on a remote compute host."
+        )
+    agent = session.get("agent")
+    if agent is None:
+        return "Nothing to refine yet — send a message first."
+    if session.get("running"):
+        return "session busy — wait for the current turn to finish, then /refine"
+
+    history_lock = session.get("history_lock")
+    if history_lock is not None:
+        with history_lock:
+            snapshot = list(session.get("history", []))
+    else:
+        snapshot = list(session.get("history", []))
+    if not snapshot:
+        snapshot = list(getattr(agent, "_session_messages", None) or [])
+    if not snapshot:
+        return "Nothing to refine yet — the conversation is empty."
+
+    review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
+    focus = (arg or "").strip() or None
+    try:
+        agent._spawn_background_review(
+            messages_snapshot=snapshot,
+            review_memory=True,
+            review_skills=review_skills,
+            focus=focus,
+        )
+    except Exception as exc:
+        return f"/refine failed to start: {exc}"
+    tail = f" (focus: {focus})" if focus else ""
+    return (
+        f"⚗ Reviewing this conversation in the background{tail} — "
+        f"any memory/skill updates will be reported when done."
+    )
 
 
 def _format_live_usage_output(session: dict) -> str:
@@ -14799,6 +14856,8 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         return _format_live_usage_output(session)
     if name == "review":
         return _format_live_review_output(session, arg)
+    if name == "refine":
+        return _format_live_refine_output(session, arg)
     if name == "history":
         if session is None:
             return "No conversation history yet."
