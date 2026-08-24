@@ -436,10 +436,29 @@ class HonchoMemoryProvider(MemoryProvider):
     def _resolve_session_key(self, cfg, session_id: str, **kwargs) -> str:
         """Resolve the Honcho session key without touching the network."""
         session_title = kwargs.get("session_title")
+        session_title_source = kwargs.get("session_title_source")
         gateway_session_key = kwargs.get("gateway_session_key")
+        # Resolve against the agent's logical working directory, not the
+        # process cwd. Desktop/gateway hosts spawn backends from an arbitrary
+        # launch directory (e.g. $HOME), so raw os.getcwd() misroutes
+        # per-repo/per-directory sessions into whatever bucket the launch dir
+        # maps to. resolve_agent_cwd() honors the pinned session cwd /
+        # TERMINAL_CWD and agrees with the system prompt and context-file
+        # discovery; CLI sessions launched inside a project get the identical
+        # value either way.
+        cwd = kwargs.get("cwd")
+        if not cwd:
+            try:
+                from agent.runtime_cwd import resolve_agent_cwd
+
+                cwd = str(resolve_agent_cwd())
+            except Exception:
+                cwd = None
         return (
             cfg.resolve_session_name(
+                cwd=cwd,
                 session_title=session_title,
+                session_title_source=session_title_source,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
             )
