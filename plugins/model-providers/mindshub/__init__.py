@@ -7,20 +7,17 @@ aliases (``sonnet``, ``opus``, ``kimi``, ``deepseek``, ``gpt``, ...) that
 stay stable across upstream model upgrades. See
 https://docs.mindshub.ai/inference/.
 
-This profile targets the Chat Completions endpoint
+This profile only relies on the Chat Completions endpoint
 (``https://api.mindshub.ai/v1/chat/completions``) — standard OpenAI wire
 format, so no new adapter or ``api_mode`` is needed; streaming, tool /
 function calling, and image inputs (``image_url`` parts, accepted on every
 catalog chat model) all flow through Hermes' existing chat_completions
-transport unmodified. MindsHub also exposes an OpenAI Responses endpoint
-and an Anthropic Messages endpoint (see /responses and
-/anthropic-compatibility in the docs), but neither is required here.
+transport unmodified.
 
 MindsHub forwards ``reasoning_effort`` as a plain top-level Chat
-Completions field and degrades gracefully server-side — a level a model
-doesn't support is clamped or dropped rather than failing the request (see
-/models#reasoning-effort) — so this profile passes the caller's effort
-straight through with no per-model gating.
+Completions field, so this profile passes the caller's effort straight
+through with no per-model gating; unsupported levels are MindsHub's own
+concern to handle, not something this integration needs to track.
 """
 
 from __future__ import annotations
@@ -54,7 +51,15 @@ mindshub = MindsHubProfile(
     env_vars=("MINDSHUB_API_KEY", "MINDSHUB_BASE_URL"),
     base_url="https://api.mindshub.ai/v1",
     auth_type="api_key",
-    default_aux_model="haiku",
+    # gpt-mini over haiku: aux calls (naming, routing, summarization) are
+    # high-frequency and latency-insensitive, so price wins over ceiling
+    # quality. gpt-mini is ~25-33% cheaper than haiku per MTok on MindsHub's
+    # current price list and is a well-exercised general-purpose pick in
+    # MindsHub's own docs; the even-cheaper gpt-nano/mindshub_air aliases
+    # are undocumented outside the price list (mindshub_air is also a
+    # shifting billing-bucket alias, not a fixed model), so they're too
+    # unproven to default to.
+    default_aux_model="gpt-mini",
     # Chat-capable catalog aliases only (embed-small is an embeddings-only
     # model and is intentionally excluded — see providers/base.py).
     fallback_models=(

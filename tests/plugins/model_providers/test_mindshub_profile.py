@@ -53,7 +53,7 @@ class TestMindsHubIdentity:
         assert mindshub_profile.fixed_temperature is None
 
     def test_default_aux_model_set(self, mindshub_profile):
-        assert mindshub_profile.default_aux_model == "haiku"
+        assert mindshub_profile.default_aux_model == "gpt-mini"
 
     def test_signup_url(self, mindshub_profile):
         assert mindshub_profile.signup_url == "https://console.mindshub.ai"
@@ -94,10 +94,10 @@ class TestMindsHubCatalog:
 
 
 class TestMindsHubAuxModel:
-    def test_consumer_api_returns_haiku(self):
+    def test_consumer_api_returns_gpt_mini(self):
         from agent.auxiliary_client import _get_aux_model_for_provider
 
-        assert _get_aux_model_for_provider("mindshub") == "haiku"
+        assert _get_aux_model_for_provider("mindshub") == "gpt-mini"
 
     def test_consumer_api_returns_non_empty(self):
         from agent.auxiliary_client import _get_aux_model_for_provider
