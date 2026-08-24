@@ -170,6 +170,64 @@ def test_model_flow_nous_signals_recoverable_login_failure(monkeypatch):
     assert _model_flow_nous({}, current_model="") is False
 
 
+def test_model_flow_nous_signals_recoverable_expired_session_relogin_failure(
+    monkeypatch,
+):
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda provider: {"access_token": "expired"},
+    )
+
+    def expired_credentials(*args, **kwargs):
+        raise AuthError(
+            "Stored credentials expired.",
+            provider="nous",
+            relogin_required=True,
+        )
+
+    def fail_relogin(*args, **kwargs):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_runtime_credentials", expired_credentials
+    )
+    monkeypatch.setattr("hermes_cli.auth._login_nous", fail_relogin)
+
+    from hermes_cli.main import _model_flow_nous
+
+    assert _model_flow_nous({}, current_model="") is False
+
+
+def test_model_flow_nous_preserves_expired_session_relogin_cancellation(monkeypatch):
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda provider: {"access_token": "expired"},
+    )
+
+    def expired_credentials(*args, **kwargs):
+        raise AuthError(
+            "Stored credentials expired.",
+            provider="nous",
+            relogin_required=True,
+        )
+
+    def cancel_relogin(*args, **kwargs):
+        raise SystemExit(130)
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_runtime_credentials", expired_credentials
+    )
+    monkeypatch.setattr("hermes_cli.auth._login_nous", cancel_relogin)
+
+    from hermes_cli.main import _model_flow_nous
+
+    assert _model_flow_nous({}, current_model="") is None
+
+
 
 
 

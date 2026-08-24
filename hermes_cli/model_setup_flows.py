@@ -488,8 +488,14 @@ def _model_flow_nous(config, current_model="", args=None):
                     insecure=False,
                 )
                 _login_nous(mock_args, PROVIDER_REGISTRY["nous"])
+            except SystemExit as login_exc:
+                print("Re-login cancelled or failed.")
+                if login_exc.code == 130:
+                    return
+                return False
             except Exception as login_exc:
                 print(f"Re-login failed: {login_exc}")
+                return False
             return
         print(f"Could not verify credentials: {msg}")
         return
