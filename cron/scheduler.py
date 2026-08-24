@@ -2820,6 +2820,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
 
+        # Multiplex profile-credential fix (#83182): load_gateway_config() reads
+        # the Telegram/Discord/Slack bot token from os.environ, but under
+        # multiplex the process-wide os.environ holds the DEFAULT profile's
+        # token. The ticking profile's token lives in the secret scope (installed
+        # by run_one_job's scope wrapper), not os.environ. Patch pconfig.token
+        # from the secret scope so the standalone lane sends with the correct
+        # profile's bot identity.
+        if pconfig is not None and transport is None:
+            from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+            from agent.secret_scope import get_secret
+            from dataclasses import replace as _dc_replace
+            _env_name = PLATFORM_TOKEN_ENV_NAMES.get(platform)
+            if _env_name:
+                _scoped_token = get_secret(_env_name, None)
+                if _scoped_token and _scoped_token != pconfig.token:
+                    pconfig = _dc_replace(pconfig, token=_scoped_token)
+
         if transport is not None and transport.is_relay:
             # A relay transport carries the RELAY adapter's config, and
             # resolve_delivery_transport already applied relay's enablement
