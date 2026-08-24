@@ -184,7 +184,9 @@ def _resolve_stt_client_config() -> Dict[str, Any]:
             "provider": "elevenlabs",
             "base_url": base_url,
             "api_key": api_key,
-            "model": section.get("model") or tt.DEFAULT_ELEVENLABS_STT_MODEL,
+            # ElevenLabs keys this ``model_id``, not ``model`` — same as the relay
+            # path in tools.transcription_tools.transcribe_recording.
+            "model": section.get("model_id") or tt.DEFAULT_ELEVENLABS_STT_MODEL,
             "language": language,
         }
 

@@ -189,3 +189,20 @@ def test_resolution_never_raises(voice_home, monkeypatch):
     result = _resolve()
     assert result["stt"]["mode"] in {"direct", "relay"}
     assert result["tts"]["mode"] in {"direct", "relay"}
+
+
+def test_elevenlabs_stt_direct_honors_configured_model_id(voice_home, monkeypatch):
+    # The setup wizard, the config defaults and the relay path all key this
+    # ``model_id``; client-direct must read the same key or a pinned model is
+    # silently replaced by the default.
+    voice_home({
+        "stt": {
+            "provider": "elevenlabs",
+            "elevenlabs": {"model_id": "scribe_v1"},
+        },
+    })
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el_key")
+    stt = _resolve()["stt"]
+    assert stt["mode"] == "direct"
+    assert stt["wire"] == "elevenlabs-stt"
+    assert stt["model"] == "scribe_v1"
