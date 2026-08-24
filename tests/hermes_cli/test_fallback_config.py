@@ -74,6 +74,20 @@ def test_get_configured_default_route_uses_requested_runtime_provider():
     }
 
 
+def test_configured_default_does_not_borrow_auth_fallback_provider():
+    route = get_configured_default_route(
+        {"model": {"default": "model-a"}},
+        runtime={
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": "fallback-model",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+    )
+
+    assert route is None
+
+
 class TestResolveEntryApiKey:
     def test_inline_api_key_wins(self, monkeypatch):
         monkeypatch.setenv("FB_KEY", "env-key")
