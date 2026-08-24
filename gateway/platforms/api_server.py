@@ -1564,6 +1564,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Which profile created each run. Run state is keyed by run_id alone,
+        # which is unique per host but records nothing about ownership. Under
+        # gateway.multiplex_profiles every served profile holds a valid API
+        # key, so _check_auth proving "a valid key" was enough to read and
+        # control another profile's runs (#93689). Kept out of the run record
+        # itself so the GET /v1/runs/{id} body does not grow a field — and does
+        # not disclose the owning profile's name to a caller who has no other
+        # way to learn it.
+        self._run_owner_profiles: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -4788,6 +4797,10 @@ class APIServerAdapter(BasePlatformAdapter):
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        # Stamped the moment the id exists, while still inside the
+        # middleware's profile scope: the work below hops to an executor
+        # thread the ContextVar does not follow.
+        self._claim_run_owner(run_id, _api_request_profile.get())
         self._set_run_status(
             run_id,
             "queued",
@@ -7460,10 +7473,97 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    @staticmethod
+    def _normalized_profile(value: Optional[str]) -> str:
+        """Collapse the unnamed listener and an explicit 'default' to one name."""
+        return (value or "default").strip() or "default"
+
+    def _caller_profile(self) -> str:
+        """Profile of the in-flight request, per the middleware ContextVar."""
+        return self._normalized_profile(_api_request_profile.get())
+
+    def _claim_run_owner(self, run_id: str, profile: Optional[str]) -> None:
+        """Record the creating profile for *run_id*, write-once.
+
+        Taken from an explicit value captured in the request handler rather
+        than read ambiently: ContextVars do not follow run_in_executor
+        threads, and runs finish their lives there.
+        """
+        self._run_owner_profiles.setdefault(
+            run_id, self._normalized_profile(profile)
+        )
+
+    def _run_visible_to_caller(self, run_id: str) -> bool:
+        """Whether the in-flight request may see or control *run_id*.
+
+        Unowned runs stay visible: ownership is stamped at creation, so a
+        record without one predates this state (or came from a path that
+        never registered), and refusing it would break runs that are nobody's
+        to steal. Anything with a recorded owner must match exactly.
+        """
+        owner = self._run_owner_profiles.get(run_id)
+        if owner is None:
+            return True
+        return owner == self._caller_profile()
+
+    def _release_run_owner_if_forgotten(self, run_id: str) -> None:
+        """Drop ownership only once nothing keyed by *run_id* survives.
+
+        Ownership has to outlive every surface it protects, and the sweeps
+        retire those surfaces on different clocks: statuses on
+        ``_RUN_STATUS_TTL``, transports on ``_RUN_STREAM_TTL``, and the
+        agent/task refs not until the task is actually done. Reclaiming the
+        owner with the status alone would leave a live agent ref reachable
+        through ``/stop`` by anyone — ``_run_visible_to_caller`` fails open
+        with no owner — and the "stopping" status write that follows would
+        re-stamp the run to whoever asked, write-once, locking the real owner
+        out for good.
+        """
+        if (
+            run_id in self._run_statuses
+            or run_id in self._active_run_agents
+            or run_id in self._active_run_tasks
+            or run_id in self._run_streams
+            or run_id in self._run_approval_sessions
+        ):
+            return
+        self._run_owner_profiles.pop(run_id, None)
+
+    def _foreign_run_response(
+        self, request: "web.Request", run_id: str
+    ) -> "web.Response":
+        """404 — never 403.
+
+        A distinct status would confirm the run exists to a caller who is not
+        allowed to know that, and run ids are the only thing keeping runs
+        unenumerable. Logged rather than refused silently, so a cross-profile
+        attempt leaves the same operator-visible trace an auth failure does.
+        """
+        logger.warning(
+            "API server refused run %r for profile %r: owned by another "
+            "profile; %s",
+            run_id,
+            self._caller_profile(),
+            self._request_audit_log_suffix(request),
+        )
+        return web.json_response(
+            _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+            status=404,
+        )
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        if not current:
+            # Belt-and-braces: the two creation sites claim ownership
+            # explicitly from the request context, which is the authoritative
+            # value. Claiming again here means a record can never exist
+            # without an owner even if a new creation path appears. Write-once
+            # inside _claim_run_owner, so a later transition — including one a
+            # foreign caller triggers, or one running on an executor thread
+            # where the ContextVar is unset — cannot re-stamp it.
+            self._claim_run_owner(run_id, _api_request_profile.get())
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -7656,6 +7756,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        # As at the other creation site: stamped the moment the id exists,
+        # while still inside the middleware's profile scope — and before any
+        # run-keyed state is registered under it, so no future await inserted
+        # below can open a window where the id resolves but the owner does not.
+        self._claim_run_owner(run_id, _api_request_profile.get())
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -7977,6 +8082,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                # Normally the terminal status record outlives this and the
+                # sweeper reclaims the owner along with it. If the sweeper
+                # already took that status while this run was still live,
+                # these pops drop the last surface — and nothing would ever
+                # revisit the id, stranding the owner entry for the life of
+                # the process.
+                self._release_run_owner_if_forgotten(run_id)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -8004,6 +8116,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if not self._run_visible_to_caller(run_id):
+            return self._foreign_run_response(request, run_id)
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(
@@ -8020,9 +8134,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
 
+        # Ownership is part of the wait condition rather than a gate before it.
+        # This is the only route that admits a caller before the run is
+        # registered, so a check up front would pass on an id that is claimed —
+        # by someone else — inside the window. Folding it in also keeps a
+        # foreign run indistinguishable from one that never existed: same 404,
+        # same body, same elapsed wait. Refusing up front instead returned in
+        # ~0.1ms against ~1s for an unknown id, which answers "does this run
+        # exist?" as plainly as the 403 this route deliberately avoids.
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
-            if run_id in self._run_streams:
+            if run_id in self._run_streams and self._run_visible_to_caller(run_id):
                 break
             await asyncio.sleep(0.05)
         else:
@@ -8071,6 +8193,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if not self._run_visible_to_caller(run_id):
+            return self._foreign_run_response(request, run_id)
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(
@@ -8159,6 +8283,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if not self._run_visible_to_caller(run_id):
+            return self._foreign_run_response(request, run_id)
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
@@ -8219,6 +8345,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if not self._run_visible_to_caller(run_id):
+            return self._foreign_run_response(request, run_id)
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
 
@@ -8282,6 +8410,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+            # This loop retires the agent/task refs, so it is also a
+            # point where a run can become fully forgotten — and only
+            # then may its owner be reclaimed.
+            self._release_run_owner_if_forgotten(run_id)
 
         stale_statuses = [
             run_id
@@ -8291,6 +8423,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._release_run_owner_if_forgotten(run_id)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

@@ -10,6 +10,8 @@ Covers:
 """
 
 import asyncio
+import json
+import logging
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -806,3 +808,430 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+# ---------------------------------------------------------------------------
+# Cross-profile run isolation (#93689)
+# ---------------------------------------------------------------------------
+
+class TestRunProfileScoping:
+    """Run-scoped routes authenticate the caller but must also scope to it.
+
+    Run state is keyed by run_id alone. Under ``gateway.multiplex_profiles``
+    every served profile holds a valid API key, so ``_check_auth`` returning
+    None proved only "some valid key" — any profile could then read another
+    profile's run output and, worse, stop/steer/approve it, executing under
+    the target's tool permissions rather than the caller's.
+    """
+
+    @staticmethod
+    def _seed_run(adapter, run_id: str, owner: str, *, status: str = "running"):
+        """Register a run as if *owner* had created it through the API."""
+        from gateway.platforms.api_server import _api_request_profile
+
+        token = _api_request_profile.set(owner)
+        try:
+            adapter._claim_run_owner(run_id, _api_request_profile.get())
+            adapter._set_run_status(run_id, status, session_id="sess")
+        finally:
+            _api_request_profile.reset(token)
+
+    @staticmethod
+    async def _as_profile(adapter, profile, handler, run_id, **kwargs):
+        """Invoke *handler* with the request-profile ContextVar set."""
+        from gateway.platforms.api_server import _api_request_profile
+
+        request = MagicMock()
+        request.match_info = {"run_id": run_id}
+        for key, value in kwargs.items():
+            setattr(request, key, value)
+        token = _api_request_profile.set(profile)
+        try:
+            return await handler(request)
+        finally:
+            _api_request_profile.reset(token)
+
+    @pytest.fixture
+    def adapter(self):
+        adapter = _make_adapter()
+        # Authentication is not the gap — every profile legitimately holds a
+        # valid key. Pin it open so the test measures scoping alone.
+        adapter._check_auth = lambda request: None
+        return adapter
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("caller", ["beta", "default", None])
+    async def test_foreign_profile_cannot_read_a_run(self, adapter, caller):
+        self._seed_run(adapter, "run_alpha", "alpha")
+        response = await self._as_profile(
+            adapter, caller, adapter._handle_get_run, "run_alpha"
+        )
+        assert response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_owning_profile_can_read_its_own_run(self, adapter):
+        self._seed_run(adapter, "run_alpha", "alpha")
+        response = await self._as_profile(
+            adapter, "alpha", adapter._handle_get_run, "run_alpha"
+        )
+        assert response.status == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("caller", ["beta", "default"])
+    async def test_foreign_profile_cannot_stop_a_run(self, adapter, caller):
+        """The critical case: stopping executes against the target's agent."""
+        self._seed_run(adapter, "run_alpha", "alpha")
+        agent = MagicMock()
+        adapter._active_run_agents["run_alpha"] = agent
+
+        response = await self._as_profile(
+            adapter, caller, adapter._handle_stop_run, "run_alpha"
+        )
+        assert response.status == 404
+        # Not merely refused — the run must be untouched.
+        assert "run_alpha" not in adapter._stopping_run_ids
+        assert adapter._run_statuses["run_alpha"]["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_owning_profile_can_stop_its_own_run(self, adapter):
+        self._seed_run(adapter, "run_alpha", "alpha")
+        adapter._active_run_agents["run_alpha"] = MagicMock()
+
+        response = await self._as_profile(
+            adapter, "alpha", adapter._handle_stop_run, "run_alpha"
+        )
+        assert response.status == 200
+        assert "run_alpha" in adapter._stopping_run_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler_name", [
+        "_handle_get_run", "_handle_run_events",
+        "_handle_run_approval", "_handle_steer_run", "_handle_stop_run",
+    ])
+    async def test_every_run_scoped_route_is_scoped(self, adapter, handler_name):
+        """All five routes, not just the ones with an obvious blast radius."""
+        self._seed_run(adapter, "run_alpha", "alpha")
+        adapter._active_run_agents["run_alpha"] = MagicMock()
+        adapter._run_streams["run_alpha"] = []
+
+        response = await self._as_profile(
+            adapter, "beta", getattr(adapter, handler_name), "run_alpha"
+        )
+        assert response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_refusal_is_404_not_403(self, adapter):
+        """403 would confirm the run exists. Run ids are the only thing
+        keeping runs unenumerable — there is no collection route."""
+        self._seed_run(adapter, "run_alpha", "alpha")
+
+        foreign = await self._as_profile(
+            adapter, "beta", adapter._handle_get_run, "run_alpha"
+        )
+        absent = await self._as_profile(
+            adapter, "beta", adapter._handle_get_run, "run_does_not_exist"
+        )
+        assert foreign.status == absent.status == 404
+        # Same error code too — only the echoed run id differs, which the
+        # caller already supplied.
+        assert (
+            json.loads(foreign.body)["error"]["code"]
+            == json.loads(absent.body)["error"]["code"]
+            == "run_not_found"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unnamed_listener_and_explicit_default_are_one_profile(
+        self, adapter
+    ):
+        """The default listener reaches handlers with the ContextVar unset;
+        /p/default/ sets it to "default". They are the same owner."""
+        self._seed_run(adapter, "run_d", None)
+        assert adapter._run_owner_profiles["run_d"] == "default"
+
+        for caller in (None, "default"):
+            response = await self._as_profile(
+                adapter, caller, adapter._handle_get_run, "run_d"
+            )
+            assert response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_ownership_is_write_once(self, adapter):
+        """A later status update — including one a foreign caller triggers —
+        must not be able to re-stamp the owner."""
+        self._seed_run(adapter, "run_alpha", "alpha")
+        self._seed_run(adapter, "run_alpha", "beta", status="running")
+        assert adapter._run_owner_profiles["run_alpha"] == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_a_bare_status_write_still_gets_an_owner(self, adapter):
+        """A run record cannot exist without an owner.
+
+        This is the shape the vulnerability took: registering a run through
+        the ordinary status write and then reading it from another profile.
+        On the unfixed code the foreign read returns 200.
+        """
+        from gateway.platforms.api_server import _api_request_profile
+
+        token = _api_request_profile.set("alpha")
+        try:
+            adapter._set_run_status("run_bare", "running", session_id="s")
+        finally:
+            _api_request_profile.reset(token)
+
+        assert adapter._run_owner_profiles.get("run_bare") == "alpha"
+
+        foreign = await self._as_profile(
+            adapter, "beta", adapter._handle_get_run, "run_bare"
+        )
+        assert foreign.status == 404
+
+        owner = await self._as_profile(
+            adapter, "alpha", adapter._handle_get_run, "run_bare"
+        )
+        assert owner.status == 200
+
+    @pytest.mark.asyncio
+    async def test_a_transition_cannot_re_stamp_the_owner(self, adapter):
+        """Executor threads run transitions with the ContextVar unset, and a
+        foreign caller can trigger one. Neither may take ownership."""
+        from gateway.platforms.api_server import _api_request_profile
+
+        token = _api_request_profile.set("alpha")
+        try:
+            adapter._set_run_status("run_t", "queued", session_id="s")
+        finally:
+            _api_request_profile.reset(token)
+
+        adapter._set_run_status("run_t", "running")          # no profile in scope
+        token = _api_request_profile.set("beta")
+        try:
+            adapter._set_run_status("run_t", "completed")    # foreign profile
+        finally:
+            _api_request_profile.reset(token)
+
+        assert adapter._run_owner_profiles["run_t"] == "alpha"
+
+    def test_owner_is_reclaimed_with_the_rest_of_the_run_state(self, adapter):
+        """The owner map must not outlive the run it describes."""
+        # Status records are only reclaimed once terminal and past their TTL.
+        self._seed_run(adapter, "run_alpha", "alpha", status="completed")
+        adapter._run_streams_created["run_alpha"] = 0.0
+        adapter._run_streams["run_alpha"] = []
+
+        adapter._sweep_orphaned_runs_once(
+            now=time.time() + adapter._RUN_STATUS_TTL + 1
+        )
+
+        assert "run_alpha" not in adapter._run_statuses
+        assert "run_alpha" not in adapter._run_owner_profiles
+
+    def test_owner_survives_a_sweep_while_the_run_is_still_controllable(
+        self, adapter
+    ):
+        """Ownership must outlive every surface it protects.
+
+        The status record and the agent ref retire on different clocks, so a
+        terminal-but-stale status can be reclaimed while a live agent ref
+        remains. /stop gates on the agent ref, not on the status — so dropping
+        the owner here would hand a still-live run to any caller.
+        """
+        self._seed_run(adapter, "run_alpha", "alpha", status="cancelled")
+        adapter._active_run_agents["run_alpha"] = MagicMock()
+
+        adapter._sweep_orphaned_runs_once(
+            now=time.time() + adapter._RUN_STATUS_TTL + 1
+        )
+
+        assert "run_alpha" not in adapter._run_statuses
+        assert adapter._run_owner_profiles.get("run_alpha") == "alpha"
+
+    def test_the_owner_goes_when_the_last_surface_does(self, adapter):
+        """The other end of that rule: ownership must not be immortal either.
+
+        If the sweeper already took the status while the run was live, the
+        run-completion teardown drops the last surface — and nothing would
+        revisit the id afterwards, so the entry has to be released there.
+        """
+        self._seed_run(adapter, "run_alpha", "alpha", status="cancelled")
+        adapter._active_run_agents["run_alpha"] = MagicMock()
+        adapter._sweep_orphaned_runs_once(
+            now=time.time() + adapter._RUN_STATUS_TTL + 1
+        )
+        assert adapter._run_owner_profiles.get("run_alpha") == "alpha"
+
+        adapter._active_run_agents.pop("run_alpha", None)   # teardown
+        adapter._release_run_owner_if_forgotten("run_alpha")
+
+        assert "run_alpha" not in adapter._run_owner_profiles
+
+    def test_the_creation_site_claim_is_what_names_the_right_profile(
+        self, adapter
+    ):
+        """Pins why the creation sites claim at all, rather than leaving it to
+        _set_run_status.
+
+        Ownership would exist either way — but a run hops to an executor
+        thread the ContextVar does not follow, and its first status write can
+        land there. Claimed only at that point, the run would be stamped
+        "default" instead of its creator.
+        """
+        from gateway.platforms.api_server import _api_request_profile
+
+        token = _api_request_profile.set("alpha")
+        try:                                            # creation site, in scope
+            adapter._claim_run_owner("run_x", _api_request_profile.get())
+        finally:
+            _api_request_profile.reset(token)
+
+        adapter._set_run_status("run_x", "queued", session_id="s")   # executor
+
+        assert adapter._run_owner_profiles["run_x"] == "alpha"
+
+    def test_an_unowned_run_stays_visible(self, adapter):
+        """The deliberate fail-open branch. A run nobody claimed is nobody's
+        to steal, and refusing it would break any path that never registered."""
+        adapter._run_statuses["run_orphan"] = {"status": "running"}
+
+        assert adapter._run_visible_to_caller("run_orphan") is True
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [(None, "default"), ("", "default"), ("   ", "default"),
+         ("  coder  ", "coder"), ("default", "default")],
+    )
+    def test_profile_names_are_normalized(self, adapter, raw, expected):
+        assert adapter._normalized_profile(raw) == expected
+
+    @pytest.mark.asyncio
+    async def test_the_run_body_never_names_the_owning_profile(self, adapter):
+        """Ownership lives in a side table precisely so the response body does
+        not disclose it to a caller with no other way to learn it."""
+        # A profile name that is not a substring of the run id, so the
+        # assertion cannot pass on an echoed id alone.
+        self._seed_run(adapter, "run_1", "zephyr")
+
+        response = await self._as_profile(
+            adapter, "zephyr", adapter._handle_get_run, "run_1"
+        )
+
+        assert response.status == 200
+        assert "zephyr" not in response.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_events_cannot_be_timed_to_learn_that_a_run_exists(
+        self, adapter, monkeypatch
+    ):
+        """A foreign run must be indistinguishable from one that never existed.
+
+        Refusing before the subscribe-early wait returned in ~0.1ms against
+        ~1s for an unknown id — an existence oracle as plain as the 403 this
+        route deliberately avoids.
+        """
+        slept = []
+
+        async def _fake_sleep(delay):
+            slept.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+        self._seed_run(adapter, "run_alpha", "alpha")
+        adapter._run_streams["run_alpha"] = asyncio.Queue()
+
+        foreign = await self._as_profile(
+            adapter, "beta", adapter._handle_run_events, "run_alpha"
+        )
+        foreign_waits = len(slept)
+        slept.clear()
+        absent = await self._as_profile(
+            adapter, "beta", adapter._handle_run_events, "run_absent"
+        )
+        absent_waits = len(slept)
+
+        assert foreign.status == absent.status == 404
+        assert foreign_waits == absent_waits > 0
+        assert (
+            json.loads(foreign.body)["error"]["code"]
+            == json.loads(absent.body)["error"]["code"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_cross_profile_attempt_is_logged(self, adapter, caplog):
+        """Refusals leave the same operator-visible trace an auth failure does
+        — a silent 404 gives an operator nothing to investigate."""
+        self._seed_run(adapter, "run_alpha", "alpha")
+
+        with caplog.at_level(logging.WARNING):
+            await self._as_profile(
+                adapter, "beta", adapter._handle_get_run, "run_alpha"
+            )
+
+        assert any(
+            "run_alpha" in r.getMessage() and "another" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler_name", ["_handle_steer_run", "_handle_run_approval"])
+    async def test_the_worst_case_routes_leave_the_run_untouched(
+        self, adapter, handler_name
+    ):
+        """Refusing the response is not enough for the routes that execute
+        against the target's agent — nothing may reach it."""
+        self._seed_run(adapter, "run_alpha", "alpha")
+        agent = MagicMock()
+        adapter._active_run_agents["run_alpha"] = agent
+
+        response = await self._as_profile(
+            adapter, "beta", getattr(adapter, handler_name), "run_alpha"
+        )
+
+        assert response.status == 404
+        agent.steer.assert_not_called()
+        assert adapter._run_statuses["run_alpha"]["status"] == "running"
+        assert "run_alpha" not in adapter._stopping_run_ids
+
+    @pytest.mark.asyncio
+    async def test_a_swept_status_does_not_expose_a_live_run_to_stop(
+        self, adapter
+    ):
+        """The end the previous test guards: without an owner, /stop would
+        reach the agent and the "stopping" write would re-stamp the run to
+        the caller — write-once, so permanently."""
+        self._seed_run(adapter, "run_alpha", "alpha", status="cancelled")
+        adapter._active_run_agents["run_alpha"] = MagicMock()
+        adapter._sweep_orphaned_runs_once(
+            now=time.time() + adapter._RUN_STATUS_TTL + 1
+        )
+
+        response = await self._as_profile(
+            adapter, "beta", adapter._handle_stop_run, "run_alpha"
+        )
+
+        assert response.status == 404
+        assert "run_alpha" not in adapter._stopping_run_ids
+        assert adapter._run_owner_profiles["run_alpha"] == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_subscribing_before_a_run_exists_cannot_capture_it(
+        self, adapter
+    ):
+        """/events is the one route that admits a caller before the run is
+        registered. An unowned run is visible by design, so the entry check
+        passes — the run must be re-checked once it appears."""
+
+        async def _create_run_mid_wait():
+            await asyncio.sleep(0.1)
+            self._seed_run(adapter, "run_late", "alpha")
+            adapter._run_streams["run_late"] = asyncio.Queue()
+
+        creator = asyncio.create_task(_create_run_mid_wait())
+        try:
+            response = await self._as_profile(
+                adapter, "beta", adapter._handle_run_events, "run_late"
+            )
+        finally:
+            await creator
+
+        assert response.status == 404
+        assert "run_late" not in adapter._run_stream_subscribers
