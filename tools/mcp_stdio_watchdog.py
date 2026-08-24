@@ -100,6 +100,23 @@ def _watchdog_loop(proc: subprocess.Popen, original_ppid: int) -> None:
         time.sleep(_POLL_INTERVAL_S)
 
 
+def _safe_fd(stream, fallback_fd: int) -> int:
+    """Return a real file descriptor for a std stream, or the raw fallback.
+
+    When the Hermes gateway runs headless (or under asyncio stream
+    wrapping), ``sys.stdin``/``sys.stdout`` can be ``None`` or wrapper
+    objects with no OS-level fd (#93529). Passing such an object to
+    ``Popen`` kills the child before it ever speaks JSON-RPC. The
+    supervisor process itself was spawned with real inherited handles, so
+    its raw fd numbers (0/1/2) are exactly the right relay regardless of
+    what Python-level wrappers sit on top.
+    """
+    try:
+        return stream.fileno()
+    except Exception:
+        return fallback_fd
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Parent-death watchdog for a stdio MCP subprocess.",
@@ -120,9 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     # touching our own group or the (already-gone) original parent's.
     proc = subprocess.Popen(
         real_argv,
-        stdin=sys.stdin,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
+        stdin=_safe_fd(sys.stdin, 0),
+        stdout=_safe_fd(sys.stdout, 1),
+        stderr=_safe_fd(sys.stderr, 2),
         start_new_session=True,
     )
 
