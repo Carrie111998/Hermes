@@ -470,9 +470,10 @@ class TestGatewaySessionCwdPersistence:
         assert store._db.get_session(entry.session_id)["cwd"] == str(home)
 
     def test_peer_refresh_heals_blank_cwd_without_overwriting_explicit_cwd(
-        self, store, tmp_path
+        self, store, tmp_path, monkeypatch
     ):
         healed_cwd = str(tmp_path / "workspace")
+        monkeypatch.setenv("TERMINAL_CWD", healed_cwd)
         db = store._db
         db.create_session("blank", source="slack", session_key="blank-key", cwd="")
         db.create_session(
@@ -480,12 +481,7 @@ class TestGatewaySessionCwdPersistence:
         )
 
         for session_id, session_key in (("blank", "blank-key"), ("explicit", "explicit-key")):
-            db.record_gateway_session_peer(
-                session_id,
-                source="slack",
-                session_key=session_key,
-                cwd=healed_cwd,
-            )
+            store._record_gateway_session_peer(session_id, session_key, self._source())
 
         assert db.get_session("blank")["cwd"] == healed_cwd
         assert db.get_session("explicit")["cwd"] == "/original"
