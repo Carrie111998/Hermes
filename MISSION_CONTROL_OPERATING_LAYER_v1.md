@@ -46,7 +46,8 @@ IMPLEMENT → PREVIEW → APPROVE`. Attachment inputs are metadata-only referenc
 (allowlisted media type, bounded size, SHA-256 digest); bytes, paths, secrets,
 and prompts never enter the control-plane contract. Telegram and Buzz preserve
 conversation identity as context-only channels until an explicit actionable
-bridge is implemented; actionable work remains deny-by-default.
+bridge is implemented; actionable work remains deny-by-default. Buzz here
+means the `buzz.xyz` product, not a generic or fabricated transport.
 
 ## Independence acceptance
 
