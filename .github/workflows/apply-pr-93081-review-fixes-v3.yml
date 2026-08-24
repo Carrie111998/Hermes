@@ -22,7 +22,8 @@ jobs:
       - name: Verify targeted regression suite
         run: |
           bash -n scripts/install.sh
-          uv run --with pytest pytest -q tests/test_install_git_free_release_runtime.py tests/test_install_no_initial_commit.py tests/test_install_sh_bootstrap_marker.py tests/test_install_sh_install_method_stamp.py
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m pytest -q tests/test_install_git_free_release_runtime.py tests/test_install_no_initial_commit.py tests/test_install_sh_bootstrap_marker.py tests/test_install_sh_install_method_stamp.py
 
       - name: Commit verified fixes and remove temporary files
         run: |
