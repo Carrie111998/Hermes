@@ -614,6 +614,21 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = str(exc)
         return result
 
+    # macOS libmalloc lite-mode MallocStackLogging noise leaks through to the
+    # model here: this hook subprocess bypasses ``BaseEnvironment.execute()``
+    # so the streaming stripper in ``_wait_for_process._drain()`` never sees
+    # the bytes. Strip at this boundary — matches the capture-end strip in
+    # ``tools/environments/base.py`` and is the only place hook output reaches
+    # the model unfiltered.
+    try:
+        from tools.environments.base import strip_malloc_stack_logging
+        if stdout:
+            stdout = strip_malloc_stack_logging(stdout)
+        if stderr:
+            stderr = strip_malloc_stack_logging(stderr)
+    except Exception:
+        pass
+
     result["returncode"] = proc.returncode
     result["stdout"] = stdout or ""
     result["stderr"] = stderr or ""

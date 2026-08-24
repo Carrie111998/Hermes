@@ -52,6 +52,106 @@ _activity_callback_local = threading.local()
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
+# macOS 27 libmalloc lite-mode spam. Presence of MallocStackLogging (value
+# ignored) makes every spawned process emit ``comm(pid) MallocStackLogging: …``
+# on stderr. Hermes merges stderr into stdout, so those lines contaminate
+# ``cat``/``sha256sum``/``wc`` captures and produce spurious post-write
+# verification failures. Strip at the capture boundary so file ops and the
+# terminal tool both see clean payloads. Optional ``N|`` prefix covers
+# read_file's line-numbered gutter. Idempotent. ``comm(pid)`` and the gutter
+# are independently optional so ``MallocStackLogging:`` (bare) and
+# ``1234|MallocStackLogging:`` (gutter-only) both match. Gutter cap raised to
+# 7 digits to cover file contents with > 999_999 lines.
+_MSL_LINE_RE = re.compile(
+    r"^(?:\d{1,7}\|)?(?:[A-Za-z0-9_.+\-]+\(\d+\) )?MallocStackLogging:[^\n]*\n?",
+    re.MULTILINE,
+)
+
+
+def strip_malloc_stack_logging(text: str) -> str:
+    """Remove macOS 27 MallocStackLogging stderr lines from captured output."""
+    if not text or "MallocStackLogging" not in text:
+        return text
+    return _MSL_LINE_RE.sub("", text)
+
+
+class _MslStreamStripper:
+    """Strip MallocStackLogging lines from streamed subprocess output.
+
+    The capture-boundary ``strip_malloc_stack_logging`` runs at
+    ``BaseEnvironment.execute()`` end — too late: MSL emitted at process exit
+    floods the tail buffer of the bounded collector, evicting real payload
+    before the strip can run. Stripping during the drain loop keeps MSL out
+    of the collector entirely, so the 40/60 head/tail budget stays intact
+    for real output.
+
+    Line-buffered: any partial trailing line from the previous chunk is
+    held in ``_carry`` and prepended to the next chunk so MSL split across
+    4 KB read boundaries still gets matched. ``flush()`` emits any held
+    carry on EOF.
+
+    Fast path: when ``"MallocStackLogging"`` is not in ``carry + chunk``,
+    the regex is skipped entirely — zero cost on healthy systems.
+
+    Assumes MSL lines always end with ``\\n`` (libmalloc always emits
+    newline-terminated lines in practice; the carry only needs to bridge
+    a partial line if it crossed a chunk boundary at that newline).
+    """
+
+    __slots__ = ("_carry",)
+
+    def __init__(self) -> None:
+        self._carry: str = ""
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            out = self._carry
+            self._carry = ""
+            return out
+
+        combined = self._carry + chunk
+
+        # Split off the trailing partial line (everything after the last
+        # newline) so the regex sees only complete lines. The partial is
+        # held for the next feed to handle MSL split across read
+        # boundaries.
+        if combined.endswith("\n"):
+            emit_combined = combined
+            trailing_partial = ""
+        else:
+            nl = combined.rfind("\n")
+            if nl == -1:
+                emit_combined = ""
+                trailing_partial = combined
+            else:
+                emit_combined = combined[: nl + 1]
+                trailing_partial = combined[nl + 1 :]
+
+        # Fast path: no MSL substring anywhere — emit the complete-lines
+        # portion unchanged and hold the partial.
+        if "MallocStackLogging" not in combined:
+            self._carry = trailing_partial
+            return emit_combined
+
+        # Slow path: run the regex on the complete-lines portion only
+        # (the partial is held back so it can be re-evaluated when the
+        # next chunk arrives).
+        cleaned = _MSL_LINE_RE.sub("", emit_combined)
+        self._carry = trailing_partial
+        return cleaned
+
+    def flush(self) -> str:
+        """Emit any held carry (call once at EOF)."""
+        carried = self._carry
+        self._carry = ""
+        if not carried:
+            return ""
+        if "MallocStackLogging" not in carried:
+            return carried
+        return _MSL_LINE_RE.sub("", carried)
+
+
+
 
 class EnvironmentConnectionError(RuntimeError):
     """Infrastructure/connection-class failure of a terminal backend.
@@ -955,6 +1055,21 @@ class BaseEnvironment(ABC):
             )
             parts.append(f"unset {present} {value}")
 
+        # macOS 27 (Tahoe) beta injects MallocStackLogging into GUI-session
+        # process environments, and the beta enables "lite mode" malloc stack
+        # logging on mere PRESENCE of the variable (value ignored, even
+        # "no").  Every spawned process then emits two MallocStackLogging
+        # lines to stderr — which we merge into stdout — corrupting captured
+        # command output, cat-based file reads, and the sha256 post-write
+        # verification in file_operations (noise appended after the payload
+        # → "Post-write verification failed" false negatives, and
+        # noise baked into files written from polluted reads).  Strip it so
+        # tool subprocesses run quiet; harmless elsewhere.
+        parts.append(
+            "unset MallocStackLogging MallocStackLoggingNoCompact 2>/dev/null || true"
+        )
+
+
         # Harness attribution: every tool subprocess advertises that it runs
         # under Hermes via the cross-agent ``AI_AGENT`` standard (read by e.g.
         # huggingface_hub's agent detection) plus the Hermes-specific
@@ -1121,6 +1236,30 @@ class BaseEnvironment(ABC):
             # contract) rather than a live pipe.  Iterate it to EOF.  Without
             # this, the drain thread would raise an unhandled exception and die
             # silently, losing all of the process's output.
+            msl_stripper = _MslStreamStripper()
+            try:
+                for piece in stream:
+                    if piece is None:
+                        continue
+                    if isinstance(piece, bytes):
+                        output.append(msl_stripper.feed(decoder.decode(piece)))
+                    else:
+                        output.append(msl_stripper.feed(str(piece)))
+            except Exception:
+                pass
+            finally:
+                try:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        output.append(msl_stripper.feed(tail))
+                    carried = msl_stripper.flush()
+                    if carried:
+                        output.append(carried)
+                except Exception:
+                    pass
+
+            # this, the drain thread would raise an unhandled exception and die
+            # silently, losing all of the process's output.
             try:
                 for piece in stream:
                     if piece is None:
@@ -1159,6 +1298,29 @@ class BaseEnvironment(ABC):
                 return
             # select.select does NOT work on pipe fds on Windows (only sockets).
             # Use blocking os.read in a daemon thread instead — safe because
+            # EOF arrives promptly when bash exits.
+            if os.name == "nt":
+                msl_stripper = _MslStreamStripper()
+                try:
+                    while True:
+                        chunk = os.read(fd, 4096)
+                        if not chunk:
+                            break
+                        output.append(msl_stripper.feed(decoder.decode(chunk)))
+                except (ValueError, OSError):
+                    pass
+                finally:
+                    try:
+                        tail = decoder.decode(b"", final=True)
+                        if tail:
+                            output.append(msl_stripper.feed(tail))
+                        carried = msl_stripper.flush()
+                        if carried:
+                            output.append(carried)
+                    except Exception:
+                        pass
+                return
+            msl_stripper = _MslStreamStripper()
             # EOF arrives promptly when bash exits.
             if os.name == "nt":
                 try:

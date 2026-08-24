@@ -279,6 +279,33 @@ class TestCallbackSubprocess:
         result = cb(tool_name="write_file", args={"content": "danger"})
         assert result == {"action": "modify", "args": {"content": "safe"}}
 
+    def test_msl_noise_stripped_from_hook_stdout(self, tmp_path):
+        """Hook subprocess bypasses BaseEnvironment.execute — strip MSL here.
+
+        macOS 27 libmalloc lite-mode noise leaks through the hook's Popen
+        path and would otherwise flow back to the model unfiltered. The
+        capture-end strip in ``tools/environments/base.py`` never sees
+        these bytes, so ``shell_hooks._spawn`` must strip on the way out.
+        """
+        script = _write_script(
+            tmp_path, "msl_hook.sh",
+            "#!/usr/bin/env bash\n"
+            "echo 'real hook payload'\n"
+            "echo 'libsystem_malloc(42) MallocStackLogging: lite mode' >&2\n"
+            "echo 'another real line'\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="post_tool_call", command=str(script),
+        )
+        cb = shell_hooks._make_callback(spec)
+        cb(tool_name="terminal", args={"command": "ls"})  # ensure register path runs
+
+        spawn_result = shell_hooks._spawn(spec, stdin_json="")
+        assert "MallocStackLogging" not in spawn_result.get("stdout", "")
+        assert "MallocStackLogging" not in spawn_result.get("stderr", "")
+        assert "real hook payload" in spawn_result["stdout"]
+        assert "another real line" in spawn_result["stdout"]
+
 
 # ── config parsing ────────────────────────────────────────────────────────
 
