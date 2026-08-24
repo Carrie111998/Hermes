@@ -1183,6 +1183,7 @@ class TestToolsEndpoint:
             model="",
             context_length=0,
             base_url="",
+            api_key="",
             provider="",
             api_mode="",
         )

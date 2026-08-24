@@ -4318,6 +4318,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
                         raw_model, _ = split_model_config_default(raw_model)
                     model = str(raw_model or "").strip()
+                    provider = str(model_config.get("provider") or "").strip()
+                    base_url = str(model_config.get("base_url") or "").strip()
+                    api_key = ""
+                    if provider:
+                        try:
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                            runtime = resolve_runtime_provider(
+                                requested=provider,
+                                target_model=model,
+                            ) or {}
+                            provider = str(runtime.get("provider") or provider).strip()
+                            base_url = str(runtime.get("base_url") or base_url).strip()
+                            api_key = str(runtime.get("api_key") or "").strip()
+                        except Exception:
+                            logger.debug(
+                                "Runtime provider resolution failed for context-engine catalog",
+                                exc_info=True,
+                            )
                     raw_context_length = model_config.get("context_length")
                     configured_context_length = (
                         raw_context_length
@@ -4328,16 +4347,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     context_length = get_model_context_length(
                         model,
-                        base_url=str(model_config.get("base_url") or ""),
+                        base_url=base_url,
+                        api_key=api_key,
                         config_context_length=configured_context_length,
-                        provider=str(model_config.get("provider") or ""),
+                        provider=provider,
                         custom_providers=config.get("custom_providers"),
                     )
                     engine.update_model(
                         model=model,
                         context_length=context_length,
-                        base_url=str(model_config.get("base_url") or ""),
-                        provider=str(model_config.get("provider") or ""),
+                        base_url=base_url,
+                        api_key=api_key,
+                        provider=provider,
                         api_mode=str(model_config.get("api_mode") or ""),
                     )
                     for raw_schema in engine.get_tool_schemas():
