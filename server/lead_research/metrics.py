@@ -8,6 +8,24 @@ FUNNEL_KEYS = (
     "raw_records", "named_candidates", "resolved_organizations",
     "eligible_companies", "qualified_leads", "contactable_leads",
 )
+CHEAP_GATE_REASONS = (
+    "shared_relevance",
+    "corpus_term",
+    "cheap_verification",
+    "excluded_by_range",
+    "cheap_verification_no_scope_signal",
+)
+
+
+def count_cheap_gate(counts: dict[str, int], decision) -> None:
+    if decision.reason not in CHEAP_GATE_REASONS:
+        raise ValueError(f"unknown cheap-gate reason: {decision.reason}")
+    counts[decision.reason] = counts.get(decision.reason, 0) + 1
+    counts["cheap_verification_requests"] = (
+        counts.get("cheap_verification_requests", 0) + decision.requests
+    )
+    if decision.passed:
+        counts["passed_cheap_gate"] = counts.get("passed_cheap_gate", 0) + 1
 
 
 def estimate_campaign(config: CampaignConfig, providers, history=None) -> CampaignEstimate:

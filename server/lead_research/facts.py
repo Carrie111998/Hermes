@@ -359,3 +359,74 @@ class FactRepository:
             facts.append(self._shared_fact(row, organization_id))
             self._consume(company_id, row["id"], stamp)
         return facts
+
+    def relevance(
+        self,
+        company_id: str,
+        candidate,
+        product_terms: list[str],
+        at: float | None = None,
+    ) -> list[str]:
+        """Validated reusable evidence connecting a candidate to this scope.
+
+        This is deliberately read-only and resolves identity by guarded domain
+        or name+country lookup. Creating the tenant organization still happens
+        only after the cheap gate passes.
+        """
+        from .candidates import matches_term, searchable_term
+
+        terms = [searchable_term(term) for term in product_terms if str(term).strip()]
+        if not terms:
+            return []
+        stamp = now() if at is None else at
+        relevant_fields = (
+            "product_term", "product_fit", "product_sector_fit", "sector_ids", "hs_code",
+        )
+        placeholders = ",".join("?" for _ in relevant_fields)
+
+        def supported(value) -> bool:
+            values = value if isinstance(value, list) else [value]
+            haystack = searchable_term(" ".join(str(item) for item in values if item is not None))
+            return any(
+                matches_term(term, haystack) or matches_term(haystack, term)
+                for term in terms
+                if haystack
+            )
+
+        tenant_params: list = [company_id]
+        tenant_identity = "normalized_name=? AND COALESCE(country,'')=?"
+        tenant_params.extend([candidate.normalized_name, candidate.country.upper()])
+        if candidate.domain:
+            tenant_identity = "(domain=? OR (normalized_name=? AND COALESCE(country,'')=?))"
+            tenant_params = [
+                company_id, candidate.domain.casefold(), candidate.normalized_name,
+                candidate.country.upper(),
+            ]
+        tenant_rows = self.db.all(
+            "SELECT f.value_en,f.evidence_id FROM tenant_facts f JOIN organizations o "
+            "ON o.id=f.organization_id AND o.company_id=f.company_id "
+            f"WHERE f.company_id=? AND {tenant_identity} AND f.field IN ({placeholders}) "
+            "AND f.status='observed' AND f.expires_at>?",
+            (*tenant_params, *relevant_fields, stamp),
+        )
+
+        shared_params: list = []
+        shared_identity = "normalized_name=? AND COALESCE(country,'')=?"
+        shared_params.extend([candidate.normalized_name, candidate.country.upper()])
+        if candidate.domain:
+            shared_identity = "(domain=? OR (normalized_name=? AND COALESCE(country,'')=?))"
+            shared_params = [
+                candidate.domain.casefold(), candidate.normalized_name, candidate.country.upper(),
+            ]
+        shared_rows = self.db.all(
+            "SELECT f.value_en,f.primary_evidence_id AS evidence_id FROM shared_facts f "
+            "JOIN shared_organizations o ON o.id=f.organization_id "
+            f"WHERE {shared_identity} AND f.field IN ({placeholders}) "
+            "AND f.status='observed' AND f.expires_at>?",
+            (*shared_params, *relevant_fields, stamp),
+        )
+        return list(dict.fromkeys(
+            row["evidence_id"]
+            for row in [*tenant_rows, *shared_rows]
+            if supported(json_load(row["value_en"]))
+        ))

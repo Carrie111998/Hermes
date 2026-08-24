@@ -32,6 +32,7 @@ class PublicCandidateSource:
                 "domain": "neue-ventil.example",
                 "categories": query.product_terms,
             })],
+            requests=1,
         )
 
 
@@ -71,6 +72,7 @@ def test_public_source_can_supply_candidates_when_corpus_is_empty(tmp_path):
 
     assert [candidate.company_name for candidate in supply.candidates] == ["Neue Ventil GmbH"]
     assert supply.counts["public-source_discovered"] == 1
+    assert supply.counts["candidate_discovery_requests"] == 1
 
 
 def test_customer_catalog_exposes_only_executable_sources():

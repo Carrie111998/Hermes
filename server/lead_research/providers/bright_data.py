@@ -216,7 +216,7 @@ class BrightDataVerifier(CatalogProvider):
         ])
         query_text = " ".join(terms)
         search_url = f"https://www.google.com/search?{urlencode({'q': query_text})}"
-        markdown, _ = self._fetch_markdown(search_url)
+        markdown, requests = self._fetch_markdown(search_url)
         records: list[RawRecord] = []
         seen_domains: set[str] = set()
         for match in MARKDOWN_LINK.finditer(markdown):
@@ -248,6 +248,7 @@ class BrightDataVerifier(CatalogProvider):
             ),
             records=records,
             source_reported_total=len(records),
+            requests=requests,
         )
 
     def _fetch_markdown(self, url: str) -> tuple[str, int]:

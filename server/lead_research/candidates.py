@@ -675,3 +675,39 @@ class CandidateRepository:
             if len(results) == limit:
                 break
         return results
+
+    def select_for_gate(
+        self,
+        *,
+        company_id: str | None = None,
+        countries: list[str],
+        product_terms: list[str],
+        limit: int,
+        exclude: set[tuple[str, str]] | None = None,
+    ) -> list[CandidateRecord]:
+        """Supply matching rows first, then a bounded unmatched fallback.
+
+        The fallback is what gives shared facts or one cheap verification the
+        chance to admit a candidate whose corpus row carries only an identity.
+        Matching rows remain first so unrelated rows cannot consume the bounded
+        candidate budget ahead of direct corpus evidence.
+        """
+        matched = self.select(
+            company_id=company_id,
+            countries=countries,
+            product_terms=product_terms,
+            limit=limit,
+            exclude=exclude,
+        )
+        if len(matched) >= limit:
+            return matched
+        skip = set(exclude or ())
+        skip.update((item.normalized_name, item.country.upper()) for item in matched)
+        fallback = self.select(
+            company_id=company_id,
+            countries=countries,
+            product_terms=[],
+            limit=limit - len(matched),
+            exclude=skip,
+        )
+        return [*matched, *fallback]

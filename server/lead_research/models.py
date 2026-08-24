@@ -243,6 +243,7 @@ class RawPage(ApiModel):
     records: list[RawRecord]
     next_cursor: str | None = None
     source_reported_total: int | None = None
+    requests: int = Field(default=0, ge=0)
 
 
 class ProviderHealth(ApiModel):

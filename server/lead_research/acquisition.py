@@ -1,7 +1,33 @@
 """Bounded provider partition runner."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from .models import DiscoveryQuery
+
+
+@dataclass(frozen=True)
+class CheapVerification:
+    matched: bool
+    evidence_ids: list[str] = field(default_factory=list)
+    requests: int = 0
+
+
+class CandidateMetadataCheapVerifier:
+    """Read a bounded discovery/lookup result already attached to a candidate.
+
+    Provider candidate discovery is itself the cheap lookup. Its adapter puts
+    the match and evidence identity on the candidate, so the gate can meter and
+    consume that result without performing full company research early.
+    """
+
+    def verify(self, candidate, terms: list[str]) -> CheapVerification:
+        del terms
+        return CheapVerification(
+            matched=bool(candidate.data.get("cheap_verification")),
+            evidence_ids=list(candidate.data.get("cheap_verification_evidence_ids", [])),
+            requests=int(candidate.data.get("cheap_verification_requests", 0)),
+        )
 
 
 class CampaignRunner:

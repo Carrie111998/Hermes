@@ -1353,6 +1353,10 @@ class LeadResearchService:
                     metrics[f"candidate_supply_{key}"] = (
                         metrics.get(f"candidate_supply_{key}", 0) + value
                     )
+                provider_requests += (
+                    supply.counts.get("cheap_verification_requests", 0)
+                    + supply.counts.get("candidate_discovery_requests", 0)
+                )
                 if not candidates:
                     # A market that selected nothing is indistinguishable from a
                     # market with no buyers in it unless the run says which it
