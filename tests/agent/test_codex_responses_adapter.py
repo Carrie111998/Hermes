@@ -386,6 +386,75 @@ def test_actual_plaintext_reasoning_replays_adjacent_to_function_call():
     }
 
 
+def test_actual_plaintext_reasoning_heads_mixed_content_action_turn():
+    """A turn with visible text AND a tool call stays one contiguous run.
+
+    Wire order is OpenAI's canonical output order — reasoning, then the
+    assistant message, then the function_call(s) — with nothing interleaved
+    and nothing dropped. The relay attaches reasoning to the contiguous
+    assistant run that follows it (the whole model turn), so the contract is
+    turn-level adjacency, not reasoning-touches-function_call.
+    """
+    messages = [
+        {"role": "user", "content": "Inspect the repository"},
+        {
+            "role": "assistant",
+            "content": "Checking the working tree and the branch.",
+            "reasoning_content": (
+                "Two probes: status for drift, branch for identity."
+            ),
+            "tool_calls": [
+                {
+                    "id": "call_status",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"git status"}',
+                    },
+                },
+                {
+                    "id": "call_branch",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"git branch --show-current"}',
+                    },
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_status", "content": "clean"},
+        {"role": "tool", "tool_call_id": "call_branch", "content": "main"},
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        replay_plaintext_reasoning=True,
+        current_issuer_kind="other:https://api.actual.inc/v1",
+    )
+
+    reasoning_index = next(
+        i for i, item in enumerate(items) if item.get("type") == "reasoning"
+    )
+    message_index = next(
+        i
+        for i, item in enumerate(items)
+        if i > reasoning_index and item.get("role") == "assistant"
+    )
+    call_indexes = [
+        i for i, item in enumerate(items) if item.get("type") == "function_call"
+    ]
+    assert message_index == reasoning_index + 1
+    assert call_indexes == [message_index + 1, message_index + 2]
+    assert items[reasoning_index]["content"][0]["text"] == (
+        "Two probes: status for drift, branch for identity."
+    )
+    # The missing_following_item guard must not inject an empty assistant
+    # message into a turn that already has visible content.
+    assert items[message_index]["content"] == (
+        "Checking the working tree and the branch."
+    )
+
+
 def test_plaintext_reasoning_replay_is_opt_in():
     messages = [{
         "role": "assistant",

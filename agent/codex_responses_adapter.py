@@ -696,9 +696,11 @@ def _chat_messages_to_responses_input(
                     # reasoning item (otherwise: missing_following_item error).
                     # When the assistant produced only reasoning with no visible
                     # content or function call, emit an empty assistant message
-                    # as the required following item. Plaintext reasoning must
-                    # remain directly adjacent to its function_call so a relay
-                    # attaches the thought to that assistant action turn.
+                    # as the required following item. Never inject one into a
+                    # turn that has a function_call: a relay attaches plaintext
+                    # reasoning to the contiguous assistant run that follows it
+                    # (message and/or function_calls — one model turn), and a
+                    # synthetic empty message would split that run.
                     items.append({"role": "assistant", "content": ""})
                     item_sources.append(msg)
 
