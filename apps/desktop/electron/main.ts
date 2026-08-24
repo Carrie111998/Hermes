@@ -3190,35 +3190,79 @@ function writeBackendOwnership(contents) {
 // Ownership is shared by every Electron interpreter for this userData tree.
 // Atomic rename protects individual writes, but not read/merge/write: two
 // interpreters can still overwrite each other's claims. Hold a sidecar lock
-// across the complete synchronous transaction. A timeout fails closed rather
-// than bypassing quarantine or silently dropping another process's row.
-function withBackendOwnershipLock(operation) {
+// across the complete transaction. Acquisition is asynchronous so a contending
+// Electron instance never blocks the main thread. The sidecar records the
+// owner's PID and start marker; a dead owner can be recovered after a crash.
+async function withBackendOwnershipLock(operation) {
   const lockPath = `${DESKTOP_BACKEND_OWNERSHIP_PATH}.lock`
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true })
+  await fs.promises.mkdir(path.dirname(lockPath), { recursive: true })
   const deadline = Date.now() + 30_000
-  let fd: number
+  let handle: any
+  let contents = ''
 
   for (;;) {
     try {
-      fd = fs.openSync(lockPath, 'wx', 0o600)
-      fs.writeFileSync(fd, `${process.pid}\\n`, { encoding: 'utf8' })
+      handle = await fs.promises.open(lockPath, 'wx', 0o600)
+      const startMarker = await processStartMarker(process.pid)
+      contents = JSON.stringify({ pid: process.pid, startMarker, createdAt: Date.now() })
+      await handle.writeFile(`${contents}\n`, { encoding: 'utf8' })
       break
     } catch (error) {
+      if (handle) {
+        await handle.close().catch(() => {})
+        handle = undefined
+        await fs.promises.unlink(lockPath).catch(() => {})
+      }
+
       if (error?.code !== 'EEXIST' || Date.now() >= deadline) {
         throw error
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+
+      let owner
+      try {
+        owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'))
+      } catch {
+        owner = null
+      }
+
+      if (owner && Number.isInteger(owner.pid) && typeof owner.startMarker === 'string' && owner.startMarker) {
+        let ownerMatches: boolean | undefined
+
+        try {
+          ownerMatches = (await processStartMarker(owner.pid)) === owner.startMarker
+        } catch (probeError) {
+          ownerMatches = probeError?.code === 'ENOENT' || probeError?.code === 'ESRCH' ? false : undefined
+        }
+
+        if (ownerMatches === false) {
+          try {
+            // The dead owner's open handle is gone, so unlinking here is safe;
+            // a live owner is never stolen, even when the PID was reused.
+            await fs.promises.unlink(lockPath)
+          } catch (unlinkError) {
+            if (unlinkError?.code !== 'ENOENT') {
+              throw unlinkError
+            }
+          }
+          continue
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 25))
     }
   }
 
   try {
-    return operation()
+    return await operation()
   } finally {
     try {
-      fs.closeSync(fd)
+      await handle.close()
     } finally {
       try {
-        fs.unlinkSync(lockPath)
+        const current = await fs.promises.readFile(lockPath, 'utf8')
+        if (current.trim() === contents) {
+          await fs.promises.unlink(lockPath)
+        }
       } catch {
         void 0
       }
@@ -3484,7 +3528,9 @@ function releaseBackendChild(child) {
   }
 
   try {
-    backendOwnership.release(identity)
+    void backendOwnership.release(identity).catch(error => {
+      rememberLog(`Could not release backend ownership for PID ${identity.pid}: ${error.message}`)
+    })
   } catch (error) {
     rememberLog(`Could not release backend ownership for PID ${identity.pid}: ${error.message}`)
   }
@@ -13312,10 +13358,7 @@ function createWindow() {
         windowsSandboxFallbackReason = 'renderer-crash-loop'
 
         try {
-          writeSandboxMarker(
-            app.getPath('userData'),
-            fallbackMarker('renderer-crash-loop', app.getVersion())
-          )
+          writeSandboxMarker(app.getPath('userData'), fallbackMarker('renderer-crash-loop', app.getVersion()))
         } catch {
           void 0
         }

@@ -193,8 +193,9 @@ async function helper(ssh, runtime, operation, args = [], stdinData?) {
   return parsed
 }
 
-function atomicWindowsSpawnCommand(runtime) {
+function atomicWindowsSpawnCommand(runtime, reservation: any = {}) {
   const argv = [runtime.python, '-m', 'hermes_cli.windows_ssh_runtime', 'spawn']
+  const helper = operation => [runtime.python, '-m', 'hermes_cli.windows_ssh_runtime', operation]
   const script = [
     '$ErrorActionPreference="Stop"',
     `$home=${psLiteral(runtime.hermesHome)}`,
@@ -207,16 +208,33 @@ function atomicWindowsSpawnCommand(runtime) {
     'try{',
     '  $mutex.Lock(0,1)',
     '  if([IO.File]::Exists($marker)){throw "remote update marker is present"}',
-    `  & ${argv.map(psLiteral).join(' ')}`,
-    '  if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}',
+    reservation.ownershipId
+      ? `  $existingLines=@(& ${helper('read-lock').map(psLiteral).join(' ')} ${psLiteral(reservation.ownershipId)}); $existingExit=$LASTEXITCODE; ` +
+        '  if($existingExit -eq 0 -and $existingLines.Count -gt 0){try{$existing=$existingLines[-1]|ConvertFrom-Json}catch{$existing=$null}; ' +
+        'if($existing -and [int]$existing.pid -gt 0){try{$p=[Diagnostics.Process]::GetProcessById([int]$existing.pid); ' +
+        'if(-not $p.HasExited){[ordered]@{existing=$true}|ConvertTo-Json -Compress;exit 0}}catch{}finally{if($p){$p.Dispose()}}}; ' +
+        `& ${helper('remove-lock').map(psLiteral).join(' ')} ${psLiteral(reservation.ownershipId)}|Out-Null}`
+      : '',
+    reservation.ownershipId
+      ? `  $spawnLines=@(& ${argv.map(psLiteral).join(' ')}); $spawnExit=$LASTEXITCODE`
+      : `  & ${argv.map(psLiteral).join(' ')}`,
+    reservation.ownershipId
+      ? '  if($spawnExit -ne 0){exit $spawnExit}'
+      : '  if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}',
+    reservation.ownershipId
+      ? `  $spawned=$spawnLines[-1]|ConvertFrom-Json; $lock=[ordered]@{schemaVersion=2;protocolVersion=1;ownershipId=${psLiteral(reservation.ownershipId)};spawnNonce=${psLiteral(reservation.spawnNonce)};pid=[int]$spawned.pid;creationTimeNs=[string]$spawned.creationTimeNs;port=0;profile=${psLiteral(reservation.profile)};hermesPath=${psLiteral(reservation.hermesPath)};hermesHome=${psLiteral(reservation.hermesHome)};tokenFingerprint=${psLiteral(reservation.tokenFingerprint)};startedAt=${psLiteral(reservation.startedAt)}}|ConvertTo-Json -Compress; ` +
+        `  & ${helper('write-lock').map(psLiteral).join(' ')} ${psLiteral(reservation.ownershipId)} $lock|Out-Null; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; $spawnLines|Write-Output`
+      : '',
     '  if([IO.File]::Exists($marker)){throw "remote update marker claimed during backend spawn"}',
     '}finally{try{$mutex.Unlock(0,1)}catch{};$mutex.Dispose()}'
-  ].join(';')
+  ]
+    .filter(line => line !== '')
+    .join(';')
   return powerShellCommand(script)
 }
 
-async function atomicWindowsSpawn(ssh, runtime, stdinData) {
-  const output = await ssh.exec(atomicWindowsSpawnCommand(runtime), { stdinData })
+async function atomicWindowsSpawn(ssh, runtime, stdinData, reservation: any = {}) {
+  const output = await ssh.exec(atomicWindowsSpawnCommand(runtime, reservation), { stdinData })
   const lines = String(output || '')
     .replace(/^\uFEFF/, '')
     .trim()
@@ -445,6 +463,28 @@ async function waitReady(ssh, runtime, ownershipId, lock, timeoutMs, signal) {
   throw error
 }
 
+async function waitForWindowsSpawnCompletion(ssh, runtime, ownershipId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    const lock = await helper(ssh, runtime, 'read-lock', [ownershipId])
+
+    if (!lock) {
+      return false
+    }
+
+    if (validLock(lock, ownershipId) && lock.port > 0) {
+      return true
+    }
+
+    await new Promise(resolve => setTimeout(resolve, READY_POLL_INTERVAL_MS))
+  }
+
+  const error: any = new Error('Timed out waiting for the concurrent Windows SSH connection to publish its backend.')
+  error.kind = 'spawn-failed'
+  throw error
+}
+
 async function connectWindowsRemote(deps) {
   const {
     ssh,
@@ -545,6 +585,8 @@ async function connectWindowsRemote(deps) {
   const token = crypto.randomBytes(32).toString('hex')
   const spawnNonce = crypto.randomBytes(8).toString('hex')
   await helper(ssh, runtime, 'upload-token', [ownershipId, spawnNonce], token)
+  const startedAt = new Date().toISOString()
+  const tokenFingerprint = fingerprintToken(token)
   let spawned
 
   try {
@@ -552,11 +594,40 @@ async function connectWindowsRemote(deps) {
     spawned = await atomicWindowsSpawn(
       ssh,
       runtime,
-      JSON.stringify({ ownershipId, spawnNonce, profile, hermesPath: runtime.hermesPath })
+      JSON.stringify({ ownershipId, spawnNonce, profile, hermesPath: runtime.hermesPath }),
+      {
+        ownershipId,
+        spawnNonce,
+        profile,
+        hermesPath: runtime.hermesPath,
+        hermesHome: runtime.hermesHome,
+        tokenFingerprint,
+        startedAt
+      }
     )
   } catch (error) {
     await helper(ssh, runtime, 'remove-token', [ownershipId, spawnNonce])
     throw error
+  }
+
+  if (spawned.existing) {
+    await helper(ssh, runtime, 'remove-token', [ownershipId, spawnNonce])
+
+    if (!reuseToken) {
+      const error: any = new Error(
+        'Another SSH connection owns this remote dashboard; a session token is required to reuse it.'
+      )
+      error.kind = 'remote-ownership-contended'
+      throw error
+    }
+
+    const published = await waitForWindowsSpawnCompletion(ssh, runtime, ownershipId, readyTimeoutMs)
+
+    if (!published) {
+      return connectWindowsRemote({ ...deps, reuseToken })
+    }
+
+    return connectWindowsRemote({ ...deps, reuseToken })
   }
 
   const owned = {
@@ -570,8 +641,8 @@ async function connectWindowsRemote(deps) {
     profile,
     hermesPath: runtime.hermesPath,
     hermesHome: runtime.hermesHome,
-    tokenFingerprint: fingerprintToken(token),
-    startedAt: new Date().toISOString()
+    tokenFingerprint,
+    startedAt
   }
 
   let localPort = 0

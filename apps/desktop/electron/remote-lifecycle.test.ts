@@ -74,11 +74,7 @@ function fakeSsh(rules: any[] = []) {
       // Existing lifecycle fixtures predate the install-wide relaunch gate.
       // Their default remote has no update marker; focused marker tests below
       // use explicit SSH doubles to exercise live/uncertain transitions.
-      if (
-        cmd.includes('.hermes-update-in-progress') &&
-        !cmd.includes('marker_clear()') &&
-        !/setsid|nohup/.test(cmd)
-      ) {
+      if (cmd.includes('.hermes-update-in-progress') && !cmd.includes('marker_clear()') && !/setsid|nohup/.test(cmd)) {
         return 'CLEAR'
       }
 
@@ -86,10 +82,7 @@ function fakeSsh(rules: any[] = []) {
         ? rules.filter(([matcher]) => !(matcher instanceof RegExp && /kill -0/.test(matcher.source)))
         : rules
 
-      if (
-        (cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) ||
-        cmd.includes('printf TERMINATED')
-      ) {
+      if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) || cmd.includes('printf TERMINATED')) {
         return 'TERMINATED'
       }
       for (const [matcher, resp] of applicableRules) {
@@ -595,10 +588,16 @@ test('cleanupStale re-proves argv in the kill command and always drops the lockf
     hermesPath: '/x/hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
   })
-  assert.ok(notOurs.calls.some(c => /print\("OWNED"/.test(c)), 'must perform an ownership preflight')
+  assert.ok(
+    notOurs.calls.some(c => /print\("OWNED"/.test(c)),
+    'must perform an ownership preflight'
+  )
   assert.ok(notOurs.calls.some(c => /rm -f/.test(c)))
 
-  const ours = fakeSsh([[/print\("OWNED"/, 'OWNED\n'], [cmd => /printf TERMINATED/.test(cmd), 'TERMINATED\n']])
+  const ours = fakeSsh([
+    [/print\("OWNED"/, 'OWNED\n'],
+    [cmd => /printf TERMINATED/.test(cmd), 'TERMINATED\n']
+  ])
   await cleanupStale(ours, OWNERSHIP_ID, {
     pid: 9,
     spawnNonce: SPAWN_NONCE,
@@ -631,6 +630,35 @@ test('buildSpawnCommand always uses serve (legacy dashboard path removed)', () =
   assert.doesNotMatch(cmd, /dashboard/)
   assert.doesNotMatch(cmd, /--skip-build/)
   assert.match(cmd, /setsid/)
+})
+
+test('buildSpawnCommand atomically reserves the ownership slot through spawn and lock publication', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'work', {
+    hermesHome: '~/.hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+    ownershipId: OWNERSHIP_ID,
+    reservationNonce: SPAWN_NONCE,
+    spawnNonce: SPAWN_NONCE,
+    tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
+    lockMetadata: {
+      ownershipId: OWNERSHIP_ID,
+      spawnNonce: SPAWN_NONCE,
+      port: 0,
+      profile: 'work',
+      hermesPath: '/x/hermes',
+      hermesHome: '~/.hermes',
+      logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+      tokenFingerprint: fingerprintToken('stored-token'),
+      protocolVersion: PROTOCOL_VERSION,
+      startedAt: '2026-07-14T00:00:00.000Z'
+    }
+  })
+
+  assert.ok(cmd.includes('.connect.lock'))
+  assert.ok(cmd.includes('backend.lock.json'))
+  assert.match(cmd, /lock_json/)
+  assert.match(cmd, /trap .*rm -rf/)
+  assert.ok(cmd.indexOf('lock_json') > cmd.indexOf('serve --isolated'))
 })
 
 test('spawnRemoteDashboard returns exact ownership artifacts', async () => {

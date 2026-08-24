@@ -1,8 +1,4 @@
-import {
-  backendCommandMatches,
-  type BackendOwnershipEntry,
-  type BackendOwnershipInspection
-} from './backend-ownership'
+import { backendCommandMatches, type BackendOwnershipEntry, type BackendOwnershipInspection } from './backend-ownership'
 
 const WINDOWS_EPOCH_TICKS = 621_355_968_000_000_000n
 
@@ -50,7 +46,7 @@ export function windowsProcessSnapshotScript(pids: readonly number[]): string {
     '$rows | ForEach-Object { $commands[[int]$_.ProcessId] = [string]$_.CommandLine }',
     '$items = @($requested | ForEach-Object {',
     '  $pid = [int]$_',
-    '  if($unknown.ContainsKey($pid) -and $rowsByPid.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="unknown"; command=$null; ticks=$null; milliseconds=$null }; return }',
+    '  if($unknown.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="unknown"; command=$null; ticks=$null; milliseconds=$null }; return }',
     '  if(-not $processes.ContainsKey($pid)){ [PSCustomObject]@{ pid=$pid; state="absent"; command=$null; ticks=$null; milliseconds=$null }; return }',
     '  $process = $processes[$pid]',
     '  $ticks = $process.StartTime.ToUniversalTime().Ticks',
@@ -144,7 +140,12 @@ export function inspectBackendOwnershipSnapshot(
 
     if (Number.isInteger(parentPid) && parentPid > 0 && entry.parentStartMarker) {
       const parent = snapshots.get(parentPid)
-      parentMatches = !parent || parent.state === 'absent' ? false : parent.state === 'unknown' ? undefined : parent.startMarkers.has(entry.parentStartMarker)
+      parentMatches =
+        !parent || parent.state === 'absent'
+          ? false
+          : parent.state === 'unknown'
+            ? undefined
+            : parent.startMarkers.has(entry.parentStartMarker)
     }
 
     return { identityMatches, parentMatches }

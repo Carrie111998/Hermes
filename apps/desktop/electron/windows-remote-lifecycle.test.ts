@@ -35,6 +35,30 @@ test('Windows spawn holds the update mutex across marker check and helper spawn'
   assert.match(script, /remote update marker is present/)
 })
 
+test('Windows spawn publishes the initial ownership record before releasing the mutex', () => {
+  const command = atomicWindowsSpawnCommand(
+    {
+      hermesHome: 'C:\\Users\\andre\\.hermes',
+      python: 'C:\\Users\\andre\\.hermes\\python.exe'
+    },
+    {
+      ownershipId,
+      spawnNonce: '0123456789abcdef',
+      profile: 'default',
+      hermesPath: 'C:\\Hermes\\hermes.exe',
+      hermesHome: 'C:\\Users\\andre\\.hermes',
+      tokenFingerprint: 'a'.repeat(32),
+      startedAt: '2026-07-14T00:00:00.000Z'
+    }
+  )
+  const encoded = command.split(' ').at(-1) || ''
+  const script = encoded ? Buffer.from(encoded, 'base64').toString('utf16le') : ''
+
+  assert.match(script, /read-lock/)
+  assert.match(script, /write-lock/)
+  assert.ok(script.indexOf('write-lock') < script.indexOf('Unlock'))
+})
+
 function sshWith(exec) {
   return { exec }
 }

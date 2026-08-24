@@ -28,6 +28,8 @@ test('Windows snapshot script uses one shell and matching Get-Process start mark
   assert.match(script, /Get-CimInstance Win32_Process -Filter 'ProcessId = 42 OR ProcessId = 43'/)
   assert.equal((script.match(/Get-CimInstance/g) || []).length, 1)
   assert.match(script, /\.StartTime\.ToUniversalTime\(\)\.Ticks/)
+  assert.match(script, /if\(\$unknown\.ContainsKey\(\$pid\)\)/)
+  assert.doesNotMatch(script, /\$unknown\.ContainsKey\(\$pid\) -and \$rowsByPid\.ContainsKey/)
   assert.doesNotMatch(script, /CreationDate/)
   assert.match(script, /ConvertTo-Json -InputObject @\(\$items\) -Compress/)
 })
@@ -44,10 +46,7 @@ test('Windows snapshot parser preserves both legacy ticks and spawn-ledger milli
     ])
   )
 
-  assert.deepEqual([...snapshots.get(42)!.startMarkers], [
-    'win:638900000000000000',
-    'winms:1750000000000'
-  ])
+  assert.deepEqual([...snapshots.get(42)!.startMarkers], ['win:638900000000000000', 'winms:1750000000000'])
   assert.equal(snapshots.get(42)!.command, 'python -m hermes_cli.main serve --port 0')
 })
 

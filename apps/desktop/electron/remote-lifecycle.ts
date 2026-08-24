@@ -88,6 +88,10 @@ function lockfilePath(ownershipId) {
   return `${ownershipDirectory(ownershipId)}/backend.lock.json`
 }
 
+function connectReservationPath(ownershipId) {
+  return `${ownershipDirectory(ownershipId)}/.connect.lock`
+}
+
 function spawnLogPath(ownershipId, spawnNonce) {
   return `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(spawnNonce)}.log`
 }
@@ -490,9 +494,12 @@ async function remotePidAlive(ssh, pid) {
 
 // Stable kernel process-start identity used to fence a later managed-update
 // termination against PID recycling. Linux exposes boot-relative start ticks;
-// Darwin's `ps lstart` is an exact value for the life of that PID. Failure is
-// represented as an empty string so SSH mode remains compatible on unusual
-// POSIX hosts, but a managed update then refuses to kill that unproved serve.
+// Darwin's `ps lstart` is only second-resolution, so the signal boundary also
+// re-reads the complete argv and random ownership nonce in the same remote
+// command. A same-second PID reuse with a forged/repeated nonce remains a
+// residual limitation. Failure is represented as an empty string so SSH mode
+// remains compatible on unusual POSIX hosts, but a managed update then refuses
+// to kill that unproved serve.
 async function remoteProcessCreationTime(ssh, pid) {
   if (!pid || !Number.isInteger(Number(pid))) {
     return ''
@@ -669,9 +676,11 @@ function buildOwnedStaleTerminationCommand(lock, ownershipId) {
   // Legacy records do not have creationTime. Re-read argv immediately before
   // signaling in this same shell command; never use the earlier probe's PID
   // verdict as authority for the kill.
-  return `${identity} kill ${pid} && ` +
+  return (
+    `${identity} kill ${pid} && ` +
     `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
     `i=$((i+1)); [ "$i" -ge 50 ] && printf TIMEOUT && exit 0; sleep 0.1; done; printf TERMINATED`
+  )
 }
 
 function lockMatchesManagedUpdateScope(lock, expected) {
@@ -725,6 +734,20 @@ def argv():
   try:return shlex.split(subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip())
   except (OSError,subprocess.CalledProcessError,ValueError):return []
 
+def identity_before_signal():
+ # Darwin's lstart has one-second resolution. Read the start time and the
+ # complete argv in one ps call immediately before signalling; the random
+ # ownership nonce is the discriminator for a same-second PID reuse. A
+ # same-second reuse with a forged/repeated nonce remains a residual limitation.
+ if sys.platform=="darwin":
+  try:
+   line=subprocess.check_output(["ps","-ww","-p",str(pid),"-o","lstart=","-o","command="],text=True).strip()
+   prefix=expected_creation.removeprefix("darwin:")
+   if not prefix or not line.startswith(prefix):return "",[]
+   return "darwin:"+prefix,shlex.split(line[len(prefix):].strip())
+  except (OSError,subprocess.CalledProcessError,ValueError):return "",[]
+ return creation(),argv()
+
 def owned(args):
  try:
   serve=args.index("serve")
@@ -750,7 +773,8 @@ if sys.platform.startswith("linux"):
  except (OSError,PermissionError):print("UNAVAILABLE");sys.exit(2)
 
 try:
- if creation()!=expected_creation or not owned(argv()):
+ live_creation,live_args=identity_before_signal()
+ if live_creation!=expected_creation or not owned(live_args):
   print("REFUSED");sys.exit(3)
  try:
   if pidfd is not None:signal.pidfd_send_signal(pidfd,signal.SIGTERM)
@@ -896,10 +920,11 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const ownerArg = opts.spawnNonce ? ` --ssh-owner-nonce ${validateSpawnNonce(opts.spawnNonce)}` : ''
   const subCmd = `serve --isolated --host 127.0.0.1 --port 0${tokenArg}${ownerArg}`
   const marker = expandRemotePath(`${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress`)
-  // The marker probe and process creation must be one remote command. The
-  // second probe runs after the child is created but before publishing its PID;
-  // if an updater claimed the marker during the spawn window, kill the child
-  // and refuse the launch instead of leaving a backend inside a mutating tree.
+  // The marker probe, ownership reservation, process creation, and initial
+  // lockfile publication must be one remote command. A second Desktop process
+  // can therefore never observe an empty lock and spawn before this one records
+  // its PID. The reservation is an atomic mkdir and is reclaimed only when its
+  // owning remote shell is dead.
   const markerClear =
     `marker_clear() { if [ ! -e ${marker} ]; then return 0; fi; ` +
     `if [ ! -r ${marker} ]; then return 1; fi; ` +
@@ -910,11 +935,43 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
     `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
 
+  if (!opts.ownershipId || !opts.lockMetadata) {
+    return (
+      `${markerClear}; marker_clear || exit 75; ` +
+      `mkdir -p "$(dirname ${logPath})" && ` +
+      `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
+      `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; echo "$child"`
+    )
+  }
+
+  const reservation = expandRemotePath(connectReservationPath(opts.ownershipId))
+  const lockPath = expandRemotePath(lockfilePath(opts.ownershipId))
+  const tokenPath = tokenFilePath ? expandRemotePath(tokenFilePath) : ''
+  const ownerPath = `${reservation}/owner`
+  const metadata = JSON.stringify({ schemaVersion: LOCKFILE_SCHEMA_VERSION, ...opts.lockMetadata, pid: '__PID__' })
+  const reservationNonce = validateSpawnNonce(opts.reservationNonce || crypto.randomBytes(8).toString('hex'))
+
   return (
-    `${markerClear}; marker_clear || exit 75; ` +
-    `mkdir -p "$(dirname ${logPath})" && ` +
+    `umask 077 && mkdir -p "$(dirname ${reservation})"; ` +
+    `reservation=${shq(reservation)}; lock=${shq(lockPath)}; owner_file=${shq(ownerPath)}; ` +
+    `reservation_nonce=${shq(reservationNonce)}; ` +
+    `i=0; while ! mkdir "$reservation" 2>/dev/null; do ` +
+    `owner_data=$(cat "$owner_file" 2>/dev/null || true); owner_pid=${'${owner_data%%:*}'}; ` +
+    `case "$owner_pid" in ''|*[!0-9]*) ;; *) kill -0 "$owner_pid" 2>/dev/null || { rm -rf "$reservation"; continue; };; esac; ` +
+    `i=$((i+1)); [ "$i" -ge 600 ] && exit 75; sleep 0.05; done; ` +
+    `printf '%s:%s' "$$" "$reservation_nonce" > "$owner_file"; ` +
+    `trap 'rm -rf "$reservation"' EXIT; ` +
+    `if [ -f "$lock" ]; then ` +
+    `existing_pid=$(sed -n 's/.*"pid":\\([0-9][0-9]*\\).*/\\1/p' "$lock" | head -n 1); ` +
+    `case "$existing_pid" in ''|*[!0-9]*) rm -f "$lock";; *) ` +
+    `if kill -0 "$existing_pid" 2>/dev/null; then ${tokenPath ? `rm -f ${tokenPath}; ` : ''}printf EXISTING; exit 0; fi; rm -f "$lock";; esac; fi; ` +
+    `${markerClear}; marker_clear || exit 75; mkdir -p "$(dirname ${logPath})" && ` +
     `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
-    `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; echo "$child"`
+    `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; ` +
+    `lock_json=${shq(metadata)}; lock_json=\${lock_json//__PID__/$child}; ` +
+    `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
+    `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
+    `echo "$child"`
   )
 }
 
@@ -1033,7 +1090,28 @@ async function spawnRemoteDashboard(
     // Close the marker race after the token-file write and immediately before
     // process creation. The caller's probe imports no changing checkout code.
     await assertInstallClear()
-    out = await ssh.exec(buildSpawnCommand(hermesPath, profile, { spawnNonce, tokenFilePath, logPath, hermesHome }))
+    out = await ssh.exec(
+      buildSpawnCommand(hermesPath, profile, {
+        spawnNonce,
+        tokenFilePath,
+        logPath,
+        hermesHome,
+        ownershipId,
+        reservationNonce: spawnNonce,
+        lockMetadata: {
+          ownershipId,
+          spawnNonce,
+          port: 0,
+          profile,
+          hermesPath,
+          hermesHome,
+          logPath,
+          tokenFingerprint: fingerprintToken(token),
+          protocolVersion: PROTOCOL_VERSION,
+          startedAt: new Date().toISOString()
+        }
+      })
+    )
   } catch (error) {
     try {
       await ssh.exec(`rm -f ${expandRemotePath(tokenFilePath)}`)
@@ -1044,13 +1122,17 @@ async function spawnRemoteDashboard(
     throw error
   }
 
-  const pid = parseInt(
-    String(out || '')
-      .trim()
-      .split('\n')
-      .pop(),
-    10
-  )
+  const outputLines = String(out || '')
+    .trim()
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  if (outputLines.at(-1) === 'EXISTING') {
+    return { existing: true }
+  }
+
+  const pid = parseInt(outputLines.at(-1) || '', 10)
 
   if (!Number.isInteger(pid) || pid <= 0) {
     try {
@@ -1126,6 +1208,28 @@ async function adoptOwnedServedToken(adoptServedToken, baseUrl, expectedToken, s
   }
 
   return token
+}
+
+async function waitForRemoteSpawnCompletion(ssh, ownershipId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    const lock = await readLockfile(ssh, ownershipId)
+
+    if (!lock) {
+      return false
+    }
+
+    if (lock.port > 0) {
+      return true
+    }
+
+    await new Promise(resolve => setTimeout(resolve, READY_POLL_INTERVAL_MS))
+  }
+
+  const error: any = new Error('Timed out waiting for the concurrent SSH connection to publish its backend.')
+  error.kind = 'spawn-failed'
+  throw error
 }
 
 async function connect(deps) {
@@ -1267,7 +1371,7 @@ async function connect(deps) {
   await assertRemoteInstallUpdateClear(ssh, hermesHome)
   const spawnToken = mintToken()
 
-  const { pid, spawnNonce, logPath, tokenFilePath } = await spawnRemoteDashboard(ssh, {
+  const spawned = await spawnRemoteDashboard(ssh, {
     hermesPath,
     profile,
     token: spawnToken,
@@ -1276,6 +1380,25 @@ async function connect(deps) {
     assertInstallClear: () => assertRemoteInstallUpdateClear(ssh, hermesHome)
   })
 
+  if (spawned.existing) {
+    if (!reuseToken) {
+      const error: any = new Error(
+        'Another SSH connection owns this remote dashboard; a session token is required to reuse it.'
+      )
+      error.kind = 'remote-ownership-contended'
+      throw error
+    }
+
+    const published = await waitForRemoteSpawnCompletion(ssh, ownershipId, readyTimeoutMs)
+
+    if (!published) {
+      return connect({ ...deps, reuseToken })
+    }
+
+    return connect({ ...deps, reuseToken })
+  }
+
+  const { pid, spawnNonce, logPath, tokenFilePath } = spawned
   log(`spawned remote dashboard pid=${pid}`)
   const creationTime = await remoteProcessCreationTime(ssh, pid)
 
@@ -1365,6 +1488,7 @@ export {
   buildSpawnCommand,
   cleanupStale,
   connect,
+  connectReservationPath,
   DEFAULT_READY_TIMEOUT_MS,
   expandRemotePath,
   fingerprintToken,

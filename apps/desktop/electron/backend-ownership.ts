@@ -17,7 +17,7 @@ export interface BackendOwnershipStore {
   read: () => string | null
   write: (contents: string) => void
   /** Serialize every read/merge/write mutation across Electron interpreters. */
-  transaction?: <T>(operation: () => T) => T
+  transaction?: <T>(operation: () => T | Promise<T>) => T | Promise<T>
   /** Move an unreadable ownership file aside (e.g. rename to `.corrupt`) so
    *  its contents survive for inspection instead of being rewritten away.
    *  Optional: stores that can't quarantine simply skip the sweep. */
@@ -189,7 +189,8 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
     return snapshot.entries
   }
   const write = (entries: BackendOwnershipEntry[]) => deps.store.write(serializeBackendOwnership(entries))
-  const transaction = <T>(operation: () => T): T => deps.store.transaction ? deps.store.transaction(operation) : operation()
+  const transaction = async <T>(operation: () => T | Promise<T>): Promise<T> =>
+    deps.store.transaction ? await deps.store.transaction(operation) : await operation()
 
   const inspectBatch = async (
     entries: readonly BackendOwnershipEntry[],
@@ -263,7 +264,7 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
     // The snapshot probe awaits. Merge confirmed-stale removals into a fresh
     // roster so concurrent claims survive and concurrent releases are not
     // resurrected. Exact identity matching protects PID reuse.
-    const compacted = transaction(() => {
+    const compacted = await transaction(() => {
       const current = readDetailed()
 
       if (current.corrupt || current.unavailable) {
@@ -325,7 +326,7 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         // roster then overwrite one another. Persist this exact identity
         // first; bounded maintenance, when needed, runs after the write and
         // fresh-merges only confirmed-stale removals.
-        transaction(() => {
+        await transaction(() => {
           const entries = readForMutation().filter(candidate => candidate.pid !== entry.pid)
           const next = [...entries, entry]
           write(next)
@@ -354,12 +355,12 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
 
     compactStale,
 
-    release(identity: BackendIdentity): void {
+    async release(identity: BackendIdentity): Promise<void> {
       if (!isCompleteIdentity(identity)) {
         throw new Error('Cannot release a backend without a complete process identity.')
       }
 
-      transaction(() => {
+      await transaction(() => {
         const entries = readForMutation()
         const next = entries.filter(entry => !identitiesMatch(entry, identity))
 
@@ -426,7 +427,7 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
       // meanwhile must survive, and an entry released meanwhile must not be
       // resurrected. Exact pid+start+nonce+profile matching also protects a
       // newly reused PID from an old snapshot's removal decision.
-      transaction(() => {
+      await transaction(() => {
         const current = readDetailed()
 
         if (current.corrupt || current.unavailable) {
@@ -445,8 +446,8 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
       return reaped
     },
 
-    clear(): void {
-      transaction(() => {
+    async clear(): Promise<void> {
+      await transaction(() => {
         readForMutation()
         write([])
       })
