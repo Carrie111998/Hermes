@@ -1117,6 +1117,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # allowed user enters a voice channel, instead of requiring /voice
         # join every time. OFF by default. See discord.voice.* in config.yaml.
         self._voice_auto_join_cfg: Dict[str, Any] = self._load_voice_auto_join_config()
+        # Monotonic per-guild token for concurrent auto-follow events. Only a
+        # fully qualified newer event may supersede an in-flight join's routing.
+        self._voice_auto_join_generations: Dict[int, int] = {}
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -1507,6 +1510,26 @@ class DiscordAdapter(BasePlatformAdapter):
                                 and existing_channel_id == getattr(after.channel, "id", None)
                             )
                             if not already_here:
+                                # A voice connection without a text/session anchor
+                                # cannot deliver transcripts into the gateway. Refuse
+                                # the automatic join rather than reporting false success.
+                                text_channel_id = str(
+                                    auto_cfg.get("auto_join_text_channel_id")
+                                    or os.getenv("DISCORD_HOME_CHANNEL")
+                                    or os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "").split(",")[0].strip()
+                                ).strip()
+                                try:
+                                    text_channel_int = int(text_channel_id)
+                                except (TypeError, ValueError):
+                                    logger.warning(
+                                        "[%s] Auto-join skipped: configure a valid discord.voice.auto_join_text_channel_id",
+                                        adapter_self.name,
+                                    )
+                                    return
+
+                                generations = adapter_self._voice_auto_join_generations
+                                generation = generations.get(guild_id, 0) + 1
+                                generations[guild_id] = generation
                                 try:
                                     success = await adapter_self.join_voice_channel(after.channel)
                                     if not success:
@@ -1517,49 +1540,33 @@ class DiscordAdapter(BasePlatformAdapter):
                                         )
                                         return
 
-                                    # Auto-join does not originate from a slash command, so
-                                    # there is no event.source to bind as the text/session
-                                    # anchor. Pick an explicit configured channel first, then
-                                    # fall back to Discord home/free-response config. This is
-                                    # what lets the gateway turn future VC transcripts into a
-                                    # real MessageEvent and route the agent's TTS reply back to
-                                    # this voice connection.
-                                    text_channel_id = str(
-                                        auto_cfg.get("auto_join_text_channel_id")
-                                        or os.getenv("DISCORD_HOME_CHANNEL")
-                                        or os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "").split(",")[0].strip()
-                                    ).strip()
-                                    if text_channel_id:
-                                        try:
-                                            text_channel_int = int(text_channel_id)
-                                        except (TypeError, ValueError):
-                                            logger.warning(
-                                                "[%s] Ignoring invalid discord.voice.auto_join_text_channel_id=%r",
-                                                adapter_self.name,
-                                                text_channel_id,
-                                            )
-                                        else:
-                                            adapter_self._voice_text_channels[guild_id] = text_channel_int
-                                            # Treat auto-joined VC sessions like `/voice tts`:
-                                            # speech heard in the VC should always get a spoken
-                                            # reply, even if global voice.auto_tts is disabled or
-                                            # the text channel had a stale `/voice off` override.
-                                            if isinstance(getattr(adapter_self, "_auto_tts_enabled_chats", None), set):
-                                                adapter_self._auto_tts_enabled_chats.add(str(text_channel_int))
-                                            if isinstance(getattr(adapter_self, "_auto_tts_disabled_chats", None), set):
-                                                adapter_self._auto_tts_disabled_chats.discard(str(text_channel_int))
-                                            adapter_self._voice_sources[guild_id] = {
-                                                "platform": Platform.DISCORD.value,
-                                                "chat_id": str(text_channel_int),
-                                                "chat_name": getattr(after.channel, "name", None),
-                                                "chat_type": "channel",
-                                                "user_id": str(member.id),
-                                                "user_name": getattr(member, "display_name", None) or getattr(member, "name", None) or str(member.id),
-                                                "thread_id": None,
-                                                "chat_topic": None,
-                                                "scope_id": str(guild_id),
-                                                "guild_id": str(guild_id),
-                                            }
+                                    # A newer qualifying follow event owns the
+                                    # routing state. An unrelated voice event never
+                                    # advances this generation.
+                                    if generations.get(guild_id) != generation:
+                                        return
+
+                                    adapter_self._voice_text_channels[guild_id] = text_channel_int
+                                    # Treat auto-joined VC sessions like `/voice tts`:
+                                    # speech heard in the VC should always get a spoken
+                                    # reply, even if global voice.auto_tts is disabled or
+                                    # the text channel had a stale `/voice off` override.
+                                    if isinstance(getattr(adapter_self, "_auto_tts_enabled_chats", None), set):
+                                        adapter_self._auto_tts_enabled_chats.add(str(text_channel_int))
+                                    if isinstance(getattr(adapter_self, "_auto_tts_disabled_chats", None), set):
+                                        adapter_self._auto_tts_disabled_chats.discard(str(text_channel_int))
+                                    adapter_self._voice_sources[guild_id] = {
+                                        "platform": Platform.DISCORD.value,
+                                        "chat_id": str(text_channel_int),
+                                        "chat_name": getattr(after.channel, "name", None),
+                                        "chat_type": "channel",
+                                        "user_id": str(member.id),
+                                        "user_name": getattr(member, "display_name", None) or getattr(member, "name", None) or str(member.id),
+                                        "thread_id": None,
+                                        "chat_topic": None,
+                                        "scope_id": str(guild_id),
+                                        "guild_id": str(guild_id),
+                                    }
 
                                     logger.info(
                                         "[%s] Auto-joined voice channel %s (triggered by %s, text_channel=%s)",
