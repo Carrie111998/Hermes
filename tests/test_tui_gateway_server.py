@@ -5166,6 +5166,92 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     assert closed["count"] == 1
 
 
+def test_finalize_session_does_not_end_live_mid_turn_session(monkeypatch, tmp_path):
+    """#88197 Bug 1 — teardown must not stamp ended_at on a live session.
+
+    The shutdown path skips the turn-thread settle join by design because
+    the process is exiting, so _finalize_session can run while the turn
+    thread is still alive. Stamping ended_at makes later compression
+    rotation abort on the "parent already ended" guard. The row must stay
+    live until the turn is finalized or the session is otherwise closed.
+    """
+    ended = []
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    class _DB:
+        def get_session(self, _key):
+            return {"id": _key, "source": "tui"}
+
+        def end_session(self, key, reason):
+            ended.append((key, reason))
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda **kw: _DB())
+
+    # Mid-turn finalize (running=True): must NOT end the row.
+    session = _session(
+        session_key="live-mid-turn",
+        profile_home=str(tmp_path / "profile-home"),
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._finalize_session(session)
+    assert ended == [], f"mid-turn finalize ended the row: {ended}"
+
+    # Idle finalize with a dead thread: must end the row as before.
+    class _DeadThread:
+        def is_alive(self):
+            return False
+
+    session2 = _session(
+        session_key="idle-session",
+        profile_home=str(tmp_path / "profile-home"),
+        running=False,
+        _run_thread=_DeadThread(),
+    )
+    server._finalize_session(session2)
+    assert ended == [("idle-session", "tui_close")]
+
+
+def test_finalize_session_does_not_end_live_turn_thread_session(monkeypatch, tmp_path):
+    """#88197 Bug 1 — running flag cleared but turn thread still alive.
+
+    The running flag is cleared under history_lock at the END of the
+    turn's finally block, but a teardown racing that window can observe
+    running=False while the thread is still unwinding. The thread-liveness
+    check is the backstop: a live thread means the session is not done.
+    """
+    ended = []
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    class _DB:
+        def get_session(self, _key):
+            return {"id": _key, "source": "tui"}
+
+        def end_session(self, key, reason):
+            ended.append((key, reason))
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda **kw: _DB())
+
+    session = _session(
+        session_key="live-thread",
+        profile_home=str(tmp_path / "profile-home"),
+        running=False,  # flag already cleared, thread still unwinding
+        _run_thread=_LiveThread(),
+    )
+    server._finalize_session(session)
+    assert ended == [], f"live-thread finalize ended the row: {ended}"
+
+
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
     """Closing a pop-out window's transport must re-bind the session to a
     still-open window instead of stranding it on the drop sentinel (#83716)."""
