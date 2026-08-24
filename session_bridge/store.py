@@ -1976,9 +1976,15 @@ class SessionBridgeStore:
         if (
             not isinstance(daily_limit, int)
             or isinstance(daily_limit, bool)
-            or not 1 <= daily_limit <= 25
+            or daily_limit < 1
         ):
-            raise ValueError("daily_limit must be between 1 and 25")
+            raise ValueError("daily_limit must be a positive integer")
+        # Must track claim_claude_visibility_job's ceiling exactly: cli.py hands
+        # both paths the same policy.daily_registration_limit, so a lower bound
+        # here turns an operator-raised limit into a raw ValueError out of an
+        # unguarded call site instead of a status. Raised from 25 on 2026-08-23.
+        if daily_limit > 100:
+            raise ValueError("daily_limit cannot exceed 100")
         if (
             not isinstance(max_attempts, int)
             or isinstance(max_attempts, bool)

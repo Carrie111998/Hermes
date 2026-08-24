@@ -14926,6 +14926,64 @@ def test_claude_visibility_store_accepts_raised_daily_limit(db: SessionDB) -> No
     assert claim.status == "claimed"
 
 
+def test_claude_auth_recovery_accepts_the_same_raised_daily_limit(
+    db: SessionDB,
+) -> None:
+    # 2026-08-23 raised the launch-claim ceiling from 25 to 100 but left the
+    # auth-recovery validator pinned at 25. cli.py hands BOTH paths the same
+    # policy.daily_registration_limit, and the live config sets it to 50, so
+    # every recovery claim raised ValueError out of an unguarded call site
+    # (cli.py `_recover_auth_failure`) instead of returning a status.
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-recovery-raised-limit")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
+    launch = store.claim_claude_visibility_job(100.0, 10, 50, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-00000000ab01",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=50,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+
+    assert recovery["status"] == "claimed"
+
+
+def test_claude_auth_recovery_rejects_daily_limit_above_hard_ceiling(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-recovery-ceiling")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    with pytest.raises(ValueError, match="cannot exceed 100"):
+        store.claim_claude_auth_recovery(
+            job_id=identity.job_id,
+            reserved_claude_uuid=identity.claude_uuid,
+            operation_id="6ae1c4de-0000-4000-8000-00000000ab02",
+            evidence_digest="a" * 64,
+            prompt_digest="b" * 64,
+            now=100.0,
+            lease_seconds=10,
+            daily_limit=101,
+            cost_limit="1.00",
+            reserved_cost="0.02",
+            max_attempts=5,
+        )
+
+
 def test_claude_visibility_emergency_cost_gate_is_independent(db: SessionDB) -> None:
     store = SessionBridgeStore(
         db, clock=lambda: 1_768_608_000.0, local_timezone=timezone.utc
