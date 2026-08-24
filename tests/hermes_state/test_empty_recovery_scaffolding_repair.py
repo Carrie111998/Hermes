@@ -2,7 +2,11 @@
 
 import pytest
 
-from hermes_state import SessionDB
+from agent.conversation_loop import _EMPTY_TOOL_RESPONSE_NUDGE
+from hermes_state import (
+    _PERSISTED_EMPTY_RECOVERY_NUDGE,
+    SessionDB,
+)
 
 
 _EMPTY_RECOVERY_NUDGE = (
@@ -43,6 +47,10 @@ def _seed_polluted_session(db, session_id="s1"):
     db.append_message(session_id, role="assistant", content="(empty)")
     db.append_message(session_id, role="user", content=_EMPTY_RECOVERY_NUDGE)
     db.append_message(session_id, role="assistant", content="Recovered answer.")
+
+
+def test_repair_signature_matches_live_empty_recovery_nudge():
+    assert _PERSISTED_EMPTY_RECOVERY_NUDGE == _EMPTY_TOOL_RESPONSE_NUDGE
 
 
 def test_resume_strips_persisted_empty_recovery_scaffolding(db):
