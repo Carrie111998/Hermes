@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import requests
 
 from tools.browser_camofox import (
     camofox_back,
@@ -106,6 +107,42 @@ class TestCamofoxNavigate:
         assert result["success"] is True
         assert result["url"] == "https://example.com"
 
+
+    def test_recovers_from_stale_tab_410_after_camofox_restart(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        stale_response = _mock_response(status=410)
+        stale_response.raise_for_status.side_effect = requests.HTTPError(
+            "Gone", response=stale_response
+        )
+
+        with (
+            patch(
+                "tools.browser_camofox.requests.get",
+                return_value=_mock_response(
+                    json_data={"snapshot": "", "refsCount": 0}
+                ),
+            ),
+            patch(
+                "tools.browser_camofox.requests.post",
+                side_effect=[
+                    _mock_response(
+                        json_data={"tabId": "stale-tab", "url": "https://a.com"}
+                    ),
+                    stale_response,
+                    _mock_response(
+                        json_data={"tabId": "fresh-tab", "url": "https://b.com"}
+                    ),
+                ],
+            ) as mock_post,
+        ):
+            first = json.loads(camofox_navigate("https://a.com", task_id="restart-410"))
+            second = json.loads(camofox_navigate("https://b.com", task_id="restart-410"))
+
+        assert first["success"] is True
+        assert second["success"] is True
+        assert second["url"] == "https://b.com"
+        assert "/tabs/stale-tab/navigate" in mock_post.call_args_list[1].args[0]
+        assert mock_post.call_args_list[2].args[0].endswith("/tabs")
 
     def test_connection_error_returns_helpful_message(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:19999")

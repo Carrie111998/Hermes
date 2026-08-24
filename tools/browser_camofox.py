@@ -521,7 +521,8 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             session = _ensure_tab(task_id, browser_url)
             data = {"ok": True, "url": browser_url}
         else:
-            # Navigate existing tab — recover from stale tab 404
+            # Recover when Camofox no longer knows the locally cached tab.
+            # The tab reaper returns 404; a container restart returns 410.
             try:
                 data = _post(
                     f"/tabs/{session['tab_id']}/navigate",
@@ -529,11 +530,13 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                     timeout=60,
                 )
             except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 404:
+                status = e.response.status_code if e.response is not None else None
+                if status in (404, 410):
                     logger.warning(
-                        "Camofox tab %s returned 404 — tab was garbage collected. "
+                        "Camofox tab %s returned %s — tab is stale. "
                         "Creating a fresh tab.",
                         session["tab_id"],
+                        status,
                     )
                     session["tab_id"] = None
                     session = _ensure_tab(task_id, browser_url)
