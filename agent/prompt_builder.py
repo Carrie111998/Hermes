@@ -1902,6 +1902,35 @@ def _build_skills_system_prompt_inner(
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
+    # Include skills-dir manifest fingerprint so a newly installed skill
+    # invalidates the in-process LRU even though the install runs in a
+    # different process from the long-running gateway (#92313).
+    try:
+        manifest = _build_skills_manifest(skills_dir)
+        manifest_fp = tuple(sorted((k, tuple(v)) for k, v in manifest.items()))
+    except Exception:
+        manifest_fp = ()
+    # Also fingerprint external/project dirs (best-effort, ignore errors).
+    try:
+        ext_manifest = tuple(
+            sorted(
+                (k, tuple(v))
+                for d in external_dirs
+                for k, v in _build_skills_manifest(d).items()
+            )
+        )
+    except Exception:
+        ext_manifest = ()
+    try:
+        proj_manifest = tuple(
+            sorted(
+                (k, tuple(v))
+                for d in project_dirs
+                for k, v in _build_skills_manifest(d).items()
+            )
+        )
+    except Exception:
+        proj_manifest = ()
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1911,6 +1940,9 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        manifest_fp,
+        ext_manifest,
+        proj_manifest,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
