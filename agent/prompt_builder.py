@@ -1391,6 +1391,32 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
+def _current_task_backend(default: str) -> str:
+    """Resolve the prompt's backend from task-scoped tool overrides."""
+
+    try:
+        from gateway.session_context import get_session_env
+
+        task_id = (
+            get_session_env("HERMES_SESSION_ID", "")
+            or os.getenv("HERMES_SESSION_ID", "")
+        )
+    except Exception:
+        task_id = os.getenv("HERMES_SESSION_ID", "")
+    if not task_id:
+        return default
+    try:
+        from tools.terminal_tool import get_effective_env_config
+
+        return (
+            str(get_effective_env_config(task_id).get("env_type") or default)
+            .strip()
+            .lower()
+        )
+    except Exception:
+        return default
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 
@@ -1412,7 +1438,9 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    backend = _current_task_backend(
+        (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    )
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS
 
     if not is_remote_backend:

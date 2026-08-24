@@ -43,7 +43,13 @@ def test_set_session_env_sets_contextvars(monkeypatch):
         user_name="alice",
         thread_id="17585",
     )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="telegram:dm:-1001:123456",
+        session_id="session-123",
+    )
 
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
@@ -65,6 +71,8 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
+    assert get_session_env("HERMES_SESSION_KEY") == "telegram:dm:-1001:123456"
+    assert get_session_env("HERMES_SESSION_ID") == "session-123"
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None

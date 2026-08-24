@@ -2675,6 +2675,7 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.ssh_mode import GatewaySshModeMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -5519,7 +5520,18 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
-        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        # Resolve the durable session binding before constructing or reusing
+        # the agent so terminal, file, and execute_code share one backend.
+        self._runner._prepare_ssh_runtime(
+            session_key=ctx.session_key or "",
+            task_id=ctx.session_id or ctx.session_key or "default",
+        )
+
+        turn_route = self._runner._resolve_turn_agent_config(
+            ctx.message,
+            model,
+            runtime_kwargs,
+        )
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -5541,12 +5553,18 @@ class TurnRunner:
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
         # schemas for prompt cache hits.
+        _cache_busting = dict(
+            self._runner._extract_cache_busting_config(ctx.user_config) or {}
+        )
+        _cache_busting.update(
+            self._runner._ssh_backend_signature(ctx.session_key or "")
+        )
         _sig = self._runner._agent_config_signature(
             turn_route["model"],
             turn_route["runtime"],
             ctx.enabled_toolsets,
             combined_ephemeral,
-            cache_keys=self._runner._extract_cache_busting_config(ctx.user_config),
+            cache_keys=_cache_busting,
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
@@ -6726,7 +6744,12 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+    GatewaySshModeMixin,
+):
     """
     Main gateway controller.
 
@@ -16478,6 +16501,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
+                "ssh": self._handle_ssh_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
@@ -17603,6 +17627,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "ssh":
+            return await self._handle_ssh_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -24677,6 +24704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,

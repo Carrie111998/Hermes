@@ -1223,6 +1223,80 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # Thread-safe because each task_id is unique per rollout.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 
+_BACKEND_OVERRIDE_KEYS = frozenset({
+    "env_type",
+    "ssh_alias",
+    "ssh_host",
+    "ssh_user",
+    "ssh_port",
+    "ssh_key",
+    "ssh_persistent",
+    "ssh_binding_error",
+})
+
+
+def _task_environment_cache_keys(task_id: str) -> set[str]:
+    """Return every environment/cache key that may represent *task_id*."""
+
+    raw = str(task_id or "default")
+    keys = {raw}
+    try:
+        keys.add(_resolve_container_task_id(raw))
+    except Exception:
+        pass
+    session_key = _current_session_key()
+    if session_key:
+        keys.add(f"session:{session_key}")
+    return {key for key in keys if key}
+
+
+def evict_task_environment(
+    task_id: str,
+    *,
+    cache_keys: set[str] | None = None,
+) -> None:
+    """Evict cached terminal/file environments after a backend change."""
+
+    keys = set(cache_keys or ())
+    keys.update(_task_environment_cache_keys(task_id))
+    evicted: list[Any] = []
+    seen_envs: set[int] = set()
+    with _env_lock:
+        for key in keys:
+            env = _active_environments.pop(key, None)
+            _last_activity.pop(key, None)
+            if env is not None and id(env) not in seen_envs:
+                seen_envs.add(id(env))
+                evicted.append(env)
+    with _creation_locks_lock:
+        for key in keys:
+            _creation_locks.pop(key, None)
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        for key in keys:
+            clear_file_ops_cache(key)
+    except Exception:
+        logger.debug(
+            "Could not clear file cache for backend change on %s",
+            task_id,
+            exc_info=True,
+        )
+    for env in evicted:
+        try:
+            if hasattr(env, "cleanup"):
+                env.cleanup()
+            elif hasattr(env, "stop"):
+                env.stop()
+            elif hasattr(env, "terminate"):
+                env.terminate()
+        except Exception:
+            logger.debug(
+                "Error cleaning evicted environment for task %s",
+                task_id,
+                exc_info=True,
+            )
+
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
 # The durable source of truth for "which directory is THIS session working
@@ -1281,25 +1355,41 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     Register environment overrides for a specific task/rollout.
 
     Called by Atropos environments before the agent loop to configure
-    per-task sandbox settings (e.g., a custom Dockerfile for the Modal image).
+    per-task sandbox settings (e.g., a custom Dockerfile for the Modal image),
+    and by the gateway to apply an explicit session-scoped SSH binding.
 
     Supported override keys:
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - env_type: str -- Per-task backend selection (for example ``ssh``)
+        - ssh_host/user/port/key: Per-task SSH connection settings
 
     Args:
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    previous = dict(_task_env_overrides.get(task_id) or {})
+    previous_keys = _task_environment_cache_keys(task_id)
+    next_overrides = dict(overrides or {})
+    _task_env_overrides[task_id] = next_overrides
+    next_keys = _task_environment_cache_keys(task_id)
+
+    if any(
+        previous.get(key) != next_overrides.get(key)
+        for key in _BACKEND_OVERRIDE_KEYS
+    ):
+        evict_task_environment(
+            task_id,
+            cache_keys=previous_keys | next_keys,
+        )
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
     # mid-session via ``session/load`` / ``session/resume``) must take effect
     # immediately. The session record is what commands resolve against;
     # the live env's cwd is also updated so env-side seeding stays consistent.
-    new_cwd = overrides.get("cwd")
+    new_cwd = next_overrides.get("cwd")
     if isinstance(new_cwd, str) and new_cwd.strip():
         # A registered workspace cwd IS the session's working directory until
         # a `cd` changes it.
@@ -1322,10 +1412,14 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
+    previous = dict(_task_env_overrides.get(task_id) or {})
+    previous_keys = _task_environment_cache_keys(task_id)
     _task_env_overrides.pop(task_id, None)
     clear_session_cwd(task_id)
     with _container_alias_lock:
         _container_aliases.pop(task_id, None)
+    if set(previous) & _BACKEND_OVERRIDE_KEYS:
+        evict_task_environment(task_id, cache_keys=previous_keys)
 
 
 # Subagent → parent container aliasing.  delegate_task children get their own
@@ -1762,6 +1856,56 @@ def _get_env_config() -> Dict[str, Any]:
     }
 
 
+def apply_task_env_overrides(
+    config: Dict[str, Any],
+    overrides: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Return a copy of terminal config with task-scoped overrides applied."""
+
+    merged = dict(config or {})
+    task_overrides = dict(overrides or {})
+    previous_env_type = str(merged.get("env_type") or "local")
+    if task_overrides.get("env_type"):
+        merged["env_type"] = str(task_overrides["env_type"]).strip().lower()
+        if (
+            merged["env_type"] == "ssh"
+            and previous_env_type != "ssh"
+            and not task_overrides.get("cwd")
+        ):
+            # A process-global local cwd is a host path and must never become
+            # the implicit cwd of a newly selected remote backend.
+            merged["cwd"] = "~"
+            merged["host_cwd"] = None
+    if task_overrides.get("cwd"):
+        merged["cwd"] = str(task_overrides["cwd"])
+    for key in (
+        "ssh_alias",
+        "ssh_host",
+        "ssh_user",
+        "ssh_key",
+        "ssh_binding_error",
+    ):
+        if key in task_overrides:
+            merged[key] = str(task_overrides.get(key) or "")
+    if "ssh_port" in task_overrides:
+        try:
+            merged["ssh_port"] = int(task_overrides.get("ssh_port") or 22)
+        except (TypeError, ValueError):
+            merged["ssh_port"] = 22
+    if "ssh_persistent" in task_overrides:
+        merged["ssh_persistent"] = bool(task_overrides.get("ssh_persistent"))
+    return merged
+
+
+def get_effective_env_config(task_id: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve global terminal config plus task/session backend overrides."""
+
+    return apply_task_env_overrides(
+        _get_env_config(),
+        resolve_task_overrides(task_id),
+    )
+
+
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     """Resolve direct vs managed Modal backend selection."""
     return resolve_modal_backend_state(
@@ -1784,6 +1928,7 @@ def _ssh_config_from_config(config: Dict[str, Any]) -> dict:
         "port": config.get("ssh_port", 22),
         "key": config.get("ssh_key", ""),
         "persistent": config.get("ssh_persistent", False),
+        "binding_error": config.get("ssh_binding_error", ""),
     }
 
 
@@ -1987,6 +2132,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
 
     elif env_type == "ssh":
+        binding_error = str((ssh_config or {}).get("binding_error") or "").strip()
+        if binding_error:
+            raise ValueError(binding_error)
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
         return _SSHEnvironment(
@@ -2126,7 +2274,7 @@ def ensure_task_env(task_id: Optional[str] = None):
     instance, or ``None`` when local or when creation fails (best-effort: a
     failure leaves the caller's fail-closed error path intact).
     """
-    config = _get_env_config()
+    config = get_effective_env_config(task_id)
     env_type = config["env_type"]
     if env_type == "local":
         return None
@@ -2717,8 +2865,8 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
-        # Get configuration
-        config = _get_env_config()
+        # Get configuration, including an explicit per-session backend binding.
+        config = get_effective_env_config(task_id)
         env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
