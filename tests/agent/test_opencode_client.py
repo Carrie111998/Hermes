@@ -263,10 +263,11 @@ def test_server_singleton_spawn_readiness_and_release(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_OPENCODE_SERVER_URL", raising=False)
     oc._reset_server_singleton()
     try:
-        handle = oc.acquire_opencode_server()
+        handle = oc.acquire_opencode_server(working_directory=str(tmp_path))
         assert handle.base_url.startswith("http://127.0.0.1:")
-        # Second acquire reuses the same process.
-        again = oc.acquire_opencode_server()
+        key = str(tmp_path)
+        # Second acquire for the same directory reuses the same process.
+        again = oc.acquire_opencode_server(working_directory=str(tmp_path))
         assert again is handle
         import urllib.request
 
@@ -278,7 +279,7 @@ def test_server_singleton_spawn_readiness_and_release(tmp_path, monkeypatch):
         while handle.proc.poll() is None and time.time() < deadline:
             time.sleep(0.05)
         assert handle.proc.poll() is not None
-        assert oc._server_state() is None
+        assert key not in oc._server_state()
     finally:
         oc._reset_server_singleton()
 

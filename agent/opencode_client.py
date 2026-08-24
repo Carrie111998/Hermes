@@ -64,7 +64,11 @@ class _UrllibTransport:
 # ---------------------------------------------------------------------------
 
 _server_lock = threading.Lock()
-_server_handle: Optional["_ServerHandle"] = None
+# One shared server per working directory: OpenCode pins sessions (and,
+# critically, native question registration over ``GET /question``) to the
+# server's *instance* directory — its startup cwd — so a server spawned in an
+# unrelated cwd would silently hide every interactive question.
+_servers: Dict[str, "_ServerHandle"] = {}
 
 
 class _ServerHandle:
@@ -74,15 +78,14 @@ class _ServerHandle:
         self.refcount = 0
 
 
-def _server_state() -> Optional[_ServerHandle]:
-    return _server_handle
+def _server_state() -> Dict[str, "_ServerHandle"]:
+    return dict(_servers)
 
 
 def _reset_server_singleton() -> None:
-    """Test hook: forget the singleton without killing anything."""
-    global _server_handle
+    """Test hook: forget all servers without killing anything."""
     with _server_lock:
-        _server_handle = None
+        _servers.clear()
 
 
 def _free_port() -> int:
@@ -118,16 +121,20 @@ def _wait_ready(base_url: str, timeout: float) -> None:
     raise RuntimeError(f"opencode server not ready at {base_url}: {last_error or 'no response'}")
 
 
-def acquire_opencode_server(ready_timeout: float = _DEFAULT_READY_TIMEOUT) -> _ServerHandle:
-    """Return the shared server handle, spawning ``opencode serve`` if needed."""
-    global _server_handle
+def acquire_opencode_server(
+    working_directory: str = "",
+    ready_timeout: float = _DEFAULT_READY_TIMEOUT,
+) -> _ServerHandle:
+    """Return the shared server handle for ``working_directory``, spawning one if needed."""
+    key = os.path.abspath(working_directory or os.getcwd())
     with _server_lock:
-        if _server_handle is not None:
-            proc = _server_handle.proc
+        handle = _servers.get(key)
+        if handle is not None:
+            proc = handle.proc
             if proc is None or proc.poll() is None:
-                _server_handle.refcount += 1
-                return _server_handle
-            _server_handle = None  # dead process: respawn below
+                handle.refcount += 1
+                return handle
+            _servers.pop(key, None)  # dead process: respawn below
 
         external = os.environ.get("HERMES_OPENCODE_SERVER_URL", "").strip()
         if external:
@@ -135,14 +142,16 @@ def acquire_opencode_server(ready_timeout: float = _DEFAULT_READY_TIMEOUT) -> _S
             handle = _ServerHandle(external.rstrip("/"), None)
         else:
             port = _free_port()
-            # ``--pure``: delegate sessions are headless workers; user TUI
-            # plugins are not loaded (they have hung the model stream on real
-            # installs, e.g. oh-my-opencode variants, and add no value here).
             cmd = _opencode_command() + [
-                "serve", "--pure", "--port", str(port), "--hostname", "127.0.0.1",
+                "serve", "--port", str(port), "--hostname", "127.0.0.1",
             ]
+            # Spawn with cwd = the session's working directory: OpenCode's
+            # instance directory (startup cwd) controls which sessions (and
+            # their pending native questions) are addressable, and user
+            # plugins load normally.
             proc = subprocess.Popen(
                 cmd,
+                cwd=key if os.path.isdir(key) else None,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -160,18 +169,18 @@ def acquire_opencode_server(ready_timeout: float = _DEFAULT_READY_TIMEOUT) -> _S
                 handle.proc.terminate()
             raise
         handle.refcount = 1
-        _server_handle = handle
+        _servers[key] = handle
         return handle
 
 
 def release_opencode_server(handle: _ServerHandle) -> None:
-    global _server_handle
     with _server_lock:
         handle.refcount -= 1
         if handle.refcount > 0:
             return
-        if _server_handle is handle:
-            _server_handle = None
+        for key, current in list(_servers.items()):
+            if current is handle:
+                del _servers[key]
     proc = handle.proc
     if proc is not None and proc.poll() is None:
         proc.terminate()
@@ -207,6 +216,8 @@ class OpenCodeClient:
         self._transport: Optional[_Transport] = None
         self._server_handle: Optional[_ServerHandle] = None
         self.native_session_id: Optional[str] = None
+        # Question ids already replied/rejected (SSE watcher + poll loop race).
+        self._answered_questions: set = set()
         self.is_closed = False
 
     # -- internals ---------------------------------------------------------
@@ -221,7 +232,7 @@ class OpenCodeClient:
             self._transport = self._transport_factory(self.cwd)
             return self._transport
         if self._server_handle is None:
-            self._server_handle = acquire_opencode_server()
+            self._server_handle = acquire_opencode_server(working_directory=self.cwd)
         self._transport = _UrllibTransport(self._server_handle.base_url)
         return self._transport
 
@@ -277,7 +288,7 @@ class OpenCodeClient:
     def _answer_pending_questions(self) -> None:
         for request in self._pending_questions():
             request_id = str(request.get("id") or "")
-            if not request_id:
+            if not request_id or request_id in self._answered_questions:
                 continue
             questions = request.get("questions") or []
             answers: List[List[str]] = []
@@ -297,12 +308,20 @@ class OpenCodeClient:
                         reject = True
                         break
                 answers.append([answer])
-            if reject:
-                self._request("POST", f"/question/{request_id}/reject{self._qdir()}", {})
-                logger.info("Rejected unanswerable opencode question %s", request_id)
-            else:
-                self._request("POST", f"/question/{request_id}/reply{self._qdir()}", {"answers": answers})
-                logger.info("Replied to opencode question %s: %s", request_id, answers)
+            try:
+                if reject:
+                    self._request("POST", f"/question/{request_id}/reject{self._qdir()}", {})
+                    logger.info("Rejected unanswerable opencode question %s", request_id)
+                else:
+                    self._request("POST", f"/question/{request_id}/reply{self._qdir()}", {"answers": answers})
+                    logger.info("Replied to opencode question %s: %s", request_id, answers)
+            except RuntimeError as exc:
+                # The SSE watcher and the poll loop can race on the same
+                # question; whoever loses gets QuestionNotFoundError (404).
+                if "QuestionNotFound" not in str(exc):
+                    raise
+                logger.debug("opencode question %s already answered elsewhere", request_id)
+            self._answered_questions.add(request_id)
 
     @staticmethod
     def _match_label(answer: str, options: List[str]) -> Optional[str]:
@@ -315,6 +334,60 @@ class OpenCodeClient:
             if 1 <= index <= len(options):
                 return options[index - 1]
         return None
+
+    def _event_stream_idle(self, timeout: float, idle_flag: "threading.Event") -> None:
+        """Watch the SSE ``/event`` stream; set ``idle_flag`` on ``session.idle``.
+
+        Also answers questions immediately when a ``question.asked`` event for
+        this session arrives (the REST ``/question`` listing lags by several
+        seconds — often past the question's own expiry). Best-effort: transport
+        errors simply stop the watcher (the polling fallback in
+        ``run_session_prompt`` decides completion).
+        """
+        try:
+            transport = self._http()
+            url = f"{transport.base_url}/event{self._qdir()}"  # type: ignore[attr-defined]
+            req = urllib.request.Request(url, headers={"accept": "text/event-stream"})
+            with urllib.request.urlopen(req, timeout=max(5.0, timeout)) as resp:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline and not idle_flag.is_set():
+                    raw = resp.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        event = json.loads(line[5:].strip())
+                    except ValueError:
+                        continue
+                    etype = event.get("type")
+                    props = event.get("properties") or {}
+                    if etype == "session.idle" and str(props.get("sessionID") or "") == self.native_session_id:
+                        idle_flag.set()
+                        return
+                    if etype in ("question.asked", "question.v2.asked") and str(
+                        props.get("sessionID") or ""
+                    ) == self.native_session_id:
+                        try:
+                            self._answer_pending_questions()
+                        except Exception:
+                            logger.debug("SSE question auto-answer failed", exc_info=True)
+        except Exception:
+            logger.debug("opencode event stream failed; polling decides completion", exc_info=True)
+
+    def _final_reply_text(self, baseline_ids: set) -> str:
+        """Fetch the transcript and join fresh assistant text parts."""
+        _status, data = self._request("GET", f"/session/{self.native_session_id}/message{self._qdir()}")
+        messages = data if isinstance(data, list) else (data or {}).get("data") or []
+        messages = sorted(messages, key=self._message_sort_key)
+        fresh = [m for m in messages if m.get("info", {}).get("id") not in baseline_ids]
+        return "\n".join(
+            self._assistant_text(m)
+            for m in fresh
+            if (m.get("info") or {}).get("role") == "assistant"
+            and self._assistant_text(m)
+        ).strip()
 
     def run_session_prompt(
         self,
@@ -331,68 +404,96 @@ class OpenCodeClient:
         deadline = time.monotonic() + timeout_seconds
         last_snapshot: Optional[tuple] = None
         stable_since: Optional[float] = None
-        # OpenCode's /question registration and message-part updates lag behind
-        # the live turn by several seconds; completion therefore requires the
-        # transcript to be unchanged for this long (not merely two polls).
+        # Completion signal, in order of reliability:
+        #   1. SSE ``session.idle`` for this session (authoritative; watched on
+        #      a background thread so question answering keeps running).
+        #   2. Fallback heuristic: transcript (IDs + part payloads) unchanged
+        #      for the stable window with a fresh assistant message, no tool
+        #      part running, and no pending question. Snapshot polling alone is
+        #      unreliable because /question registration lags the live turn by
+        #      many seconds and empty assistant shells appear immediately.
         stable_window = min(max(5.0, poll_interval * 4), max(1.0, timeout_seconds / 3.0))
-        while time.monotonic() < deadline:
-            self._answer_pending_questions()
-            _status, data = self._request("GET", f"/session/{self.native_session_id}/message{self._qdir()}")
-            messages = data if isinstance(data, list) else (data or {}).get("data") or []
-            messages = sorted(messages, key=self._message_sort_key)
-            fresh = [m for m in messages if m.get("info", {}).get("id") not in baseline_ids]
-            # Snapshot must cover message IDs AND part payloads: OpenCode
-            # streams parts into an existing message, so an ID-only snapshot
-            # goes "stable" while the turn is still mid-flight.
-            snapshot = tuple(
-                (
-                    (m.get("info") or {}).get("id"),
-                    tuple(sorted(str(p) for p in (m.get("parts") or []))),
+        idle_flag = threading.Event()
+        watcher = threading.Thread(
+            target=self._event_stream_idle,
+            args=(timeout_seconds, idle_flag),
+            daemon=True,
+        )
+        watcher.start()
+        try:
+            while time.monotonic() < deadline:
+                self._answer_pending_questions()
+                _status, data = self._request("GET", f"/session/{self.native_session_id}/message{self._qdir()}")
+                messages = data if isinstance(data, list) else (data or {}).get("data") or []
+                messages = sorted(messages, key=self._message_sort_key)
+                fresh = [m for m in messages if m.get("info", {}).get("id") not in baseline_ids]
+                snapshot = tuple(
+                    (
+                        (m.get("info") or {}).get("id"),
+                        tuple(sorted(str(p) for p in (m.get("parts") or []))),
+                    )
+                    for m in messages
                 )
-                for m in messages
-            )
-            if snapshot == last_snapshot:
-                if stable_since is None:
-                    stable_since = time.monotonic()
-            else:
-                stable_since = None
-                last_snapshot = snapshot
-            # A multi-step turn emits intermediate assistant text before tool
-            # calls, so completion is "transcript unchanged for the stable
-            # window, nothing pending, and no tool part still running" rather
-            # than "first text part".  (A question tool can be 'running'
-            # briefly before its entry appears in /question.)
-            tools_running = any(
-                (part or {}).get("type") == "tool"
-                and (part.get("state") or {}).get("status") == "running"
-                for m in fresh
-                for part in (m.get("parts") or [])
-            )
-            if (
-                stable_since is not None
-                and time.monotonic() - stable_since >= stable_window
-                and fresh
-                and not tools_running
-                and not self._pending_questions()
-            ):
-                text = "\n".join(
-                    part
+                if snapshot == last_snapshot:
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                else:
+                    stable_since = None
+                    last_snapshot = snapshot
+                tools_running = any(
+                    (part or {}).get("type") == "tool"
+                    and (part.get("state") or {}).get("status") == "running"
                     for m in fresh
-                    if (m.get("info") or {}).get("role") == "assistant"
-                    for part in [self._assistant_text(m)]
-                    if part
-                ).strip()
-                if text:
-                    return {
-                        "text": text,
-                        "state": {"sessionId": self.native_session_id},
-                        "duration_s": time.monotonic() - started,
-                    }
-                raise RuntimeError(
-                    "OpenCode turn ended without an assistant text reply "
-                    "(a pending question may have been rejected)"
+                    for part in (m.get("parts") or [])
                 )
-            time.sleep(poll_interval)
+                has_assistant = any(
+                    (m.get("info") or {}).get("role") == "assistant" and (m.get("parts") or [])
+                    for m in fresh
+                )
+                # Idle events can be observed before the transcript fetch
+                # below reflects them; give the message endpoint a short
+                # grace period after the flag trips so the final text lands.
+                completed = idle_flag.is_set() and (
+                    not tools_running or time.monotonic() - started > timeout_seconds
+                )
+                if completed or (
+                    stable_since is not None
+                    and time.monotonic() - stable_since >= stable_window
+                    and fresh
+                    and has_assistant
+                    and not tools_running
+                    and not self._pending_questions()
+                ):
+                    if idle_flag.is_set() and tools_running:
+                        # Idle raced a still-running tool part: keep waiting.
+                        idle_flag.clear()
+                        continue
+                    text = self._final_reply_text(baseline_ids)
+                    if text:
+                        return {
+                            "text": text,
+                            "state": {"sessionId": self.native_session_id},
+                            "duration_s": time.monotonic() - started,
+                        }
+                    if idle_flag.is_set():
+                        # Authoritative idle but no assistant text yet: one
+                        # short re-check before declaring the turn empty.
+                        time.sleep(min(2.0, poll_interval * 2))
+                        text = self._final_reply_text(baseline_ids)
+                        if text:
+                            return {
+                                "text": text,
+                                "state": {"sessionId": self.native_session_id},
+                                "duration_s": time.monotonic() - started,
+                            }
+                    raise RuntimeError(
+                        "OpenCode turn ended without an assistant text reply "
+                        "(a pending question may have been rejected)"
+                    )
+                time.sleep(poll_interval)
+        finally:
+            idle_flag.set()  # stop the SSE watcher
+            watcher.join(timeout=5)
         # Timed out: best-effort abort, then surface the timeout.
         try:
             self.abort(timeout=10.0)
