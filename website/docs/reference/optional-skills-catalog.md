@@ -182,7 +182,7 @@ hermes skills uninstall <skill-name>
 
 | Skill | Description |
 |-------|-------------|
-| [**coinbase-cli**](/docs/user-guide/skills/optional/payments/payments-coinbase-cli) | Trade, manage portfolios, and pay x402 resources. |
+| [**coinbase**](/docs/user-guide/skills/optional/payments/payments-coinbase) | Manage Coinbase accounts, orders, and payments. |
 | [**mpp-agent**](/docs/user-guide/skills/optional/payments/payments-mpp-agent) | Pay HTTP 402 APIs via Machine Payments Protocol (MPP). |
 | [**stripe-link-cli**](/docs/user-guide/skills/optional/payments/payments-stripe-link-cli) | Agent payments via Stripe Link — cards, SPT, approvals. |
 | [**stripe-projects**](/docs/user-guide/skills/optional/payments/payments-stripe-projects) | Provision SaaS services + sync creds via Stripe Projects. |
