@@ -35,7 +35,11 @@ from agent.reasoning_effort import (
     codex_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
-from agent.transports.types import NormalizedResponse, ToolCall
+from agent.transports.types import (
+    NormalizedResponse,
+    ToolCall,
+    map_finish_reason as _map_finish_reason,
+)
 
 
 def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
@@ -891,7 +895,7 @@ class ResponsesApiTransport(ProviderTransport):
                 extra_body.pop("prompt_cache_key", None)
         return normalized
 
-    def map_finish_reason(self, raw_reason: str) -> str:
+    def map_finish_reason(self, raw_reason: str | None) -> str | None:
         """Map Codex response.status to OpenAI finish_reason.
 
         Codex uses response.status ('completed', 'incomplete') +
@@ -905,7 +909,7 @@ class ResponsesApiTransport(ProviderTransport):
             "failed": "stop",
             "cancelled": "stop",
         }
-        return _MAP.get(raw_reason, "stop")
+        return _map_finish_reason(raw_reason, _MAP)
 
 
 # Auto-register on import

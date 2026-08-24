@@ -1025,6 +1025,10 @@ class TestCodexMapFinishReason:
     def test_completed(self, transport):
         assert transport.map_finish_reason("completed") == "stop"
 
+    def test_unknown_and_missing_reasons_are_preserved(self, transport):
+        assert transport.map_finish_reason("provider_new") == "provider_new"
+        assert transport.map_finish_reason(None) is None
+
 
 
 

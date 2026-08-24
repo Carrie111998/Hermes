@@ -85,6 +85,95 @@ def test_real_sessiondb_verification_reads_only_the_persisted_tail(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("raw_reason", "expected"),
+    [
+        (None, "incomplete"),
+        ("provider_new", "incomplete"),
+        ("length", "incomplete"),
+        ("stop", "complete"),
+    ],
+)
+def test_raw_chat_reason_survives_normalization_persistence_and_settlement(
+    tmp_path, raw_reason, expected
+):
+    """The real OpenAI-compatible path must not erase finality uncertainty."""
+    from agent.transports import get_transport
+    from cron.scheduler import _verify_persisted_cron_final_message
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="answer", tool_calls=None),
+                finish_reason=raw_reason,
+            )
+        ],
+        usage=None,
+    )
+    normalized = get_transport("chat_completions").normalize_response(response)
+
+    db = SessionDB(tmp_path / f"chat-{raw_reason or 'missing'}.db")
+    try:
+        session_id = "cron-raw-chat"
+        db.create_session(session_id, source="cron")
+        db.append_message(session_id, "user", "run it")
+        db.append_message(
+            session_id,
+            "assistant",
+            normalized.content,
+            finish_reason=normalized.finish_reason,
+        )
+
+        assert _verify_persisted_cron_final_message(db, session_id) == expected
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("raw_reason", [None, "provider_new"])
+def test_raw_anthropic_reason_survives_normalization_persistence_and_settlement(
+    tmp_path, raw_reason
+):
+    """Anthropic's provider-specific mapper must preserve unknown finality."""
+    from agent.transports import get_transport
+    from cron.scheduler import _verify_persisted_cron_final_message
+
+    response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="partial answer")],
+        stop_reason=raw_reason,
+        usage=None,
+    )
+    normalized = get_transport("anthropic_messages").normalize_response(response)
+
+    db = SessionDB(tmp_path / f"anthropic-{raw_reason or 'missing'}.db")
+    try:
+        session_id = "cron-raw-anthropic"
+        db.create_session(session_id, source="cron")
+        db.append_message(session_id, "user", "run it")
+        db.append_message(
+            session_id,
+            "assistant",
+            normalized.content,
+            finish_reason=normalized.finish_reason,
+        )
+
+        assert _verify_persisted_cron_final_message(db, session_id) == "incomplete"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("finish_reason", [None, "length", "provider_new", "tool_calls"])
+def test_silent_marker_requires_terminal_finish_reason(finish_reason):
+    from cron.scheduler import _classify_persisted_cron_final_message
+
+    assert _classify_persisted_cron_final_message(
+        {
+            "role": "assistant",
+            "content": "[SILENT]",
+            "finish_reason": finish_reason,
+        }
+    ) == "incomplete"
+
+
+@pytest.mark.parametrize(
     "tail",
     [
         {"role": "assistant", "content": "partial", "finish_reason": "length"},

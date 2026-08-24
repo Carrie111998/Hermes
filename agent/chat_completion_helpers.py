@@ -3994,7 +3994,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "reasoning_content": "".join(reasoning_parts) or None,
                             "tool_calls": tool_calls or None,
                         },
-                        "finish_reason": finish_reason or "stop",
+                        # A stream without a terminal reason is not proof of
+                        # normal completion. Preserve the missing value for
+                        # durable consumers such as cron settlement.
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": usage_obj,
@@ -4354,8 +4357,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # arguments never received a single byte (name arrived,
                     # argument generation never started before the connection
                     # died). Left unflagged, this fell through to
-                    # `effective_finish_reason = finish_reason or "stop"`
-                    # below — a normal "stop" turn carrying a tool call whose
+                    # the explicit ``length`` marker below — a normal
+                    # ``stop`` turn carrying a tool call whose
                     # empty arguments string later gets silently coerced to
                     # "{}" at the dispatch boundary and executed with no
                     # arguments and no retry (#80498). Route it through the
@@ -4446,7 +4449,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 model_name, usage_obj,
             )
 
-        effective_finish_reason = finish_reason or "stop"
+        # Keep an absent stream terminator absent. The partial-tool-call
+        # branch below upgrades only the specifically detected truncation
+        # shape to ``length``; it must not turn every clean-but-unreasoned
+        # stream close into a false terminal ``stop``.
+        effective_finish_reason = finish_reason
         if has_truncated_tool_args:
             effective_finish_reason = "length"
 

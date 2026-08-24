@@ -7,7 +7,10 @@ This transport owns format conversion and normalization — NOT client lifecycle
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
-from agent.transports.types import NormalizedResponse
+from agent.transports.types import (
+    NormalizedResponse,
+    map_finish_reason as _map_finish_reason,
+)
 
 
 class AnthropicTransport(ProviderTransport):
@@ -159,7 +162,9 @@ class AnthropicTransport(ProviderTransport):
                     )
                 )
 
-        finish_reason = self._STOP_REASON_MAP.get(response.stop_reason, "stop")
+        finish_reason = _map_finish_reason(
+            getattr(response, "stop_reason", None), self._STOP_REASON_MAP
+        )
 
         provider_data = {}
         if reasoning_details:
@@ -240,9 +245,9 @@ class AnthropicTransport(ProviderTransport):
         "model_context_window_exceeded": "length",
     }
 
-    def map_finish_reason(self, raw_reason: str) -> str:
+    def map_finish_reason(self, raw_reason: str | None) -> str | None:
         """Map Anthropic stop_reason to OpenAI finish_reason."""
-        return self._STOP_REASON_MAP.get(raw_reason, "stop")
+        return _map_finish_reason(raw_reason, self._STOP_REASON_MAP)
 
 
 # Auto-register on import

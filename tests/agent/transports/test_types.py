@@ -116,11 +116,11 @@ class TestMapFinishReason:
         assert map_finish_reason("max_tokens", self.ANTHROPIC_MAP) == "length"
         assert map_finish_reason("refusal", self.ANTHROPIC_MAP) == "content_filter"
 
-    def test_unknown_reason_defaults_to_stop(self):
-        assert map_finish_reason("something_new", self.ANTHROPIC_MAP) == "stop"
+    def test_unknown_reason_is_preserved(self):
+        assert map_finish_reason("something_new", self.ANTHROPIC_MAP) == "something_new"
 
     def test_none_reason(self):
-        assert map_finish_reason(None, self.ANTHROPIC_MAP) == "stop"
+        assert map_finish_reason(None, self.ANTHROPIC_MAP) is None
 
 
 class TestNormalizedTerminalFinishReason:

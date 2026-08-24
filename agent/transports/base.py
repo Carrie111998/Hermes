@@ -80,7 +80,7 @@ class ProviderTransport(ABC):
         """
         return None
 
-    def map_finish_reason(self, raw_reason: str) -> str:
+    def map_finish_reason(self, raw_reason: str | None) -> str | None:
         """Optional: map provider-specific stop reason to OpenAI equivalent.
 
         Default returns the raw reason unchanged.  Override for providers

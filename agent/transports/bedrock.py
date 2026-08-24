@@ -9,7 +9,12 @@ boto3 calls stay on AIAgent.
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
-from agent.transports.types import NormalizedResponse, ToolCall, Usage
+from agent.transports.types import (
+    NormalizedResponse,
+    ToolCall,
+    Usage,
+    map_finish_reason as _map_finish_reason,
+)
 
 
 class BedrockTransport(ProviderTransport):
@@ -83,7 +88,7 @@ class BedrockTransport(ProviderTransport):
 
         choice = ns.choices[0]
         msg = choice.message
-        finish_reason = choice.finish_reason or "stop"
+        finish_reason = getattr(choice, "finish_reason", None)
 
         tool_calls = None
         if msg.tool_calls:
@@ -131,7 +136,7 @@ class BedrockTransport(ProviderTransport):
             return bool(response.choices)
         return False
 
-    def map_finish_reason(self, raw_reason: str) -> str:
+    def map_finish_reason(self, raw_reason: str | None) -> str | None:
         """Map Bedrock stop reason to OpenAI finish_reason.
 
         The adapter already does this mapping inside normalize_converse_response,
@@ -145,7 +150,7 @@ class BedrockTransport(ProviderTransport):
             "guardrail_intervened": "content_filter",
             "content_filtered": "content_filter",
         }
-        return _MAP.get(raw_reason, "stop")
+        return _map_finish_reason(raw_reason, _MAP)
 
 
 # Auto-register on import

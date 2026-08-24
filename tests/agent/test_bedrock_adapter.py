@@ -402,6 +402,22 @@ class TestNormalizeConverseStreamEvents:
         assert tc[0].function.name == "read_file"
         assert json.loads(tc[0].function.arguments) == {"path": "/tmp/f"}
 
+    def test_text_stream_without_message_stop_is_not_terminal(self):
+        from agent.bedrock_adapter import normalize_converse_stream_events
+
+        events = {"stream": [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockStart": {"contentBlockIndex": 0, "start": {}}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "partial"}}},
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"metadata": {"usage": {"inputTokens": 5, "outputTokens": 3}}},
+        ]}
+
+        result = normalize_converse_stream_events(events)
+
+        assert result.choices[0].message.content == "partial"
+        assert result.choices[0].finish_reason is None
+
 
 
 

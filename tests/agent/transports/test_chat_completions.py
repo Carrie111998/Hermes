@@ -31,7 +31,23 @@ class TestChatCompletionsBasic:
 
         assert normalized.content is None
         assert normalized.tool_calls is None
-        assert normalized.finish_reason == "stop"
+        assert normalized.finish_reason is None
+
+    def test_normalize_response_preserves_unknown_finish_reason(self, transport):
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="partial", tool_calls=None),
+                    finish_reason="provider_new",
+                )
+            ],
+            usage=None,
+        )
+
+        normalized = transport.normalize_response(response)
+
+        assert normalized.content == "partial"
+        assert normalized.finish_reason == "provider_new"
 
     def test_normalize_response_allows_sparse_tool_call_fields(self, transport):
         response = SimpleNamespace(
@@ -65,7 +81,7 @@ class TestChatCompletionsBasic:
 
         normalized = transport.normalize_response(response)
 
-        assert normalized.finish_reason == "stop"
+        assert normalized.finish_reason is None
         assert normalized.tool_calls is not None
         assert [tool.id for tool in normalized.tool_calls] == [
             "call-3",

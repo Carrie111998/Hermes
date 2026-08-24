@@ -83,6 +83,8 @@ class TestBedrockMapFinishReason:
 
     def test_end_turn(self, transport):
         assert transport.map_finish_reason("end_turn") == "stop"
+        assert transport.map_finish_reason("provider_new") == "provider_new"
+        assert transport.map_finish_reason(None) is None
 
 
 
@@ -122,6 +124,22 @@ class TestBedrockNormalize:
         assert nr.finish_reason == "tool_calls"
         assert len(nr.tool_calls) == 1
         assert nr.tool_calls[0].name == "terminal"
+
+    @pytest.mark.parametrize("stop_reason", [None, "provider_new"])
+    def test_normalize_preserves_unverified_stop_reason(self, transport, stop_reason):
+        raw = self._make_bedrock_response(stop_reason=stop_reason)
+        normalized = transport.normalize_response(raw)
+
+        assert normalized.content == "Hello"
+        assert normalized.finish_reason == stop_reason
+
+    def test_normalize_missing_stop_reason_stays_unverified(self, transport):
+        raw = self._make_bedrock_response()
+        raw.pop("stopReason")
+
+        normalized = transport.normalize_response(raw)
+
+        assert normalized.finish_reason is None
 
 
     def test_already_normalized_response(self, transport):

@@ -149,9 +149,38 @@ class TestCleanStreamEndMidToolCall:
         assert getattr(response, "_dropped_tool_names", None) == ["execute_code"]
 
 
+class TestCleanStreamEndWithoutFinishReason:
+    """A text stream that closes without a terminator must stay unverified."""
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_text_only_clean_close_does_not_become_stop(
+        self, _mock_close, mock_create, monkeypatch
+    ):
+        def _clean_ending_stream():
+            yield _make_stream_chunk(content="answer without terminator")
+            # Clean generator close: no finish_reason and no [DONE].
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = (
+            lambda *a, **kw: _clean_ending_stream()
+        )
+        mock_create.return_value = mock_client
+
+        agent = _make_agent()
+        agent._fire_stream_delta = lambda text: None
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].message.content == "answer without terminator"
+        assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
 
 
-# ── Clean stream-end before any argument byte arrives (#80498) ─────────────
+
+
+# ── Clean stream-end before any tool args arrives (#80498) ─────────────
 
 class TestCleanStreamEndBeforeAnyToolArgs:
     """The upstream closes the SSE stream cleanly right after delivering the

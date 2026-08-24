@@ -891,7 +891,10 @@ class ChatCompletionsTransport(ProviderTransport):
         _fr = getattr(choice, "finish_reason", None)
         if isinstance(_fr, int):
             _fr = str(_fr)
-        finish_reason = _fr or "stop"
+        # A missing provider finish_reason is uncertainty, not proof of a
+        # normal terminal response. Preserve it for durable consumers such as
+        # cron settlement; known provider values remain unchanged here.
+        finish_reason = _fr
 
         tool_calls = None
         message_tool_calls = getattr(msg, "tool_calls", None)

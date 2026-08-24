@@ -109,7 +109,10 @@ class NormalizedResponse:
 
     content: str | None
     tool_calls: list[ToolCall] | None
-    finish_reason: str  # "stop", "tool_calls", "length", "content_filter"
+    # Known provider reasons are normalized to the shared vocabulary. Unknown
+    # reasons are preserved verbatim and an absent reason stays None so a
+    # downstream durability check cannot mistake uncertainty for "stop".
+    finish_reason: str | None  # "stop", "tool_calls", "length", "content_filter"
     reasoning: str | None = None
     usage: Usage | None = None
     provider_data: dict[str, Any] | None = field(default=None, repr=False)
@@ -170,14 +173,18 @@ def build_tool_call(
     return ToolCall(id=id, name=name, arguments=args_str, provider_data=pd)
 
 
-def map_finish_reason(reason: str | None, mapping: dict[str, str]) -> str:
+def map_finish_reason(reason: str | None, mapping: dict[str, str]) -> str | None:
     """Translate a provider-specific stop reason to the normalised set.
 
-    Falls back to ``"stop"`` for unknown or ``None`` reasons.
+    Preserve unknown provider values and missing reasons.  Falling back to
+    ``"stop"`` would convert an unverified provider response into positive
+    terminal proof for consumers such as cron settlement.
     """
     if reason is None:
-        return "stop"
-    return mapping.get(reason, "stop")
+        return None
+    if not isinstance(reason, str):
+        reason = str(reason)
+    return mapping.get(reason, reason)
 
 
 def is_normalized_terminal_finish_reason(reason: str | None) -> bool:

@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
+from agent.transports.types import map_finish_reason
 
 logger = logging.getLogger(__name__)
 
@@ -914,7 +915,7 @@ def convert_messages_to_converse(
 # Response format conversion: Bedrock Converse → OpenAI
 # ---------------------------------------------------------------------------
 
-def _converse_stop_reason_to_openai(stop_reason: str) -> str:
+def _converse_stop_reason_to_openai(stop_reason: str | None) -> str | None:
     """Map Bedrock Converse stop reasons to OpenAI finish_reason values."""
     mapping = {
         "end_turn": "stop",
@@ -924,7 +925,7 @@ def _converse_stop_reason_to_openai(stop_reason: str) -> str:
         "content_filtered": "content_filter",
         "guardrail_intervened": "content_filter",
     }
-    return mapping.get(stop_reason, "stop")
+    return map_finish_reason(stop_reason, mapping)
 
 
 def normalize_converse_response(response: Dict) -> SimpleNamespace:
@@ -942,7 +943,9 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
     output = response.get("output", {})
     message = output.get("message", {})
     content_blocks = message.get("content", [])
-    stop_reason = response.get("stopReason", "end_turn")
+    # Bedrock normally supplies stopReason, but an absent field is not proof of
+    # a terminal turn. Preserve it so durable consumers can fail closed.
+    stop_reason = response.get("stopReason")
 
     text_parts = []
     reasoning_parts = []
@@ -1074,7 +1077,8 @@ def stream_converse_with_callbacks(
     current_tool: Optional[Dict] = None
     current_text_buffer: List[str] = []
     has_tool_use = False
-    stop_reason = "end_turn"
+    # A stream that closes without messageStop has no terminal proof.
+    stop_reason = None
     usage_data: Dict[str, int] = {}
 
     for event in event_stream.get("stream", []):
@@ -1149,7 +1153,7 @@ def stream_converse_with_callbacks(
                 current_text_buffer = []
 
         elif "messageStop" in event:
-            stop_reason = event["messageStop"].get("stopReason", "end_turn")
+            stop_reason = event["messageStop"].get("stopReason")
 
         elif "metadata" in event:
             meta_usage = event["metadata"].get("usage", {})

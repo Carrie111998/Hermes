@@ -113,7 +113,8 @@ class TestAnthropicTransport:
         assert transport.map_finish_reason("stop_sequence") == "stop"
         assert transport.map_finish_reason("refusal") == "content_filter"
         assert transport.map_finish_reason("model_context_window_exceeded") == "length"
-        assert transport.map_finish_reason("unknown") == "stop"
+        assert transport.map_finish_reason("unknown") == "unknown"
+        assert transport.map_finish_reason(None) is None
 
 
 
@@ -131,6 +132,31 @@ class TestAnthropicTransport:
         assert nr.content == "Hello world"
         assert nr.tool_calls is None or nr.tool_calls == []
         assert nr.finish_reason == "stop"
+
+    @pytest.mark.parametrize("raw_reason", [None, "provider_new"])
+    def test_normalize_response_preserves_unverified_reason(self, transport, raw_reason):
+        response = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="partial")],
+            stop_reason=raw_reason,
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+            model="claude-sonnet-4-6",
+        )
+
+        normalized = transport.normalize_response(response)
+
+        assert normalized.content == "partial"
+        assert normalized.finish_reason == raw_reason
+
+    def test_normalize_response_missing_reason_attribute_is_unverified(self, transport):
+        response = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="partial")],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+            model="claude-sonnet-4-6",
+        )
+
+        normalized = transport.normalize_response(response)
+
+        assert normalized.finish_reason is None
 
     def test_normalize_response_tool_calls(self, transport):
         """Test normalization of a tool-use response."""

@@ -611,12 +611,12 @@ def _classify_persisted_cron_final_message(message: Optional[dict]) -> str:
         text = content.strip() if isinstance(content, str) else ""
     if not text:
         return _CRON_SETTLEMENT_INCOMPLETE
-    if text == SILENT_MARKER:
-        return _CRON_SETTLEMENT_SILENT
     # Do not turn a denylist into a success predicate: a missing or new
     # provider reason is not proof that this assistant answer is terminal.
     if not is_normalized_terminal_finish_reason(message.get("finish_reason")):
         return _CRON_SETTLEMENT_INCOMPLETE
+    if text == SILENT_MARKER:
+        return _CRON_SETTLEMENT_SILENT
     return _CRON_SETTLEMENT_COMPLETE
 
 
