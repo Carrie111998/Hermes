@@ -1,0 +1,130 @@
+name: Export PR 93042 sparse merge snapshot
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export-sparse-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out Phase 4 head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: andrexibiza/hermes-agent
+          ref: phase4-desktop-fleet
+          fetch-depth: 0
+
+      - name: Build exact sparse base/head/main bundle
+        shell: bash
+        env:
+          MAIN_SHA: 057dcdf236f8a6a26721c10fcc6ccb72726e272a
+          EXPECTED_BASE_SHA: 91e867631e9d2eb9fbd69edd4459475d38070979
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream "$MAIN_SHA"
+          mkdir -p sparse-bundle
+
+          PHASE4_SHA="$(git rev-parse HEAD)"
+          BASE_SHA="$(git merge-base "$PHASE4_SHA" "$MAIN_SHA")"
+          test "$BASE_SHA" = "$EXPECTED_BASE_SHA"
+
+          python3 - "$BASE_SHA" "$PHASE4_SHA" "$MAIN_SHA" <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+
+          base_sha, head_sha, main_sha = sys.argv[1:]
+          out_dir = pathlib.Path("sparse-bundle")
+
+          def run(*args: str, env=None, input_bytes=None) -> bytes:
+              return subprocess.check_output(args, env=env, input=input_bytes)
+
+          raw_paths = run(
+              "git", "diff", "--name-only", "-z", "--no-renames", base_sha, head_sha
+          )
+          paths = sorted({p.decode("utf-8") for p in raw_paths.split(b"\0") if p})
+          (out_dir / "paths.txt").write_text("".join(f"{p}\n" for p in paths), encoding="utf-8")
+
+          refs = {"base": base_sha, "head": head_sha, "main": main_sha}
+          trees: dict[str, str] = {}
+
+          for label, ref in refs.items():
+              fd, index_path = tempfile.mkstemp(prefix=f"index-{label}-")
+              os.close(fd)
+              os.unlink(index_path)
+              env = dict(os.environ, GIT_INDEX_FILE=index_path)
+              subprocess.check_call(["git", "read-tree", "--empty"], env=env)
+
+              manifest: list[str] = []
+              for path in paths:
+                  record = run("git", "ls-tree", "-z", ref, "--", path)
+                  if not record:
+                      continue
+                  meta, actual_path = record[:-1].split(b"\t", 1)
+                  mode, obj_type, sha = meta.decode("ascii").split()
+                  if obj_type != "blob":
+                      raise RuntimeError(f"unsupported {obj_type} entry at {path}")
+                  actual = actual_path.decode("utf-8")
+                  subprocess.check_call(
+                      ["git", "update-index", "--add", "--cacheinfo", f"{mode},{sha},{actual}"],
+                      env=env,
+                  )
+                  manifest.append(f"{mode}\t{sha}\t{actual}\n")
+
+              tree = run("git", "write-tree", env=env).decode("ascii").strip()
+              trees[label] = tree
+              (out_dir / f"{label}-entries.tsv").write_text("".join(manifest), encoding="utf-8")
+              os.unlink(index_path)
+
+          fixed_env = dict(
+              os.environ,
+              GIT_AUTHOR_NAME="Hermes merge probe",
+              GIT_AUTHOR_EMAIL="merge-probe@example.invalid",
+              GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+              GIT_COMMITTER_NAME="Hermes merge probe",
+              GIT_COMMITTER_EMAIL="merge-probe@example.invalid",
+              GIT_COMMITTER_DATE="2000-01-01T00:00:00Z",
+          )
+          synthetic_base = run(
+              "git", "commit-tree", trees["base"], env=fixed_env, input_bytes=b"synthetic sparse base\n"
+          ).decode("ascii").strip()
+          synthetic_head = run(
+              "git", "commit-tree", trees["head"], "-p", synthetic_base,
+              env=fixed_env, input_bytes=b"synthetic sparse Phase 4 head\n"
+          ).decode("ascii").strip()
+          synthetic_main = run(
+              "git", "commit-tree", trees["main"], "-p", synthetic_base,
+              env=fixed_env, input_bytes=b"synthetic sparse current main\n"
+          ).decode("ascii").strip()
+
+          subprocess.check_call(["git", "update-ref", "refs/heads/sparse-head", synthetic_head])
+          subprocess.check_call(["git", "update-ref", "refs/heads/sparse-main", synthetic_main])
+          subprocess.check_call(
+              ["git", "bundle", "create", str(out_dir / "pr-93042-sparse.bundle"),
+               "refs/heads/sparse-head", "refs/heads/sparse-main"]
+          )
+
+          (out_dir / "source-shas.txt").write_text(
+              f"base={base_sha}\nhead={head_sha}\nmain={main_sha}\n"
+              f"synthetic_base={synthetic_base}\nsynthetic_head={synthetic_head}\n"
+              f"synthetic_main={synthetic_main}\n",
+              encoding="utf-8",
+          )
+          subprocess.check_call(["git", "bundle", "verify", str(out_dir / "pr-93042-sparse.bundle")])
+          PY
+
+      - name: Upload sparse three-way snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-93042-sparse-merge-snapshot
+          path: sparse-bundle
+          if-no-files-found: error
+          retention-days: 1
