@@ -1119,193 +1119,26 @@ def test_humanize_non_registration_403_passthrough():
 # ---------------------------------------------------------------------------
 
 
-class TestRefreshOn401:
-    """Tests for the async_auth_flow override that tries refresh before browser auth."""
-
-    @pytest.mark.asyncio
-    async def test_refresh_on_401_with_valid_refresh_token(self, tmp_path, monkeypatch):
-        """When a 401 is received and a refresh token is available, try refresh first."""
-        import httpx
-        
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        _set_interactive_stdin(monkeypatch)
-        provider = build_oauth_auth("test-refresh", "https://example.com/mcp")
-        assert provider is not None
-        
-        # Set up initial tokens with a refresh token
-        mock_token = MagicMock()
-        mock_token.access_token = "initial-access"
-        mock_token.refresh_token = "refresh-token-123"
-        mock_token.expires_in = 3600
-        mock_token.model_dump.return_value = {
-            "access_token": "initial-access",
-            "refresh_token": "refresh-token-123",
-            "expires_in": 3600,
-        }
-        provider.context.current_tokens = mock_token
-        provider.context.update_token_expiry(mock_token)
-        
-        # Create a mock request
-        mock_request = MagicMock()
-        mock_request.headers = {}
-        
-        # Mock the async generator to simulate httpx behavior
-        async def mock_flow():
-            # First yield is the initial request
-            yield mock_request
-            # Then we get back the response (simulated by httpx)
-            # The test will simulate what happens next
-        
-        # Test that _refresh_token is called when 401 is received
-        with patch.object(provider, '_refresh_token') as mock_refresh, \
-             patch.object(provider, '_handle_refresh_response') as mock_handle_refresh, \
-             patch.object(provider, '_add_auth_header'):
-            
-            mock_refresh_response = MagicMock()
-            mock_refresh.return_value = mock_refresh_response
-            mock_handle_refresh.return_value = True
-            
-            # Simulate the flow
-            response = MagicMock()
-            response.status_code = 401
-            
-            # The actual flow happens in the SDK, but we can test our override
-            # by manually calling the method and checking behavior
-            assert provider.context.current_tokens.refresh_token == "refresh-token-123"
-
-    @pytest.mark.asyncio
-    async def test_no_refresh_falls_through_to_browser_auth(self, tmp_path, monkeypatch):
-        """When no refresh token is available, fall through to browser auth."""
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        _set_interactive_stdin(monkeypatch)
-        provider = build_oauth_auth("test-no-refresh", "https://example.com/mcp")
-        assert provider is not None
-        
-        # Set up tokens WITHOUT a refresh token
-        mock_token = MagicMock()
-        mock_token.access_token = "initial-access"
-        mock_token.refresh_token = None  # No refresh token
-        mock_token.expires_in = 3600
-        mock_token.model_dump.return_value = {
-            "access_token": "initial-access",
-            "expires_in": 3600,
-        }
-        provider.context.current_tokens = mock_token
-        provider.context.update_token_expiry(mock_token)
-        
-        # Verify no refresh token
-        assert provider.context.current_tokens.refresh_token is None
-
-    def test_token_expiry_safety_margin(self, tmp_path, monkeypatch):
-        """Tokens should be considered invalid 60 seconds before actual expiry."""
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        storage = HermesTokenStorage("safety-margin-test")
-        
-        # Create a token that expires in 30 seconds
-        mock_token = MagicMock()
-        mock_token.model_dump.return_value = {
-            "access_token": "token-abc",
-            "token_type": "Bearer",
-            "expires_in": 30,  # expires in 30 seconds
-        }
-        asyncio.run(storage.set_tokens(mock_token))
-        
-        # Get the token back
-        loaded = asyncio.run(storage.get_tokens())
-        
-        # With 60-second safety margin, a token that expires in 30 seconds
-        # should be reported as expired (expires_in should be 0)
-        assert loaded is not None
-        # The expires_in should be clamped to 0 due to the 60-second margin
-        # since 30 seconds < 60 seconds margin
-
-
-class TestExtractExtraAuthParams:
-    """Tests for _extract_extra_auth_params — provider-specific auth params."""
-
-    def test_zoho_server_gets_access_type_offline(self):
-        """Zoho MCP servers should get access_type=offline automatically."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        params = _extract_extra_auth_params({}, "https://mcp.zohomcp.com/mcp")
-        assert params == {"access_type": "offline"}
-
-    def test_zoho_eu_server_gets_access_type_offline(self):
-        """Zoho EU MCP servers should also get access_type=offline."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        params = _extract_extra_auth_params({}, "https://mcp.zohomcp.eu/mcp")
-        assert params == {"access_type": "offline"}
-
-    def test_non_zoho_server_gets_no_extra_params(self):
-        """Non-Zoho servers should not get extra params by default."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        params = _extract_extra_auth_params({}, "https://mcp.example.com/mcp")
-        assert params == {}
-
-    def test_user_config_overrides_builtin(self):
-        """User-configured extra_auth_params should override built-in defaults."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        cfg = {"extra_auth_params": {"access_type": "online", "custom": "value"}}
-        params = _extract_extra_auth_params(cfg, "https://mcp.zohomcp.com/mcp")
-        # User config wins over built-in Zoho default
-        assert params == {"access_type": "online", "custom": "value"}
-
-    def test_user_config_adds_to_builtin(self):
-        """User-configured params merge with built-in defaults."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        cfg = {"extra_auth_params": {"custom": "value"}}
-        params = _extract_extra_auth_params(cfg, "https://mcp.zohomcp.com/mcp")
-        assert params == {"access_type": "offline", "custom": "value"}
-
-    def test_user_config_only(self):
-        """User-configured params work without built-in defaults."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        cfg = {"extra_auth_params": {"prompt": "consent"}}
-        params = _extract_extra_auth_params(cfg, "https://mcp.example.com/mcp")
-        assert params == {"prompt": "consent"}
-
-    def test_none_config_handled(self):
-        """None/missing extra_auth_params in config should be ignored."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        params = _extract_extra_auth_params({"extra_auth_params": None}, "https://mcp.example.com/mcp")
-        assert params == {}
-
-    def test_auth_endpoint_fallback(self):
-        """Should match against auth_endpoint when server_url is empty."""
-        from tools.mcp_oauth import _extract_extra_auth_params
-
-        # Use a URL that contains 'zohomcp' to match the built-in pattern
-        params = _extract_extra_auth_params(
-            {}, "", auth_endpoint="https://zohomcp.example.com/oauth/v2/auth"
-        )
-        assert params == {"access_type": "offline"}
-
 
 class TestExtractExtraAuthParams:
     """Tests for _extract_extra_auth_params (provider-specific auth URL params)."""
 
-    def test_zoho_eu匹配(self):
+    def test_zoho_eu_url(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params("https://datawyse-comms-mcp.zohomcp.eu/mcp/abc")
         assert params == {"access_type": "offline"}
 
-    def test_zoho_com匹配(self):
+    def test_zoho_com_url(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params("https://mcp.zohomcp.com/some/path")
         assert params == {"access_type": "offline"}
 
-    def test_non_zoho无匹配(self):
+    def test_non_zoho_no_match(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params("https://api.example.com/mcp")
         assert params == {}
 
-    def test_user_config覆盖(self):
+    def test_user_config_override(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params(
             "https://mcp.zohomcp.eu/mcp/abc",
@@ -1313,7 +1146,7 @@ class TestExtractExtraAuthParams:
         )
         assert params == {"access_type": "online", "prompt": "login"}
 
-    def test_user_config合并(self):
+    def test_user_config_merge(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params(
             "https://mcp.example.com/mcp",
@@ -1321,12 +1154,12 @@ class TestExtractExtraAuthParams:
         )
         assert params == {"prompt": "consent"}
 
-    def test_none_config无影响(self):
+    def test_none_config_ignored(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params("https://mcp.example.com/mcp", user_config=None)
         assert params == {}
 
-    def test大小写不敏感(self):
+    def test_case_insensitive(self):
         from tools.mcp_oauth import _extract_extra_auth_params
         params = _extract_extra_auth_params("https://MCP.ZOHOMCP.EU/mcp")
         assert params == {"access_type": "offline"}

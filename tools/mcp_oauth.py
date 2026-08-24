@@ -1224,10 +1224,16 @@ def _get_hermes_oauth_provider_class() -> type | None:
         and WAFs reject httpx's default User-Agent there (#75576).
         """
 
-        def __init__(self, *args: Any, token_user_agent: "str | None" = None, **kwargs: Any):
+        def __init__(
+            self,
+            *args: Any,
+            token_user_agent: "str | None" = None,
+            extra_auth_params: "dict[str, str] | None" = None,
+            **kwargs: Any,
+        ):
             super().__init__(*args, **kwargs)
             self._hermes_token_user_agent = token_user_agent
-            self._hermes_extra_auth_params: dict[str, str] = kwargs.pop("extra_auth_params", None) or {}
+            self._hermes_extra_auth_params: dict[str, str] = extra_auth_params or {}
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -1238,6 +1244,11 @@ def _get_hermes_oauth_provider_class() -> type | None:
         async def _perform_authorization_code_grant(self) -> "tuple[str, str]":
             """Inject provider-specific extra params into the authorization URL.
 
+            Mirrors the upstream SDK's ``_perform_authorization_code_grant``
+            (mcp SDK >=1.26,<2.0) with one addition: ``_hermes_extra_auth_params``
+            are merged into the authorization query string.  Keep this in sync
+            when bumping the ``mcp`` pin.
+
             Overrides the SDK method to merge ``_hermes_extra_auth_params``
             (e.g. ``access_type=offline`` for Zoho) into the authorization
             query string before the browser redirect.
@@ -1245,7 +1256,10 @@ def _get_hermes_oauth_provider_class() -> type | None:
             import secrets as _secrets
             from urllib.parse import urlencode
 
-            from mcp.shared.auth import PKCEParameters
+            from mcp.shared.auth import OAuthFlowError, PKCEParameters
+
+            if self.context.client_metadata.redirect_uris is None:
+                raise OAuthFlowError("No redirect URIs provided for authorization code grant")
 
             if (
                 self.context.oauth_metadata
@@ -1259,7 +1273,7 @@ def _get_hermes_oauth_provider_class() -> type | None:
                 auth_endpoint = f"{auth_base_url}/authorize"
 
             if not self.context.client_info:
-                raise Exception("No client info available for authorization")
+                raise OAuthFlowError("No client info available for authorization")
 
             pkce_params = PKCEParameters.generate()
             state = _secrets.token_urlsafe(32)
@@ -1291,9 +1305,13 @@ def _get_hermes_oauth_provider_class() -> type | None:
             result = await self.context.callback_handler()
 
             if result.state is None or not _secrets.compare_digest(result.state, state):
-                raise Exception(
+                raise OAuthFlowError(
                     f"State parameter mismatch: {result.state} != {state}"
                 )
+
+            # RFC 9207: validate the authorization-response issuer
+            from mcp.client.auth.oauth2 import validate_authorization_response_iss
+            validate_authorization_response_iss(result.iss, self.context.oauth_metadata)
 
             return result.code, pkce_params.code_verifier
 
