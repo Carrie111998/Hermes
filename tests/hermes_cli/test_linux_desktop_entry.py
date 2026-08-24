@@ -35,7 +35,9 @@ def _parse(entry_text: str) -> dict:
     return values
 
 
-def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, monkeypatch):
+def test_install_writes_entry_with_absolute_exec_and_icon(
+    tmp_path, xdg_home, monkeypatch
+):
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
@@ -68,7 +70,9 @@ def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, mo
 
 def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes"
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -93,15 +97,21 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # interpreter when the DE spawns the .desktop entry → ModuleNotFoundError,
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
 # resolved bin that is a python script escaping the running venv.
-def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
+def test_exec_prefixes_interpreter_for_env_shebang_python_script(
+    tmp_path, xdg_home, monkeypatch
+):
     import sys
 
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
     hermes_bin.chmod(0o755)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -117,9 +127,13 @@ def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypat
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    hermes_bin.write_text('#!/bin/bash\nexec /opt/hermes/venv/bin/python "$@"\n', encoding="utf-8")
+    hermes_bin.write_text(
+        '#!/bin/bash\nexec /opt/hermes/venv/bin/python "$@"\n', encoding="utf-8"
+    )
     hermes_bin.chmod(0o755)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -138,7 +152,9 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     interpreter = str(Path(sys.executable).resolve())
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -149,11 +165,140 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     assert exec_line == f"{hermes_bin} desktop"
 
 
+# The persisted entry must be launch-context independent: whatever process
+# writes it, the next launch reads and rewrites the same bytes. argv[0]
+# differs per launch path (wrapper / repo script / python -m), so a
+# checkout-internal argv[0] must not be persisted — the resolver falls
+# through to PATH, where the installer's durable wrapper lives.
+def _argv0_context(monkeypatch, argv0: str) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "argv", [argv0, "desktop"])
+
+
+def test_exec_converges_from_repo_script_argv0_to_installed_wrapper(
+    tmp_path, xdg_home, monkeypatch
+):
+    """A broken interpreter-form entry must self-heal to the wrapper form.
+
+    Launching with argv[0] = <checkout>/hermes (what the broken entry
+    itself spawns) previously re-persisted the same broken form forever —
+    the bootstrap loop that kept #90492 from repairing existing installs.
+    """
+    import sys
+
+    root = _make_project(tmp_path)
+    repo_script = root / "hermes"  # checkout-internal launcher candidate
+    repo_script.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    repo_script.chmod(0o755)
+    wrapper = tmp_path / "installed" / "bin" / "hermes"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(f'#!/bin/bash\nexec {sys.executable} "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    # argv[0] = repo script; PATH lookup finds the installed wrapper.
+    _argv0_context(monkeypatch, str(repo_script))
+    monkeypatch.setattr(
+        "shutil.which", lambda name: str(wrapper) if name == "hermes" else None
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # Converged on the durable wrapper — NOT the repo script, and NOT an
+    # interpreter-prefixed form pinning sys.executable.
+    assert exec_line == f"{wrapper} desktop"
+
+
+def test_exec_never_persists_a_bare_interpreter_command(
+    tmp_path, xdg_home, monkeypatch
+):
+    """The `python -m hermes_cli.main` relaunch context must not write
+    `Exec=<python> desktop` — a command line no DE can run."""
+    import sys
+
+    root = _make_project(tmp_path)
+    wrapper = tmp_path / "installed" / "bin" / "hermes"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    interpreter = tmp_path / "uv" / "cpython-3.11.15" / "bin" / "python3.11"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"\x7fELF fake")
+    interpreter.chmod(0o755)
+
+    # argv[0] IS the interpreter (python -m context); PATH has the wrapper.
+    _argv0_context(monkeypatch, str(interpreter))
+    monkeypatch.setattr(
+        "shutil.which", lambda name: str(wrapper) if name == "hermes" else None
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    first_token = exec_line.split(" ")[0].strip('"')
+    assert Path(first_token) != interpreter
+    assert not (
+        Path(first_token).name.startswith("python")
+        and "desktop" in exec_line.split(" ", 1)[1]
+    ), f"persisted an unrunnable bare-interpreter Exec: {exec_line}"
+    assert exec_line == f"{wrapper} desktop"
+
+
+def test_exec_keeps_resolver_fallback_when_no_wrapper_on_path(
+    tmp_path, xdg_home, monkeypatch
+):
+    """No PATH wrapper → today's fallback chain stays authoritative.
+
+    #90492's interpreter-prefix semantics are preserved for installs that
+    genuinely have no installed launcher: the repo script is still used,
+    prefixed with sys.executable when its shebang would escape the venv.
+    """
+    import sys
+
+    root = _make_project(tmp_path)
+    repo_script = root / "hermes"
+    repo_script.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    repo_script.chmod(0o755)
+
+    _argv0_context(monkeypatch, str(repo_script))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    def fake_resolve():
+        # Mirror resolve_hermes_bin's chain: argv[0] → relative → PATH → None.
+        return sys.argv[0] if sys.argv[0] else None
+
+    monkeypatch.setattr(
+        lde,
+        "_resolve_hermes_bin_for_desktop_entry",
+        lambda resolve_fn=None, checkout_root=None: fake_resolve(),
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # Still the interpreter-prefixed repo script (#90492 behavior), never dropped.
+    assert str(repo_script) in exec_line
+    assert exec_line.endswith("desktop")
+
+
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes"
+    )
     calls: list[Path] = []
-    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda d: calls.append(d) or [])
+    monkeypatch.setattr(
+        lde, "refresh_desktop_databases", lambda d: calls.append(d) or []
+    )
 
     lde.install_desktop_entry(root)
     assert len(calls) == 1
@@ -166,7 +311,9 @@ def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monke
 def test_install_without_source_icon_uses_themed_name(tmp_path, xdg_home, monkeypatch):
     root = tmp_path / "hermes-agent"
     root.mkdir()
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes"
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -198,7 +345,9 @@ def test_install_is_a_noop_on_windows(tmp_path):
 def _stub_tools(monkeypatch, available: "set[str]") -> "list[list[str]]":
     ran: list[list[str]] = []
     monkeypatch.setattr(
-        lde.shutil, "which", lambda name: f"/usr/bin/{name}" if name in available else None
+        lde.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in available else None,
     )
     monkeypatch.setattr(lde, "_run_quiet", lambda cmd: ran.append(cmd) or True)
     return ran
