@@ -3,6 +3,16 @@
 import os
 import sys
 
+if sys.platform == "win32":
+    try:
+        import ctypes
+        _h = ctypes.windll.kernel32.GetStdHandle(-11)
+        _m = ctypes.c_uint32()
+        ctypes.windll.kernel32.GetConsoleMode(_h, ctypes.byref(_m))
+        ctypes.windll.kernel32.SetConsoleMode(_h, _m.value | 0x0004)
+    except Exception:
+        pass
+
 
 def should_use_color() -> bool:
     """Return True when colored output is appropriate.
@@ -36,3 +46,4 @@ def color(text: str, *codes) -> str:
     if not should_use_color():
         return text
     return "".join(codes) + text + Colors.RESET
+    
