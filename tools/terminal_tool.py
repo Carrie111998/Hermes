@@ -2181,12 +2181,25 @@ def ensure_task_env(task_id: Optional[str] = None):
     with _creation_locks_lock:
         task_lock = _creation_locks.setdefault(effective_task_id, threading.Lock())
 
+    # Bounded acquire (same bug-class fix as terminal_tool's creation path):
+    # if a previous creation call for this task wedged while holding the lock,
+    # a plain blocking acquire would pile every subsequent call up forever.
+    # threading.Lock can be released by any thread, so releasing after giving
+    # up is safe even if the abandoned creator is still running.
+    if not task_lock.acquire(timeout=_ENV_CREATION_WATCHDOG_SECONDS):
+        logger.error(
+            "Timed out after %ds waiting for the %s environment creation "
+            "lock for task %s -- a previous creation call appears wedged.",
+            _ENV_CREATION_WATCHDOG_SECONDS, env_type, effective_task_id,
+        )
+        return None
+
     with task_lock:
         existing = get_active_env(effective_task_id)
         if existing is not None:
             return existing
         try:
-            new_env = _create_environment(
+            new_env = _create_environment_with_watchdog(
                 env_type=env_type,
                 image=image,
                 cwd=config["cwd"],
