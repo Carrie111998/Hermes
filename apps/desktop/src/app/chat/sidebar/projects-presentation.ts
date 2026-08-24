@@ -2,6 +2,7 @@ import { useMemo, useSyncExternalStore } from 'react'
 
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
+import type { Contribution } from '@/contrib/types'
 
 import type { SidebarProjectTree } from './projects'
 
@@ -58,6 +59,7 @@ function sanitizeSnapshot(value: unknown): ProjectsGroupingSnapshot | null {
   }
 
   const groups: ProjectGroupDescriptor[] = []
+  const groupIds = new Set<string>()
 
   for (const raw of (value as { groups: readonly unknown[] }).groups) {
     if (!raw || typeof raw !== 'object') {
@@ -77,8 +79,15 @@ function sanitizeSnapshot(value: unknown): ProjectsGroupingSnapshot | null {
       return null
     }
 
+    const id = group.id.trim()
+
+    if (groupIds.has(id)) {
+      continue
+    }
+
+    groupIds.add(id)
     groups.push({
-      id: group.id.trim(),
+      id,
       label: group.label.trim(),
       projectIds: group.projectIds.map(projectId => projectId.trim()).filter(Boolean),
       ...(group.collapsed === true && { collapsed: true })
@@ -91,11 +100,18 @@ function sanitizeSnapshot(value: unknown): ProjectsGroupingSnapshot | null {
   return { groups, ...(validRevision && { revision }) }
 }
 
-function readValidProvider(): {
+interface ResolvedProjectsGroupingProvider {
   contribution: ProjectsGroupingContribution
+  entryIndex: number
   snapshot: ProjectsGroupingSnapshot
-} | null {
-  for (const entry of registry.getArea(PROJECTS_GROUPING_AREA)) {
+}
+
+function readValidProvider(
+  entries: readonly Contribution[] = registry.getArea(PROJECTS_GROUPING_AREA),
+  startIndex = 0
+): ResolvedProjectsGroupingProvider | null {
+  for (let entryIndex = startIndex; entryIndex < entries.length; entryIndex += 1) {
+    const entry = entries[entryIndex]
     const contribution = entry.data as Partial<ProjectsGroupingContribution> | undefined
 
     if (typeof contribution?.getSnapshot !== 'function' || typeof contribution.subscribe !== 'function') {
@@ -106,7 +122,7 @@ function readValidProvider(): {
       const snapshot = sanitizeSnapshot(contribution.getSnapshot())
 
       if (snapshot) {
-        return { contribution: contribution as ProjectsGroupingContribution, snapshot }
+        return { contribution: contribution as ProjectsGroupingContribution, entryIndex, snapshot }
       }
     } catch {
       // A malformed provider must not suppress a valid lower-priority provider.
@@ -178,9 +194,6 @@ function resolveProjectsGroupingFrom(
   }
 }
 
-const EMPTY_SUBSCRIBE = () => () => undefined
-const NULL_SNAPSHOT = () => null
-
 function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingSnapshot): boolean {
   if (left === right) {
     return true
@@ -218,48 +231,75 @@ function snapshotsEqual(left: ProjectsGroupingSnapshot, right: ProjectsGroupingS
   })
 }
 
-function createStoreAdapter(contribution: ProjectsGroupingContribution, initialSnapshot: ProjectsGroupingSnapshot) {
-  let cachedSnapshot = initialSnapshot
+interface ProjectsGroupingStoreSnapshot {
+  readonly contribution: ProjectsGroupingContribution
+  readonly snapshot: ProjectsGroupingSnapshot
+}
+
+function createStoreAdapter(
+  entries: readonly Contribution[],
+  initialProvider: ResolvedProjectsGroupingProvider | null
+) {
+  let active = initialProvider
+  let cached: ProjectsGroupingStoreSnapshot | null = active
+    ? { contribution: active.contribution, snapshot: active.snapshot }
+    : null
+
+  const select = (provider: ResolvedProjectsGroupingProvider | null) => {
+    active = provider
+    cached = provider ? { contribution: provider.contribution, snapshot: provider.snapshot } : null
+  }
 
   return {
     getSnapshot: () => {
+      if (!active || !cached) {
+        return null
+      }
+
       let snapshot: ProjectsGroupingSnapshot | null = null
 
       try {
-        snapshot = sanitizeSnapshot(contribution.getSnapshot())
+        snapshot = sanitizeSnapshot(active.contribution.getSnapshot())
       } catch {
         // Keep the last safe value if an accepted provider later misbehaves.
       }
 
-      if (!snapshot || snapshotsEqual(cachedSnapshot, snapshot)) {
-        return cachedSnapshot
+      if (!snapshot || snapshotsEqual(cached.snapshot, snapshot)) {
+        return cached
       }
 
-      cachedSnapshot = snapshot
+      active = { ...active, snapshot }
+      cached = { contribution: active.contribution, snapshot }
 
-      return snapshot
+      return cached
     },
-    subscribe: (listener: () => void) => contribution.subscribe(listener)
+    subscribe: (listener: () => void) => {
+      while (active) {
+        try {
+          const unsubscribe = active.contribution.subscribe(listener)
+
+          if (typeof unsubscribe === 'function') {
+            return unsubscribe
+          }
+        } catch {
+          // A provider can pass snapshot validation yet still fail to establish
+          // its subscription. Continue down the same deterministic precedence
+          // ladder instead of letting React's external-store effect crash.
+        }
+
+        select(readValidProvider(entries, active.entryIndex + 1))
+      }
+
+      return () => undefined
+    }
   }
 }
 
 function useProjectsGroupingStore() {
-  useContributions(PROJECTS_GROUPING_AREA)
-  const active = readValidProvider()
-  const contribution = active?.contribution ?? null
+  const entries = useContributions(PROJECTS_GROUPING_AREA)
+  const store = useMemo(() => createStoreAdapter(entries, readValidProvider(entries)), [entries])
 
-  const store = useMemo(
-    () => (contribution && active ? createStoreAdapter(contribution, active.snapshot) : null),
-    [contribution]
-  )
-
-  const snapshot = useSyncExternalStore(
-    store?.subscribe ?? EMPTY_SUBSCRIBE,
-    store?.getSnapshot ?? NULL_SNAPSHOT,
-    store?.getSnapshot ?? NULL_SNAPSHOT
-  )
-
-  return contribution && snapshot && Array.isArray(snapshot.groups) ? { contribution, snapshot } : null
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
 }
 
 export function useProjectsGrouping(projects: readonly SidebarProjectTree[]): PresentedProjectsGrouping | null {

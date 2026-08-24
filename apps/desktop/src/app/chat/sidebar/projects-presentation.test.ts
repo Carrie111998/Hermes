@@ -77,7 +77,11 @@ describe('Projects grouping contribution', () => {
       ])
     )
 
-    expect(resolveProjectsGrouping([project('home', true), project('a'), project('b'), project('c')])).toEqual({
+    const projects = [project('home', true), project('a'), project('b'), project('c')]
+    const resolved = resolveProjectsGrouping(projects)
+    const { result } = renderHook(() => useActiveProjectsGrouping())
+
+    expect(resolved).toEqual({
       contribution: expect.any(Object),
       groups: [
         { collapsed: false, id: 'one', label: 'One', projects: [project('a')] },
@@ -87,6 +91,44 @@ describe('Projects grouping contribution', () => {
       snapshot: expect.any(Object),
       ungrouped: [project('c')]
     })
+    expect(result.current?.snapshot.groups).toEqual([
+      { id: 'one', label: 'One', projectIds: ['a', 'missing', 'a'] },
+      { collapsed: true, id: 'two', label: 'Two', projectIds: ['a', 'b'] }
+    ])
+  })
+
+  it('falls through when the highest-priority valid provider throws while subscribing', () => {
+    register(
+      {
+        getSnapshot: () => ({ groups: [{ id: 'broken', label: 'Broken', projectIds: ['a'] }] }),
+        subscribe: () => {
+          throw new Error('subscription failed')
+        }
+      },
+      0
+    )
+    register(provider([{ id: 'fallback', label: 'Fallback', projectIds: ['b'] }]), 10)
+
+    const { result } = renderHook(() => useProjectsGrouping([project('a'), project('b')]))
+
+    expect(result.current?.groups).toEqual([
+      { collapsed: false, id: 'fallback', label: 'Fallback', projects: [project('b')] }
+    ])
+  })
+
+  it('settles on a stable empty state when every valid provider throws while subscribing', () => {
+    register({
+      getSnapshot: () => ({ groups: [{ id: 'broken', label: 'Broken', projectIds: ['a'] }] }),
+      subscribe: () => {
+        throw new Error('subscription failed')
+      }
+    })
+
+    const { rerender, result } = renderHook(() => useActiveProjectsGrouping())
+
+    expect(result.current).toBeNull()
+    rerender()
+    expect(result.current).toBeNull()
   })
 
   it('uses deterministic contribution ordering and reads one stable snapshot', () => {

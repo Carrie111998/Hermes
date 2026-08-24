@@ -1,8 +1,14 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { registry } from '@/contrib/registry'
+
 import { ProjectGroupDialog, normalizeProjectGroupName } from './project-group-dialog'
-import type { ProjectsGroupingContribution } from './projects-presentation'
+import {
+  PROJECTS_GROUPING_AREA,
+  type ProjectsGroupingContribution,
+  useActiveProjectsGrouping
+} from './projects-presentation'
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -24,7 +30,12 @@ vi.mock('@/i18n', () => ({
 
 vi.mock('@/store/notifications', () => ({ notifyError: vi.fn() }))
 
-afterEach(cleanup)
+const disposers: Array<() => void> = []
+
+afterEach(() => {
+  cleanup()
+  while (disposers.length) disposers.pop()?.()
+})
 
 const snapshot = { groups: [{ id: 'cue', label: 'CUE++', projectIds: [] }] }
 
@@ -62,6 +73,40 @@ describe('ProjectGroupDialog', () => {
     fireEvent.change(screen.getByPlaceholderText('Group name'), { target: { value: 'x'.repeat(101) } })
     expect(screen.getByText('Invalid group')).toBeTruthy()
     expect(createGroup).not.toHaveBeenCalled()
+  })
+
+  it('validates names against the same first-valid duplicate-id snapshot as the sidebar and menu', async () => {
+    const createGroup = vi.fn().mockResolvedValue(undefined)
+    const contribution: ProjectsGroupingContribution = {
+      createGroup,
+      getSnapshot: () => ({
+        groups: [
+          { id: 'duplicate', label: 'First group', projectIds: [] },
+          { id: 'duplicate', label: 'Discarded group', projectIds: [] }
+        ]
+      }),
+      subscribe: () => () => undefined
+    }
+    disposers.push(registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'groups' }))
+
+    const ConnectedDialog = () => {
+      const grouping = useActiveProjectsGrouping()
+
+      return grouping ? (
+        <ProjectGroupDialog
+          contribution={grouping.contribution}
+          onOpenChange={vi.fn()}
+          open
+          snapshot={grouping.snapshot}
+        />
+      ) : null
+    }
+
+    render(<ConnectedDialog />)
+    fireEvent.change(screen.getByPlaceholderText('Group name'), { target: { value: 'Discarded group' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    await waitFor(() => expect(createGroup).toHaveBeenCalledWith('Discarded group'))
   })
 })
 

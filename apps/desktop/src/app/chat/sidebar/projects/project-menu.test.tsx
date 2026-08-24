@@ -139,6 +139,28 @@ describe('ProjectMenu', () => {
     expect(await screen.findByRole('button', { name: 'No color' })).toBeTruthy()
   }, 15000)
 
+  it('offers only the first valid group when a provider repeats a group id', async () => {
+    const contribution: ProjectsGroupingContribution = {
+      assignProject: vi.fn(),
+      getSnapshot: () => ({
+        groups: [
+          { id: 'duplicate', label: 'First group', projectIds: [] },
+          { id: 'duplicate', label: 'Discarded group', projectIds: [] }
+        ]
+      }),
+      subscribe: () => () => undefined
+    }
+    disposers.push(registry.register({ area: PROJECTS_GROUPING_AREA, data: contribution, id: 'groups' }))
+
+    render(<ProjectMenu isActive={false} project={project} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+    fireEvent.pointerMove(await screen.findByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+    fireEvent.pointerEnter(screen.getByRole('menuitem', { name: 'Move to group' }), { pointerType: 'mouse' })
+
+    expect(await screen.findByRole('menuitem', { name: 'First group' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Discarded group' })).toBeNull()
+  }, 15000)
+
   it('adopts an auto Project before grouping so later appearance edits keep its membership', async () => {
     const autoProject = { ...project, id: '/repo', isAuto: true }
     const adoptedProject = { ...project, id: 'p_stable', isAuto: false }
