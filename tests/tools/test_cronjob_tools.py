@@ -410,7 +410,30 @@ class TestUnifiedCronjobTool:
         assert stored["attach_to_session"] is True
 
         listing = json.loads(cronjob(action="list"))
-        assert listing["jobs"][0]["attach_to_session"] is True
+        listed = next(
+            job for job in listing["jobs"] if job["job_id"] == created["job_id"]
+        )
+        assert listed["attach_to_session"] is True
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                attach_to_session=False,
+            )
+        )
+
+        assert updated["success"] is True
+        assert updated["job"]["attach_to_session"] is False
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["attach_to_session"] is False
+
+        listing = json.loads(cronjob(action="list"))
+        listed = next(
+            job for job in listing["jobs"] if job["job_id"] == created["job_id"]
+        )
+        assert listed["attach_to_session"] is False
 
 
 # =========================================================================
