@@ -504,6 +504,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             pass
         return None
 
+    def _use_private_api_send(self) -> bool:
+        """Send through the Private API helper when it is available.
+
+        An omitted ``method`` defaults to AppleScript on the server, which
+        cannot drive Messages.app unless the BlueBubbles macOS user is the
+        active GUI login.
+        """
+        return bool(self._private_api_enabled and self._helper_connected)
+
     async def _create_chat_for_handle(
         self, address: str, message: str
     ) -> SendResult:
@@ -513,6 +522,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             "message": message,
             "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
         }
+        if self._use_private_api_send():
+            payload["method"] = "private-api"
         try:
             res = await self._api_post("/api/v1/chat/new", payload)
             data = res.get("data") or {}
@@ -570,14 +581,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
                 "message": chunk,
             }
-            if self._private_api_enabled and self._helper_connected:
-                # The server treats an omitted ``method`` as "apple-script",
-                # which drives Messages.app through AppleScript and needs the
-                # helper's macOS user to hold an active GUI session. Private
-                # API sends also work from a fast-user-switched or otherwise
-                # backgrounded login, so prefer it whenever the helper is
-                # connected -- replies already did, and reactions, typing
-                # indicators and read receipts require the helper anyway.
+            if self._use_private_api_send():
                 payload["method"] = "private-api"
                 if reply_to:
                     payload["selectedMessageGuid"] = reply_to
@@ -629,6 +633,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             }
             if is_audio_message:
                 data["isAudioMessage"] = "true"
+            if self._use_private_api_send():
+                data["method"] = "private-api"
             res = await self.client.post(
                 self._api_url("/api/v1/message/attachment"),
                 files=files,
