@@ -207,6 +207,110 @@ def test_request_changes_requires_bound_reviewer_and_restores_writer(conn) -> No
     assert task.review_artifacts is None
 
 
+def test_native_request_review_argument_omission_fails_closed(conn) -> None:
+    """Direct module callers cannot select legacy authority by omitting args."""
+    task_id = kb.create_task(conn, title="no downgrade", assignee="writer")
+    writer_run = kb.claim_task(conn, task_id)
+    assert writer_run is not None
+    before = _event_count(conn, task_id)
+
+    ok, reason = kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        artifacts=_frozen(),
+        expected_run_id=writer_run.current_run_id,
+        with_reason=True,
+    )
+
+    assert ok is False
+    assert "authenticated writer" in (reason or "")
+    assert _event_count(conn, task_id) == before
+
+    ok, reason = kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        artifacts=_frozen(),
+        actor_profile="writer",
+        with_reason=True,
+    )
+
+    assert ok is False
+    assert "run token" in (reason or "")
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.current_run_id == writer_run.current_run_id
+    assert unchanged.assignee == "writer"
+    assert unchanged.review_assignee is None
+    assert unchanged.review_artifacts is None
+    assert _event_count(conn, task_id) == before
+
+
+def test_native_request_changes_argument_omission_fails_closed(conn) -> None:
+    task_id = kb.create_task(conn, title="no verdict downgrade", assignee="writer")
+    writer_run = kb.claim_task(conn, task_id)
+    assert writer_run is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        artifacts=_frozen(),
+        actor_profile="writer",
+        expected_run_id=writer_run.current_run_id,
+    )
+    review_run = kb.claim_review_task(conn, task_id, actor_profile="reviewer")
+    assert review_run is not None
+    before = _event_count(conn, task_id)
+
+    ok, reason = kb.request_changes(
+        conn,
+        task_id,
+        reason="unauthenticated",
+        expected_run_id=review_run.current_run_id,
+    )
+
+    assert ok is False
+    assert "authenticated reviewer" in (reason or "")
+    assert _event_count(conn, task_id) == before
+
+    ok, reason = kb.request_changes(
+        conn,
+        task_id,
+        reason="missing token",
+        actor_profile="reviewer",
+    )
+
+    assert ok is False
+    assert "run token" in (reason or "")
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.current_run_id == review_run.current_run_id
+    assert unchanged.assignee == "writer"
+    assert unchanged.review_assignee == "reviewer"
+    assert unchanged.review_artifacts == _frozen()
+    assert _event_count(conn, task_id) == before
+
+
+def test_generic_complete_cannot_approve_malformed_native_review(conn) -> None:
+    """The generic-complete gate keys off protocol, not nullable artifacts."""
+    task_id = kb.create_task(conn, title="malformed native review", assignee="writer")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review', review_assignee = 'reviewer', "
+            "review_artifacts = NULL WHERE id = ?",
+            (task_id,),
+        )
+
+    assert kb.complete_task(conn, task_id) is False
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert not any(event.kind == "completed" for event in kb.list_events(conn, task_id))
+
+
 def test_native_schedule_t15_due_restart_and_duplicate_ticks(tmp_path: Path) -> None:
     db_path = tmp_path / "scheduled.db"
     base = 2_000_000_000

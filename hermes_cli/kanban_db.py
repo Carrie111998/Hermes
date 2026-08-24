@@ -1084,6 +1084,7 @@ class Task:
     # directly remain source-compatible with pre-review releases.
     review_assignee: Optional[str] = None
     review_artifacts: Optional[dict] = None
+    review_protocol: str = "native_v2"
     scheduled_for: Optional[int] = None
     due_at: Optional[int] = None
     pre_notice_sent_at: Optional[int] = None
@@ -1184,6 +1185,11 @@ class Task:
             review_artifacts=(
                 _decode_review_artifacts(row["review_artifacts"])
                 if "review_artifacts" in keys else None
+            ),
+            review_protocol=(
+                row["review_protocol"]
+                if "review_protocol" in keys and row["review_protocol"]
+                else "legacy"
             ),
             scheduled_for=(row["scheduled_for"] if "scheduled_for" in keys else None),
             due_at=(row["due_at"] if "due_at" in keys else None),
@@ -1371,6 +1377,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- a review cycle and survives reviewer retries/restarts.
     review_assignee      TEXT,
     review_artifacts     TEXT,
+    -- Authority mode is durable row state, never inferred from nullable call
+    -- arguments. Fresh work is fail-closed; migration marks existing rows as
+    -- legacy before they can use the compatibility lifecycle.
+    review_protocol      TEXT NOT NULL DEFAULT 'native_v2'
+                         CHECK (review_protocol IN ('native_v2', 'legacy')),
     -- UTC Unix epochs avoid worker-local timezone/DST disagreement.
     scheduled_for        INTEGER,
     due_at               INTEGER,
@@ -2729,6 +2740,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "review_artifacts", "review_artifacts TEXT"
         )
+    if "review_protocol" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "review_protocol",
+            "review_protocol TEXT NOT NULL DEFAULT 'native_v2' "
+            "CHECK (review_protocol IN ('native_v2', 'legacy'))",
+        )
+        # This branch only runs for a board created by a pre-v2 runtime. Mark
+        # exactly those already-existing rows as compatibility-only. Tasks
+        # created after this migration inherit the fail-closed native default.
+        conn.execute("UPDATE tasks SET review_protocol = 'legacy'")
 
     # Additive native scheduling migration. NULL means legacy/immediate work.
     for column in ("scheduled_for", "due_at", "pre_notice_sent_at"):
@@ -5566,17 +5589,17 @@ def complete_task(
         "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if review_gate is not None:
-        # Native v2 reviews carry a frozen artifact identity and require the
-        # authenticated pass_review() verdict.  Legacy review rows predate
-        # that field and retain their operator-driven complete behavior during
-        # the additive migration window.
+        # Native v2 authority is a durable row property, not inferred from a
+        # nullable artifact. Legacy review rows predate the protocol marker and
+        # retain operator-driven completion during the additive migration.
         native_review = conn.execute(
-            "SELECT review_artifacts FROM tasks WHERE id = ?", (task_id,)
+            "SELECT review_artifacts, review_protocol FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if (
             review_gate["status"] == "review"
             and native_review is not None
-            and native_review["review_artifacts"] is not None
+            and native_review["review_protocol"] != "legacy"
         ):
             return False
         if review_gate["status"] == "running" and review_gate["current_run_id"]:
@@ -5593,7 +5616,7 @@ def complete_task(
                 isinstance(source_payload, dict)
                 and source_payload.get("source_status") == "review"
                 and native_review is not None
-                and native_review["review_artifacts"] is not None
+                and native_review["review_protocol"] != "legacy"
             ):
                 return False
     # Fail before validating cards or staging artifacts; re-check inside the
@@ -5638,10 +5661,36 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, review_protocol FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Re-evaluate the security-sensitive review gate under the same
+        # BEGIN IMMEDIATE transaction as the completion update. The optimistic
+        # check above gives callers an early failure, but cannot be the trust
+        # boundary because another connection may route the task to native
+        # review before this transaction acquires the write lock.
+        if prior is not None and prior["review_protocol"] != "legacy":
+            if prior_status == "review":
+                return False
+            if prior_status == "running" and prior["current_run_id"] is not None:
+                claimed = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                    "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+                    (task_id, int(prior["current_run_id"])),
+                ).fetchone()
+                try:
+                    claimed_payload = (
+                        json.loads(claimed["payload"])
+                        if claimed and claimed["payload"] else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    claimed_payload = {}
+                if (
+                    isinstance(claimed_payload, dict)
+                    and claimed_payload.get("source_status") == "review"
+                ):
+                    return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6749,36 +6798,41 @@ def request_review(
 ):
     """Atomically close a writer run and route a frozen tree to review.
 
-    Authenticated v2 callers pass ``actor_profile`` and must also provide the
-    active run token, an independent reviewer, and a valid frozen artifact
-    identity. Legacy operator/CLI callers remain readable during migration,
-    but are explicitly compatibility-only and do not get v2 authorization
-    claims unless they provide those arguments.
+    Authority mode is selected only by the task's durable ``review_protocol``
+    marker. New tasks are native v2 and must provide the active run token, an
+    authenticated writer, an independent reviewer, and frozen artifact
+    identity. Only rows proven to predate the additive migration are marked
+    legacy and retain the compatibility lifecycle.
     """
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
-    native_v2 = actor_profile is not None or artifacts is not None
-    canonical_artifacts: Optional[dict] = None
-    if native_v2:
-        canonical_artifacts, artifact_error = _validate_frozen_review_artifacts(
-            redact_review_value(artifacts)
-        )
-        if artifact_error:
-            return _ret(False, artifact_error)
     actor = _canonical_assignee(actor_profile) if actor_profile is not None else None
+    canonical_artifacts: Optional[dict] = None
 
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, review_assignee, status, claim_lock, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT assignee, review_assignee, status, claim_lock, current_run_id, "
+            "review_protocol FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        # Compatibility is an explicit allow-list. Any missing/corrupt/future
+        # marker fails closed as native rather than becoming an authorization
+        # downgrade merely because it is not the current native literal.
+        native_v2 = trow["review_protocol"] != "legacy"
+        if native_v2:
+            if actor_profile is None:
+                return _ret(False, "authenticated writer profile is required")
+            canonical_artifacts, artifact_error = _validate_frozen_review_artifacts(
+                redact_review_value(artifacts)
+            )
+            if artifact_error:
+                return _ret(False, artifact_error)
         implementer = _canonical_assignee(trow["assignee"])
         if native_v2:
             if expected_run_id is None:
@@ -6903,10 +6957,12 @@ def pass_review(
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, review_assignee, review_artifacts, "
-            "current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "review_protocol, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False, "task not found"
+        if row["review_protocol"] != "native_v2":
+            return False, "authenticated PASS is available only for native review cycles"
         if row["status"] != "running" or row["current_run_id"] is None:
             return False, "task is not in an active review run"
         if int(row["current_run_id"]) != int(expected_run_id):
@@ -6989,8 +7045,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, review_assignee, current_run_id "
-            "FROM tasks WHERE id = ?",
+            "SELECT status, assignee, review_assignee, review_artifacts, "
+            "review_protocol, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6998,6 +7054,13 @@ def request_changes(
         current_run_id = task_row["current_run_id"]
         if task_row["status"] != "running" or current_run_id is None:
             return False, "task is not in an active review run"
+        native_v2 = task_row["review_protocol"] != "legacy"
+        if native_v2 and actor_profile is None:
+            return False, "authenticated reviewer profile is required"
+        if native_v2 and expected_run_id is None:
+            return False, "active reviewer run token is required"
+        if native_v2 and _decode_review_artifacts(task_row["review_artifacts"]) is None:
+            return False, "frozen review artifact identity is missing or malformed"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
         effective_reviewer = _canonical_assignee(

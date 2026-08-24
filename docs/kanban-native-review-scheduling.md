@@ -21,12 +21,14 @@ The migration is additive and idempotent:
 
 - `tasks.review_assignee TEXT`
 - `tasks.review_artifacts TEXT`
+- `tasks.review_protocol TEXT NOT NULL DEFAULT 'native_v2'` with an allow-list
+  constraint for `native_v2|legacy`
 - `tasks.scheduled_for INTEGER`
 - `tasks.due_at INTEGER`
 - `tasks.pre_notice_sent_at INTEGER`
 - `idx_tasks_schedule(status, scheduled_for, created_at)`
 
-Existing rows receive NULL values and retain prior behavior. Legacy Review cards without frozen artifact metadata keep the compatibility lifecycle. New authenticated work does not depend on `review-required` comment text.
+When `review_protocol` is first added, rows already present in that transaction are explicitly marked `legacy`; tasks created after the migration inherit `native_v2`. Reopen/reapply does not relabel either class. Legacy compatibility is selected only by that durable one-time marker, never by omitted function arguments or nullable artifact metadata. Missing, malformed, or future protocol values fail closed as native. New authenticated work does not depend on `review-required` comment text.
 
 SQLite ignores additional columns when an older binary reads named legacy fields. Historical review/schedule fields and events therefore remain preserved if code is rolled back. Cards already in Review remain in the pre-existing Review status. Cards in Scheduled remain parked and can be manually unblocked by the legacy control surface.
 
@@ -47,7 +49,7 @@ SQLite ignores additional columns when an older binary reads named legacy fields
 
 1. Set `kanban.review_dispatch=false` and `kanban.native_scheduling=false`; verify no new review/schedule claims occur.
 2. Stop only the approved dispatcher/gateway unit in the maintenance window.
-3. Restore the previously pinned image/runtime atomically; do not downgrade or rewrite the database.
+3. Verify there are no active or parked `native_v2` Review cycles before restoring the previously pinned image/runtime atomically; the old runtime does not enforce the native verdict gate. Do not downgrade or rewrite the database.
 4. Restart the prior runtime and verify card/comment/link/run/event/subscription counts and SQLite integrity.
 5. Leave native columns/events intact as historical evidence. Do not delete them.
 6. For any active reviewer run, first allow the approved reclaim path to restore it to Review; do not directly edit SQLite.
@@ -60,7 +62,8 @@ Rollback proof is a feature-disable plus prior-runtime restoration, not a destru
 - Self-approval: reviewer canonical identity must differ from the stable writer identity.
 - Identity spoofing: worker tools derive profile and run id from dispatcher-owned environment; DB transitions compare them with the active run.
 - Stale/replayed verdict: verdicts require current_run_id, an open matching run, and a review-origin claim event.
-- Generic completion bypass: native frozen reviews reject generic completion.
+- Authority downgrade: review authority is bound to `review_protocol`; omitted actor/run/artifact arguments cannot select legacy behavior for new tasks.
+- Generic completion bypass: every `native_v2` review rejects generic completion, including malformed rows with missing frozen metadata.
 - Artifact substitution: canonical commit/tree ids and relative artifact paths with SHA-256 digests are frozen in the request transaction; reassignment is refused during Review.
 - Queue starvation: review lane reserves an opportunity within the shared bounded budget.
 - Crash/restart: review-origin provenance restores the Review phase.

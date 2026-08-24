@@ -153,6 +153,25 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        assert migrated.execute(
+            "SELECT review_protocol FROM tasks WHERE id = 'legacy'"
+        ).fetchone()[0] == "legacy"
+        fresh_id = kb.create_task(
+            migrated, title="created after migration", assignee="writer"
+        )
+        assert migrated.execute(
+            "SELECT review_protocol FROM tasks WHERE id = ?", (fresh_id,)
+        ).fetchone()[0] == "native_v2"
+
+    # Reopen proves the additive migration is idempotent and does not relabel
+    # work created after the one-time legacy-row boundary.
+    with kb.connect(db_path) as reopened:
+        assert reopened.execute(
+            "SELECT review_protocol FROM tasks WHERE id = 'legacy'"
+        ).fetchone()[0] == "legacy"
+        assert reopened.execute(
+            "SELECT review_protocol FROM tasks WHERE id = ?", (fresh_id,)
+        ).fetchone()[0] == "native_v2"
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
