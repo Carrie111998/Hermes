@@ -68,7 +68,10 @@ describe('clarify.request stream hydration', () => {
 
     clarifyRequest({ choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-reveal' })
 
-    expect(scrollToBottom).toHaveBeenCalledOnce()
+    expect(scrollToBottom).not.toHaveBeenCalled()
+    expect($clarifyRequests.get()[SID]?.requestId).toBe('req-reveal')
+    expect(clarifyParts()).toHaveLength(1)
+    expect(stream.state().needsInput).toBe(true)
   })
 
   it('does not move the active thread for a background session clarify', () => {

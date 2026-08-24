@@ -4,7 +4,6 @@ import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
-import { requestScrollToBottom } from '@/store/thread-scroll'
 
 import type { GatewayEventContext } from './types'
 
@@ -13,7 +12,7 @@ import type { GatewayEventContext } from './types'
  *  each of these must be parked per-session and surfaced. */
 export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, occurredAt } = ctx
-  const { activeSessionIdRef, updateSessionState, upsertToolCall } = deps
+  const { updateSessionState, upsertToolCall } = deps
 
   if (event.type === 'clarify.request') {
     // Surface the clarify tool's overlay. The Python side is blocked on
@@ -78,10 +77,6 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
           occurredAt
         )
         updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
-
-        if (sessionId === activeSessionIdRef.current) {
-          requestScrollToBottom()
-        }
       }
 
       dispatchNativeNotification({
@@ -128,11 +123,10 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         // it's working). Flag the session so the sidebar shows a persistent
         // "needs input" indicator on its row — works for the active session
         // too, and survives alt-tab / window blur (unlike a toast).
+        // Deliberately NO requestScrollToBottom() here: yanking the viewport
+        // to the bottom is what users experienced as the panel "covering the
+        // conversation". Scrolling stays with the thread's own stick-to-bottom.
         updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
-
-        if (sessionId === activeSessionIdRef.current) {
-          requestScrollToBottom()
-        }
       }
 
       dispatchNativeNotification({

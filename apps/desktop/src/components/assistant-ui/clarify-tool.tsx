@@ -22,6 +22,7 @@ import { Kbd } from '@/components/ui/kbd'
 import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -37,6 +38,7 @@ import {
 } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
+import { $activeSessionId, $messages } from '@/store/session'
 
 import { selectMessageRunning } from './tool/fallback-model'
 import { parseMaybeObject } from './tool/fallback-model/format'
@@ -289,12 +291,110 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
   return <ClarifyToolLive {...props} />
 }
 
+/** Fallback window for the visibility gate: when the turn is still streaming
+ *  and no prose increment has been observed yet, hold the panel this long so
+ *  it appears *after* the same-turn conversation text instead of jumping ahead
+ *  of it. Named constant — the tests drive it with fake timers. */
+const CLARIFY_TEXT_WAIT_MS = 1500
+
+/** Character count of the text parts on the last assistant message, or `null`
+ *  when there is no assistant message at all (nothing being painted). */
+function lastAssistantTextChars(messages: ChatMessage[]): number | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+
+    if (message.role !== 'assistant') {
+      continue
+    }
+
+    return message.parts.reduce((sum, part) => (part.type === 'text' ? sum + part.text.length : sum), 0)
+  }
+
+  return null
+}
+
+/** Visibility gate for a pending clarify panel.
+ *
+ *  While the turn is running and a request is parked, the panel must not pop
+ *  ahead of the same-turn conversation text. The gate watches the last
+ *  assistant message's text length on `$messages`: any increment past the
+ *  zero point (request arrived + tool row mounted) releases immediately; with
+ *  no increment it releases after CLARIFY_TEXT_WAIT_MS. When there is no
+ *  assistant message to wait for (and on a session-identity mismatch, e.g.
+ *  session tiles), there is nothing the panel could overtake, so it releases
+ *  without waiting. The gate is a pure boolean — ClarifyToolPending mounts at
+ *  the ClarifyToolLive top level, never inside the gate, so release / running
+ *  transitions never remount the panel or drop its staged choices. */
+function useClarifyTextGate({ sessionId, active }: { sessionId: string | null; active: boolean }): boolean {
+  const activeSessionId = useStore($activeSessionId)
+  const messages = useStore($messages)
+  const [released, setReleased] = useState(false)
+  const zeroChars = useRef<number | null>(null)
+
+  const sameSession = sessionId != null && activeSessionId === sessionId
+  const textChars = useMemo(() => (sameSession ? lastAssistantTextChars(messages) : null), [messages, sameSession])
+
+  useEffect(() => {
+    if (!active) {
+      // Not gating (no parked request / dead turn): reset so the next request
+      // starts a fresh zero point instead of inheriting a stale release.
+      zeroChars.current = null
+      setReleased(false)
+
+      return
+    }
+
+    if (released) {
+      return
+    }
+
+    if (textChars === null) {
+      // No assistant turn to wait for — nothing precedes the panel.
+      setReleased(true)
+
+      return
+    }
+
+    if (zeroChars.current === null) {
+      zeroChars.current = textChars
+    }
+
+    if (textChars > zeroChars.current) {
+      setReleased(true)
+
+      return
+    }
+
+    const timer = window.setTimeout(() => setReleased(true), CLARIFY_TEXT_WAIT_MS)
+
+    return () => window.clearTimeout(timer)
+  }, [active, released, textChars])
+
+  return released
+}
+
 function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const messageRunning = useAuiState(selectMessageRunning)
+  const sessionId = useStore(useSessionView().$runtimeId)
+  const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
+  const request = useStore($request)
+  const gateReleased = useClarifyTextGate({ active: messageRunning && request != null, sessionId })
 
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
+  // Keep-alive condition is "the request is still answerable", NOT the turn
+  // still running: a dead turn with a parked request keeps the panel live.
+  if (request != null && !messageRunning) {
+    return <ClarifyToolPending {...props} />
+  }
+
   if (!messageRunning) {
+    // Dead turn with nothing parked — don't leave a dead interactive panel.
     return <ToolFallback {...props} />
+  }
+
+  if (request != null && !gateReleased) {
+    // Hold the panel until the same-turn text has painted (or the fallback
+    // window lapses). Render nothing meanwhile — no fallback row, no stub.
+    return null
   }
 
   return <ClarifyToolPending {...props} />
