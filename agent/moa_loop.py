@@ -1172,9 +1172,10 @@ def _current_turn_reference_messages(
     """Return exactly the latest real user turn from the raw transcript.
 
     Unlike ``_reference_messages``, this deliberately excludes every prior
-    assistant/tool frame and preserves a genuinely empty user turn. Structured
-    image-only content becomes the same text placeholder used by the legacy
-    conversation view, so binary/base64 payloads never reach advisors.
+    assistant/tool frame. Structured image-only content becomes the same text
+    placeholder used by the legacy conversation view, while empty text gets a
+    distinct non-empty placeholder so strict advisor providers do not reject
+    the request. Binary/base64 payloads never reach advisors.
     """
     for msg in reversed(messages):
         if msg.get("role") != "user":
@@ -1183,6 +1184,8 @@ def _current_turn_reference_messages(
         text = flatten_message_text(content)
         if not text.strip() and isinstance(content, list) and content:
             text = "[user sent non-text content (e.g. an image attachment)]"
+        elif not text.strip():
+            text = "[user sent an empty message]"
         return [{"role": "user", "content": text}]
     return []
 
@@ -2052,10 +2055,20 @@ class MoAChatCompletions:
         from agent.usage_pricing import CanonicalUsage
 
         reference_outputs: list[tuple[str, str, Any]] = []
-        # Keep the legacy rendered conversation as the sole cache/cadence
+        # Keep the legacy rendered conversation as the primary cache/cadence
         # signature source. Scope/filter only shape the disposable provider
-        # payload, so two distinct raw states never collide after redaction.
+        # payload, so distinct text states never collide after redaction. The
+        # rendered view deliberately drops empty user messages, though, so the
+        # raw user-turn count (excluding the advisory marker) is folded into
+        # every hash below to ensure a new empty turn cannot reuse the prior
+        # turn's advisor output.
         ref_messages = _reference_messages(messages)
+        raw_user_turn_count = sum(
+            1
+            for message in messages
+            if message.get("role") == "user"
+            and flatten_message_text(message.get("content")) != _ADVISORY_INSTRUCTION
+        )
         reference_input_scope = str(
             preset.get("reference_input_scope") or "conversation"
         ).strip().lower()
@@ -2124,7 +2137,10 @@ class MoAChatCompletions:
         def _hash_messages(msgs: list[dict[str, Any]]) -> str:
             return hashlib.sha256(
                 "\u0000".join(
-                    f"{m.get('role')}:{m.get('content')}" for m in msgs
+                    [
+                        *(f"{m.get('role')}:{m.get('content')}" for m in msgs),
+                        f"raw_user_turn_count:{raw_user_turn_count}",
+                    ]
                 ).encode("utf-8", "replace")
             ).hexdigest()
 

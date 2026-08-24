@@ -1251,34 +1251,58 @@ def test_render_tool_calls_tolerates_namespace_shapes():
     assert _render_tool_calls([SimpleNamespace()]) == "[called tool: tool]"
 
 
-# ── G8 V2 oracle: reference input scope/filter boundary (RED) ──────────────
+# ── G8 V2 oracle: reference input scope/filter boundary ────────────────────
 #
 # Contract: reference_input_scope (conversation|current_turn) shapes what an
 # advisor sees; reference_input_filter (none|redact) redacts advisor INPUT;
 # the acting aggregator ALWAYS gets the raw transcript, with guidance attached
-# in the existing canonical shapes. Neither field is implemented yet, so the
-# value-bearing advisor assertions below are RED on the legacy full-transcript
-# view; the aggregator-transcript and cadence assertions are green invariants
-# that must hold once the feature lands.
-#
-# SUT call reconciliation (call_llm is stubbed; every recorded advisor or
-# aggregator call counts 1):
-#   F2 current_turn full create (1 ref + 1 agg) + 2 prepare-only runs (2 ref) = 4
-#   F3 redact/off full create (1 ref + 1 agg) + none/full and redact/full
-#      prepare-only runs (2 ref)                                             = 4
-#   F4 conversation + current_turn prepare-only legs                          = 2
-#   F5 two-turn facade (2 ref) + redact pair (2 ref) + one-shot
-#      aggregate_moa_context (1 ref + 1 agg)                                  = 6
-#   Loop-mode subtotal 16; config-file subtotal 14 -> 30 SUT calls <= 30.
-#   Node IDs: 4 test functions added here + 1 parametrized config function
-#   (2 collected cases) -> 5 functions / 6 collected node IDs <= 11.
+# in the existing canonical shapes. The assertions below cover those boundaries
+# plus the aggregator-transcript and fan-out cadence invariants.
 
 _IMAGE_PLACEHOLDER = "[user sent non-text content (e.g. an image attachment)]"
+_EMPTY_USER_PLACEHOLDER = "[user sent an empty message]"
+
+
+@pytest.mark.parametrize("content", ["", "   ", None])
+def test_current_turn_empty_user_content_invalidates_turn_cache(
+    monkeypatch, tmp_path, content
+):
+    from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
+
+    home = tmp_path / "home_empty_turn"
+    _moa_home_config(home, scope="current_turn", input_filter="none")
+    calls = _install_moa_call_llm(monkeypatch)
+    facade, _events = _moa_facade(monkeypatch, home)
+
+    facade.create(
+        messages=[{"role": "user", "content": "prior ask"}],
+        _moa_prepare_only=True,
+    )
+    facade.create(
+        messages=[
+            {"role": "user", "content": "prior ask"},
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "f", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+            {"role": "user", "content": content},
+        ],
+        _moa_prepare_only=True,
+    )
+
+    refs = [call for call in calls if call["task"] == "moa_reference"]
+    assert len(refs) == 2
+    assert _advisor_view(refs[-1], _REFERENCE_SYSTEM_PROMPT) == [
+        {"role": "user", "content": _EMPTY_USER_PLACEHOLDER}
+    ]
 
 
 def _moa_home_config(home, *, scope=None, input_filter=None, privacy=None):
-    """Write a minimal moa config; the two reference-input fields are
-    deliberately accepted (they are ignored until the feature lands)."""
+    """Write a minimal MoA config with optional reference-input controls."""
     home.mkdir()
     lines = ["moa:"]
     if privacy is not None:
@@ -1387,14 +1411,9 @@ def test_moa_current_turn_advisor_boundary_and_aggregator_transcript(
     monkeypatch, tmp_path
 ):
     """F2: current_turn leaves ONLY the last real user for advisors (prior
-    user/assistant/tool and the synthetic advisory turn all excluded, empty
-    content kept), while the acting aggregator keeps the raw transcript with
-    guidance attached in the canonical shape.
-
-    RED: current_turn is unimplemented — the advisor gets the legacy flattened
-    view, so the single-user expectations fail. GREEN (must survive the
-    feature): the conversation leg's legacy behavior and both
-    aggregator-transcript invariants.
+    user/assistant/tool and the synthetic advisory turn all excluded), replaces
+    empty content with a provider-safe placeholder, and keeps the acting
+    aggregator's raw transcript with guidance attached in the canonical shape.
     """
     from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
 
@@ -1419,8 +1438,8 @@ def test_moa_current_turn_advisor_boundary_and_aggregator_transcript(
     agg_call = next(c for c in calls if c["task"] == "moa_aggregator")
 
     current_view = _advisor_view(ref_call, _REFERENCE_SYSTEM_PROMPT)
-    # Defer the RED assertion until all three legs have exercised their provider
-    # seams; this keeps the 4-call budget mechanically observable on baseline.
+    # Defer the assertion until all three legs have exercised their provider
+    # seams; this keeps the 4-call budget mechanically observable.
 
     # Aggregator transcript stays raw and intact: roles alternate, no frame is
     # dropped or added, guidance merges into the trailing EMPTY user turn.
@@ -1470,10 +1489,12 @@ def test_moa_current_turn_advisor_boundary_and_aggregator_transcript(
     calls, _events, _facade, prepared = _moa_facade_run(monkeypatch, home, transcript)
     ref_call = next(c for c in calls if c["task"] == "moa_reference")
     # All four provider calls across the three legs have now executed.
-    assert current_view == [{"role": "user", "content": ""}]  # RED
+    assert current_view == [
+        {"role": "user", "content": _EMPTY_USER_PLACEHOLDER}
+    ]
     assert _advisor_view(ref_call, _REFERENCE_SYSTEM_PROMPT) == [
         {"role": "user", "content": "u1"}
-    ]  # RED
+    ]
     assert _normalize_wire_messages(prepared["messages"]) == [
         *transcript,
         {"role": "user", "content": prepared["guidance"]},
@@ -1487,11 +1508,8 @@ def test_moa_reference_input_filter_privacy_quadrants(monkeypatch, tmp_path):
     they stay independent of the input filter. Expected redaction markers are
     derived from the central redactor (redact_sensitive_text with
     force=True, redact_url_credentials=True) — no regexes are invented here.
-
-    RED: redact is unimplemented — the advisor payload still carries every
-    full sentinel string. The none-legacy input and raw aggregator transcript
-    are compatibility invariants; strict URL credential redaction under
-    privacy=full is part of this feature's output-side hardening.
+    The none-legacy input and raw aggregator transcript remain compatibility
+    invariants; privacy=full also enforces strict URL credential redaction.
     """
     from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
     from agent.redact import redact_sensitive_text
@@ -1546,7 +1564,7 @@ def test_moa_reference_input_filter_privacy_quadrants(monkeypatch, tmp_path):
         url_up, force=True, redact_url_credentials=True
     )
 
-    # Output/trace surfaces stay independent of the input filter (green).
+    # Output/trace surfaces stay independent of the input filter.
     output_sentinels = (email, phone, token, pem, url_up, url_q, public)
     assert all(raw in echo for raw in output_sentinels)
     ref_events = [kw for ev, kw in events if ev == "moa.reference"]
@@ -1598,7 +1616,7 @@ def test_moa_reference_input_filter_privacy_quadrants(monkeypatch, tmp_path):
     # A: redact/off sanitizes input but leaves display, trace, and aggregator
     # advisor output raw.
     for raw in input_sentinels:
-        assert raw not in redact_off_payload  # RED
+        assert raw not in redact_off_payload
     assert "[redacted email]" in redact_off_payload
     assert "[redacted phone]" in redact_off_payload
     assert expected_url_userinfo in redact_off_payload
@@ -1640,8 +1658,8 @@ def test_moa_reference_input_filter_privacy_quadrants(monkeypatch, tmp_path):
 def test_moa_multimodal_advisor_never_sees_base64(monkeypatch, tmp_path):
     """F4: an image-only user turn (base64 data URL) reaches advisors as the
     existing non-text placeholder under BOTH scopes — never the raw base64.
-    The conversation leg is legacy behavior (green); current_turn is the new
-    single-user scope (red until implemented).
+    The conversation leg preserves legacy behavior while current_turn keeps
+    only the latest user scope.
     """
     from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
 
@@ -1668,9 +1686,9 @@ def test_moa_multimodal_advisor_never_sees_base64(monkeypatch, tmp_path):
     ref_call = next(c for c in calls if c["task"] == "moa_reference")
     view = _advisor_view(ref_call, _REFERENCE_SYSTEM_PROMPT)
     text = "".join(m["content"] for m in view)
-    assert sentinel_b64 not in text  # never base64 (green)
-    assert _IMAGE_PLACEHOLDER in text  # existing placeholder (green)
-    assert view[-1]["role"] == "user"  # legacy ends on a user turn (green)
+    assert sentinel_b64 not in text  # never base64
+    assert _IMAGE_PLACEHOLDER in text  # existing placeholder
+    assert view[-1]["role"] == "user"  # legacy ends on a user turn
 
     home = tmp_path / "home_current"
     _moa_home_config(home, scope="current_turn", input_filter="none")
@@ -1678,8 +1696,8 @@ def test_moa_multimodal_advisor_never_sees_base64(monkeypatch, tmp_path):
     ref_call = next(c for c in calls if c["task"] == "moa_reference")
     view = _advisor_view(ref_call, _REFERENCE_SYSTEM_PROMPT)
     text = "".join(m["content"] for m in view)
-    assert sentinel_b64 not in text  # never base64 (green)
-    assert view == [{"role": "user", "content": _IMAGE_PLACEHOLDER}]  # RED
+    assert sentinel_b64 not in text  # never base64
+    assert view == [{"role": "user", "content": _IMAGE_PLACEHOLDER}]
 
 
 def test_moa_scope_filter_propagation_and_fanout_cadence(monkeypatch, tmp_path):
@@ -1689,10 +1707,6 @@ def test_moa_scope_filter_propagation_and_fanout_cadence(monkeypatch, tmp_path):
     after redaction still both re-fan-out (no cache collision); (c) the
     one-shot aggregate_moa_context production path feeds both fields into the
     advisor PAYLOAD content, not just the call count.
-
-    RED: current_turn/redact are unimplemented — (a)/(c) advisor payloads are
-    the legacy full transcript and (b) leaks the raw address. The re-fan-out
-    counts are green invariants that must survive the feature.
     """
     from agent import moa_loop
     from agent.conversation_loop import run_conversation
@@ -1721,7 +1735,7 @@ def test_moa_scope_filter_propagation_and_fanout_cadence(monkeypatch, tmp_path):
         _moa_prepare_only=True,
     )
     refs = [c for c in calls if c["task"] == "moa_reference"]
-    assert len(refs) == 2  # each new turn re-fans-out (green invariant)
+    assert len(refs) == 2  # each new turn re-fans-out
     turn_views = [
         _advisor_view(ref, _REFERENCE_SYSTEM_PROMPT) for ref in refs
     ]
@@ -1811,20 +1825,20 @@ def test_moa_scope_filter_propagation_and_fanout_cadence(monkeypatch, tmp_path):
             moa_config=active_preset,
         )
 
-    assert captured_oneshot.get("reference_input_scope") == "current_turn"  # RED
-    assert captured_oneshot.get("reference_input_filter") == "redact"  # RED
+    assert captured_oneshot.get("reference_input_scope") == "current_turn"
+    assert captured_oneshot.get("reference_input_filter") == "redact"
     refs = [c for c in calls if c["task"] == "moa_reference"]
     aggs = [c for c in calls if c["task"] == "moa_aggregator"]
     assert len(refs) == 5 and len(aggs) == 1
     payload = "".join(
         m["content"] for m in _advisor_view(refs[4], _REFERENCE_SYSTEM_PROMPT)
     )
-    assert "alice@corp.example" not in payload  # RED: raw email reaches advisors
-    assert payload == "my email is [redacted email]"  # RED: only the last user
+    assert "alice@corp.example" not in payload
+    assert payload == "my email is [redacted email]"
     assert turn_views == [
         [{"role": "user", "content": "u1"}],
         [{"role": "user", "content": "u1"}],
-    ]  # RED
+    ]
     for redact_payload in redact_payloads:
         assert "[redacted email]" in redact_payload
-        assert "x@y.com" not in redact_payload  # RED: raw address reaches advisors
+        assert "x@y.com" not in redact_payload
