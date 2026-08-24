@@ -1455,13 +1455,24 @@ export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 /** Deterministic soft-body avatars from any string (name → face). String
  *  renderer for rasterization; React component for live rendering (the only
  *  one that animates — the string renderer ignores `animate` by design).
- *  `motion.css` is imported here rather than by each consumer: nothing
- *  animates without it, and it costs the stylesheet and nothing else on the
- *  static path (imported at the top of this file). That import is a deliberate
- *  SIDE EFFECT, not dead weight — it is what makes `animate` work at all, so
- *  every consumer pays the sheet whether or not it renders a Blobatar. Do not
- *  "optimize" it into a per-consumer import: the faces silently stop moving in
- *  whichever surface forgets it. */
+ *  `motion.css` is imported once at the top of this file rather than by each
+ *  consumer, and that import is a deliberate SIDE EFFECT: it is what makes
+ *  `animate` work at all, so every consumer pays the sheet whether or not it
+ *  renders a Blobatar. Measured before accepting it (blobatar@2.4.0): 7.9 KB
+ *  raw, 1.5 KB gzipped, read from local disk in the desktop app — no network,
+ *  no measurable parse. Deferring it to first render would buy that back at
+ *  the price of an unanimated first frame, which is the wrong trade.
+ *
+ *  It also cannot be dropped by accident: blobatar declares
+ *  `sideEffects: ["*.css"]`, so no bundler tree-shakes it out from under a
+ *  consumer that only imports `Blobatar`. Do not "optimize" it into a
+ *  per-consumer import anyway — the faces would silently stop moving in
+ *  whichever surface forgot it, with no error to catch.
+ *
+ *  The one real global claim is the namespace: the sheet registers 15
+ *  document-wide `@property --mo-*` typed customs plus the `.mo-*` classes.
+ *  Nothing else in this app uses either prefix; a future collision there is
+ *  the thing to check, not the byte count. */
 export { blobatar as blobatarSvg } from 'blobatar/blob'
 export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll
