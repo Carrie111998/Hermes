@@ -315,7 +315,7 @@ def _dependency_state(venv: Path) -> dict[str, Any]:
     directory_count = 0
     manifest = hashlib.sha256()
     distributions: list[str] = []
-    paths = [venv, *venv.rglob("*")]
+    paths = list(_iter_dependency_state_paths(venv))
     for path in sorted(paths, key=lambda item: item.relative_to(venv).as_posix()):
         try:
             rel = path.relative_to(venv).as_posix() or "."
@@ -387,6 +387,38 @@ def _dependency_state(venv: Path) -> dict[str, Any]:
         "pyvenv_cfg_sha256": pyvenv_sha,
         "distributions": sorted(distributions),
     }
+
+
+def _iter_dependency_state_paths(venv: Path):
+    """Walk a venv without following nested Windows reparse points."""
+
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    pending = [Path(venv)]
+    yield Path(venv)
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+                for entry in children:
+                    path = Path(entry.path)
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise CheckpointError(
+                            f"cannot stat venv entry {path}: {exc}"
+                        ) from exc
+                    if bool(
+                        getattr(metadata, "st_file_attributes", 0) & reparse_flag
+                    ):
+                        raise CheckpointError(
+                            f"venv entry contains a link or reparse point: {path}"
+                        )
+                    yield path
+                    if stat.S_ISDIR(metadata.st_mode):
+                        pending.append(path)
+        except OSError as exc:
+            raise CheckpointError(f"cannot scan venv directory {current}: {exc}") from exc
 
 
 def _find_venv(project_root: Path) -> tuple[Path, str, bool]:

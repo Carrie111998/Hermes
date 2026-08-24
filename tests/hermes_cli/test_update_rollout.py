@@ -23,6 +23,7 @@ from hermes_cli.update_rollout import (
     _CANARY_PROVIDER_SMOKE_PREFIX,
     _CANARY_SMOKE_MODULES,
     _bounded_smoke_run,
+    _dependency_state,
     _profile_smoke,
     _provider_smoke_turn,
     _validate_windows_coordinator_paths,
@@ -759,6 +760,24 @@ def test_checkpoint_symlink_target_tamper_is_rejected(repo: Path):
     link.symlink_to("changed.bin")
     with pytest.raises(RollbackError, match="manifest"):
         restore_checkpoint(checkpoint, repo)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_dependency_state_rejects_nested_windows_junction(repo: Path, tmp_path: Path):
+    external = tmp_path / "external-junction-target"
+    external.mkdir()
+    junction = repo / "venv" / "lib" / "external-link"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot create junction: {result.stdout} {result.stderr}")
+
+    with pytest.raises(CheckpointError, match="link or reparse point"):
+        _dependency_state(repo / "venv")
 
 
 @pytest.mark.linux_only

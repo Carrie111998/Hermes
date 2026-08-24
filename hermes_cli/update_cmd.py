@@ -4218,11 +4218,22 @@ def _capture_rollout_active_optional_dependencies(
     absence and forces a complete candidate install later.
     """
 
-    project = Path(project_root).resolve()
+    project = Path(project_root)
+    from hermes_cli.update_rollout import (
+        validate_no_reparse_topology,
+        validate_real_venv_root,
+    )
+
+    # Validate the project and candidate roots before resolving or selecting an
+    # interpreter.  On Windows, resolving/is_dir() on a junction can otherwise
+    # route the probe outside the install tree.
+    validate_no_reparse_topology(project)
+    project = project.resolve()
     selected_venv: Path | None = None
     for name in ("venv", ".venv"):
         candidate = project / name
-        if candidate.is_dir():
+        validate_no_reparse_topology(candidate)
+        if validate_real_venv_root(candidate, allow_missing=True):
             selected_venv = candidate
             break
     if selected_venv is None:

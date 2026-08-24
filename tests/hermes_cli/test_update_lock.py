@@ -19,6 +19,8 @@ from __future__ import annotations
 import builtins
 import errno
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -498,6 +500,33 @@ def test_takeover_fails_closed_when_marker_mutex_is_unavailable(marker, monkeypa
     monkeypatch.setattr(update_lock_mod._MarkerMutex, "__enter__", fail_mutex)
     assert UpdateLock(path=marker).take_over_handoff() is False
     assert marker.read_text(encoding="utf-8") == body
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_marker_mutex_rejects_windows_junction(marker, tmp_path):
+    target = tmp_path / "mutex-target"
+    target.mkdir()
+    mutex_path = marker.with_name(f"{marker.name}.mutex")
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(mutex_path), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot create junction: {result.stdout} {result.stderr}")
+
+    try:
+        with pytest.raises(update_lock_mod.UpdateLockUnavailable):
+            with update_lock_mod._MarkerMutex(marker):
+                pass
+        assert not (target / "unexpected").exists()
+    finally:
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "rmdir", str(mutex_path)],
+            capture_output=True,
+            check=False,
+        )
 
 
 class TestHandoffFromOrchestratingUpdater:

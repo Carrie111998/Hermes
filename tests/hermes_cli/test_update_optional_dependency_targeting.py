@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import memory_setup, update_cmd
+from hermes_cli.update_rollout import CheckpointError
 from tools import lazy_deps
 
 
@@ -80,6 +81,37 @@ def test_absent_project_venv_has_empty_capture_and_forces_full_install(
         {"dependency_state": {"venv_present": False}},
         project_root=tmp_path,
     )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_windows_capture_rejects_venv_junction_before_interpreter_selection(
+    tmp_path: Path, monkeypatch
+):
+    project = tmp_path / "project"
+    external = tmp_path / "external-venv"
+    project.mkdir()
+    external.mkdir()
+    junction = project / "venv"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot create junction: {result.stdout} {result.stderr}")
+
+    monkeypatch.setattr(update_cmd._m(), "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "a linked venv must be rejected before interpreter selection"
+        ),
+    )
+
+    with pytest.raises(CheckpointError, match="link or reparse point"):
+        update_cmd._capture_rollout_active_optional_dependencies(project)
 
 
 def test_existing_project_venv_probe_failure_refuses_empty_snapshot(

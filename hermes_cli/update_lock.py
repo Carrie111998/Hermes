@@ -257,6 +257,80 @@ def _write_all(fd: int, payload: bytes) -> None:
         remaining = remaining[written:]
 
 
+def _open_marker_mutex_no_follow(path: Path) -> int:
+    """Open the mutex without following a symlink or Windows reparse point."""
+
+    flags = os.O_RDWR | os.O_CREAT
+    if sys.platform != "win32":
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        return os.open(path, flags, 0o600)
+
+    import ctypes
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    open_always = 4
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    file_attribute_reparse_point = 0x00000400
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    handle = create_file(
+        str(path),
+        generic_read | generic_write,
+        share_all,
+        None,
+        open_always,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.WinError(error))
+    fd: int | None = None
+    transferred = False
+    try:
+        import msvcrt
+
+        fd = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+        transferred = True
+        metadata = os.fstat(fd)
+        if bool(
+            getattr(metadata, "st_file_attributes", 0) & file_attribute_reparse_point
+        ):
+            os.close(fd)
+            fd = None
+            raise OSError(0, f"mutex path is a reparse point: {path}")
+        assert fd is not None
+        return fd
+    except BaseException:
+        # open_osfhandle transfers ownership only when it succeeds.  Close the
+        # matching resource for either the CRT fd or the raw Win32 handle.
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        elif not transferred:
+            close_handle(handle)
+        raise
+
+
 class _MarkerMutex:
     """Short cross-process mutex for Python marker read/modify/write cycles.
 
@@ -278,8 +352,13 @@ class _MarkerMutex:
 
     def __enter__(self) -> "_MarkerMutex":
         try:
+            from hermes_cli.update_rollout import validate_no_reparse_topology
+
+            validate_no_reparse_topology(self.path.parent)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            validate_no_reparse_topology(self.path.parent)
+            validate_no_reparse_topology(self.path)
+            self.fd = _open_marker_mutex_no_follow(self.path)
             deadline = time.monotonic() + MARKER_MUTEX_TIMEOUT_SECONDS
             while True:
                 try:
@@ -311,6 +390,16 @@ class _MarkerMutex:
                 self.fd = None
             raise
         except OSError as exc:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+            raise UpdateLockUnavailable(
+                f"could not lock update marker mutex {self.path}: {exc}"
+            ) from exc
+        except Exception as exc:
             if self.fd is not None:
                 try:
                     os.close(self.fd)
