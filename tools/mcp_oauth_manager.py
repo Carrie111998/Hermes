@@ -114,6 +114,17 @@ def _make_hermes_provider_class() -> Optional[type]:
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
 
+    # Silent-shadowing guard (#93719 review): the scope-restore override below
+    # shadows a specific SDK method name. If an mcp release renames it, Python
+    # would happily keep the dead override and the configured-scope bug would
+    # silently return. Warn once at class build so the breakage is visible.
+    if not callable(getattr(OAuthClientProvider, "_perform_authorization_code_grant", None)):
+        logger.warning(
+            "mcp SDK: OAuthClientProvider has no _perform_authorization_code_grant; "
+            "the configured oauth.scope restore override will never run — check "
+            "upstream for a renamed hook"
+        )
+
     class HermesMCPOAuthProvider(OAuthClientProvider):
         """OAuthClientProvider with pre-flow disk-mtime reload.
 
@@ -742,6 +753,9 @@ class MCPOAuthManager:
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            # cfg here is the per-server `mcp_servers.<name>.oauth:` mapping
+            # (entry.oauth_config after apply_oauth_provider_defaults), NOT the
+            # top-level server config — scope/client_id both live under oauth:.
             configured_scope=cfg.get("scope"),
             server_url=entry.server_url,
             client_metadata=client_metadata,

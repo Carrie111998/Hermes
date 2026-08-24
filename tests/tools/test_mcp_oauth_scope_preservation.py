@@ -22,13 +22,26 @@ Fix contract: when an explicit ``oauth.scope`` is configured for the server,
 the effective requested scope must be built FROM that configuration — server
 metadata may add to it (e.g. a WWW-Authenticate-required scope), but may not
 replace it.
+
+NOTE on the "pre-fix state" assertions below: they pin the *SDK's current*
+behavior via the public ``get_client_metadata_scopes`` helper. If the mcp SDK
+fixes scope preservation upstream, these tests will start failing WITHOUT any
+Hermes change — that failure means "upgrade and re-evaluate this fix," not a
+regression here. They are marked with the ``sdk_behavior_pin`` marker so they
+can be deselected or re-baselined against a new SDK version in one place.
 """
 
 from __future__ import annotations
 
+import pytest
+
 from mcp.client.auth.utils import get_client_metadata_scopes
 
 CONFIGURED = "mcp:ea offline_access"
+
+# Marker: tests asserting the installed SDK's (currently buggy) scope
+# selection. Register in pyproject if the repo grows more of these.
+sdk_behavior_pin = pytest.mark.sdk_behavior_pin
 
 
 class _AS:
@@ -49,6 +62,7 @@ class _ASNone:
     scopes_supported = None
 
 
+@sdk_behavior_pin
 def test_configured_scope_dropped_when_server_advertises_different_set():
     """A 401 with no WWW-Authenticate header replaces the configured scope with
     the advertised list — the user's explicit request never reaches /authorize."""
@@ -65,6 +79,7 @@ def test_configured_scope_dropped_when_server_advertises_different_set():
     )
 
 
+@sdk_behavior_pin
 def test_configured_scope_dropped_when_server_metadata_has_no_scopes():
     """With no advertised scopes anywhere, the helper returns None — the
     explicitly configured scope is silently not requested at all."""
@@ -75,6 +90,7 @@ def test_configured_scope_dropped_when_server_metadata_has_no_scopes():
     )
 
 
+@sdk_behavior_pin
 def test_wa_challenge_narrows_configured_scope_without_offline_access():
     """When the challenge demands only 'mcp:ea' and AS metadata lacks
     offline_access, the SEP-2207 refresh-token augmentation cannot fire and the
