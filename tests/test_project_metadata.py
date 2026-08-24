@@ -44,6 +44,19 @@ def test_matrix_extra_not_in_all():
     )
 
 
+def test_wake_openwakeword_has_explicit_python_compatibility_boundary():
+    """The released openWakeWord path is limited to CPython 3.11."""
+    optional_dependencies = _load_optional_dependencies()
+    wake = optional_dependencies["wake"]
+
+    assert "openwakeword==0.6.0; python_version < '3.12'" in wake
+    assert not any(
+        spec.startswith("openwakeword==0.6.0")
+        and spec != "openwakeword==0.6.0; python_version < '3.12'"
+        for spec in wake
+    )
+
+
 def test_lazy_installable_extras_excluded_from_all():
     """Policy (2026-05-12): every extra that has a `LAZY_DEPS` entry
     in `tools/lazy_deps.py` must be excluded from [all].

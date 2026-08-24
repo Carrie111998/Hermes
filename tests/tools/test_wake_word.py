@@ -19,6 +19,17 @@ import pytest
 import tools.wake_word as ww
 
 
+@pytest.fixture(autouse=True)
+def _allow_legacy_openwakeword_test_paths(monkeypatch):
+    """Keep pre-existing engine tests focused on their own behavior.
+
+    The compatibility boundary is exercised explicitly below; other tests use
+    fake openWakeWord modules and must remain portable across the test runner's
+    Python version.
+    """
+    monkeypatch.setattr("tools.lazy_deps.openwakeword_unsupported_reason", lambda: None)
+
+
 # ── Config helpers ───────────────────────────────────────────────────────
 
 
@@ -100,6 +111,7 @@ def _voice_loop_ready(monkeypatch, stt=True, tts=True):
 def test_requirements_openwakeword_available(monkeypatch):
     _voice_loop_ready(monkeypatch)
     monkeypatch.setattr(ww, "_audio_available", lambda: True)
+    monkeypatch.setattr("tools.lazy_deps.openwakeword_unsupported_reason", lambda: None)
     monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
     r = ww.check_wake_word_requirements(
         {"provider": "openwakeword", "phrase": "hey hermes"}
@@ -107,6 +119,60 @@ def test_requirements_openwakeword_available(monkeypatch):
     assert r["available"] is True
     assert r["provider"] == "openwakeword"
     assert r["phrase"] == "hey hermes"
+
+
+def test_requirements_openwakeword_unsupported_python_fails_closed(monkeypatch):
+    """Python 3.12+ must report remediation without attempting lazy install."""
+    import tools.lazy_deps as lazy_deps
+
+    _voice_loop_ready(monkeypatch)
+    monkeypatch.setattr(
+        lazy_deps,
+        "openwakeword_unsupported_reason",
+        lambda: (
+            "unsupported on Python 3.13: use Python 3.11 for openWakeWord "
+            "or select another configured wake provider"
+        ),
+    )
+    monkeypatch.setattr(
+        lazy_deps,
+        "is_available",
+        lambda feature: pytest.fail("availability must not trigger an install"),
+    )
+    monkeypatch.setattr(
+        lazy_deps,
+        "_allow_lazy_installs",
+        lambda: pytest.fail("installer policy must not be probed"),
+    )
+    monkeypatch.setattr(ww, "_audio_available", lambda: pytest.fail("audio probe is unnecessary"))
+    monkeypatch.setattr(
+        ww, "_local_input_device_ready", lambda: pytest.fail("mic probe is unnecessary")
+    )
+
+    result = ww.check_wake_word_requirements({"provider": "openwakeword"})
+
+    assert result["available"] is False
+    assert result["deps_available"] is False
+    assert "Python 3.13" in result["hint"]
+    assert "Python 3.11" in result["hint"]
+
+
+def test_openwakeword_engine_rejects_unsupported_python_before_lazy_install(monkeypatch):
+    import tools.lazy_deps as lazy_deps
+
+    monkeypatch.setattr(
+        lazy_deps,
+        "openwakeword_unsupported_reason",
+        lambda: "unsupported on Python 3.14; use Python 3.11",
+    )
+    monkeypatch.setattr(
+        lazy_deps,
+        "ensure",
+        lambda *args, **kwargs: pytest.fail("incompatible wake deps must not install"),
+    )
+
+    with pytest.raises(RuntimeError, match="Python 3.14"):
+        ww._OpenWakeWordEngine({"provider": "openwakeword"})
 
 
 def test_tts_ready_is_a_probe_never_an_installer(monkeypatch):
@@ -212,6 +278,7 @@ def _install_fake_openwakeword(monkeypatch):
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    monkeypatch.setattr("tools.lazy_deps.openwakeword_unsupported_reason", lambda: None)
     return calls
 
 
@@ -318,6 +385,7 @@ def _openwakeword_engine_with_scores(monkeypatch, cfg_wake, scores):
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    monkeypatch.setattr("tools.lazy_deps.openwakeword_unsupported_reason", lambda: None)
     monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
     return ww._OpenWakeWordEngine({"provider": "openwakeword", **cfg_wake})
 

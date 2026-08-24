@@ -335,6 +335,33 @@ _SAFE_SPEC = re.compile(
 )
 
 
+_OPENWAKEWORD_MAX_PYTHON = (3, 12)
+
+
+def openwakeword_supported(version_info=None) -> bool:
+    """Whether the released openWakeWord/tflite path is supported.
+
+    ``openwakeword==0.6.0`` requires ``tflite-runtime`` on Linux, and the
+    published wheels for the supported Linux architectures stop at CPython
+    3.11. Keep this predicate shared by the lazy installer and wake runtime so
+    a resolver marker cannot drift from the first-use behavior.
+    """
+    version = version_info if version_info is not None else sys.version_info
+    return tuple(version[:2]) < _OPENWAKEWORD_MAX_PYTHON
+
+
+def openwakeword_unsupported_reason() -> Optional[str]:
+    """Return an actionable reason when the released wake path is unavailable."""
+    if openwakeword_supported():
+        return None
+    return (
+        "unsupported on Python 3.12 or newer: openwakeword==0.6.0 depends on "
+        "tflite-runtime wheels that are published only for CPython 3.11. "
+        "Use Python 3.11 for openWakeWord, select another configured wake "
+        "provider, or wait for the upstream LiteRT-based release"
+    )
+
+
 class FeatureUnavailable(RuntimeError):
     """A lazily-installable feature is missing and cannot be made available.
 
@@ -549,6 +576,8 @@ def _unsupported_feature_reason(feature: str) -> Optional[str]:
             "which has no Windows wheel and requires make + libolm to build "
             "from sdist. Run Hermes under WSL to use Matrix on Windows."
         )
+    if feature == "wake.openwakeword":
+        return openwakeword_unsupported_reason()
     return None
 
 
