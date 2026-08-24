@@ -290,7 +290,34 @@ class TestWsAuthOkGated:
             assert "ws_ticket_rejected" in content
 
 
-class TestWsRequestIsAllowedGated:
+class TestGatewayWsAuthRejectionLogging:
+    """`/api/ws` must log an auth rejection the same way `/api/pty` does.
+
+    Before this fix, `gateway_ws` called the boolean `_ws_auth_ok` and
+    discarded the rejection reason, so a bad/missing credential on
+    `/api/ws` closed the socket with no log line at all (see #93235:
+    "`/api/ws` auth rejections are invisible in the logs").
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_credential_is_logged_before_close(self, loopback_app, caplog):
+        ws = _fake_ws(query={}, path="/api/ws")
+
+        closed = {}
+
+        async def fake_close(code=None, reason=None):
+            closed["code"] = code
+
+        ws.close = fake_close
+
+        with caplog.at_level("WARNING", logger="hermes_cli.web_server"):
+            await web_server.gateway_ws(ws)
+
+        assert closed["code"] == 4401
+        assert any(
+            "ws auth rejected" in record.message and "reason=no_credential" in record.message
+            for record in caplog.records
+        )
     """Bug fix: in gated mode, the WS peer-IP loopback check must be
     bypassed.
 
