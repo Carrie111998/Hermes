@@ -96,6 +96,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
+from transcript_parts import message_parts
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -10472,6 +10473,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        parts: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -10512,6 +10514,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
+        stored_parts = self._encode_content(
+            message_parts({"parts": parts})
+            if parts is not None
+            else message_parts({
+                "role": role,
+                "content": content,
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "tool_calls": tool_calls,
+                "reasoning": reasoning,
+                "reasoning_content": reasoning_content,
+            })
+        )
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -10537,15 +10552,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
             cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT INTO messages (session_id, role, content, parts, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   )""",
                 (
                     session_id,
                     role,
                     stored_content,
+                    stored_parts,
                     tool_call_id,
                     tool_calls_json,
                     _scrub_surrogates(tool_name),
@@ -10966,17 +10985,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
             api_content = msg.get("api_content")
+            stored_parts = self._encode_content(message_parts(msg))
 
             cur = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT INTO messages (session_id, role, content, parts, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   )""",
                 (
                     session_id,
                     role,
                     self._encode_content(msg.get("content")),
+                    stored_parts,
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
@@ -11437,6 +11461,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             msg = dict(row)
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
+            if msg.get("parts") is not None:
+                msg["parts"] = self._decode_content(msg["parts"])
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -11654,6 +11680,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
+        include_parts: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -11701,13 +11728,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
             include_row_ids=include_row_ids,
+            include_parts=include_parts,
         )
 
     # Columns every conversation projection decodes. Shared by
     # get_messages_as_conversation and get_resume_conversations so a single
     # SELECT can feed both the model-fed and display views.
     _CONVERSATION_ROW_COLUMNS = (
-        "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+        "id, role, content, parts, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
@@ -11721,6 +11749,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_ancestors: bool,
         repair_alternation: bool,
         include_row_ids: bool = False,
+        include_parts: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -11735,6 +11764,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if include_parts:
+                raw_parts = row["parts"] if "parts" in row.keys() else None
+                if raw_parts:
+                    decoded_parts = self._decode_content(raw_parts)
+                    if isinstance(decoded_parts, dict) and isinstance(decoded_parts.get("parts"), list):
+                        msg["parts"] = decoded_parts
             # Born durable (#92231): this dict is materialized FROM a durable
             # row, so stamp the persistence marker at the source instead of
             # relying on every restore caller to thread the loaded list back
@@ -11820,6 +11855,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+            # Legacy rows predate the additive envelope. Synthesize a bounded
+            # text/tool projection only for display callers; model history
+            # remains byte/role/tool-identical to the historical projection.
+            if include_parts and "parts" not in msg:
+                msg["parts"] = message_parts(msg)
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
@@ -11905,6 +11945,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_ancestors=False,
             repair_alternation=True,
             include_row_ids=True,
+            include_parts=False,
         )
         display_history = self._rows_to_conversation(
             rows,
@@ -11912,6 +11953,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_ancestors=True,
             repair_alternation=False,
             include_row_ids=True,
+            include_parts=True,
         )
         return model_history, display_history
 

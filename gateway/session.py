@@ -3879,6 +3879,7 @@ class SessionStore:
             session_id=session_id,
             role=message.get("role", "unknown"),
             content=message.get("content"),
+            parts=message.get("parts"),
             tool_name=message.get("tool_name"),
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),

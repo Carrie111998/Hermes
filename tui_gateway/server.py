@@ -140,6 +140,11 @@ except Exception:
     pass
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
+from transcript_parts import (
+    message_parts as _message_parts,
+    stream_text_part as _stream_text_part,
+    wire_fields as _wire_part_fields,
+)
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
@@ -6433,6 +6438,15 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
             args_text = _tool_args_text(args)
             if args_text:
                 payload["args_text"] = args_text
+        payload.update(_wire_part_fields(_message_parts({
+            "role": "assistant",
+            "parts": [{
+                "kind": "tool-call",
+                "id": tool_call_id,
+                "name": name,
+                "arguments": args,
+            }],
+        })))
         # tool.complete is the source of truth for todos (full list from the
         # tool result). args.todos here may be a partial merge update.
         _emit("tool.start", sid, payload)
@@ -6460,6 +6474,12 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         result_text = _tool_result_text(result)
         if result_text:
             payload["result_text"] = result_text
+    payload.update(_wire_part_fields(_message_parts({
+        "role": "tool",
+        "content": payload.get("result"),
+        "tool_call_id": tool_call_id,
+        "tool_name": name,
+    })))
     if name == "todo":
         try:
             data = json.loads(result)
@@ -8088,6 +8108,7 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
+    tool_calls_projected_with_assistant: set[str] = set()
 
     for m in history:
         if not isinstance(m, dict):
@@ -8106,26 +8127,46 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        parts_envelope = _message_parts(m)
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
+            row_tool_call_ids: list[str] = []
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
                 tc_id = tc.get("id", "")
                 if tc_id and fn.get("name"):
                     try:
-                        args = json.loads(fn.get("arguments", "{}"))
+                        raw_args = fn.get("arguments", "{}")
+                        args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
                     except (json.JSONDecodeError, TypeError):
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
+                    row_tool_call_ids.append(tc_id)
             if not content_text.strip():
                 continue
+            # This row will carry its own tool-call parts alongside the
+            # assistant commentary. The later tool row must not prepend the
+            # same invocation a second time.
+            tool_calls_projected_with_assistant.update(row_tool_call_ids)
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
             tc_info = tool_call_args.get(tc_id) if tc_id else None
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
             tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+            if tc_id and tc_info and tc_id not in tool_calls_projected_with_assistant:
+                invocation = _message_parts({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": tc_id,
+                        "function": {"name": name, "arguments": args},
+                    }],
+                })
+                parts_envelope = _message_parts({
+                    "parts": invocation["parts"] + parts_envelope["parts"],
+                })
+            tool_msg.update(_wire_part_fields(parts_envelope))
             # This is the display projection, so keep it faithful. `context`
             # is an 80-char preview for collapsed row titles. A renderer that
             # shows the full call (the expanded `$` transcript in the desktop)
@@ -8151,9 +8192,18 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
-        if not content_text.strip() and not has_reasoning:
+        visible_parts = [
+            part for part in parts_envelope["parts"]
+            if part.get("kind") != "tool-call"
+            and (
+                part.get("kind") not in {"text", "reasoning"}
+                or bool(str(part.get("text") or "").strip())
+            )
+        ]
+        if not content_text.strip() and not has_reasoning and not visible_parts:
             continue
         msg = {"role": role, "text": content_text}
+        msg.update(_wire_part_fields(parts_envelope))
         # Persisted authoring time (Unix seconds) for display.timestamps
         # renderers (#41531). Display-only: never fed back into model context.
         ts = m.get("timestamp")
@@ -8174,6 +8224,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 # turn by ordinal, so no client needs it.
                 msg["text"] = invocation
                 msg["display_kind"] = "skill_invocation"
+                msg.update(_wire_part_fields(_message_parts({
+                    "role": "user", "content": invocation,
+                })))
         if role == "assistant":
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
@@ -8189,6 +8242,72 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         messages.append(msg)
 
     return messages
+
+
+def _assistant_turn_parts(
+    messages: Any, *, fallback_text: Any = "", reasoning: Any = None,
+    prior_history_count: int | None = None, turn_user_content: Any = None,
+) -> dict[str, Any]:
+    """Collect the complete assistant/tool run after this turn's user row.
+
+    Conversation-loop recovery can append synthetic user-role nudges inside
+    one logical turn. Using the *latest* user row truncates the terminal
+    replacement at that nudge and discards already-sealed commentary/tools.
+    The caller knows the pre-turn history boundary and exact submitted wire
+    content, so prefer those authorities; retain the old latest-user fallback
+    only for isolated callers that provide neither.
+    """
+    rows = messages if isinstance(messages, list) else []
+    start = 0
+    boundary_found = False
+    if isinstance(prior_history_count, int) and prior_history_count >= 0:
+        for candidate in range(prior_history_count, len(rows)):
+            row = rows[candidate]
+            if (
+                isinstance(row, dict)
+                and row.get("role") == "user"
+                and (
+                    turn_user_content is None
+                    or row.get("content") == turn_user_content
+                )
+            ):
+                start = candidate + 1
+                boundary_found = True
+                break
+    if not boundary_found and turn_user_content is not None:
+        for index in range(len(rows) - 1, -1, -1):
+            row = rows[index]
+            if (
+                isinstance(row, dict)
+                and row.get("role") == "user"
+                and row.get("content") == turn_user_content
+            ):
+                start = index + 1
+                boundary_found = True
+    if not boundary_found and prior_history_count is None and turn_user_content is None:
+        for index, row in enumerate(rows):
+            if isinstance(row, dict) and row.get("role") == "user":
+                start = index + 1
+    parts: list[dict[str, Any]] = []
+    for row in rows[start:]:
+        if not isinstance(row, dict) or row.get("role") not in {"assistant", "tool"}:
+            continue
+        envelope = _message_parts(row)
+        parts.extend(envelope.get("parts") or [])
+    if not parts:
+        parts = _message_parts({
+            "role": "assistant",
+            "content": fallback_text,
+            "reasoning": reasoning,
+        }).get("parts") or []
+    return _message_parts({"parts": parts})
+
+
+def _set_inflight_assistant_parts(session: dict, envelope: dict[str, Any]) -> None:
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return
+    turn["assistant_parts"] = list(envelope.get("parts") or [])
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:
@@ -8249,14 +8368,23 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _start_inflight_turn(
+    session: dict, text: Any, image_paths: list[str] | None = None
+) -> None:
     now = time.time()
+    content: Any = text
+    if image_paths:
+        content = [{"type": "text", "text": text}]
+        content.extend({"type": "image", "ref": f"@image:{path}"} for path in image_paths)
+    user_parts = _message_parts({"role": "user", "content": content})
     session["inflight_turn"] = {
         "assistant": "",
+        "assistant_parts": [],
         "started_at": now,
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        "user_parts": user_parts,
     }
 
 
@@ -8266,8 +8394,19 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
         return
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "streaming": True, "user": ""}
+        turn = {"assistant": "", "assistant_parts": [], "streaming": True, "user": ""}
     turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
+    current_parts = list(turn.get("assistant_parts") or [])
+    if current_parts and current_parts[-1].get("kind") == "text" \
+            and current_parts[-1].get("id") == "assistant-stream":
+        current_parts[-1] = _stream_text_part(
+            f"{current_parts[-1].get('text') or ''}{text}",
+            part_id="assistant-stream",
+            timestamp=current_parts[-1].get("timestamp"),
+        )
+    else:
+        current_parts.append(_stream_text_part(text, timestamp=time.time()))
+    turn["assistant_parts"] = _message_parts({"parts": current_parts})["parts"]
     turn["streaming"] = True
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
@@ -8875,6 +9014,22 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    assistant_envelope = _message_parts({
+        "role": "assistant",
+        "parts": turn.get("assistant_parts") or ([{"type": "text", "text": assistant}] if assistant else []),
+    })
+    if assistant_envelope["parts"]:
+        snapshot.update(_wire_part_fields(assistant_envelope))
+    user_envelope = turn.get("user_parts")
+    if not isinstance(user_envelope, dict) and user:
+        # In-memory turns created by an older process predate user_parts.
+        # Synthesize the same bounded text fallback used for legacy durable
+        # rows so a reconnect never changes the additive contract shape.
+        user_envelope = _message_parts({"role": "user", "content": user})
+    if isinstance(user_envelope, dict) and isinstance(user_envelope.get("parts"), list):
+        user_fields = _wire_part_fields(user_envelope)
+        snapshot["user_parts"] = user_fields["parts"]
+        snapshot["user_parts_clipped"] = user_fields["parts_clipped"]
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -8949,6 +9104,11 @@ def _emit_terminal_turn_error(
         "error": message,
         "recoverable": True,
     }
+    payload.update(_wire_part_fields(_message_parts({
+        "role": "assistant",
+        "parts": turn.get("assistant_parts") or ([{"type": "text", "text": partial}] if partial else []),
+    })))
+    payload["parts_mode"] = "replace"
     if error_surface:
         payload["error_surface"] = error_surface
     if partial:
@@ -9422,7 +9582,9 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     key = session.get("session_key")
     if db is not None and key:
         try:
-            display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
+            display = db.get_messages_as_conversation(
+                key, include_ancestors=True, include_row_ids=True, include_parts=True
+            )
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
             logger.debug("live display projection read failed", exc_info=True)
@@ -11218,7 +11380,7 @@ def _run_prompt_submit(
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, text, images)
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -11244,7 +11406,20 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    _start_parts_content: Any = text
+    if images:
+        _start_parts_content = [{"type": "text", "text": text}]
+        _start_parts_content.extend(
+            {"type": "image", "ref": f"@image:{path}"} for path in images
+        )
+    _emit(
+        "message.start",
+        sid,
+        _wire_part_fields(_message_parts({
+            "role": "user",
+            "content": _start_parts_content,
+        })),
+    )
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
@@ -11486,6 +11661,11 @@ def _run_prompt_submit(
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
                 payload = {"text": delta}
+                payload.update(_wire_part_fields(_message_parts({
+                    "role": "assistant",
+                    "parts": [_stream_text_part(delta, timestamp=time.time())],
+                })))
+                payload["parts_mode"] = "append"
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 if tts_queue is not None and isinstance(delta, str):
@@ -11499,10 +11679,16 @@ def _run_prompt_submit(
             # Gated on display.interim_assistant_messages (default true).
             if _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                    _emit("message.interim", sid, {
+                    payload = {
                         "text": text,
                         "already_streamed": already_streamed,
-                    })
+                    }
+                    payload.update(_wire_part_fields(_message_parts({
+                        "role": "assistant",
+                        "parts": [_stream_text_part(text, timestamp=time.time())],
+                    })))
+                    payload["parts_mode"] = "seal" if already_streamed else "append"
+                    _emit("message.interim", sid, payload)
 
                 agent.interim_assistant_callback = _interim_assistant_cb
             else:
@@ -11730,6 +11916,15 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            _assistant_envelope = _assistant_turn_parts(
+                result.get("messages") if isinstance(result, dict) else None,
+                fallback_text=raw,
+                reasoning=last_reasoning,
+                prior_history_count=len(history),
+                turn_user_content=run_message,
+            )
+            payload.update(_wire_part_fields(_assistant_envelope))
+            payload["parts_mode"] = "replace"
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -11766,6 +11961,7 @@ def _run_prompt_submit(
                 except Exception:
                     _error_surface = None
             with session["history_lock"]:
+                _set_inflight_assistant_parts(session, _assistant_envelope)
                 if status == "error":
                     # Returned-error result (provider 4xx, budget, etc.): retain
                     # the failed turn for resume replay instead of clearing it.
@@ -14493,7 +14689,7 @@ def _format_live_history_output(session: dict) -> str:
         if db is not None and session.get("session_key"):
             try:
                 history = db.get_messages_as_conversation(
-                    session["session_key"], include_ancestors=True, include_row_ids=True
+                    session["session_key"], include_ancestors=True, include_row_ids=True, include_parts=True
                 )
             except Exception:
                 pass
@@ -14536,7 +14732,7 @@ def _format_live_context_output(session: dict) -> str:
             try:
                 messages = _history_to_messages(
                     db.get_messages_as_conversation(
-                        session["session_key"], include_ancestors=True, include_row_ids=True
+                        session["session_key"], include_ancestors=True, include_row_ids=True, include_parts=True
                     )
                 )
             except Exception:

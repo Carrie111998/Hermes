@@ -694,7 +694,7 @@ def _(rid, params: dict) -> dict:
             # feeds live replay. Fall back to it if the display read fails.
             try:
                 display_history = db.get_messages_as_conversation(
-                    target, repair_alternation=False, include_row_ids=True
+                    target, repair_alternation=False, include_row_ids=True, include_parts=True
                 )
             except Exception:
                 logger.debug("child-watch display projection read failed", exc_info=True)
@@ -2793,6 +2793,7 @@ def _(rid, params: dict) -> dict:
                         session["session_key"],
                         include_ancestors=True,
                         include_row_ids=True,
+                        include_parts=True,
                     )
                 except Exception:
                     pass

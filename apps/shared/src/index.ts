@@ -59,6 +59,12 @@ export {
   type WebSocketLike
 } from './json-rpc-gateway'
 export { skillInvocationText } from './skill-scaffold'
+export type {
+  GatewayTranscriptPart,
+  GatewayTranscriptPartKind,
+  GatewayTranscriptPartsFields,
+  GatewayTranscriptPartsMode
+} from './transcript-parts'
 export {
   type HermesSkin,
   SKIN_BRANDING_TOKENS,
