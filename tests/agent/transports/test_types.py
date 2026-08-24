@@ -7,6 +7,7 @@ from agent.transports.types import (
     ToolCall,
     Usage,
     build_tool_call,
+    is_normalized_terminal_finish_reason,
     map_finish_reason,
 )
 
@@ -120,6 +121,14 @@ class TestMapFinishReason:
 
     def test_none_reason(self):
         assert map_finish_reason(None, self.ANTHROPIC_MAP) == "stop"
+
+
+class TestNormalizedTerminalFinishReason:
+    def test_only_normalized_stop_is_terminal(self):
+        assert is_normalized_terminal_finish_reason("stop") is True
+        assert is_normalized_terminal_finish_reason(" length ") is False
+        assert is_normalized_terminal_finish_reason("provider_new") is False
+        assert is_normalized_terminal_finish_reason(None) is False
 
 
 # ---------------------------------------------------------------------------

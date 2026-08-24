@@ -347,9 +347,22 @@ def finalize_turn(
             if _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
+                # Recovery-generated rows must carry an explicit normalized
+                # reason: cron settlement rejects absent/unknown reasons. A
+                # partial-stream recovery is still non-terminal even when it
+                # has visible recovered text, so preserve that outcome.
+                _persisted_finish_reason = (
+                    "incomplete"
+                    if str(_turn_exit_reason) == "partial_stream_recovery"
+                    else "stop"
+                )
                 append_message(
                     messages,
-                    {"role": "assistant", "content": final_response},
+                    {
+                        "role": "assistant",
+                        "content": final_response,
+                        "finish_reason": _persisted_finish_reason,
+                    },
                 )
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:

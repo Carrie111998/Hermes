@@ -18,6 +18,11 @@ from hermes_state import SessionDB
         ({"role": "assistant", "content": "", "finish_reason": "stop"}, "incomplete"),
         ({"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]}, "incomplete"),
         ({"role": "assistant", "content": "partial", "finish_reason": "incomplete"}, "incomplete"),
+        # A partial-stream stub is normalized to length and is not terminal.
+        ({"role": "assistant", "content": "partial", "finish_reason": "length"}, "incomplete"),
+        # Unknown and absent reasons are not positive proof of finality.
+        ({"role": "assistant", "content": "partial", "finish_reason": "provider_new"}, "incomplete"),
+        ({"role": "assistant", "content": "partial"}, "incomplete"),
         ({"role": "tool", "content": "ok"}, "incomplete"),
         ({"role": "user", "content": "run it"}, "incomplete"),
         (None, "incomplete"),
@@ -53,9 +58,28 @@ def test_real_sessiondb_verification_reads_only_the_persisted_tail(tmp_path):
         db.append_message("cron-silent", "user", "check it")
         db.append_message("cron-silent", "assistant", "[SILENT]", finish_reason="stop")
 
+        # Real persisted partial/unknown/absent finish-reason tails must all
+        # remain non-success, even when they carry visible text.
+        for session_id, finish_reason in (
+            ("cron-length", "length"),
+            ("cron-unknown", "provider_new"),
+            ("cron-absent", None),
+        ):
+            db.create_session(session_id, source="cron")
+            db.append_message(session_id, "user", "continue")
+            db.append_message(
+                session_id,
+                "assistant",
+                "partial answer",
+                finish_reason=finish_reason,
+            )
+
         assert _verify_persisted_cron_final_message(db, "cron-tool-tail") == "incomplete"
         assert _verify_persisted_cron_final_message(db, "cron-complete") == "complete"
         assert _verify_persisted_cron_final_message(db, "cron-silent") == "silent"
+        assert _verify_persisted_cron_final_message(db, "cron-length") == "incomplete"
+        assert _verify_persisted_cron_final_message(db, "cron-unknown") == "incomplete"
+        assert _verify_persisted_cron_final_message(db, "cron-absent") == "incomplete"
     finally:
         db.close()
 

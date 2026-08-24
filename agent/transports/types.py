@@ -15,6 +15,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# Only this normalized reason proves that a provider response reached a
+# terminal assistant answer. ``length``/``incomplete`` are continuation or
+# partial states; tool-call reasons still require another model turn.
+NORMALIZED_TERMINAL_FINISH_REASONS = frozenset({"stop"})
+
+
 @dataclass
 class ToolCall:
     """A normalized tool call from any provider.
@@ -172,3 +178,11 @@ def map_finish_reason(reason: str | None, mapping: dict[str, str]) -> str:
     if reason is None:
         return "stop"
     return mapping.get(reason, "stop")
+
+
+def is_normalized_terminal_finish_reason(reason: str | None) -> bool:
+    """Return whether *reason* positively proves a terminal model answer."""
+    return (
+        isinstance(reason, str)
+        and reason.strip().lower() in NORMALIZED_TERMINAL_FINISH_REASONS
+    )

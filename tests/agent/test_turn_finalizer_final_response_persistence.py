@@ -130,6 +130,36 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == result["messages"][-1]
 
 
+def test_partial_stream_recovery_persists_non_terminal_reason(monkeypatch):
+    """Recovered partial text must not become a durable successful answer."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="partial answer",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="partial_stream_recovery",
+    )
+
+    assert result["messages"][-1]["finish_reason"] == "incomplete"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["finish_reason"] == "incomplete"
+
+
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     monkeypatch, tmp_path
 ):

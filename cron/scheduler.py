@@ -56,6 +56,7 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
+from agent.transports.types import is_normalized_terminal_finish_reason
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
     exit_non_dispatcher_owned_context,
@@ -587,15 +588,6 @@ _CRON_SETTLEMENT_COMPLETE = "complete"
 _CRON_SETTLEMENT_SILENT = "silent"
 _CRON_SETTLEMENT_INCOMPLETE = "incomplete"
 _CRON_SETTLEMENT_UNVERIFIED = "unverified"
-_CRON_NON_TERMINAL_FINISH_REASONS = frozenset({
-    "error",
-    "agent_error",
-    "content_filter",
-    "incomplete",
-    "tool_calls",
-    "verification_required",
-    "verify_hook_continue",
-})
 
 
 def _classify_persisted_cron_final_message(message: Optional[dict]) -> str:
@@ -609,8 +601,6 @@ def _classify_persisted_cron_final_message(message: Optional[dict]) -> str:
         return _CRON_SETTLEMENT_INCOMPLETE
     if message.get("tool_calls"):
         return _CRON_SETTLEMENT_INCOMPLETE
-    if str(message.get("finish_reason") or "").strip().lower() in _CRON_NON_TERMINAL_FINISH_REASONS:
-        return _CRON_SETTLEMENT_INCOMPLETE
 
     content = message.get("content")
     try:
@@ -623,6 +613,8 @@ def _classify_persisted_cron_final_message(message: Optional[dict]) -> str:
         return _CRON_SETTLEMENT_INCOMPLETE
     if text == SILENT_MARKER:
         return _CRON_SETTLEMENT_SILENT
+    if not is_normalized_terminal_finish_reason(message.get("finish_reason")):
+        return _CRON_SETTLEMENT_INCOMPLETE
     return _CRON_SETTLEMENT_COMPLETE
 
 
