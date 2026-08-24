@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 from hermes_constants import get_hermes_home
+from hermes_cli.fallback_config import resolve_aux_task_fallback_chain
 from tools import skill_usage
 from utils import atomic_json_write
 
@@ -1937,6 +1938,15 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             api_mode=_api_mode,
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
+            # The curator fork fails over through run_conversation()'s
+            # _try_activate_fallback(), which only consults _fallback_chain
+            # — built from this argument. Without it a configured
+            # auxiliary.curator.fallback_chain was silently ignored and the
+            # curation pass died with its primary (#78371). Per-task entries
+            # first, top-level chain as the last-resort safety net.
+            fallback_model=(
+                resolve_aux_task_fallback_chain("curator") or None
+            ),
             **_agent_kwargs,
             enabled_toolsets=["skills", "terminal"],
             # Umbrella-building over a large skill collection is worth a

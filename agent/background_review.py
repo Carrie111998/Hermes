@@ -27,6 +27,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
+from hermes_cli.fallback_config import resolve_aux_task_fallback_chain
 
 logger = logging.getLogger(__name__)
 
@@ -1240,6 +1241,17 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                # The review fork fails over through run_conversation()'s
+                # _try_activate_fallback(), which only consults
+                # _fallback_chain — built from this argument. Without it a
+                # configured auxiliary.background_review.fallback_chain was
+                # silently ignored and the review died with its primary
+                # (#93592). Per-task entries first, top-level chain as the
+                # last-resort safety net.
+                fallback_model=(
+                    resolve_aux_task_fallback_chain("background_review")
+                    or None
+                ),
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
