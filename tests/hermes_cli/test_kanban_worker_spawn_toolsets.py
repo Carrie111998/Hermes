@@ -2,6 +2,24 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
+
+class _SnapshotConnection:
+    """Minimal connection stub for the spawn-boundary snapshot read."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, *args, **kwargs):
+        return self
+
+    def fetchone(self):
+        return self.row
+
+    def close(self):
+        pass
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -22,6 +40,23 @@ def _make_task(kb, *, assignee: str):
         tenant=None,
         current_run_id=7,
     )
+
+
+def test_default_spawn_rejects_incomplete_modern_snapshot(monkeypatch, tmp_path):
+    """Modern runs must not fall back to mutable task routing at spawn."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.routing_contract import ROUTING_CONTRACT_VERSION, RoutingContractError
+
+    task = _make_task(kb, assignee="coder")
+    task.model_override = "mutable-model"
+    monkeypatch.setattr(kb, "connect", lambda: _SnapshotConnection({
+        "routing_model": None,
+        "routing_provider": "provider",
+        "routing_contract": ROUTING_CONTRACT_VERSION,
+    }))
+
+    with pytest.raises(RoutingContractError, match="incomplete frozen routing snapshot"):
+        kb._default_spawn(task, str(tmp_path))
 
 
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):

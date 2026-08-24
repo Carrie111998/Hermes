@@ -11801,15 +11801,24 @@ def _default_spawn(
         try:
             with contextlib.closing(connect()) as _snap_conn:
                 run_row = _snap_conn.execute(
-                    "SELECT routing_model, routing_provider "
+                    "SELECT routing_model, routing_provider, routing_contract "
                     "FROM task_runs WHERE id = ?",
                     (task.current_run_id,),
                 ).fetchone()
             if run_row is not None:
                 snapshot_model = run_row["routing_model"]
                 snapshot_provider = run_row["routing_provider"]
-        except Exception as exc:  # noqa: BLE001 -- best-effort advisory read
-            # A snapshot-read hiccup must never kill the spawn: fall back to
+                if run_row["routing_contract"] is not None and (
+                    not snapshot_model or not snapshot_provider
+                ):
+                    raise RoutingContractError(
+                        "incomplete frozen routing snapshot for modern run "
+                        f"{task.current_run_id}"
+                    )
+        except RoutingContractError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- legacy advisory read
+            # A legacy snapshot-read hiccup must not kill the spawn: fall back to
             # the task pin (Wave 1 behavior) instead of failing the worker.
             _log.debug("kanban spawn: snapshot read failed, falling back to "
                        "task pin (%s)", exc)
