@@ -21,6 +21,7 @@
   "messages_omitted": false,
   "resumed": "stored-running",
   "running": true,
+  "auto_continuing": false,
   "session_id": "rt-running",
   "session_key": "stored-running",
   "started_at": 1700000000.0,

@@ -352,6 +352,44 @@ def test_double_schedule_is_guarded(emits, schedule_env, marker_home):
     assert len(schedule_env) == 1
 
 
+def test_live_payload_labels_scheduled_and_running_auto_continuations():
+    scheduled = server._live_session_payload(
+        "sid",
+        _session(_auto_continue_scheduled=True),
+        omit_messages=True,
+    )
+    running = server._live_session_payload(
+        "sid",
+        _session(_auto_continue_attempt=1, running=True),
+        omit_messages=True,
+    )
+    ordinary = server._live_session_payload(
+        "sid",
+        _session(running=True),
+        omit_messages=True,
+    )
+
+    assert scheduled["auto_continuing"] is True
+    assert running["auto_continuing"] is True
+    assert ordinary["auto_continuing"] is False
+
+
+def test_interrupt_retires_auto_continue_marker(marker_home):
+    record_turn_start(marker_home, "session-key", "old request")
+    session = _session(
+        _auto_continue_scheduled=True,
+        _auto_continue_attempt=1,
+        _auto_continue_prompt="old request",
+    )
+
+    server._interrupt_session_turn("sid", session)
+
+    assert session["_auto_continue_scheduled"] is False
+    assert "_auto_continue_attempt" not in session
+    assert "_auto_continue_prompt" not in session
+    assert read_turn_marker(marker_home, "session-key") is None
+
+
 def test_failed_agent_build_leaves_marker_for_retry(
     emits, schedule_env, marker_home, monkeypatch
 ):
@@ -372,5 +410,3 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
-
-
