@@ -460,6 +460,29 @@ class TestGatewaySessionCwdPersistence:
 
         assert store._db.get_session(entry.session_id)["cwd"] == str(configured_cwd)
 
+    def test_local_relative_terminal_cwd_is_persisted_as_absolute(
+        self, store, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", "workspace")
+
+        entry = store.get_or_create_session(self._source())
+
+        assert store._db.get_session(entry.session_id)["cwd"] == str(
+            (tmp_path / "workspace").resolve()
+        )
+
+    def test_remote_terminal_cwd_preserves_remote_tilde(
+        self, store, monkeypatch
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_CWD", "~/workspace")
+
+        entry = store.get_or_create_session(self._source())
+
+        assert store._db.get_session(entry.session_id)["cwd"] == "~/workspace"
+
     def test_new_gateway_session_falls_back_to_home(self, store, tmp_path, monkeypatch):
         home = tmp_path / "home"
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
@@ -485,6 +508,18 @@ class TestGatewaySessionCwdPersistence:
 
         assert db.get_session("blank")["cwd"] == healed_cwd
         assert db.get_session("explicit")["cwd"] == "/original"
+
+    def test_peer_refresh_inserts_missing_row_with_cwd(
+        self, store, tmp_path, monkeypatch
+    ):
+        configured_cwd = str(tmp_path / "workspace")
+        monkeypatch.setenv("TERMINAL_CWD", configured_cwd)
+
+        store._record_gateway_session_peer("missing", "missing-key", self._source())
+
+        inserted = store._db.get_session("missing")
+        assert inserted is not None
+        assert inserted["cwd"] == configured_cwd
 
 
 class TestLoadTranscriptDBOnly:

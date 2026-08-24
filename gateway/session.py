@@ -31,7 +31,12 @@ def _now() -> datetime:
 def _gateway_session_cwd() -> str:
     """Return the workspace persisted for gateway-created session rows."""
     configured = (os.environ.get("TERMINAL_CWD") or "").strip()
-    return os.path.expanduser(configured) if configured else str(Path.home())
+    if not configured:
+        return str(Path.home())
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if backend != "local":
+        return configured
+    return str(Path(os.path.expandvars(configured)).expanduser().resolve())
 
 
 # Default auto-continue freshness window in seconds (1 hour).  A session
