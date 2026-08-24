@@ -39,6 +39,25 @@ function makeEditor(text: string) {
 }
 
 describe('useComposerUndo', () => {
+  it('restores a programmatically replaced prompt as one undo step', () => {
+    const { editor, ref } = makeEditor('rough brainstorming prompt')
+    placeCaretAtEnd(editor)
+
+    const { api, view } = mountUndo(ref, () => editor.textContent || '')
+
+    api.current!.recordUndoPoint()
+    editor.replaceChildren(document.createTextNode('Structured autonomous task'))
+
+    api.current!.undo()
+    expect(editor.textContent).toBe('rough brainstorming prompt')
+
+    api.current!.redo()
+    expect(editor.textContent).toBe('Structured autonomous task')
+
+    view.unmount()
+    editor.remove()
+  })
+
   it('restores the pre-edit text, which is what a paste destroyed', () => {
     const { editor, ref } = makeEditor('before')
     placeCaretAtEnd(editor)

@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import type { ReactNode } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -46,7 +47,8 @@ export function ComposerControls({
   voiceStatus,
   onDictate,
   onQueue,
-  onToggleAutoSpeak
+  onToggleAutoSpeak,
+  rewriteControl
 }: {
   autoSpeak: boolean
   busy: boolean
@@ -63,6 +65,7 @@ export function ComposerControls({
   onDictate: () => void
   onQueue: () => void
   onToggleAutoSpeak: () => void
+  rewriteControl?: ReactNode
 }) {
   const { t } = useI18n()
   const c = t.composer
@@ -108,6 +111,7 @@ export function ComposerControls({
       {minimal ? null : (
         <>
           <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
+          {rewriteControl}
           {voiceControls}
         </>
       )}
