@@ -72,6 +72,7 @@ def _patch_list_profiles(names: list[str]):
         patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
         patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
         patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
+        patch("hermes_cli.kanban_db.list_profiles_on_disk", return_value=["default", *names]),
     ]
 
 

@@ -215,6 +215,38 @@ hermes kanban stats
 
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
+Assignees are validated against the live Hermes profile registry at the shared
+database boundary. This applies equally to CLI, dashboard/API, plugin,
+decomposer, and `kanban_create` calls. An unknown name fails synchronously and
+is never interpreted as an alias (`worker` and `agent` have no special
+meaning). Check valid targets with `hermes profile list`, create a profile
+explicitly, or omit the assignee for later routing.
+
+If a named profile is removed after a card was created, the next dispatcher
+tick moves an unclaimed `ready`/`review` card to audited `triage` instead of
+leaving it stuck or spawning under another identity. Inspect and repair legacy
+cards without guessing across boards:
+
+```bash
+# Read-only, board-qualified report across every active board.
+hermes kanban repair-assignees --all-boards
+
+# Explicit repair on the selected board.
+hermes kanban repair-assignees --task t_abcd --profile researcher
+
+# Across all boards, task selectors are board/task qualified.
+hermes kanban repair-assignees --all-boards \
+    --task project-a/t_abcd --profile engineer
+
+# Explicit terminal disposition when the card is obsolete.
+hermes kanban repair-assignees --task t_abcd --archive
+```
+
+`--all-boards` resolves each board's dedicated database independently. It
+deliberately ignores a process-level `HERMES_KANBAN_DB` pin so a dispatcher or
+profile environment cannot silently scan one database under several board
+labels. Ordinary single-board commands continue to honour that pin.
+
 ### Gateway-embedded dispatcher (default)
 
 The dispatcher runs inside the gateway process. Nothing to install, no

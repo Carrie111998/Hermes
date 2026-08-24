@@ -22,6 +22,19 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def installed_test_profiles(monkeypatch):
+    monkeypatch.setattr(
+        kb,
+        "list_profiles_on_disk",
+        lambda: [
+            "default", "alice", "builder", "new", "newbie", "old", "ops",
+            "orig", "planner", "researcher", "reviewer", "worker", "writer",
+            "x", "y",
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -79,6 +92,20 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+@pytest.mark.real_kanban_profile_registry
+def test_create_task_rejects_unknown_assignee_without_insertion(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad route", "assignee": "ghost-profile"},
+    )
+    assert response.status_code == 422
+    assert "unknown Kanban assignee 'ghost-profile'" in response.json()["detail"]
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee='ghost-profile'"
+        ).fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
