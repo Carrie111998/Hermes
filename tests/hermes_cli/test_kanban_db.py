@@ -26,6 +26,24 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    # These legacy DB-layer tests exercise lifecycle behavior rather than the
+    # routing resolver. Supply a valid deterministic route so fail-closed
+    # claim routing does not obscure the behavior each test targets.
+    monkeypatch.setattr(
+        kb,
+        "_resolve_routing_snapshot",
+        lambda *args, **kwargs: {
+            "routing_role": "executor",
+            "routing_model": "test-model",
+            "routing_provider": "test-provider",
+            "routing_contract": "test-contract",
+            "routing_reason": "legacy DB lifecycle fixture",
+            "roster_digest": "test-roster",
+            "routing_policy": "test-policy",
+            "ac_revision": "test-revision",
+            "routing_source": "test-fixture",
+        },
+    )
     return home
 
 
