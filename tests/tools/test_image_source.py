@@ -344,6 +344,40 @@ class TestSvgNormalization:
         assert path is None
         assert "rasterizer" in err
 
+    def test_opaque_image_normalizes_to_jpeg(self, tmp_path, monkeypatch):
+        """Opaque images (like HEIC/BMP camera photos) normalize to JPEG, not PNG,
+        to prevent massive size inflation and HTTP 413s."""
+        import pytest
+        Image = pytest.importorskip("PIL.Image")
+        from tools import vision_tools as vt
+        _reload(monkeypatch, tmp_path / "hermes")
+        bmp = tmp_path / "photo.bmp"
+        Image.new("RGB", (100, 100), (0, 128, 255)).save(bmp, format="BMP")
+        path, mime, err = vt._normalize_to_supported_image(bmp, "image/bmp")
+        assert err is None
+        assert mime == "image/jpeg"
+        assert path.suffix == ".jpg"
+        assert path.exists()
+        path.unlink()
+
+    def test_alpha_image_normalizes_to_png(self, tmp_path, monkeypatch):
+        """Images with transparency preserve alpha by normalizing to PNG."""
+        import pytest
+        Image = pytest.importorskip("PIL.Image")
+        from tools import vision_tools as vt
+        _reload(monkeypatch, tmp_path / "hermes")
+        # Save a BMP with RGBA or create an uncompressed format with alpha
+        from unittest.mock import patch
+        img_path = tmp_path / "transparent.bmp"
+        Image.new("RGBA", (100, 100), (0, 128, 255, 128)).save(img_path, format="PNG")
+        # Pass non-standard mime to trigger normalization
+        path, mime, err = vt._normalize_to_supported_image(img_path, "image/x-custom")
+        assert err is None
+        assert mime == "image/png"
+        assert path.suffix == ".png"
+        assert path.exists()
+        path.unlink()
+
 
 class TestLazySandboxBringUp:
     """Issue #62825: under a non-local backend, the FIRST vision_analyze of a

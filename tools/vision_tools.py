@@ -371,14 +371,30 @@ def _normalize_to_supported_image(
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(image_path) as _img:
-            if _img.mode not in ("RGB", "RGBA", "L"):
-                _img = _img.convert("RGBA")
-            _img.save(out_path, format="PNG")
+            # Re-encode opaque images as JPEG (quality 85) to avoid blowing up
+            # camera photos (e.g. 48MP iPhone HEIC -> 30MB+ PNG -> 413 error).
+            # Keep PNG for images with alpha transparency.
+            has_alpha = _img.mode in ("RGBA", "LA", "PA") or (
+                _img.mode == "P" and "transparency" in _img.info
+            )
+            if has_alpha:
+                if _img.mode not in ("RGB", "RGBA", "L"):
+                    _img = _img.convert("RGBA")
+                out_path = out_dir / f"converted_{uuid.uuid4()}.png"
+                _img.save(out_path, format="PNG")
+                out_mime = "image/png"
+            else:
+                if _img.mode not in ("RGB", "L"):
+                    _img = _img.convert("RGB")
+                out_path = out_dir / f"converted_{uuid.uuid4()}.jpg"
+                _img.save(out_path, format="JPEG", quality=85)
+                out_mime = "image/jpeg"
+
         if out_path.exists() and out_path.stat().st_size > 0:
-            return out_path, "image/png", None
+            return out_path, out_mime, None
     except Exception as _exc:
-        logger.warning("Failed to normalize %s image to PNG: %s",
-                       detected_mime, _exc)
+        logger.warning("Failed to normalize %s image to %s: %s",
+                       detected_mime, out_mime if 'out_mime' in locals() else 'PNG/JPEG', _exc)
     return (
         None,
         None,
