@@ -16344,24 +16344,6 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
-        # Loopback-spawner escape hatch (#93981): a backend that declares a
-        # non-loopback ``dashboard.public_url`` engages this gated branch even
-        # when it binds loopback — which is exactly how the Desktop spawns its
-        # local chat backends for edge-accessible profiles. The spawned child
-        # probe authenticates with the legacy ``?token=<_SESSION_TOKEN>``, a
-        # process-injected secret that never reaches the SPA and is worthless
-        # to any client that isn't already on loopback. Accept it ONLY when
-        # the peer itself is loopback: remote callers still need a real
-        # ticket, so the public-dashboard posture is unchanged.
-        token_early = ws.query_params.get("token", "")
-        client_host = (ws.client.host if ws.client else "").lower()
-        if (
-            token_early
-            and client_host in _LOOPBACK_HOSTS
-            and hmac.compare_digest(token_early.encode(), _SESSION_TOKEN.encode())
-        ):
-            return None, "token-loopback"
-
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
@@ -17548,6 +17530,51 @@ async def pty_ws(ws: WebSocket) -> None:
 # already paints. Both transports bind to the same session id when one is
 # active, so a tool.start emitted by the agent fans out to both sinks.
 # ---------------------------------------------------------------------------
+
+
+@app.post("/api/auth/spawn-ticket")
+async def api_auth_spawn_ticket(request: Request):
+    """Mint a single-use WS ticket for the process that spawned this backend.
+
+    The Desktop injects ``HERMES_DASHBOARD_SESSION_TOKEN`` into backends it
+    spawns and probes their readiness with that token over REST. But when the
+    profile declares a non-loopback ``dashboard.public_url``, gated WS auth
+    rejects the legacy ``?token=`` upgrade unconditionally (#93981) — and the
+    OAuth ``/api/auth/ws-ticket`` route is unreachable because the freshly
+    spawned backend has no dashboard session yet.
+
+    This endpoint closes that bootstrap gap: it authenticates with the spawn
+    token (same secret, constant-time, header/bearer — never a query param)
+    and mints exactly the kind of single-use ticket the SPA flow produces. It
+    is only reachable by a caller already holding the process's own token, so
+    exposing it adds no new attack surface: that caller could reconstruct
+    everything this protects anyway.
+
+    Deliberately does NOT use _require_token: that helper defers to the
+    dashboard gate in gated mode, which would 401 the exact bootstrap caller
+    this endpoint exists for. The constant-time token compare below IS the
+    auth, in every mode.
+    """
+    presented = (
+        request.headers.get(_SESSION_HEADER_NAME, "")
+        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    )
+    if not presented or not hmac.compare_digest(
+        presented.encode(), _SESSION_TOKEN.encode()
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+    from hermes_cli.dashboard_auth.middleware import _client_ip
+    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+
+    ticket = mint_ticket(user_id="spawn", provider="session-token")
+    audit_log(
+        AuditEvent.WS_TICKET_MINTED,
+        provider="session-token",
+        user_id="spawn",
+        ip=_client_ip(request),
+    )
+    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
 
 
 @app.websocket("/api/ws")
