@@ -16,8 +16,11 @@ version-matched headers through the sandbox proxy -- what a real install
 does -- so the fix is to pass the nodedir through only when the directory
 is actually visible inside the sandbox and contains the bundled headers.
 
-These tests drive the real stage2-run.sh with a fake ``bwrap`` on PATH that
-records its argv, and assert on the --setenv plan it would have executed.
+The visibility decision itself is a pure function (``nodedir_visible``) at
+the top of stage2-run.sh, table-tested here by sourcing the script. The
+end-to-end tests drive the real stage2-run.sh with a fake ``bwrap`` on PATH
+that records its argv, and assert on the --setenv plan it would have
+executed.
 """
 
 import os
@@ -32,7 +35,9 @@ STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
 pytestmark = pytest.mark.linux_only
 
 
-def _run_stage2(tmp_path: Path, node_dir: str) -> tuple[list[str], subprocess.CompletedProcess]:
+def _run_stage2(
+    tmp_path: Path, node_dir: str
+) -> tuple[list[str], subprocess.CompletedProcess]:
     """Run stage2-run.sh against a minimal sandbox root and a fake bwrap.
 
     The fake bwrap dumps its argv (one arg per line) and exits, so the test
@@ -41,7 +46,16 @@ def _run_stage2(tmp_path: Path, node_dir: str) -> tuple[list[str], subprocess.Co
     """
     sandbox = tmp_path / "sandbox"
     root = sandbox / "root"
-    for sub in ("logs", "usr/local", "usr/bin", "bin", "lib64", "repo", "certs", "http"):
+    for sub in (
+        "logs",
+        "usr/local",
+        "usr/bin",
+        "bin",
+        "lib64",
+        "repo",
+        "certs",
+        "http",
+    ):
         (root / sub).mkdir(parents=True)
     # Non-empty ready file skips the wait for the (absent) network helper.
     (root / "logs" / "slirp.ready").write_text("1\n", encoding="utf-8")
@@ -91,6 +105,56 @@ def _nodedir_settings(argv: list[str]) -> list[str]:
     ]
 
 
+def _nodedir_visible(node_dir: str, use_host_runtime: bool) -> bool:
+    """Call stage2-run.sh's nodedir_visible without running stage 2."""
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1" && nodedir_visible "$2" "$3"',
+            "_",
+            str(STAGE2),
+            node_dir,
+            "true" if use_host_runtime else "false",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode in (0, 1), proc.stderr
+    return proc.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("node_dir", "host_runtime", "visible"),
+    [
+        # /usr/local: shadowed by the sandbox's own copy in both modes.
+        ("/usr/local", True, False),
+        ("/usr/local", False, False),
+        ("/usr/local/n/versions/22", True, False),
+        # Host mode ro-binds the runtime prefixes; nix mode does not.
+        ("/usr", True, True),
+        ("/usr/lib/node", True, True),
+        ("/usr", False, False),
+        # Nix mode binds /nix; host mode does not.
+        ("/nix/store/abc-nodejs-22", False, True),
+        ("/nix/store/abc-nodejs-22", True, False),
+        # Nothing binds the host HOME (the sandbox HOME is a fresh directory),
+        # hostedtoolcache, Homebrew, or a bare prefix that only shares a name.
+        ("/home/dev/.nvm/versions/node/v22.0.0", True, False),
+        ("/opt/hostedtoolcache/node/22.0.0/x64", True, False),
+        ("/home/linuxbrew/.linuxbrew", True, False),
+        ("/usrlocal", True, False),
+        ("/nixos", False, False),
+    ],
+)
+def test_nodedir_visible_table(
+    node_dir: str, host_runtime: bool, visible: bool
+) -> None:
+    """Both branches of the visibility decision, hermetically."""
+    assert _nodedir_visible(node_dir, host_runtime) is visible
+
+
 def test_usr_local_nodedir_is_dropped(tmp_path: Path) -> None:
     """/usr/local is always shadowed inside the sandbox; a host node living
     there (GitHub runners) must not become npm_config_nodedir."""
@@ -129,6 +193,10 @@ def test_empty_nodedir_stays_absent(tmp_path: Path) -> None:
 )
 def test_visible_nodedir_with_headers_is_kept(tmp_path: Path) -> None:
     """A distro node under /usr is ro-bound into the sandbox and its headers
-    are real: that nodedir must survive, preserving the offline build path."""
+    are real: that nodedir must survive, preserving the offline build path.
+
+    Opportunistic: needs root-owned headers, so it only runs on hosts that
+    have them. The keep branch of the decision itself is covered
+    hermetically by test_nodedir_visible_table; this proves the wiring."""
     argv, _ = _run_stage2(tmp_path, "/usr")
     assert _nodedir_settings(argv) == ["/usr"]
