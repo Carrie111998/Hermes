@@ -39,36 +39,49 @@ def _waiter_code(root, env=None) -> str:
     return parts[parts.index("-c") + 1]
 
 
+def _waiter_argv(root, env=None):
+    """The argv payload after the `-c` code: [reply_path, label, wait_s, state_db, event_id].
+
+    The merged waiter passes all user/route data as argv, never interpolated
+    into the generated Python source (the #93590 backslash-folding and
+    #93091 injection defects are structurally eliminated by that design).
+    """
+    cmd = bot_relay.waiter_command(root, env or ENV)
+    parts = shlex.split(cmd)
+    # parts: [python, -c, <code>, reply_path, label, wait_s, state_db, event_id]
+    return parts[parts.index("-c") + 2 :]
+
+
 def test_waiter_windows_path_compiles_after_backslash_folding():
-    """A Windows reply path must survive the execution layer folding the
-    repr-escaped double backslash back to a single one — the exact shape
-    that SyntaxErrored with ``\\U`` on #93590's reporter setup."""
-    code = _waiter_code("C:\\Users\\joshu\\.hermes")
-    assert "C:" in code  # sanity: the Windows path made it into the payload
-    folded = code.replace("\\\\", "\\")
-    # Raw literals: `p = r'C:\Users\joshu\...'` — no unicode-escape crash.
-    compile(folded, "<waiter>", "exec")
+    """A Windows reply path rides as argv, so no backslash is ever embedded
+    in the generated Python source — the ``\\\\U`` SyntaxError class from
+    #93590 cannot occur because the path is sys.argv[1], not a literal."""
+    root = "C:\\Users\\joshu\\.hermes"
+    code = _waiter_code(root)
+    assert "C:" not in code  # the path is NOT in the source
+    argv = _waiter_argv(root)
+    # Build the expected value the same way relay_root() does — Path joins
+    # with "/" even when the root string carries literal backslashes (Linux
+    # CI treats them as ordinary characters, Windows does not).
+    assert argv[0] == str(Path(root) / "bot_relay" / "replies" / f"{ENV['id']}.json")
+    compile(code, "<waiter>", "exec")  # source stays clean regardless of path
 
 
 def test_waiter_posix_path_and_label_values_roundtrip():
-    """On POSIX (backslash-free paths) the raw prefix changes nothing."""
+    """On POSIX the reply path and label ride argv unchanged."""
     root = Path("/tmp/hermes-home")
+    argv = _waiter_argv(root)
+    assert argv[0] == str(root / "bot_relay" / "replies" / f"{ENV['id']}.json")
+    assert argv[1] == "@researcher on ssh-vps"
+    assert argv[4] == ENV["id"]
+    # The generated source has no user-data interpolation at all.
     code = _waiter_code(root)
-    assigns = {
-        t.targets[0].id: t.value
-        for t in ast.parse(code).body
-        if isinstance(t, ast.Assign) and isinstance(t.targets[0], ast.Name)
-    }
-    expected = str(root / "bot_relay" / "replies" / f"{ENV['id']}.json")
-    assert assigns["p"].value == expected
-    assert assigns["label"].value == "@researcher on ssh-vps"
-    # The literals are raw-prefixed in the generated source.
-    assert "\np = r'" in code
-    assert "\nlabel = r'" in code
+    assert "sys.argv[1]" in code
+    assert "sys.argv[2]" in code
 
 
 def test_waiter_raw_prefix_keeps_injection_defense():
-    """Hostile roster fields must stay data under the raw prefix too."""
+    """Hostile roster fields stay data: they ride argv, never source."""
     inj = {
         "id": "e" * 32,
         "target_handle": "researcher",
@@ -81,17 +94,22 @@ def test_waiter_raw_prefix_keeps_injection_defense():
         for n in ast.walk(ast.parse(code))
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
     ]
-    # The generated waiter only calls str/print/compile-free builtins by
-    # name; the payload's __import__ must remain a string literal, not a
-    # live call — parse it back and confirm it stayed data.
+    # The generated waiter only calls stdlib by name; the payload's
+    # __import__ must remain argv data, not a live call in source.
     assert "__import__" not in calls
-    assert "x'); __import__('sys').exit(2); print('x" in code
+    assert "__import__('sys')" not in code
+    argv = _waiter_argv(Path("/tmp/hermes-home"), inj)
+    assert argv[1] == "@researcher on x'); __import__('sys').exit(2); print('x"
 
 
 def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
+    import sys as _sys
+
     bin_dir = tmp_path / "venv" / "bin"
     bin_dir.mkdir(parents=True)
-    sibling = bin_dir / "hermes"
+    # On Windows the sibling entrypoint is hermes.exe; elsewhere hermes.
+    sibling_name = "hermes.exe" if _sys.platform == "win32" else "hermes"
+    sibling = bin_dir / sibling_name
     sibling.touch()
     sibling.chmod(0o755)
     monkeypatch.setattr("sys.executable", str(bin_dir / "python"))

@@ -98,7 +98,7 @@ def message_agent_tool_schema() -> dict:
                 "'<peer>/<agent>' for an agent on a registered peer gateway "
                 "(e.g. 'spark/researcher', or just '<peer>' for the peer's main agent), "
                 "or an agent on another connected machine from your roster (use "
-                "'<handle>@<connection>' if the same handle exists on several)."
+                "the exact qualified target shown there when a name is ambiguous)."
             ),
             "parameters": {
                 "type": "object",
@@ -137,9 +137,35 @@ def ensure_message_agent_tool(agent: Any) -> bool:
     sees the schema. Never raises.
     """
     try:
-        if not getattr(agent, "_bot_mode_protocol", True):
-            return False
         tools = getattr(agent, "tools", None)
+
+        def reject_existing_schema() -> bool:
+            if isinstance(tools, list):
+                tools[:] = [
+                    tool
+                    for tool in tools
+                    if not (
+                        isinstance(tool, dict)
+                        and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
+                    )
+                ]
+            valid = getattr(agent, "valid_tool_names", None)
+            if isinstance(valid, set):
+                valid.discard(MESSAGE_AGENT_TOOL_NAME)
+            return False
+
+        if not getattr(agent, "_bot_mode_protocol", True):
+            return reject_existing_schema()
+        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+
+        if _session_title(agent) != BOT_CHAT_TITLE:
+            return reject_existing_schema()
+        # Managed-install check, NOT section non-emptiness: a profile whose
+        # SOUL.md carries the legacy plugin-appended protocol text gets an
+        # empty section (dedupe) but must still receive the tool — otherwise
+        # upgraded installs silently lose A2A messaging (Aug 2026).
+        if not is_bot_mode_managed(_agent_home(agent)):
+            return reject_existing_schema()
         if tools:
             for tool in tools:
                 if (
@@ -147,16 +173,6 @@ def ensure_message_agent_tool(agent: Any) -> bool:
                     and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
                 ):
                     return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
-
-        if _session_title(agent) != BOT_CHAT_TITLE:
-            return False
-        # Managed-install check, NOT section non-emptiness: a profile whose
-        # SOUL.md carries the legacy plugin-appended protocol text gets an
-        # empty section (dedupe) but must still receive the tool — otherwise
-        # upgraded installs silently lose A2A messaging (Aug 2026).
-        if not is_bot_mode_managed(_agent_home(agent)):
-            return False
         if agent.tools is None:
             agent.tools = []
         agent.tools.append(message_agent_tool_schema())
@@ -242,6 +258,7 @@ def message_agent_tool(
     target: str = "",
     message: str = "",
     task_id: Optional[str] = None,
+    tool_call_id: str = "",
     agent: Any = None,
 ) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
@@ -322,7 +339,14 @@ def message_agent_tool(
         # relay roster lists agents on the other connections; delivery rides
         # the Desktop's own persistent socket to that gateway.
         relayed = _try_relay_delivery(
-            root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
+            root,
+            raw_target,
+            body,
+            me,
+            sender_handle,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            agent=agent,
         )
         if relayed is not None:
             return relayed
@@ -338,7 +362,14 @@ def message_agent_tool(
         # 'default' messaging the cloud 'default') — try the relay before
         # calling it a self-message.
         relayed = _try_relay_delivery(
-            root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
+            root,
+            raw_target,
+            body,
+            me,
+            sender_handle,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            agent=agent,
         )
         if relayed is not None:
             return relayed
@@ -373,6 +404,7 @@ def _try_relay_delivery(
     sender_handle: str,
     *,
     task_id: Optional[str],
+    tool_call_id: str = "",
     agent: Any,
 ) -> Optional[str]:
     """Cross-connection delivery via the Desktop relay, or None if the
@@ -388,6 +420,7 @@ def _try_relay_delivery(
             EnvelopeRefusedError,
             enqueue_envelope,
             read_remote_roster,
+            remote_target_forms,
             resolve_remote_target,
             waiter_command,
         )
@@ -399,10 +432,11 @@ def _try_relay_delivery(
         if match is None:
             return None
         if match == "ambiguous":
+            wanted_name = raw_target.strip().lstrip("@").partition("@")[0].lower()
             forms = ", ".join(
-                f"{r['handle']}@{r['connection_id']}"
-                for r in roster
-                if r["handle"].lower() == raw_target.strip().lstrip("@").lower()
+                form
+                for row, form in zip(roster, remote_target_forms(roster))
+                if wanted_name in (row["handle"].lower(), row["profile"].lower())
             )
             return _err(
                 f"'{raw_target}' exists on several connected machines — "
@@ -413,8 +447,12 @@ def _try_relay_delivery(
                 root,
                 target=match,
                 message=f"Message from 🤖 {sender_handle} (@{sender_handle}): {body}",
+                body=body,
                 sender_profile=me,
                 sender_handle=sender_handle,
+                idempotency_key=(
+                    f"{_session_identity(agent)}\0{tool_call_id}" if tool_call_id else ""
+                ),
             )
         except EnvelopeRefusedError as exc:
             # Fail fast: target definitively offline — nothing was queued.
@@ -422,8 +460,51 @@ def _try_relay_delivery(
             # resolution error ('runtime_offline' per the #93091 reason enum).
             return json.dumps({"error": str(exc), "reason": exc.reason})
         label = f"@{match['handle']} on {match['connection_label'] or match['connection_id']}"
-        return _spawn_delivery(
-            waiter_command(root, envelope), label, task_id=task_id, agent=agent
+        try:
+            waiter = waiter_command(root, envelope)
+            spawned = _spawn_delivery(
+                waiter,
+                label,
+                task_id=task_id,
+                agent=agent,
+            )
+        except Exception as exc:
+            logger.debug("relay waiter setup failed after enqueue", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "queued",
+                    "event_id": str(envelope["id"]),
+                    "to": label,
+                    "error": f"relay event queued but waiter could not start: {exc}",
+                }
+            )
+        try:
+            accepted = json.loads(spawned)
+        except (TypeError, ValueError):
+            return json.dumps(
+                {
+                    "status": "queued",
+                    "event_id": str(envelope["id"]),
+                    "to": label,
+                    "error": "relay event queued but waiter returned an invalid acknowledgement",
+                }
+            )
+        if isinstance(accepted, dict) and accepted.get("error"):
+            accepted["status"] = "queued"
+            accepted["event_id"] = str(envelope["id"])
+            accepted["to"] = label
+            return json.dumps(accepted)
+        if isinstance(accepted, dict):
+            accepted["status"] = "accepted"
+            accepted["event_id"] = str(envelope["id"])
+            return json.dumps(accepted)
+        return json.dumps(
+            {
+                "status": "queued",
+                "event_id": str(envelope["id"]),
+                "to": label,
+                "error": "relay event queued but waiter returned no acknowledgement",
+            }
         )
     except Exception:
         logger.debug("relay delivery attempt failed", exc_info=True)
@@ -751,6 +832,19 @@ def _session_title(agent: Any) -> str:
     except Exception:
         pass
     return ""
+
+
+def _session_identity(agent: Any) -> str:
+    """Stable-enough scope for one model tool-call id without message dedup."""
+    try:
+        sid = str(getattr(agent, "session_id", "") or "").strip()
+        sdb = getattr(agent, "_session_db", None)
+        db_path = str(getattr(sdb, "db_path", "") or "")
+        if sid or db_path:
+            return f"{db_path}\0{sid}"
+    except Exception:
+        pass
+    return "unknown-session"
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a background process

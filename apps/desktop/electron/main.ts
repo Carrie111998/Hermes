@@ -66,6 +66,7 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { createBotRelayLeadership } from './bot-relay-leadership'
 import { detectBundleSkew } from './bundle-skew'
 import { applyConnectionChange } from './connection-apply'
 import {
@@ -229,8 +230,10 @@ import {
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
 import {
   buildRegistryProfileRoutes,
+  invalidateConnectionDiscovery,
   localRouteFallbackProfiles,
   registryGatewayWsUrl,
+  registryProfileRouteSources,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { selectPoolEvictions } from './pool-eviction'
@@ -8806,6 +8809,11 @@ async function saveRegistryConnection(input: any = {}) {
   // connection's pooled backends/tunnels and tell renderers to dispose+redial
   // their secondaries for this connection id.
   if (existing && connectionDialFieldsChanged(existing, entry)) {
+    invalidateConnectionDiscovery(entry.id, {
+      installIds: connectionInstallIds,
+      sshInventoryAttemptedAt,
+      sshRoster: sshRosterCache
+    })
     await stopRegistryConnectionBackends(entry.id)
     broadcastConnectionsChanged({ connectionId: entry.id, reason: 'updated' })
   }
@@ -9205,6 +9213,7 @@ async function buildRemoteConnection(
 
 const sshConnections = new Map<string, any>()
 const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PATH)
+const botRelayLeadership = createBotRelayLeadership(`desktop-${desktopInstallationId}`, () => crypto.randomUUID())
 
 const sshBootstrapCoordinator = createBootstrapCoordinator()
 
@@ -12864,7 +12873,13 @@ ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) =
     ]
   }
 
-  return buildRegistryProfileRoutes({ agents, sources: registry.connections })
+  return buildRegistryProfileRoutes({
+    agents,
+    // Enumeration owns the live /api/status probe. Project only the routing
+    // fields plus its credential-free stable backend identity; auth and
+    // endpoint material remain in Electron.
+    sources: registryProfileRouteSources(enumerations)
+  })
 })
 ipcMain.handle('hermes:ssh-config:hosts', async () => ({ hosts: collectSshConfigHosts() }))
 ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
@@ -12912,6 +12927,26 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
 })
 ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
 
+// Exactly one renderer may courier Bot Mode envelopes for this Desktop. Main
+// owns the lock because every full renderer (primary, secondary, HUD, peer)
+// loads plugins and renderer-local concurrency limits cannot compose globally.
+ipcMain.handle('hermes:bot-relay:leadership:acquire', event => {
+  const ownerId = event.sender.id
+  const grant = botRelayLeadership.acquire(ownerId)
+
+  if (grant.acquired && grant.leadershipToken) {
+    const token = grant.leadershipToken
+    event.sender.once('destroyed', () => {
+      botRelayLeadership.release(ownerId, token)
+    })
+  }
+
+  return grant
+})
+ipcMain.handle('hermes:bot-relay:leadership:release', (event, token) => ({
+  released: botRelayLeadership.release(event.sender.id, String(token || ''))
+}))
+
 // ── v2 connection registry IPC (multi-source) ───────────────────────────────
 // Storage-level CRUD for named agent sources. Routing/pooling consumption of
 // the registry lands separately; these handlers only manage the persisted
@@ -12926,6 +12961,14 @@ ipcMain.handle('hermes:connections:remove', async (_event, id) => {
   const key = String(id || '')
   const registry = removeConnection(readDesktopConnectionsRegistry(), key)
   writeDesktopConnectionsRegistry(registry)
+  // A later connection with the same label can reuse this registry id. Drop
+  // all observations now so that replacement never inherits this backend's
+  // install identity or SSH profile inventory.
+  invalidateConnectionDiscovery(key, {
+    installIds: connectionInstallIds,
+    sshInventoryAttemptedAt,
+    sshRoster: sshRosterCache
+  })
   // Tear down anything the removed connection still had running: pooled
   // backends under its composite keys and any ssh tunnel scopes it owned.
   await stopRegistryConnectionBackends(key)
@@ -13238,7 +13281,9 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
 
       const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
 
-      return { connection, ...remembered, ...(raw.installId ? { installId: raw.installId } : {}) }
+      const installId = raw.installId || connectionInstallIds.get(connection.id)?.id
+
+      return { connection, ...remembered, ...(installId ? { installId } : {}) }
     })
   )
 }

@@ -18,7 +18,8 @@ function load({
   profiles = ['research', 'ops'],
   title = null,
   unionProfiles = null,
-  requestProfileSpy = null
+  requestProfileSpy = null,
+  relayNamespace = null
 } = {}) {
   const values = new Map()
   const atom = initial => {
@@ -35,9 +36,7 @@ function load({
       request: async method => {
         if (method === 'profiles.list') {
           return {
-            profiles: profiles.map(profile =>
-              typeof profile === 'string' ? { name: profile } : profile
-            )
+            profiles: profiles.map(profile => (typeof profile === 'string' ? { name: profile } : profile))
           }
         }
         return {}
@@ -50,9 +49,7 @@ function load({
         gateway: { listen: () => undefined }
       }
     },
-    ...(unionProfiles
-      ? { queryClient: { getQueryData: () => ({ profiles: unionProfiles }) } }
-      : {})
+    ...(unionProfiles ? { queryClient: { getQueryData: () => ({ profiles: unionProfiles }) } } : {})
   }
   const source = pluginSource
     .replace(/^import\s+\*\s+as\s+sdk\s+from '@hermes\/plugin-sdk'\r?\n/m, '')
@@ -61,9 +58,12 @@ function load({
     .replace(/^import .* from 'react'\r?\n/m, '')
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
-    .concat('\nglobalThis.__mention = { $botMeta };\n')
+    .concat(
+      '\nglobalThis.__mention = { $botMeta, setRelayNamespace: value => { botRelayCourierNamespace = value } };\n'
+    )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   context.__mention.$botMeta.set(title ? { [activeProfile]: { title } } : {})
+  context.__mention.setRelayNamespace(relayNamespace)
 
   const registered = []
   context.plugin.register({ storage: { get: () => null }, register: entry => registered.push(entry) })
@@ -123,6 +123,7 @@ test('remote mentions: identified with their device, never delivered by the rend
         remoteSource: true
       }
     ],
+    relayNamespace: 'namespace-desktop-a',
     requestProfileSpy: async (...args) => {
       delivered.push(args)
       return {}
@@ -132,6 +133,7 @@ test('remote mentions: identified with their device, never delivered by the rend
   const result = await handler({ text: '@dixie what is the disk space?' })
   assert.match(result.text, /@dixie = agent profile "dixie"/)
   assert.match(result.text, /on Mac Mini/)
+  assert.match(result.text, /message_agent target: "dixie@mac-mini~namespace-desktop-a"/)
   // The renderer must NOT deliver: no requestProfile traffic at all.
   await new Promise(resolve => setTimeout(resolve, 50))
   assert.equal(delivered.length, 0, 'middleware must never deliver over Connections')

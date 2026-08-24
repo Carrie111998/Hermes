@@ -7,32 +7,34 @@ can find and message agents on ANY other, with `message_agent` as the one
 send path (Teknium ruling, Aug 2026 — the peers-vs-connections split was
 itself the bug).
 
-How the relay works (three files under ``<root>/bot_relay/``):
+How the relay works:
 
-- ``roster.json`` — the union roster of agents on OTHER connections, pushed
-  by the Desktop over each connection's WebSocket (``bot_relay.roster.sync``).
+- ``bot_relay/rosters/`` — one route snapshot per Desktop namespace, pushed
+  over each connection's WebSocket (``bot_relay.roster.sync``).
   ``tools/bot_mode_probe.py`` folds it into the Bot Chat protocol section so
   every bot knows every reachable teammate, and ``message_agent`` resolves
   cross-connection targets against it.
-- ``outbox/`` — envelopes queued by ``message_agent`` for targets that live
-  on another connection. The Desktop drains them (``bot_relay.outbox.drain``)
-  and delivers each to the target connection (``bot_relay.deliver``).
-- ``replies/`` — one JSON per envelope, written when the Desktop relays the
-  target agent's reply back (``bot_relay.reply``). A background waiter
-  spawned at send time watches for it, so the reply wakes the sender through
-  the exact same completion-notification path local DMs already use.
+- profile ``state.db`` — v2 envelopes, renewable courier leases, immutable
+  terminal outcomes, and recipient receipts.  The Desktop claims only free
+  capacity, renews slow turns, then ACKs or NACKs with a fenced token and
+  generation.  Expired leases are reclaimable; committed target results are
+  replayed without a second Bot Chat turn.
+- ``bot_relay/outbox|claimed|replies`` — the explicit v1 rolling-upgrade lane
+  and a compatibility result projection.  These files are not v2 authority.
 
 The gateway never holds another connection's credentials; the Desktop owns
-every socket and does all cross-connection I/O. Everything here is plain
-file plumbing on the gateway's own HERMES root — no network. The public
-helpers never raise, with one deliberate exception: ``enqueue_envelope``
-raises ``EnvelopeRefusedError`` when the target is definitively offline, so
-the sender fails fast instead of queueing a DM nobody will drain (#93091).
+every socket and does all cross-connection I/O. The state machine is local;
+this module performs no network I/O. Everything else here is plain file
+plumbing on the gateway's own HERMES root — no network. The public helpers
+never raise, with one deliberate exception: ``enqueue_envelope`` raises
+``EnvelopeRefusedError`` when the target is definitively offline, so the
+sender fails fast instead of queueing a DM nobody will drain (#93091).
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +43,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -50,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 RELAY_DIR_NAME = "bot_relay"
 ROSTER_FILE = "roster.json"
+ROSTERS_DIR = "rosters"
 OUTBOX_DIR = "outbox"
 CLAIMED_DIR = "claimed"
 REPLIES_DIR = "replies"
@@ -59,9 +63,12 @@ LOCKS_DIR = "locks"
 # The real knob is ``bot_mode.turn_wait_seconds`` in config.yaml.
 TURN_WAIT_SECONDS_FALLBACK = 120
 
+DELIVERY_STREAM = "bot_relay.outbox.v2"
+DELIVERY_INBOX = "bot_relay.inbox.v2"
+
 # A reply must arrive before the waiter gives up. Cross-connection turns can
 # be slow (remote model, cold gateway) — generous, but bounded.
-REPLY_WAIT_SECONDS = 900
+REPLY_WAIT_SECONDS = 1200
 
 # Envelopes and replies older than this are stale artifacts (Desktop was
 # closed, connection died) and are swept opportunistically.
@@ -91,17 +98,90 @@ class EnvelopeRefusedError(RuntimeError):
         super().__init__(message)
         self.reason = reason
 
+
+# A short source lease is renewed while a 600s target turn is in flight.  If
+# the renderer dies, another courier can recover promptly; the target's longer
+# durable processing receipt prevents that recovery from running a second
+# tool-capable turn.
+LEASE_SECONDS = 180
+DELIVERY_PROCESSING_SECONDS = 660
+MAX_CLAIM_BATCH = 32
+# Five-minute capped retries need at least 72 attempts to span the six-hour
+# envelope deadline.  Keep a finite poison-message guard, but never let that
+# guard defeat the advertised reconnect horizon under ordinary outages.
+MAX_DELIVERY_ATTEMPTS = 128
+MAX_ROSTER_ROWS = 500
+MAX_ROSTER_BYTES = 512 * 1024
+ROSTER_STALE_SECONDS = 3 * 60
+
 _HANDLE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_OPAQUE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:@/-]{0,127}$")
+_EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# Desktop normally claims one envelope at a time.  Keep the next profile
+# cursor across RPCs so a perpetually busy default profile cannot starve a
+# named profile merely because state.db is first in the filesystem order.
+# The lock also gives concurrent claim RPCs distinct starting positions.
+_claim_cursor_lock = threading.Lock()
+_claim_cursors: dict[tuple[str, str], int] = {}
+_MAX_CLAIM_CURSOR_KEYS = 128
+
+
+def _clean_label(value: Any, limit: int) -> str:
+    """Collapse controls/newlines in Desktop-provided prompt text."""
+    printable = "".join(ch if ch.isprintable() else " " for ch in str(value or ""))
+    return " ".join(printable.split())[:limit]
+
+
+def _normalize_opaque_id(value: Any, *, field: str, required: bool = True) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned and not required:
+        return ""
+    if not _OPAQUE_ID_RE.fullmatch(cleaned):
+        raise ValueError(f"invalid {field}")
+    return cleaned
 
 
 def relay_root(root: Path | str) -> Path:
     return Path(root) / RELAY_DIR_NAME
 
 
+def _profile_home(root: Path | str, profile: str) -> Path:
+    base = Path(root)
+    return base if profile == "default" else base / "profiles" / profile
+
+
+def _profile_state_db(root: Path | str, profile: str) -> Path:
+    return _profile_home(root, profile) / "state.db"
+
+
+def _profile_state_dbs(root: Path | str) -> list[Path]:
+    """Every profile-owned state.db a gateway relay may courier from."""
+    base = Path(root)
+    paths = [base / "state.db"]
+    profiles = base / "profiles"
+    try:
+        paths.extend(
+            child / "state.db"
+            for child in sorted(profiles.iterdir())
+            if child.is_dir()
+        )
+    except OSError:
+        pass
+    return paths
+
+
 def _ensure_dirs(root: Path | str) -> Path:
     base = relay_root(root)
-    for sub in (OUTBOX_DIR, CLAIMED_DIR, REPLIES_DIR):
+    for sub in (ROSTERS_DIR, OUTBOX_DIR, CLAIMED_DIR, REPLIES_DIR):
         (base / sub).mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+        for sub in (ROSTERS_DIR, OUTBOX_DIR, CLAIMED_DIR, REPLIES_DIR):
+            (base / sub).chmod(0o700)
+    except OSError:
+        # Windows and some network filesystems do not implement POSIX modes.
+        pass
     return base
 
 
@@ -125,19 +205,35 @@ def _normalize_roster_row(row: Any) -> Optional[dict]:
         return None
     if not handle:
         handle = "hermes" if profile == "default" else profile
-    if (
-        not _HANDLE_RE.match(handle)
-        or not _HANDLE_RE.match(profile)
-        or not _HANDLE_RE.match(connection_id)
-    ):
+    if not _HANDLE_RE.fullmatch(handle) or not _HANDLE_RE.fullmatch(profile):
+        return None
+    try:
+        # Connection ids are short opaque route tokens; keep the stricter
+        # handle charset (64-char cap) that also excludes shell metacharacters.
+        connection_id = _normalize_opaque_id(connection_id, field="connection id")
+        if not _HANDLE_RE.fullmatch(connection_id):
+            return None
+        namespace = _normalize_opaque_id(
+            row.get("courier_namespace_id"),
+            field="courier namespace",
+            required=False,
+        )
+        install_id = _normalize_opaque_id(
+            row.get("target_install_id") or row.get("install_id"),
+            field="target install id",
+            required=False,
+        )
+    except ValueError:
         return None
     out = {
         "profile": profile,
         "handle": handle,
         "connection_id": connection_id,
-        "connection_label": str(row.get("connection_label") or "").strip()[:80],
-        "title": str(row.get("title") or "").strip()[:120],
-        "description": " ".join(str(row.get("description") or "").split())[:160],
+        "courier_namespace_id": namespace,
+        "target_install_id": install_id,
+        "connection_label": _clean_label(row.get("connection_label"), 80),
+        "title": _clean_label(row.get("title"), 120),
+        "description": _clean_label(row.get("description"), 160),
     }
     # Optional explicit liveness flag (additive — the Desktop may push it).
     # Preserved only when it is a real bool so absent stays distinguishable
@@ -147,12 +243,25 @@ def _normalize_roster_row(row: Any) -> Optional[dict]:
     return out
 
 
-def write_remote_roster(root: Path | str, rows: Any) -> int:
-    """Atomically persist the Desktop-pushed remote roster. Returns count."""
+def write_remote_roster(
+    root: Path | str, rows: Any, *, courier_namespace_id: str = ""
+) -> int:
+    """Atomically persist one Desktop namespace's remote roster.
+
+    Connection ids are Desktop-local route coordinates.  A namespaced
+    snapshot prevents a second Desktop from overwriting those coordinates or
+    claiming events it cannot route.  Tokenless v1 callers retain the legacy
+    single-snapshot lane for rolling upgrades.
+    """
     base = _ensure_dirs(root)
+    namespace = _normalize_opaque_id(
+        courier_namespace_id, field="courier namespace", required=False
+    )
     cleaned: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for row in rows if isinstance(rows, list) else []:
+    for row in (rows if isinstance(rows, list) else [])[:MAX_ROSTER_ROWS]:
+        if isinstance(row, dict):
+            row = {**row, "courier_namespace_id": namespace}
         norm = _normalize_roster_row(row)
         if not norm:
             continue
@@ -162,13 +271,29 @@ def write_remote_roster(root: Path | str, rows: Any) -> int:
         seen.add(key)
         cleaned.append(norm)
     cleaned.sort(key=lambda r: (r["connection_id"], r["profile"]))
-    payload = {"updated_at": int(time.time()), "agents": cleaned}
+    payload = {
+        "updated_at": int(time.time()),
+        "courier_namespace_id": namespace,
+        "agents": cleaned,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(encoded.encode("utf-8")) > MAX_ROSTER_BYTES:
+        raise ValueError("roster payload too large")
     target = base / ROSTER_FILE
+    if namespace:
+        key = hashlib.sha256(namespace.encode("utf-8")).hexdigest()
+        target = base / ROSTERS_DIR / f"{key}.json"
     fd, tmp = tempfile.mkstemp(dir=str(base), prefix=".roster-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            f.write(encoded)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, target)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
     except Exception:
         try:
             os.unlink(tmp)
@@ -179,19 +304,62 @@ def write_remote_roster(root: Path | str, rows: Any) -> int:
 
 
 def read_remote_roster(root: Path | str) -> list[dict]:
-    """The current remote roster (possibly empty). Never raises."""
+    """Union of fresh namespaced snapshots plus the v1 legacy snapshot."""
+    base = relay_root(root)
+    paths = [base / ROSTER_FILE]
     try:
-        raw = (relay_root(root) / ROSTER_FILE).read_text(encoding="utf-8")
-        data = json.loads(raw)
-        agents = data.get("agents") if isinstance(data, dict) else None
-        if not isinstance(agents, list):
-            return []
-        return [r for r in (_normalize_roster_row(a) for a in agents) if r]
-    except FileNotFoundError:
-        return []
-    except Exception:
-        logger.debug("bot_relay roster read failed", exc_info=True)
-        return []
+        paths.extend(sorted((base / ROSTERS_DIR).glob("*.json")))
+    except OSError:
+        pass
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    now = time.time()
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            updated_at = float(data.get("updated_at") or 0) if isinstance(data, dict) else 0
+            namespace = str(data.get("courier_namespace_id") or "") if isinstance(data, dict) else ""
+            if now - updated_at > ROSTER_STALE_SECONDS:
+                continue
+            agents = data.get("agents") if isinstance(data, dict) else None
+            if not isinstance(agents, list):
+                continue
+            for row in agents[:MAX_ROSTER_ROWS]:
+                if isinstance(row, dict) and namespace:
+                    row = {**row, "courier_namespace_id": namespace}
+                norm = _normalize_roster_row(row)
+                if not norm:
+                    continue
+                key = (
+                    norm["courier_namespace_id"],
+                    norm["connection_id"],
+                    norm["profile"],
+                )
+                if key not in seen:
+                    seen.add(key)
+                    out.append(norm)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.debug("bot_relay roster read failed: %s", path, exc_info=True)
+    # A pre-v2 Desktop leaves ``roster.json`` behind when it upgrades.  Once
+    # the same Desktop-local route/profile appears in a namespace-fenced
+    # snapshot, prefer that addressable v2 row over the tokenless duplicate.
+    # Otherwise a harmless rolling upgrade makes every common ``local``
+    # target ambiguous forever (the legacy snapshot has no namespace by which
+    # a courier could safely distinguish it).
+    namespaced_routes = {
+        (row["connection_id"].lower(), row["profile"].lower())
+        for row in out
+        if row["courier_namespace_id"]
+    }
+    return [
+        row
+        for row in out
+        if row["courier_namespace_id"]
+        or (row["connection_id"].lower(), row["profile"].lower())
+        not in namespaced_routes
+    ]
 
 
 def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
@@ -200,6 +368,8 @@ def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
     Accepted forms:
     - bare handle/profile (``moxie``) — must be unique across connections;
     - ``<handle>@<connection-id>`` / ``<profile>@<connection-id>`` — exact.
+    - ``<handle>@<connection-id>~<courier-namespace>`` — globally exact
+      when multiple Desktops use the same connection id (notably ``local``).
 
     Returns the matched row, the string ``"ambiguous"`` when a bare form
     matches agents on several connections, or None for no match.
@@ -208,17 +378,26 @@ def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
     if not want:
         return None
     conn: Optional[str] = None
+    namespace: Optional[str] = None
     if "@" in want:
         want, _, conn = want.partition("@")
         want = want.strip()
         conn = conn.strip()
+        if "~" in conn:
+            conn, _, namespace = conn.rpartition("~")
+            conn = conn.strip()
+            namespace = namespace.strip()
         if not want or not conn:
+            return None
+        if "~" in str(namespace or "") or (namespace is not None and not namespace):
             return None
     matches = []
     for row in roster:
         if want.lower() not in (row["handle"].lower(), row["profile"].lower()):
             continue
         if conn and row["connection_id"].lower() != conn.lower():
+            continue
+        if namespace is not None and row["courier_namespace_id"].lower() != namespace.lower():
             continue
         matches.append(row)
     if not matches:
@@ -229,16 +408,65 @@ def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
 
 
 def remote_target_forms(roster: list[dict]) -> list[str]:
-    """Human/agent-facing target strings, ambiguity-aware."""
-    by_handle: dict[str, int] = {}
+    """Shortest unambiguous target string for every roster row.
+
+    Connection ids are scoped to one Desktop, so ``handle@local`` is still
+    ambiguous when two Desktop namespaces are connected.  The ``~namespace``
+    suffix is emitted only when it is needed; ``~`` cannot occur in a
+    validated route coordinate, making the form reversible without escaping.
+    """
+
+    def count_matches(name: str, connection: str = "", namespace: str = "") -> int:
+        return sum(
+            1
+            for candidate in roster
+            if name.lower()
+            in (candidate["handle"].lower(), candidate["profile"].lower())
+            and (
+                not connection
+                or candidate["connection_id"].lower() == connection.lower()
+            )
+            and (
+                not namespace
+                or candidate["courier_namespace_id"].lower() == namespace.lower()
+            )
+        )
+
+    forms: list[str] = []
     for row in roster:
-        by_handle[row["handle"].lower()] = by_handle.get(row["handle"].lower(), 0) + 1
-    forms = []
-    for row in roster:
-        if by_handle[row["handle"].lower()] > 1:
-            forms.append(f"{row['handle']}@{row['connection_id']}")
-        else:
-            forms.append(row["handle"])
+        names = [row["handle"]]
+        if row["profile"].lower() != row["handle"].lower():
+            names.append(row["profile"])
+
+        chosen = ""
+        for name in names:
+            if count_matches(name) == 1:
+                chosen = name
+                break
+        if not chosen:
+            for name in names:
+                if count_matches(name, row["connection_id"]) == 1:
+                    chosen = f"{name}@{row['connection_id']}"
+                    break
+        if not chosen and row["courier_namespace_id"]:
+            for name in names:
+                if (
+                    count_matches(
+                        name,
+                        row["connection_id"],
+                        row["courier_namespace_id"],
+                    )
+                    == 1
+                ):
+                    chosen = (
+                        f"{name}@{row['connection_id']}"
+                        f"~{row['courier_namespace_id']}"
+                    )
+                    break
+        # A normalized namespaced row is unique by namespace/route/profile.
+        # The fallback is defensive for malformed caller-supplied lists; the
+        # resolver will still reject it as ambiguous rather than misroute.
+        forms.append(chosen or f"{row['profile']}@{row['connection_id']}")
     return forms
 
 
@@ -312,12 +540,18 @@ def enqueue_envelope(
     message: str,
     sender_profile: str,
     sender_handle: str,
+    body: str | None = None,
+    idempotency_key: str = "",
 ) -> dict:
-    """Queue a cross-connection DM for the Desktop relay. Returns envelope.
+    """Durably queue a cross-connection DM. Returns its immutable envelope.
+
+    Namespaced v2 routes use the profile's shared ``state.db`` delivery
+    substrate.  A tokenless v1 roster stays on the legacy JSON lane so an old
+    Desktop—which cannot ACK a lease—never causes delayed duplicate claims.
 
     Raises ``EnvelopeRefusedError`` (reason ``'runtime_offline'``) instead of
-    writing the outbox file when the target is definitively offline per
-    ``_target_liveness``. Unknown liveness enqueues as before (fail-open).
+    queueing when the target is definitively offline per ``_target_liveness``
+    (#93091). Unknown liveness enqueues as before (fail-open).
     """
     if _target_liveness(root, target) is False:
         label = (
@@ -331,31 +565,80 @@ def enqueue_envelope(
             "Try again once that machine reconnects to the Desktop.",
         )
     base = _ensure_dirs(root)
+    namespace = str(target.get("courier_namespace_id") or "")
+    created_at = int(time.time())
+    expires_at = created_at + STALE_AFTER_SECONDS
+    event_id = uuid.uuid4().hex
+    if idempotency_key:
+        material = f"bot-relay-v2\0{sender_profile}\0{idempotency_key}"
+        event_id = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
     envelope = {
-        "id": uuid.uuid4().hex,
-        "created_at": int(time.time()),
+        "schema_version": 2 if namespace else 1,
+        "id": event_id,
+        "created_at": created_at,
+        "expires_at": expires_at,
         "from_profile": sender_profile,
         "from_handle": sender_handle,
+        "courier_namespace_id": namespace,
         "target_connection": target["connection_id"],
+        "target_install_id": str(target.get("target_install_id") or ""),
         "target_profile": target["profile"],
         "target_handle": target["handle"],
         "message": message,
+        "body": str(body if body is not None else message),
     }
+    if namespace:
+        from gateway.durable_events import enqueue
+
+        durable_payload = {
+            key: value
+            for key, value in envelope.items()
+            if key not in {"created_at", "expires_at"}
+        }
+        stored = enqueue(
+            _profile_state_db(root, sender_profile),
+            stream=DELIVERY_STREAM,
+            event_id=event_id,
+            payload=durable_payload,
+            route_namespace=namespace,
+            expires_at=float(expires_at),
+        )
+        payload = stored.get("payload") if isinstance(stored, dict) else None
+        if isinstance(payload, dict):
+            return {
+                **payload,
+                "created_at": int(stored.get("created_at") or created_at),
+                "expires_at": int(stored.get("expires_at") or expires_at),
+            }
+        return envelope
+
+    # Explicit rolling-upgrade lane.  Old Desktops call outbox.drain and
+    # never ACK, so these files deliberately retain the v1 one-shot contract.
     path = base / OUTBOX_DIR / f"{envelope['id']}.json"
     fd, tmp = tempfile.mkstemp(dir=str(base / OUTBOX_DIR), prefix=".env-", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(envelope, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(envelope, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return envelope
 
 
 def claim_pending_envelopes(root: Path | str) -> list[dict]:
-    """Drain the outbox (rename → claimed/, so a second drain can't double-
-    deliver). Sweeps stale claimed/reply artifacts opportunistically.
+    """Legacy v1 one-shot drain.  V2 namespaced events never enter this lane.
 
-    Envelopes older than ``bot_mode.envelope_ttl_seconds`` are NOT delivered:
-    each gets an error reply (reason ``'queued_expired'``) so the sender's
-    waiter resolves, and its outbox file is removed (#93091 item 2).
+    Renames outbox → claimed/ so a second drain can't double-deliver, and
+    sweeps stale claimed/reply artifacts opportunistically.  Envelopes older
+    than ``bot_mode.envelope_ttl_seconds`` are NOT delivered: each gets an
+    error reply (reason ``'queued_expired'``) so the sender's waiter resolves,
+    and its outbox file is removed (#93091 item 2).
     """
     base = _ensure_dirs(root)
     _sweep_stale(base)
@@ -374,7 +657,10 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
                     handle = str(env.get("target_handle") or "?")
                     conn = str(env.get("target_connection") or "?")
                     # 'queued_expired' matches the #93091 item-1 reason enum.
-                    write_reply(
+                    # Write the projection directly: the envelope is still in
+                    # the outbox (never claimed), so the write-once
+                    # ``write_reply`` gate would reject it.
+                    _write_reply_projection(
                         root,
                         str(env.get("id") or ""),
                         error=(
@@ -404,10 +690,344 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
     return out
 
 
+def _bounded_lease_seconds(value: Any) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = LEASE_SECONDS
+    return max(30, min(seconds, LEASE_SECONDS))
+
+
+def claim_leased_envelopes(
+    root: Path | str,
+    *,
+    courier_namespace_id: str,
+    courier_id: str,
+    limit: int = MAX_CLAIM_BATCH,
+    lease_seconds: int = LEASE_SECONDS,
+    now: float | None = None,
+) -> list[dict]:
+    """Claim a bounded v2 batch with renewable, fenced leases.
+
+    Claims are restricted to the Desktop namespace that minted the target
+    route coordinates.  Profile databases are visited round-robin so one
+    busy sender cannot monopolize all courier capacity.
+    """
+    from gateway.durable_events import claim, nack
+
+    namespace = _normalize_opaque_id(
+        courier_namespace_id, field="courier namespace"
+    )
+    owner = _normalize_opaque_id(courier_id, field="courier id")
+    try:
+        remaining = max(1, min(int(limit), MAX_CLAIM_BATCH))
+    except (TypeError, ValueError):
+        remaining = MAX_CLAIM_BATCH
+    lease_for = _bounded_lease_seconds(lease_seconds)
+    dbs = _profile_state_dbs(root)
+    if dbs:
+        cursor_key = (str(Path(root).resolve()), namespace)
+        with _claim_cursor_lock:
+            start = _claim_cursors.get(cursor_key, 0) % len(dbs)
+            _claim_cursors[cursor_key] = (start + 1) % len(dbs)
+            if len(_claim_cursors) > _MAX_CLAIM_CURSOR_KEYS:
+                # A gateway has only a handful of roots/namespaces.  Bound
+                # defensive process memory if an untrusted caller churns IDs.
+                _claim_cursors.pop(next(iter(_claim_cursors)), None)
+        dbs = dbs[start:] + dbs[:start]
+    out: list[dict] = []
+    # One event per profile per pass gives deterministic bounded fairness.
+    while remaining and dbs:
+        progressed = False
+        for db_path in dbs:
+            if remaining <= 0:
+                break
+            rows = claim(
+                db_path,
+                stream=DELIVERY_STREAM,
+                route_namespace=namespace,
+                owner=owner,
+                limit=1,
+                lease_seconds=lease_for,
+                now=now,
+            )
+            if not rows:
+                continue
+            progressed = True
+            remaining -= 1
+            for row in rows:
+                payload = row.get("payload") if isinstance(row, dict) else None
+                if not isinstance(payload, dict):
+                    nack(
+                        db_path,
+                        stream=DELIVERY_STREAM,
+                        event_id=str(row.get("event_id") or "") if isinstance(row, dict) else "",
+                        owner=owner,
+                        lease_token=str(row.get("lease_token") or "") if isinstance(row, dict) else "",
+                        generation=int(
+                            row.get("generation") or row.get("lease_generation") or 0
+                        )
+                        if isinstance(row, dict)
+                        else 0,
+                        error="claimed payload must be an object",
+                        retryable=False,
+                        retry_after_seconds=0,
+                        max_attempts=MAX_DELIVERY_ATTEMPTS,
+                        now=now,
+                    )
+                    remaining += 1
+                    continue
+                if int(row.get("attempts") or 0) > MAX_DELIVERY_ATTEMPTS:
+                    nack(
+                        db_path,
+                        stream=DELIVERY_STREAM,
+                        event_id=str(row.get("event_id") or payload.get("id") or ""),
+                        owner=owner,
+                        lease_token=str(row.get("lease_token") or ""),
+                        generation=int(row.get("generation") or 0),
+                        error="delivery attempts exhausted",
+                        retryable=False,
+                        retry_after_seconds=0,
+                        max_attempts=MAX_DELIVERY_ATTEMPTS,
+                        now=now,
+                    )
+                    remaining += 1
+                    continue
+                out.append(
+                    {
+                        **payload,
+                        "id": row.get("event_id") or payload.get("id"),
+                        "created_at": row.get("created_at"),
+                        "expires_at": row.get("expires_at"),
+                        "lease_owner": owner,
+                        "lease_token": row.get("lease_token"),
+                        "lease_generation": row.get("lease_generation") or row.get("generation"),
+                        "lease_expires_at": row.get("lease_expires_at"),
+                        "attempt": row.get("attempts"),
+                    }
+                )
+        if not progressed:
+            break
+    return out
+
+
+def _with_leased_event(root: Path | str, operation):
+    """Try a fenced operation across profile ledgers without leaking shape."""
+    from gateway.durable_events import LeaseMismatch
+
+    for db_path in _profile_state_dbs(root):
+        try:
+            return operation(db_path)
+        except LeaseMismatch:
+            continue
+    raise LeaseMismatch()
+
+
+def renew_envelope_lease(
+    root: Path | str,
+    *,
+    envelope_id: str,
+    courier_id: str,
+    lease_token: str,
+    lease_generation: int,
+    lease_seconds: int = LEASE_SECONDS,
+    now: float | None = None,
+) -> dict:
+    """Extend a live lease; stale owner/token/generation all fail opaquely."""
+    from gateway.durable_events import renew
+
+    _validate_event_id(envelope_id)
+    owner = _normalize_opaque_id(courier_id, field="courier id")
+    return _with_leased_event(
+        root,
+        lambda db_path: renew(
+            db_path,
+            stream=DELIVERY_STREAM,
+            event_id=envelope_id,
+            owner=owner,
+            lease_token=lease_token,
+            generation=int(lease_generation),
+            lease_seconds=_bounded_lease_seconds(lease_seconds),
+            now=now,
+        ),
+    )
+
+
+def outcome_digest(envelope_id: str, reply: str, error: str) -> str:
+    material = f"{envelope_id}\0{reply}\0{error}"
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+
+def ack_envelope(
+    root: Path | str,
+    *,
+    envelope_id: str,
+    courier_id: str,
+    lease_token: str,
+    lease_generation: int,
+    reply: str = "",
+    error: str = "",
+    claimed_outcome_digest: str = "",
+    now: float | None = None,
+) -> dict:
+    """Atomically settle a v2 event and fence duplicate/conflicting ACKs."""
+    from gateway.durable_events import ack, json_digest
+
+    _validate_event_id(envelope_id)
+    owner = _normalize_opaque_id(courier_id, field="courier id")
+    reply = str(reply or "")
+    error = str(error or "")
+    if len(reply) > 200_000 or len(error) > 2_000:
+        raise ValueError("relay outcome too large")
+    digest = outcome_digest(envelope_id, reply, error)
+    if claimed_outcome_digest and claimed_outcome_digest != digest:
+        raise ValueError("outcome digest mismatch")
+    outcome = {
+        "status": "failed" if error else "completed",
+        "reply": reply,
+        "error": error,
+    }
+    result = _with_leased_event(
+        root,
+        lambda db_path: ack(
+            db_path,
+            stream=DELIVERY_STREAM,
+            event_id=envelope_id,
+            owner=owner,
+            lease_token=lease_token,
+            generation=int(lease_generation),
+            outcome=outcome,
+            outcome_digest=json_digest(outcome),
+            now=now,
+        ),
+    )
+    # Compatibility projection only; state.db is the delivery authority and
+    # the waiter reads it directly.  A projection failure cannot undo ACK.
+    try:
+        _write_reply_projection(root, envelope_id, reply=reply, error=error)
+    except Exception:
+        logger.debug("bot_relay reply projection failed", exc_info=True)
+    return result
+
+
+def nack_envelope(
+    root: Path | str,
+    *,
+    envelope_id: str,
+    courier_id: str,
+    lease_token: str,
+    lease_generation: int,
+    error: str,
+    retryable: bool,
+    retry_after_seconds: float = 5,
+    now: float | None = None,
+) -> dict:
+    """Release for bounded retry or atomically terminalize a failed event."""
+    from gateway.durable_events import nack
+
+    _validate_event_id(envelope_id)
+    owner = _normalize_opaque_id(courier_id, field="courier id")
+    if not isinstance(retryable, bool):
+        raise ValueError("retryable must be boolean")
+    detail = _clean_label(error, 2_000) or "delivery failed"
+    result = _with_leased_event(
+        root,
+        lambda db_path: nack(
+            db_path,
+            stream=DELIVERY_STREAM,
+            event_id=envelope_id,
+            owner=owner,
+            lease_token=lease_token,
+            generation=int(lease_generation),
+            error=detail,
+            retryable=retryable,
+            retry_after_seconds=max(0.0, min(float(retry_after_seconds), 300.0)),
+            max_attempts=MAX_DELIVERY_ATTEMPTS,
+            now=now,
+        ),
+    )
+    if result.get("state") in {"failed", "expired"}:
+        try:
+            _write_reply_projection(root, envelope_id, error=result.get("error") or detail)
+        except Exception:
+            logger.debug("bot_relay failure projection failed", exc_info=True)
+    return result
+
+
+def _validate_event_id(envelope_id: str) -> str:
+    safe = str(envelope_id or "").strip()
+    if not _EVENT_ID_RE.fullmatch(safe):
+        raise ValueError(f"invalid envelope id: {envelope_id!r}")
+    return safe
+
+
+def _write_json_once(path: Path, payload: dict) -> Path:
+    """Publish a fully-fsynced immutable JSON file without overwrite races."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing.get("reply", "") == payload.get("reply", "") and existing.get(
+            "error", ""
+        ) == payload.get("error", ""):
+            return path
+        raise ValueError("conflicting terminal reply")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".rep-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if existing.get("reply", "") != payload.get("reply", "") or existing.get(
+                "error", ""
+            ) != payload.get("error", ""):
+                raise ValueError("conflicting terminal reply")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return path
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _write_reply_projection(
+    root: Path | str,
+    envelope_id: str,
+    *,
+    reply: str = "",
+    error: str = "",
+    reason: str = "",
+) -> Path:
+    base = _ensure_dirs(root)
+    safe = _validate_event_id(envelope_id)
+    code = str(reason or "")
+    if not code and error:
+        from tools.bot_failure_reasons import classify_agent_error
+
+        code = classify_agent_error(str(error))
+    return _write_json_once(
+        base / REPLIES_DIR / f"{safe}.json",
+        {
+            "id": safe,
+            "at": int(time.time()),
+            "reply": str(reply or ""),
+            "error": str(error or ""),
+            "reason": code,
+        },
+    )
+
+
 def write_reply(
     root: Path | str, envelope_id: str, *, reply: str = "", error: str = "", reason: str = ""
 ) -> Path:
-    """Persist the relayed reply (or delivery error) for the waiter.
+    """Settle a legacy claimed event with a write-once reply projection.
 
     ``reason`` is an optional typed failure code (see
     ``tools.bot_failure_reasons``, e.g. 'queued_expired'); when omitted and
@@ -415,28 +1035,23 @@ def write_reply(
     only surfaces the human ``error``.
     """
     base = _ensure_dirs(root)
-    safe = str(envelope_id or "").strip()
-    if not re.match(r"^[0-9a-f]{32}$", safe):
-        raise ValueError(f"invalid envelope id: {envelope_id!r}")
-    err = str(error or "")
-    code = str(reason or "")
-    if not code and err:
-        from tools.bot_failure_reasons import classify_agent_error
-
-        code = classify_agent_error(err)
+    safe = _validate_event_id(envelope_id)
     path = base / REPLIES_DIR / f"{safe}.json"
-    payload = {
-        "id": safe,
-        "at": int(time.time()),
-        "reply": str(reply or ""),
-        "error": err,
-        "reason": code,
-    }
-    fd, tmp = tempfile.mkstemp(dir=str(base / REPLIES_DIR), prefix=".rep-", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, path)
-    return path
+    if path.exists():
+        return _write_reply_projection(
+            root, safe, reply=reply, error=error, reason=reason
+        )
+    claimed = base / CLAIMED_DIR / f"{safe}.json"
+    if not claimed.is_file():
+        raise ValueError("unknown or unclaimed envelope id")
+    result = _write_reply_projection(
+        root, safe, reply=reply, error=error, reason=reason
+    )
+    try:
+        claimed.unlink()
+    except OSError:
+        pass
+    return result
 
 
 def _sweep_stale(base: Path, *, now: float | None = None) -> int:
@@ -471,9 +1086,33 @@ def cleanup_bot_relay_artifacts(max_age_hours: float | None = None) -> int:
         home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
         root = home.parent.parent if home.parent.name == "profiles" else home
         base = relay_root(root)
-        if not base.is_dir():
-            return 0
-        return _sweep_stale(base)
+        removed = _sweep_stale(base) if base.is_dir() else 0
+        try:
+            from gateway.durable_events import cleanup
+
+            now = time.time()
+            for db_path in _profile_state_dbs(root):
+                if not db_path.is_file():
+                    continue
+                event_result = cleanup(
+                    db_path,
+                    stream=DELIVERY_STREAM,
+                    retention_seconds=STALE_AFTER_SECONDS,
+                    now=now,
+                )
+                inbox_result = cleanup(
+                    db_path,
+                    inbox=DELIVERY_INBOX,
+                    retention_seconds=STALE_AFTER_SECONDS,
+                    now=now,
+                )
+                if isinstance(event_result, dict):
+                    removed += int(event_result.get("events_deleted") or 0)
+                if isinstance(inbox_result, dict):
+                    removed += int(inbox_result.get("inbox_deleted") or 0)
+        except Exception:
+            logger.debug("bot_relay durable event sweep failed", exc_info=True)
+        return removed
     except Exception:
         logger.debug("bot_relay artifact sweep failed", exc_info=True)
         return 0
@@ -491,25 +1130,25 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
     interpreter.
     """
     reply_path = str(relay_root(root) / REPLIES_DIR / f"{envelope['id']}.json")
-    label = (
-        f"@{envelope.get('target_handle', '')} "
-        f"on {envelope.get('target_connection', '')}"
-    )
-    # Encode label with !r so roster fields cannot break out of the generated
-    # python -c source (quotes, parens, or extra statements in connection_id).
-    # The raw-string prefix keeps Windows paths viable: repr escapes each
-    # backslash ("C:\\Users\\..."), but the Windows execution layer the
-    # waiter runs under folds "\\" back to "\", which turns "\U" into an
-    # invalid unicode escape and SyntaxErrors the whole script (#93590).
-    # With the r prefix the folded single backslash parses as a literal.
-    # POSIX paths contain no backslashes, so the prefix is a no-op there,
-    # and \' inside a raw literal still cannot terminate the string, so
-    # the injection defense above is unchanged.
+    label = f"@{envelope['target_handle']} on {envelope['target_connection']}"
+    state_db = ""
+    if int(envelope.get("schema_version") or 1) >= 2:
+        state_db = str(_profile_state_db(root, str(envelope.get("from_profile") or "default")))
+    # User/route data is passed as argv, never interpolated into executable
+    # Python source.  The former f-string construction made a quoted
+    # connection id a code-injection primitive even though the outer shell
+    # command was correctly shlex-quoted.
     code = (
-        "import json,os,sys,time\n"
-        f"p = r{reply_path!r}\n"
-        f"label = r{label!r}\n"
-        f"deadline = time.time() + {REPLY_WAIT_SECONDS}\n"
+        "import json,os,sqlite3,sys,time\n"
+        "p,label,wait_s,db,event_id = sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4],sys.argv[5]\n"
+        "conn = None\n"
+        "if db:\n"
+        "    try:\n"
+        "        conn = sqlite3.connect(db, timeout=2)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "deadline = time.time() + wait_s\n"
+
         "while time.time() < deadline:\n"
         "    if os.path.exists(p):\n"
         "        d = json.load(open(p, encoding='utf-8'))\n"
@@ -524,12 +1163,39 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
         "        print('Reply from ' + label + ':')\n"
         "        print(d.get('reply') or '(empty reply)')\n"
         "        sys.exit(0)\n"
+        "    if conn is not None:\n"
+        "        try:\n"
+        "            row = conn.execute('SELECT state,outcome_json FROM durable_events WHERE stream=? AND event_id=?', ('bot_relay.outbox.v2',event_id)).fetchone()\n"
+        "            state = str(row[0] if row else '')\n"
+        "            if state in {'acked','completed','failed','dead_lettered','expired','cancelled','indeterminate'}:\n"
+        "                outcome = json.loads(row[1]) if row and row[1] else {}\n"
+        "                error = str(outcome.get('error') or '')\n"
+        "                if error or state not in {'acked','completed'}:\n"
+        "                    print('Delivery to ' + label + ' failed: ' + (error or state))\n"
+        "                    sys.exit(1)\n"
+        "                print('Reply from ' + label + ':')\n"
+        "                print(str(outcome.get('reply') or '(empty reply)'))\n"
+        "                sys.exit(0)\n"
+        "        except Exception:\n"
+        "            pass\n"
         "    time.sleep(2)\n"
-        f"print('No reply from ' + label + ' within {REPLY_WAIT_SECONDS}s. The message may "
-        "still be delivered when the Desktop reconnects; do not resend blindly.')\n"
+        "print('No reply from ' + label + ' within ' + str(wait_s) + "
+        "'s. The message may still be delivered when the Desktop reconnects; "
+        "do not resend blindly.')\n"
         "sys.exit(1)\n"
     )
-    return f"{shlex.quote(sys.executable or 'python3')} -c {shlex.quote(code)}"
+    return shlex.join(
+        [
+            sys.executable or "python3",
+            "-c",
+            code,
+            reply_path,
+            label,
+            str(REPLY_WAIT_SECONDS),
+            state_db,
+            str(envelope["id"]),
+        ]
+    )
 
 
 # ── delivery command (used by the deliver RPC on the TARGET gateway) ────────
@@ -674,3 +1340,117 @@ def acquire_turn_lock(
                 pass
     finally:
         os.close(fd)
+def begin_recipient_delivery(
+    root: Path | str,
+    *,
+    event_id: str,
+    target_profile: str,
+    body: str,
+    from_profile: str,
+    from_handle: str,
+    source_install_id: str = "",
+    target_install_id: str = "",
+    courier_namespace_id: str = "",
+    now: float | None = None,
+) -> dict:
+    """Admit a v2 delivery exactly once up to an honest indeterminate edge.
+
+    The inbox record is durable before the tool-capable Bot Chat turn starts.
+    A committed result is replayed.  If the target process dies after
+    admission but before committing a result, an expired processing record is
+    terminalized as ``indeterminate`` and is never blindly re-executed.
+    """
+    from gateway.durable_events import begin_inbox
+
+    safe_id = _validate_event_id(event_id)
+    if not _HANDLE_RE.fullmatch(target_profile):
+        raise ValueError("invalid target profile")
+    if not _HANDLE_RE.fullmatch(from_profile) or not _HANDLE_RE.fullmatch(from_handle):
+        raise ValueError("invalid sender identity")
+    source_install = _normalize_opaque_id(
+        source_install_id, field="source install id", required=False
+    )
+    target_install = _normalize_opaque_id(
+        target_install_id, field="target install id", required=False
+    )
+    namespace = _normalize_opaque_id(
+        courier_namespace_id, field="courier namespace", required=False
+    )
+    raw_body = str(body or "").strip()
+    if not raw_body:
+        raise ValueError("message body required")
+    identity = {
+        "from_profile": from_profile,
+        "from_handle": from_handle,
+        "source_install_id": source_install,
+        "target_install_id": target_install,
+        "target_profile": target_profile,
+        "courier_namespace_id": namespace,
+    }
+    material = json.dumps(
+        {"identity": identity, "body": raw_body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    admission = begin_inbox(
+        _profile_state_db(root, target_profile),
+        inbox=DELIVERY_INBOX,
+        event_id=safe_id,
+        identity=identity,
+        payload_hash=payload_hash,
+        lane=target_profile,
+        processing_seconds=DELIVERY_PROCESSING_SECONDS,
+        now=now,
+    )
+    normalized = {
+        **admission,
+        "event_id": safe_id,
+        "payload_hash": payload_hash,
+        "message": f"Message from 🤖 {from_handle} (@{from_handle}): {raw_body}",
+    }
+    if admission.get("token") and not normalized.get("execution_token"):
+        normalized["execution_token"] = admission["token"]
+    return normalized
+
+
+def finish_recipient_delivery(
+    root: Path | str,
+    *,
+    event_id: str,
+    target_profile: str,
+    execution_token: str,
+    status: str,
+    reply: str = "",
+    error: str = "",
+    now: float | None = None,
+) -> dict:
+    """Commit the immutable recipient result before the RPC returns."""
+    from gateway.durable_events import finish_inbox
+
+    safe_id = _validate_event_id(event_id)
+    if status == "indeterminate":
+        terminal = "indeterminate"
+    else:
+        terminal = "succeeded" if status == "completed" and not error else "failed"
+    return finish_inbox(
+        _profile_state_db(root, target_profile),
+        inbox=DELIVERY_INBOX,
+        event_id=safe_id,
+        execution_token=execution_token,
+        status=terminal,
+        result={
+            "status": (
+                "completed"
+                if terminal == "succeeded"
+                else "indeterminate"
+                if terminal == "indeterminate"
+                else "failed"
+            ),
+            "event_id": safe_id,
+            "reply": str(reply or "")[:200_000],
+            "error": str(error or "")[:2_000],
+        },
+        now=now,
+    )

@@ -78,9 +78,11 @@ def _deliver(params):
 
 def _is_hermes_cli(argv) -> bool:
     """Match the delivery CLI by basename — local_delivery_command may
-    resolve the venv-relative hermes next to the interpreter (#93590)."""
+    resolve the venv-relative hermes next to the interpreter (#93590),
+    and WindowsApps Python can resolve the hermes.CMD PATH shim when no
+    venv sibling exists."""
     name = str(argv[0]).rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-    return name in ("hermes", "hermes.exe")
+    return name.lower() in ("hermes", "hermes.exe", "hermes.cmd")
 
 
 def _transport_calls(calls):

@@ -33,26 +33,26 @@ def _reply_file(home, envelope_id):
 
 def test_write_reply_persists_forwarded_reason(home):
     """A reason forwarded by the Desktop drain loop lands in the reply file."""
-    envelope_id = "a" * 32
+    env = _claimed_envelope(home)
     bot_relay.write_reply(
         home,
-        envelope_id,
+        env["id"],
         error="delivery turn failed: Error code: 429",
         reason=bfr.PROVIDER_RATE_LIMIT,
     )
-    data = json.loads(_reply_file(home, envelope_id).read_text(encoding="utf-8"))
+    data = json.loads(_reply_file(home, env["id"]).read_text(encoding="utf-8"))
     assert data["reason"] == bfr.PROVIDER_RATE_LIMIT
 
 
 def test_write_reply_classifies_when_reason_omitted(home):
     """Old senders that never forward a reason still get a classified code."""
-    envelope_id = "b" * 32
+    env = _claimed_envelope(home)
     bot_relay.write_reply(
         home,
-        envelope_id,
+        env["id"],
         error="Error code: 401 - Your API key is invalid, blocked or out of funds",
     )
-    data = json.loads(_reply_file(home, envelope_id).read_text(encoding="utf-8"))
+    data = json.loads(_reply_file(home, env["id"]).read_text(encoding="utf-8"))
     assert data["reason"] == bfr.PROVIDER_AUTH_OR_ACCESS
 
 
@@ -81,11 +81,24 @@ def _envelope(home):
     )
 
 
+def _claimed_envelope(home):
+    """Enqueue AND claim so write_reply's write-once gate accepts the id.
+
+    The durable v2 substrate settles only claimed events: write_reply raises
+    for an envelope still sitting in the outbox. Mirrors the claim-then-settle
+    pattern of the PR's own tests.
+    """
+    env = _envelope(home)
+    claimed = bot_relay.claim_pending_envelopes(home)
+    assert any(c["id"] == env["id"] for c in claimed)
+    return env
+
+
 def test_waiter_surfaces_reason_tag_to_sending_agent(home, monkeypatch):
     """The waiter's stdout — the sending agent's completion notification —
     carries the typed reason so the agent can branch without parsing prose."""
     monkeypatch.setattr(bot_relay, "_target_liveness", lambda *a, **k: True)
-    env = _envelope(home)
+    env = _claimed_envelope(home)
     bot_relay.write_reply(
         home,
         env["id"],
@@ -100,7 +113,7 @@ def test_waiter_surfaces_reason_tag_to_sending_agent(home, monkeypatch):
 def test_waiter_healthy_reply_has_no_reason_tag(home, monkeypatch):
     """Success path unchanged: no reason tag noise on good replies."""
     monkeypatch.setattr(bot_relay, "_target_liveness", lambda *a, **k: True)
-    env = _envelope(home)
+    env = _claimed_envelope(home)
     bot_relay.write_reply(home, env["id"], reply="pong")
     proc = _run_waiter(home, env)
     assert proc.returncode == 0
@@ -112,7 +125,7 @@ def test_waiter_reasonless_error_prints_plain(home, monkeypatch):
     """A reply file with error text whose classification is unknown still
     prints cleanly — the unknown code is a valid tag, never a crash."""
     monkeypatch.setattr(bot_relay, "_target_liveness", lambda *a, **k: True)
-    env = _envelope(home)
+    env = _claimed_envelope(home)
     bot_relay.write_reply(home, env["id"], error="something odd happened")
     proc = _run_waiter(home, env)
     assert proc.returncode == 1

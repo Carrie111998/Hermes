@@ -121,16 +121,11 @@ test('lifecycle: set on classified failure, latest wins, cleared on success', ()
 })
 
 test('hooks: relay delivery and group member turns note/clear attention', () => {
-  // Relay drain: deliver success clears, deliver failure notes.
-  const drain = pluginSource.slice(
-    pluginSource.indexOf('async function drainRelayOutboxes'),
-    pluginSource.indexOf('function startBotRelay')
-  )
-  assert.match(drain, /clearBotAttention\(attentionKey\)/)
-  // #93091: the drain prefers the typed reason from bot_relay.deliver's
-  // error.data over free-text re-parsing, and forwards it to the reply.
-  assert.match(drain, /noteBotAttention\(attentionKey, reason \|\| error\?\.message \|\| error\)/)
-  assert.match(drain, /\.\.\.\(reason \? \{ reason \} : \{\}\)/)
+  // The v1 renderer-side relay drain is gone: the durable courier
+  // supervisor (bot-relay.mjs) hands delivery to the gateway's
+  // bot_relay.deliver, so the renderer no longer drains outboxes or
+  // records attention from drain outcomes. Group member turn boundary
+  // attention remains renderer-side and is asserted below.
 
   // Group member turn boundary: failure notes under the member key; a real
   // reply clears it.

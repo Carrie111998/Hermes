@@ -190,6 +190,8 @@ const $focusedSessionProfile = computed(
 
 export interface PluginProfileRoute {
   connectionId: string
+  /** Stable backend installation identity; never an auth credential. */
+  installId?: string
   mode: 'local' | 'remote'
   /** Desktop profile used to select the connection route. */
   profile: string
@@ -227,20 +229,25 @@ const $viewport = atom<ViewportRect>(readViewport())
 async function requestPluginProfile<T>(
   route: PluginProfileRoute | string,
   method: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  timeoutMs?: number
 ): Promise<T> {
   if (typeof route !== 'string') {
     if (!route.connectionId.trim() || !route.profile.trim() || !route.targetProfile.trim()) {
       throw new Error('Profile route must include connectionId, profile, and targetProfile')
     }
 
-    return requestGatewayForAgent<T>(route.connectionId, route.profile, method, params)
+    return timeoutMs === undefined
+      ? requestGatewayForAgent<T>(route.connectionId, route.profile, method, params)
+      : requestGatewayForAgent<T>(route.connectionId, route.profile, method, params, timeoutMs)
   }
 
   const getAgentRoster = window.hermesDesktop?.getAgentRoster
 
   if (!getAgentRoster) {
-    return requestGatewayForProfile<T>(route, method, params)
+    return timeoutMs === undefined
+      ? requestGatewayForProfile<T>(route, method, params)
+      : requestGatewayForProfile<T>(route, method, params, timeoutMs)
   }
 
   const roster = await getAgentRoster()
@@ -252,7 +259,9 @@ async function requestPluginProfile<T>(
   // its live enumeration transiently failed. Any additional source requires a
   // descriptor because an undialed/unreachable source may expose the same name.
   if (soleLocalSource) {
-    return requestGatewayForProfile<T>(profile, method, params)
+    return timeoutMs === undefined
+      ? requestGatewayForProfile<T>(profile, method, params)
+      : requestGatewayForProfile<T>(profile, method, params, timeoutMs)
   }
 
   throw new Error(
@@ -1102,6 +1111,9 @@ export const host = {
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
 
+  /** Electron-main authority for the one Desktop-global Bot Mode courier. */
+  botRelayLeadership: window.hermesDesktop?.botRelayLeadership,
+
   /** Credential-free routes across every current registry source. Identity is
    *  the (connectionId, profile) pair; endpoint/auth details stay in Electron. */
   profileRoutes: async () => {
@@ -1127,12 +1139,17 @@ export const host = {
   /** Gateway JSON-RPC through a credential-free route descriptor without
    *  foregrounding it. Passing a bare profile is the v1/local compatibility
    *  overload; registry callers must pass the descriptor so duplicate names
-   *  remain unambiguous. */
+   *  remain unambiguous. Long-running calls may override the gateway's default
+   *  timeout with the optional fourth argument. */
   requestProfile: async <T>(
     route: PluginProfileRoute | string,
     method: string,
-    params: Record<string, unknown> = {}
-  ): Promise<T> => requestPluginProfile<T>(route, method, params),
+    params: Record<string, unknown> = {},
+    timeoutMs?: number
+  ): Promise<T> =>
+    timeoutMs === undefined
+      ? requestPluginProfile<T>(route, method, params)
+      : requestPluginProfile<T>(route, method, params, timeoutMs),
 
   /** Pin a route's pooled gateway socket open across repeated `requestProfile`
    *  calls (#93594: the bot-relay drain loop was dialing and tearing down a
@@ -1386,6 +1403,14 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+/** Durable Bot Mode courier runtime. Exporting it through the SDK keeps the
+ *  bundled and blob-loaded plain-ESM plugin on the same implementation without
+ *  a relative module import that blob URLs cannot resolve. */
+export {
+  createBotRelaySupervisor,
+  createBotRelayWorker,
+  createRelayRuntimeId
+} from '@/plugins/hermes-bots/bot-relay.mjs'
 /** Live accent override — set a hex and the ACTIVE theme repaints with its
  *  accent family re-seeded from it (see `retintTheme`); `null` restores the
  *  authored palette. Deliberately not persisted: it is an authoring knob, not
@@ -1431,6 +1456,7 @@ export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll
  *  loops, cross-component signals) — the same primitive `host.state` uses. */
 export { atom, computed } from 'nanostores'
+
 /** Markdown renderer (same pipeline core chat surfaces use) so plugins render
  *  message text as a preview instead of raw Markdown source. */
 export { Streamdown } from 'streamdown'

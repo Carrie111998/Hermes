@@ -2106,6 +2106,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     target=next_args.get("target", ""),
                     message=next_args.get("message", ""),
                     task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
                     agent=agent,
                 )
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(

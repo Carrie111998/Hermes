@@ -301,12 +301,15 @@ _LONG_HANDLERS = frozenset(
         "profiles.get_asset",
         "profiles.list",
         "profiles.set_asset",
-        # Bot-relay RPCs: roster.sync/outbox.drain/reply are cheap file I/O,
-        # but bot_relay.deliver runs a FULL one-turn agent conversation
-        # (subprocess, up to 600s) — all four stay off the WS reader thread
-        # so a slow relay delivery can never block prompt.submit.
+        # Bot-relay RPCs stay off the WS reader thread. Lease-control methods
+        # use a reserved pool below so long bot_relay.deliver turns cannot
+        # starve renew/ACK/NACK and make live leases look abandoned.
         "bot_relay.roster.sync",
         "bot_relay.outbox.drain",
+        "bot_relay.outbox.claim",
+        "bot_relay.outbox.renew",
+        "bot_relay.outbox.ack",
+        "bot_relay.outbox.nack",
         "bot_relay.deliver",
         "bot_relay.reply",
         # image.generate is a multi-second remote API round-trip.
@@ -377,6 +380,25 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+
+_RELAY_CONTROL_HANDLERS = frozenset(
+    {
+        "bot_relay.roster.sync",
+        "bot_relay.outbox.drain",
+        "bot_relay.outbox.claim",
+        "bot_relay.outbox.renew",
+        "bot_relay.outbox.ack",
+        "bot_relay.outbox.nack",
+        "bot_relay.reply",
+    }
+)
+_relay_control_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="tui-relay-control",
+)
+atexit.register(
+    lambda: _relay_control_pool.shutdown(wait=False, cancel_futures=True)
+)
 
 # Exact in-memory session generation executing on the current turn thread.
 # Unlike a public session id, this object identity cannot be supplied by RPC.
@@ -2494,7 +2516,10 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        executor = (
+            _relay_control_pool if method in _RELAY_CONTROL_HANDLERS else _pool
+        )
+        executor.submit(lambda: ctx.run(run))
 
         return None
     finally:

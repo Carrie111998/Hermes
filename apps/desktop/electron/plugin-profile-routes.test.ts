@@ -3,9 +3,11 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   buildOpaqueProfileRoutes,
   buildRegistryProfileRoutes,
+  invalidateConnectionDiscovery,
   localRouteFallbackProfiles,
   type ProfileRouteConfig,
   registryGatewayWsUrl,
+  registryProfileRouteSources,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 
@@ -209,11 +211,12 @@ describe('buildRegistryProfileRoutes', () => {
       ],
       legacyRoutes: [{ connectionId: 'legacy-hash', mode: 'local', profile: 'research', targetProfile: 'research' }],
       sources: [
-        { id: 'local', kind: 'local', label: 'This device' },
+        { id: 'local', installId: 'backend-install-local', kind: 'local', label: 'This device' },
         {
           authMode: 'token',
           host: 'private.lan',
           id: 'homelab',
+          installId: 'backend-install-homelab',
           kind: 'ssh',
           keyPath: '/secret/id_ed25519',
           label: 'Homelab',
@@ -224,8 +227,20 @@ describe('buildRegistryProfileRoutes', () => {
     })
 
     expect(routes).toEqual([
-      { connectionId: 'local', mode: 'local', profile: 'research', targetProfile: 'research' },
-      { connectionId: 'homelab', mode: 'remote', profile: 'research', targetProfile: 'remote-research' }
+      {
+        connectionId: 'local',
+        installId: 'backend-install-local',
+        mode: 'local',
+        profile: 'research',
+        targetProfile: 'research'
+      },
+      {
+        connectionId: 'homelab',
+        installId: 'backend-install-homelab',
+        mode: 'remote',
+        profile: 'research',
+        targetProfile: 'remote-research'
+      }
     ])
     expect(JSON.stringify(routes)).not.toContain('private.lan')
     expect(JSON.stringify(routes)).not.toContain('id_ed25519')
@@ -243,6 +258,47 @@ describe('buildRegistryProfileRoutes', () => {
     expect(routes).toEqual([{ connectionId: 'local', mode: 'local', profile: 'barry', targetProfile: 'barry' }])
   })
 
+  it('prefers a live install ID and falls back to cached identity without forwarding secrets', () => {
+    const sources = registryProfileRouteSources([
+      {
+        connection: {
+          host: 'private.lan',
+          id: 'homelab',
+          installId: 'cached-install-homelab',
+          keyPath: '/secret/id_ed25519',
+          kind: 'ssh',
+          remoteProfile: 'research',
+          token: 'encrypted-secret'
+        }
+      },
+      {
+        connection: {
+          id: 'cloud-prod',
+          installId: 'stale-install-cloud',
+          kind: 'cloud',
+          token: 'another-secret',
+          url: 'https://private.example'
+        },
+        installId: 'live-install-cloud'
+      }
+    ])
+
+    const routes = buildRegistryProfileRoutes({
+      agents: [
+        { connectionId: 'homelab', profile: 'default' },
+        { connectionId: 'cloud-prod', profile: 'default' }
+      ],
+      sources
+    })
+
+    expect(routes.map(route => route.installId)).toEqual(['cached-install-homelab', 'live-install-cloud'])
+    expect(JSON.stringify(sources)).not.toContain('private.lan')
+    expect(JSON.stringify(sources)).not.toContain('id_ed25519')
+    expect(JSON.stringify(sources)).not.toContain('private.example')
+    expect(JSON.stringify(sources)).not.toContain('encrypted-secret')
+    expect(JSON.stringify(sources)).not.toContain('another-secret')
+  })
+
   it('scopes registry-shared remote websocket URLs to the requested profile', () => {
     expect(
       registryGatewayWsUrl({ profile: 'research', sharedRemote: true }, 'wss://gateway.example/api/ws?token=secret')
@@ -250,6 +306,31 @@ describe('buildRegistryProfileRoutes', () => {
     expect(registryGatewayWsUrl({ profile: 'research' }, 'ws://127.0.0.1:5151/api/ws?token=local')).toBe(
       'ws://127.0.0.1:5151/api/ws?token=local'
     )
+  })
+})
+
+describe('invalidateConnectionDiscovery', () => {
+  it('forgets identity and SSH inventory when an edited or recreated source reuses its id', () => {
+    const installIds = new Map([['homelab', { id: 'old-install', ts: 1 }]])
+    const sshInventoryAttemptedAt = new Map([['homelab', 1]])
+    const sshRoster = new Map([['homelab', ['old-profile']]])
+
+    invalidateConnectionDiscovery('homelab', {
+      installIds,
+      sshInventoryAttemptedAt,
+      sshRoster
+    })
+
+    expect(installIds.has('homelab')).toBe(false)
+    expect(sshInventoryAttemptedAt.has('homelab')).toBe(false)
+    expect(sshRoster.has('homelab')).toBe(false)
+
+    // Removing and then re-adding the label "Homelab" can mint the same slug.
+    // The replacement must start empty and learn only its new backend state.
+    installIds.set('homelab', { id: 'new-install', ts: 2 })
+    sshRoster.set('homelab', ['new-profile'])
+    expect(installIds.get('homelab')?.id).toBe('new-install')
+    expect(sshRoster.get('homelab')).toEqual(['new-profile'])
   })
 })
 
