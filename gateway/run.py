@@ -5737,13 +5737,16 @@ class TurnRunner:
         # must reach the next turn (#60955).  Per-session turn
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
-            agent._configured_default_route = _configured_default_route
+            refreshed_chain = self._runner._refresh_fallback_model(
+                primary_route=_fallback_primary_route,
+                configured_default_route=_configured_default_route,
+            )
+            agent._configured_default_route = getattr(
+                self._runner, "_configured_default_route", _configured_default_route
+            )
             self._runner._apply_fallback_chain_to_agent(
                 agent,
-                self._runner._refresh_fallback_model(
-                    primary_route=_fallback_primary_route,
-                    configured_default_route=_configured_default_route,
-                ),
+                refreshed_chain,
             )
 
         # Lock released — now schedule cleanup of any cross-process-evicted
@@ -5822,7 +5825,9 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
-        agent._configured_default_route = _configured_default_route
+        agent._configured_default_route = getattr(
+            self._runner, "_configured_default_route", _configured_default_route
+        )
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -6912,6 +6917,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        self._configured_default_route = None
 
         # Wire process registry into session store for reset protection.
         # A background process older than the configured threshold (default 24h,
@@ -8111,6 +8117,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "credential_pool": override.get("credential_pool"),
             }
             if override_runtime.get("api_key"):
+                if configured_default_route is None and model:
+                    # Legacy ``model: <id>`` and default-only model blocks rely
+                    # on runtime provider inference. The inline-key override
+                    # returns before the normal runtime path below, so resolve
+                    # only enough of the configured route to retain it for
+                    # recovery. A broken default must not block this override.
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                        default_runtime = resolve_runtime_provider(target_model=model)
+                    except Exception:
+                        logger.debug(
+                            "Could not resolve configured default route for fast session override",
+                            exc_info=True,
+                        )
+                    else:
+                        configured_default_route = get_configured_default_route(
+                            user_config,
+                            runtime=default_runtime,
+                        )
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
                         override.get("provider")
@@ -9902,10 +9928,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
+                self._configured_default_route = None
                 return compose_fallback_chain(
                     None,
                     primary=primary_route,
-                    configured_default=configured_default_route,
+                    configured_default=None,
                 ) or None
             # Raw primitive (raises on parse failure) is required here: the
             # canonical fail-open loader would return {} on a torn mid-edit
@@ -9933,13 +9960,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return compose_fallback_chain(
                 self._fallback_model,
                 primary=primary_route,
-                configured_default=configured_default_route,
+                configured_default=getattr(
+                    self, "_configured_default_route", configured_default_route
+                ),
             ) or None
         self._fallback_model = get_fallback_chain(cfg) or None
+        self._configured_default_route = configured_default_route
         return compose_fallback_chain(
             self._fallback_model,
             primary=primary_route,
-            configured_default=configured_default_route,
+            configured_default=self._configured_default_route,
         ) or None
 
     @staticmethod
@@ -22790,6 +22820,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                fallback_model = self._refresh_fallback_model(
+                    primary_route=_fallback_primary_route,
+                    configured_default_route=_configured_default_route,
+                )
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -22819,12 +22853,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(
-                        primary_route=_fallback_primary_route,
-                        configured_default_route=_configured_default_route,
-                    ),
+                    fallback_model=fallback_model,
                 )
-                agent._configured_default_route = _configured_default_route
+                agent._configured_default_route = self._configured_default_route
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,

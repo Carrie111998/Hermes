@@ -93,6 +93,67 @@ def test_refresh_composes_configured_default_for_session_override(tmp_path, monk
     ]
 
 
+def test_refresh_preserves_last_known_default_on_transient_parse_failure(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "fallback_providers:\n"
+        "  - provider: openai-codex\n"
+        "    model: gpt-5.6-luna\n"
+    )
+    runner = SimpleNamespace(
+        _fallback_model=None,
+        _configured_default_route=None,
+    )
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+    primary = {"provider": "openrouter", "model": "override-model"}
+    configured_default = {"provider": "commandcode", "model": "model-a"}
+
+    initial = bound(
+        primary_route=primary,
+        configured_default_route=configured_default,
+    )
+    cfg.write_text("model: [unterminated")
+    retained = bound(
+        primary_route=primary,
+        configured_default_route=None,
+    )
+
+    assert initial == retained == [
+        configured_default,
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+    ]
+    assert runner._configured_default_route == configured_default
+
+
+def test_refresh_clears_last_known_default_after_successful_removal(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("fallback_providers: []\n")
+    configured_default = {"provider": "commandcode", "model": "model-a"}
+    runner = SimpleNamespace(
+        _fallback_model=None,
+        _configured_default_route=configured_default,
+    )
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+
+    chain = bound(
+        primary_route={"provider": "openrouter", "model": "override-model"},
+        configured_default_route=None,
+    )
+
+    assert chain is None
+    assert runner._configured_default_route is None
+
+
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):
     """_load_fallback_model remains a pure static reader used by refresh."""
     from gateway.run import GatewayRunner
