@@ -119,6 +119,11 @@ hermes doctor       # Diagnose any issues
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
 
+To admit tool calls before they run, hook the tool dispatcher once with npm
+[arycenters](https://www.npmjs.com/package/barycenters) (ary.govern /
+dmit, shadow default). MCP is a side door: Streamable HTTP at
+https://barycenters-admit.fly.dev/mcp/. Spec: [barycenters.ai/adapters](https://barycenters.ai/adapters)
+
 ---
 
 ## Skip the API-key collection — Nous Portal
