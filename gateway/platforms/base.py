@@ -2394,6 +2394,12 @@ class MessageEvent:
     # and None means no authoritative agent result was produced. Kept last to
     # preserve positional construction compatibility.
     agent_run_failed: Optional[bool] = None
+
+    # True when the runner could not persist ownership of this exact active
+    # turn. Autonomous adapters use this to preserve a competing durable owner
+    # instead of finalizing its session from a losing event. Kept last to
+    # preserve positional construction compatibility.
+    active_turn_admission_failed: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

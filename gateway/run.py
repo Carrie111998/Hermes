@@ -19690,9 +19690,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
+        event.active_turn_admission_failed = False
         try:
             token = await self.async_session_store.mark_turn_active(session_key)
         except Exception as exc:
+            event.active_turn_admission_failed = True
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
                 session_key,
@@ -19700,6 +19702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
         if not token:
+            event.active_turn_admission_failed = True
             return False
         # Private event attributes are process-local ownership state.  Keep the
         # token out of public metadata, transcripts, and platform payloads.

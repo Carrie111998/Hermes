@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
 from hermes_state import _WEBHOOK_HANDOFF_CLAIM_LOCK_PROTOCOL
@@ -798,6 +799,35 @@ async def test_runner_active_turn_carrier_clears_the_exact_resolved_key():
     clear_active.assert_awaited_once_with("resolved-session-key", "token-1")
     assert not hasattr(event, "_gateway_active_turn_session_key")
     assert not hasattr(event, "_gateway_active_turn_token")
+
+
+@pytest.mark.asyncio
+async def test_runner_active_turn_carrier_marks_failed_admission():
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = MagicMock()
+    mark_active = AsyncMock(return_value=None)
+    setattr(
+        runner,
+        "_async_session_store",
+        SimpleNamespace(
+            _store=runner.session_store,
+            mark_turn_active=mark_active,
+        ),
+    )
+    event = MessageEvent(
+        text="alert",
+        source=SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:alerts:delivery-1",
+        ),
+    )
+
+    admitted = await runner._mark_durable_active_turn(
+        event, "resolved-session-key"
+    )
+
+    assert admitted is False
+    assert event.active_turn_admission_failed is True
 
 
 @pytest.mark.asyncio

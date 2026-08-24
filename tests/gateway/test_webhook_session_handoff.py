@@ -1923,6 +1923,142 @@ async def test_losing_running_recovery_cannot_finalize_or_unsuppress_winner(
 
 
 @pytest.mark.asyncio
+async def test_failed_active_turn_admission_cannot_finalize_live_owner(
+    tmp_path, monkeypatch
+):
+    run = _real_lifecycle(
+        tmp_path,
+        monkeypatch,
+        delivery_id="pre-hook-admission-loser",
+    )
+    try:
+        loser_event, _marker = _make_event(
+            run.adapter,
+            "pre-hook-admission-loser",
+        )
+        loser_event._webhook_handoff_admission_owner = (
+            run.event._webhook_handoff_admission_owner
+        )
+        loser_event.agent_run_failed = True
+        loser_event.active_turn_admission_failed = True
+        run.adapter._active_handoff_sessions.add(run.event.source.chat_id)
+
+        await run.adapter.on_processing_complete(
+            loser_event,
+            ProcessingOutcome.FAILURE,
+        )
+
+        assert run.store._db.get_meta(run.state_key) == run.accepted_state
+        assert run.store.peek_session_id(run.session_key) == run.entry.session_id
+        assert run.store._db.get_session(run.entry.session_id)["ended_at"] is None
+        assert _durable_route(run.store, run.session_key)[
+            "active_turn_token"
+        ] == run.token
+        assert (
+            run.event.source.chat_id
+            in run.adapter._active_handoff_sessions
+        )
+        accepted = run.adapter._parse_handoff_delivery_state(
+            run.accepted_state,
+            marker=run.marker,
+            handoff_to="discord",
+        )
+        assert run.store._db.try_acquire_webhook_delivery_admission_lock(
+            run.state_key,
+            accepted["admission_token"],
+            accepted["lock_protocol"],
+            "provider-retry-owner",
+        )
+    finally:
+        run.store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_startup_admission_loser_without_metadata_preserves_live_owner(
+    tmp_path, monkeypatch
+):
+    run = _real_lifecycle(
+        tmp_path,
+        monkeypatch,
+        delivery_id="startup-admission-loser",
+    )
+    try:
+        await _start_and_persist(
+            run.adapter,
+            run.event,
+            session_key=run.session_key,
+            session_id=run.entry.session_id,
+        )
+        winner_state = run.store._db.get_meta(run.state_key)
+        synthetic_event = MessageEvent(
+            text="",
+            source=run.entry.origin,
+            internal=True,
+            agent_run_failed=True,
+            active_turn_admission_failed=True,
+        )
+
+        await run.adapter.on_processing_complete(
+            synthetic_event,
+            ProcessingOutcome.FAILURE,
+        )
+
+        assert synthetic_event.metadata == {}
+        assert run.store._db.get_meta(run.state_key) == winner_state
+        assert run.store.peek_session_id(run.session_key) == run.entry.session_id
+        assert run.store._db.get_session(run.entry.session_id)["ended_at"] is None
+        assert _durable_route(run.store, run.session_key)[
+            "active_turn_token"
+        ] == run.token
+        assert (
+            run.event.source.chat_id
+            in run.adapter._active_handoff_sessions
+        )
+    finally:
+        run.store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_legacy_webhook_admission_failure_still_closes_session():
+    adapter = _make_adapter(
+        {
+            "alerts": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message}",
+            }
+        }
+    )
+    store = SimpleNamespace(peek_session_id=MagicMock(return_value="legacy-session"))
+    db = SimpleNamespace(end_session=AsyncMock())
+    adapter.gateway_runner = SimpleNamespace(
+        session_store=store,
+        _session_db=db,
+        _session_key_for_source=lambda source: f"key:{source.chat_id}",
+    )
+    source = adapter.build_source(
+        chat_id="webhook:alerts:legacy-delivery",
+        chat_name="webhook/alerts",
+        chat_type="webhook",
+        user_id="webhook:alerts",
+        user_name="alerts",
+    )
+    event = MessageEvent(
+        text="legacy alert",
+        source=source,
+        message_id="legacy-delivery",
+        agent_run_failed=True,
+        active_turn_admission_failed=True,
+    )
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    db.end_session.assert_awaited_once_with(
+        "legacy-session",
+        "webhook_complete",
+    )
+
+
+@pytest.mark.asyncio
 async def test_restart_identity_restores_running_delivery_suppression(
     tmp_path, monkeypatch
 ):

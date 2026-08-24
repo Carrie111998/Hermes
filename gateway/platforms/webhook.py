@@ -1471,12 +1471,44 @@ class WebhookAdapter(BasePlatformAdapter):
         if callable(track_quiescence):
             track_quiescence()
 
+        if not handoff_to and event.active_turn_admission_failed:
+            # Startup recovery rebuilds a metadata-free event from the stored
+            # SessionSource. If this turn loses the active-route CAS, the
+            # adapter hook never gets a chance to restore handoff metadata.
+            # A durable webhook source is the only webhook source that persists
+            # its provider delivery ID, so preserve that owner while legacy
+            # one-shot webhooks continue through their normal close path.
+            durable_delivery_id = getattr(event.source, "message_id", None)
+            durable_marker = event.metadata.get(_EVENT_HANDOFF_MARKER_KEY)
+            if durable_marker or durable_delivery_id:
+                try:
+                    identity = await self._handoff_delivery_identity_for_event(
+                        event
+                    )
+                except Exception:
+                    logger.error(
+                        "[webhook] Could not verify failed active-turn "
+                        "admission; preserving the source route fail-closed",
+                        exc_info=True,
+                    )
+                    return
+                if identity is None:
+                    logger.error(
+                        "[webhook] Durable delivery identity is missing after "
+                        "failed active-turn admission; preserving the source "
+                        "route fail-closed"
+                    )
+                    return
+                await self._release_event_admission_if_accepted(event)
+                return
+
         if not handoff_to:
             await self._end_webhook_session(event, event.source.chat_id)
             return
 
         ownership_conflict = bool(
             event.metadata.get(_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY)
+            or event.active_turn_admission_failed
         )
         # A losing recovery event shares the winner's chat identity.  It may
         # release only its own accepted admission fence; it must not remove the
