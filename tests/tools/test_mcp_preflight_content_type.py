@@ -5,8 +5,8 @@ HTTP server (via httpx's ASGI/transport plumbing through a stdlib server),
 rather than reimplementing the probe inline. That distinction matters: the
 production probe must run on its own httpx client outside the MCP SDK's anyio
 task group, and a faithful test must exercise that actual method so the
-content-type allow-list, HEAD->GET fallback, POST probe fallback, and
-best-effort pass-through are all covered as shipped.
+content-type allow-list, HEAD->GET fallback, protocol-free ambiguity handling,
+and best-effort pass-through are all covered as shipped.
 
 OAuth note
 ----------
@@ -57,18 +57,14 @@ def _serve(handler_cls):
 def _handler(status: int = 200,
              content_type: "str | None" = "text/html; charset=utf-8",
              body: bytes = b"<html>x</html>", head_status=None, record=None,
-             post_content_type: "str | None" = None,
-             post_body: bytes = b"",
-             post_status: "int | None" = None):
+             allow_methods: "str | None" = None):
     """Build a BaseHTTPRequestHandler that replies with the given shape.
 
     ``head_status`` lets HEAD return a different status than GET (to exercise
     the HEAD->GET fallback). ``record`` is an optional list that captures the
     HTTP methods the server actually saw.
 
-    ``post_content_type`` / ``post_body`` / ``post_status`` let POST return a
-    different response than HEAD/GET (to exercise the POST probe fallback for
-    servers that serve HTML on GET but speak MCP via POST).
+    ``allow_methods`` models an endpoint that explicitly rules POST in or out.
     """
 
     class _H(http.server.BaseHTTPRequestHandler):
@@ -76,6 +72,8 @@ def _handler(status: int = 200,
             self.send_response(sc)
             if ct is not None:
                 self.send_header("Content-Type", ct)
+            if allow_methods is not None:
+                self.send_header("Allow", allow_methods)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if payload:
@@ -95,14 +93,10 @@ def _handler(status: int = 200,
         def do_POST(self):
             if record is not None:
                 record.append("POST")
-            # Read and discard request body to avoid broken pipe.
             length = int(self.headers.get("Content-Length", 0))
             if length:
                 self.rfile.read(length)
-            sc = post_status if post_status is not None else status
-            ct = post_content_type if post_content_type is not None else content_type
-            pb = post_body if post_body else body
-            self._write(sc, ct, pb)
+            self._write(status, content_type, body)
 
         def log_message(self, format, *args):  # noqa: A002
             pass
@@ -123,7 +117,11 @@ def _handler(status: int = 200,
 ])
 def test_non_mcp_content_type_raises(content_type):
     task = _make_task("bad_srv")
-    with _serve(_handler(status=200, content_type=content_type)) as base:
+    with _serve(_handler(
+        status=200,
+        content_type=content_type,
+        allow_methods="GET, HEAD",
+    )) as base:
         with pytest.raises(NonMcpEndpointError) as exc_info:
             asyncio.run(task._preflight_content_type(f"{base}/", timeout=5.0))
     msg = str(exc_info.value)
@@ -185,7 +183,11 @@ def test_oauth_server_html_response_raises_without_skip():
     """
     task = _make_task("hospitable")
     # HEAD returns 200 text/html — what Hospitable sends without a token.
-    with _serve(_handler(status=200, content_type="text/html; charset=UTF-8")) as base:
+    with _serve(_handler(
+        status=200,
+        content_type="text/html; charset=UTF-8",
+        allow_methods="GET, HEAD",
+    )) as base:
         with pytest.raises(NonMcpEndpointError) as exc_info:
             asyncio.run(task._preflight_content_type(f"{base}/mcp", timeout=5.0))
     assert "hospitable" in str(exc_info.value)
@@ -266,21 +268,26 @@ def test_run_skips_preflight_when_skip_preflight_set(monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
-# POST probe fallback for POST-only MCP servers
-# ---------------------------------------------------------------------------
-
-
-def test_post_probe_not_attempted_for_valid_head():
-    """When HEAD already returns application/json, no POST probe is needed."""
+def test_preflight_does_not_send_protocol_request_for_valid_head():
     task = _make_task()
     record: list[str] = []
     with _serve(_handler(
         status=200, content_type="application/json", body=b"{}",
-        post_content_type="application/json",
-        post_body=b'{}',
         record=record,
     )) as base:
         asyncio.run(task._preflight_content_type(f"{base}/mcp", timeout=5.0))
     assert record == ["HEAD"]
     assert "POST" not in record
+
+
+def test_html_preflight_defers_without_sending_json_rpc():
+    task = _make_task()
+    record: list[str] = []
+    with _serve(_handler(
+        status=200,
+        content_type="text/html",
+        record=record,
+    )) as base:
+        asyncio.run(task._preflight_content_type(f"{base}/mcp", timeout=5.0))
+
+    assert record == ["HEAD"]

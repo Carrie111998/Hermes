@@ -107,15 +107,29 @@ class TestMessageHandler:
             mock_schedule.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_ignores_exceptions_and_other_messages(self):
+    async def test_transport_exception_requests_reconnect_and_ignores_other_messages(self):
         server = MCPServerTask("notif_srv")
         with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_schedule:
             handler = server._make_message_handler()
-            # Exceptions should not trigger refresh
             await handler(RuntimeError("connection dead"))
-            # Unknown message types should not trigger refresh
+            assert server._reconnect_event.is_set()
+            server._reconnect_event.clear()
             await handler({"jsonrpc": "2.0", "result": "ok"})
+            assert not server._reconnect_event.is_set()
             mock_schedule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_handler_cannot_request_reconnect(self):
+        server = MCPServerTask("notif_srv")
+        server._connection_generation = 1
+        handler = server._make_message_handler(1)
+        server._connection_generation = 2
+        server.catalogue_state = "current"
+
+        await handler(RuntimeError("stale connection dead"))
+
+        assert not server._reconnect_event.is_set()
+        assert server.catalogue_state == "current"
 
 
 class TestDeregister:

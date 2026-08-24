@@ -1,0 +1,121 @@
+name: MCP Dual-Era Conformance
+
+on:
+  pull_request:
+    paths:
+      - "tools/mcp_*.py"
+      - "tools/mcp_tool.py"
+      - "tools/computer_use/cua_backend.py"
+      - "mcp_serve.py"
+      - "agent/transports/hermes_tools_mcp_server.py"
+      - "hermes_cli/web_routers/mcp.py"
+      - "tui_gateway/mcp_oauth_sessions.py"
+      - "tests/tools/test_mcp_*.py"
+      - "tests/fixtures/mcp_*.py"
+      - "tests/test_mcp_serve.py"
+      - "tests/agent/transports/test_hermes_tools_mcp_server.py"
+      - "tests/hermes_cli/test_mcp_dashboard_oauth.py"
+      - "tests/website/test_mcp_config_reference.py"
+      - "website/docs/reference/mcp-config-reference.md"
+      - ".github/workflows/mcp-dual-era-conformance.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "tools/mcp_*.py"
+      - "tools/mcp_tool.py"
+      - "tools/computer_use/cua_backend.py"
+      - "mcp_serve.py"
+      - "agent/transports/hermes_tools_mcp_server.py"
+      - "hermes_cli/web_routers/mcp.py"
+      - "tui_gateway/mcp_oauth_sessions.py"
+      - "tests/tools/test_mcp_*.py"
+      - "tests/fixtures/mcp_*.py"
+      - "tests/test_mcp_serve.py"
+      - "tests/agent/transports/test_hermes_tools_mcp_server.py"
+      - "tests/hermes_cli/test_mcp_dashboard_oauth.py"
+      - "tests/website/test_mcp_config_reference.py"
+      - "website/docs/reference/mcp-config-reference.md"
+      - ".github/workflows/mcp-dual-era-conformance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-dual-era-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Modern and legacy wire conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install locked repository environment
+        run: uv sync --locked --python 3.11 --extra dev --extra mcp
+
+      - name: Create isolated legacy MCP environment
+        run: |
+          uv venv --python 3.11 .mcp-legacy
+          uv pip install --python .mcp-legacy/bin/python "mcp==1.28.1"
+
+      - name: Run dual-era lifecycle conformance
+        env:
+          MCP_LEGACY_PYTHON: ${{ github.workspace }}/.mcp-legacy/bin/python
+          OPENAI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/tools/test_mcp_protocol_negotiation.py \
+            tests/tools/test_mcp_preflight_content_type.py \
+            tests/tools/test_mcp_dual_era_wire.py \
+            tests/tools/test_mcp_mrtr.py \
+            tests/tools/test_mcp_subscriptions.py \
+            tests/tools/test_mcp_schema_cache.py \
+            tests/tools/test_mcp_list_pagination.py \
+            tests/tools/test_mcp_lifecycle.py \
+            tests/tools/test_mcp_oauth_issuer.py \
+            tests/tools/test_mcp_stateless_liveness.py \
+            tests/test_mcp_serve.py \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/website/test_mcp_config_reference.py \
+            tests/tools/test_computer_use.py::TestCuaEnvironmentScrubbing::test_cua_session_sanitizes_provider_env_vars \
+            -o addopts= \
+            -q
+
+      - name: Run static conformance checks
+        run: |
+          source .venv/bin/activate
+          python -m ruff check \
+            tools/mcp_protocol.py \
+            tools/mcp_tool.py \
+            tools/mcp_schema_cache.py \
+            tools/mcp_oauth.py \
+            tools/mcp_oauth_manager.py \
+            tests/tools
+          python -m py_compile \
+            tools/mcp_protocol.py \
+            tools/mcp_tool.py \
+            tools/mcp_schema_cache.py \
+            tools/mcp_oauth.py \
+            tools/mcp_oauth_manager.py
+          uv lock --check
+          git diff --check
