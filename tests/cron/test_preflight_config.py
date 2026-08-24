@@ -340,3 +340,44 @@ class TestDeliveryPlatform:
 
         assert success is True
         assert agent_constructed is True
+
+    def test_route_only_skips_credential_check(self):
+        """A route_only deployment fronts delivery — an empty set must not block.
+
+        route_only configs hold no platform credentials by design: the
+        fronting gateway owns them and fire-time delivery resolves through
+        ITS live adapter. get_connected_platforms() is empty there for every
+        platform, so without the carve-out the credential check blocks every
+        concrete platform target on every multi-profile host.
+        """
+        gateway_config = MagicMock()
+        gateway_config.route_only = True
+        gateway_config.get_connected_platforms.return_value = []
+        with patch("gateway.config.load_gateway_config",
+                   return_value=gateway_config):
+            assert sched._preflight_check_delivery(
+                {"deliver": "discord:123"}) is None
+
+    def test_route_only_still_blocks_unknown_platform(self):
+        """The carve-out covers credentials only — a typo'd target still blocks."""
+        gateway_config = MagicMock()
+        gateway_config.route_only = True
+        gateway_config.get_connected_platforms.return_value = []
+        with patch("gateway.config.load_gateway_config",
+                   return_value=gateway_config), \
+                patch("cron.scheduler._is_known_delivery_platform",
+                      return_value=False):
+            reason = sched._preflight_check_delivery({"deliver": "notaplatform"})
+
+        assert reason is not None and "not a known cron" in reason
+
+    def test_native_deployment_keeps_strict_credential_check(self):
+        """Non-route_only topologies must keep blocking unconfigured platforms."""
+        gateway_config = MagicMock()
+        gateway_config.route_only = False
+        gateway_config.get_connected_platforms.return_value = []
+        with patch("gateway.config.load_gateway_config",
+                   return_value=gateway_config):
+            reason = sched._preflight_check_delivery({"deliver": "discord:123"})
+
+        assert reason is not None and "no gateway credentials" in reason
