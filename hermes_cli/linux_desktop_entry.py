@@ -77,12 +77,15 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly. Keep it UNRESOLVED: a venv
+            # `bin/python` is commonly a symlink into a shared toolchain (uv,
+            # pyenv, conda) and resolving it loses the venv, so the spawned
+            # interpreter would not see Hermes' site-packages.
+            argv = [str(sys.executable), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [str(sys.executable), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -106,8 +109,21 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # Compare by resolving both sides: a venv's ``bin/python`` is often a
+    # symlink into a shared toolchain (uv, pyenv, conda), so a shebang that
+    # points at the venv symlink and the running interpreter both resolve to
+    # the same real binary — and must NOT be prefixed (prefixing with the
+    # toolchain's real binary would lose Hermes' site-packages and die with
+    # ``ModuleNotFoundError``). String-compare the raw paths instead and this
+    # venv-symlink shebang is wrongly treated as "outside" the interpreter.
+    real_exe = str(Path(sys.executable).resolve())
+    if not shebang[2:].strip():
+        return False
+    try:
+        real_shebang = str(Path(shebang[2:].split()[0].strip()).resolve())
+    except (OSError, IndexError):
+        real_shebang = ""
+    return real_shebang != real_exe
 
 
 def _quote_exec_arg(arg: str) -> str:

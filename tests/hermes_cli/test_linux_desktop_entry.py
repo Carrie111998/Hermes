@@ -107,8 +107,10 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # Prefix with the UNRESOLVED interpreter: a venv `bin/python` may be a
+    # symlink into a shared toolchain, and resolving it would drop the venv's
+    # site-packages (#venv-symlink-exec).
+    assert exec_line.split(" ")[0].strip('"') == str(sys.executable)
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
 
@@ -146,6 +148,46 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
 
     # Console-script with the venv's own interpreter in the shebang: correct
     # as-is, prefixing would only add noise.
+    assert exec_line == f"{hermes_bin} desktop"
+
+
+def test_exec_leaves_venv_symlink_shebang_alone(tmp_path, xdg_home, monkeypatch):
+    """Regression: a venv whose ``bin/python`` is a symlink into a shared
+    toolchain (uv, pyenv, conda).
+
+    The shebang points at the venv symlink; the running interpreter is the
+    same binary reached through that symlink. Resolving either side yields the
+    toolchain's real binary, so the script's own shebang already loads the
+    venv — the Exec must NOT be prefixed with the resolved toolchain python
+    (which lacks Hermes' site-packages → ModuleNotFoundError on launch).
+    """
+    import sys
+
+    root = _make_project(tmp_path)
+
+    # Fake a shared toolchain binary + a venv symlink pointing at it.
+    toolchain = tmp_path / "toolchain" / "bin" / "python3"
+    toolchain.parent.mkdir(parents=True)
+    toolchain.write_text("", encoding="utf-8")
+    toolchain.chmod(0o755)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(toolchain)
+
+    hermes_bin = venv / "bin" / "hermes"
+    hermes_bin.write_text(f"#!{venv / 'bin' / 'python'}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    # The running interpreter must resolve to the same real binary as the
+    # shebang (both reach the toolchain python).
+    monkeypatch.setattr(lde.sys, "executable", str(venv / "bin" / "python"))
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # No interpreter prefix: the venv symlink shebang is self-sufficient.
     assert exec_line == f"{hermes_bin} desktop"
 
 
