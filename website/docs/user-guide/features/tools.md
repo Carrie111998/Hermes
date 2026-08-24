@@ -42,12 +42,21 @@ Paid [Nous Portal](https://portal.nousresearch.com) subscribers can use web sear
 # Use specific toolsets
 hermes chat --toolsets "web,terminal"
 
-# See all available tools
-hermes tools
-
 # Configure tools per platform (interactive)
 hermes tools
+
+# Emit a deterministic, redacted JSON catalog for audit or CI diffing
+# (availability checks are NOT run by default)
+hermes tools catalog --platform cli
+
+# Explicitly probe dynamic availability checks when needed
+hermes tools catalog --platform cli --probe
+
+# Include trusted profile/plugin tools (imports and executes plugin modules)
+hermes tools catalog --platform cli --include-plugins
 ```
+
+The capability catalog includes registered tool names, toolsets, bounded registration-time origin classes, validated environment-variable names (never values), structural schema digests, platform selection, and `available` / `unavailable` / `unknown` status. MCP origin is assigned only to tools registered through Hermes's native MCP boundary, not from an `mcp-` label alone. Credential-shaped identifier components are redacted even inside composed names such as `mcp-<server>`. Schema annotations/defaults, free-form descriptions, suspicious environment declarations, and configured identifiers with no observed capability are omitted because plugin-controlled strings can contain local paths, operator values, or secrets. MCP selections use canonical `mcp-<server>` IDs so a server name such as `file` cannot be mistaken for the built-in `file` toolset. `selected_for_platform` means the tool's toolset is selected for that platform; availability, per-session filtering, policy, and progressive disclosure can still keep it out of model-facing definitions. Unknown platforms fail instead of producing a misleading empty selection. The default command requests built-in registration only: it reports dynamic checks as `unknown` independently of process-global probe-cache state, does not execute availability probes, request profile/plugin discovery, create profile files, restore persistent delegation state, load external secrets, initialize file logging, clean quarantined executables, or sweep stale bytecode. Because the registry is process-global, `plugin_loading` reports `preloaded` when plugin contributions were already present, rather than incorrectly claiming they were skipped. `--probe` explicitly runs availability checks. `--include-plugins` follows the normal trusted-plugin import path and therefore executes plugin import code. Use `--compact` for single-line JSON.
 
 Common toolsets include `web`, `search`, `terminal`, `file`, `browser`, `vision`, `image_gen`, `skills`, `tts`, `todo`, `memory`, `session_search`, `cronjob`, `code_execution`, `delegation`, `clarify`, `homeassistant`, `messaging`, `spotify`, `discord`, `discord_admin`, `debugging`, and `safe`.
 
