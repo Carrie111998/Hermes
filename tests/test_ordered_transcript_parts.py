@@ -376,3 +376,34 @@ def test_parts_budget_never_truncates_legacy_inflight_text():
     assert snapshot["assistant"] == legacy_text
     assert snapshot["parts_clipped"] is True
     assert snapshot["user_parts_clipped"] is True
+
+
+def test_terminal_parts_keep_the_whole_logical_turn_across_internal_user_nudges():
+    # Repeated identical prompts must not make the collector jump back to the
+    # older turn when locating the current external-user boundary.
+    history = [{"role": "user", "content": "current prompt"},
+               {"role": "assistant", "content": "old answer"}]
+    rows = history + [
+        {"role": "user", "content": "current prompt"},
+        {"role": "assistant", "content": "I will inspect.", "tool_calls": [{
+            "id": "call-1",
+            "function": {"name": "terminal", "arguments": {"command": "pwd"}},
+        }]},
+        {"role": "tool", "tool_call_id": "call-1", "tool_name": "terminal",
+         "content": "ok"},
+        {"role": "user", "content": "[internal continuation nudge]"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    envelope = server._assistant_turn_parts(
+        rows,
+        prior_history_count=len(history),
+        turn_user_content="current prompt",
+    )
+
+    assert [part["kind"] for part in envelope["parts"]] == [
+        "text", "tool-call", "tool-result", "text",
+    ]
+    assert [part.get("text") for part in envelope["parts"] if part["kind"] == "text"] == [
+        "I will inspect.", "Done.",
+    ]

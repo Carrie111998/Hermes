@@ -8245,14 +8245,49 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
 
 
 def _assistant_turn_parts(
-    messages: Any, *, fallback_text: Any = "", reasoning: Any = None
+    messages: Any, *, fallback_text: Any = "", reasoning: Any = None,
+    prior_history_count: int | None = None, turn_user_content: Any = None,
 ) -> dict[str, Any]:
-    """Collect the ordered assistant/tool run after the latest user row."""
+    """Collect the complete assistant/tool run after this turn's user row.
+
+    Conversation-loop recovery can append synthetic user-role nudges inside
+    one logical turn. Using the *latest* user row truncates the terminal
+    replacement at that nudge and discards already-sealed commentary/tools.
+    The caller knows the pre-turn history boundary and exact submitted wire
+    content, so prefer those authorities; retain the old latest-user fallback
+    only for isolated callers that provide neither.
+    """
     rows = messages if isinstance(messages, list) else []
     start = 0
-    for index, row in enumerate(rows):
-        if isinstance(row, dict) and row.get("role") == "user":
-            start = index + 1
+    boundary_found = False
+    if isinstance(prior_history_count, int) and prior_history_count >= 0:
+        for candidate in range(prior_history_count, len(rows)):
+            row = rows[candidate]
+            if (
+                isinstance(row, dict)
+                and row.get("role") == "user"
+                and (
+                    turn_user_content is None
+                    or row.get("content") == turn_user_content
+                )
+            ):
+                start = candidate + 1
+                boundary_found = True
+                break
+    if not boundary_found and turn_user_content is not None:
+        for index in range(len(rows) - 1, -1, -1):
+            row = rows[index]
+            if (
+                isinstance(row, dict)
+                and row.get("role") == "user"
+                and row.get("content") == turn_user_content
+            ):
+                start = index + 1
+                boundary_found = True
+    if not boundary_found and prior_history_count is None and turn_user_content is None:
+        for index, row in enumerate(rows):
+            if isinstance(row, dict) and row.get("role") == "user":
+                start = index + 1
     parts: list[dict[str, Any]] = []
     for row in rows[start:]:
         if not isinstance(row, dict) or row.get("role") not in {"assistant", "tool"}:
@@ -11885,6 +11920,8 @@ def _run_prompt_submit(
                 result.get("messages") if isinstance(result, dict) else None,
                 fallback_text=raw,
                 reasoning=last_reasoning,
+                prior_history_count=len(history),
+                turn_user_content=run_message,
             )
             payload.update(_wire_part_fields(_assistant_envelope))
             payload["parts_mode"] = "replace"
