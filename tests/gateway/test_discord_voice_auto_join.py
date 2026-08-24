@@ -251,6 +251,28 @@ async def test_auto_join_skipped_when_already_connected_to_that_channel(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_auto_join_handles_connected_client_without_channel(monkeypatch, adapter):
+    adapter._voice_auto_join_cfg = {"auto_join_on_user_join": True, "auto_join_users": []}
+    adapter._allowed_user_ids = {"42"}
+    bot = await _connect_adapter(monkeypatch, adapter)
+    adapter.join_voice_channel = AsyncMock(return_value=True)
+
+    guild = SimpleNamespace(id=1)
+    channel = SimpleNamespace(id=99, name="General")
+    existing_vc = MagicMock()
+    existing_vc.is_connected.return_value = True
+    existing_vc.channel = None
+    adapter._voice_clients[guild.id] = existing_vc
+
+    await bot._events["on_voice_state_update"](
+        _make_member(42, guild), _make_voice_state(None), _make_voice_state(channel)
+    )
+
+    adapter.join_voice_channel.assert_awaited_once_with(channel)
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_auto_join_follows_allowed_user_when_switching_channels(monkeypatch, adapter):
     adapter._voice_auto_join_cfg = {
         "auto_join_on_user_join": True,

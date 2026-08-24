@@ -1500,10 +1500,11 @@ class DiscordAdapter(BasePlatformAdapter):
                             # anyway, but skip the call entirely when nothing
                             # would change to avoid needless log noise.
                             existing_vc = adapter_self._voice_clients.get(guild_id)
+                            existing_channel_id = getattr(getattr(existing_vc, "channel", None), "id", None)
                             already_here = (
                                 existing_vc
                                 and existing_vc.is_connected()
-                                and existing_vc.channel.id == after.channel.id
+                                and existing_channel_id == getattr(after.channel, "id", None)
                             )
                             if not already_here:
                                 try:
