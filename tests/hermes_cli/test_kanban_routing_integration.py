@@ -61,15 +61,20 @@ def _insert_snapshot_run(
     return int(run_id)
 
 
-def _legacy_pre_routing_db(path: Path) -> None:
-    """Build a valid legacy DB by stripping routing additions from a fixture DB."""
+def _legacy_pre_routing_db(path: Path, *, run_count: int = 0) -> list[int]:
+    """Build a legacy DB with optional runs, then strip routing additions."""
     kb.init_db(path)
     with sqlite3.connect(path) as conn:
+        run_ids = [
+            _insert_legacy_run(conn, f"legacy-{index}", "done")
+            for index in range(run_count)
+        ]
         conn.execute("DROP TABLE kanban_metadata")
         conn.execute("ALTER TABLE tasks DROP COLUMN routing_role")
         conn.execute("ALTER TABLE task_runs DROP COLUMN routing_source")
         conn.commit()
     kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    return run_ids
 
 
 def _roster() -> tuple[dict, str]:
@@ -135,9 +140,10 @@ def test_cross_board_run_ids_are_connection_local_and_mutations_are_isolated(tmp
 
 
 def test_concurrent_connect_closing_migrates_one_legacy_db_atomically(tmp_path):
-    """Concurrent first opens publish one complete routing migration without errors."""
+    """Concurrent first opens publish a complete schema and exact legacy cutoff."""
     db_path = tmp_path / "legacy.db"
-    _legacy_pre_routing_db(db_path)
+    legacy_run_ids = _legacy_pre_routing_db(db_path, run_count=3)
+    expected_cutoff = max(legacy_run_ids)
     errors: list[BaseException] = []
     barrier = threading.Barrier(8)
 
@@ -163,7 +169,7 @@ def test_concurrent_connect_closing_migrates_one_legacy_db_atomically(tmp_path):
             "GROUP BY key,value ORDER BY key"
         ).fetchall()
         assert [(row["key"], row["value"], row["n"]) for row in metadata] == [
-            ("migration_cutoff_id", "0", 1),
+            ("migration_cutoff_id", str(expected_cutoff), 1),
             ("routing_schema_version", "1", 1),
         ]
         assert "routing_role" in {
@@ -178,6 +184,10 @@ def test_concurrent_connect_closing_migrates_one_legacy_db_atomically(tmp_path):
             "routing_source",
         } <= run_columns
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        post_migration_id = _insert_legacy_run(conn, "post-migration", "done")
+        conn.commit()
+
+    assert post_migration_id > expected_cutoff
 
 
 def test_routing_rejection_events_remain_compatible_with_list_events(tmp_path, monkeypatch):
