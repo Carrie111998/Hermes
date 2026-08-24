@@ -62,10 +62,28 @@ let defaultTree: LayoutNode | null = null
  * differently on every restart. The LIVE tree keeps them for the session; only
  * the STORED copy is scrubbed, and boot adoption re-docks surviving preview
  * tabs at their remembered share (see `rememberPaneShare`).
+ *
+ * The pane-id namespace preview tiles are MINTED under (`paneMirror` builds
+ * `${prefix}:${key}`) is declared HERE and exported for the minting side, so
+ * the minted id and the ephemeral set are one definition; the predicate below
+ * is exported for the same reason — the minting side asserts against THIS
+ * definition instead of a second copy of the `preview-tile:` literal.
  */
-const EPHEMERAL_PANE_PREFIXES = ['preview-tile:'] as const
+export const PREVIEW_TILE_PANE_NAMESPACE = 'preview-tile'
 
-const isEphemeralPane = (paneId: string): boolean => EPHEMERAL_PANE_PREFIXES.some(prefix => paneId.startsWith(prefix))
+const EPHEMERAL_PANE_PREFIXES = [`${PREVIEW_TILE_PANE_NAMESPACE}:`] as const
+
+export const isEphemeralPane = (paneId: string): boolean =>
+  EPHEMERAL_PANE_PREFIXES.some(prefix => paneId.startsWith(prefix))
+
+/** Depth-first, allocation-free: true the moment any pane id is ephemeral.
+ *  `persist` runs on every commit, and most commits carry no preview tile —
+ *  the no-op path must not materialize the `allPaneIds` array. */
+function containsEphemeralPane(node: LayoutNode): boolean {
+  return node.type === 'group'
+    ? node.panes.some(isEphemeralPane)
+    : node.children.some(containsEphemeralPane)
+}
 
 /** Remove every ephemeral tile pane from a tree COPY (`removePane` rebuilds;
  *  the input is never mutated). Returns the same reference when nothing matches
@@ -74,6 +92,10 @@ const isEphemeralPane = (paneId: string): boolean => EPHEMERAL_PANE_PREFIXES.som
 function scrubEphemeralPanes(tree: LayoutNode | null): LayoutNode | null {
   if (!tree) {
     return null
+  }
+
+  if (!containsEphemeralPane(tree)) {
+    return tree
   }
 
   let next: LayoutNode | null = tree

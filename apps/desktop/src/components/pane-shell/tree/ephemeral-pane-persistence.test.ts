@@ -2,6 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { LayoutNode } from '@/components/pane-shell/tree/model'
 
+// The drift test below imports the preview tile watcher to exercise REAL
+// id minting. Its render/console leaves are never invoked there (the mirror
+// only registers pane contributions), and their component graph is heavy —
+// mock them so this file stays light under parallel full-suite runs.
+vi.mock('@/app/chat/right-rail/preview', () => ({ PreviewTilePane: () => null }))
+vi.mock('@/app/chat/right-rail/preview-console-store', () => ({ forgetPreviewConsole: () => {} }))
+
 // Preview tiles are transient: their panes must never reach the persisted
 // layout tree. A tree saved WITH them bakes splits/weights around tabs the
 // next session may not restore (artifact previews never persist; the Browser
@@ -132,6 +139,55 @@ describe('ephemeral preview panes are scrubbed from the persisted tree', () => {
     }
 
     expect(stored.weights).toEqual([3, 1])
+  })
+
+  it('persisting a preview-free tree never materializes the pane-id list', async () => {
+    const { model, registerFiles, tree } = await setup()
+
+    // Adoption of `files` itself runs `allPaneIds` (dock-anchor lookup) — that
+    // is expected. The assertion covers the EVERY-COMMIT persist that follows:
+    // with no preview tile in the tree it must early-out before building ids.
+    registerFiles()
+
+    const spy = vi.spyOn(model, 'allPaneIds')
+
+    tree.persistTree()
+
+    expect(spy).not.toHaveBeenCalled()
+
+    spy.mockRestore()
+  })
+
+  it('exports the ephemeral predicate and namespace so minting and scrubbing share one definition', async () => {
+    const { tree } = await setup()
+
+    expect(tree.PREVIEW_TILE_PANE_NAMESPACE).toBe('preview-tile')
+    expect(tree.isEphemeralPane(`${tree.PREVIEW_TILE_PANE_NAMESPACE}:file:notes`)).toBe(true)
+    expect(tree.isEphemeralPane('workspace')).toBe(false)
+    expect(tree.isEphemeralPane('route-tile:/skills')).toBe(false)
+  })
+
+  it('pane ids minted by the preview tile mirror satisfy the shared predicate', async () => {
+    const { registry, tree } = await setup()
+
+    const { $previewTabs } = await import('@/store/preview')
+    const { watchPreviewTiles } = await import('@/app/chat/preview-tile')
+
+    watchPreviewTiles()
+
+    $previewTabs.set([
+      {
+        id: 'file:notes',
+        target: { kind: 'file', label: 'notes', source: 'C:/notes.md', url: 'file:///C:/notes.md' }
+      }
+    ])
+
+    const ephemeralPaneIds = registry
+      .getArea('panes')
+      .map(contribution => contribution.id)
+      .filter(id => tree.isEphemeralPane(id))
+
+    expect(ephemeralPaneIds).toEqual(['preview-tile:file:notes'])
   })
 
   it('a stored tree written by an older build heals on load', async () => {
