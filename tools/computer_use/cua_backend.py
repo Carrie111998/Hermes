@@ -221,11 +221,18 @@ _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
 
 def _computer_use_cfg() -> Dict[str, Any]:
-    """The ``computer_use`` config block, or ``{}`` when config is unreadable."""
-    try:
-        from hermes_cli.config import load_config
+    """The ``computer_use`` config block, or ``{}`` when config is unreadable.
 
-        return (load_config() or {}).get("computer_use") or {}
+    Read-only fast path: several consumers sit on hot paths (the typed-browser
+    refusal postprocess reads ``grant_existing_profile`` on every typed call),
+    so this uses ``load_config_readonly`` — hermes_cli's stat-keyed cache
+    without the whole-config deepcopy. Callers must never mutate the returned
+    block.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        return (load_config_readonly() or {}).get("computer_use") or {}
     except Exception:
         return {}
 
@@ -334,6 +341,14 @@ def _cua_grant_existing_profile() -> bool:
 # these unsatisfiable until the session is rebound (#93068).
 _CONSENT_REFUSAL_CODES = frozenset({"browser_consent_required"})
 
+# Known driver prose for the verify-ladder consent refusal: the refusal code
+# (``browser_wrong_target_refused``) carries no consent term, so the message
+# must be matched — but only the driver's own phrasing. A generic refusal
+# whose prose happens to mention consent (an OS permissions dialog, a system
+# prompt) is NOT consent-family: rewriting it would discard the driver's
+# actual instructions (#93068 review).
+_CONSENT_MESSAGE_PHRASES = frozenset({"remote-debugging consent", "consent sheet"})
+
 
 def _is_consent_refusal(payload: Dict[str, Any]) -> bool:
     """True when a refused driver payload is about existing-profile consent.
@@ -342,8 +357,10 @@ def _is_consent_refusal(payload: Dict[str, Any]) -> bool:
     but the driver also emits verify-ladder refusals whose message names the
     Chrome remote-debugging consent sheet (e.g. ``browser_wrong_target_refused``
     — "no exact Chrome remote-debugging consent sheet appeared"). Under a
-    stale launch grant those are equally unsatisfiable, so the consent term in
-    the message matches too. Never matches successful payloads.
+    stale launch grant those are equally unsatisfiable, so the known consent
+    phrases in the message match too. Never matches successful payloads, and
+    never matches prose that merely mentions consent without the driver's
+    phrasing.
     """
     if not isinstance(payload, dict):
         return False
@@ -355,7 +372,12 @@ def _is_consent_refusal(payload: Dict[str, Any]) -> bool:
         if lowered in _CONSENT_REFUSAL_CODES or "consent" in lowered:
             return True
     message = payload.get("message")
-    return isinstance(message, str) and "consent" in message.lower()
+    if not isinstance(message, str):
+        return False
+    lowered_message = message.lower()
+    return any(
+        phrase in lowered_message for phrase in _CONSENT_MESSAGE_PHRASES
+    )
 
 
 def _annotate_browser_harness_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -367,6 +389,10 @@ def _annotate_browser_harness_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
     letting the passthrough imply a bare command exists (#93068).
     """
     if not isinstance(payload, dict):
+        return payload
+    # Mirror `_is_consent_refusal`: success results are never guidance, even
+    # when their message happens to quote the helper name (#93068 review).
+    if payload.get("ok") is True or payload.get("status") == "ok":
         return payload
     message = payload.get("message")
     if not isinstance(message, str) or "browser-harness" not in message:
