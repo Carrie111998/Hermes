@@ -510,9 +510,10 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # deepseek-chat / deepseek-reasoner are deprecated 2026-07-24 and now alias
     # deepseek-v4-flash's non-thinking / thinking modes — same rates.
     # NOTE: DeepSeek bills PEAK vs OFF-PEAK tiers (peak = 2x off-peak; peak hours
-    # 01:00-04:00 and 06:00-10:00 UTC). Snapshot stores OFF-PEAK rates — the
-    # conservative baseline (majority of usage is off-peak). Actual spend for
-    # peak-hour runs will be up to 2x these figures.
+    # 01:00-04:00 and 06:00-10:00 UTC; off-peak all day on Beijing weekends).
+    # Snapshot stores OFF-PEAK rates — the optimistic floor (majority of usage
+    # is off-peak). Actual spend for peak-hour runs will be up to 2x these
+    # figures.
     (
         "deepseek",
         "deepseek-chat",

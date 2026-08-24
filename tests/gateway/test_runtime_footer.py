@@ -426,6 +426,93 @@ def test_rate_tier_default_windows_boundaries():
         )
 
 
+def test_rate_tier_longest_match_beats_insertion_order():
+    """A user's model-specific window beats the built-in generic matcher.
+
+    Regression for review: _merge_rate_windows seeds 'deepseek' FIRST, so
+    iterating in insertion order returns the built-in default before the
+    user's 'deepseek-v4-flash' entry is ever checked — silently inverting
+    their config. Longest-key matching makes specificity win regardless of
+    dict order.
+    """
+    import datetime as dt
+
+    from gateway.runtime_footer import _merge_rate_windows, rate_tier_for_model
+
+    windows = _merge_rate_windows(
+        {"deepseek-v4-flash": {"tz": "UTC", "peak": [[20, 23]]}}
+    )
+    # merged order: built-in 'deepseek' is first, user's specific key second
+    assert list(windows)[0] == "deepseek"
+    assert "deepseek-v4-flash" in windows
+
+    # 21:00 UTC — the user's [[20,23]] says PEAK; the built-in deepseek
+    # window (01-04/06-10) says off-peak. The user's config must win.
+    t = dt.datetime(2026, 8, 20, 21, 0, tzinfo=dt.timezone.utc)
+    assert rate_tier_for_model("deepseek-v4-flash", windows, now=t) == "peak"
+
+    # The generic matcher still applies to other deepseek models.
+    t2 = dt.datetime(2026, 8, 20, 8, 0, tzinfo=dt.timezone.utc)
+    assert rate_tier_for_model("deepseek-r1", windows, now=t2) == "peak"
+
+
+def test_rate_tier_midnight_crossing_window():
+    """A peak window that wraps midnight ([[22, 2]]) is peak for 22:00-01:59.
+
+    Regression for review: `start <= hour < end` is unsatisfiable for a
+    wrapped window, so it parsed fine but silently matched nothing.
+    """
+    import datetime as dt
+
+    from gateway.runtime_footer import rate_tier_for_model
+
+    windows = {"nightowl": {"tz": "UTC", "peak": [[22, 2]]}}
+    cases = {
+        0: "peak", 1: "peak", 2: "off-peak", 3: "off-peak",
+        21: "off-peak", 22: "peak", 23: "peak",
+    }
+    for hour, expected in cases.items():
+        t = dt.datetime(2026, 8, 20, hour, 30, tzinfo=dt.timezone.utc)
+        assert rate_tier_for_model("nightowl-1", windows, now=t) == expected, (
+            f"hour {hour}: expected {expected}"
+        )
+
+
+def test_rate_tier_deepseek_weekend_off_peak_beijing():
+    """DeepSeek bills off-peak ALL DAY on Beijing weekends (fixed UTC+8).
+
+    Regression for review: the old default mislabelled 14 of every 168 hours
+    as peak because it had no day-of-week axis. Weekend-ness is a property of
+    the BEIJING date, not the UTC date: the Beijing weekend runs Friday
+    16:00 UTC -> Sunday 16:00 UTC. A UTC-date weekday check would agree only
+    while every peak window sits clear of the 16:00-24:00 UTC stretch where
+    the two dates disagree.
+    """
+    import datetime as dt
+
+    from gateway.runtime_footer import rate_tier_for_model
+
+    # Beijing Saturday 10:00 (UTC 02:00) — inside the UTC peak window 01-04,
+    # but DeepSeek is off-peak all weekend.
+    sat = dt.datetime(2026, 8, 22, 2, 0, tzinfo=dt.timezone.utc)
+    assert rate_tier_for_model("deepseek-v4-flash", now=sat) == "off-peak"
+
+    # Beijing Sunday 16:00 (UTC 08:00) — inside the UTC peak window 06-10.
+    sun = dt.datetime(2026, 8, 23, 8, 0, tzinfo=dt.timezone.utc)
+    assert rate_tier_for_model("deepseek-v4-flash", now=sun) == "off-peak"
+
+    # Same UTC clock time on Monday: weekday, so the peak window applies again.
+    mon = dt.datetime(2026, 8, 24, 2, 0, tzinfo=dt.timezone.utc)
+    assert rate_tier_for_model("deepseek-v4-flash", now=mon) == "peak"
+
+    # Beijing Saturday begins at UTC Friday 16:00 — already weekend there.
+    fri_eve = dt.datetime(2026, 8, 21, 16, 30, tzinfo=dt.timezone.utc)
+    assert rate_tier_for_model("deepseek-v4-flash", now=fri_eve) == "off-peak"
+
+    # Non-DeepSeek models match no window and stay silent.
+    assert rate_tier_for_model("claude-opus-5", now=sat) is None
+
+
 def test_deepseek_rate_tier_legacy_helper():
     """Backward-compat helper still returns the same UTC-based tiers."""
     import datetime as dt
