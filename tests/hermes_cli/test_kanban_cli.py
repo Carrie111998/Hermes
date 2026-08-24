@@ -211,8 +211,6 @@ def test_unblock_on_triage_task_leaves_no_comment_or_event(kanban_home):
         assert all(e.kind != "commented" for e in kb.list_events(conn, tid))
 
 
-
-
 # ---------------------------------------------------------------------------
 # /kanban specify — slash surface (same entry point CLI + gateway use)
 # ---------------------------------------------------------------------------
