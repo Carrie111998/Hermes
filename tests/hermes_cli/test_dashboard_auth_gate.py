@@ -255,6 +255,19 @@ def test_public_url_aware_gate_preserves_local_only_mode(monkeypatch):
     assert should_require_dashboard_auth("127.0.0.1") is False
 
 
+def test_public_url_does_not_gate_desktop_private_loopback_backend(monkeypatch):
+    """Desktop's ephemeral loopback backend keeps its minted-token auth."""
+    from hermes_cli.web_server import should_require_dashboard_auth
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    assert should_require_dashboard_auth(
+        "127.0.0.1", desktop_private=True
+    ) is False
+
+
 def test_start_server_loopback_public_url_enables_gate(monkeypatch):
     """A declared external URL turns a loopback reverse proxy into gated mode."""
     from hermes_cli.dashboard_auth import clear_providers, register_provider

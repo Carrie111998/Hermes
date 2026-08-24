@@ -725,6 +725,8 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
 def should_require_dashboard_auth(
     host: str,
     trusted_public_hosts: Optional[frozenset[str]] = None,
+    *,
+    desktop_private: bool = False,
 ) -> bool:
     """Return whether the dashboard auth gate must be active.
 
@@ -732,7 +734,14 @@ def should_require_dashboard_auth(
     ``dashboard.public_url`` requires authentication even when a reverse proxy
     reaches a backend bound to loopback. Callers may pass the already-resolved
     host set so startup and request validation use the same snapshot.
+
+    Desktop-spawned profile backends are private, ephemeral loopback listeners;
+    the configured public dashboard URL does not route to them. They retain the
+    per-process session-token boundary minted by Desktop. A non-loopback bind
+    remains gated regardless of this flag.
     """
+    if desktop_private and not should_require_auth(host):
+        return False
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
     return should_require_auth(host) or any(
@@ -19393,7 +19402,9 @@ def start_server(
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_dashboard_auth(
-        host, app.state.trusted_public_hosts
+        host,
+        app.state.trusted_public_hosts,
+        desktop_private=os.environ.get("HERMES_DESKTOP") == "1",
     )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
