@@ -9488,8 +9488,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active_skill = None
         if task_id:
             try:
-                from tools.skills_tool import active_skill_reasoning
+                from tools.skills_tool import active_skill_reasoning, reset_active_skill_reasoning
                 active_skill = active_skill_reasoning(str(task_id))
+                # Consume-and-clear: skill views recorded during the PREVIOUS
+                # turn are read here (the one-turn lag), then cleared so a
+                # skill viewed once does not stick for every future turn of the
+                # session. Without this the registry never resets and the
+                # suggestion lingers until restart (review comment on #93378).
+                reset_active_skill_reasoning(str(task_id))
             except Exception:
                 active_skill = None
         return resolve_reasoning_config(cfg, model, active_skill=active_skill)

@@ -1418,6 +1418,14 @@ def resolve_reasoning_config(
                     parsed = parse_reasoning_effort(user_val)
                     if parsed is not None and parsed.get("enabled"):
                         return parsed
+                    # Unrecognized non-off value (e.g. a typo like "turbo"):
+                    # the user said SOMETHING for this skill, so we must NOT
+                    # silently fall through to the skill's own suggestion —
+                    # that would activate the very thing they were trying to
+                    # control. Treat it as "skip the skill layer" and fall
+                    # through to per-model/global, matching how per-model
+                    # overrides behave on an unrecognized value.
+                    skip_skill = True
 
     # 2. Active skill's own suggestion (user has not overridden/disabled it).
     if not skip_skill and active_skill and active_skill[1]:

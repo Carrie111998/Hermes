@@ -563,6 +563,20 @@ class TestResolveReasoningConfigWithSkill:
         result = resolve_reasoning_config(cfg, "gpt-5", active_skill=("fetch", None))
         assert result == {"enabled": True, "effort": "medium"}
 
+    def test_invalid_user_value_skips_skill_suggestion(self):
+        """A typo'd per-skill value must NOT fall through to the skill's
+        suggestion. If the user set plan to something unrecognized, the
+        resolver must skip the skill layer entirely and go to per-model/global
+        — otherwise the typo silently activates the very suggestion the user
+        was trying to override."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium", by_skill={"plan": "turbo"})
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        # Must NOT be xhigh (the skill's suggestion) — must fall through to global medium.
+        assert result == {"enabled": True, "effort": "medium"}
+
 
 class TestReasoningOverridesDefaultConfig:
     """Tests for the agent.reasoning_overrides default config key (Task 2)."""

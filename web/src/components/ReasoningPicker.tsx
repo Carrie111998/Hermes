@@ -22,6 +22,7 @@
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import { Brain, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 
 import { api } from "@/lib/api";
 import {
@@ -137,6 +138,10 @@ export function ReasoningPicker({
     }));
 
   const setRowSkill = (key: string, skill: string) => {
+    // Update local state only. Persisting here would fire a full config
+    // GET+PUT on EVERY keystroke (e.g. typing "planning" → ~8 writes of
+    // junk intermediates {p:…},{pl:…} that race concurrent writers).
+    // The name is committed to config on blur / Enter via commitRowSkill.
     const rows = skillRows();
     const row = rows.find((r) => r.key === key);
     if (!row) return;
@@ -144,7 +149,14 @@ export function ReasoningPicker({
     if (next[row.skill] !== undefined) delete next[row.skill];
     if (skill.trim()) next[skill.trim()] = row.effort;
     setSkillMap(next);
-    persistSkillMap(next);
+  };
+
+  const commitRowSkill = (key: string) => {
+    const rows = skillRows();
+    const row = rows.find((r) => r.key === key);
+    if (!row) return;
+    if (!row.skill.trim()) return; // empty name — leave the row, don't persist
+    persistSkillMap({ ...skillMap });
   };
 
   const setRowEffort = (key: string, eff: string) => {
@@ -211,6 +223,12 @@ export function ReasoningPicker({
               disabled={saving}
               placeholder="skill name (e.g. plan)"
               onChange={(e) => setRowSkill(row.key, e.target.value)}
+              onBlur={() => commitRowSkill(row.key)}
+              onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
+                }
+              }}
             />
             <Select
               className="min-w-0"
