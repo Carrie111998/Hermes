@@ -6000,6 +6000,20 @@ class DiscordAdapter(BasePlatformAdapter):
             # so a rejected invoker can receive an ephemeral rejection.
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
+        @tree.command(name="plan", description="Create a thread and have Hermes return a plan only")
+        @discord.app_commands.describe(request="What you want Hermes to plan")
+        async def slash_plan(interaction: discord.Interaction, request: str):
+            request = (request or "").strip()
+            thread_name = self._derive_auto_thread_name(request)
+            await self._handle_thread_create_slash(
+                interaction,
+                thread_name,
+                request,
+                10080,
+                command_text="/plan",
+                dispatch_text=f"/plan {request}".strip(),
+            )
+
         @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
         @discord.app_commands.describe(prompt="The prompt to queue")
         async def slash_queue(interaction: discord.Interaction, prompt: str):
@@ -6441,9 +6455,12 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         message: str = "",
         auto_archive_duration: int = 1440,
+        *,
+        command_text: str = "/thread",
+        dispatch_text: Optional[str] = None,
     ) -> None:
         """Create a Discord thread from a slash command and start a session in it."""
-        if not await self._check_slash_authorization(interaction, "/thread"):
+        if not await self._check_slash_authorization(interaction, command_text):
             return
         deferred_response = False
         try:
@@ -6453,14 +6470,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if not self._is_discord_unknown_interaction(e):
                 raise
             logger.warning(
-                "[Discord] /thread: interaction expired before defer. "
+                "[Discord] %s: interaction expired before defer. "
                 "Creating the thread anyway, skipping interaction followups.",
+                command_text,
             )
         result = await self._create_thread(
             interaction,
             name=name,
             message=message,
             auto_archive_duration=auto_archive_duration,
+            requested_via=command_text,
         )
 
         if not result.get("success"):
@@ -6482,7 +6501,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._threads.mark(thread_id)
 
         # If a message was provided, kick off a new Hermes session in the thread
-        starter = (message or "").strip()
+        starter = (dispatch_text if dispatch_text is not None else message or "").strip()
         if starter and thread_id:
             await self._dispatch_thread_session(interaction, thread_id, thread_name, starter)
 
@@ -7133,6 +7152,7 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         message: str = "",
         auto_archive_duration: int = 1440,
+        requested_via: str = "/thread",
     ) -> Dict[str, Any]:
         """Create a thread in the current Discord channel.
 
@@ -7159,7 +7179,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return {"error": "Could not determine a parent text channel for the new thread."}
 
         display_name = getattr(getattr(interaction, "user", None), "display_name", None) or "unknown user"
-        reason = f"Requested by {display_name} via /thread"
+        reason = f"Requested by {display_name} via {requested_via}"
         starter_message = (message or "").strip()
 
         try:

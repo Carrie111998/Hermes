@@ -142,6 +142,45 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_registers_plan_slash_as_planning_only_thread(adapter):
+    adapter._handle_thread_create_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["plan"]
+    interaction = SimpleNamespace()
+
+    await command(interaction, request="Add audit logging")
+
+    adapter._handle_thread_create_slash.assert_awaited_once_with(
+        interaction,
+        "Add audit logging",
+        "Add audit logging",
+        10080,
+        command_text="/plan",
+        dispatch_text="/plan Add audit logging",
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_slash_trims_request_and_thread_title(adapter):
+    adapter._handle_thread_create_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["plan"]
+    interaction = SimpleNamespace()
+    request = "  " + "x" * 90 + "  "
+
+    await command(interaction, request=request)
+
+    call = adapter._handle_thread_create_slash.await_args
+    assert call is not None
+    assert call.args[1] == "x" * 77 + "..."
+    assert call.args[2] == "x" * 90
+    assert call.kwargs["command_text"] == "/plan"
+    assert call.kwargs["dispatch_text"] == "/plan " + "x" * 90
+
+
+@pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
         status = 404
@@ -344,6 +383,44 @@ async def test_handle_thread_create_slash_falls_back_to_seed_message(adapter):
         reason="Requested by Jezza via /thread",
     )
     interaction.followup.send.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_plan_thread_displays_request_but_dispatches_plan_skill(adapter):
+    created_thread = SimpleNamespace(id=555, name="Add audit logging", send=AsyncMock())
+    parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), send=AsyncMock())
+    interaction = SimpleNamespace(
+        channel=parent_channel,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        guild=SimpleNamespace(name="TestGuild"),
+        followup=SimpleNamespace(send=AsyncMock()),
+        response=SimpleNamespace(defer=AsyncMock()),
+    )
+    adapter._dispatch_thread_session = AsyncMock()
+
+    await adapter._handle_thread_create_slash(
+        interaction,
+        "Add audit logging",
+        "Add audit logging",
+        10080,
+        command_text="/plan",
+        dispatch_text="/plan Add audit logging",
+    )
+
+    adapter._check_slash_authorization.assert_awaited_once_with(interaction, "/plan")
+    parent_channel.create_thread.assert_awaited_once_with(
+        name="Add audit logging",
+        auto_archive_duration=10080,
+        reason="Requested by Jezza via /plan",
+    )
+    created_thread.send.assert_awaited_once_with("Add audit logging")
+    adapter._dispatch_thread_session.assert_awaited_once_with(
+        interaction,
+        "555",
+        "Add audit logging",
+        "/plan Add audit logging",
+    )
 
 
 # ------------------------------------------------------------------
