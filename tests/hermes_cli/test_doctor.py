@@ -1708,3 +1708,51 @@ class TestMacOSTCCGrants:
         out = capsys.readouterr().out
         assert "could not read code-signing requirement" in out
         assert "stable" not in out
+
+
+def test_run_doctor_still_flags_vendor_slugs_for_direct_providers(monkeypatch, tmp_path):
+    """Negative-case guard for the vendor-slug allowlist.
+
+    If a future PR accidentally broadens `providers_accepting_vendor_slugs`
+    — or the allowlist is removed in favour of a metadata field that
+    defaults to True — this regression catches it. A *direct* provider
+    like DeepSeek (whose native IDs are bare, e.g. `deepseek-chat`) must
+    still be warned when a vendor-prefixed slug is used.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n  provider: deepseek\n  default: deepseek/deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "model.provider 'deepseek' is not a recognised provider" not in out
+    assert (
+        "model.default 'deepseek/deepseek-v4-flash' uses a vendor/model slug but provider is "
+        "'deepseek'" in out
+    )
+    assert "Either set model.provider to 'openrouter', or drop the vendor prefix." in out
