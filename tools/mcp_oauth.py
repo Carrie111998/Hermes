@@ -1037,6 +1037,10 @@ def _make_callback_waiter(
             while elapsed < timeout:
                 if result["auth_code"] is not None or result["error"] is not None:
                     break
+                if dashboard_flow is not None:
+                    flow = dashboard_flow.snapshot()
+                    if flow["status"] == "error":
+                        raise RuntimeError(flow["error"] or "OAuth flow cancelled")
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
