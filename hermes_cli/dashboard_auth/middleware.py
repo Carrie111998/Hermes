@@ -28,7 +28,6 @@ from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     ProviderError,
     RefreshExpiredError,
-    Session,
 )
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
@@ -355,27 +354,6 @@ async def gated_auth_middleware(
     # the gate never sets a cookie here, so the transparent cookie-rotation
     # below must not run for a bearer caller.
     bearer = _extract_bearer(request)
-    session_header = request.headers.get("X-Hermes-Session-Token", "")
-    client_host = _client_ip(request)
-    from hermes_cli.web_server import _LOOPBACK_HOST_VALUES, _SESSION_TOKEN
-    import hmac
-    # Accept testclient / localhost / 127.0.0.1 loopback
-    if not client_host or client_host in _LOOPBACK_HOST_VALUES or client_host == "testclient":
-        token_candidate = bearer or session_header
-        if token_candidate and _SESSION_TOKEN and hmac.compare_digest(token_candidate.encode(), _SESSION_TOKEN.encode()):
-            # Loopback client authenticated via process _SESSION_TOKEN
-            request.state.session = Session(
-                user_id="loopback-admin",
-                email="admin@local",
-                display_name="Admin",
-                org_id="",
-                provider="local",
-                expires_at=2147483647,
-                access_token=token_candidate,
-                refresh_token=""
-            )
-            return await call_next(request)
-
     if bearer:
         try:
             bearer_session = _verify_bearer(request, access_token=bearer)
