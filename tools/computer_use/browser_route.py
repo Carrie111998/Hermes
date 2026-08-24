@@ -401,12 +401,16 @@ class CuaTypedBrowserRoute:
         missing = self._require_tool("browser_prepare")
         if missing is not None:
             return missing
-        exact_pid = _positive_int(pid)
-        if exact_pid is None:
-            return _refusal(
-                "browser_pid_required", "browser_prepare requires a positive pid."
-            )
         if profile_mode == "existing_profile":
+            # Attaching to a live browser is the only mode that needs an
+            # existing process. Driver-owned isolated modes launch the
+            # browser themselves under allow_launch, so a pre-existing pid
+            # must not gate them (#93763).
+            exact_pid = _positive_int(pid)
+            if exact_pid is None:
+                return _refusal(
+                    "browser_pid_required", "browser_prepare requires a positive pid."
+                )
             exact_window = _positive_int(window_id)
             if exact_window is None:
                 return _refusal(
@@ -458,10 +462,14 @@ class CuaTypedBrowserRoute:
                 )
             profile["name"] = profile_name
         args: Dict[str, Any] = {
-            "pid": exact_pid,
             "allow_launch": True,
             "profile": profile,
         }
+        # A caller-supplied pid is forwarded when present but never
+        # required here: the driver owns the launch for these modes (#93763).
+        exact_pid = _positive_int(pid)
+        if exact_pid is not None:
+            args["pid"] = exact_pid
         exact_window = _positive_int(window_id)
         if exact_window is not None:
             args["window_id"] = exact_window

@@ -135,6 +135,70 @@ def test_isolated_prepare_unaffected_by_the_grant():
     assert [name for name, _ in driver.calls] == ["browser_prepare"]
 
 
+def test_isolated_prepare_without_pid_reaches_driver():
+    """Driver-owned isolated modes launch the browser themselves under
+    allow_launch — a pre-existing pid must not gate them (#93763). The
+    request reaches the driver with the profile forwarded and no pid key."""
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=None,
+        profile_mode="isolated_new",
+        allow_launch=True,
+    )
+
+    assert result["status"] == "ok"
+    assert driver.calls[0][0] == "browser_prepare"
+    args = driver.calls[0][1]
+    assert args["profile"] == {"mode": "isolated_new"}
+    assert args["allow_launch"] is True
+    assert "pid" not in args
+
+
+def test_isolated_named_prepare_without_pid_reaches_driver():
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=None,
+        profile_mode="isolated_named",
+        profile_name="pid-repro",
+        allow_launch=True,
+    )
+
+    assert result["status"] == "ok"
+    args = driver.calls[0][1]
+    assert args["profile"] == {"mode": "isolated_named", "name": "pid-repro"}
+    assert "pid" not in args
+
+
+def test_isolated_prepare_forwards_supplied_pid_when_present():
+    """A caller-supplied pid is still forwarded (optional, not dropped)."""
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=321,
+        profile_mode="isolated_new",
+        allow_launch=True,
+    )
+
+    assert result["status"] == "ok"
+    assert driver.calls[0][1]["pid"] == 321
+
+
+def test_existing_profile_prepare_still_requires_pid():
+    """The attachment contract is unchanged: existing_profile still demands
+    an exact positive pid (and window_id) — the security floor the isolated
+    relaxation must not touch."""
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=None,
+        window_id=202,
+        profile_mode="existing_profile",
+        grant_existing_profile=True,
+    )
+
+    assert result["status"] == "refused"
+    assert result["code"] == "browser_pid_required"
+    assert driver.calls == []
+
+
 def test_backend_resolves_authorization_and_ignores_model_supplied_values(monkeypatch):
     """pid/window_id come from the model; the grant never does."""
     captured: Dict[str, Any] = {}
