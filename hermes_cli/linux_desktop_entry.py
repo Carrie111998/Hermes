@@ -113,7 +113,7 @@ def _resolve_hermes_bin_for_desktop_entry(
     wrapper execs with, or an interpreter binary surfaced by programmatic
     relaunch paths), not a durable installed launcher. Persisting it makes
     the entry a function of however the previous launch happened — the
-    bootstrap loop behind #90292's incomplete fix. Skip argv[0]/relative
+    bootstrap loop behind #90492's incomplete fix. Skip argv[0]/relative
     candidates in that case and fall through to PATH, where the shell
     installer's wrapper lives.
 
@@ -185,10 +185,21 @@ def _resolve_hermes_bin_for_desktop_entry(
 
 
 def _known_wrapper_candidates():
-    """Durable installed-launcher locations, most likely first."""
+    """Durable installed-launcher locations, most likely first.
+
+    Mirrors the installer's ``get_command_link_dir()`` layouts: user
+    (``~/.local/bin``), root FHS (``/usr/local/bin``), and Termux
+    (``$PREFIX/bin``). The wrapper is always named ``hermes``.
+    """
+    candidates = []
     home = Path.home()
+    prefix = os.environ.get("PREFIX")
+    if prefix:
+        candidates.append(Path(prefix) / "bin" / "hermes")
+    if os.geteuid() == 0:
+        candidates.append(Path("/usr/local/bin/hermes"))
+    candidates.append(home / ".local" / "bin" / "hermes")
     data_home = os.environ.get("XDG_DATA_HOME")
-    candidates = [home / ".local" / "bin" / "hermes"]
     if data_home:
         candidates.append(
             Path(data_home) / "hermes-agent" / "hermes-cli" / "bin" / "hermes"
