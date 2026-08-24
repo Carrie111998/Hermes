@@ -76,7 +76,7 @@ def test_matrix_extra_not_in_all():
 
 
 def test_wake_openwakeword_has_explicit_python_platform_compatibility_boundary():
-    """The Linux tflite path is limited to CPython 3.11, not Darwin."""
+    """The Linux tflite path is limited to CPython 3.11, not non-Linux."""
     optional_dependencies = _load_optional_dependencies()
     wake = optional_dependencies["wake"]
 
@@ -86,6 +86,9 @@ def test_wake_openwakeword_has_explicit_python_platform_compatibility_boundary()
     assert marker.evaluate(_wake_marker_environment((3, 12), sys_platform="linux")) is False
     assert marker.evaluate(
         _wake_marker_environment((3, 13), sys_platform="darwin", platform_machine="arm64")
+    ) is True
+    assert marker.evaluate(
+        _wake_marker_environment((3, 12), sys_platform="win32", platform_machine="AMD64")
     ) is True
 
 
@@ -115,6 +118,9 @@ def test_wake_lock_markers_preserve_linux_boundary_and_darwin_bridge():
         "darwin-arm64-cp313": _wake_marker_environment(
             (3, 13), sys_platform="darwin", platform_machine="arm64"
         ),
+        "windows-amd64-cp312": _wake_marker_environment(
+            (3, 12), sys_platform="win32", platform_machine="AMD64"
+        ),
     }
     expected = {
         "linux-cp311": True,
@@ -122,6 +128,7 @@ def test_wake_lock_markers_preserve_linux_boundary_and_darwin_bridge():
         "linux-cp314": False,
         "darwin-arm64-cp312": True,
         "darwin-arm64-cp313": True,
+        "windows-amd64-cp312": True,
     }
     for name, environment in environments.items():
         assert project_marker.evaluate(environment) is expected[name], name

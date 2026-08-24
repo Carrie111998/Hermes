@@ -95,7 +95,8 @@ On macOS ARM64, the dependency remains selectable on supported CPython 3.12 and
 It is not a silent replacement for the Linux runtime. On Linux Python 3.12 and
 newer Hermes reports openWakeWord unavailable and does not attempt an
 incompatible lazy install; use Python 3.11, select sherpa or Porcupine, or wait
-for the upstream LiteRT-based release.
+for the upstream LiteRT-based release. Windows uses openWakeWord's ONNX path;
+the Linux-only `tflite-runtime` boundary does not disable it.
 
 The normal `[all]` profile deliberately does not include the `wake` extra, so
 this optional compatibility boundary cannot break a regular all-features sync.

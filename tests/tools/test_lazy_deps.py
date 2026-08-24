@@ -94,6 +94,10 @@ class TestAllowlist:
         assert ld.openwakeword_supported((3, 12), sys_platform="darwin") is True
         assert ld.openwakeword_supported((3, 13), sys_platform="darwin") is True
 
+    def test_openwakeword_windows_onnx_path_is_not_blocked_by_linux_tflite_boundary(self):
+        assert ld.openwakeword_supported((3, 12), sys_platform="win32") is True
+        assert ld.openwakeword_supported((3, 13), sys_platform="win32") is True
+
     def test_openwakeword_unsupported_fails_before_pip(self, monkeypatch):
         monkeypatch.setattr(ld, "openwakeword_supported", lambda: False)
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)

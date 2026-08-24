@@ -379,6 +379,30 @@ def test_darwin_arm64_openwakeword_uses_existing_tflite_bridge(monkeypatch, pyth
     assert bridge_calls == ["bridge"]
 
 
+@pytest.mark.windows_only
+@pytest.mark.parametrize("python_minor", [12, 13])
+def test_windows_openwakeword_uses_onnx_path_without_linux_tflite_gate(monkeypatch, python_minor):
+    """Windows keeps openWakeWord's ONNX path on future Python minors."""
+    import tools.lazy_deps as lazy_deps
+
+    real_reason = lazy_deps.openwakeword_unsupported_reason
+    _install_fake_openwakeword(monkeypatch)
+    monkeypatch.setattr(lazy_deps, "openwakeword_unsupported_reason", real_reason)
+    monkeypatch.setattr(lazy_deps.sys, "version_info", (3, python_minor, 0, "final", 0))
+    monkeypatch.setattr(lazy_deps.sys, "platform", "win32")
+    monkeypatch.setattr(ww, "_is_macos_arm64", lambda: False)
+    monkeypatch.setattr(
+        ww,
+        "ensure_tflite_runtime",
+        lambda: pytest.fail("Windows ONNX path must not probe the tflite bridge"),
+    )
+
+    assert real_reason() is None
+    engine = ww._OpenWakeWordEngine({"provider": "openwakeword"})
+
+    assert engine._labels == ["hey_hermes"]
+
+
 def test_bundled_hey_hermes_model_ships_on_disk():
     # The "hey hermes" wake word works out of the box only if the model is
     # actually bundled. Both framework artifacts must exist and be non-trivial.
