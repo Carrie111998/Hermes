@@ -398,6 +398,37 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     return env
 
 
+def _open_cua_driver_stderr_log() -> Any:
+    """Open a real file descriptor for the cua-driver MCP child's stderr.
+
+    The interactive CLI runs tool calls inside prompt_toolkit's
+    ``patch_stdout()`` context. On Windows that replaces ``sys.stderr`` with
+    an output proxy whose console handle is not necessarily inheritable by
+    ``CreateProcess``. The MCP SDK otherwise captures that proxy as its
+    default ``errlog`` and the stdio spawn can fail with ``WinError 5``.
+
+    An owned file handle is stable across every Hermes surface and keeps the
+    driver's startup diagnostics available without writing through the TUI.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handle = open(
+            log_dir / "cua-driver-stderr.log",
+            "a",
+            encoding="utf-8",
+            errors="replace",
+            buffering=1,
+        )
+        handle.fileno()
+        return handle
+    except Exception:
+        logger.debug("could not open cua-driver stderr log", exc_info=True)
+        return open(os.devnull, "w", encoding="utf-8")
+
+
 def _linux_session_locked() -> Optional[bool]:
     """Best-effort: is the graphical session locked? (Linux only.)
 
@@ -1622,30 +1653,31 @@ class _CuaDriverSession:
                 env=_sanitize_subprocess_env(child_env),
             )
 
-            async with stdio_client(params) as (read, write):
-                self._startup_phase = "mcp-initialize"
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    _t_init = _time.monotonic()
-                    # Populate capabilities + capability_version BEFORE
-                    # exposing the session to callers, so the first
-                    # tool call already sees them.
-                    self._startup_phase = "capability-discovery"
-                    await self._populate_capabilities(session)
-                    self._session = session
-                    self._startup_phase = "ready"
-                    self._ready_event.set()
-                    logger.info(
-                        "cua-driver session ready in %.1fs "
-                        "(manifest=%.1fs, mcp_init=%.1fs)",
-                        _time.monotonic() - _t0,
-                        _t_manifest - _t0,
-                        _t_init - _t_manifest,
-                    )
-                    # Hold the contexts open until stop() / restart asks
-                    # us to wind down. Tool calls run as their own tasks
-                    # on the same loop and touch self._session directly.
-                    await self._shutdown_event.wait()
+            with _open_cua_driver_stderr_log() as errlog:
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    self._startup_phase = "mcp-initialize"
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        _t_init = _time.monotonic()
+                        # Populate capabilities + capability_version BEFORE
+                        # exposing the session to callers, so the first
+                        # tool call already sees them.
+                        self._startup_phase = "capability-discovery"
+                        await self._populate_capabilities(session)
+                        self._session = session
+                        self._startup_phase = "ready"
+                        self._ready_event.set()
+                        logger.info(
+                            "cua-driver session ready in %.1fs "
+                            "(manifest=%.1fs, mcp_init=%.1fs)",
+                            _time.monotonic() - _t0,
+                            _t_manifest - _t0,
+                            _t_init - _t_manifest,
+                        )
+                        # Hold the contexts open until stop() / restart asks
+                        # us to wind down. Tool calls run as their own tasks
+                        # on the same loop and touch self._session directly.
+                        await self._shutdown_event.wait()
         except BaseException as e:
             # Capture both ordinary errors and anyio CancelledError.
             # The caller (start()) inspects this to surface setup
