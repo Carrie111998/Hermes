@@ -5253,6 +5253,12 @@ def _claim_task_once(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        claimable = conn.execute(
+            "SELECT 1 FROM tasks WHERE id=? AND status='ready' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if claimable is None:
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
