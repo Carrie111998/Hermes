@@ -5774,6 +5774,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 return
             incomplete_text = "".join(final_text_parts) or final_response_text
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
+            if reasoning_item is not None and reasoning_parts:
+                # Materialize the accumulated deltas only at the persistence
+                # boundary.  Keeping the live item empty avoids rebuilding an
+                # ever-growing prefix for every streamed token.
+                reasoning_text = "".join(reasoning_parts)
+                incomplete_reasoning = {
+                    **reasoning_item,
+                    "summary": [{"type": "summary_text", "text": reasoning_text}],
+                    "content": [{"type": "reasoning_text", "text": reasoning_text}],
+                }
+                incomplete_items = [
+                    incomplete_reasoning if item is reasoning_item else item
+                    for item in incomplete_items
+                ]
             if incomplete_text:
                 incomplete_items.append({
                     "type": "message",
@@ -5867,16 +5881,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 """Emit an OpenAI Responses reasoning delta immediately."""
                 await _open_reasoning_item()
                 reasoning_parts.append(delta_text)
-                reasoning_text = "".join(reasoning_parts)
-                # Update the stored terminal item on every delta so abrupt
-                # disconnect snapshots retain the reasoning received so far.
-                if reasoning_item is not None:
-                    reasoning_item["summary"] = [
-                        {"type": "summary_text", "text": reasoning_text}
-                    ]
-                    reasoning_item["content"] = [
-                        {"type": "reasoning_text", "text": reasoning_text}
-                    ]
                 await _write_event("response.reasoning_text.delta", {
                     "type": "response.reasoning_text.delta",
                     "item_id": reasoning_item_id,
@@ -5891,6 +5895,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     return
                 reasoning_text = "".join(reasoning_parts)
                 reasoning_item["status"] = "completed"
+                reasoning_item["summary"] = [
+                    {"type": "summary_text", "text": reasoning_text}
+                ]
+                reasoning_item["content"] = [
+                    {"type": "reasoning_text", "text": reasoning_text}
+                ]
                 await _write_event("response.reasoning_text.done", {
                     "type": "response.reasoning_text.done",
                     "item_id": reasoning_item_id,
@@ -7240,10 +7250,13 @@ class APIServerAdapter(BasePlatformAdapter):
         Walks *result["messages"]* starting at *start_index* and emits:
         - ``function_call`` items for each tool_call on assistant messages
         - ``function_call_output`` items for each tool-role message
-        - ``reasoning`` items for textual assistant reasoning
+        - at most one aggregated ``reasoning`` item for assistant reasoning
         - a final ``message`` item with the assistant's text reply
         """
         items: List[Dict[str, Any]] = []
+        reasoning_text = APIServerAdapter._extract_reasoning_text(
+            result, start_index=start_index
+        )
         messages = result.get("messages", [])
         if start_index > 0:
             messages = messages[start_index:]
@@ -7275,16 +7288,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output": msg.get("content", ""),
                 })
 
-            if role == "assistant":
-                reasoning = msg.get("reasoning_content") or msg.get("reasoning")
-                if isinstance(reasoning, str) and reasoning.strip():
-                    items.append({
-                        "id": f"rs_{uuid.uuid4().hex[:24]}",
-                        "type": "reasoning",
-                        "status": "completed",
-                        "summary": [{"type": "summary_text", "text": reasoning}],
-                        "content": [{"type": "reasoning_text", "text": reasoning}],
-                    })
+        if reasoning_text:
+            items.append({
+                "id": f"rs_{uuid.uuid4().hex[:24]}",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning_text}],
+                "content": [{"type": "reasoning_text", "text": reasoning_text}],
+            })
 
         # Final assistant message
         final = result.get("final_response", "")
