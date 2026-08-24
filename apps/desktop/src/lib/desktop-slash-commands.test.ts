@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { setRuntimeI18nLocale } from '@/i18n'
 
 import {
   desktopSkinSlashCompletions,
@@ -13,6 +15,10 @@ import {
   rankSkillCommands,
   resolveDesktopCommand
 } from './desktop-slash-commands'
+
+afterEach(() => {
+  setRuntimeI18nLocale('en')
+})
 
 describe('desktop slash command curation', () => {
   it('keeps core desktop chat commands in suggestions', () => {
@@ -250,6 +256,15 @@ describe('desktop slash command curation', () => {
     )
     expect(desktopSlashDescription('/skin', 'Show or change the display skin/theme')).toBe(
       'Switch desktop theme or cycle to the next one'
+    )
+  })
+
+  it('localizes desktop command descriptions to the active locale', () => {
+    setRuntimeI18nLocale('zh')
+
+    expect(desktopSlashDescription('/branch', 'Branch the current session')).toBe('将最新消息分支为新对话')
+    expect(desktopSlashDescription('/skin', 'Show or change the display skin/theme')).toBe(
+      '切换桌面主题，或循环到下一个主题'
     )
   })
 

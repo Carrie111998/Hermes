@@ -2871,6 +2871,7 @@ export interface Translations {
     providerCredentialRequired: string
     emptySlashCommand: string
     desktopCommands: string
+    slashCommandDescs: Record<string, string>
     skillCommandsAvailable: (count: number) => string
     warningLine: (message: string) => string
     yoloArmed: string
