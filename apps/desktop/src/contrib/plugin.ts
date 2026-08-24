@@ -15,16 +15,21 @@
 import { pluginRest, type PluginRestOptions, pluginSocket } from '@/hermes'
 import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
-import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
+import {
+  dispatchPluginNativeNotification,
+  type PluginNativeNotificationInput,
+  type PluginNotificationAction
+} from '@/store/native-notifications'
 
 import { registry } from './registry'
 import type { Contribution } from './types'
 
 export type { PluginRestOptions } from '@/hermes'
+export type { PluginNativeNotificationInput, PluginNotificationAction }
 
 /** A contribution as a plugin author writes it — provenance + id scoping are
  *  the host's job, so those fields are off-limits here. */
-type PluginContribution = Omit<Contribution, 'source' | 'id'> & { id: string }
+export type PluginContribution = Omit<Contribution, 'source' | 'id'> & { id: string }
 
 /** Namespaced JSON persistence (the VS Code `globalState` analog). Keys live
  *  under `hermes.plugin.<id>.` — plugins can't read or clobber each other. */

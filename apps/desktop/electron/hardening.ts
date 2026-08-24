@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 // specifier would typecheck and then fail to bundle.
 import { clampDataUrlReadMaxMb, DATA_URL_READ_DEFAULT_MAX_MB } from '../../shared/src/data-url-read-max'
 
-const DEFAULT_FETCH_TIMEOUT_MS = 15_000
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000
 // Remote file.attach sends one base64 JSON-RPC frame. Cap the dedicated attach
 // reader so the payload still fits uvicorn's raised ws_max_size (384 MiB)
 // after base64 + framing. Preview stays on the Settings-configurable path.

@@ -26,13 +26,21 @@ import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
 import {
   $narrowViewport,
+  $newSessionTabAction,
   $paneVisible,
   registerPaneCloser,
   removeTreePane,
   revealTreePane
 } from '@/components/pane-shell/tree/store'
+import {
+  $workspaceMode,
+  $workspaceOwnerKey,
+  setWorkspaceScope as publishWorkspaceScope,
+  type WorkspaceNewSessionTarget
+} from '@/components/pane-shell/workspace-scope'
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
+import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
 import {
   $gateway,
@@ -41,6 +49,8 @@ import {
   openGatewayForProfile,
   requestGatewayForAgent,
   requestGatewayForProfile,
+  retainGatewayForAgent,
+  retainGatewayForRelay,
   retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
@@ -50,6 +60,7 @@ import {
   $profiles,
   ensureGatewayAgent,
   ensureGatewayProfile,
+  newSessionInAgent,
   newSessionInProfile,
   normalizeProfileKey,
   refreshProfiles,
@@ -66,15 +77,19 @@ import {
   $messages,
   $selectedStoredSessionId,
   $sessions,
+  getSessionOwnerHints,
   rememberedSessionProfile,
   requestSessionResume,
-  setResumeExhaustedSessionId
+  sessionMatchesStoredId,
+  setResumeExhaustedSessionId,
+  setSessionOwnerHint
 } from '@/store/session'
 import {
   $focusedRuntimeId,
   $focusedSessionState,
   $focusedStoredSessionId,
-  $sessionStates
+  $sessionStates,
+  $sessionTiles
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { UsageStats } from '@/types/hermes'
@@ -109,20 +124,68 @@ const $focusedAwaitingResponse = focusedTurnFlag(
   PRIMARY_SESSION_VIEW.$awaitingResponse
 )
 
+export interface PluginFocusedSessionOwner {
+  connectionId: string
+  profile: string
+}
+
 /**
- * Owner profile of the FOCUSED chat. The gateway-routing atom
+ * Connection-qualified owner of the FOCUSED chat. The gateway-routing atom
  * (`$activeGatewayProfile`) answers "which backend is the live socket homed
  * on" — but tab/tile focus moves without swapping the socket, and a cold
  * start can restore a route into a session the booting gateway doesn't own.
- * Any per-bot readout (roster highlight, a bot-scoped panel) must follow the
- * chat the user is LOOKING AT, so this resolves the focused stored session to
- * the owner stamped on its session row (the cross-profile aggregator tags
- * every row) and only falls back to the gateway profile for a draft or an
- * uncached id — the same ladder the remembered-navigation key and the HUD use.
+ * Any per-bot readout must follow the chat the user is LOOKING AT, so this
+ * resolves the focused stored session to a unique immutable owner hint or a
+ * unique connection-qualified aggregated row. Ambiguous or unresolved focused
+ * ids fail closed with null; only a draft/no focused id uses the active gateway
+ * owner. `focusedSessionProfile` remains the profile-only compatibility ladder.
  */
+const $focusedSessionOwner = computed(
+  [$focusedStoredSessionId, $sessions, $activeGatewayProfile, $connection],
+  (focused, sessions, activeProfile, connection): PluginFocusedSessionOwner | null => {
+    const activeConnectionId = String(connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')).trim()
+
+    const fallback = {
+      connectionId: activeConnectionId,
+      profile: normalizeProfileKey(activeProfile)
+    }
+
+    if (!focused) {
+      return fallback
+    }
+
+    const hints = getSessionOwnerHints(focused)
+
+    if (hints.length === 1) {
+      return {
+        connectionId: hints[0].connectionId,
+        profile: normalizeProfileKey(hints[0].profile)
+      }
+    }
+
+    if (hints.length > 1) {
+      return null
+    }
+
+    const owners = new Map<string, PluginFocusedSessionOwner>()
+
+    for (const row of sessions.filter(session => sessionMatchesStoredId(session, focused))) {
+      const connectionId = String(row.connection_id || '').trim()
+      const profile = normalizeProfileKey(row.profile)
+
+      if (connectionId) {
+        owners.set(`${connectionId}::${profile}`, { connectionId, profile })
+      }
+    }
+
+    return owners.size === 1 ? [...owners.values()][0] : null
+  }
+)
+
 const $focusedSessionProfile = computed(
-  [$focusedStoredSessionId, $sessions, $activeGatewayProfile],
-  (focused, sessions, activeProfile) => normalizeProfileKey(rememberedSessionProfile(sessions, focused, activeProfile))
+  [$focusedSessionOwner, $focusedStoredSessionId, $sessions, $activeGatewayProfile],
+  (owner, focused, sessions, activeProfile) =>
+    owner?.profile || rememberedSessionProfile(sessions, focused, activeProfile)
 )
 
 export interface PluginProfileRoute {
@@ -167,6 +230,10 @@ async function requestPluginProfile<T>(
   params: Record<string, unknown>
 ): Promise<T> {
   if (typeof route !== 'string') {
+    if (!route.connectionId.trim() || !route.profile.trim() || !route.targetProfile.trim()) {
+      throw new Error('Profile route must include connectionId, profile, and targetProfile')
+    }
+
     return requestGatewayForAgent<T>(route.connectionId, route.profile, method, params)
   }
 
@@ -191,6 +258,31 @@ async function requestPluginProfile<T>(
   throw new Error(
     `Profile "${profile}" requires a route descriptor from host.profileRoutes(); profile-only routing is limited to legacy/local profiles.`
   )
+}
+
+/** Re-read Electron's current registry before retrying an exact-owner wake.
+ *  A route that was removed or replaced while the first hydration wait ran is
+ *  no longer authority to touch that backend, even when its labels still look
+ *  identical. */
+async function pluginRouteStillRegistered(route: PluginProfileRoute): Promise<boolean> {
+  const getProfileRoutes = window.hermesDesktop?.getProfileRoutes
+
+  if (!getProfileRoutes) {
+    return false
+  }
+
+  try {
+    const routes = await getProfileRoutes($profiles.get().map(profile => profile.name))
+
+    return routes.some(
+      candidate =>
+        candidate.connectionId === route.connectionId &&
+        candidate.profile === route.profile &&
+        candidate.targetProfile === route.targetProfile
+    )
+  } catch {
+    return false
+  }
 }
 
 if (typeof window !== 'undefined') {
@@ -221,24 +313,34 @@ const $activeConnectionId = computed($connection, connection => {
 const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
 let openSessionGeneration = 0
 
-interface PluginOpenSessionOptions {
+export interface PluginOpenSessionOptions {
   awaitHydration?: boolean
   expectHistory?: boolean
   hydrationTimeoutMs?: number
   intent?: OpenSessionIntent
   keepAllProfilesScope?: boolean
   profile?: null | string
+  route?: PluginProfileRoute
+  workspaceMode?: WorkspaceMode
+  workspaceOwnerKey?: string
   /** A cold profile backend can lose the hydration-timeout race once and still
    *  be fine on a second try. When set, a hydration timeout is retried
    *  internally before it reaches the caller or arms the core stranded-session
    *  overlay ($resumeExhaustedSessionId) — a caller-side retry can't do this
    *  itself because only this SDK layer sees $resumeExhaustedSessionId. */
   retryHydrationTimeoutOnce?: boolean
+  tabTitle?: string
+}
+
+export interface PluginNewChatOptions {
+  workspaceMode?: WorkspaceMode
+  workspaceOwnerKey?: string
 }
 
 function waitForFocusedSessionHydration({
   expectHistory,
   generation,
+  isCurrent,
   profile,
   requireActiveProfile,
   storedSessionId,
@@ -246,6 +348,7 @@ function waitForFocusedSessionHydration({
 }: {
   expectHistory: boolean
   generation: number
+  isCurrent?: () => boolean
   profile: string
   requireActiveProfile: boolean
   storedSessionId: string
@@ -279,16 +382,32 @@ function waitForFocusedSessionHydration({
     }
 
     const check = () => {
-      if (generation !== openSessionGeneration) {
+      if (generation !== openSessionGeneration || (isCurrent && !isCurrent())) {
         finish(new Error('Session open was superseded by a newer selection.'))
 
         return
       }
 
       const profileMatches = !requireActiveProfile || normalizeProfileKey($activeGatewayProfile.get()) === profile
-      const sessionMatches = $selectedStoredSessionId.get() === storedSessionId
-      const runtimeReady = Boolean($activeSessionId.get())
-      const historyPainted = Boolean($messages.get().length)
+      const mainMatches = $selectedStoredSessionId.get() === storedSessionId
+      const storedTile = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)
+      const tileMatches = $focusedStoredSessionId.get() === storedSessionId || Boolean(storedTile)
+      const focusedTileMatches = $focusedStoredSessionId.get() === storedSessionId
+      const tileRuntimeId = focusedTileMatches ? $focusedRuntimeId.get() : (storedTile?.runtimeId ?? null)
+
+      const tileState = focusedTileMatches
+        ? $focusedSessionState.get()
+        : tileRuntimeId
+          ? $sessionStates.get()[tileRuntimeId]
+          : undefined
+
+      const runtimeReady = mainMatches ? Boolean($activeSessionId.get()) : tileMatches ? Boolean(tileRuntimeId) : false
+
+      const historyPainted = mainMatches
+        ? Boolean($messages.get().length)
+        : tileMatches
+          ? Boolean(tileState?.messages.length)
+          : false
 
       // Paint-first hydration: for a history-bearing chat, the wake is DONE
       // the moment the persisted transcript is painted on the right session —
@@ -304,15 +423,23 @@ function waitForFocusedSessionHydration({
       // surface is real rather than a stuck loader.
       const hydrated = expectHistory ? historyPainted : runtimeReady
 
-      if (profileMatches && sessionMatches && hydrated) {
+      if (profileMatches && (mainMatches || tileMatches) && hydrated) {
         finish()
       }
     }
 
     unbinds.push($activeGatewayProfile.listen(check))
+    unbinds.push($activeConnectionId.listen(check))
     unbinds.push($selectedStoredSessionId.listen(check))
     unbinds.push($activeSessionId.listen(check))
     unbinds.push($messages.listen(check))
+    unbinds.push($focusedStoredSessionId.listen(check))
+    unbinds.push($focusedRuntimeId.listen(check))
+    unbinds.push($focusedSessionState.listen(check))
+    unbinds.push($sessionTiles.listen(check))
+    unbinds.push($sessionStates.listen(check))
+    unbinds.push($workspaceMode.listen(check))
+    unbinds.push($workspaceOwnerKey.listen(check))
 
     timer = window.setTimeout(() => {
       finish(new Error(`Timed out loading ${profile}'s session history.`))
@@ -403,10 +530,12 @@ export const host = {
      *  primary. Prefer this over `activeSessionId` for any readout that
      *  should follow the user between tiles (context, tokens, cost). */
     focusedSessionId: readonlyAtom<null | string>($focusedRuntimeId),
+    /** Connection-qualified owner of the focused chat. Prefer this for any
+     *  readout or mutation where separate sources can share a profile name. */
+    focusedSessionOwner: readonlyAtom<PluginFocusedSessionOwner | null>($focusedSessionOwner),
     /** Owner profile of the focused chat (session-row stamp, falling back to
-     *  the gateway profile for drafts/uncached ids). Prefer this over
-     *  `profile` for any readout keyed to the bot/profile the user is looking
-     *  at — tab focus moves without swapping the gateway socket. */
+     *  the gateway profile for drafts/uncached ids). Compatibility projection
+     *  of `focusedSessionOwner`; use the complete owner for source routing. */
     focusedSessionProfile: readonlyAtom<string>($focusedSessionProfile),
     /** Stored (durable) id of the focused session — for navigation and
      *  session-list matching, where runtime ids don't survive reloads. */
@@ -470,27 +599,49 @@ export const host = {
    *  entirely. When the deleted profile was the live gateway's, the app is
    *  re-homed to the default profile — same semantics as the core dialog.
    *  Rejects with the backend's error when the delete fails. */
-  deleteProfile: async (profile: string): Promise<void> => {
-    const name = (profile ?? '').trim()
+  deleteProfile: async (profile: string | PluginProfileRoute): Promise<void> => {
+    const route =
+      typeof profile === 'string'
+        ? null
+        : {
+            ...profile,
+            connectionId: String(profile.connectionId || '').trim(),
+            profile: String(profile.profile || '').trim(),
+            targetProfile: String(profile.targetProfile || '').trim()
+          }
+
+    const name = typeof profile === 'string' ? profile.trim() : route?.profile || ''
+
+    if (route && (!route.connectionId || !route.profile || !route.targetProfile)) {
+      throw new Error('deleteProfile: route requires connectionId, profile, and targetProfile')
+    }
+
+    const targetProfile = route?.targetProfile || name
 
     if (!name) {
       throw new Error('deleteProfile: profile name required')
     }
 
-    if (normalizeProfileKey(name) === 'default') {
+    if (normalizeProfileKey(targetProfile) === 'default') {
       throw new Error('The default profile cannot be deleted.')
     }
 
     // Capture before the delete; re-home after so our write is the last one
     // (mirrors DeleteProfileDialog — a refreshActiveProfile racing the dying
     // backend can't clobber the pill back to the deleted profile).
-    const wasActive = normalizeProfileKey(name) === normalizeProfileKey($activeGatewayProfile.get())
+    const wasActive = route
+      ? route.connectionId === ($activeConnectionId.get() || '') &&
+        normalizeProfileKey(route.profile) === normalizeProfileKey($activeGatewayProfile.get())
+      : normalizeProfileKey(name) === normalizeProfileKey($activeGatewayProfile.get())
 
     // A hover-warmed Bot Mode row owns a retained renderer socket. Retire it
     // before Electron stops the profile backend so the socket closure cannot
     // schedule a reconnect that resurrects the deleted profile.
-    retireLocalProfileGateways(name)
-    await deleteProfile(name)
+    if (!route || route.mode === 'local') {
+      retireLocalProfileGateways(targetProfile)
+    }
+
+    await deleteProfile(targetProfile, route ? { connectionId: route.connectionId, profile: route.profile } : undefined)
 
     // The profile rail paints from the shared $profiles cache; without a
     // refresh the deleted profile's badge survives and clicking it starts a
@@ -568,9 +719,45 @@ export const host = {
    *  also scope chrome onto that profile and collapse the sidebar. */
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
     const generation = ++openSessionGeneration
-    const profile = (options.profile ?? '').trim()
+    const explicitRoute = options.route ? { ...options.route } : null
+    const profile = (explicitRoute?.profile ?? options.profile ?? '').trim()
     const targetProfile = normalizeProfileKey(profile || $activeGatewayProfile.get())
+
+    // A local bot open passes only `profile` (no cross-connection route), but
+    // its RPCs STILL have to reach that profile's own local gateway while chrome
+    // stays on the launch profile. Synthesize a local owner route from the
+    // profile so the persisted tile carries it — the session-request router
+    // reads the tile route to dispatch on the owning backend, and the canonical
+    // Bot Chat is hidden (never in $sessions), so this is the only owner record
+    // it can consult. Without it, submit falls back to the active profile and
+    // 4001s / hangs against a backend that never owned the session.
+    //
+    // This is ROUTING metadata only (tile ownerRoute + owner hint); the dial
+    // path below still keys off the explicit cross-connection route, so a plain
+    // local open dials exactly as before (openGatewayForProfile), never the
+    // registry-secondary path.
+    const localConnectionId = activeGatewayConnectionId()
+
+    const ownerRoute =
+      explicitRoute ??
+      (options.workspaceMode === 'bots' && profile && localConnectionId
+        ? { connectionId: localConnectionId, mode: 'local' as const, profile: targetProfile }
+        : null)
+
     const expectHistory = options.expectHistory ?? false
+
+    if (options.workspaceMode === 'bots') {
+      publishWorkspaceScope(
+        'bots',
+        options.workspaceOwnerKey ?? null,
+        ownerRoute ? { kind: 'route', route: ownerRoute } : null
+      )
+    }
+
+    const openingStillCurrent = () =>
+      generation === openSessionGeneration &&
+      (options.workspaceMode !== 'bots' ||
+        ($workspaceMode.get() === 'bots' && $workspaceOwnerKey.get() === (options.workspaceOwnerKey ?? null)))
 
     const plan = planPluginOpenSession({
       activeProfile: $activeGatewayProfile.get(),
@@ -590,6 +777,22 @@ export const host = {
     // is a gateway problem, a slow transcript is a backend-warmup one.
     let wakePhase: 'activation' | 'hydration' = 'activation'
 
+    if (ownerRoute) {
+      setSessionOwnerHint(storedSessionId, ownerRoute)
+    } else if (profile) {
+      // Local plugin-owned opens (Bot Mode without a cross-connection route)
+      // still carry an explicit owning profile. Record it: hidden sessions
+      // (canonical Bot Chats) have no sidebar row, so this hint is the only
+      // durable owner record the session-RPC router can consult — without it
+      // a later prompt.submit resolves to the ACTIVE profile's backend and
+      // 4001s while the bot's own backend is healthy.
+      const connectionId = activeGatewayConnectionId()
+
+      if (connectionId) {
+        setSessionOwnerHint(storedSessionId, { connectionId, mode: 'local', profile: targetProfile })
+      }
+    }
+
     // Bounded to 2 attempts (never more): a cold profile backend can lose the
     // hydration-timeout race once and still be fine moments later, but this is
     // a caller-opt-in retry of the SAME wait, not a backoff loop.
@@ -600,11 +803,18 @@ export const host = {
       // budget's. A workspace switch moves $activeGatewayProfile / chrome REST;
       // a plain navigation only opens the bot's gateway so session.resume can
       // hydrate, leaving chrome on the launch backend.
-      const dial = plan.switchWorkspace
-        ? () => ensureGatewayProfile(plan.switchWorkspace as string)
-        : plan.dialWithoutSwitching
-          ? () => openGatewayForProfile(plan.dialWithoutSwitching as string)
-          : null
+      // Dial keys off the EXPLICIT cross-connection route only: a synthesized
+      // local ownerRoute is routing metadata for the tile/hint, and a local
+      // profile must dial through openGatewayForProfile (its established path),
+      // not the registry-secondary path openGatewayForAgent takes for a 'local'
+      // connection id. Behavior for a plain local open is unchanged.
+      const dial = explicitRoute
+        ? () => openGatewayForAgent(explicitRoute.connectionId, explicitRoute.profile)
+        : plan.switchWorkspace
+          ? () => ensureGatewayProfile(plan.switchWorkspace as string)
+          : plan.dialWithoutSwitching
+            ? () => openGatewayForProfile(plan.dialWithoutSwitching as string)
+            : null
 
       if (dial) {
         // Bounded only on the hydration contract, which is where a budget and a
@@ -615,13 +825,22 @@ export const host = {
         profileActiveAt = Date.now()
       }
 
-      if (plan.showAllProfiles !== null) {
+      if (!openingStillCurrent()) {
+        throw new Error('Session open was superseded by a newer selection.')
+      }
+
+      // Only a cross-connection (explicit route) open forces the all-profiles
+      // view; a local bot open keeps the planner's decision, unchanged from
+      // before the synthesized-route addition.
+      if (explicitRoute) {
+        setShowAllProfiles(true)
+      } else if (plan.showAllProfiles !== null) {
         setShowAllProfiles(plan.showAllProfiles)
       }
 
       wakePhase = 'hydration'
 
-      if (generation !== openSessionGeneration) {
+      if (!openingStillCurrent()) {
         throw new Error('Session open was superseded by a newer selection.')
       }
 
@@ -636,19 +855,28 @@ export const host = {
       // again inside the same wake — that is the Retry surface's job.
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-          openSession(
-            storedSessionId,
-            (to: string, opts?: { replace?: boolean }) => {
-              const target = to.startsWith('#') ? to : `#${to}`
+          const navigate = (to: string, opts?: { replace?: boolean }) => {
+            const target = to.startsWith('#') ? to : `#${to}`
 
-              if (opts?.replace) {
-                window.location.replace(target)
-              } else {
-                window.location.hash = target
-              }
-            },
-            options.intent ?? 'in-place'
-          )
+            if (opts?.replace) {
+              window.location.replace(target)
+            } else {
+              window.location.hash = target
+            }
+          }
+
+          const intent = options.intent ?? 'in-place'
+
+          if (options.workspaceMode === 'bots') {
+            openSession(storedSessionId, navigate, intent, {
+              ownerRoute: ownerRoute ?? undefined,
+              workspaceMode: 'bots',
+              workspaceOwnerKey: options.workspaceOwnerKey,
+              ...(options.tabTitle ? { workspaceTabTitle: options.tabTitle } : {})
+            })
+          } else {
+            openSession(storedSessionId, navigate, intent)
+          }
 
           // Judge the main surface AFTER the open: on a cold start the persisted
           // route can already point at this session while selection has not
@@ -666,17 +894,18 @@ export const host = {
             (!expectHistory || $messages.get().length > 0)
 
           if (options.awaitHydration && !surfaceHealthy) {
-            requestSessionResume(storedSessionId)
+            requestSessionResume(storedSessionId, ownerRoute || undefined)
           }
 
           if (options.awaitHydration) {
             await waitForFocusedSessionHydration({
               expectHistory,
               generation,
+              isCurrent: openingStillCurrent,
               profile: targetProfile,
               // A background dial never moves $activeGatewayProfile, so gating
               // hydration on it would wait for something that is not coming.
-              requireActiveProfile: plan.requireActiveProfileForHydration,
+              requireActiveProfile: ownerRoute ? false : plan.requireActiveProfileForHydration,
               storedSessionId,
               timeoutMs: hydrationTimeoutMs
             })
@@ -695,6 +924,13 @@ export const host = {
             throw error
           }
 
+          // The registry check applies only to a real cross-connection route
+          // (explicit): a synthesized local route is never in getProfileRoutes,
+          // so checking it would spuriously abort a local bot's hydration retry.
+          if (explicitRoute && !(await pluginRouteStillRegistered(explicitRoute))) {
+            throw new Error(`The ${targetProfile} gateway is no longer available.`)
+          }
+
           // Logged per attempt so a support bundle shows the retry happened at
           // all; the terminal failure is reported once by the catch below.
           console.warn('[bot-wake] hydration timed out, retrying', {
@@ -708,7 +944,7 @@ export const host = {
     } catch (error) {
       if (
         options.awaitHydration &&
-        generation === openSessionGeneration &&
+        openingStillCurrent() &&
         error instanceof Error &&
         error.message.startsWith('Timed out loading ')
       ) {
@@ -751,7 +987,17 @@ export const host = {
    *  fallback. */
   openWorkspace: (
     id: string,
-    options: { minWidth?: string; onClose?: () => void; render: () => ReactNode; title?: string }
+    options: {
+      dock?: { before?: null | string; pane: string; pos: 'bottom' | 'center' | 'left' | 'right' | 'top' }
+      headerVeto?: boolean
+      minWidth?: string
+      onClose?: () => void
+      render: () => ReactNode
+      title?: string
+      uncloseable?: boolean
+      workspaceMode?: WorkspaceMode
+      workspaceOwnerKey?: string
+    }
   ): (() => void) => {
     const key = (id ?? '').trim()
 
@@ -766,13 +1012,17 @@ export const host = {
       data: {
         // The session-tile shape: a full workspace surface docked beside main,
         // closeable so it keeps its tab when it lands in a zone of its own.
-        dock: { pane: 'workspace', pos: 'center' },
+        dock: options.dock ?? { pane: 'workspace', pos: 'center' },
+        headerVeto: options.headerVeto,
         minWidth: options.minWidth ?? '22rem',
-        placement: 'main'
+        placement: 'main',
+        uncloseable: options.uncloseable
       },
       id: paneId,
       render: options.render,
-      title: options.title ?? key
+      title: options.title ?? key,
+      workspaceMode: options.workspaceMode,
+      workspaceOwnerKey: options.workspaceOwnerKey
     })
 
     const close = () => {
@@ -791,11 +1041,45 @@ export const host = {
     return close
   },
 
+  /** Switch the visible main-pane workspace without unregistering retained panes. */
+  setWorkspaceScope: (
+    mode: WorkspaceMode,
+    ownerKey: null | string = null,
+    newSessionTarget: WorkspaceNewSessionTarget | null = null
+  ): boolean => publishWorkspaceScope(mode, ownerKey, newSessionTarget),
+
   /** Start a fresh chat draft, optionally pointed at another profile (its
    *  backend spins up in the background — same door the sidebar's per-profile
    *  "+" uses). */
-  newChat: (profile?: null | string): void => {
-    newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
+  newChat: (profile?: null | string | PluginProfileRoute, options: PluginNewChatOptions = {}): void => {
+    if (options.workspaceMode === 'bots') {
+      if (!profile || typeof profile === 'string' || !options.workspaceOwnerKey) {
+        notify({ kind: 'error', message: 'Select a Bot before starting another chat.' })
+
+        return
+      }
+
+      publishWorkspaceScope('bots', options.workspaceOwnerKey, { kind: 'route', route: { ...profile } })
+
+      const openTab = $newSessionTabAction.get()
+
+      if (!openTab) {
+        notify({ kind: 'error', message: 'Update Hermes Desktop to open another Bot chat.' })
+
+        return
+      }
+
+      openTab()
+
+      return
+    }
+
+    if (profile && typeof profile !== 'string') {
+      newSessionInAgent({ ...profile })
+    } else {
+      newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
+    }
+
     window.location.hash = '#/'
   },
 
@@ -850,6 +1134,39 @@ export const host = {
     params: Record<string, unknown> = {}
   ): Promise<T> => requestPluginProfile<T>(route, method, params),
 
+  /** Pin a route's pooled gateway socket open across repeated `requestProfile`
+   *  calls (#93594: the bot-relay drain loop was dialing and tearing down a
+   *  fresh WebSocket per registered connection per tick). Returns a once-only
+   *  release. Local routes are exempt (no-op release) so the idle reaper can
+   *  still reclaim spawned local backends. Feature-detect on older desktops
+   *  (`typeof host.retainProfileSocket === 'function'`). */
+  retainProfileSocket: (route: PluginProfileRoute | string): (() => void) => {
+    if (typeof route === 'string' || !route) {
+      // Bare-profile compatibility overload: local/legacy routing — exempt.
+      return () => undefined
+    }
+
+    return retainGatewayForRelay(route.connectionId, route.profile)
+  },
+
+  /** Hold a route's pooled socket open across a multi-RPC, session-scoped
+   *  sequence (#93602). Each requestProfile call is its own request lease, so
+   *  a non-retained secondary socket closes at refcount 0 between calls — and
+   *  the gateway reaps any runtime session that socket minted, failing the
+   *  next RPC with 4001. Acquire before the first session-scoped RPC, release
+   *  (idempotent) in a `finally`. Feature-detect: older hosts lack this. */
+  retainProfile: async (route: PluginProfileRoute | string): Promise<() => void> => {
+    if (typeof route !== 'string') {
+      if (!route.connectionId.trim() || !route.profile.trim()) {
+        throw new Error('Profile route must include connectionId and profile')
+      }
+
+      return retainGatewayForAgent(route.connectionId, route.profile)
+    }
+
+    return retainGatewayForAgent(null, route.trim() || 'default')
+  },
+
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
    *  the app itself uses. Lazy: resolves the LIVE socket per call. */
   request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -875,7 +1192,13 @@ export const host = {
 // Every contribution surface, plugin-reachable: register keybinds, palette
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
-export { COMPOSER_AREAS } from '@/app/chat/composer/contrib'
+export {
+  COMPOSER_AREAS,
+  type ComposerAtCompletionItem,
+  type ComposerAtCompletionSource,
+  type ComposerAttachmentProvider,
+  type ComposerMiddleware
+} from '@/app/chat/composer/contrib'
 
 // -- ui: the design language --------------------------------------------------
 
@@ -892,7 +1215,14 @@ export { ToolsetConfigPanel } from '@/app/settings/toolset-config-panel'
  *  menu renders and navigates, your controller decides what a selection MEANS
  *  (write to a session, hold a per-task override, …). Never fork it — a copy
  *  drifts from the composer the first time either side changes. */
-export { ModelCatalogMenu, ModelMenuCloseContext, type ModelMenuController } from '@/app/shell/model-catalog-menu'
+export {
+  ModelCatalogMenu,
+  type ModelChoice,
+  ModelMenuCloseContext,
+  type ModelMenuController
+} from '@/app/shell/model-catalog-menu'
+export type { StatusbarItem } from '@/app/shell/statusbar-controls'
+export type { TitlebarTool } from '@/app/shell/titlebar-controls'
 
 /** THE whole Capabilities surface (Skills / Tools / MCP tabs, installed
  *  lists, full-skill detail pane, embedded hub picker with one-click
@@ -914,6 +1244,8 @@ export { McpTab } from '@/app/skills/mcp-tab'
  *  it — it takes no width from any zone, has no tab, and can't be docked.
  *  Pair it with `anchor` (spawn corner, default `'top-right'`) plus
  *  `width`/`height`. */
+export type { FloatingAnchor } from '@/components/pane-shell/tree/renderer/floating-rect'
+export { StatusDot, type StatusTone } from '@/components/status-dot'
 export { Badge } from '@/components/ui/badge'
 export { Button } from '@/components/ui/button'
 export { Checkbox } from '@/components/ui/checkbox'
@@ -927,13 +1259,15 @@ export {
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
 export { CopyButton } from '@/components/ui/copy-button'
+export { DecodeText } from '@/components/ui/decode-text'
 export {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
-  DialogTitle
+  DialogTitle,
+  DialogTrigger
 } from '@/components/ui/dialog'
 export {
   DropdownMenu,
@@ -947,46 +1281,72 @@ export { ErrorState } from '@/components/ui/error-state'
 export { FadeScroll } from '@/components/ui/fade-scroll'
 export { GlyphSpinner } from '@/components/ui/glyph-spinner'
 export { Input } from '@/components/ui/input'
+export { Kbd, KbdGroup } from '@/components/ui/kbd'
 /** The app's canonical loader (animated curves; `lemniscate-bloom` for long
  *  page loads) — the same one every core page uses. */
-export { Loader } from '@/components/ui/loader'
+export { Loader, type LoaderType } from '@/components/ui/loader'
 export { LogView } from '@/components/ui/log-view'
 export { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 export { ScrollArea } from '@/components/ui/scroll-area'
 export { SearchField } from '@/components/ui/search-field'
+export { SegmentedControl } from '@/components/ui/segmented-control'
 export { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+export { Separator } from '@/components/ui/separator'
+export { Skeleton } from '@/components/ui/skeleton'
 export { Switch } from '@/components/ui/switch'
+export { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 export { Textarea } from '@/components/ui/textarea'
-export { Tip } from '@/components/ui/tooltip'
-export type { HermesPlugin, PluginOs, PluginRestOptions, PluginStorage } from '@/contrib/plugin'
+export { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+export type { GatewayEventListener } from '@/contrib/events'
+export type {
+  HermesPlugin,
+  PluginContext,
+  PluginContribution,
+  PluginNativeNotificationInput,
+  PluginNotificationAction,
+  PluginOs,
+  PluginRestOptions,
+  PluginStorage
+} from '@/contrib/plugin'
 /** Mount-scoped contribution: while the rendering component is mounted, its
  *  children render in the target area's slot; unmount disposes it. Use for
  *  page-owned chrome (a page's titlebar control leaves with the page) —
  *  `ctx.register` stays the door for permanent contributions. Namespace the
  *  id with your plugin slug (`kanban:board-switcher`). */
-export { Contribute } from '@/contrib/react/contribute'
+export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
 
 // -- contracts ----------------------------------------------------------------
 
+export type { Contribution } from '@/contrib/types'
 /** The live gateway instance type — for typing the `gateway` prop `McpTab`
  *  takes; obtain the instance from `host.getGateway()`. */
 export type { HermesGateway } from '@/hermes'
 /** Grab-to-pan for overflow containers (boards, timelines, wide tables) —
  *  the shared scrub primitive; don't hand-roll drag-to-scroll. */
-export { useGrabScroll } from '@/hooks/use-grab-scroll'
+export { type GrabScroll, useGrabScroll } from '@/hooks/use-grab-scroll'
 /** Localized copy. `useI18n` reuses the app's strings; `usePluginI18n(id)` +
  *  `ctx.i18n.register` let a plugin ship its OWN locale bundles, scoped like
  *  `ctx.storage` and resolved against the app's active locale — no core edit. */
-export { type PluginLocaleBundles, type PluginTranslate, usePluginI18n } from '@/i18n'
+export {
+  type Locale,
+  type PluginI18n,
+  type PluginLocaleBundles,
+  type PluginMessages,
+  type PluginMessageValue,
+  type PluginTranslate,
+  useI18n,
+  usePluginI18n
+} from '@/i18n'
 /** THE way to run a decorative rAF animation (avatars, shimmer, sprites):
  *  fps budget + hidden/minimized/unfocused pause + idle dormancy + teardown.
  *  Plugins must route animation clocks through this instead of raw rAF loops
  *  so a disabled plugin or an empty roster costs zero frames. */
-export { createBudgetedLoop } from '@/lib/budgeted-loop'
+export { type BudgetedLoop, type BudgetedLoopOptions, createBudgetedLoop } from '@/lib/budgeted-loop'
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@/lib/format'
 export { triggerHaptic as haptic } from '@/lib/haptics'
+export type { HermesOpenTarget } from '@/lib/hermes-open-target'
 /** The app's lucide icon set (RefreshCw, LayoutDashboard, Activity, …). */
 export * as icons from '@/lib/icons'
 export { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
@@ -1001,15 +1361,30 @@ export { profileColor, profileColorSoft } from '@/lib/profile-color'
 export { queryClient } from '@/lib/query-client'
 /** Hermes' reasoning levels + their compact labels, so a plugin surfacing a
  *  thinking depth uses the same scale and spelling as the rest of the app. */
-export { reasoningEffortLabel } from '@/lib/reasoning-effort'
+export {
+  DEFAULT_REASONING_EFFORT,
+  REASONING_EFFORT_VALUES,
+  REASONING_EFFORTS,
+  type ReasoningEffort,
+  reasoningEffortLabel
+} from '@/lib/reasoning-effort'
+
+export const PANES_AREA = 'panes'
 /** The app's own gateway-readiness evaluation (setup.status +
  *  setup.runtime_check, reconciled) — pass `host.request`. Don't hand-roll
  *  readiness from raw RPC shapes. */
+export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' } as const
 export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left', right: 'titleBar.right' } as const
-export { coarseElapsed, relativeTime } from '@/lib/time'
+
+export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time'
 /** The transcript as a contribution area: register a named `::directive{...}`
  *  and the model can render your component inline in assistant messages. */
+export {
+  TRANSCRIPT_DIRECTIVE_AREA,
+  type TranscriptDirectiveContribution,
+  type TranscriptDirectiveProps
+} from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
 /** Live accent override — set a hex and the ACTIVE theme repaints with its
  *  accent family re-seeded from it (see `retintTheme`); `null` restores the
@@ -1019,10 +1394,30 @@ export { $accentOverride, setAccentOverride } from '@/themes/accent-override'
 /** OKLCH colour maths, for anything deriving a palette rather than hardcoding
  *  one: perceptual conversion, the sRGB gamut boundary, WCAG contrast, and
  *  hue-stable blending. */
-export { contrastRatio, hexToOklch, maxChroma, type Oklch, oklchToHex, oklchToSrgb255 } from '@/themes/color'
+export {
+  contrastRatio,
+  hexToOklch,
+  hueDelta,
+  maxChroma,
+  mixOklab,
+  normalizeHex,
+  type Oklch,
+  oklchToHex,
+  oklchToSrgb255,
+  readableOn
+} from '@/themes/color'
 /** The painted theme, its name, and the appearance it resolved to — plus
  *  `setTheme` / `setMode` to change it from a component. */
 export { useTheme } from '@/themes/context'
+/** Switch the theme from outside React (a gateway event, a connection coming
+ *  up, any callback with no component around it). Returns false and leaves the
+ *  appearance alone when the name doesn't resolve, so it doubles as the "is
+ *  this theme installed?" check. */
+export { requestTheme } from '@/themes/request'
+export { retintTheme, themeHue } from '@/themes/retint'
+export type { DesktopTheme, DesktopThemeColors } from '@/themes/types'
+export { THEMES_AREA } from '@/themes/user-themes'
+export type { RpcEvent, StatusResponse } from '@/types/hermes'
 /** Subscribe a component to a `host.state` atom. */
 export { useStore as useValue } from '@nanostores/react'
 /** The app's data-fetching layer. Plugins share the ONE QueryClient mounted at
@@ -1032,9 +1427,10 @@ export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 /** Deterministic soft-body avatars from any string (name → face). String
  *  renderer for rasterization; React component for live rendering. */
 export { blobatar as blobatarSvg } from 'blobatar/blob'
+export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll
  *  loops, cross-component signals) — the same primitive `host.state` uses. */
-export { atom } from 'nanostores'
+export { atom, computed } from 'nanostores'
 /** Markdown renderer (same pipeline core chat surfaces use) so plugins render
  *  message text as a preview instead of raw Markdown source. */
 export { Streamdown } from 'streamdown'

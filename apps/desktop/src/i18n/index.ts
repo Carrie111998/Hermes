@@ -3,6 +3,8 @@ export {
   createPluginI18n,
   type PluginI18n,
   type PluginLocaleBundles,
+  type PluginMessages,
+  type PluginMessageValue,
   type PluginTranslate,
   usePluginI18n
 } from './plugin-i18n'

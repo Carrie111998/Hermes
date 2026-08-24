@@ -56,7 +56,7 @@ export const ModelMenuCloseContext = createContext<() => void>(() => {})
 
 /** One model choice, everything a caller needs to act on a selection.
  *  `effort` is '' for "inherit the default" and 'none' for thinking off. */
-interface ModelChoice {
+export interface ModelChoice {
   effort: string
   fast: boolean
   model: string
