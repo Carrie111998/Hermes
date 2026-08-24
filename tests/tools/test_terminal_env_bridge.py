@@ -18,6 +18,12 @@ from hermes_constants import get_hermes_home
 def _reset_bridge_state(monkeypatch):
     """Each test starts with an un-attempted bridge and clean mapped env."""
     monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    monkeypatch.setattr(
+        terminal_tool, "_terminal_config_bridge_scope", None, raising=False
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_terminal_config_bridge_keys", set(), raising=False
+    )
     for name in (
         "TERMINAL_ENV",
         "TERMINAL_CWD",
@@ -106,6 +112,104 @@ def test_env_is_preserved_when_config_has_no_terminal_section(monkeypatch):
 
     assert config["env_type"] == "ssh"
     assert config["ssh_host"] == "example.test"
+
+
+# -- profile-multiplexing scope handoff (#94200) ------------------------------
+
+
+def test_scope_change_rebridges_instead_of_inheriting_previous_profile(
+    monkeypatch, tmp_path
+):
+    """Multiplexed gateway: a docker profile bridging first must not pin
+    TERMINAL_ENV for a later local profile (#94200)."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    (home_a / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    (home_b / "config.yaml").write_text("terminal:\n  backend: local\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    config_a = terminal_tool._get_env_config()
+    assert config_a["env_type"] == "docker"
+    assert os.environ["TERMINAL_ENV"] == "docker"
+
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    config_b = terminal_tool._get_env_config()
+
+    assert config_b["env_type"] == "local"
+    assert os.environ["TERMINAL_ENV"] == "local"
+
+
+def test_scope_change_without_terminal_section_drops_bridged_env(
+    monkeypatch, tmp_path
+):
+    """The leak's worst shape: profile B has no terminal section, so the
+    old `elif TERMINAL_ENV not in os.environ` branch kept profile A's
+    docker selection forever. The bridge-introduced keys must be unset on
+    handoff so B falls back to its own (default local) selection."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    (home_a / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    (home_b / "config.yaml").write_text("agent:\n  max_turns: 5\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    terminal_tool._get_env_config()
+    assert os.environ["TERMINAL_ENV"] == "docker"
+
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    config_b = terminal_tool._get_env_config()
+
+    assert config_b["env_type"] == "local"
+
+
+def test_same_scope_keeps_one_shot_semantics(monkeypatch, tmp_path):
+    """Within one profile the bridge still runs at most once (no per-call
+    config re-reads)."""
+    home = tmp_path / "single-profile"
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import hermes_cli.config as cli_config
+
+    calls = {"n": 0}
+    real_apply = cli_config.apply_terminal_config_to_env
+
+    def _counting_apply(env=None, override=False):
+        calls["n"] += 1
+        return real_apply(env=env, override=override)
+
+    monkeypatch.setattr(cli_config, "apply_terminal_config_to_env", _counting_apply)
+    terminal_tool._get_env_config()
+    terminal_tool._get_env_config()
+    terminal_tool._get_env_config()
+
+    assert calls["n"] == 1
+    assert os.environ["TERMINAL_ENV"] == "docker"
+
+
+def test_handoff_never_unsets_shell_exported_terminal_vars(
+    monkeypatch, tmp_path
+):
+    """Keys the user's shell/.env exported are not bridge-owned and must
+    survive a scope handoff."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    (home_a / "config.yaml").write_text("agent:\n  max_turns: 5\n")
+    (home_b / "config.yaml").write_text("agent:\n  max_turns: 5\n")
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "shell/image:9")
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    terminal_tool._get_env_config()
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    terminal_tool._get_env_config()
+
+    assert os.environ["TERMINAL_DOCKER_IMAGE"] == "shell/image:9"
 
 
 def test_defaults_backfill_when_neither_config_nor_env_selects_backend():
