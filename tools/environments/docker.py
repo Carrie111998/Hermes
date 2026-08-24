@@ -151,6 +151,12 @@ def _sanitize_label_value(value: str) -> str:
 _sandbox_dir_name = sanitize_task_id_for_path
 
 
+def _task_identity_fingerprint(task_id: str) -> str:
+    """Return a collision-resistant label value for the unsanitized task ID."""
+    raw = str(task_id or "default")
+    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:48]
+
+
 def _get_active_profile_name() -> str:
     """Return the active Hermes profile name, or ``"default"`` on any error.
 

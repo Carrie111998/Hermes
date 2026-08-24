@@ -349,6 +349,8 @@ def sanitize_task_id_for_path(task_id: str) -> str:
     ):
         return value
 
+    if reserved_on_windows:
+        cleaned = f"task-{cleaned}"
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:_SANDBOX_DIR_HASH_LEN]
     stem = cleaned[: _SANDBOX_DIR_MAX_LEN - _SANDBOX_DIR_HASH_LEN - 1].strip("._")
     return f"{stem or 'task'}-{digest}"
