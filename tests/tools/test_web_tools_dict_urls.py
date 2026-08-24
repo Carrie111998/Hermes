@@ -73,6 +73,7 @@ async def test_web_extract_dispatches_urls_from_search_result_objects(extract_pr
         "https://example.org/b",
     ]
     assert [entry["url"] for entry in result["results"]] == extract_provider.received_urls
+    assert result["provider"] == "dict-url-test"
 
 
 def test_web_extract_registry_dispatch_accepts_search_result_objects(

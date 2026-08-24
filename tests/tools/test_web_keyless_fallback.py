@@ -526,7 +526,8 @@ class TestKeylessFailover:
         monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda urls: throttled)
         monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", lambda urls: good)
         out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
-        assert out == good
+        assert [r["content"] for r in out] == ["x", "y"]
+        assert all(r["metadata"]["served_by"] == "parallel" for r in out)
 
     def test_extract_partial_failure_stays_on_primary(self, monkeypatch):
         self._pin(monkeypatch, "exa")
