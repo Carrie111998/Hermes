@@ -291,3 +291,83 @@ class TestDDGSSearchOnlyErrors:
         assert result["success"] is False
         assert "search-only" in result["error"].lower()
         assert "duckduckgo" in result["error"].lower() or "ddgs" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Termux / Android HTML fallback tests (#85972)
+# ---------------------------------------------------------------------------
+
+
+class TestDDGSTermuxFallback:
+    def test_termux_is_available_without_package(self, monkeypatch):
+        monkeypatch.setenv("TERMUX_VERSION", "0.118.0")
+        monkeypatch.delitem(sys.modules, "ddgs", raising=False)
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        assert DDGSWebSearchProvider().is_available() is True
+
+    def test_termux_env_detection(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
+        assert prov._is_termux_env() is True
+
+        monkeypatch.setenv("PREFIX", "/usr/local")
+        assert prov._is_termux_env() is False
+
+    def test_html_search_parsing(self, monkeypatch):
+        import io
+        import plugins.web.ddgs.provider as prov
+
+        fake_html = """
+        <html><body>
+        <div class="result results_links">
+          <h2 class="result__title">
+            <a class="result__a" href="/l/?kh=-1&uddg=https%3A%2F%2Fexample.com%2Fpage">Example <b>Title</b> &amp; More</a>
+          </h2>
+          <a class="result__snippet">This is an <b>example</b> description snippet.</a>
+        </div>
+        <div class="result results_links">
+          <h2 class="result__title">
+            <a class="result__a" href="https://direct.example.org/about">Direct Link</a>
+          </h2>
+          <a class="result__snippet">Second snippet text.</a>
+        </div>
+        </body></html>
+        """
+
+        class _FakeResponse:
+            def read(self):
+                return fake_html.encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=10: _FakeResponse())
+        results = prov._run_ddgs_html_search("test query", safe_limit=5)
+        assert len(results) == 2
+        assert results[0]["title"] == "Example Title & More"
+        assert results[0]["url"] == "https://example.com/page"
+        assert results[0]["description"] == "This is an example description snippet."
+        assert results[0]["position"] == 1
+
+        assert results[1]["title"] == "Direct Link"
+        assert results[1]["url"] == "https://direct.example.org/about"
+        assert results[1]["description"] == "Second snippet text."
+        assert results[1]["position"] == 2
+
+    def test_search_falls_back_when_ddgs_raises(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        monkeypatch.setattr(prov, "_is_termux_env", lambda: False)
+        # Install a fake DDGS that throws an exception simulating primp panic
+        _install_fake_ddgs(monkeypatch, text_raises=RuntimeError("android context was not initialized"))
+
+        fallback_hits = [
+            {"title": "Fallback", "url": "https://fallback.org", "description": "desc", "position": 1}
+        ]
+        monkeypatch.setattr(prov, "_run_ddgs_html_search", lambda query, limit: fallback_hits)
+
+        results = prov._run_ddgs_search("query", safe_limit=3)
+        assert results == fallback_hits
+
