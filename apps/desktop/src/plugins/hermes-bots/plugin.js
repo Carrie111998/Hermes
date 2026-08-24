@@ -8392,7 +8392,7 @@ async function runGroupChatRounds(group, members, thread) {
             ...(reason ? { reason } : {})
           })
           noteBotAttention(groupMemberKey(member), reason || error?.message || error)
-          reply = null // a failed turn is a pass, never a room error
+          reply = null // failure notice is committed below, after the stale-turn gate
         }
 
         // #93127: the turn may have finished AFTER a newer user send bumped

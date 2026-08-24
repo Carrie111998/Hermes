@@ -304,7 +304,7 @@ test('hard caps: chatty members stop at GROUP_CHAT_MAX_MESSAGES total', async ()
   assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MESSAGES, `posted ${memberMessages.length}`)
 })
 
-test('failed member turn is a pass, not a room error', async () => {
+test('failed member turn posts a one-line error notice, not silence', async () => {
   const gc = load(profile => {
     if (profile === 'builder') {
       throw new Error('gateway hiccup')
@@ -318,7 +318,12 @@ test('failed member turn is a pass, not a room error', async () => {
   }
 
   const log = roomLog(gc, 'Flaky')
-  assert.equal(log.length, 1) // just the user message; no error entries
+  // user message + the failed member's one-line error notice
+  assert.equal(log.length, 2)
+  const notice = log[1]
+  assert.equal(notice.from.kind, 'member')
+  assert.equal(notice.from.name, 'builder')
+  assert.match(notice.text, /my last turn failed \(gateway hiccup\)/)
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {
