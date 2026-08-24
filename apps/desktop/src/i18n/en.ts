@@ -81,6 +81,8 @@ export const en: Translations = {
       backendStopped: 'Backend stopped',
       desktopBootFailed: 'Desktop boot failed',
       gatewayConnectionLost: 'Lost connection to the gateway',
+      gatewayConnectionLostDetail:
+        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
       gatewaySignInRequired: 'Gateway sign-in required',
       ipcBridgeUnavailable: 'Desktop IPC bridge is unavailable.'
     },
@@ -1074,6 +1076,7 @@ export const en: Translations = {
         approval: { label: 'Approval', hint: 'Smart auto-approve' },
         mcp: { label: 'MCP', hint: 'MCP tool routing' },
         title_generation: { label: 'Title gen', hint: 'Session titles' },
+        review: { label: 'Review', hint: '/review reviewer subagent' },
         curator: { label: 'Curator', hint: 'Skill-usage review' }
       }
     },
@@ -1819,8 +1822,7 @@ export const en: Translations = {
       menuItem: 'Connect to a remote host…',
       badge: (host: string) => `Runs on ${host}`,
       title: (profile: string) => `Connect ${profile} to a remote host`,
-      description:
-        'Sessions in this profile will run on the remote Hermes you point it at, instead of this computer.',
+      description: 'Sessions in this profile will run on the remote Hermes you point it at, instead of this computer.',
       urlLabel: 'Remote address',
       urlPlaceholder: 'https://hermes.example.com',
       urlInvalid: 'Enter a full address starting with http:// or https://',
@@ -2853,6 +2855,7 @@ export const en: Translations = {
       gateway: 'Gateway',
       gatewayReady: 'ready',
       gatewayNeedsSetup: 'needs setup',
+      gatewayUnavailable: 'inference unavailable',
       gatewayChecking: 'checking',
       gatewayConnecting: 'connecting',
       gatewayOffline: 'offline',
