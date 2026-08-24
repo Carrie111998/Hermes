@@ -2513,7 +2513,12 @@ def connect(
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
+                    # Publish all additive schema state under one writer lock.
+                    # This prevents a concurrent claimer from creating a run
+                    # between the cutoff capture and schema-version marker.
+                    with write_txn(conn):
+                        _migrate_add_optional_columns(conn)
+                        _migrate_routing_metadata(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2893,7 +2898,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=True):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -2953,6 +2958,49 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+
+
+def _migrate_routing_metadata(conn: sqlite3.Connection) -> None:
+    """Install and atomically publish immutable run-routing metadata.
+
+    The caller owns one IMMEDIATE write transaction. Schema additions happen
+    before the cutoff marker, while the schema version is inserted last so no
+    reader can observe a published migration with incomplete prerequisites.
+    Existing metadata is intentionally preserved across repeated initialization.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_metadata (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    _add_column_if_missing(conn, "tasks", "routing_role", "routing_role TEXT")
+    _add_column_if_missing(
+        conn, "task_runs", "routing_source", "routing_source TEXT"
+    )
+
+    updated_at = int(time.time())
+    cutoff = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS cutoff FROM task_runs"
+    ).fetchone()["cutoff"]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_metadata (key, value, updated_at)
+        VALUES ('migration_cutoff_id', ?, ?)
+        """,
+        (str(cutoff), updated_at),
+    )
+    # The version marker is the publication point and must remain last.
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_metadata (key, value, updated_at)
+        VALUES ('routing_schema_version', '1', ?)
+        """,
+        (updated_at,),
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
