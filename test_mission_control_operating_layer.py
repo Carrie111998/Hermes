@@ -1,12 +1,20 @@
 import unittest
 
 from mission_control_operating_layer import (
+    build_capability_manifest,
     build_consumer_contract,
     sanitize_atlas_health,
 )
 
 
 class OperatingLayerTests(unittest.TestCase):
+  def test_capability_manifest_is_explicit_and_non_executing(self):
+    result = build_capability_manifest("forge")
+    self.assertFalse(result["execution_enabled"])
+    names = {item["name"] for item in result["capabilities"]}
+    self.assertIn("approvals", names)
+    self.assertIn("sanitized_health", names)
+
   def test_forge_consumes_only_sanitized_atlas_health_and_fails_safe(self):
     result = build_consumer_contract(
         "forge",

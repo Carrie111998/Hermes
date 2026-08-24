@@ -13,6 +13,24 @@ import json
 from typing import Any, Mapping
 
 CONTRACT_VERSION = "hermes-os-forge-atlas-operating-layer-v1"
+CAPABILITY_REGISTRY = {
+    "forge": {
+        "player_execution": ("tenant_safe_player_authority",),
+        "runs_tasks": ("governed_run_authority",),
+        "usage_cost": ("existing_saas_usage_authority",),
+        "connections": ("existing_connection_authority",),
+        "approvals": ("governed_approval_authority",),
+        "outcomes": ("existing_outcome_authority",),
+        "sanitized_health": ("atlas_contract",),
+    },
+    "atlas": {
+        "worker_process_health": ("atlas_runtime",),
+        "host_metrics": ("atlas_runtime",),
+        "deployment_state": ("atlas_runtime",),
+        "self_healing": ("atlas_runtime",),
+        "runtime_failures": ("atlas_runtime",),
+    },
+}
 FORBIDDEN = {
     "tenant_id", "company_id", "customer_id", "entitlement", "wallet",
     "ledger", "credential", "secret", "api_key", "prompt", "memory",
@@ -72,6 +90,7 @@ def build_consumer_contract(
         },
         "paco": "connected" if paco_connected else "disconnected",
         "mission_control": "saas_forge" if role == "forge" else "saas_atlas",
+        "capability_manifest": build_capability_manifest(role),
     }
     if role == "atlas":
         # Atlas remains capable of infra monitoring when Forge is degraded.
@@ -87,6 +106,21 @@ def build_consumer_contract(
         result["workload_policy"] = "fail_safe" if atlas["status"] != "healthy" else "normal"
     _assert_safe(result)
     return result
+
+
+def build_capability_manifest(role: str, observed: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Expose routing metadata while keeping execution and authority elsewhere."""
+    if role not in CAPABILITY_REGISTRY:
+        raise ValueError("role must be forge or atlas")
+    observed = observed or {}
+    capabilities = []
+    for name, authorities in CAPABILITY_REGISTRY[role].items():
+        status = str(observed.get(name, "declared")).lower()
+        if status not in {"declared", "observed", "degraded", "unavailable"}:
+            status = "unavailable"
+        capabilities.append({"name": name, "status": status, "authorities": list(authorities)})
+    return {"schema": CONTRACT_VERSION, "role": role, "capabilities": capabilities,
+            "execution_enabled": False, "source_of_truth": "existing_authorities"}
 
 
 def main() -> int:
