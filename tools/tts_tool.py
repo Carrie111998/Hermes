@@ -1739,7 +1739,11 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     _edge_tts = _import_edge_tts()
     edge_config = tts_config.get("edge") or {}
     voice = edge_config.get("voice", DEFAULT_EDGE_VOICE)
-    speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
+    speed = float(
+        edge_config.get(
+            "rate", edge_config.get("speed", tts_config.get("speed", 1.0))
+        )
+    )
 
     kwargs = {"voice": voice}
     if speed != 1.0:

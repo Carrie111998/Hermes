@@ -47,6 +47,20 @@ class TestEdgeTtsSpeed:
         assert "rate" not in kwargs
 
 
+    def test_edge_rate_key_is_honored(self, tmp_path):
+        """tts.edge.rate (the intuitive key) drives playback speed."""
+        comm_cls = self._run({"edge": {"rate": 1.6}}, tmp_path)
+        kwargs = comm_cls.call_args[1]
+        assert kwargs["rate"] == "+60%"
+
+
+    def test_edge_rate_takes_precedence_over_speed(self, tmp_path):
+        """When both are set, tts.edge.rate wins over tts.edge.speed."""
+        comm_cls = self._run({"edge": {"rate": 1.6, "speed": 1.25}}, tmp_path)
+        kwargs = comm_cls.call_args[1]
+        assert kwargs["rate"] == "+60%"
+
+
 # ---------------------------------------------------------------------------
 # OpenAI TTS speed
 # ---------------------------------------------------------------------------
