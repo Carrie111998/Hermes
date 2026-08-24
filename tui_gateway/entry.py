@@ -468,7 +468,18 @@ def main():
         logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
     while True:
-        raw = sys.stdin.readline()
+        try:
+            raw = sys.stdin.readline()
+        except OSError as e:
+            # Orca ADE (and similar PTY-less launchers) raises EINVAL (22)
+            # on sys.stdin.readline() - the gateway child was spawned with
+            # an unreadable stdin handle. Treat as clean EOF, not crash.
+            import errno
+
+            if e.errno == errno.EINVAL:
+                _log_exit(f"stdin read EINVAL (Orca PTY compat, no readable stdin): {e}")
+                break
+            raise
         if not raw:
             # Stdin fell through — check if spurious (O_NONBLOCK flip by a
             # child on the shared open file description) or genuine EOF.
