@@ -22,6 +22,8 @@ import type {
   CustomEndpointValidationResponse,
   DebugShareResponse,
   ElevenLabsVoicesResponse,
+  EmailAutoReplyPolicyResponse,
+  EmailAutoReplyPolicyUpdate,
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
@@ -159,6 +161,8 @@ export type {
   DebugShareResponse,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
+  EmailAutoReplyPolicyResponse,
+  EmailAutoReplyPolicyUpdate,
   EnvVarInfo,
   GatewayReadyPayload,
   HermesConfig,
@@ -1278,6 +1282,24 @@ export function updateMessagingPlatform(
 ): Promise<{ ok: boolean; platform: string }> {
   return window.hermesDesktop.api<{ ok: boolean; platform: string }>({
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}`,
+    method: 'PUT',
+    body
+  })
+}
+
+export function getEmailAutoReplyPolicy(): Promise<EmailAutoReplyPolicyResponse> {
+  return window.hermesDesktop.api<EmailAutoReplyPolicyResponse>({
+    ...profileScoped(),
+    path: '/api/messaging/platforms/email/auto-reply-policy'
+  })
+}
+
+export function updateEmailAutoReplyPolicy(
+  body: EmailAutoReplyPolicyUpdate
+): Promise<{ ok: boolean } & EmailAutoReplyPolicyResponse> {
+  return window.hermesDesktop.api<{ ok: boolean } & EmailAutoReplyPolicyResponse>({
+    ...profileScoped(),
+    path: '/api/messaging/platforms/email/auto-reply-policy',
     method: 'PUT',
     body
   })
