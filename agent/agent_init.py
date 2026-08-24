@@ -1908,6 +1908,14 @@ def init_agent(
                             _st = agent._session_db.get_session_title(agent.session_id)
                             if _st:
                                 _init_kwargs["session_title"] = _st
+                                try:
+                                    _sts = agent._session_db.get_session_title_source(
+                                        agent.session_id
+                                    )
+                                except Exception:
+                                    _sts = None
+                                if _sts:
+                                    _init_kwargs["session_title_source"] = _sts
                         except Exception:
                             pass
                     # Thread gateway user identity for per-user memory scoping
