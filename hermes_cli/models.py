@@ -3993,9 +3993,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         # safe source for the chat picker, including its empty/failure result.
         return _fetch_deepinfra_models(force_refresh=force_refresh) or []
     if normalized == "ollama-cloud":
-        live = fetch_ollama_cloud_models(force_refresh=force_refresh)
-        if live:
-            return live
+        return fetch_ollama_cloud_models(force_refresh=force_refresh)
     if normalized in ("openai", "openai-api"):
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if api_key:
@@ -4420,6 +4418,11 @@ def cached_provider_model_ids(
     normalized = requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
     if not normalized:
         return []
+    if normalized == "ollama-cloud":
+        # Ollama Cloud owns a dedicated cache that distinguishes a successful
+        # empty live catalog from discovery failure. The generic cache cannot
+        # represent that distinction and may contain retired pre-fix rows.
+        return provider_model_ids(normalized, force_refresh=force_refresh)
     if normalized == "ollama":
         ttl_seconds = min(ttl_seconds, _OLLAMA_LOCAL_MODELS_CACHE_TTL)
 

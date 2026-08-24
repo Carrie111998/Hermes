@@ -193,6 +193,31 @@ class TestOllamaCloudResolvedDiscovery:
         assert cached == []
         fetch_mdev.assert_not_called()
 
+    def test_picker_cache_does_not_resurrect_retired_generic_row(self, tmp_path, monkeypatch):
+        """The picker must preserve an authoritative empty cloud catalog."""
+        import hermes_cli.models as models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        models._save_provider_models_cache({
+            "ollama-cloud": {
+                "fp": models._credential_fingerprint("ollama-cloud"),
+                "at": 0,
+                "models": ["retired-model"],
+            }
+        })
+
+        with patch("hermes_cli.models.fetch_api_models", return_value=[]), \
+             patch("providers.get_provider_profile") as generic_profile:
+            refreshed = models.cached_provider_model_ids(
+                "ollama-cloud", force_refresh=True
+            )
+            cached = models.cached_provider_model_ids("ollama-cloud")
+
+        assert refreshed == []
+        assert cached == []
+        generic_profile.assert_not_called()
+
     def test_falls_back_to_models_dev_without_api_key(self, tmp_path, monkeypatch):
         """Without API key, only models.dev results are returned."""
         from hermes_cli.models import fetch_ollama_cloud_models
