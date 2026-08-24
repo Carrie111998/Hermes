@@ -2886,7 +2886,7 @@ except Exception:
     }
 
     # Baseline-import gate. Even if a tier reported success above, the
-    # actual deps may have landed somewhere other than $InstallDir\venv\
+    # actual deps may have landed somewhere other than $InstallDir\.venv\
     # (e.g. uv 0.5+ syncing into a sibling venv\ when UV_PROJECT_ENVIRONMENT
     # isn't set, leaving .venv\ empty and hermes.exe broken with
     # `ModuleNotFoundError: No module named 'dotenv'` on first run).
