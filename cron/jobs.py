@@ -2133,6 +2133,9 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        # Structured transport references from the latest successful delivery.
+        # Keep provider responses and message content out of persistent job state.
+        "last_delivery_receipts": [],
         "failure_streak": 0,
         # Delivery configuration
         "deliver": deliver,
