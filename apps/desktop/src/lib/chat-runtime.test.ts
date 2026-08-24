@@ -309,7 +309,7 @@ describe('coalesceToolOnlyAssistants toolCallId uniqueness', () => {
 
     expect(ids).toEqual(['call-a', 'call-b'])
   })
-}
+})
 
 function makeSession(partial: Partial<SessionInfo>): SessionInfo {
   return {
