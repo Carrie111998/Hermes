@@ -1686,6 +1686,50 @@ def apply_oauth_provider_defaults(
     return cfg
 
 
+_PinnedOAuthClientMetadata: Any = None
+
+
+def _pin_explicit_scope(
+    metadata: "OAuthClientMetadata", scope: str
+) -> "OAuthClientMetadata":
+    """Return metadata whose explicit scope cannot be widened by discovery.
+
+    The MCP SDK applies its advertised-scope selection strategy after the
+    protected-resource challenge by assigning to ``client_metadata.scope``.
+    That is the correct fallback when Hermes has no configured scope, but it
+    must not replace a user's explicit least-privilege selection.
+
+    Build the guard lazily because the MCP dependency is optional and its
+    Pydantic model is loaded on demand. The subclass otherwise behaves exactly
+    like the SDK model, including registration serialization.
+    """
+    global _PinnedOAuthClientMetadata
+
+    metadata_type = type(metadata)
+    if _PinnedOAuthClientMetadata is None or not issubclass(
+        _PinnedOAuthClientMetadata, metadata_type
+    ):
+
+        class _ExplicitScopeMetadata(metadata_type):
+            def __setattr__(self, name: str, value: Any) -> None:
+                if (
+                    name == "scope"
+                    and self.__dict__.get("_hermes_explicit_scope") is not None
+                ):
+                    return
+                super().__setattr__(name, value)
+
+        _ExplicitScopeMetadata.__name__ = "PinnedOAuthClientMetadata"
+        _ExplicitScopeMetadata.__qualname__ = "PinnedOAuthClientMetadata"
+        _PinnedOAuthClientMetadata = _ExplicitScopeMetadata
+
+    pinned = _PinnedOAuthClientMetadata.model_validate(
+        metadata.model_dump(by_alias=True, mode="json", exclude_none=True)
+    )
+    object.__setattr__(pinned, "_hermes_explicit_scope", scope)
+    return pinned
+
+
 def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
     """Build OAuthClientMetadata from the oauth config dict.
 
@@ -1727,12 +1771,14 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         metadata_kwargs["scope"] = scope
 
     try:
-        return OAuthClientMetadata.model_validate(metadata_kwargs)
+        metadata = OAuthClientMetadata.model_validate(metadata_kwargs)
     except Exception:
         # mcp 1.x metadata models predate SEP-837 and reject the unknown
         # field — retry without it rather than failing the whole flow.
         metadata_kwargs.pop("application_type", None)
-        return OAuthClientMetadata.model_validate(metadata_kwargs)
+        metadata = OAuthClientMetadata.model_validate(metadata_kwargs)
+
+    return _pin_explicit_scope(metadata, scope) if scope else metadata
 
 
 def _invalidate_tokens_on_client_change(

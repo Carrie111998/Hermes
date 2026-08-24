@@ -26,7 +26,10 @@ the full ``.asend()`` round-trip — the integration tests in
 These tests drive the wrapper through a manual ``.asend()`` sequence to prove
 the bridge forwards responses correctly into the inner SDK generator.
 """
+
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -204,6 +207,116 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
 
     # Clean up the generator — we don't need to complete the full dance.
     await flow.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_scope", "expected_scope"),
+    [
+        ("read", "read"),
+        (None, "read write admin"),
+    ],
+)
+async def test_oauth_registration_preserves_explicit_scope_and_discovers_fallback(
+    tmp_path, monkeypatch, configured_scope, expected_scope
+):
+    """Drive the real SDK flow through discovery and dynamic registration.
+
+    An explicit Hermes scope is a capability boundary and must survive the
+    SDK's advertised-scope selection step. With no configured scope, the SDK
+    must retain its normal fallback to all scopes advertised by the protected
+    resource.
+    """
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+
+    from tools.mcp_oauth import (
+        HermesTokenStorage,
+        _build_client_metadata,
+        _configure_callback_port,
+    )
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    cfg = {"redirect_port": 0}
+    if configured_scope is not None:
+        cfg["scope"] = configured_scope
+    storage = HermesTokenStorage("scoped-registration")
+    _configure_callback_port(cfg, storage)
+    metadata = _build_client_metadata(cfg)
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="scoped-registration",
+        server_url="https://mcp.example.com/mcp",
+        client_metadata=metadata,
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+
+    flow = provider.async_auth_flow(
+        httpx.Request("POST", "https://mcp.example.com/mcp")
+    )
+    outbound = await flow.__anext__()
+    outbound = await flow.asend(
+        httpx.Response(
+            401,
+            request=outbound,
+            headers={
+                "www-authenticate": (
+                    'Bearer resource_metadata="https://mcp.example.com/'
+                    '.well-known/oauth-protected-resource"'
+                )
+            },
+        )
+    )
+
+    for _ in range(8):
+        url = str(outbound.url)
+        if url.endswith("/oauth/register"):
+            registration = json.loads(outbound.content)
+            assert registration["scope"] == expected_scope
+            await flow.aclose()
+            return
+
+        if url.endswith("/.well-known/oauth-protected-resource"):
+            response = httpx.Response(
+                200,
+                request=outbound,
+                json={
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"],
+                    "scopes_supported": ["read", "write", "admin"],
+                    "bearer_methods_supported": ["header"],
+                },
+            )
+        elif "/.well-known/oauth-authorization-server" in url:
+            response = httpx.Response(
+                200,
+                request=outbound,
+                json={
+                    "issuer": "https://auth.example.com",
+                    "authorization_endpoint": "https://auth.example.com/oauth/authorize",
+                    "token_endpoint": "https://auth.example.com/oauth/token",
+                    "registration_endpoint": "https://auth.example.com/oauth/register",
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                    "scopes_supported": ["read", "write", "admin"],
+                },
+            )
+        else:
+            response = httpx.Response(404, request=outbound)
+
+        outbound = await flow.asend(response)
+
+    await flow.aclose()
+    raise AssertionError("OAuth flow never reached dynamic client registration")
 
 
 async def _noop_redirect(_url: str) -> None:
