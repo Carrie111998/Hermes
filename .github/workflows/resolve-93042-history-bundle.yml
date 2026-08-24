@@ -1,0 +1,137 @@
+name: Export PR 93042 sparse histories
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export-sparse-histories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out Phase 4 history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: andrexibiza/hermes-agent
+          ref: phase4-desktop-fleet
+          fetch-depth: 0
+
+      - name: Build exact four-path history bundle
+        shell: bash
+        env:
+          PHASE4_SHA: a47902f068d91ee95aea41b0de94d5067b03d1e8
+          MAIN_SHA: 057dcdf236f8a6a26721c10fcc6ccb72726e272a
+          BASE_SHA: 91e867631e9d2eb9fbd69edd4459475d38070979
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PHASE4_SHA"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream "$MAIN_SHA"
+          test "$(git merge-base "$PHASE4_SHA" "$MAIN_SHA")" = "$BASE_SHA"
+          mkdir -p sparse-history
+
+          python3 - "$BASE_SHA" "$PHASE4_SHA" "$MAIN_SHA" <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+
+          base, phase4, main = sys.argv[1:]
+          out = pathlib.Path("sparse-history")
+          paths = [
+              "apps/desktop/src/app/skills/index.test.tsx",
+              "apps/desktop/src/store/updates.ts",
+              "hermes_cli/main.py",
+              "plugins/platforms/telegram/adapter.py",
+          ]
+
+          def output(*args, env=None, input_bytes=None):
+              return subprocess.check_output(args, env=env, input=input_bytes)
+
+          def sparse_tree(ref):
+              fd, index_path = tempfile.mkstemp(prefix="sparse-index-")
+              os.close(fd)
+              os.unlink(index_path)
+              env = dict(os.environ, GIT_INDEX_FILE=index_path)
+              subprocess.check_call(["git", "read-tree", "--empty"], env=env)
+              for path in paths:
+                  record = output("git", "ls-tree", "-z", ref, "--", path)
+                  if not record:
+                      continue
+                  meta, actual_path = record[:-1].split(b"\t", 1)
+                  mode, obj_type, sha = meta.decode("ascii").split()
+                  if obj_type != "blob":
+                      raise RuntimeError(f"unsupported {obj_type} at {path}")
+                  subprocess.check_call(
+                      ["git", "update-index", "--add", "--cacheinfo", f"{mode},{sha},{actual_path.decode('utf-8')}"],
+                      env=env,
+                  )
+              tree = output("git", "write-tree", env=env).decode().strip()
+              os.unlink(index_path)
+              return tree
+
+          fixed = dict(
+              os.environ,
+              GIT_AUTHOR_NAME="Hermes sparse history",
+              GIT_AUTHOR_EMAIL="sparse-history@example.invalid",
+              GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+              GIT_COMMITTER_NAME="Hermes sparse history",
+              GIT_COMMITTER_EMAIL="sparse-history@example.invalid",
+              GIT_COMMITTER_DATE="2000-01-01T00:00:00Z",
+          )
+
+          base_tree = sparse_tree(base)
+          synthetic_base = output(
+              "git", "commit-tree", base_tree,
+              env=fixed,
+              input_bytes=f"source {base}\n".encode(),
+          ).decode().strip()
+
+          def build_chain(label, tip):
+              commits = output(
+                  "git", "rev-list", "--reverse", "--first-parent", f"{base}..{tip}"
+              ).decode().splitlines()
+              parent = synthetic_base
+              rows = [f"base\t{base}\t{synthetic_base}\n"]
+              for source in commits:
+                  tree = sparse_tree(source)
+                  subject = output("git", "show", "-s", "--format=%s", source).decode().strip()
+                  synthetic = output(
+                      "git", "commit-tree", tree, "-p", parent,
+                      env=fixed,
+                      input_bytes=f"{label}: {source} {subject}\n".encode(),
+                  ).decode().strip()
+                  rows.append(f"commit\t{source}\t{synthetic}\t{subject}\n")
+                  parent = synthetic
+              (out / f"{label}-map.tsv").write_text("".join(rows), encoding="utf-8")
+              subprocess.check_call(["git", "update-ref", f"refs/heads/{label}-history", parent])
+              return parent, len(commits)
+
+          phase4_tip, phase4_count = build_chain("phase4", phase4)
+          main_tip, main_count = build_chain("main", main)
+          (out / "summary.txt").write_text(
+              f"base={base}\nphase4={phase4}\nmain={main}\n"
+              f"synthetic_base={synthetic_base}\n"
+              f"synthetic_phase4_tip={phase4_tip}\nsynthetic_main_tip={main_tip}\n"
+              f"phase4_first_parent_commits={phase4_count}\n"
+              f"main_first_parent_commits={main_count}\n",
+              encoding="utf-8",
+          )
+          subprocess.check_call([
+              "git", "bundle", "create", str(out / "pr-93042-sparse-histories.bundle"),
+              "refs/heads/phase4-history", "refs/heads/main-history",
+          ])
+          subprocess.check_call(["git", "bundle", "verify", str(out / "pr-93042-sparse-histories.bundle")])
+          PY
+
+      - name: Upload exact sparse histories
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-93042-sparse-histories
+          path: sparse-history
+          if-no-files-found: error
+          retention-days: 1
