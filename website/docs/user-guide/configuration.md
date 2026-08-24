@@ -363,6 +363,30 @@ TERMINAL_SSH_USER=ubuntu
 | `TERMINAL_SSH_KEY` | (system default) | Path to SSH private key |
 | `TERMINAL_SSH_PERSISTENT` | `true` | Enable persistent shell |
 
+#### Per-session SSH Mode (gateway)
+
+Gateway conversations can opt into SSH without changing the process-wide
+terminal backend. Define an explicit, profile-scoped target registry at
+`$HERMES_HOME/ssh/targets.yaml` (`~/.hermes/ssh/targets.yaml` by default):
+
+```yaml
+ssh:
+  targets:
+    build-box:
+      host: build.example.com
+      user: builder
+      port: 22
+      identity_file: ~/.ssh/id_ed25519
+      cwd: /srv/project
+```
+
+Then use `/ssh list`, `/ssh use build-box`, `/ssh status`, and `/ssh local`
+in a gateway chat. The binding belongs only to that conversation and routes
+`terminal`, file tools, and `execute_code` together. Hermes does not import
+targets from `~/.ssh/config`; a missing or invalid bound target blocks remote
+tool execution instead of silently falling back to the gateway host. Identity
+file paths are redacted from `/ssh` responses.
+
 **How it works:** Connects at init time with `BatchMode=yes` and `StrictHostKeyChecking=accept-new`. Persistent shell keeps a single `bash -l` process alive on the remote host, communicating via temporary files. Commands that need `stdin_data` or `sudo` automatically fall back to one-shot mode.
 
 ### Modal Backend

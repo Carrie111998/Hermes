@@ -148,6 +148,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
+    CommandDef("ssh", "Manage session SSH backend targets", "Session",
+               gateway_only=True,
+               args_hint="[list|status|test <alias>|use <alias> [--cwd <path>]|local]",
+               subcommands=("list", "status", "test", "use", "off", "local", "help"),
+               busy_policy="interrupt_then_dispatch"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
@@ -1368,7 +1373,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - ssh: backend control is available through /hermes ssh on Slack so the
+#     new session surface does not displace an existing native command.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "ssh"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

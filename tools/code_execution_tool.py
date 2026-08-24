@@ -790,9 +790,10 @@ def _get_or_create_env(task_id: str):
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
+        get_effective_env_config, _last_activity, _start_cleanup_thread,
+        _creation_locks, _creation_locks_lock,
         _resolve_container_task_id, _resolve_task_host_cwd,
+        _ssh_config_from_config, resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -801,7 +802,8 @@ def _get_or_create_env(task_id: str):
     with _env_lock:
         if effective_task_id in _active_environments:
             _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            config = get_effective_env_config(task_id)
+            return _active_environments[effective_task_id], config["env_type"]
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -813,11 +815,12 @@ def _get_or_create_env(task_id: str):
         with _env_lock:
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+                config = get_effective_env_config(task_id)
+                return _active_environments[effective_task_id], config["env_type"]
 
-        config = _get_env_config()
+        config = get_effective_env_config(task_id)
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = resolve_task_overrides(task_id)
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -845,15 +848,11 @@ def _get_or_create_env(task_id: str):
                 "docker_network": config.get("docker_network", True),
             }
 
-        ssh_config = None
-        if env_type == "ssh":
-            ssh_config = {
-                "host": config.get("ssh_host", ""),
-                "user": config.get("ssh_user", ""),
-                "port": config.get("ssh_port", 22),
-                "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
-            }
+        ssh_config = (
+            _ssh_config_from_config(config)
+            if env_type == "ssh"
+            else None
+        )
 
         local_config = None
         if env_type == "local":
@@ -1096,6 +1095,7 @@ def _execute_remote(
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
+    original_cwd = getattr(env, "cwd", None)
 
     sandbox_id = uuid.uuid4().hex[:12]
     temp_dir = _env_temp_dir(env)
@@ -1206,10 +1206,18 @@ def _execute_remote(
         # Clean up remote sandbox dir
         try:
             env.execute(
-                f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15,
+                f"rm -rf {quoted_sandbox_dir}",
+                cwd=original_cwd or "/",
+                timeout=15,
             )
         except Exception:
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
+        finally:
+            # Internal RPC setup uses / and a temporary sandbox, but those
+            # implementation details must not change the session's cwd for the
+            # next terminal/file call.
+            if original_cwd:
+                env.cwd = original_cwd
 
     duration = round(time.monotonic() - exec_start, 2)
 
@@ -1314,9 +1322,10 @@ def execute_code(
                 "Run the lifecycle command from a shell outside the gateway."
             )
 
-    # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
+    # Dispatch by the task/session backend. A gateway SSH binding must route
+    # the top-level Python process remotely too, not only nested tool calls.
+    from tools.terminal_tool import get_effective_env_config, _docker_has_host_access
+    _env_config = get_effective_env_config(task_id)
     env_type = _env_config["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
