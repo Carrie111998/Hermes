@@ -67,15 +67,33 @@ function executableOnPath(name: string): string {
   throw new Error(`could not resolve ${name} from PATH`)
 }
 
+function resolveHostPython(): string {
+  for (const name of ['python3', 'python']) {
+    try {
+      return executableOnPath(name)
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  // Some development environments ship no system python; fall back to a uv-managed one.
+  const uvLookup = spawnSync(executableOnPath('uv'), ['python', 'find'], { encoding: 'utf8' })
+  const discovered = String(uvLookup.stdout || '').trim()
+
+  assert.ok(
+    discovered,
+    String(uvLookup.stderr || 'no python3, python, or uv-managed interpreter available on PATH')
+  )
+
+  return discovered
+}
+
 test.skipIf(process.platform === 'win32')('POSIX hand-off resolves re-exec helpers from PATH', async () => {
   const { home, installRoot } = sandbox('path-helpers')
   const mockBin = path.join(home, 'mock-bin')
   const realBash = executableOnPath('bash')
   const realSh = executableOnPath('sh')
-  const uv = executableOnPath('uv')
-  const pythonLookup = spawnSync(uv, ['python', 'find'], { encoding: 'utf8' })
-  const realPython = String(pythonLookup.stdout || '').trim()
-  assert.ok(realPython, String(pythonLookup.stderr || 'uv python find failed'))
+  const realPython = resolveHostPython()
   const helperLog = path.join(home, 'helpers.log')
 
   fs.mkdirSync(mockBin)
