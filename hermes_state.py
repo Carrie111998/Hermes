@@ -37,6 +37,15 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.session_activity import ActivityProvenance
 from agent.message_sanitization import _sanitize_surrogates
+# Intrinsic persistence marker stamped on message dicts that are known-durable
+# (#92231). One shared constant with agent.context_compressor (this module
+# already imports agent.* at module level, and context_compressor is a
+# transitive dependency via hermes_state_common). run_agent keeps its own
+# predating copy — hermes_state cannot import run_agent (circular) — guarded
+# by test_marker_constant_in_sync.
+from agent.context_compressor import (
+    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,
+)
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
     SKILL_SCAFFOLD_SQL_LIKE,
@@ -56,6 +65,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _LISTABLE_CHILD_SQL,
     _PREVIEW_ELIGIBLE_SQL,
     _PREVIEW_RAW_SELECT,
+    _RECOVERABLE_END_REASONS,
+    _RECOVERABLE_END_REASONS_SQL,
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
@@ -1529,8 +1540,9 @@ def apply_database_pragmas(
 # The canonical ``sessions`` / ``messages`` data is intact in these cases —
 # only the derived schema is broken — so recovery preserves all transcripts
 # and merely rebuilds the FTS layer.
-_MALFORMED_SCHEMA_MARKERS = (
-    "malformed database schema",
+_MALFORMED_SCHEMA_MARKERS = ("malformed database schema",)
+_MALFORMED_DB_MARKERS = (
+    *_MALFORMED_SCHEMA_MARKERS,
     "database disk image is malformed",
 )
 
@@ -1542,30 +1554,27 @@ _repair_attempt_lock = threading.Lock()
 
 
 def is_malformed_db_error(exc: BaseException) -> bool:
-    """True if *exc* is a SQLite 'malformed schema / disk image' error.
+    """True for explicit malformed-schema or generic corrupt-image errors.
 
-    These are the corruption classes where the schema fails to parse, so
-    targeted ``sqlite_master`` surgery (not an ordinary FTS rebuild) is the
-    only recovery path.
+    This broad classifier is for diagnostics and explicit offline recovery
+    dispatch. Runtime repair must use :func:`is_malformed_schema_error`, since
+    a generic corrupt-image error does not identify the damaged object.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    return any(marker in str(exc).lower() for marker in _MALFORMED_DB_MARKERS)
+
+
+def is_malformed_schema_error(exc: BaseException) -> bool:
+    """True only when SQLite explicitly reports malformed schema text.
+
+    A generic ``database disk image is malformed`` error is SQLITE_CORRUPT
+    and may come from any B-tree or freelist page.  It does not prove that
+    canonical rows are intact, so runtime schema/FTS repair must fail closed.
     """
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
-
-
-def _is_not_a_database_error(exc: BaseException) -> bool:
-    """True if *exc* is SQLite's 'file is not a database' error.
-
-    Raised when a connection's backing file is not a SQLite database — the
-    runtime connection-corruption class: a sibling process (forked curator
-    agent, external repair pass) replaced/truncated the file out from under
-    the live connection.  The file on disk may be perfectly healthy; the
-    CONNECTION is broken.  Distinct from the malformed-schema class: the fix
-    is a reconnect, not schema surgery.
-    """
-    if not isinstance(exc, sqlite3.DatabaseError):
-        return False
-    return "file is not a database" in str(exc).lower()
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -3781,13 +3790,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
-        # One-shot guard for the runtime connection-reopen recovery on the
-        # write path. A connection whose backing file was replaced/truncated
-        # by a sibling process surfaces as "file is not a database" on every
-        # write; we close and reopen the connection at most once per
-        # SessionDB instance so a genuinely unrecoverable database can't put
-        # writers into a reconnect loop.
-        self._notadb_reconnect_attempted = False
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
@@ -3973,7 +3975,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # place (backup first; canonical sessions/messages preserved),
                 # then reopen once. This is what lets Desktop/Dashboard
                 # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
                     raise
                 logger.error(
                     "state.db schema is malformed (%s) — attempting automatic "
@@ -4566,20 +4568,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
-                # Runtime connection-corruption self-heal: a connection whose
-                # backing file was replaced/truncated by a sibling process
-                # (e.g. a forked curator agent inheriting and closing the
-                # write fd, or an external repair pass) surfaces as "file is
-                # not a database" on EVERY subsequent write. Without a
-                # reconnect branch the gateway wedges permanently: every
-                # transcript/routing write raises, messages stay in memory,
-                # and swap grows without bound until the process is killed.
-                # Close the broken connection, reopen the DB file, and retry
-                # the write once.
-                if _is_not_a_database_error(exc):
-                    if not self._reconnect_after_notadb():
-                        raise
-                    continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
                 # while the canonical messages table is intact. Recover here,
@@ -4630,74 +4618,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         time.sleep(min(jitter, max(deadline - now, 0.001)))
         return True
 
-    def _reconnect_after_notadb(self) -> bool:
-        """Close the corrupted write connection and reopen state.db.
-
-        Returns True when the connection was successfully replaced and the
-        failed write should be retried.  Mirrors the constructor's
-        ``_connect_and_init`` so WAL/schema reconciliation runs on the fresh
-        connection.  Never raises — logs and returns False on failure so the
-        original error propagates.
-
-        One-shot per instance: a genuinely unrecoverable database must not
-        put writers into a reconnect loop that pins CPU on every write.
-        """
-        if self._notadb_reconnect_attempted:
-            return False
-        self._notadb_reconnect_attempted = True
-        logger.warning(
-            "state.db connection reported 'file is not a database' — closing "
-            "and reopening the connection to self-heal (one-shot)."
-        )
-        try:
-            with self._lock:
-                if self._conn is not None:
-                    try:
-                        self._conn.close()
-                    except Exception:
-                        pass
-                    self._conn = None
-                new_conn = _connect_tracked_db(
-                    str(self.db_path),
-                    tracking_path=self.db_path,
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
-                )
-                new_conn.row_factory = sqlite3.Row
-                # Publish BEFORE schema init: _init_schema/_reconcile_columns
-                # operate on self._conn, not on the local variable.
-                self._conn = new_conn
-                self._wal_active = (
-                    apply_wal_with_fallback(new_conn, db_label="state.db")
-                    == "wal"
-                )
-                apply_database_pragmas(new_conn, db_label="state.db")
-                new_conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
-                self._init_schema()
-        except Exception as exc:
-            logger.error(
-                "state.db reconnect after 'file is not a database' failed (%s); "
-                "the database may need the full offline repair path.",
-                exc,
-            )
-            return False
-        logger.warning(
-            "state.db connection reopened successfully; retrying the failed write."
-        )
-        return True
-
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
         """True for the error class a corrupt FTS index raises on writes.
 
-        The message varies by SQLite version: older builds raise the generic
-        ``database disk image is malformed`` (covered by
-        ``is_malformed_db_error``); newer builds (e.g. ubuntu-latest CI)
-        raise the FTS5-specific ``fts5: corrupt structure record for table
-        "messages_fts"``. Both mean the same thing for the write path: the
-        canonical rows are fine, the FTS shadow tables are not.
+        SQLite's message for a corrupt FTS index varies by version: older
+        builds raise the generic ``database disk image is malformed`` (covered
+        by :func:`is_malformed_db_error`); newer builds raise the FTS5-specific
+        ``fts5: corrupt structure record for table "messages_fts"``. Both mean
+        the same thing for the write path: the canonical rows are fine, the
+        FTS shadow tables are not.  The FTS-only rebuild and fail-open
+        detach are safe here because they only touch derived indexes; if the
+        damage is actually in a canonical B-tree, the rebuild itself fails and
+        the write propagates.
         """
         if is_malformed_db_error(exc):
             return True
@@ -5816,7 +5749,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.session_key = ?
                   AND s.source = ?
-                  AND (s.ended_at IS NULL OR s.end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))
                   AND NOT EXISTS (
                       SELECT 1 FROM sessions b
                       WHERE b.session_key = s.session_key
@@ -5855,7 +5788,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND COALESCE(s.chat_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_type, '') = COALESCE(?, '')
                   AND COALESCE(s.thread_id, '') = COALESCE(?, '')
-                  AND (s.ended_at IS NULL OR s.end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))
                   AND (COALESCE(s.message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
                   ))
@@ -6491,7 +6424,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND (ended_at IS NULL "
-                "OR end_reason IN ('agent_close', 'ws_orphan_reap'))",
+                f"OR end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))",
                 (now, reason, session_id),
             )
             return cursor.rowcount
@@ -8898,6 +8831,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    # Accidental end reasons that recovery treats as resumable. Single source
+    # of truth: hermes_state_common._RECOVERABLE_END_REASONS, interpolated
+    # into find_latest_gateway_session_for_peer / promote_to_session_reset
+    # SQL — literals cannot drift (docs/session-lifecycle.md "recoverable
+    # accidental reasons").
+    RECOVERABLE_END_REASONS = _RECOVERABLE_END_REASONS
+
+    def unarchive_recoverable_session(self, session_id: str) -> bool:
+        """Un-archive a session that was archived by a recoverable accident.
+
+        Registry-style lookups (Bot Mode's canonical "Bot Chat") use this to
+        resurrect a row the ws-orphan reaper (``ws_orphan_reap``) or older
+        agent cleanup (``agent_close``) archived: those ends are accidents,
+        not user intent, so the identity-scoped canonical chat must survive
+        them (#92687). Sessions archived with no end_reason or an explicit
+        boundary reason (user archived deliberately, ``session_reset``, …)
+        are left untouched — returns ``False`` for those, ``True`` only when
+        the row was archived for a recoverable reason and is now un-archived
+        (whole compression lineage, via :meth:`set_session_archived`).
+        """
+        if not session_id:
+            return False
+        try:
+            row = self.get_session(session_id)
+        except Exception:
+            return False
+        if not row or not row.get("archived"):
+            return False
+        # A compressed lineage's registry row keeps end_reason='compression';
+        # the accidental stamp lives on the live TIP. Judge recoverability at
+        # the tip (== the row itself when uncompressed).
+        tip = row
+        try:
+            tip_id = self.resolve_resume_session_id(session_id) or session_id
+            if tip_id != session_id:
+                tip = self.get_session(tip_id) or row
+        except Exception:
+            tip_id = session_id
+        if (tip.get("end_reason") or "") not in self.RECOVERABLE_END_REASONS:
+            return False
+        if not self.set_session_archived(session_id, False):
+            return False
+
+        # Clear the accidental end stamp: the session is live again, and a
+        # surviving ws_orphan_reap/agent_close reason would make a LATER
+        # deliberate archive (which never writes end_reason) auto-resurrect
+        # on the next lookup — permanently overriding user intent.
+        def _clear_end(conn):
+            conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                (tip["id"],),
+            )
+            return 1
+
+        self._execute_write(_clear_end)
+        return True
+
     def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
         """Pin or unpin a session (and its whole compression lineage).
 
@@ -11168,6 +11158,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            # Born durable (#92231): this dict is materialized FROM a durable
+            # row, so stamp the persistence marker at the source instead of
+            # relying on every restore caller to thread the loaded list back
+            # through a flush as ``conversation_history=`` — any
+            # identity-losing handoff (compression's durable-snapshot
+            # adoption, incremental persists with no history arg) would
+            # otherwise re-append the ENTIRE transcript on flush.
+            # Underscore-prefixed like ``_row_id``: every transport strips it
+            # before the wire, and compression's assembly copies deliberately
+            # strip it so rotated child handoffs still flush (see
+            # _fresh_compaction_message_copy).
+            msg[_DB_PERSISTED_MARKER_KEY] = True
             # Durable per-message identity for surfaces that need to address a
             # specific row later (desktop reactions). OPT-IN: only the gateway
             # asks for it — every other consumer (ACP restore, export,
