@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { test, vi } from 'vitest'
 
@@ -11,6 +14,28 @@ import {
   createBackendShutdownCoordinator,
   parseBackendOwnership
 } from './backend-ownership'
+
+const mainSource = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8')
+
+function sourceSlice(startMarker: string, endMarker: string): string {
+  const start = mainSource.indexOf(startMarker)
+  assert.notEqual(start, -1, `missing source marker: ${startMarker}`)
+  const end = mainSource.indexOf(endMarker, start + startMarker.length)
+  return mainSource.slice(start, end === -1 ? undefined : end)
+}
+
+test('Electron backend lock cleanup uses a rename tombstone CAS, including malformed recovery', () => {
+  const helper = sourceSlice('async function compareAndDeleteBackendOwnershipLock', '\nfunction normalizeBackendOwnershipLockStartMarker')
+  const transaction = sourceSlice('async function withBackendOwnershipLock', '\nfunction execText')
+
+  assert.match(helper, /rename\(lockPath, tombstonePath\)/)
+  assert.match(helper, /currentContents !== expectedContents/)
+  assert.match(helper, /link\(tombstonePath, lockPath\)/)
+  assert.match(helper, /unlink\(tombstonePath\)/)
+  assert.doesNotMatch(helper, /unlink\(lockPath\)/)
+  assert.match(transaction, /compareAndDeleteBackendOwnershipLock\(lockPath, rawOwner\)/)
+  assert.equal(transaction.split('compareAndDeleteBackendOwnershipLock(lockPath, `${contents}\\n`)').length - 1, 2)
+})
 
 function memoryStore(initial = '') {
   let contents = initial

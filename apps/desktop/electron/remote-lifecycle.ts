@@ -776,13 +776,11 @@ try:
  live_creation,live_args=identity_before_signal()
  if live_creation!=expected_creation or not owned(live_args):
   print("REFUSED");sys.exit(3)
- if sys.platform=="darwin":
-  # There is no pidfd-style signal binding on Darwin. Re-read the complete
-  # identity immediately before os.kill, with no intervening await or remote
-  # round trip, and refuse if the PID or argv changed at that boundary.
-  bound_creation,bound_args=identity_before_signal()
-  if bound_creation!=expected_creation or not owned(bound_args):
-   print("REFUSED");sys.exit(3)
+ if (sys.platform=="darwin"):
+  # Darwin has no pidfd-style signal binding. Refuse instead of accepting the
+  # residual PID-reuse window between ps and os.kill; reconnect will surface
+  # the still-running remote owner for an explicit retry.
+  print("DARWIN_UNAVAILABLE");sys.exit(2)
  try:
   if pidfd is not None:signal.pidfd_send_signal(pidfd,signal.SIGTERM)
   else:os.kill(pid,signal.SIGTERM)
@@ -809,8 +807,8 @@ finally:
 // The updater's Python _MarkerMutex uses the marker's .mutex sidecar and an
 // advisory flock. Keep that same descriptor locked while the remote shell does
 // the marker check, spawns the backend, and publishes its initial lockfile.
-// Python execs the shell with the descriptor inheritable so the flock survives
-// the interpreter handoff and is released only when the command exits.
+// The outer shell inherits the descriptor so the critical section survives the
+// Python exec; each detached child closes the descriptor before execing Hermes.
 function withRemoteUpdateMutex(command, mutexPath) {
   const script = `
 import fcntl,os,sys
@@ -821,7 +819,7 @@ if parent:os.makedirs(parent,exist_ok=True)
 fd=os.open(mutex_path,os.O_RDWR|os.O_CREAT,0o600)
 os.set_inheritable(fd,True)
 fcntl.flock(fd,fcntl.LOCK_EX)
-os.execvp("sh",["sh","-c",payload])
+os.execvp("sh",["sh","-c",payload,"hermes-update-mutex",str(fd)])
 `.trim()
 
   return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
@@ -918,9 +916,11 @@ async function terminateOwnedDashboardForUpdate(ssh, expected) {
       const error: any = new Error(
         result === 'REFUSED'
           ? 'The remote POSIX process identity changed at the signal boundary.'
-          : 'The remote POSIX signal boundary was unavailable.'
+          : result === 'DARWIN_UNAVAILABLE'
+            ? 'Darwin cannot atomically bind a signal to the verified PID; refusing termination.'
+            : 'The remote POSIX signal boundary was unavailable.'
       )
-      error.kind = result === 'REFUSED' ? 'ownership-changed' : 'transient-transport-error'
+      error.kind = result === 'REFUSED' || result === 'DARWIN_UNAVAILABLE' ? 'ownership-changed' : 'transient-transport-error'
       throw error
     }
   } catch (cause: any) {
@@ -966,11 +966,14 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
     `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
 
+  const detachedShell = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
+  const detachedSpawn = `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(detachedShell)} hermes-update-child "$1" & echo $!)`
+
   if (!opts.ownershipId || !opts.lockMetadata) {
     return withRemoteUpdateMutex(
       `${markerClear}; marker_clear || exit 75; ` +
         `mkdir -p "$(dirname ${logPath})" && ` +
-        `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
+        `${detachedSpawn}; ` +
         `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; echo "$child"`,
       updateMutex
     )
@@ -998,7 +1001,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
       `case "$existing_pid" in ''|*[!0-9]*) rm -f "$lock";; *) ` +
       `if kill -0 "$existing_pid" 2>/dev/null; then ${tokenPath ? `rm -f ${tokenPath}; ` : ''}printf EXISTING; exit 0; fi; rm -f "$lock";; esac; fi; ` +
       `${markerClear}; marker_clear || exit 75; mkdir -p "$(dirname ${logPath})" && ` +
-      `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(`${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`)}); ` +
+      `${detachedSpawn}; ` +
       `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; ` +
       `lock_json=${shq(metadata)}; lock_json=\${lock_json//__PID__/$child}; ` +
       `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +

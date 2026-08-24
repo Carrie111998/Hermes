@@ -663,6 +663,8 @@ test('buildSpawnCommand atomically reserves the ownership slot through spawn and
   assert.ok(cmd.includes('.hermes-update-in-progress.mutex'))
   assert.match(cmd, /fcntl\.flock\(fd,fcntl\.LOCK_EX\)/)
   assert.match(cmd, /os\.set_inheritable\(fd,True\)/)
+  assert.match(cmd, /hermes-update-child "\$1"/)
+  assert.match(cmd, /eval "exec \$1>&-"/)
   assert.ok(cmd.includes('backend.lock.json'))
   assert.match(cmd, /lock_json/)
   assert.match(cmd, /trap .*rm -rf/)
@@ -1057,7 +1059,7 @@ test('managed update drain rechecks the POSIX ownership record before signalling
   )
 })
 
-test('managed update drain refuses a PID whose identity changes at the atomic signal boundary', async () => {
+test('managed update drain refuses Darwin termination because PID signals cannot be atomically bound', async () => {
   const lock = ownedLock()
   const rawLock = JSON.stringify(lock)
   const ssh = fakeSsh([
@@ -1075,8 +1077,11 @@ test('managed update drain refuses a PID whose identity changes at the atomic si
     'the final signal must stay inside the identity-checking helper'
   )
   const termination = ssh.calls.find(command => command.includes('identity_before_signal'))
-  assert.match(termination, /live_creation,live_args=identity_before_signal\(\)/)
-  assert.match(termination, /bound_creation,bound_args=identity_before_signal\(\)/)
+  const darwinStart = termination.indexOf('if (sys.platform=="darwin"):')
+  const darwinEnd = termination.indexOf('\n try:', darwinStart)
+  const darwinGuard = termination.slice(darwinStart, darwinEnd)
+  assert.match(darwinGuard, /DARWIN_UNAVAILABLE/)
+  assert.doesNotMatch(darwinGuard, /os\.kill\(pid,signal\.SIGTERM\)/)
 })
 
 test('connect() respawns when the dashboard is wedged (alive pid, probe fails)', async () => {

@@ -3190,6 +3190,61 @@ function writeBackendOwnership(contents) {
 const WINDOWS_FILETIME_EPOCH_TICKS = 621_355_968_000_000_000n
 const UNKNOWN_BACKEND_OWNERSHIP_LOCK_GRACE_MS = 1_000
 
+// A pathname-only unlink is not a compare-and-delete: another interpreter can
+// replace the lock after the read and before the unlink. Rename the exact
+// pathname to a private tombstone first, compare the bytes there, and delete
+// only that tombstone. If the bytes changed, restore the tombstone with a
+// hard-link without ever overwriting a replacement lock at the public path.
+async function compareAndDeleteBackendOwnershipLock(lockPath, expectedContents) {
+  const tombstonePath = `${lockPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tombstone`
+
+  try {
+    await fs.promises.rename(lockPath, tombstonePath)
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+
+  const restoreTombstone = async () => {
+    try {
+      // link() is non-destructive when a contender has already published a
+      // replacement at lockPath: EEXIST leaves that replacement untouched.
+      await fs.promises.link(tombstonePath, lockPath)
+      await fs.promises.unlink(tombstonePath)
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        throw error
+      }
+    }
+  }
+
+  let currentContents
+
+  try {
+    currentContents = await fs.promises.readFile(tombstonePath, 'utf8')
+  } catch {
+    await restoreTombstone()
+    return false
+  }
+
+  if (currentContents !== expectedContents) {
+    await restoreTombstone()
+    return false
+  }
+
+  try {
+    await fs.promises.unlink(tombstonePath)
+    return true
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}
+
 function normalizeBackendOwnershipLockStartMarker(marker) {
   if (!IS_WINDOWS || typeof marker !== 'string' || !marker.startsWith('win:')) {
     return marker
@@ -3247,9 +3302,7 @@ async function withBackendOwnershipLock(operation) {
 
       if (published) {
         try {
-          if ((await fs.promises.readFile(lockPath, 'utf8')).trim() === contents) {
-            await fs.promises.unlink(lockPath)
-          }
+          await compareAndDeleteBackendOwnershipLock(lockPath, `${contents}\n`)
         } catch {
           void 0
         }
@@ -3312,13 +3365,7 @@ async function withBackendOwnershipLock(operation) {
           }
 
           if (latest !== null && latestMalformed && latest === rawOwner) {
-            try {
-              await fs.promises.unlink(lockPath)
-            } catch (unlinkError) {
-              if (unlinkError?.code !== 'ENOENT') {
-                throw unlinkError
-              }
-            }
+            await compareAndDeleteBackendOwnershipLock(lockPath, rawOwner)
           }
 
           malformedLockSince = null
@@ -3349,9 +3396,9 @@ async function withBackendOwnershipLock(operation) {
 
         if (ownerMatches === false) {
           try {
-            // The dead owner's open handle is gone, so unlinking here is safe;
-            // a live owner is never stolen, even when the PID was reused.
-            await fs.promises.unlink(lockPath)
+            // Compare-and-delete through a rename tombstone. A delayed
+            // contender can never unlink a replacement owner's pathname.
+            await compareAndDeleteBackendOwnershipLock(lockPath, rawOwner)
           } catch (unlinkError) {
             if (unlinkError?.code !== 'ENOENT') {
               throw unlinkError
@@ -3372,10 +3419,7 @@ async function withBackendOwnershipLock(operation) {
       await handle.close()
     } finally {
       try {
-        const current = await fs.promises.readFile(lockPath, 'utf8')
-        if (current.trim() === contents) {
-          await fs.promises.unlink(lockPath)
-        }
+        await compareAndDeleteBackendOwnershipLock(lockPath, `${contents}\n`)
       } catch {
         void 0
       }
