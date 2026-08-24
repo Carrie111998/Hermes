@@ -775,9 +775,20 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               onRecovered: recoveredId => {
                 if (onRuntimeRecovered) {
                   onRuntimeRecovered(recoveredId)
-                } else if (targetIsCurrentView()) {
-                  activeSessionIdRef.current = recoveredId
-                  setActiveSessionId(recoveredId)
+                } else {
+                  // Publish stored→runtime ownership before the helper retries
+                  // prompt.submit. The window router needs this binding to keep
+                  // the fresh runtime on its owning remote gateway; without it,
+                  // the retry treats the short id as a stored id and falls back
+                  // to the ambient backend with another 4001 (#93744).
+                  if (recoverStoredSessionId) {
+                    updateSessionState(recoveredId, state => state, recoverStoredSessionId)
+                  }
+
+                  if (targetIsCurrentView()) {
+                    activeSessionIdRef.current = recoveredId
+                    setActiveSessionId(recoveredId)
+                  }
                 }
               }
             },
