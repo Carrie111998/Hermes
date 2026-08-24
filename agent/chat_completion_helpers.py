@@ -1014,6 +1014,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
+    # ponytail: ox-alpha-free upstream 503s on any tools payload (Console Go has no function-calling support for this model)
+    if getattr(agent, "model", "").startswith("ox-alpha"):
+        tools_for_api = []
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
