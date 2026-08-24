@@ -170,6 +170,52 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
         _cleanup(mcp_tool, "srv")
 
 
+def test_application_tool_errors_do_not_trip_server_breaker(monkeypatch, tmp_path):
+    """CallToolResult(isError=True) is an application failure, not transport loss.
+
+    A server may reject an invalid allowlist target while remaining fully
+    reachable. Repeating such validation errors must not park every tool on the
+    server behind the transport circuit breaker.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_validation_error(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.is_error = True
+        block = MagicMock()
+        block.text = "Application is not allowlisted"
+        result.content = [block]
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_validation_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        # Start one strike below the open threshold. The first completed RPC
+        # must clear the stale transport strike even though the tool rejects
+        # its arguments.
+        mcp_tool._server_error_counts["srv"] = (
+            mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+        )
+        handler = _make_tool_handler("srv", "app_health", 10.0)
+
+        for _ in range(4):
+            parsed = json.loads(handler({"app": "invalid"}))
+            assert "Application is not allowlisted" in parsed.get("error", "")
+            assert "unreachable" not in parsed.get("error", "").lower()
+
+        assert call_count["n"] == 4
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
     """If the half-open probe fails, the breaker must re-arm the
     cooldown (not let every subsequent call through).
