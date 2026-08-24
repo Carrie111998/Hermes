@@ -1551,6 +1551,24 @@ class TestNativeServiceIdentityRootQualification:
         assert gateway_cli.get_service_name() == "hermes-gateway-coder"
         assert gateway_cli.get_launchd_label() == "ai.hermes.gateway-coder"
 
+    def test_unset_hermes_home_stays_canonical_even_if_home_disagrees_with_passwd(self, tmp_path, monkeypatch):
+        """A plain default install (HERMES_HOME unset) must stay canonical even
+        when $HOME doesn't match the real account's passwd entry — e.g.
+        containers that set HOME via ENV without a matching /etc/passwd row,
+        restricted-UID pods, or sudo without -H. Regression for a review
+        finding on #93349: the root-hash check must not reinterpret
+        "canonical" via pwd.getpwuid unless HERMES_HOME gives it a reason to."""
+        home = tmp_path / "home"
+        home.mkdir()
+        real_passwd_home = tmp_path / "real-passwd-home"
+        real_passwd_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(real_passwd_home)))
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        assert gateway_cli.get_service_name() == "hermes-gateway"
+        assert gateway_cli.get_launchd_label() == "ai.hermes.gateway"
+
     def test_distinct_custom_root_defaults_never_collide(self, tmp_path, monkeypatch):
         canonical_home = tmp_path / "home"
         canonical_home.mkdir()

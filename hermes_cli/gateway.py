@@ -2326,9 +2326,23 @@ def _native_root_hash(root: Path) -> str:
     Shared by :func:`_native_service_suffix` (current process) and
     :func:`launchd_gateway_labels_for_install` (every profile of an
     install), so both fold the same root identity into their names.
+
+    The pwd-anchored comparison against :func:`_real_native_hermes_root` only
+    runs when ``HERMES_HOME`` is actually set — i.e. there is real evidence
+    of a custom root or profile-mode HOME redirection to correct for. When
+    ``HERMES_HOME`` is unset, *root* is ``get_default_hermes_root()``'s
+    plain ``Path.home()``-based default with nothing Hermes-controlled to
+    redirect it, so it's trusted as canonical outright. Falling through to
+    the pwd check unconditionally would flag a plain default install as
+    "custom" any time ``$HOME`` merely disagrees with the ``/etc/passwd``
+    entry for reasons unrelated to Hermes (containers with a synthetic
+    ``HOME``, restricted-UID pods, ``sudo`` without ``-H``, CI runners) —
+    giving it a spurious hashed identity on every invocation.
     """
     import hashlib
 
+    if not os.environ.get("HERMES_HOME", "").strip():
+        return ""
     resolved = root.resolve()
     if resolved == _real_native_hermes_root().resolve():
         return ""
