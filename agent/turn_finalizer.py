@@ -135,6 +135,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    frontier_required=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -735,6 +736,39 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    # HF-04 Layer A (IGN-197): the CLI/cron/delegated turn path has no single
+    # "fallback resolution complete" return point the way the API server's
+    # _run_agent does — try_activate_fallback() mutates agent.model/provider
+    # in place and can fire from a dozen sites inside the retry loop. Turn end
+    # is where that loop has stopped retrying, so this is the first moment the
+    # served model is final. Requested model is the primary-runtime snapshot
+    # taken before any fallback activated; served model is what agent.model
+    # ended the turn on.
+    #
+    # Gated on the caller-supplied per-call `frontier_required` flag AND the
+    # shared HERMES_FRONTIER_DOWNGRADE_CHECK env flag (default off). The API
+    # server path (IGN-196) checks at _run_agent and does not set this kwarg,
+    # so the two hooks cannot double-warn for one call.
+    from agent.frontier_guard import check_frontier_downgrade
+
+    check_frontier_downgrade(
+        result,
+        # `_primary_runtime` is the snapshot taken at agent init, so it already
+        # reflects any fallback that resolved *before* the agent existed —
+        # gateway/run.py::_try_resolve_fallback_provider resolves credentials at
+        # startup/auth-failure and has no caller context or frontier_required
+        # flag to check against. A caller that knows the model it originally
+        # asked for can stamp `_frontier_requested_model` on the agent to close
+        # that window; otherwise the primary-runtime snapshot is used.
+        requested_model=(
+            getattr(agent, "_frontier_requested_model", None)
+            or (getattr(agent, "_primary_runtime", None) or {}).get("model")
+            or agent.model
+        ),
+        served_model=agent.model,
+        frontier_required=frontier_required,
+    )
+
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
