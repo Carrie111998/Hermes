@@ -171,6 +171,25 @@ class TestVisionAutoZaiEndpointAware:
             == "https://api.z.ai/api/paas/v4"
         )
 
+    def test_bigmodel_coding_runtime_uses_glm45v_on_coding_endpoint(self):
+        """The BigModel CN host routes exactly like api.z.ai in auto mode —
+        both hosts of the pair must drive the same endpoint reuse."""
+        provider, client, model, mock_resolve = self._run_auto(
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        )
+
+        assert provider == "zai"
+        assert client is not None
+        assert model == "glm-4.5v"
+        assert mock_resolve.call_args.args[1] == "glm-4.5v"
+        kwargs = mock_resolve.call_args.kwargs
+        assert (
+            kwargs.get("explicit_base_url")
+            == "https://open.bigmodel.cn/api/coding/paas/v4"
+        )
+        assert kwargs.get("explicit_api_key") == "zai-runtime-key"
+        assert kwargs.get("api_mode") == "chat_completions"
+
 
 # ── Explicit mode: prepend the main-runtime endpoint ────────────────────────
 
@@ -258,6 +277,27 @@ class TestVisionExplicitZaiEndpointAware:
         assert calls[0]["model"] == "glm-4.5v"
         assert calls[0]["api_mode"] == "chat_completions"
 
+    def test_bigmodel_anthropic_wire_runtime_rewritten_to_coding_openai_wire(self):
+        """Both Z.AI hosts' /api/anthropic form must map to the OpenAI-wire
+        coding endpoint — not just api.z.ai (#92817 review point 3)."""
+        provider, _client, model, calls = self._run_explicit(
+            {
+                "provider": "zai",
+                "model": "glm-5.3",
+                "base_url": "https://open.bigmodel.cn/api/anthropic",
+                "api_key": "zai-runtime-key",
+                "api_mode": "anthropic_messages",
+            }
+        )
+
+        assert provider == "zai"
+        assert model == "glm-4.5v"
+        assert (
+            calls[0]["base_url"] == "https://open.bigmodel.cn/api/coding/paas/v4"
+        )
+        assert calls[0]["model"] == "glm-4.5v"
+        assert calls[0]["api_mode"] == "chat_completions"
+
     def test_non_zai_main_runtime_keeps_general_urls_and_vision_default(self):
         """When main is not zai, the general-API list remains — but the
         model default becomes the vision model, not the text-only aux
@@ -295,6 +335,114 @@ class TestVisionExplicitZaiEndpointAware:
         assert model == "glm-5v-turbo"
         assert calls[0]["base_url"] == "https://api.z.ai/api/coding/paas/v4"
         assert calls[0]["model"] == "glm-5v-turbo"
+
+
+# ── Auto mode: explicit custom vision config wins over the Z.ai runtime ─────
+
+
+class TestVisionAutoCustomPrecedence:
+    def test_explicit_custom_vision_base_wins_over_zai_main_runtime(self):
+        """An explicit custom vision base_url in config is user intent — a
+        Z.ai-family main endpoint must not silently clobber it (#92817 review
+        point 1)."""
+        fake_client = MagicMock(name="custom_vision_client")
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fake_client, None),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value="custom:zai",
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="glm-5.3",
+        ), patch(
+            "agent.auxiliary_client._read_main_base_url",
+            return_value="https://api.z.ai/api/coding/paas/v4",
+        ), patch(
+            "agent.auxiliary_client._resolve_custom_runtime",
+            return_value=(
+                "https://gateway.example.com/v1",
+                "gateway-key",
+                "chat_completions",
+            ),
+        ):
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client(
+                main_runtime={}
+            )
+
+        assert provider == "custom:zai"
+        assert client is not None
+        kwargs = mock_resolve.call_args.kwargs
+        assert kwargs.get("explicit_base_url") == "https://gateway.example.com/v1"
+        assert kwargs.get("explicit_api_key") == "gateway-key"
+        assert kwargs.get("api_mode") == "chat_completions"
+
+
+# ── Host facts live in the zai plugin; aux delegates to the profile ─────────
+
+
+class TestZaiProfileHostCheck:
+    """``ZaiProfile.is_zai_host_url`` — the single source aux delegates to."""
+
+    def test_profile_accepts_both_hosts(self, zai_profile):
+        assert zai_profile.is_zai_host_url("https://api.z.ai/api/paas/v4") is True
+        assert (
+            zai_profile.is_zai_host_url("https://open.bigmodel.cn/api/anthropic")
+            is True
+        )
+
+    def test_profile_rejects_lookalike_and_path_markers(self, zai_profile):
+        assert (
+            zai_profile.is_zai_host_url("https://api.z.ai.evil.example.com/api/paas/v4")
+            is False
+        )
+        assert (
+            zai_profile.is_zai_host_url(
+                "https://gateway.example.com/api.z.ai/api/paas/v4"
+            )
+            is False
+        )
+        assert zai_profile.is_zai_host_url(None) is False
+
+
+class TestAuxZaiHostCheckDelegation:
+    """aux ``_is_zai_host_url`` asks the registered zai profile and only falls
+    back to its local host pair when the plugin is not loaded."""
+
+    def test_aux_accepts_both_hosts(self, zai_profile):
+        from agent.auxiliary_client import _is_zai_host_url
+
+        assert _is_zai_host_url("https://api.z.ai/api/paas/v4") is True
+        assert _is_zai_host_url("https://open.bigmodel.cn/api/anthropic") is True
+
+    def test_aux_rejects_lookalike_and_path_markers(self, zai_profile):
+        from agent.auxiliary_client import _is_zai_host_url
+
+        assert (
+            _is_zai_host_url("https://api.z.ai.evil.example.com/api/paas/v4")
+            is False
+        )
+        assert (
+            _is_zai_host_url(
+                "https://gateway.example.com/api.z.ai/api/paas/v4"
+            )
+            is False
+        )
+        assert _is_zai_host_url("") is False
+        assert _is_zai_host_url(None) is False
+
+    def test_aux_falls_back_to_local_pair_without_profile(self):
+        from agent.auxiliary_client import _is_zai_host_url
+
+        with patch("providers.get_provider_profile", return_value=None):
+            assert _is_zai_host_url("https://api.z.ai/api/paas/v4") is True
+            assert _is_zai_host_url("https://open.bigmodel.cn/api/paas/v4") is True
+            assert _is_zai_host_url("https://api.z.ai.evil.example.com/x") is False
 
 
 # ── Fallback logging names the endpoint it degraded to ──────────────────────

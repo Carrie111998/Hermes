@@ -1329,7 +1329,9 @@ def _to_openai_base_url(base_url: str) -> str:
     if url.endswith("/anthropic"):
         # ZAI uses /api/anthropic for the Coding Plan's Anthropic wire.  The
         # matching OpenAI-wire endpoint is /api/coding/paas/v4; /api/paas/v4
-        # is the independently billed general API.
+        # is the independently billed general API.  Covers both Z.AI hosts
+        # (api.z.ai and open.bigmodel.cn — the host pair lives in the zai
+        # plugin's _ZAI_HOSTS; keep this table in sync, see #92817).
         if base_url_host_matches(url, "open.bigmodel.cn") or base_url_host_matches(url, "api.z.ai"):
             rewritten = url[: -len("/anthropic")] + "/coding/paas/v4"
             logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
@@ -7307,10 +7309,31 @@ def _is_zai_host_url(base_url: Optional[str]) -> bool:
 
     Host-anchored (never path-anchored) so a lookalike host or a path
     marker on a gateway URL cannot trigger Z.ai-specific routing.
+
+    Z.AI host facts live in exactly one place: ``_ZAI_HOSTS`` in the zai
+    plugin (plugins/model-providers/zai/__init__.py).  This helper delegates
+    to the registered profile's ``is_zai_host_url()`` so an endpoint added
+    there is picked up here automatically.  The local pair below is only a
+    fallback for contexts where provider plugins are not loaded (e.g. CLI
+    surfaces) — keep it in sync with the plugin (#92817).
     """
     url = str(base_url or "").strip()
     if not url:
         return False
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("zai")
+        if profile is not None:
+            checker = getattr(profile, "is_zai_host_url", None)
+            if callable(checker):
+                return bool(checker(url))
+    except Exception:
+        logger.debug(
+            "Auxiliary client: zai host check via profile unavailable; "
+            "using local host pair",
+            exc_info=True,
+        )
     return base_url_host_matches(url, "api.z.ai") or base_url_host_matches(
         url, "open.bigmodel.cn"
     )
@@ -7519,7 +7542,7 @@ def resolve_vision_provider_client(
                             rpc_base_url = custom_base
                             rpc_api_key = custom_key
                             rpc_api_mode = resolved_api_mode or custom_mode or None
-                if zai_main_base:
+                if zai_main_base and rpc_base_url is None:
                     # Reuse the live Z.ai main endpoint so vision consumes the
                     # same billing pool as the main model.  A Coding Plan key
                     # is rejected by the general API (1113) and the coding
@@ -7528,6 +7551,12 @@ def resolve_vision_provider_client(
                     # endpoint is what actually works (#92817).  The OpenAI
                     # wire is mandatory for Z.ai vision (the Anthropic wire
                     # rejects multimodal calls with error 1210).
+                    #
+                    # Precedence: the guard above means an explicit custom
+                    # vision base_url (set in the custom-provider branch from
+                    # user config, above) wins over the runtime-derived
+                    # endpoint — user-explicit config is never silently
+                    # clobbered by the live Z.ai runtime (#92817 review).
                     rpc_base_url = _to_openai_base_url(zai_main_base)
                     rpc_api_key = runtime.get("api_key") or None
                     if isinstance(rpc_api_key, str):

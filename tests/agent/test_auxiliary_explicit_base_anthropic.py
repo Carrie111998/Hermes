@@ -140,3 +140,39 @@ def test_explicit_base_unknown_host_keeps_anthropic_path():
     assert client is not None
     assert not isinstance(client, AnthropicAuxiliaryClient)
     assert _client_base_url(client).rstrip("/").endswith("/proxy/anthropic")
+
+
+# ── Z.AI: /api/anthropic → /api/coding/paas/v4 rewrite table ────────────────
+
+
+_ZAI_ANTHROPIC_REWRITES = [
+    ("https://api.z.ai/api/anthropic", "https://api.z.ai/api/coding/paas/v4"),
+    (
+        "https://open.bigmodel.cn/api/anthropic",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    ),
+]
+
+
+@pytest.mark.parametrize("anthropic_url,expected", _ZAI_ANTHROPIC_REWRITES)
+def test_zai_anthropic_wire_rewrites_to_coding_openai_wire(anthropic_url, expected):
+    """Both Z.AI hosts' /api/anthropic form must map to the OpenAI-wire coding
+    endpoint — the billing pool is preserved, never the general /api/paas/v4
+    (#92817 review point 3)."""
+    from agent.auxiliary_client import _to_openai_base_url
+
+    assert _to_openai_base_url(anthropic_url) == expected
+
+
+def test_zai_openai_wire_urls_pass_through_unchanged():
+    """OpenAI-wire Z.AI URLs (general + coding) are not part of the /anthropic
+    rewrite table and must pass through byte-identical."""
+    from agent.auxiliary_client import _to_openai_base_url
+
+    for url in (
+        "https://api.z.ai/api/paas/v4",
+        "https://open.bigmodel.cn/api/paas/v4",
+        "https://api.z.ai/api/coding/paas/v4",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    ):
+        assert _to_openai_base_url(url) == url

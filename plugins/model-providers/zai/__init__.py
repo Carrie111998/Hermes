@@ -41,10 +41,36 @@ from providers.base import ProviderProfile
 
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
 
-#: Z.AI / BigModel hosts.  Host-anchored matching so a lookalike host
+#: Z.AI / BigModel hosts — the single source of truth for Z.AI host facts.
+#: The shared aux client does NOT keep its own copy: ``agent.auxiliary_client.
+#: _is_zai_host_url`` delegates to :meth:`ZaiProfile.is_zai_host_url` (its
+#: local host pair is only a fallback for contexts where this plugin is not
+#: loaded).  Add any new Z.AI/BigModel endpoint here so every consumer picks
+#: it up in one edit (#92817).  Host-anchored matching so a lookalike host
 #: (``api.z.ai.evil.example.com``) or a path marker on a gateway URL never
 #: triggers endpoint-specific routing.
 _ZAI_HOSTS = ("api.z.ai", "open.bigmodel.cn")
+
+
+def _is_zai_host_url(base_url: str | None) -> bool:
+    """True when *base_url* points at a Z.AI / BigModel host.
+
+    Host-anchored (never path-anchored) and subdomain-tolerant — mirrors
+    ``utils.base_url_host_matches`` semantics — so a lookalike host
+    (``api.z.ai.evil.example.com``) or a path marker on a gateway URL never
+    matches, while a genuine ``*.api.z.ai`` endpoint still does.  The aux
+    client reaches this through :meth:`ZaiProfile.is_zai_host_url`.
+    """
+    url = str(base_url or "").strip()
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _ZAI_HOSTS)
 
 
 def _is_zai_coding_endpoint(base_url: str | None) -> bool:
@@ -157,6 +183,15 @@ def _glm_5_2_reasoning_effort(
 
 class ZaiProfile(ProviderProfile):
     """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort."""
+
+    def is_zai_host_url(self, base_url: str | None = None) -> bool:
+        """Host check delegated from ``agent.auxiliary_client._is_zai_host_url``.
+
+        Public so the shared aux client asks the profile instead of
+        re-deriving Z.AI host facts — when a new Z.AI/BigModel endpoint is
+        added to :data:`_ZAI_HOSTS`, aux picks it up with no change there.
+        """
+        return _is_zai_host_url(base_url)
 
     def default_vision_model(self, base_url: str | None = None) -> str | None:
         """Vision default for the billing pool *base_url* lands on.
