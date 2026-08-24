@@ -47,6 +47,7 @@ export interface DesktopBrand {
   foundrly?: {
     webUrl: string
     adminPortalUrl: string
+    adminChatUrl: string
   }
 }
 

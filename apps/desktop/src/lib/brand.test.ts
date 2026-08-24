@@ -71,6 +71,7 @@ describe('brand manifests', () => {
   it('foundrly manifest declares product web + admin portal URLs', () => {
     expect(foundrlyBrand.foundrly.webUrl).toMatch(/^https:\/\//)
     expect(foundrlyBrand.foundrly.adminPortalUrl).toMatch(/^https:\/\//)
+    expect(foundrlyBrand.foundrly.adminChatUrl).toMatch(/\/admin\/portal\/chat$/)
   })
 })
 

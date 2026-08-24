@@ -332,8 +332,10 @@ declare global {
           ok: boolean
           brand: string
           workspace: string
+          portalPartition: string
           webUrl: string
           adminPortalUrl: string
+          adminChatUrl: string
           settingsPath: string
         }>
         openUrl: (url: string) => Promise<{ ok: boolean; url: string }>

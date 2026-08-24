@@ -12878,13 +12878,16 @@ if (process.env.HERMES_DESKTOP_BRAND === 'foundrly') {
     const FOUNDRLY_SETTINGS_PATH = path.join(app.getPath('userData'), 'foundrly.json')
 
     foundrlyIpcHandle('hermes:foundrly:status', async () => {
-      // Marker string persist:foundrly-home is required by check-brand-separation.
+      // Marker strings persist:foundrly-home and persist:foundrly-portal are
+      // required by check-brand-separation.
       return {
         ok: true,
         brand: 'foundrly',
         workspace: 'persist:foundrly-home',
+        portalPartition: 'persist:foundrly-portal',
         webUrl: BRAND.foundrly?.webUrl ?? 'https://foundrly.intelli-verse-x.ai',
         adminPortalUrl: BRAND.foundrly?.adminPortalUrl ?? 'https://admin.intelli-verse-x.ai/admin/portal',
+        adminChatUrl: BRAND.foundrly?.adminChatUrl ?? 'https://admin.intelli-verse-x.ai/admin/portal/chat',
         settingsPath: FOUNDRLY_SETTINGS_PATH
       }
     })
@@ -12896,6 +12899,51 @@ if (process.env.HERMES_DESKTOP_BRAND === 'foundrly') {
       }
       await shell.openExternal(url)
       return { ok: true, url }
+    })
+
+    const FOUNDRLY_PORTAL_PARTITION = 'persist:foundrly-portal'
+
+    app.on('web-contents-created', (_event, contents) => {
+      contents.on('will-attach-webview', (_attachEvent, webPreferences, params) => {
+        if (params.partition !== FOUNDRLY_PORTAL_PARTITION) {
+          return
+        }
+
+        delete webPreferences.preload
+        webPreferences.nodeIntegration = false
+        webPreferences.contextIsolation = true
+        webPreferences.sandbox = true
+      })
+
+      if (contents.getType() !== 'webview') {
+        return
+      }
+
+      if (contents.session !== session.fromPartition(FOUNDRLY_PORTAL_PARTITION)) {
+        return
+      }
+
+      contents.setWindowOpenHandler(({ url }) => {
+        if (!/^https?:\/\//i.test(url)) {
+          return { action: 'deny' }
+        }
+
+        try {
+          const host = new URL(url).hostname
+          const stayInGuest =
+            host === 'admin.intelli-verse-x.ai' || host.endsWith('.intelli-verse-x.ai')
+
+          if (stayInGuest) {
+            void contents.loadURL(url)
+          } else {
+            void shell.openExternal(url)
+          }
+        } catch {
+          // ignore malformed popup URLs
+        }
+
+        return { action: 'deny' }
+      })
     })
   })()
 }

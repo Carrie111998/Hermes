@@ -20,6 +20,7 @@
   "workspaceLabel": "Foundrly",
   "foundrly": {
     "webUrl": "https://foundrly.intelli-verse-x.ai",
-    "adminPortalUrl": "https://admin.intelli-verse-x.ai/admin/portal"
+    "adminPortalUrl": "https://admin.intelli-verse-x.ai/admin/portal",
+    "adminChatUrl": "https://admin.intelli-verse-x.ai/admin/portal/chat"
   }
 }
