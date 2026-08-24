@@ -190,6 +190,7 @@ gateway:
   reasoning:
     level_default:             "medium (за замовчуванням)"
     level_disabled:            "none (вимкнено)"
+    level_provider_default:    "за замовчуванням провайдера"
     scope_session:             "перевизначення сеансу"
     scope_global:              "глобальна конфігурація"
     status:                    "🧠 **Налаштування мислення**\n\n**Зусилля:** `{level}`\n**Область:** {scope}\n**Показ:** {display}\n\n_Використання:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"

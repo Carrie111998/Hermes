@@ -190,6 +190,7 @@ gateway:
   reasoning:
     level_default:             "medium (verstek)"
     level_disabled:            "none (gedeaktiveer)"
+    level_provider_default:    "verskaffer se verstek"
     scope_session:             "sessie-oorskryf"
     scope_global:              "globale konfigurasie"
     status:                    "🧠 **Redenering-instellings**\n\n**Inspanning:** `{level}`\n**Bereik:** {scope}\n**Vertoon:** {display}\n\n_Gebruik:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"

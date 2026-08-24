@@ -194,6 +194,7 @@ gateway:
   reasoning:
     level_default:             "medium (réamhshocraithe)"
     level_disabled:            "none (díchumasaithe)"
+    level_provider_default:    "réamhshocrú an tsoláthraí"
     scope_session:             "sárú seisiúin"
     scope_global:              "cumraíocht dhomhanda"
     status:                    "🧠 **Socruithe Réasúnaíochta**\n\n**Iarracht:** `{level}`\n**Scóip:** {scope}\n**Taispeáint:** {display}\n\n_Úsáid:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"

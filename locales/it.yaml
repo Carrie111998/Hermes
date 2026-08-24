@@ -190,6 +190,7 @@ gateway:
   reasoning:
     level_default:             "medio (predefinito)"
     level_disabled:            "nessuno (disattivato)"
+    level_provider_default:    "predefinito del provider"
     scope_session:             "override di sessione"
     scope_global:              "configurazione globale"
     status:                    "🧠 **Impostazioni di reasoning**\n\n**Sforzo:** `{level}`\n**Ambito:** {scope}\n**Visualizzazione:** {display}\n\n_Uso:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"

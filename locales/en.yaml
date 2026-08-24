@@ -205,6 +205,7 @@ gateway:
   reasoning:
     level_default:             "medium (default)"
     level_disabled:            "none (disabled)"
+    level_provider_default:    "provider default"
     scope_session:             "session override"
     scope_global:              "global config"
     status:                    "🧠 **Reasoning Settings**\n\n**Effort:** `{level}`\n**Scope:** {scope}\n**Display:** {display}\n\n_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"

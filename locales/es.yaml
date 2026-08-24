@@ -190,6 +190,7 @@ gateway:
   reasoning:
     level_default:             "medium (predeterminado)"
     level_disabled:            "none (deshabilitado)"
+    level_provider_default:    "predeterminado del proveedor"
     scope_session:             "anulación de sesión"
     scope_global:              "configuración global"
     status:                    "🧠 **Ajustes de razonamiento**\n\n**Esfuerzo:** `{level}`\n**Alcance:** {scope}\n**Visualización:** {display}\n\n_Uso:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"
