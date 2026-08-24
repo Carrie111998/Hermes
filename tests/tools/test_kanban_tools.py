@@ -244,7 +244,7 @@ class TestGoalModeHandoffRejectionTool:
             (
                 ("skipped", "empty goal", False, None, False),
                 None,
-                None,
+                "empty goal",
             ),
             (
                 ("done", "achieved", False, None, False),
@@ -252,9 +252,24 @@ class TestGoalModeHandoffRejectionTool:
                 None,
             ),
             (
+                ("done", "malformed response", True, None, False),
+                None,
+                "malformed response",
+            ),
+            (
+                ("done", "achieved", False, None, "false"),
+                None,
+                "judge error: ValueError",
+            ),
+            (
+                ("unknown", "unexpected verdict", False, None, False),
+                None,
+                "judge error: ValueError",
+            ),
+            (
                 None,
                 RuntimeError("boom"),
-                None,
+                "judge error: RuntimeError",
             ),
         ],
         ids=[
@@ -262,6 +277,9 @@ class TestGoalModeHandoffRejectionTool:
             "transport_failure",
             "skipped",
             "success",
+            "parse_failure",
+            "nonboolean_transport_flag",
+            "unknown_verdict",
             "exception",
         ],
     )
