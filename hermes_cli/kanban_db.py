@@ -4869,92 +4869,188 @@ def _extract_ac_text(body: str, ac_ids: list) -> str:
     return "\n".join(chunks)
 
 
+def _task_value(trow: Any, name: str) -> Any:
+    """Return a task-row value without assuming a particular row shape."""
+    if trow is None:
+        return None
+    try:
+        keys = trow.keys()
+    except (AttributeError, TypeError):
+        keys = None
+    if keys is not None and name not in keys:
+        return None
+    try:
+        return trow[name]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+def _load_profile_model_config(assignee: str | None) -> tuple[Any, Any]:
+    """Load a profile's configured default model and provider."""
+    if not isinstance(assignee, str) or not assignee.strip():
+        return None, None
+    from hermes_cli.profiles import get_profile_dir
+
+    config_path = get_profile_dir(assignee.strip()) / "config.yaml"
+    if not config_path.exists():
+        return None, None
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise RoutingContractError(
+            f"profile {assignee!r} config is unreadable: {exc}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise RoutingContractError(
+            f"profile {assignee!r} config must be a mapping"
+        )
+    model_config = config.get("model")
+    if model_config is None:
+        return None, None
+    if not isinstance(model_config, dict):
+        raise RoutingContractError(
+            f"profile {assignee!r} model config must be a mapping"
+        )
+    return model_config.get("default"), model_config.get("provider")
+
+
+def _load_global_default_provider() -> Any:
+    """Load the global configured model provider for model-only routes."""
+    config_path = Path(
+        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    ) / "config.yaml"
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return None
+    model_config = config.get("model")
+    return model_config.get("provider") if isinstance(model_config, dict) else None
+
+
+def _empty_routing_snapshot() -> dict:
+    """Return a routing snapshot with every frozen field unset."""
+    return {
+        "routing_role": None, "routing_model": None,
+        "routing_provider": None, "routing_contract": None,
+        "routing_reason": None, "roster_digest": None,
+        "routing_policy": None, "ac_revision": None,
+        "routing_source": None,
+    }
+
+
+def _raw_routing_snapshot(model: Any, provider: Any, source: str) -> dict:
+    """Validate and freeze a raw model/provider route."""
+    if not isinstance(model, str) or not model.strip():
+        raise RoutingContractError(f"{source} model must be a non-empty string")
+    if not isinstance(provider, str) or not provider.strip():
+        raise RoutingContractError(f"{source} provider must be a non-empty string")
+    snapshot = _empty_routing_snapshot()
+    snapshot.update(
+        routing_model=model.strip(), routing_provider=provider.strip(),
+        routing_source=source,
+    )
+    return snapshot
+
+
+def _semantic_routing_snapshot(
+    role: Any,
+    source: str,
+    phase: str,
+    parsed: Optional[dict] = None,
+    body: str = "",
+) -> dict:
+    """Resolve and freeze a semantic role from the authoritative roster."""
+    if not isinstance(role, str) or not role.strip():
+        raise RoutingContractError(f"{source} role must be a non-empty string")
+    data, roster_digest = _load_roster()
+    roles = data.get("roles") or {}
+    selected = role.strip()
+    entry = roles.get(selected)
+    if not isinstance(entry, dict):
+        raise RoutingContractError(f"role {selected!r} not found in roles.yaml")
+    resolved_source = source
+    if phase == "review":
+        if entry.get("review_capable") is True:
+            resolved_source = "review_capable"
+        else:
+            selected = "reviewer"
+            entry = roles.get(selected)
+            resolved_source = "review_coerced"
+            if not isinstance(entry, dict):
+                raise RoutingContractError("role 'reviewer' not found in roles.yaml")
+    model = entry.get("model")
+    provider = entry.get("provider")
+    if not isinstance(model, str) or not model.strip():
+        raise RoutingContractError(f"role {selected!r} missing valid model in roles.yaml")
+    if not isinstance(provider, str) or not provider.strip():
+        raise RoutingContractError(f"role {selected!r} missing valid provider in roles.yaml")
+    snapshot = _empty_routing_snapshot()
+    snapshot.update(
+        routing_role=selected,
+        routing_model=model.strip(),
+        routing_provider=provider.strip(),
+        roster_digest=roster_digest,
+        routing_policy=json.dumps(
+            {"invocation": entry.get("invocation"),
+             "may_edit": entry.get("may_edit")}, sort_keys=True,
+        ),
+        routing_source=resolved_source,
+    )
+    if parsed:
+        snapshot["routing_contract"] = ROUTING_CONTRACT_VERSION
+        snapshot["routing_reason"] = parsed.get("reason")
+        ac_ids = parsed.get("ac_ids")
+        if ac_ids:
+            text = _extract_ac_text(body, ac_ids)
+            snapshot["ac_revision"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return snapshot
+
 def _resolve_routing_snapshot(
     conn: sqlite3.Connection,
     task_id: str,
     trow: sqlite3.Row,
-    phase: str,  # "implement" | "review"
+    phase: str,
 ) -> dict:
-    """Resolve the Wave 2 routing snapshot for a claim, inside the txn.
-
-    Called from ``claim_task`` / ``claim_review_task`` BEFORE the status CAS
-    flips to ``running``. Returns the dict of snapshot columns to write on
-    the new ``task_runs`` row:
-
-    - No v1 envelope or ``enforcement_required: false`` → all-None dict
-      (unenforced; ``_default_spawn`` falls back to task pins / profile
-      defaults).
-    - Enforced → role resolved from roles.yaml (``reviewer`` for the review
-      phase unless the envelope names a review-capable role), model/provider
-      from the roster entry, ``roster_digest`` = sha256(roles.yaml),
-      ``ac_revision`` = sha256 of the concatenated AC text when ``ac_ids`` is
-      present, and ``routing_policy`` = JSON ``{invocation, may_edit}`` —
-      never skills or reasoning_effort, which stay live task fields.
-
-    Raises :class:`RoutingContractError` on any roster failure; callers emit
-    ``preflight_rejected`` and return None (task stays ready).
-    """
-    body = None
-    if trow is not None and "body" in trow.keys():
-        body = trow["body"]
+    """Resolve the first present claim route by Rev9 precedence, failing closed."""
+    body = _task_value(trow, "body")
     if body is None:
-        row = conn.execute(
-            "SELECT body FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        body = row["body"] if row is not None else None
-    try:
-        parsed = parse_routing_envelope(body or "")
-    except RoutingContractError:
-        # Malformed envelope: fail closed — emit preflight_rejected upstream.
-        raise
-    if not parsed or not parsed.get("enforcement_required"):
-        # Unenforced (no envelope, Wave 1 envelope, or enforcement off):
-        # backfill NULLs so spawn falls back to task pins / profile defaults.
-        return {
-            "routing_role": None,
-            "routing_model": None,
-            "routing_provider": None,
-            "routing_contract": None,
-            "routing_reason": None,
-            "roster_digest": None,
-            "routing_policy": None,
-            "ac_revision": None,
-        }
-    data, roster_digest = _load_roster()
-    roles = data.get("roles") or {}
-    if phase == "review":
-        env_role = parsed.get("role")
-        role = env_role if env_role in _REVIEW_CAPABLE_ROLES else "reviewer"
-    else:
-        role = parsed.get("role")
-    entry = roles.get(role)
-    if not isinstance(entry, dict):
-        raise RoutingContractError(f"role {role!r} not found in roles.yaml")
-    model = entry.get("model")
-    if not model:
-        raise RoutingContractError(f"role {role!r} has no model in roles.yaml")
-    provider = entry.get("provider") or data.get("provider")
-    # Roster policy only — invocation/may_edit. Skills and reasoning_effort
-    # are deliberately NOT frozen: they stay live task fields.
-    routing_policy = json.dumps(
-        {"invocation": entry.get("invocation"), "may_edit": entry.get("may_edit")},
-        sort_keys=True,
+        row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        body = row["body"] if row is not None else ""
+    parsed = parse_routing_envelope(body or "")
+    if parsed and parsed.get("enforcement_required"):
+        return _semantic_routing_snapshot(
+            parsed.get("role"), "envelope", phase, parsed, body or ""
+        )
+
+    task_role = _task_value(trow, "routing_role")
+    if task_role is not None:
+        return _semantic_routing_snapshot(task_role, "task_role", phase)
+
+    model = _task_value(trow, "model_override")
+    provider = _task_value(trow, "provider_override")
+    if provider is not None and model is None:
+        raise RoutingContractError("provider_override requires model_override")
+    if model is not None:
+        if provider is None:
+            _, provider = _load_profile_model_config(_task_value(trow, "assignee"))
+            if provider is None:
+                provider = _load_global_default_provider()
+        return _raw_routing_snapshot(model, provider, "task_override")
+
+    board_role = read_board_metadata().get("default_role")
+    if board_role is not None:
+        return _semantic_routing_snapshot(board_role, "board_default", phase)
+
+    profile_model, profile_provider = _load_profile_model_config(
+        _task_value(trow, "assignee")
     )
-    ac_revision = None
-    ac_ids = parsed.get("ac_ids")
-    if ac_ids:
-        ac_text = _extract_ac_text(body or "", ac_ids)
-        ac_revision = hashlib.sha256(ac_text.encode("utf-8")).hexdigest()
-    return {
-        "routing_role": role,
-        "routing_model": model,
-        "routing_provider": provider,
-        "routing_contract": ROUTING_CONTRACT_VERSION,
-        "routing_reason": parsed.get("reason"),
-        "roster_digest": roster_digest,
-        "routing_policy": routing_policy,
-        "ac_revision": ac_revision,
-    }
+    if profile_model is not None or profile_provider is not None:
+        return _raw_routing_snapshot(
+            profile_model, profile_provider, "profile_default"
+        )
+    raise RoutingContractError("routing unresolved after all configured sources")
+
 
 
 def claim_task(
