@@ -26,6 +26,7 @@ from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
 from events.producers.code_drift_monitor import CodeDriftMonitor, watched_repos
 from events.producers.partial_backlog_monitor import PartialBacklogMonitor
+from events.roster import ROSTER_PATH, RosterError, load_roster
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
@@ -120,6 +121,91 @@ _startup_monotonic: float = 0.0
 # time so stopped-emit can include runtime_seconds without a global wallclock.
 _gateway_stopped_emitted: bool = False
 _gateway_started_at_monotonic: Optional[float] = None
+
+
+def _verify_subscriber_roster() -> None:
+    """Announce any drift between what startup() REGISTERED and the roster.
+
+    The roster (``events/subscriber_roster.json``) is the single source of
+    truth shared with ``scripts/event_bus_retention.py`` and
+    ``hermes_cli/events_doctor.py``.  Keeping those in sync by hand failed
+    twice with operator-visible consequences (see events/roster.py), so the
+    check runs here, at the only place that holds the ANSWER rather than a
+    guess: real subscriber objects, whose ``subscriber_id`` needs no parsing
+    and whose conditional registrations (jobflow-dispatcher's try/except)
+    have already resolved for this boot.
+
+    Report-only by design.  A roster typo must never take down the WhatsApp
+    gateway — so drift logs at ERROR and emits ONE HIGH-priority AGENT_ERROR,
+    which telegram-notifier delivers within a poll cycle.  Emitting after
+    construction is safe: every subscriber seeded its cursor at the bus head
+    during __init__, so this event's rowid is past every cursor and will be
+    delivered rather than skipped.
+    """
+    if _registry is None:
+        return
+    registered = {s.subscriber_id for s in _registry.subscribers if s.subscriber_id}
+    payload: Dict[str, Any] = {
+        "subscriber_id": "roster-check",
+        "registered": sorted(registered),
+        "roster_path": str(ROSTER_PATH),
+    }
+    problems: List[str] = []
+
+    try:
+        roster = load_roster()
+    except RosterError as exc:
+        # Fail LOUD, not closed: the gateway keeps running, but nobody gets to
+        # believe the roster was checked.
+        problems.append(f"roster could not be loaded ({exc})")
+    else:
+        retired = roster.retired
+        unregistered = sorted(roster.live - registered)
+        unlisted = sorted(registered - roster.live)
+        if unregistered:
+            problems.append(
+                "roster says live but startup() registered nothing for: "
+                + ", ".join(unregistered)
+            )
+            payload["live_but_not_registered"] = unregistered
+        if unlisted:
+            problems.append(
+                "registered but not live in the roster: "
+                + ", ".join(
+                    f"{sid} (roster: retired {retired[sid].since})"
+                    if sid in retired else f"{sid} (absent from roster)"
+                    for sid in unlisted
+                )
+            )
+            payload["registered_but_not_live"] = unlisted
+
+    if not problems:
+        logger.info(
+            "EventBus: subscriber roster verified — %d registered subscribers match",
+            len(registered),
+        )
+        return
+
+    detail = "; ".join(problems)
+    payload["error"] = "subscriber roster drift"
+    payload["detail"] = detail
+    logger.error(
+        "EventBus: SUBSCRIBER ROSTER DRIFT — %s. Fix %s (and note that "
+        "scripts/event_bus_retention.py classifies subscriber_cursors rows from it).",
+        detail, ROSTER_PATH,
+    )
+    if _bus is None:
+        return
+    try:
+        from events.schema import EventType, Priority
+        _bus.emit(
+            event_type=EventType.AGENT_ERROR,
+            source="event-bus",
+            payload=payload,
+            priority=Priority.HIGH,
+        )
+    except Exception:
+        logger.exception("Failed to emit subscriber-roster drift event")
 
 
 def startup(adapters: Optional[Dict] = None) -> None:
@@ -218,6 +304,12 @@ def startup(adapters: Optional[Dict] = None) -> None:
     ))
 
     _registry.startup_all()
+
+    # Registration is complete — assert it against the canonical roster before
+    # anything starts polling.  This is the mechanism that makes roster drift
+    # self-announcing instead of surfacing as a nightly retention warning that
+    # tells the operator to prune a live cursor (2026-08-23, af05110a).
+    _verify_subscriber_roster()
 
     # Start subscriber polling thread
     _stop_event.clear()

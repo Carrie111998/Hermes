@@ -1,0 +1,116 @@
+{
+  "_readme": [
+    "CANONICAL ROSTER of Hermes event-bus subscribers. Single source of truth.",
+    "",
+    "Read events/roster.py first -- it defines the schema, the validation rules,",
+    "and why this is a JSON data file rather than a Python constant.",
+    "",
+    "Consumers (add yourself here if you add another):",
+    "  - events/gateway_integration.py startup()  -- asserts the REGISTERED set",
+    "    equals the 'live' set here and emits AGENT_ERROR on any mismatch. This",
+    "    is the mechanism that makes drift self-announcing: the check runs",
+    "    against real subscriber objects, so no id is ever guessed or parsed.",
+    "  - hermes_cli/events_doctor.py               -- derives its required-cursor",
+    "    list from entries flagged \"core\": true.",
+    "  - scripts/event_bus_retention.py (+ the profiles/main mirror)             ",
+    "    -- reads this file WITHOUT importing the package (stdlib json, absolute",
+    "    path) to classify subscriber_cursors rows. It is a --no-agent cron and",
+    "    must stay import-free of agent-src.",
+    "",
+    "WHEN YOU ADD A SUBSCRIBER: register it in startup() and add a \"live\" entry",
+    "here. Forgetting the entry is not silent -- the next gateway boot emits an",
+    "AGENT_ERROR naming it.",
+    "",
+    "WHEN YOU RETIRE A SUBSCRIBER: comment out its register() call, flip its",
+    "entry to \"retired\", set \"since\" and \"cursor_frozen_at_rowid\" to the rowid",
+    "its cursor stopped at (read it from subscriber_cursors). NEVER delete the",
+    "entry while its cursor row survives: the entry is what keeps",
+    "--prune-cursor refusing it and keeps the nightly unknown-cursor warning",
+    "quiet. A retired entry whose cursor later MOVES is reported nightly."
+  ],
+  "version": 1,
+  "subscribers": [
+    {
+      "id": "audit-logger",
+      "status": "live",
+      "core": true,
+      "note": "Seeds its cursor at 0 for a gap-free forensic trail (SEED_CURSOR_AT_CONSTRUCTION=False)."
+    },
+    {
+      "id": "cron-trigger-log",
+      "status": "live"
+    },
+    {
+      "id": "telegram-notifier",
+      "status": "live",
+      "core": true
+    },
+    {
+      "id": "whatsapp-escalator",
+      "status": "live",
+      "core": true
+    },
+    {
+      "id": "digest-composer",
+      "status": "live",
+      "core": true
+    },
+    {
+      "id": "memory-writer",
+      "status": "live",
+      "core": true
+    },
+    {
+      "id": "mailbox-translator",
+      "status": "live",
+      "core": true
+    },
+    {
+      "id": "jobflow-dispatcher",
+      "status": "live",
+      "note": "Registered UNCONDITIONALLY (inside a try/except around the jobflow_dispatch import) so its cursor advances and lag_report() covers it; merely INERT unless HERMES_JOBFLOW_EVENT_DISPATCH is set -- which it currently is ('on'). Absent from the retention script's roster until 2026-08-23, which made the nightly sweep WARN about a live subscriber whose cursor advances every few minutes and tell the operator to prune it. Pruning a live cursor is not cosmetic: the subscriber would resume from a reset position. That drift is the reason this file exists."
+    },
+    {
+      "id": "tracker-intent-applier",
+      "status": "live",
+      "note": "Registered like any other subscriber (so startup_all() builds its IntentApplier and shutdown_all()/lag_report() cover it) but driven by a DEDICATED thread and SKIPPED in the serial poll loop. Its cursor is type-filtered and legitimately advances only when tracker intents arrive -- do NOT add a generic frozen-cursor alarm on the strength of it."
+    },
+    {
+      "id": "critic-trigger",
+      "status": "live"
+    },
+    {
+      "id": "scribe-action-telemetry",
+      "status": "live"
+    },
+    {
+      "id": "scribe-voice-tuning",
+      "status": "live"
+    },
+    {
+      "id": "cron-stale-monitor",
+      "status": "live"
+    },
+    {
+      "id": "telegram-mirror",
+      "status": "retired",
+      "since": "2026-04-28",
+      "cursor_frozen_at_rowid": null,
+      "note": "v1-era shadow-copy of mailbox_message events to the Agent Comms topic. The v2 cutover collapsed Agent Comms and Digests into one scribe_daily topic, which TelegramNotifier already routes mailbox_message to -- keeping this registered duplicated every delivery. Registration commented out at events/gateway_integration.py. No cursor row survives (null above means 'no cursor row expected'); if one ever appears, the nightly sweep reports it. events_doctor kept it in its required list until 2026-07-12, producing a permanent false FAIL on every run -- the third-copy drift this roster removes."
+    },
+    {
+      "id": "scribe-realtime",
+      "status": "retired",
+      "since": "2026-07-18",
+      "cursor_frozen_at_rowid": 513686,
+      "note": "Retired under routing v3 P2 (one-event-one-message): its narrated mailbox_message NOTIFICATION copies duplicated the typed delivery of the same 7 event types (interview/offer landed in THREE topics per event). Typed events are canonical; plain-language bodies live in events/formatting.py. Registration commented out; class + tests kept for history. The retention script listed it as LIVE until 2026-08-23 -- harmless to the cursor logic, but it told every reader the gateway still ran it."
+    },
+    {
+      "id": "devflow-bridge",
+      "status": "retired",
+      "since": "2026-08-06",
+      "cursor_frozen_at_rowid": 514176,
+      "note": "Never registered in startup() -- it was a direct bus.subscribe() consumer running outside the gateway, which is why the register()-vs-roster check cannot see it and why this file, not startup(), is the roster. Retired as dead weight: no producer emits devflow.run_*, and the session-mirror bridge superseded the intended producer on 2026-07-21. Cron paused + watchdog cadence removed. Do not prune; do not re-add to the watchdog's EXPECTED_CADENCE_SECONDS."
+    }
+  ]
+}

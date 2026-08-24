@@ -9,24 +9,30 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from events.paths import (
     audit_log_path, events_db_path, quiet_hours_path,
     telegram_topics_path, telegram_verbosity_path,
 )
+from events.roster import ROSTER_PATH, RosterError, load_roster
 from events.producers.code_drift_monitor import (
     DEFAULT_TRUNK_REF, sample_code_drift, watched_repos,
 )
 
-# telegram-mirror retired 2026-04-28 (scribe_daily topic cutover made it
-# duplicate every mailbox_message); checking it produced a permanent false
-# FAIL on every doctor run until 2026-07-12.
-REQUIRED_SUBSCRIBERS = [
-    "audit-logger", "telegram-notifier", "whatsapp-escalator",
-    "digest-composer", "memory-writer",
-    "mailbox-translator",
-]
+# DERIVED from events/subscriber_roster.json — the entries flagged "core".
+# Hand-maintaining this list is what made the doctor check telegram-mirror for
+# 2.5 months after its 2026-04-28 retirement, a permanent false FAIL on every
+# run until 2026-07-12.  The roster refuses to mark a retired subscriber core,
+# so that failure mode is now unrepresentable rather than merely fixed.
+# Deliberately a SUBSET of the live roster: these are the subscribers whose
+# missing cursor is a doctor-level FAIL, not every registered subscriber.
+def _required_subscribers() -> List[str]:
+    """Core subscriber ids, or [] if the roster is unreadable (reported below)."""
+    try:
+        return list(load_roster().core)
+    except RosterError:
+        return []
 
 
 def _check(name: str, ok: bool, detail: str = "") -> bool:
@@ -173,7 +179,12 @@ def run_doctor(check_telegram_api: bool = True) -> int:
 
             cursors = {row[0] for row in conn.execute(
                 "SELECT subscriber_id FROM subscriber_cursors")}
-            for sub in REQUIRED_SUBSCRIBERS:
+            required = _required_subscribers()
+            if not _check("subscriber roster readable", bool(required),
+                          f"{len(required)} core subscribers"
+                          if required else str(ROSTER_PATH)):
+                issues += 1
+            for sub in required:
                 if not _check(f"subscriber cursor: {sub}",
                               sub in cursors, "present" if sub in cursors else "missing"):
                     issues += 1
