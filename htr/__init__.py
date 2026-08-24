@@ -327,6 +327,13 @@ from htr.state import (
     is_valid_run_transition,
     is_valid_task_transition,
 )
+from htr.artifact_inspection import (
+    inspect_artifact_reference,
+    inspect_attempt_artifacts,
+    inspect_run_artifacts,
+    inspect_task_artifacts,
+)
+from htr.link_inspection import inspect_link_reference, inspect_run_links
 
 __all__ = [
     "ATTEMPT_CANCELLED",
@@ -504,7 +511,13 @@ __all__ = [
     "get_approval",
     "issue_approval",
     "issue_marker_disposition_approval",
+    "inspect_artifact_reference",
+    "inspect_attempt_artifacts",
+    "inspect_link_reference",
+    "inspect_run_artifacts",
     "inspect_run_completion_reconciliation",
+    "inspect_run_links",
+    "inspect_task_artifacts",
     "invoke_approved_run_completion",
     "list_approvals",
     "record_use_outcome",
