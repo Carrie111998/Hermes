@@ -99,10 +99,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
 
       // Workspace-identifying fields may reach the foreground composer only
       // when this event's durable stored-session identity matches the
-      // selected conversation (#92888): a background Kanban worker's
-      // session.info carries ITS PR-worktree cwd/branch, and publishing that
-      // unguarded left the default chat's coding rail pointing at another
-      // session's checkout while the conversation never moved.
+      // selected conversation — see workspaceIdentityMatchesSelectedSession
+      // for why (#92888: a background Kanban worker's session.info carries
+      // ITS PR-worktree cwd/branch, and publishing that unguarded left the
+      // default chat's coding rail pointing at another session's checkout).
       const workspaceIdentityMatches = workspaceIdentityMatchesSelectedSession(payload?.stored_session_id)
 
       if (typeof payload?.cwd === 'string' && workspaceIdentityMatches) {

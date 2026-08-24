@@ -31,6 +31,11 @@ export function workspaceIdentityMatchesSelectedSession(
   const selected = context.$selectedStoredSessionId.get() ?? null
 
   if (!infoStoredSessionId) {
+    // Absent-id publishes stay allowed (#71254). Deliberate, but worth one
+    // debug line: if this class of cross-session leak ever resurfaces via a
+    // lazy path, this is the fastest place to see which event wrote what.
+    console.debug('[session-info] workspace publish allowed on absent stored_session_id')
+
     return true
   }
 
@@ -47,6 +52,13 @@ export function workspaceIdentityMatchesSelectedSession(
 
   // Either id may be the live tip or the lineage root, so ask whether ONE row
   // answers to both rather than assuming which side rotated.
+  //
+  // Cold-start window: $sessions is briefly empty right after boot or a hard
+  // re-home, so a compression-rotated tip's branch update would fail this
+  // lookup and be dropped where the pre-#92888 branch path was unconditional.
+  // The window is one sessions-refresh wide and self-heals on the next
+  // heartbeat (session.info repeats); accepted rather than queued because a
+  // queue would need invalidation on every list mutation to stay honest.
   return context.$sessions
     .get()
     .some(session => sessionMatchesStoredId(session, infoStoredSessionId) && sessionMatchesStoredId(session, selected))
