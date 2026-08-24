@@ -153,16 +153,41 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        assert migrated.execute(
+            "SELECT review_protocol FROM tasks WHERE id = 'legacy'"
+        ).fetchone()[0] == "legacy"
+        fresh_id = kb.create_task(
+            migrated, title="created after migration", assignee="writer"
+        )
+        assert migrated.execute(
+            "SELECT review_protocol FROM tasks WHERE id = ?", (fresh_id,)
+        ).fetchone()[0] == "native_v2"
+
+    # Reopen proves the additive migration is idempotent and does not relabel
+    # work created after the one-time legacy-row boundary.
+    with kb.connect(db_path) as reopened:
+        assert reopened.execute(
+            "SELECT review_protocol FROM tasks WHERE id = 'legacy'"
+        ).fetchone()[0] == "legacy"
+        assert reopened.execute(
+            "SELECT review_protocol FROM tasks WHERE id = ?", (fresh_id,)
+        ).fetchone()[0] == "native_v2"
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "review_assignee" in task_columns
+    assert "review_artifacts" in task_columns
+    assert "scheduled_for" in task_columns
+    assert "due_at" in task_columns
+    assert "pre_notice_sent_at" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
+    assert "idx_tasks_schedule" in indexes
     assert "idx_events_run" in indexes
 
 

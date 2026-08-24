@@ -11,6 +11,14 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
 
+def _mark_legacy_fixture(conn, task_id: str) -> None:
+    """Model a row proven to exist before the native-v2 migration."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET review_protocol = 'legacy' WHERE id = ?", (task_id,)
+        )
+
+
 @pytest.fixture
 def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     home = tmp_path / ".hermes"
@@ -42,6 +50,11 @@ def test_review_tools_redact_handoff_and_route_changes(
             "summary": f"Ready; temporary token was {secret}",
             "metadata": {"token": secret, "tests_run": 7},
             "reviewer": "reviewer",
+            "artifacts": {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "artifacts": [{"path": "dist/x", "sha256": "c" * 64}],
+            },
         })
     )
     assert requested["ok"] is True
@@ -50,12 +63,15 @@ def test_review_tools_redact_handoff_and_route_changes(
         task = kb.get_task(conn, review_worker)
         assert task is not None
         assert task.status == "review"
-        assert task.assignee == "reviewer"
+        assert task.assignee == "builder"
+        assert task.review_assignee == "reviewer"
         handoff = kb.latest_run(conn, review_worker)
         assert handoff is not None
         assert secret not in (handoff.summary or "")
         assert secret not in json.dumps(handoff.metadata)
-        review = kb.claim_review_task(conn, review_worker, claimer="reviewer:1")
+        review = kb.claim_review_task(
+            conn, review_worker, claimer="reviewer:1", actor_profile="reviewer"
+        )
         assert review is not None
 
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
@@ -126,6 +142,7 @@ def test_review_cli_round_trip_preserves_handoff(
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="CLI review", assignee="builder")
+        _mark_legacy_fixture(conn, task_id)
         implementation = kb.claim_task(conn, task_id, claimer="builder:1")
         assert implementation is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -159,6 +176,41 @@ def test_review_cli_round_trip_preserves_handoff(
         assert task.assignee == "builder"
 
 
+def test_cli_cannot_downgrade_new_native_task_by_omitting_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="native CLI mutant", assignee="builder")
+        implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+        assert implementation is not None
+        before = len(kb.list_events(conn, task_id))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementation.current_run_id))
+
+    output = kc.run_slash(
+        f"request-review {task_id} --summary 'attempted downgrade' "
+        "--reviewer reviewer"
+    )
+
+    assert "authenticated writer profile is required" in output
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == implementation.current_run_id
+        assert task.review_assignee is None
+        assert task.review_artifacts is None
+        assert len(kb.list_events(conn, task_id)) == before
+
+
 def test_domain_and_cli_review_handoffs_redact_before_persistence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -170,6 +222,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
 
     with kb.connect() as conn:
         direct_id = kb.create_task(conn, title="direct redaction", assignee="builder")
+        _mark_legacy_fixture(conn, direct_id)
         direct_run = kb.claim_task(conn, direct_id)
         assert direct_run is not None
         assert kb.request_review(
@@ -207,6 +260,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
         assert secret not in json.dumps(event.payload)
 
         cli_id = kb.create_task(conn, title="CLI redaction", assignee="builder")
+        _mark_legacy_fixture(conn, cli_id)
     cli_output = kc.run_slash(
         f'request-review {cli_id} --summary "cli {secret}" '
         f"--metadata '{{\"token\":\"{secret}\"}}'"
@@ -238,7 +292,7 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "metadata=..." in KANBAN_GUIDANCE
     kanban_defaults = DEFAULT_CONFIG["kanban"]
     assert isinstance(kanban_defaults, dict)
-    assert kanban_defaults["review_dispatch"] is True
+    assert kanban_defaults["review_dispatch"] is False
 
     repo_root = Path(__file__).resolve().parents[2]
     review_skill = repo_root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
@@ -259,6 +313,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
     with kb.connect() as conn:
         invalid_id = kb.create_task(conn, title="not review", assignee="builder")
         review_id = kb.create_task(conn, title="review", assignee="builder")
+        _mark_legacy_fixture(conn, review_id)
         assert kb.request_review(conn, review_id, summary="ready")
 
     invalid_output = kc.run_slash(
@@ -319,7 +374,14 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             False,
         ),
     )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
+    rejected = json.loads(tools._handle_request_review({
+        "summary": "Looks ready.",
+        "artifacts": {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "artifacts": [{"path": "dist/x", "sha256": "c" * 64}],
+        },
+    }))
     assert "error" in rejected
     assert "rejected by judge" in rejected["error"]
     with kb.connect() as conn:
