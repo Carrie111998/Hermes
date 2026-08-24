@@ -52,6 +52,17 @@ python scripts/check-windows-footguns.py --all
 
 This catches common cross-platform mistakes (missing `encoding=`, unguarded `signal.SIGKILL`, POSIX-only imports, and more).
 
+### Single-GPU VRAM Contention
+
+On a single-GPU rig running a local model (Ollama, llama.cpp) alongside GPU-bound tools (ComfyUI, Stable Diffusion), the agent's model and the tool compete for VRAM. The degradation is **silent**: `ollama ps` reports `100% GPU` throughout because every layer is still assigned, but free VRAM drops below ~1.5 GB and the WDDM driver demotes compute/KV buffers to system RAM without logging anything. Measured impact on an RTX 3090:
+
+| State | Effect |
+|-------|--------|
+| Model loaded while ComfyUI renders | SDXL render 562s vs. 3s unloaded (187x slower) |
+| ComfyUI rendering while model answers | Prompt eval 24 tok/s vs. 1105 tok/s (45x slower) |
+
+The practical rule: **don't take agent turns while a GPU-bound tool is mid-render on the same card.** Use a GPU-mode switch script (unload model → render → reload) or schedule render checks to avoid agent turns until the render completes.
+
 ---
 
 ## Tier 2
