@@ -15,6 +15,18 @@
 
 ## 0. Changelog
 
+## REV9 GAPS CLOSED
+
+1. Review base role provenance — c53f5f5deb
+2. Claim_rejected same-attempt dedup — a5a8e9caf6
+3. Audit-event error preservation — f3792caa68
+4. Reject malformed modern spawn snapshots — 9d558d69f4
+5. Corrupted spawn lifecycle test — 00c375273b
+6. Event-consumer compatibility docs — 806e73eefa
+7. Backfill terminality from runs — 4d338b9122
+8. Migration cutoff hardening — 2b62652d5f
+9. Plan changelog sync — THIS COMMIT
+
 ### 0.0a Rev9 final-audit closure (shipped)
 
 | Gap | Shipped behavior | Commit |
