@@ -15,6 +15,21 @@
  * bot-initiated sends use `hermes -p <bot> chat --in ~ -c "Bot Chat"`.
  */
 
+// Blobatar's motion sheet. The SDK exports the COMPONENT but deliberately not
+// this stylesheet, so every consumer that wants moving faces pulls it itself
+// and consumers that render none pay nothing. Without it `animate` is a no-op
+// and the faces render correct but static — no error, so the symptom is
+// "nothing moves", not a crash.
+//
+// This plugin is a BUNDLED one (vite glob in contrib/plugins.ts), which is the
+// only reason it can say this at all: runtime plugins loaded from the disk
+// door may import `@hermes/plugin-sdk` and `react` and nothing else
+// (contrib/runtime-loader.ts), so they cannot pull the sheet themselves. That
+// makes this import load-bearing beyond this plugin — while Bot Mode is
+// enabled, it is what animates any runtime plugin's faces too, and disabling
+// Bot Mode stops them. See the `Blobatar` export docs in the SDK.
+import 'blobatar/motion.css'
+
 import * as sdk from '@hermes/plugin-sdk'
 import {
   atom,

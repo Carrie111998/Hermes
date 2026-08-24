@@ -33,6 +33,9 @@ function runtime({ meta } = {}) {
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } }
   }
   const code = source
+    // Bare side-effect imports (blobatar/motion.css) carry no binding the
+    // sandbox needs, and vm has no module loader to resolve them.
+    .replace(/^import '[^']*'\r?\n/gm, '')
     .replace(/^import\s+\*\s+as\s+sdk\s+from '@hermes\/plugin-sdk'\r?\n/m, '')
     .replace(/^import\s+\{[\s\S]*?\}\s+from '@hermes\/plugin-sdk'\r?\n/m, '')
     .replace(/^const \{ McpTab, ToolsetConfigPanel \} = sdk\r?\n/m, '')
@@ -154,6 +157,9 @@ test('composer autocomplete offers the renamed tag and matches on the display na
     sdk: new Proxy({}, { get: () => undefined })
   }
   const code = source
+    // Bare side-effect imports (blobatar/motion.css) carry no binding the
+    // sandbox needs, and vm has no module loader to resolve them.
+    .replace(/^import '[^']*'\r?\n/gm, '')
     .replace(/^import \* as sdk from '@hermes\/plugin-sdk'\r?\n/m, '')
     .replace(/^import\s+\{[\s\S]*?\}\s+from '@hermes\/plugin-sdk'\r?\n/m, '')
     .replace(/^import .* from 'react'\r?\n/m, '')

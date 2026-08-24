@@ -18,11 +18,6 @@
  *  - `ui.*` — the design language, so plugin UI looks native by default.
  */
 
-// Nothing animates without it, and it costs the stylesheet and nothing else
-// when no blobatar sets `animate`. Imported once here so every consumer of the
-// SDK's `Blobatar` gets motion for free.
-import 'blobatar/motion.css'
-
 import { atom, computed, type ReadableAtom } from 'nanostores'
 import type { ReactNode } from 'react'
 
@@ -1455,26 +1450,31 @@ export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 /** Deterministic soft-body avatars from any string (name → face). String
  *  renderer for rasterization; React component for live rendering (the only
  *  one that animates — the string renderer ignores `animate` by design).
- *  `motion.css` is imported once at the top of this file rather than by each
- *  consumer, and that import is a deliberate SIDE EFFECT: it is what makes
- *  `animate` work at all, so every consumer pays the sheet whether or not it
- *  renders a Blobatar. Measured before accepting it (blobatar@2.4.0): 7.9 KB
- *  raw, 1.5 KB gzipped, read from local disk in the desktop app — no network,
- *  no measurable parse. Deferring it to first render would buy that back at
- *  the price of an unanimated first frame, which is the wrong trade.
  *
- *  It also cannot be dropped by accident: blobatar declares
- *  `sideEffects: ["*.css"]`, so no bundler tree-shakes it out from under a
- *  consumer that only imports `Blobatar`. That is first-party — a guarantee
- *  this project keeps, not one it inherits — so it holds only as long as
- *  blobatar's package.json keeps saying so. Do not "optimize" this into a
- *  per-consumer import on either side: the faces would silently stop moving
- *  in whichever surface forgot it, with no error to catch.
+ *  MOTION IS NOT INCLUDED. `Blobatar` renders a correct but STATIC face until
+ *  something on the page has loaded `blobatar/motion.css`; `animate` is a
+ *  no-op without it. The sheet is imported by the bots plugin (its only
+ *  consumer today), not by this entry point, so an SDK consumer that never
+ *  renders a face does not pay for it — 7.9 KB raw / 1.5 KB gzipped.
  *
- *  The one real global claim is the namespace: the sheet registers 15
- *  document-wide `@property --mo-*` typed customs plus the `.mo-*` classes.
- *  Nothing else in this app uses either prefix; a future collision there is
- *  the thing to check, not the byte count. */
+ *  Two consequences worth knowing before you rely on `animate`:
+ *
+ *  - Whether your face moves depends on whether some OTHER surface already
+ *    pulled the sheet in. Nothing errors when it has not; the face just sits
+ *    still. If you need motion, import `blobatar/motion.css` yourself and do
+ *    not assume a sibling did it.
+ *  - RUNTIME plugins (the `<hermes home>/desktop-plugins/<name>/plugin.js`
+ *    disk door) cannot do that: the loader admits only `@hermes/plugin-sdk`
+ *    and `react` specifiers and rejects everything else
+ *    (contrib/runtime-loader.ts). A runtime plugin therefore gets static
+ *    faces whenever no bundled surface has loaded the sheet, and has no way
+ *    to fix it from its own source. Use `animate` there only as a
+ *    progressive enhancement.
+ *
+ *  The sheet's own footprint, once something does load it, is a global
+ *  namespace claim: 15 document-wide `@property --mo-*` typed customs plus
+ *  the `.mo-*` classes. Nothing else in this app uses either prefix; a future
+ *  collision there is the thing to check, not the byte count. */
 export { blobatar as blobatarSvg } from 'blobatar/blob'
 export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll

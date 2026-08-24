@@ -141,6 +141,9 @@ function load({ cacheKeyConnection = 'local' } = {}) {
     sdk: new Proxy({}, { get: () => undefined })
   }
   const code = pluginSource
+    // Bare side-effect imports (blobatar/motion.css) carry no binding the
+    // sandbox needs, and vm has no module loader to resolve them.
+    .replace(/^import '[^']*'\r?\n/gm, '')
     .replace(/^import \* as sdk from '@hermes\/plugin-sdk'\r?\n/m, '')
     .replace(/^import\s+\{[\s\S]*?\}\s+from '@hermes\/plugin-sdk'\r?\n/m, '')
     .replace(/^import .* from 'react'\r?\n/m, '')
