@@ -8,6 +8,8 @@ They must also never see 'The request failed: None' when the gateway result
 dict carries an explicit ``error: None``.
 """
 
+import sys
+
 import pytest
 
 from gateway.run import _normalize_empty_agent_response
@@ -189,4 +191,47 @@ class TestIsEmptyAgentSentinelHelper:
         is_sentinel = self._helper()
         for value in ("hello", "(empty) but also words", "(emptyish)", "0", 123):
             assert not is_sentinel(value), repr(value)
+
+    @staticmethod
+    def _install_fake_agent_package(monkeypatch, tmp_path, anthropic_adapter_source):
+        """Make `agent.anthropic_adapter` resolve to a fake, in-test module."""
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        (agent_dir / "__init__.py").write_text("", encoding="utf-8")
+        (agent_dir / "anthropic_adapter.py").write_text(
+            anthropic_adapter_source, encoding="utf-8"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.delitem(sys.modules, "agent.anthropic_adapter", raising=False)
+        monkeypatch.delitem(sys.modules, "agent", raising=False)
+
+    def test_import_error_falls_back_to_literal(self, monkeypatch, tmp_path):
+        """Standalone/test edge still degrades gracefully on ImportError.
+
+        With the sentinel constant absent from the (fake) module, the lazy
+        ``from ... import`` raises ImportError and the classifier must fall
+        back to the ``"(empty)"`` literal (#92924 review: narrow to
+        ImportError, keep the standalone edge working).
+        """
+        is_sentinel = self._helper()
+        self._install_fake_agent_package(
+            monkeypatch, tmp_path, "# no _EMPTY_TEXT_PLACEHOLDER here\n"
+        )
+        assert is_sentinel("(empty)")
+        assert is_sentinel("   \n")
+        assert not is_sentinel("real answer")
+
+    def test_syntax_error_in_anthropic_adapter_surfaces(self, monkeypatch, tmp_path):
+        """A genuine breakage in agent.anthropic_adapter must NOT be swallowed.
+
+        A syntax error is not an ImportError, so the narrowed handler must let
+        it propagate instead of silently pinning the fallback literal forever
+        (#92924 review: real bugs surface loudly).
+        """
+        is_sentinel = self._helper()
+        self._install_fake_agent_package(
+            monkeypatch, tmp_path, "def broken(:\n"
+        )
+        with pytest.raises(SyntaxError):
+            is_sentinel("(empty)")
 

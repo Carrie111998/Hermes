@@ -51,7 +51,11 @@ def _empty_agent_sentinel_text() -> str:
     try:
         from agent.anthropic_adapter import _EMPTY_TEXT_PLACEHOLDER
         return _EMPTY_TEXT_PLACEHOLDER
-    except Exception:
+    except ImportError:
+        # Standalone/test-use fallback only.  Narrow on purpose: genuine
+        # breakage in agent.anthropic_adapter (e.g. a syntax error) must
+        # raise loudly instead of silently pinning the literal and drifting
+        # from the gateway's classifier (#92924).
         return "(empty)"
 
 

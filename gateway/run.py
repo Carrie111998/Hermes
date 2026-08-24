@@ -4031,7 +4031,11 @@ def _is_empty_agent_sentinel(text: Any) -> bool:
         text = str(text)
     try:
         from agent.anthropic_adapter import _EMPTY_TEXT_PLACEHOLDER
-    except Exception:
+    except ImportError:
+        # Only the standalone/test edge (``agent`` package not importable)
+        # degrades to the literal.  Narrow on purpose: a syntax error or
+        # other genuine breakage in agent.anthropic_adapter must surface
+        # loudly, not silently pin the fallback literal forever (#92924).
         _EMPTY_TEXT_PLACEHOLDER = "(empty)"
     return text.strip() in ("", _EMPTY_TEXT_PLACEHOLDER)
 
@@ -20477,6 +20481,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # looks like a bug; a short explanation is more helpful.
             # Compare stripped text (#92924): whitespace-padded sentinel
             # variants must not slip past the exact-equality check.
+            # The `str(response).strip() != ""` clause deliberately lets a
+            # whitespace-only reply bypass this explainer: that case is
+            # normalized by _normalize_empty_agent_response() below, which
+            # has its own friendly fallback for blank responses.  Only the
+            # non-blank sentinel (incl. padded variants) gets this
+            # tool-results message; this asymmetry is intentional.
             if (
                 isinstance(response, str)
                 and not _intentional_silence
