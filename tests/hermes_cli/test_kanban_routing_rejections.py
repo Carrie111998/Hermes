@@ -169,6 +169,15 @@ def test_corrupted_claimed_run_rejects_spawn_and_accounts_retry(conn, monkeypatc
     assert "incomplete frozen routing snapshot" in json.loads(event["payload"])["reason"]
 
 
+@pytest.mark.parametrize("kind", ["spawn_failed", "spawn_rejected"])
+def test_resume_phase_dual_reads_legacy_and_canonical_spawn_events(conn, kind):
+    """Resume inference accepts old and canonical spawn event kinds."""
+    task_id = kb.create_task(conn, title="resume review", assignee="coder")
+    kb._append_event(conn, task_id, kind, {"retry_status": "review"})
+
+    assert kb._resume_status_from_events(conn, task_id) == "review"
+
+
 @pytest.mark.parametrize("failure_limit, expected_status", [(3, "ready"), (1, "blocked")])
 def test_spawn_rejection_closes_run_and_deduplicates_event(
     conn, monkeypatch, failure_limit, expected_status

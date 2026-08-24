@@ -4854,7 +4854,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'spawn_rejected', "
+        "'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -4994,7 +4995,7 @@ def _load_roster() -> tuple:
     Returns ``(data, digest)`` where ``data`` is the parsed YAML mapping and
     ``digest`` is sha256 of the raw file content. Raises
     :class:`RoutingContractError` on any load / parse failure so the claim
-    transaction can emit ``preflight_rejected`` and leave the task ready.
+    transaction can emit ``claim_rejected`` and leave the task ready.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -5286,7 +5287,7 @@ def _claim_task_once(
             return None
         # Wave 2 routing snapshot (Step 2b): resolve the immutable routing
         # decision BEFORE the CAS flips ready→running. On roster failure we
-        # emit preflight_rejected and return None — the only write in this
+        # emit claim_rejected and return None — the only write in this
         # txn is the event row, so the task stays ready and the dispatch
         # loop's circuit breaker decides the next move. No silent loop.
         trow = conn.execute(
@@ -5428,7 +5429,7 @@ def _claim_review_task_once(
             return None
         # Wave 2 routing snapshot (Step 2b): same pre-CAS resolution as
         # claim_task, but phase="review" → resolves the reviewer role. On
-        # roster failure emit preflight_rejected and return None; the task
+        # roster failure claim_rejected is audited after rollback; the task
         # stays in review and the dispatch loop's circuit breaker decides.
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key, body, "
