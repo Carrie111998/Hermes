@@ -83,6 +83,7 @@ import subprocess
 import sys
 import threading
 import logging
+import uuid
 import time
 import yaml
 from contextvars import ContextVar, Token
@@ -5053,7 +5054,7 @@ def _resolve_routing_snapshot(
 
 
 
-def claim_task(
+def _claim_task_once(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -5109,11 +5110,7 @@ def claim_task(
                 conn, task_id, trow, phase="implement"
             )
         except RoutingContractError as exc:
-            _append_event(
-                conn, task_id, "preflight_rejected",
-                {"reason": str(exc), "phase": "implement"},
-            )
-            return None
+            raise exc
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -5200,7 +5197,7 @@ def claim_task(
     return claimed
 
 
-def claim_review_task(
+def _claim_review_task_once(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -5253,11 +5250,7 @@ def claim_review_task(
                 conn, task_id, trow, phase="review"
             )
         except RoutingContractError as exc:
-            _append_event(
-                conn, task_id, "preflight_rejected",
-                {"reason": str(exc), "phase": "review"},
-            )
-            return None
+            raise exc
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5315,6 +5308,59 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def claim_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Claim review work or durably audit a rejected review route."""
+    attempt_id = str(uuid.uuid4())
+    try:
+        return _claim_review_task_once(
+            conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer
+        )
+    except RoutingContractError as exc:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"attempt_id": attempt_id, "reason": str(exc)},
+            )
+        raise
+
+
+def claim_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Claim implementation work or durably audit a rejected route.
+
+    Routing rejection must escape the main claim transaction so that its
+    rollback completes before the audit event is written in a separate
+    transaction. The exception is then returned to the caller unchanged.
+    """
+    attempt_id = str(uuid.uuid4())
+    try:
+        return _claim_task_once(
+            conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer
+        )
+    except RoutingContractError as exc:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"attempt_id": attempt_id, "reason": str(exc)},
+            )
+        raise
 
 
 def _retry_status_for_run(
@@ -9788,6 +9834,42 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _append_spawn_rejected_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    reason: str,
+    consecutive_failures: int,
+    max_retries: int,
+) -> None:
+    """Append one canonical spawn rejection event per run.
+
+    A missing run id cannot identify a post-claim attempt and is ignored.
+    Callers run this helper inside their lifecycle transaction.
+    """
+    if run_id is None:
+        return
+    existing = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE run_id=? AND kind='spawn_rejected' LIMIT 1",
+        (int(run_id),),
+    ).fetchone()
+    if existing is not None:
+        return
+    _append_event(
+        conn,
+        task_id,
+        "spawn_rejected",
+        {
+            "run_id": int(run_id),
+            "reason": reason[:500],
+            "consecutive_failures": int(consecutive_failures),
+            "max_retries": int(max_retries),
+        },
+        run_id=int(run_id),
+    )
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9898,7 +9980,7 @@ def _record_task_failure(
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
                     conn, task_id,
-                    outcome="gave_up", status="gave_up",
+                    outcome=outcome, status="failed",
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -9918,9 +10000,12 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
-            )
+            if end_run:
+                _append_spawn_rejected_event(
+                    conn, task_id, run_id, error, failures, effective_limit
+                )
+            else:
+                _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
             blocked = True
         else:
             # Below threshold.
@@ -9944,21 +10029,15 @@ def _record_task_failure(
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
                     conn, task_id,
-                    outcome=outcome, status=outcome,
+                    outcome=outcome, status="failed",
                     error=error[:500],
                     metadata={
                         "failures": failures,
                         "retry_status": retry_status,
                     },
                 )
-                _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                    run_id=run_id,
+                _append_spawn_rejected_event(
+                    conn, task_id, run_id, error, failures, effective_limit
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
