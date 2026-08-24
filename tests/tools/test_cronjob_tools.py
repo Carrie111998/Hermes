@@ -387,6 +387,31 @@ class TestUnifiedCronjobTool:
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
 
+    def test_update_attach_to_session_persists_and_is_visible(self):
+        """An attach-only update must persist and be observable via the tool."""
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 1h")
+        )
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                attach_to_session=True,
+            )
+        )
+
+        assert updated["success"] is True
+        assert updated["job"]["attach_to_session"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["attach_to_session"] is True
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["attach_to_session"] is True
+
 
 # =========================================================================
 # Agent-facing surface: per-job model pins are user-owned
