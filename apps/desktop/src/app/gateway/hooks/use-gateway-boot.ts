@@ -360,6 +360,7 @@ export function useGatewayBoot({
 
       if (!gatewayOpen()) {
         await attemptReconnect()
+
         return
       }
 
