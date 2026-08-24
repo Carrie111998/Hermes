@@ -1355,6 +1355,13 @@ export { formatModifierToken } from '@/lib/keybinds/combo'
  *  authors) + its translucent tag fill — so plugin-rendered identities read
  *  the same hue as everywhere else. */
 export { profileColor, profileColorSoft } from '@/lib/profile-color'
+/** Stable connection/profile ownership helpers for routed plugin surfaces. */
+export {
+  buildProfileRouteOwner,
+  evaluateProfileReadiness,
+  profileNamesForConnection,
+  type ProfileRouteOwner
+} from '@/lib/profile-route-owner'
 /** The shared client itself, for invalidation OUTSIDE React (e.g. a
  *  `ctx.socket` frame invalidating a query). Inside components keep using
  *  `useQueryClient`. */

@@ -67,6 +67,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const { McpTab, ToolsetConfigPanel } = sdk
+const createAgentOwner = typeof sdk === 'undefined' ? undefined : sdk.buildProfileRouteOwner
+const createAgentCloneProfiles = typeof sdk === 'undefined' ? undefined : sdk.profileNamesForConnection
+const evaluateCreatedAgentReadiness = typeof sdk === 'undefined' ? undefined : sdk.evaluateProfileReadiness
 // Keep optional exports feature-detected; test harnesses may strip the SDK namespace.
 const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
 // TRUE only on builds whose SkillsView routes `fixedConnection` to the pinned
@@ -8592,7 +8595,7 @@ function useModelOptions(bot = null) {
  * same data the core model picker shows. `value = {provider, model}`;
  * onChange receives the merged patch.
  */
-function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway default' }) {
+function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway default', inheritLabel = 'Inherit (launch profile)' }) {
   const { data, isLoading, error } = useModelOptions(bot)
 
   // Hooks are ALWAYS declared up front, before any conditional return.
@@ -8705,7 +8708,7 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
             jsx(SelectTrigger, { className: 'h-8 rounded-md', children: jsx(SelectValue, {}) }),
             jsxs(SelectContent, {
               children: [
-                jsx(SelectItem, { value: NONE, children: 'Inherit (launch profile)' }),
+                jsx(SelectItem, { value: NONE, children: inheritLabel }),
                 ...providers.map(p =>
                   jsx(
                     SelectItem,
@@ -9680,6 +9683,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const targetLabel = remoteTarget
     ? (connections || []).find(c => c.id === targetConnection)?.label || targetConnection
     : ''
+  const createConnectionId = targetConnection || activeConnectionId || 'local'
+  const targetOwner = createAgentOwner({
+    activeConnectionId,
+    connections,
+    name: remoteTarget ? 'default' : String(host.state?.profile?.get?.() || 'default'),
+    targetConnection
+  })
+  const cloneProfiles = createAgentCloneProfiles(roster, createConnectionId, remoteTarget)
 
   /** Gateway RPC on the create target: the picked connection's default
    *  backend for remote targets, the active gateway otherwise. */
@@ -9690,6 +9701,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
           method,
           params
         )
+      : host.request(method, params)
+
+  /** Profile-scoped RPC after creation. Unlike requestForTarget, this opens the
+   * created profile's socket, so readiness and first-turn checks cannot borrow
+   * the active/default profile's provider state. */
+  const requestForCreatedAgent = (owner, method, params = {}) =>
+    typeof host.requestProfile === 'function'
+      ? host.requestProfile(owner.route, method, params)
       : host.request(method, params)
 
   // Set once ensureAgentCreated() materializes the profile for the live
@@ -9776,7 +9795,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
     }
 
     Promise.all([
-      requestForTarget('profiles.describe', { name: remoteTarget ? 'default' : capSource }),
+      requestForTarget('profiles.describe', { name: capSource }),
       requestForTarget('mcp.catalog', {}).catch(() => null)
     ])
       .then(([res, cat]) => {
@@ -9844,11 +9863,9 @@ function CreateAgentDialog({ open, onClose, roster }) {
       await requestForTarget('profiles.create', {
         name: slug,
         description: descriptionText,
-        // Clone sources are profiles of the TARGET backend. The picker's
-        // roster is the local one, so a remote create always starts from the
-        // remote machine's default (or fresh) — never a local profile name
-        // the remote box doesn't have.
-        clone_from: cloneFrom === '__none__' ? null : remoteTarget ? 'default' : cloneFrom,
+        // Clone choices are already filtered to the target connection, so the
+        // selected name is safe to send unchanged for local and remote homes.
+        clone_from: cloneFrom === '__none__' ? null : cloneFrom,
         no_skills: noSkills,
         // Shared (not copied) auth keeps ONE OAuth/token pool with the main
         // profile, so refreshes can't invalidate each other. Older gateways
@@ -9940,31 +9957,52 @@ function CreateAgentDialog({ open, onClose, roster }) {
           : `Bot "${displayName({ name: slug, title })}" created`
       })
       const wasRemote = remoteTarget
+      const createdOwner = createAgentOwner({
+        activeConnectionId,
+        connections,
+        name: slugCreated,
+        targetConnection: wasRemote ? targetConnection : ''
+      })
+      const readiness = await evaluateCreatedAgentReadiness({
+        owner: createdOwner,
+        requestedProvider: provider,
+        request: requestForCreatedAgent
+      })
       reset()
       onClose()
 
-      if (wasRemote) {
-        // The bot lives on another machine: it appears in the roster via the
-        // union enumeration; chat routes through its own source. No local
-        // canonical chat to birth here.
+      if (!readiness.ready) {
+        noteBotAttention(botRosterKey(createdOwner), readiness.reason || 'missing_config')
+        host.notify({
+          kind: 'warning',
+          message: `Bot created on ${createdOwner.connectionLabel}, but its model is not ready. ${readiness.reason || `Switch to ${createdOwner.connectionLabel} and open Settings → Providers.`}`
+        })
         queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
         return
       }
 
-      $selectedBot.set(slug)
+      $selectedBot.set(slugCreated)
+      $selectedRosterKey.set(botRosterKey(createdOwner))
 
       // Birth the bot's forever chat right away: it introduces itself as
       // the first thing the user sees, and the pin exists from minute one.
       try {
         // Creates, pins, opens, and kicks off the intro in one flow.
-        const sid = await createCanonicalChat(slug)
+        const sid = await createCanonicalChat(createdOwner)
 
-        if (!sid && typeof host.newChat === 'function') {
-          host.newChat(slug)
+        if (!sid && !wasRemote && typeof host.newChat === 'function') {
+          host.newChat(slugCreated)
+        } else if (!sid && wasRemote) {
+          host.notify({
+            kind: 'warning',
+            message: `Bot created on ${createdOwner.connectionLabel}, but its first chat could not be started. Open the Bot from the roster to retry.`
+          })
         }
-      } catch {
-        if (typeof host.newChat === 'function') {
-          host.newChat(slug)
+      } catch (err) {
+        if (!wasRemote && typeof host.newChat === 'function') {
+          host.newChat(slugCreated)
+        } else {
+          host.notifyError(err, `Bot created on ${createdOwner.connectionLabel}, but its first chat could not be started`)
         }
       }
     } catch (err) {
@@ -10044,6 +10082,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                     value: targetConnection || activeConnectionId || 'local',
                     onValueChange: value => {
                       setTargetConnection(value === (activeConnectionId || 'local') ? '' : value)
+                      setCloneFrom('default')
                       // The capability catalog and clone list belong to the
                       // target backend — refetch for the new home. The live
                       // Capabilities tab re-pins to it via fixedConnection on
@@ -10180,8 +10219,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                             labeled(
                               remoteTarget ? `Clone from profile (on ${targetLabel})` : 'Clone from profile',
                               jsxs(Select, {
-                                disabled: remoteTarget,
-                                value: remoteTarget ? 'default' : cloneFrom,
+                                value: cloneFrom,
                                 onValueChange: value => {
                                   setCloneFrom(value)
                                   setCaps(null)
@@ -10198,13 +10236,16 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                         value: '__none__',
                                         children: 'Fresh profile (bundled skills)'
                                       }),
-                                      ...roster.map(b => jsx(SelectItem, { value: b.name, children: b.name }, b.name))
+                                      ...cloneProfiles.map(profile =>
+                                        jsx(SelectItem, { value: profile, children: profile }, profile)
+                                      )
                                     ]
                                   })
                                 ]
                               })
                             ),
                             jsx(ModelPicker, {
+                              bot: remoteTarget ? targetOwner : null,
                               value: { provider, model },
                               onChange: patch => {
                                 if ('provider' in patch) {
@@ -10214,7 +10255,12 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   setModel(patch.model)
                                 }
                               },
-                              placeholderModel: 'inherited from launch profile'
+                              placeholderModel: remoteTarget
+                                ? `inherited from default on ${targetLabel}`
+                                : 'inherited from launch profile',
+                              inheritLabel: remoteTarget
+                                ? `Inherit from default on ${targetLabel}`
+                                : 'Inherit (launch profile)'
                             }),
                             labeled(
                               'SOUL.md (optional — replaces the generated persona)',
@@ -10233,7 +10279,9 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   checked: shareAuth,
                                   onCheckedChange: value => setShareAuth(Boolean(value))
                                 }),
-                                'Share keys & accounts with the main profile'
+                                remoteTarget
+                                  ? `Share keys & accounts with default on ${targetLabel}`
+                                  : 'Share keys & accounts with the main profile'
                               ]
                             }),
                             jsx('div', {
@@ -10330,15 +10378,17 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                       className: 'text-[0.65rem] leading-4 text-(--ui-text-quaternary)',
                                       children: `Catalog from ${caps.source} — unchecked skills are disabled after creation.`
                                     }),
-                                    jsx(HubSkillsSection, {
-                                      forProfile: null,
-                                      onInstalled: name =>
-                                        setCaps(prev =>
-                                          !prev || prev.skills.some(s => s.name === name)
-                                            ? prev
-                                            : { ...prev, skills: [...prev.skills, { name, enabled: true }] }
-                                        )
-                                    })
+                                    remoteTarget
+                                      ? null
+                                      : jsx(HubSkillsSection, {
+                                          forProfile: null,
+                                          onInstalled: name =>
+                                            setCaps(prev =>
+                                              !prev || prev.skills.some(s => s.name === name)
+                                                ? prev
+                                                : { ...prev, skills: [...prev.skills, { name, enabled: true }] }
+                                            )
+                                        })
                                   ]
                                 })
                             : advTab === 'toolsets'
