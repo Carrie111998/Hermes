@@ -441,3 +441,173 @@ def test_registry_dispatch_resolves_bound_parent(monkeypatch):
     # Without a bound parent the explicit error is preserved.
     err = entry.handler({"action": "list"})
     assert "requires a parent agent context" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Backend-configurable sessions (Pi default + OpenCode)
+# ---------------------------------------------------------------------------
+
+class FakeOpenCodeClient(FakePiClient):
+    """Fake OpenCode backend client mirroring agent.opencode_client surface."""
+
+    instances = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.native_session_id = None
+
+    def pending_question_payload(self):
+        return None
+
+    def is_dead(self):
+        return False
+
+
+def test_default_backend_is_pi():
+    parent = Parent()
+    result = payload(ds.delegate_session(action="start", parent_agent=parent))
+    assert result["backend"] == "pi"
+    assert result["pi_session_id"] == result["native_session_id"] == result["session_id"]
+    assert isinstance(FakePiClient.instances[-1], FakePiClient)
+
+
+def test_backend_env_var_selects_opencode(monkeypatch):
+    monkeypatch.setattr(ds, "OpenCodeClient", FakeOpenCodeClient)
+    monkeypatch.setenv("HERMES_DELEGATE_SESSION_BACKEND", "opencode")
+    parent = Parent()
+    result = payload(ds.delegate_session(action="start", parent_agent=parent))
+    assert result["backend"] == "opencode"
+    assert result["native_session_id"]
+    assert result["pi_session_id"] == result["native_session_id"]  # compatibility alias
+
+
+def test_backend_arg_routes_to_opencode_client(monkeypatch):
+    monkeypatch.setattr(ds, "OpenCodeClient", FakeOpenCodeClient)
+    parent = Parent()
+    result = payload(ds.delegate_session(action="start", backend="opencode", parent_agent=parent))
+    assert result["backend"] == "opencode"
+    client = FakeOpenCodeClient.instances[-1]
+    assert client.cwd  # opened in resolved cwd
+    # follow-up send reaches the same client
+    sid = result["session_id"]
+    accepted = payload(ds.delegate_session(action="send", session_id=sid, message="go", parent_agent=parent))
+    assert accepted["accepted"] is True
+    done = wait_for_status(parent, sid, "idle")
+    assert done["last_result"]["text"].startswith("done:")
+
+
+def test_unknown_backend_is_bounded_error():
+    parent = Parent()
+    err = ds.delegate_session(action="start", backend="claude", parent_agent=parent)
+    assert "unknown backend" in err.lower()
+
+
+def test_control_action_with_mismatched_backend_errors(monkeypatch):
+    monkeypatch.setattr(ds, "OpenCodeClient", FakeOpenCodeClient)
+    parent = Parent()
+    started = payload(ds.delegate_session(action="start", backend="opencode", parent_agent=parent))
+    sid = started["session_id"]
+    err = ds.delegate_session(action="send", session_id=sid, message="x", backend="pi", parent_agent=parent)
+    assert "is a opencode delegate session" in err.lower()
+
+
+def test_resume_of_live_session_with_other_backend_errors(monkeypatch):
+    monkeypatch.setattr(ds, "OpenCodeClient", FakeOpenCodeClient)
+    parent = Parent()
+    started = payload(ds.delegate_session(action="start", parent_agent=parent))  # pi
+    sid = started["session_id"]
+    err = ds.delegate_session(action="resume", session_id=sid, backend="opencode", parent_agent=parent)
+    assert "cannot be reopened as a opencode session" in err.lower()
+
+
+def test_metadata_v2_roundtrip_reopens_correct_backend(monkeypatch, tmp_path):
+    monkeypatch.setattr(ds, "OpenCodeClient", FakeOpenCodeClient)
+    parent = Parent()
+    started = payload(ds.delegate_session(action="start", backend="opencode", parent_agent=parent))
+    sid = started["session_id"]
+    native = started["native_session_id"]
+    with ds._SESSION_LOCK:
+        stale = ds._SESSIONS.pop(sid)
+    stale["client"].close()
+
+    meta = ds._load_metadata(sid)
+    assert meta["version"] == 2
+    assert meta["backend"] == "opencode"
+    assert meta["native_session_id"] == native
+
+    # metadata snapshot keeps the pi_session_id alias for one release
+    assert meta["pi_session_id"] == native
+
+    # resume without an explicit backend reopens the stored backend
+    resumed = payload(ds.delegate_session(action="resume", session_id=sid, parent_agent=parent))
+    assert resumed["backend"] == "opencode"
+    client = FakeOpenCodeClient.instances[-1]
+    assert client.native_session_id == native
+
+
+def test_v1_metadata_loads_as_pi(monkeypatch, tmp_path):
+    parent = Parent()
+    sid = "legacy-v1-session"
+    root = ds._session_store_root()
+    root.mkdir(parents=True, exist_ok=True)
+    legacy = {
+        "version": 1,
+        "session_id": sid,
+        "pi_session_id": "pi_native_123",
+        "owner": "parent-session",
+        "cwd": str(tmp_path),
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    ds._metadata_path(sid).write_text(json.dumps(legacy))
+
+    resumed = payload(ds.delegate_session(action="resume", session_id=sid, parent_agent=parent))
+    assert resumed["backend"] == "pi"
+    # pi session id is reused as the native session on resume
+    assert resumed["native_session_id"] == "pi_native_123"
+    # re-persisted as v2
+    assert ds._load_metadata(sid)["version"] == 2
+
+
+def test_list_includes_backend_field(monkeypatch):
+    monkeypatch.setattr(ds, "OpenCodeClient", FakeOpenCodeClient)
+    parent = Parent()
+    pi_row = payload(ds.delegate_session(action="start", parent_agent=parent))
+    oc_row = payload(ds.delegate_session(action="start", backend="opencode", parent_agent=parent))
+
+    listed = payload(ds.delegate_session(action="list", parent_agent=parent))
+    by_id = {row["session_id"]: row for row in listed["sessions"]}
+    assert by_id[pi_row["session_id"]]["backend"] == "pi"
+    assert by_id[oc_row["session_id"]]["backend"] == "opencode"
+    assert "native_session_id" in by_id[pi_row["session_id"]]
+    assert "pi_session_id" in by_id[oc_row["session_id"]]
+
+    # offline durable rows also carry the backend
+    for sid in (pi_row["session_id"], oc_row["session_id"]):
+        with ds._SESSION_LOCK:
+            stale = ds._SESSIONS.pop(sid)
+        stale["client"].close()
+    listed2 = payload(ds.delegate_session(action="list", parent_agent=parent))
+    by_id2 = {row["session_id"]: row for row in listed2["sessions"]}
+    assert by_id2[pi_row["session_id"]]["backend"] == "pi"
+    assert by_id2[oc_row["session_id"]]["backend"] == "opencode"
+
+
+def test_registry_handler_forwards_backend(monkeypatch):
+    from tools import registry as reg
+
+    entry = reg.registry.get_entry("delegate_session")
+    from agent.subagent_lifecycle import bind_subagent_parent
+
+    owner = Parent("backend-forward")
+    with bind_subagent_parent(owner):
+        err = entry.handler({"action": "start", "backend": "bogus"})
+    assert "unknown backend" in err.lower()
+
+
+def test_check_requirements_accepts_opencode_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(ds.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(ds.Path, "home", lambda: tmp_path)  # no ~/.local/bin binaries
+    assert ds.check_delegate_session_requirements() is False
+    monkeypatch.setenv("HERMES_OPENCODE_SERVER_URL", "http://127.0.0.1:1")
+    assert ds.check_delegate_session_requirements() is True
