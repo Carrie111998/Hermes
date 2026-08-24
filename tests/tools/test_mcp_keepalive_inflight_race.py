@@ -1133,3 +1133,92 @@ def test_teardown_sweep_cancels_mixed_families_together():
         assert all("reconnected during" in e for e in errs)
 
     asyncio.run(drive())
+
+
+# ---------------------------------------------------------------------------
+# #48069 final: fold in PR #73377 (luijoc) tools/list drain bound
+# ---------------------------------------------------------------------------
+
+
+def test_discover_tools_bounds_hanging_list_tools(monkeypatch):
+    """PR #73377 (luijoc): ``_discover_tools`` ran ``list_tools`` under the RPC
+    lock with NO timeout, so a transport that hangs after initialize wedged the
+    server permanently. The drain is now bounded via the unified deadline layer
+    (``resolve_timeout('mcp.tool_call')``) and a hung ``list_tools`` raises
+    ``TimeoutError`` (caller reconnects) instead of hanging forever."""
+    import agent.deadline as deadline
+
+    # Force a tiny, fast deadline regardless of config so the hang is bounded
+    # within the test's time budget. The method imports resolve_timeout lazily
+    # from agent.deadline, so patch it there.
+    monkeypatch.setattr(
+        deadline, "resolve_timeout", lambda *a, **k: 0.1, raising=True,
+    )
+
+    server = _make_lifecycle_server("list-drain-hang")
+
+    class _HangingSession:
+        def __init__(self):
+            self.list_calls = 0
+
+        async def list_tools(self, *a, **k):
+            self.list_calls += 1
+            await asyncio.sleep(3600)  # hangs after initialize
+
+    session = _HangingSession()
+    server.session = session
+    # A fresh server advertises tools by default (no initialize_result), so
+    # _discover_tools actually issues list_tools. Stub registration on the
+    # CLASS (instances use __slots__, so instance attrs are read-only) to
+    # avoid touching the real registry.
+    monkeypatch.setattr(
+        type(server), "_register_discovered_tools_if_needed",
+        lambda self: None, raising=True,
+    )
+
+    async def drive():
+        # Must raise TimeoutError (bounded) rather than hang.
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await asyncio.wait_for(server._discover_tools(), timeout=5.0)
+        # The RPC lock is released after the bounded failure so the server is
+        # NOT wedged: a later probe/tool call can take the lock.
+        assert not server._rpc_lock.locked()
+        assert session.list_calls == 1
+
+    asyncio.run(drive())
+
+
+def test_discover_tools_unbounded_when_timeout_is_zero(monkeypatch):
+    """``resolve_timeout`` returning 0/None means "unbounded" per its contract.
+    ``_discover_tools`` then awaits the drain directly (no wait_for wrapper),
+    so a normal fast ``list_tools`` still completes and registers."""
+    import agent.deadline as deadline
+
+    monkeypatch.setattr(
+        deadline, "resolve_timeout", lambda *a, **k: 0, raising=True,
+    )
+
+    server = _make_lifecycle_server("list-drain-unbounded")
+
+    class _FastSession:
+        async def list_tools(self, *a, **k):
+            return _ToolsPage([])
+
+    class _ToolsPage:
+        def __init__(self, tools):
+            self.tools = tools
+            self.nextCursor = None
+
+    server.session = _FastSession()
+    registered = {}
+    monkeypatch.setattr(
+        type(server), "_register_discovered_tools_if_needed",
+        lambda self: registered.setdefault("called", True), raising=True,
+    )
+
+    async def drive():
+        await asyncio.wait_for(server._discover_tools(), timeout=5.0)
+        assert server._tools == []
+        assert registered.get("called") is True
+
+    asyncio.run(drive())

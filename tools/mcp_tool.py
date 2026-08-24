@@ -4051,10 +4051,35 @@ class MCPServerTask:
             return
         async with self._rpc_lock:
             self._list_cache_meta = {}
-            self._tools = await _paginate_full_list(
-                self.session.list_tools, "tools", self.name,
-                cache_meta_out=self._list_cache_meta,
+            # Bound the tools/list drain under the RPC lock (folds in PR
+            # #73377, luijoc, "tools/list drain hang"). A transport that hangs
+            # AFTER initialize but during tools/list would otherwise wedge this
+            # server permanently: the await never returns, the RPC lock is held
+            # forever, and every later keepalive/tool call blocks on it. Bound
+            # it via the unified deadline layer already on main so a hung
+            # list_tools raises TimeoutError (caller triggers reconnect)
+            # instead of hanging. resolve_timeout applies config/env overrides
+            # and platform clamping; the mcp.tool_call key is the same one the
+            # tool-call path uses (Phase 2g, #93830), reused here deliberately.
+            from agent.deadline import resolve_timeout
+
+            _list_timeout = resolve_timeout(
+                "mcp.tool_call", default=_DEFAULT_TOOL_TIMEOUT,
             )
+
+            async def _drain_tools():
+                return await _paginate_full_list(
+                    self.session.list_tools, "tools", self.name,
+                    cache_meta_out=self._list_cache_meta,
+                )
+
+            if _list_timeout and _list_timeout > 0:
+                self._tools = await asyncio.wait_for(
+                    _drain_tools(), timeout=_list_timeout,
+                )
+            else:
+                # 0 / None means "unbounded" per resolve_timeout's contract.
+                self._tools = await _drain_tools()
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:
