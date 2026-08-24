@@ -175,6 +175,23 @@ from gateway.platforms.base import (
 from tools.url_safety import is_safe_url
 
 
+def normalize_reaction_emoji(emoji: Any) -> str:
+    """Normalize an emoji to allowlist form: unicode passes through;
+    custom emojis ``<:name:id>`` / ``<a:name:id>`` reduce to ``name``."""
+    text = str(emoji or "").strip()
+    if not text:
+        return ""
+    if text.startswith("<") and text.endswith(">"):
+        inner = text[1:-1]
+        if inner.startswith("a:"):
+            inner = inner[2:]
+        # NOTE: "<:name:id>"[1:-1] KEEPS a leading colon (":name:id"), so the
+        # plain split(":")[0] yields "". Drop empty segments instead.
+        parts = [part for part in inner.split(":") if part]
+        return parts[0] if parts else ""
+    return text
+
+
 async def _read_url_image_with_redirect_guard(
     session: Any,
     url: str,
@@ -3350,6 +3367,9 @@ class DiscordAdapter(BasePlatformAdapter):
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+
+    def _normalize_reaction_emoji(self, emoji) -> str:
+        return normalize_reaction_emoji(emoji)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
