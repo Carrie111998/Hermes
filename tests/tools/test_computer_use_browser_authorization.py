@@ -419,6 +419,73 @@ def test_daemon_startup_error_names_last_probe_failure(monkeypatch):
         daemon.start()
 
 
+def test_daemon_probe_timeout_clamps_to_remaining_deadline(monkeypatch):
+    """Each probe's timeout must shrink toward the overall startup deadline
+    so a run of slow probes can't overshoot the 15s budget (#93312)."""
+    daemon = _EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    monkeypatch.setattr(daemon, "_START_TIMEOUT_SECONDS", 0.35)
+
+    class _FakeProc:
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(cb.subprocess, "Popen", lambda command, **kw: _FakeProc())
+    monkeypatch.setattr(cb, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+
+    captured_timeouts = []
+
+    def _fake_run(command, **kwargs):
+        if command[1] != "status":
+            raise cb.subprocess.TimeoutExpired(command, kwargs["timeout"])
+        captured_timeouts.append(kwargs["timeout"])
+        raise cb.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError):
+        daemon.start()
+
+    assert len(captured_timeouts) >= 2
+    assert captured_timeouts == sorted(captured_timeouts, reverse=True)
+    assert captured_timeouts[-1] < captured_timeouts[0]
+
+
+def test_daemon_probe_survives_uncommon_subprocess_error(monkeypatch):
+    """A SubprocessError subclass other than TimeoutExpired (e.g. a
+    CalledProcessError, if the probe call ever gains check=True) must be
+    treated as a failed probe, not crash start() with a raw traceback
+    (#93312)."""
+    daemon = _EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    monkeypatch.setattr(daemon, "_START_TIMEOUT_SECONDS", 0.25)
+
+    class _FakeProc:
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(cb.subprocess, "Popen", lambda command, **kw: _FakeProc())
+    monkeypatch.setattr(cb, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+
+    def _fake_run(command, **kwargs):
+        if command[1] == "status":
+            raise cb.subprocess.SubprocessError("boom")
+        return None
+
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="last probe: status probe failed: boom"):
+        daemon.start()
+
+
 # ── standard-mode --grant existing-profile ──────────────────────────────
 
 

@@ -751,6 +751,9 @@ class _EmbeddedCuaDaemon:
             except OSError as exc:
                 probe = None
                 last_probe_detail = f"status probe failed: {exc}"
+            except subprocess.SubprocessError as exc:
+                probe = None
+                last_probe_detail = f"status probe failed: {exc}"
             if probe is not None:
                 if probe.returncode == 0:
                     return
