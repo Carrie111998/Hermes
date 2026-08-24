@@ -13,6 +13,7 @@ Environment variables:
     MATRIX_E2EE_MODE            off | optional | required. Overrides MATRIX_ENCRYPTION
                                 when set. Legacy MATRIX_ENCRYPTION=true maps to required.
     MATRIX_DEVICE_ID            Stable device ID for E2EE persistence across restarts
+    MATRIX_REFRESH_TOKEN        Refresh token for MAS (matrix.org) — rotated on use
     MATRIX_PROXY                HTTP(S) or SOCKS proxy URL for Matrix traffic
     MATRIX_ALLOWED_USERS    Comma-separated Matrix user IDs (@user:server)
     MATRIX_ALLOWED_ROOMS    Comma-separated Matrix room IDs allowed to trigger turns
@@ -829,6 +830,19 @@ def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
     return "required" if legacy_enabled else "off"
 
 
+def _is_m_unknown_token_error(exc: Exception) -> bool:
+    """Return True if *exc* is a Matrix M_UNKNOWN_TOKEN / MUnknownToken error."""
+    try:
+        from mautrix.errors import MatrixInvalidToken  # type: ignore
+
+        if isinstance(exc, MatrixInvalidToken):
+            return True
+    except ImportError:
+        pass
+    text = str(exc).lower()
+    return "m_unknown_token" in text or "unknown_token" in text or getattr(exc, "errcode", "") == "M_UNKNOWN_TOKEN"
+
+
 def _redact_matrix_value(value: Any) -> str:
     """Return a safe, non-reversible preview for Matrix diagnostics."""
     text = str(value or "").strip()
@@ -1214,8 +1228,66 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_DEVICE_ID", ""
         )
         self._device_id_unverified: bool = False
+        self._refresh_token: str = config.extra.get("refresh_token", "") or _startup_env_secret(
+            "MATRIX_REFRESH_TOKEN"
+        )
+        self._refresh_lock: asyncio.Lock = asyncio.Lock()
 
         self._client: Any = None  # mautrix.client.Client
+
+    async def _refresh_access_token(self, api, reason: str = "") -> bool:
+        """Refresh the Matrix access token using the stored refresh token.
+
+        Calls ``POST /_matrix/client/v3/refresh`` with the current
+        ``MATRIX_REFRESH_TOKEN``. On success updates ``api.token``,
+        ``self._access_token`` and rotates ``self._refresh_token`` in
+        memory (best-effort). Returns True on success.
+        """
+        if not self._refresh_token or not self._homeserver:
+            return False
+        async with self._refresh_lock:
+            # Re-check after acquiring lock (another task may have refreshed)
+            if not self._refresh_token:
+                return False
+            try:
+                resp = await api.request(
+                    "POST", "/_matrix/client/v3/refresh", {"refresh_token": self._refresh_token}
+                )
+                # mautrix may return dict or object with access_token attr
+                new_access = None
+                new_refresh = None
+                if isinstance(resp, dict):
+                    new_access = resp.get("access_token")
+                    new_refresh = resp.get("refresh_token")
+                    if not new_refresh:
+                        new_refresh = resp.get("refresh_token")
+                else:
+                    new_access = getattr(resp, "access_token", None)
+                    # mautrix LoginResponse stores unknown fields in unrecognized_
+                    new_refresh = getattr(resp, "refresh_token", None)
+                    if not new_refresh:
+                        unrec = getattr(resp, "unrecognized_", None)
+                        if isinstance(unrec, dict):
+                            new_refresh = unrec.get("refresh_token")
+                if not new_access:
+                    return False
+                self._access_token = new_access
+                try:
+                    api.token = new_access
+                except Exception:
+                    pass
+                if new_refresh and new_refresh != self._refresh_token:
+                    self._refresh_token = new_refresh
+                logger.info(
+                    "Matrix: refreshed access token via MAS (reason=%s)", reason or "unknown"
+                )
+                return True
+            except Exception as exc:
+                if _is_m_unknown_token_error(exc) or "invalid_grant" in str(exc).lower():
+                    logger.error("Matrix: refresh token rejected: %s", exc)
+                else:
+                    logger.warning("Matrix: refresh failed: %s", exc)
+                return False
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
@@ -1831,13 +1903,63 @@ class MatrixAdapter(BasePlatformAdapter):
                     f" (device {effective_device_id})" if effective_device_id else "",
                 )
             except Exception as exc:
-                logger.error(
-                    "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
-                    exc,
-                    exc_info=True,
-                )
-                await api.session.close()
-                return False
+                if _is_m_unknown_token_error(exc):
+                    logger.warning(
+                        "Matrix: whoami failed with M_UNKNOWN_TOKEN, attempting refresh: %s", exc
+                    )
+                    if await self._refresh_access_token(api, reason="whoami M_UNKNOWN_TOKEN"):
+                        try:
+                            resp = await client.whoami()
+                            resolved_user_id = getattr(resp, "user_id", "") or self._user_id
+                            resolved_device_id = str(getattr(resp, "device_id", "") or "")
+                            if resolved_user_id:
+                                self._user_id = str(resolved_user_id)
+                                client.mxid = UserID(self._user_id)
+                            if (
+                                resolved_device_id
+                                and self._device_id
+                                and resolved_device_id != self._device_id
+                            ):
+                                logger.error(
+                                    "Matrix: MATRIX_DEVICE_ID=%s does not match the device "
+                                    "this access token belongs to (%s).",
+                                    self._device_id,
+                                    resolved_device_id,
+                                )
+                                effective_device_id = resolved_device_id
+                            else:
+                                effective_device_id = self._device_id or resolved_device_id
+                            if effective_device_id:
+                                client.device_id = effective_device_id
+                            logger.info(
+                                "Matrix: using access token for %s%s (refreshed)",
+                                self._user_id or "(unknown user)",
+                                f" (device {effective_device_id})" if effective_device_id else "",
+                            )
+                        except Exception as exc2:
+                            logger.error(
+                                "Matrix: whoami failed after refresh — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
+                                exc2,
+                                exc_info=True,
+                            )
+                            await api.session.close()
+                            return False
+                    else:
+                        logger.error(
+                            "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
+                            exc,
+                            exc_info=True,
+                        )
+                        await api.session.close()
+                        return False
+                else:
+                    logger.error(
+                        "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    await api.session.close()
+                    return False
         elif self._password and self._user_id:
             try:
                 resp = await client.login(
@@ -1848,6 +1970,22 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 if resp and hasattr(resp, "device_id"):
                     client.device_id = resp.device_id
+                # Capture refresh token if homeserver returned one (MAS, matrix.org)
+                try:
+                    raw_refresh = None
+                    if isinstance(resp, dict):
+                        raw_refresh = resp.get("refresh_token")
+                    else:
+                        raw_refresh = getattr(resp, "refresh_token", None)
+                        if not raw_refresh:
+                            unrec = getattr(resp, "unrecognized_", None)
+                            if isinstance(unrec, dict):
+                                raw_refresh = unrec.get("refresh_token")
+                    if raw_refresh:
+                        self._refresh_token = str(raw_refresh)
+                        logger.debug("Matrix: captured refresh token from login")
+                except Exception:
+                    pass
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
                 logger.error("Matrix: login failed — %s", exc)
@@ -3043,6 +3181,13 @@ class MatrixAdapter(BasePlatformAdapter):
                 if _sync_msg and isinstance(_sync_msg, str):
                     _lower = _sync_msg.lower()
                     if "m_unknown_token" in _lower or "unknown_token" in _lower:
+                        if await self._refresh_access_token(
+                            client.api, reason="sync M_UNKNOWN_TOKEN"
+                        ):
+                            logger.info(
+                                "Matrix: refreshed token after sync M_UNKNOWN_TOKEN, retrying"
+                            )
+                            continue
                         logger.error(
                             "Matrix: permanent auth error from sync: %s — stopping",
                             _sync_msg,
@@ -3083,12 +3228,20 @@ class MatrixAdapter(BasePlatformAdapter):
                     return
                 # Detect permanent auth/permission failures.
                 err_str = str(exc).lower()
-                if (
+                if _is_m_unknown_token_error(exc) or (
                     "401" in err_str
                     or "403" in err_str
                     or "unauthorized" in err_str
                     or "forbidden" in err_str
                 ):
+                    if _is_m_unknown_token_error(exc):
+                        if await self._refresh_access_token(
+                            client.api, reason=f"sync exception {exc}"
+                        ):
+                            logger.info(
+                                "Matrix: refreshed token after sync exception, retrying"
+                            )
+                            continue
                     logger.error(
                         "Matrix: permanent auth error: %s — stopping sync", exc
                     )
