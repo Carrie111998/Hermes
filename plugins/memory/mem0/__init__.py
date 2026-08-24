@@ -122,7 +122,12 @@ SEARCH_SCHEMA = {
         "what you know about the user (preferences, facts, history, people, "
         "projects, past decisions). For multi-part or multi-hop questions, "
         "call it several times — vary the wording and run follow-up searches "
-        "on what earlier results reveal; one search is rarely enough."
+        "on what earlier results reveal. Stop as soon as results stop being "
+        "useful: if the top results are unrelated to the question or their "
+        "scores are low, do NOT keep rephrasing and re-searching — answer "
+        "from general knowledge and, when it helps, note that memory had "
+        "nothing relevant. Also never call this tool again once the user "
+        "asks you to stop searching."
     ),
     "parameters": {
         "type": "object",
@@ -405,8 +410,11 @@ class Mem0MemoryProvider(MemoryProvider):
             "alone, and do not assume you have no memory.\n"
             "For multi-part or multi-hop questions, run several searches with "
             "different wording/angles and follow-up searches on what the first "
-            "results surface; one search is rarely enough. Keep searching until "
-            "you have every fact the question needs before you answer.\n"
+            "results surface. Stop when the results stop being relevant: if "
+            "searches return unrelated records or low scores, do not keep "
+            "rephrasing — answer from general knowledge and, when it helps, "
+            "note that memory had nothing relevant. Also stop immediately "
+            "when the user asks you to stop searching.\n"
             "Tools: mem0_search to find memories, mem0_add to store facts, "
             f"mem0_update and mem0_delete to manage by ID.{rerank_note}"
         )

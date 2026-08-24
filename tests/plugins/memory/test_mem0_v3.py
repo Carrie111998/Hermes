@@ -260,6 +260,27 @@ class TestMem0V3Config:
         assert "mem0_profile" not in block
         assert "mem0_conclude" not in block
 
+    def test_search_guidance_has_stop_conditions(self):
+        """#93485: the search guidance must tell the agent when to STOP.
+
+        The old text ended with imperatives that encouraged retrying ("vary
+        the wording", "keep searching until you have every fact") with no
+        relevance qualifier, so low-relevance results produced a rephrase-
+        and-research loop that ignored the user's stop instruction.
+        """
+        provider = Mem0MemoryProvider()
+        provider._user_id = "test"
+        block = provider.system_prompt_block()
+        search_schema = provider.get_tool_schemas()[0]
+
+        for text in (block, search_schema["description"]):
+            assert "do NOT keep rephrasing" in text or \
+                "do not keep rephrasing" in text
+            assert "asks you to stop" in text
+        # The unconditional continuation imperative is gone from both sites.
+        assert "Keep searching until" not in block
+        assert "one search is rarely enough" not in search_schema["description"]
+
 
 class TestMem0ModeSwitch:
 
