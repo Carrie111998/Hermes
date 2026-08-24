@@ -1060,6 +1060,60 @@ class TeamsAdapter(BasePlatformAdapter):
             return await self._app.send(chat_id, card)
         return None
 
+    def _is_card_action_authorized(
+        self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
+    ) -> bool:
+        """Authorize an Adaptive Card button click.
+
+        Routes through the shared gateway allowlist/pairing-store check
+        (``GatewayRunner._is_user_authorized``, the same path Slack's and
+        Telegram's button handlers use) instead of comparing the clicker's
+        Teams AAD object ID / conversation ID directly against
+        TEAMS_ALLOWED_USERS. That comparison never matched: every Teams setup
+        doc has operators put an email/UPN in TEAMS_ALLOWED_USERS, which is
+        not the identity Teams hands back on an invoke activity — so approval
+        buttons rejected every clicker, including ones whose plain messages
+        the bot already accepted via pairing-store approval.
+        """
+        from_account = ctx.activity.from_
+        clicker_id = str(
+            getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "") or ""
+        )
+        if not clicker_id:
+            return False
+
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                conversation = getattr(ctx.activity, "conversation", None)
+                source = self.build_source(
+                    chat_id=str(getattr(conversation, "id", "") or clicker_id),
+                    chat_type="dm",
+                    user_id=clicker_id,
+                    user_name=str(getattr(from_account, "name", "") or "") or None,
+                    guild_id=getattr(conversation, "tenant_id", None) or self._tenant_id,
+                )
+                return bool(auth_fn(source))
+            except Exception:
+                logger.debug(
+                    "[teams] Falling back to env-only card-action auth for %s",
+                    clicker_id,
+                    exc_info=True,
+                )
+
+        # Fallback when the runner isn't reachable: same default-deny posture
+        # as before -- require an explicit allowlist or TEAMS_ALLOW_ALL_USERS
+        # opt-in, matched against the raw AAD/conversation ID.
+        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
+        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
+        if allow_all:
+            return True
+        if not allowed_csv:
+            return False
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        return "*" in allowed_ids or clicker_id in allowed_ids
+
     async def _on_card_action(
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
@@ -1078,34 +1132,14 @@ class TeamsAdapter(BasePlatformAdapter):
             )
 
         # Only authorized users may click approval buttons.
-        # Default-deny: require either TEAMS_ALLOWED_USERS or an explicit
-        # TEAMS_ALLOW_ALL_USERS=true opt-in. Without one of these set, the
-        # bot silently treated every clicker as authorized — meaning any
-        # Teams user who could message the bot could approve dangerous commands.
-        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
-        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
-
-        if not allow_all:
-            if not allowed_csv:
-                logger.warning(
-                    "[teams] card action rejected: TEAMS_ALLOWED_USERS not configured "
-                    "and TEAMS_ALLOW_ALL_USERS not set — default deny"
-                )
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(
-                        value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
-                    ),
-                )
+        if not self._is_card_action_authorized(ctx):
             from_account = ctx.activity.from_
             clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and clicker_id not in allowed_ids:
-                logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
-                )
+            logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
+            )
 
         choice_map = {
             "approve_once": "once",
