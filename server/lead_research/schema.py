@@ -178,6 +178,23 @@ CREATE TABLE IF NOT EXISTS research_fact_consumers (
     last_used_at REAL NOT NULL,
     PRIMARY KEY(company_id, shared_fact_id)
 );
+CREATE TABLE IF NOT EXISTS research_search_attempts (
+    id TEXT PRIMARY KEY,
+    company_id TEXT REFERENCES companies(id),
+    shareable INTEGER NOT NULL CHECK(shareable IN (0,1)),
+    organization_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    query_hash TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('empty','failed','succeeded')),
+    reason TEXT,
+    request_count INTEGER NOT NULL DEFAULT 1,
+    attempted_at REAL NOT NULL,
+    retry_after REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    CHECK((shareable=1 AND company_id IS NULL) OR (shareable=0 AND company_id IS NOT NULL))
+);
 -- Candidate corpora are service-only shared inputs.  They deliberately have
 -- no company_id: a later campaign may evaluate them, but importing a corpus
 -- cannot create a tenant lead, organization, research row, or evidence.
@@ -232,6 +249,12 @@ CREATE INDEX IF NOT EXISTS ix_shared_facts_reusable
     ON shared_facts(organization_id, field, status, expires_at);
 CREATE INDEX IF NOT EXISTS ix_tenant_facts_reusable
     ON tenant_facts(company_id, organization_id, field, status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_research_search_attempt_shared
+    ON research_search_attempts(query_hash) WHERE shareable=1;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_research_search_attempt_private
+    ON research_search_attempts(company_id, query_hash) WHERE shareable=0;
+CREATE INDEX IF NOT EXISTS ix_research_search_attempt_retry
+    ON research_search_attempts(shareable, company_id, retry_after);
 -- Evidence reuse reads by tenant, source and age; the tenant index above leads
 -- with campaign_id, which this lookup deliberately does not filter on, so
 -- without this it scanned every evidence row the tenant owns once per run.

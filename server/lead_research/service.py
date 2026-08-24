@@ -11,7 +11,7 @@ from ..db import json_dump, json_load, new_id, now
 from .candidates import CandidateRecord, CandidateRepository
 from .enrichment import FeaturePlanner, satisfied_playbook_fields
 from .discovery import CandidateDiscoveryService
-from .facts import FactRepository
+from .facts import FactRepository, FreshnessPolicy
 from .identity import IdentityResolver
 from .languages import build_market_terms
 from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
@@ -22,7 +22,7 @@ from .profiles import ProfileRepository
 from .qualification import EligibilityService
 from .registry import ProviderRegistry, build_registry
 from .quotes import EvidenceRejected, accept_fact
-from .scoring import FACT_TTL_DAYS, attainable_dimensions, score_lead
+from .scoring import attainable_dimensions, score_lead
 from .sectors import load_sectors
 from .storage import EvidenceRepository
 from .verdicts import SourceCoverage, evaluate_verdict, terminal_value
@@ -573,12 +573,12 @@ class LeadResearchService:
                 source_class, visibility = "public", "public"
             retrieved = stored["envelope"].retrieved_at.timestamp()
             observed = source.retrieved_at or retrieved
+            freshness = FreshnessPolicy(
+                default_ttl_days=definition.freshness_days if definition else 180
+            )
             for field, values in source.facts.items():
                 spans = source.fact_spans.get(field, [])
                 for value, span in zip(values, spans):
-                    ttl_days = FACT_TTL_DAYS.get(
-                        field, definition.freshness_days if definition else 180
-                    )
                     proposed = ResearchFact(
                         organization_id=organization_id,
                         campaign_id=campaign_id,
@@ -597,10 +597,20 @@ class LeadResearchService:
                         mechanically_validated=False,
                         observed_at=observed,
                         retrieved_at=retrieved,
-                        expires_at=observed + ttl_days * 86400,
+                        expires_at=freshness.expires_at(
+                            field, source_class, observed, retrieved,
+                        ),
                     )
                     try:
                         accepted = accept_fact(stored["envelope"], proposed)
+                        accepted = accepted.model_copy(update={
+                            "expires_at": freshness.expires_at(
+                                field,
+                                source_class,
+                                accepted.observed_at,
+                                accepted.retrieved_at,
+                            )
+                        })
                         stored_ids.append(facts.accept(company_id, accepted).id)
                     except (EvidenceRejected, ValueError) as exc:
                         self._try_save_processing_issue(

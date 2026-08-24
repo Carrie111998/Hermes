@@ -11,6 +11,53 @@ from .models import EvidenceSpan, ResearchFact, StoredFact
 
 
 FactPool = Literal["shared", "tenant"]
+DAY_SECONDS = 86_400.0
+
+# A fact's shelf life belongs to the field, not to the page or bundle that
+# happened to carry it. Stable identity facts can outlive volatile intent and
+# hiring signals from the same snapshot.
+FIELD_TTL_DAYS = {
+    "company_name": 3650, "domain": 3650, "registry_id": 3650, "country": 3650,
+    "founded_year": 3650, "website": 365,
+    "sector_ids": 1095, "hs_code": 1095, "product_term": 730, "product_fit": 730,
+    "brands_carried": 365, "certifications": 365, "locations": 365,
+    "countries_served": 365, "market_coverage": 365, "buyer_role": 365,
+    "buyer_type": 365, "employee_count": 365, "store_count": 365,
+    "revenue": 550, "market_cap": 180, "relevant_import_value": 550,
+    "relevant_export_value": 550, "lifecycle_status": 180, "legal_status": 30,
+    "email": 365, "phone": 365, "linkedin_url": 365, "tender": 30,
+    "procurement_intent": 60, "sourcing_intent": 60, "buying_intent": 60,
+    "procurement_signal": 90, "recent_hiring": 30,
+}
+
+
+class FreshnessPolicy:
+    def __init__(
+        self,
+        default_ttl_days: int = 180,
+        *,
+        field_ttl_days: dict[str, int] | None = None,
+        source_ttl_days: dict[str, int] | None = None,
+    ) -> None:
+        if default_ttl_days < 1:
+            raise ValueError("default freshness must be at least one day")
+        self.default_ttl_days = default_ttl_days
+        self.field_ttl_days = {**FIELD_TTL_DAYS, **(field_ttl_days or {})}
+        self.source_ttl_days = dict(source_ttl_days or {})
+
+    def expires_at(
+        self,
+        field: str,
+        source_class: str,
+        observed_at: float | None,
+        retrieved_at: float,
+    ) -> float:
+        basis = observed_at if observed_at is not None else retrieved_at
+        ttl_days = self.field_ttl_days.get(
+            field,
+            self.source_ttl_days.get(source_class, self.default_ttl_days),
+        )
+        return basis + ttl_days * DAY_SECONDS
 
 
 def _hash(value) -> str:

@@ -174,6 +174,45 @@ class DiscoveryQuery(ApiModel):
         return output
 
 
+class ResearchQuery(ApiModel):
+    """One normalized fact lookup, including inputs that affect shareability."""
+
+    company_id: str
+    organization_id: str
+    field: str
+    normalized_query_class: str
+    customer_terms: list[str] = Field(default_factory=list)
+    hidden_label_ids: list[str] = Field(default_factory=list)
+    licensed_source_ids: list[str] = Field(default_factory=list)
+
+
+class SearchScope(ApiModel):
+    company_id: str | None
+    shareable: bool
+
+    @model_validator(mode="after")
+    def scope_matches_visibility(self):
+        if self.shareable and self.company_id is not None:
+            raise ValueError("shareable search scope cannot carry a tenant id")
+        if not self.shareable and not self.company_id:
+            raise ValueError("private search scope requires a tenant id")
+        return self
+
+
+class SearchAttempt(ApiModel):
+    id: str
+    scope: SearchScope
+    organization_id: str
+    field: str
+    query_hash: str
+    source_id: str
+    status: Literal["empty", "failed", "succeeded"]
+    reason: str | None = None
+    request_count: int = Field(default=1, ge=0)
+    attempted_at: float
+    retry_after: float
+
+
 class DiscoveryEstimate(ApiModel):
     kind: Literal["reported", "historical_range", "unavailable"]
     low: int | None = Field(default=None, ge=0)

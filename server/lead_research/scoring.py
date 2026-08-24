@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from time import time
 
+from .facts import FIELD_TTL_DAYS as FACT_TTL_DAYS
 from .models import Claim, LeadScore, ScoringProfile
 
 
@@ -82,20 +83,9 @@ _SUPPORT_SATURATES_AT = 2
 
 # How long a fact stays true, by field. Confidence ages each claim against its
 # own shelf life rather than against one global window: a founding year does not
-# expire, a headcount is good for about a year, an open tender is stale in a
-# week. This is what makes a long-lived shared cache safe to score from — a
-# cached fact that never ages would keep reporting last year's company.
-FACT_TTL_DAYS = {
-    "company_name": 3650, "domain": 3650, "registry_id": 3650, "country": 3650,
-    "sector_ids": 1095, "hs_code": 1095, "product_term": 730, "product_fit": 730,
-    "brands_carried": 365, "certifications": 365, "locations": 365,
-    "countries_served": 365, "market_coverage": 365, "buyer_role": 365,
-    "buyer_type": 365, "employee_count": 365, "store_count": 365,
-    "revenue": 550, "market_cap": 180, "relevant_import_value": 550,
-    "relevant_export_value": 550, "lifecycle_status": 180, "email": 365,
-    "phone": 365, "linkedin_url": 365, "tender": 30,
-    "procurement_intent": 60, "sourcing_intent": 60, "buying_intent": 60,
-}
+# expire, a headcount is good for about a year, an open tender a short time.
+# Persistence and scoring share one field policy so a fact never appears fresh
+# in one layer after the other has expired it.
 _DEFAULT_TTL_DAYS = 180
 _DAY_SECONDS = 86400.0
 # What freshness reports when no claim carries a retrieval time. The old code
