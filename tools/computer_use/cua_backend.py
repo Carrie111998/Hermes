@@ -1452,6 +1452,31 @@ def _parse_key_combo(keys: str) -> Tuple[Optional[str], List[str]]:
     return key, modifiers
 
 
+def _flush_modifier_after(action: str, args: Dict[str, Any]) -> bool:
+    """Return True when an injected action carried modifier state and should
+    be followed by a no-op key flush.
+
+    cua-driver injects chords (hotkey) and modifier-bearing clicks/drags/
+    scrolls via CGEvent on macOS. A lost key-up leaves the OS believing the
+    modifier is still held, which turns the user's own typing into hotkey
+    behaviour until the stuck state is re-synced. Only actions that actually
+    carried modifiers need the flush; plain clicks/keys/type_text are already
+    self-contained key-up events.
+
+    The check is intentionally conservative and silent-failing: a flush is a
+    no-op if the driver rejects the extra key, and it must never change the
+    outcome of the action it follows.
+    """
+    if sys.platform != "darwin":
+        return False
+    if action in {"hotkey", "press_key"}:
+        keys = args.get("keys")
+        if keys:
+            return True  # hotkey is by construction a modifier chord
+        return bool(args.get("key") is None and args.get("modifiers"))
+    return bool(args.get("modifiers")) or bool(args.get("modifier"))
+
+
 # ---------------------------------------------------------------------------
 # Asyncio bridge — one long-lived loop on a background thread
 # ---------------------------------------------------------------------------
@@ -3293,7 +3318,64 @@ class CuaDriverBackend(ComputerUseBackend):
                 "invoked": True,
                 "tool": "bring_to_front",
             }
+        # Post-injection hygiene: cua-driver injects modifier key chords via
+        # CGEvent, and a lost key-up leaves macOS believing ctrl/cmd/fn is
+        # still held — the user's typing then behaves as hotkeys and input
+        # feels "stuck" (see macos-input-troubleshooting skill). After any
+        # action that carries modifier state (hotkey, press_key with
+        # modifiers, click/drag/scroll with modifiers), flush the chord with
+        # a no-op key so the OS modifier state machine is re-synced. F12 has
+        # no default binding on macOS and is deliberately used here; it is
+        # harmless if the target app binds it because this only runs after a
+        # modifier-bearing injection already changed focus semantics.
+        if result.ok and _flush_modifier_after(action, args):
+            self._flush_stuck_modifiers()
         return result
+
+    def _flush_stuck_modifiers(self) -> None:
+        """Re-sync macOS modifier state after a modifier-bearing injection.
+
+        cua-driver's CGEvent injection can lose a modifier key-up under
+        race (window switch, IME toggle, event contention). macOS then
+        believes ctrl/cmd/fn is still held and the user's own keyboard
+        input acts as hotkeys until the state is cleared.
+
+        This prefers the standalone `release-stuck-keys --fix` helper
+        (ships with the macos-input-troubleshooting skill): it re-posts
+        every modifier key-up via CGEvent, which re-syncs the OS state
+        machine without producing any visible key. When the helper is not
+        installed (e.g. fresh machines / CI), fall back to pressing F12
+        with no modifiers through the live session — F12 has no default
+        binding on macOS, produces no text, and nudges the state machine
+        to drop stale presses. Failures are silent: the flush must never
+        change the outcome of the action it follows.
+        """
+        if sys.platform != "darwin":
+            return
+        # Preferred: local helper re-posts all modifier key-ups.
+        try:
+            helper = os.path.expanduser("~/bin/release-stuck-keys")
+            if os.path.exists(helper):
+                subprocess.run(
+                    [helper, "--fix"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                )
+                return
+        except Exception:
+            pass
+        # Fallback: no-op F12 through the live session (self-contained).
+        try:
+            if self._active_pid is None:
+                return
+            args: Dict[str, Any] = {"pid": self._active_pid, "key": "f12"}
+            if self._active_window_id is not None:
+                args["window_id"] = self._active_window_id
+            self._action("press_key", args)
+        except Exception:
+            pass
 
     def click(
         self,
