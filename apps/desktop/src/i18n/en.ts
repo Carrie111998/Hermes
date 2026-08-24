@@ -1257,6 +1257,8 @@ export const en: Translations = {
     sortAlpha: 'A–Z',
     sortMostUsedDesc: '↓ Most used',
     sortLeastUsedAsc: '↑ Least used',
+    viewFlat: 'Flat view',
+    viewGrouped: 'By category',
     enableAll: 'Enable all',
     disableAll: 'Disable all',
     disableUnused: 'Disable unused',

@@ -1126,6 +1126,8 @@ export const zhHant = defineLocale({
     sortAlpha: 'A–Z',
     sortMostUsedDesc: '↓ 最常用',
     sortLeastUsedAsc: '↑ 最少用',
+    viewFlat: '平鋪',
+    viewGrouped: '按分類分組',
     enableAll: '全部啟用',
     disableAll: '全部停用',
     disableUnused: '停用未使用',

@@ -63,7 +63,7 @@ import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { EmbeddedHubPicker } from './embedded-hub-picker'
 import { McpTab } from './mcp-tab'
-import { $skillsSortDesc, $toolsetsSortDesc } from './store'
+import { $skillsGroupedView, $skillsSortDesc, $toolsetsSortDesc } from './store'
 
 // 'hub' is gone as a top-level tab — the Skills Hub browser lives inside the
 // Skills tab now (EmbeddedHubPicker below the installed list). Legacy
@@ -144,6 +144,27 @@ function filteredSkills(skills: SkillInfo[], query: string, desc: boolean): Skil
         !q || includesQuery(skill.name, q) || includesQuery(skill.description, q) || includesQuery(skill.category, q)
     )
     .sort((a, b) => sign * (usageOf(b) - usageOf(a)) || asText(a.name).localeCompare(asText(b.name)))
+}
+
+// Grouped view: bucket by category, preserving each skill's position within
+// its bucket (already sorted by `filteredSkills`), sections ordered A–Z by
+// display name so "General" (uncategorized) falls in with the rest instead
+// of always leading or trailing.
+function groupSkillsByCategory(skills: SkillInfo[]): [string, SkillInfo[]][] {
+  const groups = new Map<string, SkillInfo[]>()
+
+  for (const skill of skills) {
+    const key = categoryFor(skill)
+    const bucket = groups.get(key)
+
+    if (bucket) {
+      bucket.push(skill)
+    } else {
+      groups.set(key, [skill])
+    }
+  }
+
+  return [...groups.entries()].sort(([a], [b]) => prettyName(a).localeCompare(prettyName(b)))
 }
 
 const toolsetCalls = (toolset: ToolsetInfo, toolCalls: Record<string, number>): number =>
@@ -329,6 +350,7 @@ export function SkillsView({
   const toolCallsEpoch = useRef(0)
   const skillsSortDesc = useStore($skillsSortDesc)
   const toolsetsSortDesc = useStore($toolsetsSortDesc)
+  const skillsGroupedView = useStore($skillsGroupedView)
   const [bulkBusy, setBulkBusy] = useState(false)
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
   const [selectedToolset, setSelectedToolset] = useState<string | null>(null)
@@ -399,6 +421,13 @@ export function SkillsView({
   const visibleSkills = useMemo(
     () => (skills ? filteredSkills(skills, query, skillsSortDesc) : []),
     [query, skills, skillsSortDesc]
+  )
+
+  // Only computed in grouped mode — searching still filters within groups,
+  // and a category with no matches simply drops out (no empty section shown).
+  const skillGroups = useMemo(
+    () => (skillsGroupedView ? groupSkillsByCategory(visibleSkills) : null),
+    [skillsGroupedView, visibleSkills]
   )
 
   const visibleToolsets = useMemo(
@@ -568,6 +597,12 @@ export function SkillsView({
 
   const sortButton = (desc: boolean, flip: () => void) => (
     <ListStripButton onClick={flip}>{desc ? t.skills.sortMostUsedDesc : t.skills.sortLeastUsedAsc}</ListStripButton>
+  )
+
+  const groupViewButton = (grouped: boolean, flip: () => void) => (
+    <ListStripButton active={grouped} onClick={flip}>
+      {grouped ? t.skills.viewGrouped : t.skills.viewFlat}
+    </ListStripButton>
   )
 
   // Full-bleed empty state, matching the MCP tab (spans both columns, not a
@@ -822,7 +857,13 @@ export function SkillsView({
                   <ListColumn
                     header={
                       <ListStrip
-                        left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
+                        left={
+                          <>
+                            {sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
+                            <span className="text-muted-foreground/30">·</span>
+                            {groupViewButton(skillsGroupedView, () => $skillsGroupedView.set(!skillsGroupedView))}
+                          </>
+                        }
                         right={
                           <ListStripMenu
                             items={[
@@ -839,20 +880,42 @@ export function SkillsView({
                       />
                     }
                   >
-                    {visibleSkills.map(skill => (
-                      <CapRow
-                        active={activeSkill?.name === skill.name}
-                        busy={bulkBusy}
-                        enabled={skill.enabled}
-                        key={skill.name}
-                        meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
-                        onSelect={() => setSelectedSkill(skill.name)}
-                        onToggle={enabled => void handleToggleSkill(skill, enabled)}
-                        subtitle={skillSubtitle(skill)}
-                        title={skill.name}
-                        toggleLabel={skill.name}
-                      />
-                    ))}
+                    {skillGroups
+                      ? skillGroups.map(([category, rows]) => (
+                          <div key={category}>
+                            <h4 className="truncate px-2 pb-1 pt-2 text-[0.65rem] font-medium uppercase tracking-wide text-muted-foreground/60 first:pt-0">
+                              {prettyName(category)}
+                            </h4>
+                            {rows.map(skill => (
+                              <CapRow
+                                active={activeSkill?.name === skill.name}
+                                busy={bulkBusy}
+                                enabled={skill.enabled}
+                                key={skill.name}
+                                meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
+                                onSelect={() => setSelectedSkill(skill.name)}
+                                onToggle={enabled => void handleToggleSkill(skill, enabled)}
+                                subtitle={skillSubtitle(skill)}
+                                title={skill.name}
+                                toggleLabel={skill.name}
+                              />
+                            ))}
+                          </div>
+                        ))
+                      : visibleSkills.map(skill => (
+                          <CapRow
+                            active={activeSkill?.name === skill.name}
+                            busy={bulkBusy}
+                            enabled={skill.enabled}
+                            key={skill.name}
+                            meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
+                            onSelect={() => setSelectedSkill(skill.name)}
+                            onToggle={enabled => void handleToggleSkill(skill, enabled)}
+                            subtitle={skillSubtitle(skill)}
+                            title={skill.name}
+                            toggleLabel={skill.name}
+                          />
+                        ))}
                   </ListColumn>
                   <DetailColumn footer={t.skills.changesApplyNewSessions}>
                     {activeSkill && (

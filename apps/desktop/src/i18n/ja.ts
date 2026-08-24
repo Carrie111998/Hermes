@@ -1166,6 +1166,8 @@ export const ja = defineLocale({
     sortAlpha: 'A–Z',
     sortMostUsedDesc: '↓ 使用頻度順',
     sortLeastUsedAsc: '↑ 使用頻度が低い順',
+    viewFlat: 'フラット表示',
+    viewGrouped: 'カテゴリ別',
     enableAll: 'すべて有効化',
     disableAll: 'すべて無効化',
     disableUnused: '未使用を無効化',

@@ -97,11 +97,15 @@ beforeEach(() => {
   getProfiles.mockResolvedValue({ profiles: [{ name: 'default', is_default: true }] })
 })
 
-afterEach(() => {
+afterEach(async () => {
   cleanup()
   vi.clearAllMocks()
   // Shared singleton client — drop cached skills/toolsets so each test refetches.
   queryClient.clear()
+  // Persisted view-state atom — reset so a test that flips it doesn't leak
+  // into the next one.
+  const { $skillsGroupedView } = await import('./store')
+  $skillsGroupedView.set(false)
 })
 
 describe('SkillsView toolset management', () => {
@@ -232,6 +236,39 @@ describe('SkillsView toolset management', () => {
       fireEvent.click(sw)
     })
     await waitFor(() => expect(setSkillEnabled).toHaveBeenCalledWith('web-research', false, 'researcher'))
+  })
+
+  it('groups skills by category when the grouped view is toggled on', async () => {
+    getSkills.mockResolvedValue([
+      { name: 'plot-charts', description: 'Charts', category: 'creative', enabled: true, usage: 1 },
+      { name: 'gh-pr-review', description: 'Reviews PRs', category: 'github', enabled: true, usage: 0 },
+      { name: 'gh-issue-triage', description: 'Triages issues', category: 'github', enabled: true, usage: 5 }
+    ])
+
+    const { SkillsView } = await import('./index')
+    await act(async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/skills?tab=skills']}>
+            <SkillsView />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    })
+
+    // Flat by default — no category section headings, all three rows visible.
+    await screen.findByRole('switch', { name: 'plot-charts' })
+    expect(screen.queryByRole('heading', { level: 4 })).toBeNull()
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Flat view'))
+    })
+
+    // Grouped: one heading per category, A–Z, github's two skills sit together.
+    const headers = await screen.findAllByRole('heading', { level: 4 })
+    expect(headers.map(el => el.textContent)).toEqual(['Creative', 'Github'])
+    expect(await screen.findByRole('switch', { name: 'gh-pr-review' })).toBeTruthy()
+    expect(await screen.findByRole('switch', { name: 'gh-issue-triage' })).toBeTruthy()
   })
 
   it('shows the FULL skill in the detail pane — frontmatter metadata + body', async () => {

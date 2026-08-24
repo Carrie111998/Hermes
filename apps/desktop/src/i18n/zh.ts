@@ -1448,6 +1448,8 @@ export const zh: Translations = {
     sortAlpha: 'A–Z',
     sortMostUsedDesc: '↓ 最常用',
     sortLeastUsedAsc: '↑ 最少用',
+    viewFlat: '平铺',
+    viewGrouped: '按分类分组',
     enableAll: '全部启用',
     disableAll: '全部停用',
     disableUnused: '禁用未使用',
