@@ -11,8 +11,8 @@ Verifies the contract documented in Phase 6 v2 of the plan:
     loops back to ``/login`` / ``/auth/*`` are dropped.
   - Invalid/expired cookies are cleared on 401 so the browser doesn't
     keep replaying them.
-  - ``set_session_cookies(refresh_token="")`` does NOT emit the
-    ``hermes_session_rt`` cookie (contract V1: no RT to persist).
+  - Providers that return ``refresh_token=""`` do not emit a dead
+    ``hermes_session_rt`` cookie; Nous sessions use their rotating token.
   - ``/auth/callback?next=…`` honours the same-origin landing path.
 """
 
@@ -72,7 +72,7 @@ def gated_app():
 # ---------------------------------------------------------------------------
 
 
-class TestRefreshTokenCookieDeprecation:
+class TestOptionalRefreshTokenCookie:
     def _build_app(self, *, refresh_token: str):
         app = FastAPI()
 
@@ -99,9 +99,7 @@ class TestRefreshTokenCookieDeprecation:
 
 
     def test_clear_session_cookies_still_emits_rt_deletion(self):
-        """Even when we never wrote the RT cookie, logout/clear should
-        emit a Max-Age=0 deletion to flush stale cookies from old
-        deployments."""
+        """Logout always deletes the RT cookie, including stale rotations."""
         app = FastAPI()
 
         @app.get("/clear")

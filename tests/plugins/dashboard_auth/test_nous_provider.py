@@ -8,8 +8,8 @@ Covers four shapes from Phase 4 of ``.hermes/plans/2026-05-21-dashboard-oauth-au
 4. ``verify_session`` JWT verification — RSA keypair, audience/issuer pinning,
    ``agent_instance_id`` cross-check, ``oauth_contract_version`` tolerance.
 
-Also exercises ``revoke_session`` (no-op) and ``refresh_session``
-(unconditional ``RefreshExpiredError``).
+Also exercises refresh-token rotation, reuse rejection, and the Nous
+``revoke_session`` no-op.
 
 All HTTP is mocked: nothing in this file talks to a real Portal.
 """
@@ -492,11 +492,9 @@ class TestCompleteLogin:
                     redirect_uri="https://hermes.fly.dev/auth/callback",
                 )
 
-    def test_captures_refresh_token_if_present_forward_compat(
-        self, provider, rsa_keypair
-    ):
-        """Forward-compat: contract V1 doesn't issue, but if a future Portal
-        does, we should preserve it in the Session for later use."""
+    def test_auth_code_grant_preserves_refresh_token(self, provider, rsa_keypair):
+        """The v1 grant's opaque refresh token must reach the cookie layer
+        unchanged."""
         access_token = _mint_token(rsa_keypair)
         mock_resp = self._mock_post(
             200,
@@ -649,17 +647,31 @@ class TestRefreshAndRevoke:
         assert session.refresh_token == "rt_rotated_value"
         assert session.provider == "nous"
 
-        # Posts grant_type=refresh_token with the RT in BOTH the body (Portal's
-        # schema requires it there) and the X-Refresh-Token header (log
-        # redaction). Verified against the live preview deploy.
+        # Portal requires the same token in both the form body and the exact
+        # x-nous-refresh-token header.
         _, kwargs = mock_post.call_args
         assert kwargs["data"]["grant_type"] == "refresh_token"
         assert kwargs["data"]["client_id"] == "agent:inst123"
         assert kwargs["data"]["refresh_token"] == "rt_old_value"
         assert kwargs["headers"]["x-nous-refresh-token"] == "rt_old_value"
 
+    def test_reuse_detected_invalid_grant_maps_to_refresh_expired(self, provider):
+        """Map a synthetic replay-related ``invalid_grant`` response to
+        ``RefreshExpiredError``. Portal revocation itself is server-side and is
+        not exercised by this provider-boundary test."""
+        mock_resp = self._mock_post(
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "refresh token reuse detected",
+            },
+        )
+        with patch("plugins.dashboard_auth.nous.httpx.post", return_value=mock_resp):
+            with pytest.raises(RefreshExpiredError, match="invalid_grant"):
+                provider.refresh_session(refresh_token="rt_replayed_value")
 
-    def test_revoke_is_noop(self, provider):
+
+    def test_logout_revoke_is_noop_without_portal_endpoint(self, provider):
         # Must not raise; returns None implicitly.
         assert provider.revoke_session(refresh_token="anything") is None
         assert provider.revoke_session(refresh_token="") is None

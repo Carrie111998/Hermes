@@ -988,24 +988,29 @@ The provider implements the [Nous Portal OAuth contract v1](https://github.com/N
 2. Login page shows a "Continue with Nous Research" button → `/auth/login?provider=nous`.
 3. Server stashes PKCE state in a short-lived cookie, redirects user to `https://portal.nousresearch.com/oauth/authorize?…`.
 4. User authenticates with Portal, lands at `/auth/callback?code=…&state=…`.
-5. Server exchanges the code for an access token at `POST /api/oauth/token`, verifies the JWT signature against the Portal's JWKS (`/.well-known/jwks.json`), and sets the `hermes_session_at` cookie.
+5. Server exchanges the code for an access token and a rotating refresh token at `POST /api/oauth/token`, verifies the access-token JWT against the Portal's JWKS (`/.well-known/jwks.json`), and sets the session cookies.
 6. User is redirected to `/` (or to the original deep-link path via the `next=` query parameter).
 
-Access tokens have a 15-minute TTL. **There is no refresh token in contract v1** — when the token expires, the SPA's fetch wrapper detects the 401 envelope and full-page-navigates back to `/login` to re-run the flow.
+Portal access tokens expire after 15 minutes. Refresh tokens expire server-side after 24 hours. When the browser no longer has a valid access token, the dashboard gate submits the refresh token to `POST /api/oauth/token` with `grant_type=refresh_token`. A successful refresh replaces both token cookies, so the next refresh uses the rotated token rather than replaying the previous one.
+
+Portal permits a 60-second grace window for an in-flight request that races with rotation. Reusing an older refresh token outside that window revokes the whole Portal dashboard session. Expired, revoked, and reuse-detected refresh tokens all produce a 400 response from Portal; Hermes clears its session cookies and requires a fresh login.
 
 ### Cookies set
 
 | Name | Lifetime | Notes |
 |------|----------|-------|
 | `hermes_session_at` | Token TTL (15 min) | HttpOnly, SameSite=Lax, Secure-when-HTTPS |
+| `hermes_session_rt` | Browser Max-Age: 30 days; Portal token TTL: 24 hours | HttpOnly, SameSite=Lax, Secure-when-HTTPS. Replaced after every successful refresh. The longer browser lifetime does not extend the server-side token TTL. |
+| `hermes_session_provider` | 30 days | HttpOnly, SameSite=Lax, Secure-when-HTTPS. Non-secret hint that routes refresh to the provider that issued the token. |
 | `hermes_session_pkce` | 10 min | HttpOnly; holds the PKCE verifier + provider hint during the round trip. SameSite=None + Secure over HTTPS (must survive the cross-site IDP redirect chain — Chromium drops SameSite=Lax cookies set on a 302 in a cross-site chain); SameSite=Lax on loopback HTTP |
-| `hermes_session_rt` | unused in v1 | Reserved for forward-compat; not written when `refresh_token` is empty |
 
-All three are `Path=/`. The session cookies are `SameSite=Lax`; the PKCE cookie is `SameSite=None` when set over HTTPS (see table). The `Secure` flag is set when the dashboard is reached over HTTPS (detected via the request URL scheme — honours `X-Forwarded-Proto` from an upstream TLS terminator under `proxy_headers=True`).
+Cookie paths follow the active dashboard prefix: `Path=/` for a direct deployment and the configured prefix, such as `Path=/hermes`, behind a prefixed reverse proxy. The session and provider-hint cookies are `SameSite=Lax`; the PKCE cookie is `SameSite=None` when set over HTTPS (see table). The `Secure` flag is set when the dashboard is reached over HTTPS, as detected from the request URL scheme. This honours `X-Forwarded-Proto` from an upstream TLS terminator under `proxy_headers=True`.
 
 ### Logout
 
-The sidebar widget shows `Logged in as <user_id…> via nous` with a logout icon. Clicking it POSTs `/auth/logout`, which clears all dashboard-auth cookies and redirects back to `/login`.
+The sidebar widget shows `Logged in as <user_id…> via nous` with a logout icon. Clicking it POSTs `/auth/logout`, asks each registered provider to revoke the refresh token, clears the access-token, refresh-token, provider-hint, and PKCE cookies, and redirects back to `/login`.
+
+Nous Portal does not currently expose a token-revocation endpoint to Hermes, so the Nous provider's revoke operation is a no-op. Logging out removes the browser's token copies but does not invalidate the refresh token at Portal. That token remains valid until its 24-hour expiry unless Portal revokes the session through reuse detection or an operator revokes the Portal session. Use Portal's **Sessions** page when server-side invalidation is required.
 
 ### Audit log
 

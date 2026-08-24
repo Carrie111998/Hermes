@@ -1,10 +1,11 @@
 """Cookie helpers for dashboard auth.
 
-Three cookies in play:
+The OAuth round trip uses four primary cookies:
   - hermes_session_at:   the OAuth access token
                          (HttpOnly, lifetime = token TTL, ~15 min)
   - hermes_session_rt:   the OAuth refresh token
-                         (HttpOnly, lifetime = 24h, ROTATING + reuse-detected)
+                         (HttpOnly, browser Max-Age = 30 days; Portal token TTL
+                         = 24h, rotating + reuse-detected)
                          Nous Portal issues a rotating refresh token for the
                          dashboard auth-code grant (Portal NAS #293 / hermes
                          #37247). ``set_session_cookies`` writes this cookie
@@ -14,11 +15,13 @@ Three cookies in play:
                          provider that omits the refresh token (empty string)
                          degrades gracefully to access-token-only sessions —
                          the RT cookie is simply not written.
+  - hermes_session_provider: non-secret refresh-routing hint
+                         (HttpOnly, browser Max-Age = 30 days)
   - hermes_session_pkce: short-lived PKCE state + CSRF nonce + provider
                          hint (HttpOnly, lifetime = 10 minutes)
 
-The two session cookies are ``SameSite=Lax`` and live under the prefix's
-Path. The PKCE cookie is the exception: ``SameSite=None`` over HTTPS,
+The token and provider-hint cookies are ``SameSite=Lax`` and live under the
+prefix's Path. The PKCE cookie is the exception: ``SameSite=None`` over HTTPS,
 falling back to ``Lax`` on plain HTTP (where ``SameSite=None`` is invalid
 without ``Secure``). It is set on the ``/auth/login`` 302 and must survive
 the cross-site redirect chain out to the IDP and back to
@@ -204,7 +207,8 @@ def set_session_cookies(
         max_age=access_token_expires_in,
         **_common_attrs(use_https=use_https, prefix=prefix),
     )
-    # Contract v1: empty refresh token means "don't persist RT cookie".
+    # An empty refresh token means "don't persist an RT cookie" for providers
+    # that do not issue one.
     # Keeping a literal empty-value cookie around would be dead state at
     # best, attack surface at worst.
     if refresh_token:

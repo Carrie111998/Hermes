@@ -245,9 +245,8 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         """Rotate the access token using the refresh token.
 
         Posts ``grant_type=refresh_token`` to Portal's token endpoint. The
-        refresh token is sent in the ``X-Refresh-Token`` header (not the body)
-        so it never lands in Portal's request-body access logs — mirroring the
-        device-flow CLI convention; Portal reconciles header vs. body and
+        endpoint requires the refresh token in the form body and in the exact
+        ``x-nous-refresh-token`` header. Portal reconciles the two values and
         rejects conflicts.
 
         Portal rotates the refresh token on every successful refresh, so the
@@ -257,8 +256,9 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         — trips reuse-detection and revokes the whole session.
 
         Raises ``RefreshExpiredError`` on a 400 (expired / revoked / reuse-
-        detected), so the middleware clears cookies and forces re-login.
-        Raises ``ProviderError`` if Portal is unreachable.
+        detected), which lets the middleware clear the dead session cookies and
+        require fresh authentication. Raises ``ProviderError`` if Portal is
+        unreachable.
         """
         if not refresh_token:
             # No RT to present — treat as a dead session so middleware
@@ -268,17 +268,11 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         try:
             response = httpx.post(
                 self._token_url,
-                # The refresh token goes in BOTH the body and the
-                # ``x-nous-refresh-token`` header. Portal's token endpoint
-                # requires ``refresh_token`` in the body (its request schema
-                # rejects a header-only request as ``invalid_request``), and
-                # additionally reconciles the header against the body — sending
-                # both lets Portal keep the value out of body-access-logs while
-                # still satisfying the schema. The header name must match
-                # Portal's ``REFRESH_TOKEN_HEADER`` exactly (``x-nous-refresh-
-                # token``); any other name is silently ignored. (Verified
-                # against the NAS #293 preview deploy: header-only → 400
-                # invalid_request; body → accepted.)
+                # Portal's request schema requires ``refresh_token`` in the
+                # body. Its refresh contract also reconciles the exact
+                # ``x-nous-refresh-token`` header against that value. Send the
+                # same opaque token on both surfaces; a header-only request is
+                # rejected as ``invalid_request`` and conflicting values fail.
                 data={
                     "grant_type": "refresh_token",
                     "client_id": self._client_id,
