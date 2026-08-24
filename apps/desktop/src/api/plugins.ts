@@ -20,6 +20,8 @@ async function activeConnection(): Promise<HermesConnection> {
   return window.hermesDesktop.getConnection(getApiRequestProfile())
 }
 
+// Keep these segment rules in sync with the defense-in-depth URL parsing check
+// in apps/desktop/electron/media-protocol.ts::assertSafePluginMediaSegment.
 function assertSafePluginMediaSegment(segment: string, path: string, message: string): void {
   let inspected = segment
 
