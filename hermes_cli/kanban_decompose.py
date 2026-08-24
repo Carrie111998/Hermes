@@ -268,11 +268,26 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _requires_human_triage(task: kb.Task) -> bool:
+    """Return whether ``task`` reached triage via the block-loop breaker.
+
+    ``block_task`` records the recurrence count on the task before routing it
+    to triage. Normal rough-input triage cards keep the default count of zero.
+    This distinction lets the gateway skip human-decision cards without
+    weakening manual ``kanban decompose`` / ``kanban specify`` actions.
+    """
+    return (
+        task.status == "triage"
+        and task.block_recurrences >= kb.BLOCK_RECURRENCE_LIMIT
+    )
+
+
 def decompose_task(
     task_id: str,
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    automatic: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -288,6 +303,12 @@ def decompose_task(
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if automatic and _requires_human_triage(task):
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "block-loop escalation requires human triage",
         )
 
     cfg = _load_config()
@@ -456,8 +477,17 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(
+    *,
+    tenant: Optional[str] = None,
+    automatic: bool = False,
+) -> list[str]:
+    """Return triage task ids eligible for the requested caller.
+
+    Automatic sweeps omit cards escalated by the block-loop breaker. Manual
+    callers retain the complete triage list so a human can deliberately
+    specify or decompose one of those cards.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +495,6 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
+    if automatic:
+        rows = [row for row in rows if not _requires_human_triage(row)]
     return [row.id for row in rows]

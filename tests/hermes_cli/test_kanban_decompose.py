@@ -161,3 +161,74 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_auto_decompose_skips_block_loop_triage_before_llm(kanban_home):
+    """A loop-breaker escalation is human triage, not rough-input triage."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs a human", assignee="worker")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(
+            conn, tid, reason="waiting on Caleb", kind="needs_input"
+        )
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(
+            conn, tid, reason="still waiting on Caleb", kind="needs_input"
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+
+    assert tid in decomp.list_triage_ids()
+    assert tid not in decomp.list_triage_ids(automatic=True)
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(
+            tid,
+            author="auto-decomposer",
+            automatic=True,
+        )
+
+    assert outcome.ok is False
+    assert "human triage" in outcome.reason
+    call_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+
+
+def test_auto_decompose_still_specifies_normal_triage(kanban_home):
+    """The loop guard must not disable normal rough-card specification."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Concrete task",
+        "body": "Implement the requested outcome.",
+        "assignee": "orchestrator",
+    })
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as call_llm:
+            outcome = decomp.decompose_task(
+                tid,
+                author="auto-decomposer",
+                automatic=True,
+            )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    call_llm.assert_called_once()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.title == "Concrete task"
+
+
