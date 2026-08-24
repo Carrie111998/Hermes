@@ -11678,7 +11678,11 @@ function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...inputPr
     }
 
     const caret = inputRef.current?.selectionStart ?? value.length
-    const next = `${value.slice(0, token.start)}@${handle} ${value.slice(caret)}`
+    // Separator-aware: insert exactly one space after the handle, unless the
+    // remainder already starts with whitespace — never double-space at a word
+    // boundary (e.g. "hello @herin  world" when the caret sits mid-sentence).
+    const separator = /^\s/.test(value.slice(caret)) ? '' : ' '
+    const next = `${value.slice(0, token.start)}@${handle}${separator}${value.slice(caret)}`
     onChange(next)
     setToken(null)
 

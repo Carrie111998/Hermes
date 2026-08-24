@@ -32,8 +32,10 @@ test('popover offers @everyone/@all and inserts parser-compatible strings', () =
     source.indexOf('function GroupChatWorkspace')
   )
   assert.ok(component.includes("['everyone', 'all']"), 'quick picks for the room-wide broadcast')
-  // Insertion writes exactly "@handle " — the shape parseGroupChatMentions resolves.
-  assert.ok(component.includes('`${value.slice(0, token.start)}@${handle} ${value.slice(caret)}`'))
+  // Insertion writes exactly "@handle " — the shape parseGroupChatMentions resolves —
+  // but never double-spaces when the remainder already starts with whitespace.
+  assert.ok(component.includes('`${value.slice(0, token.start)}@${handle}${separator}${value.slice(caret)}`'))
+  assert.ok(component.includes("const separator = /^\\s/.test(value.slice(caret)) ? '' : ' '"), 'separator-aware insertion at word boundaries')
   // Member handles come from the same botHandle used by the parser.
   assert.ok(component.includes('botHandle(member.name, member)'))
   // mousedown insertion must preventDefault so the input keeps focus.
@@ -66,4 +68,31 @@ test('mentionTokenAt finds the active @-token at the caret', () => {
   assert.equal(fn('plain text', 10), null)
   // Caret before the @ is not inside the token.
   assert.equal(fn('hey @al', 3), null)
+})
+
+test('insert never double-spaces at a word boundary (regression)', () => {
+  // Extract the insert() body and run it with scripted closure values so the
+  // separator logic is exercised for real, not just source-matched.
+  const start = source.indexOf('function GroupMentionInput')
+  const end = source.indexOf('function GroupChatWorkspace')
+  const component = source.slice(start, end)
+
+  const insertBody = component.slice(
+    component.indexOf('const insert = handle => {'),
+    component.indexOf('\n  }\n', component.indexOf('requestAnimationFrame')) + 4
+  )
+  const ctx = {
+    inputRef: { current: { selectionStart: 7 } },
+    token: { start: 6, query: '' },
+    value: 'hello @ world',
+    onChange: v => {
+      ctx.__next = v
+    },
+    setToken: () => undefined,
+    requestAnimationFrame: () => undefined
+  }
+  vm.createContext(ctx)
+  vm.runInContext(insertBody + '\nthis.__insert = insert', ctx)
+  ctx.__insert('herin')
+  assert.equal(ctx.__next, 'hello @herin world', 'single space at word boundary, no double space')
 })
