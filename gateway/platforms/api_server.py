@@ -7464,6 +7464,14 @@ class APIServerAdapter(BasePlatformAdapter):
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        if not current:
+            # Stamp the owning profile at first write (#93689): every creation
+            # path runs inside the request middleware, so the ContextVar holds
+            # the URL-selected profile here. Later updates merge into the
+            # record and never re-stamp. Run-scoped handlers enforce equality
+            # so one served profile's API key cannot read or control another
+            # profile's run.
+            current["profile"] = _api_request_profile.get() or "default"
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -7474,6 +7482,21 @@ class APIServerAdapter(BasePlatformAdapter):
         current.update(fields)
         self._run_statuses[run_id] = current
         return current
+
+    def _run_visible_to_request(self, run_id: str) -> bool:
+        """Ownership gate for the run-scoped endpoints (#93689).
+
+        A registry record owned by a different profile must be
+        indistinguishable from one that does not exist, so callers return
+        their existing not-found 404 shape (never 403 — that would confirm
+        the run id exists under another profile). Records without a profile
+        stamp cannot occur since first-write stamping, and are treated as
+        not visible (fail closed) rather than trusted.
+        """
+        record = self._run_statuses.get(run_id)
+        if record is None:
+            return True  # caller's not-found branch handles it
+        return record.get("profile") == (_api_request_profile.get() or "default")
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -8005,12 +8028,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
-        if status is None:
+        if status is None or not self._run_visible_to_request(run_id):
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        return web.json_response(status)
+        # The ownership stamp is internal bookkeeping, not part of the
+        # public run payload.
+        payload = {k: v for k, v in status.items() if k != "profile"}
+        return web.json_response(payload)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -8026,6 +8052,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 break
             await asyncio.sleep(0.05)
         else:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        # Ownership gate (#93689): same 404 shape as a run that does not
+        # exist. Inside the creation race window the registry record may not
+        # be written yet; _run_visible_to_request passes unknown ids through
+        # to preserve that window's subscribe-early semantics.
+        if not self._run_visible_to_request(run_id):
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         q = self._run_streams[run_id]
@@ -8072,7 +8105,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
-        if status is None:
+        if status is None or not self._run_visible_to_request(run_id):
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
@@ -8160,7 +8193,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
-        if status is None:
+        if status is None or not self._run_visible_to_request(run_id):
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
         # Only genuinely running runs are steerable.  /stop retains agent/task
         # refs during cooperative shutdown, so the status gate (not the mere
@@ -8219,6 +8252,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        # Ownership gate first (#93689): a foreign profile must not learn the
+        # run exists (404 shape) let alone interrupt it. The registry record
+        # is written at creation before agent/task refs activate, so a live
+        # run always carries its stamp here.
+        if not self._run_visible_to_request(run_id):
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
 
