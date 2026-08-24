@@ -6426,9 +6426,22 @@ async function disbandGroupChat(group, members) {
   // reconstructs a metadata-only roster row. Clear the group from every
   // meta entry that still names it, independent of what was rendered.
   for (const [key, entry] of Object.entries($botMeta.get())) {
-    if (botGroups(entry).includes(group)) {
-      await saveBotMeta(key, groupMembershipPatch(entry, group, false))
+    if (!botGroups(entry).includes(group)) {
+      continue
     }
+
+    // A route-keyed entry (`connectionId::profile`) is not itself a valid
+    // saveBotMeta owner — botOwner's string path only resolves migrated
+    // LOCAL routes, so passing the raw key would send profiles.configure
+    // to the default connection with the garbled composite as `name`.
+    // Reconstruct the source-scoped owner so the write reaches the bot's
+    // actual connection.
+    const { connectionId, name } = parseRosterKey(key)
+    const owner = connectionId
+      ? { name, sourceScoped: true, route: { connectionId, profile: name, targetProfile: name } }
+      : key
+
+    await saveBotMeta(owner, groupMembershipPatch(entry, group, false))
   }
 
   // Converge on server truth: the cached roster still carries the pre-disband

@@ -1209,6 +1209,38 @@ test('disband: removes only this membership, room log, workspace, and needs-you 
   assert.equal(durable.Keep.members[0].connectionId, 'remote-1')
 })
 
+test('disband: a route-keyed stale entry clears via the bot\'s own connection, not the default gateway (#93345)', async () => {
+  const gc = load(() => '(pass)')
+  const remoteRequests = []
+  gc.host.requestProfile = async (route, method, params) => {
+    remoteRequests.push({ connectionId: route.connectionId, profile: route.profile, method, params })
+    if (method === 'profiles.configure') {
+      return { applied: { ui_meta: true, ui_meta_revisions: {} } }
+    }
+    return {}
+  }
+
+  gc.$botMeta.set({ 'gw-42::builder': { groups: ['Ghost'], group: 'Ghost' } })
+  gc.$groupChats.set({
+    Ghost: { log: [], members: [], watermarks: {}, sessions: {}, running: false }
+  })
+
+  await gc.disbandGroupChat('Ghost', [])
+
+  assert.equal(JSON.stringify(gc.$botMeta.get()['gw-42::builder'].groups), JSON.stringify([]))
+  assert.equal(gc.$botMeta.get()['gw-42::builder'].group, null)
+
+  const routed = remoteRequests.filter(call => call.method === 'profiles.configure')
+  assert.equal(routed.length, 1, 'the server-side clear is sent to the bot\'s own connection')
+  assert.equal(routed[0].connectionId, 'gw-42')
+  assert.equal(routed[0].params.name, 'builder', 'name must not be the garbled composite key')
+
+  const defaultBotMetaCalls = gc.requests.filter(
+    call => call.method === 'profiles.configure' && 'hermes-bots' in (call.params.ui_meta || {})
+  )
+  assert.equal(defaultBotMetaCalls.length, 0, 'the bot-meta write must not go to the default connection')
+})
+
 test('disband: skips source-qualified remote members instead of mutating same-named local metadata', async () => {
   const gc = load(() => '(pass)')
   gc.$botMeta.set({ builder: { groups: ['Keep'], group: 'Keep' } })
