@@ -206,6 +206,12 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
 
   let settle: (value: 'done' | 'fallback') => void = () => undefined
 
+  // stopVoicePlayback() → immediate barge-in: settle this session so its
+  // queued audio never resumes. Registered until settle, so a barge always
+  // reaches this session even while another playback is live alongside it
+  // (#91991).
+  const stop = () => settle(started ? 'done' : 'fallback')
+
   const done = new Promise<'done' | 'fallback'>(resolve => {
     settle = value => {
       if (settled) {
@@ -213,7 +219,7 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
       }
 
       settled = true
-      currentStop = null
+      liveStops.delete(stop)
 
       if (playing) {
         playing.pause()
@@ -225,7 +231,7 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
     }
   })
 
-  currentStop = () => settle(started ? 'done' : 'fallback')
+  liveStops.add(stop)
 
   const pump = async () => {
     if (synthesizing || settled) {
