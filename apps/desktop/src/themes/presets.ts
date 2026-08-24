@@ -86,8 +86,8 @@ export const nousTheme: DesktopTheme = {
     destructiveForeground: '#FEF2F2',
     sidebarBackground: '#09286F',
     sidebarBorder: '#234A9C',
-    userBubble: '#143B91',
-    userBubbleBorder: '#3A63BD'
+    userBubble: '#3E6DE0',
+    userBubbleBorder: '#7DA3F5'
   },
   typography: {
     fontSans: SYSTEM_SANS,
