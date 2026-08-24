@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 
 import { test } from 'vitest'
 
+import { resolveBashExecutable } from './bash-resolver'
 import { profileSshOverride } from './connection-config'
 import {
   buildSpawnCommand,
@@ -371,7 +372,7 @@ test.skipIf(process.platform === 'win32')(
     const child = spawnInstaller(['--profile', 'ops', 'serve', '--isolated', ...backendFlags])
 
     const ssh = {
-      exec: async (command: string) => (await exec(command, { shell: '/bin/bash' })).stdout
+      exec: async (command: string) => (await exec(command, { shell: resolveBashExecutable() ?? 'bash' })).stdout
     }
 
     const waitForEntrypoint = async (process: ReturnType<typeof spawn>) => {

@@ -2,7 +2,12 @@ import { spawn, type SpawnOptions } from 'node:child_process'
 import { statSync } from 'node:fs'
 import path from 'node:path'
 
+import { resolveBashExecutable } from './bash-resolver'
 import { hiddenWindowsChildOptions } from './windows-child-options'
+
+// Resolve bash once at module load. PATH first, then well-known locations;
+// `/bin/bash` alone breaks on NixOS and musl distros.
+const POSIX_BASH = resolveBashExecutable() ?? '/bin/bash'
 
 export interface UpdaterChild {
   pid?: number
@@ -98,7 +103,7 @@ export function resolvePosixScriptHandoff(
   }
 
   return {
-    command: '/bin/bash',
+    command: POSIX_BASH,
     args: [scriptPath],
     scriptPath
   }

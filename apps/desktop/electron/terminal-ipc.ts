@@ -30,6 +30,28 @@ export interface TerminalIpcApi {
   disposeAllTerminalSessions: () => void
 }
 
+// Resolve the POSIX interactive shell when no override applies.
+//
+// Preference order: a shell found on PATH first (NixOS, musl, and minimal
+// containers have no /bin/zsh or /bin/bash), then the traditional absolute
+// locations, then PATH `sh`, then a bare `/bin/sh` so node-pty always gets
+// something spawnable.
+export function resolvePosixInteractiveShell(findOnPath: (name: string) => null | string): string {
+  const fromPath = ['zsh', 'bash'].map(name => findOnPath(name)).find(Boolean)
+
+  const absolute = ['/bin/zsh', '/bin/bash', '/bin/sh'].find(candidate => {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+
+      return true
+    } catch {
+      return false
+    }
+  })
+
+  return fromPath || absolute || findOnPath('sh') || '/bin/sh'
+}
+
 export function registerTerminalIpc({
   isWindows,
   findOnPath,
@@ -118,9 +140,7 @@ export function registerTerminalIpc({
       return windowsShellSpec()
     }
 
-    const shellPath = ['/bin/zsh', '/bin/bash', '/bin/sh'].find(candidate => isExecutableFile(candidate))
-
-    return posixShellSpec(shellPath || '/bin/sh')
+    return posixShellSpec(resolvePosixInteractiveShell(findOnPath))
   }
 
   function safeTerminalCwd(cwd) {

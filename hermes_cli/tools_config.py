@@ -1575,7 +1575,8 @@ def _run_cua_driver_installer(
             except OSError:
                 pass
             return False
-        install_cmd = ["/bin/bash", script_path]
+        # Resolve bash through PATH; /bin/bash does not exist on NixOS/musl.
+        install_cmd = [shutil.which("bash") or "/bin/bash", script_path]
     use_shell = False
 
     if show_progress:

@@ -58,6 +58,7 @@ import {
   shouldLatchHostKeyChangedFailure,
   shouldLatchRemoteReauthFailure
 } from './backend-start-failure'
+import { resolveBashExecutable } from './bash-resolver'
 import {
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,
@@ -15210,7 +15211,7 @@ async function runDesktopUninstall(mode) {
     } else {
       scriptPath = path.join(app.getPath('temp'), `hermes-uninstall-${Date.now()}.sh`)
       fs.writeFileSync(scriptPath, buildPosixCleanupScript(scriptArgs), { mode: 0o755 })
-      runner = '/bin/bash'
+      runner = resolveBashExecutable() ?? '/bin/bash'
       runnerArgs = [scriptPath]
     }
   } catch (error) {

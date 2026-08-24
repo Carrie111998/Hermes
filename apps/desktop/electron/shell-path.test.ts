@@ -58,7 +58,11 @@ test('mergeLoginShellPath puts login entries first and appends current-only entr
 test('loginShellExecutable honors $SHELL and falls back per platform', () => {
   assert.equal(loginShellExecutable({ SHELL: '/usr/local/bin/fish' }, 'darwin'), '/usr/local/bin/fish')
   assert.equal(loginShellExecutable({}, 'darwin'), '/bin/zsh')
-  assert.equal(loginShellExecutable({}, 'linux'), '/bin/bash')
+  // Linux fallback resolves bash through PATH (never assumes /bin/bash).
+  const linuxFallback = loginShellExecutable({}, 'linux')
+
+  assert.ok(linuxFallback, 'linux fallback must resolve to a bash path')
+  assert.ok(linuxFallback.endsWith('bash'), `unexpected linux fallback: ${linuxFallback}`)
 })
 
 test('applyLoginShellPath merges the captured login PATH into the env', async () => {

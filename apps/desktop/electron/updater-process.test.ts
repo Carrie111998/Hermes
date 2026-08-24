@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import { test } from 'vitest'
 
+import { resolveBashExecutable } from './bash-resolver'
 import {
   collectRelaunchArgs,
   MARKER_SELF_ADOPT_EPOCH_MS,
@@ -261,7 +262,12 @@ test('resolvePosixScriptHandoff returns the bash recipe when the script exists',
   })
 
   assert.ok(handoff)
-  assert.equal(handoff.command, '/bin/bash')
+  // bash is resolved through the shared resolver (PATH-aware) instead of a
+  // hardcoded /bin/bash that does not exist on NixOS or musl distros.
+  const expectedBash = resolveBashExecutable({ pathEnv: process.env.PATH })
+
+  assert.ok(expectedBash, 'resolveBashExecutable must find bash in this environment')
+  assert.equal(handoff.command, expectedBash)
   assert.deepEqual(handoff.args, [expected])
 })
 

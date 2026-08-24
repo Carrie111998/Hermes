@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 
 import { appendUniquePathEntries, delimiterForPlatform, pathEnvKey } from './backend-env'
+import { resolveBashExecutable } from './bash-resolver'
 
 // Login-shell PATH resolution for GUI launches.
 //
@@ -36,8 +37,13 @@ function loginShellExecutable(env: any = process.env, platform = process.platfor
     return shell
   }
 
-  // macOS Catalina+ defaults to zsh; most Linux distros default to bash.
-  return platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
+  // macOS Catalina+ defaults to zsh; on Linux prefer a PATH-resolved bash
+  // before /bin/bash, which does not exist on NixOS or musl distros.
+  if (platform === 'darwin') {
+    return '/bin/zsh'
+  }
+
+  return resolveBashExecutable() ?? '/bin/bash'
 }
 
 // Extract $PATH from between the sentinel markers. Uses the LAST start marker

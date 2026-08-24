@@ -6,6 +6,8 @@ import path from 'node:path'
 
 import { test } from 'vitest'
 
+import { resolveBashExecutable } from './bash-resolver'
+
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..')
 const POSIX_SCRIPT = path.join(REPO_ROOT, 'scripts', 'desktop-update', 'posix.sh')
 const WINDOWS_SCRIPT = path.join(REPO_ROOT, 'scripts', 'desktop-update', 'windows.ps1')
@@ -33,7 +35,7 @@ function runPosix(installRoot: string, startedAt?: string) {
     env.HERMES_UPDATE_STARTED_AT = startedAt
   }
 
-  return spawnSync('/bin/bash', [POSIX_SCRIPT, '--daemonized', '--install-root', installRoot, '--self-test-marker'], {
+  return spawnSync(resolveBashExecutable() ?? 'bash', [POSIX_SCRIPT, '--daemonized', '--install-root', installRoot, '--self-test-marker'], {
     env,
     encoding: 'utf8'
   })
