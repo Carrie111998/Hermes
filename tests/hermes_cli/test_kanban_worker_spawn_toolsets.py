@@ -6,16 +6,23 @@ import pytest
 
 
 class _SnapshotConnection:
-    """Minimal connection stub for the spawn-boundary snapshot read."""
+    """Minimal connection stub for spawn snapshot and migration metadata reads."""
 
-    def __init__(self, row):
+    def __init__(self, row, *, cutoff=0):
         self.row = row
+        self.cutoff = cutoff
+        self._result = None
 
-    def execute(self, *args, **kwargs):
+    def execute(self, sql, *args, **kwargs):
+        self._result = (
+            {"value": str(self.cutoff)}
+            if "migration_cutoff_id" in sql
+            else self.row
+        )
         return self
 
     def fetchone(self):
-        return self.row
+        return self._result
 
     def close(self):
         pass
@@ -45,18 +52,48 @@ def _make_task(kb, *, assignee: str):
 def test_default_spawn_rejects_incomplete_modern_snapshot(monkeypatch, tmp_path):
     """Modern runs must not fall back to mutable task routing at spawn."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.routing_contract import ROUTING_CONTRACT_VERSION, RoutingContractError
+    from hermes_cli.routing_contract import RoutingContractError
 
     task = _make_task(kb, assignee="coder")
     task.model_override = "mutable-model"
     monkeypatch.setattr(kb, "connect", lambda: _SnapshotConnection({
         "routing_model": None,
         "routing_provider": "provider",
-        "routing_contract": ROUTING_CONTRACT_VERSION,
-    }))
+        "routing_contract": None,
+    }, cutoff=task.current_run_id - 1))
 
     with pytest.raises(RoutingContractError, match="incomplete frozen routing snapshot"):
         kb._default_spawn(task, str(tmp_path))
+
+
+def test_default_spawn_allows_legacy_snapshot_fallback(monkeypatch, tmp_path):
+    """Pre-cutoff runs retain their historical mutable-override fallback."""
+    from hermes_cli import kanban_db as kb
+
+    task = _make_task(kb, assignee="coder")
+    task.model_override = "mutable-model"
+    monkeypatch.setattr(kb, "connect", lambda: _SnapshotConnection({
+        "routing_model": None,
+        "routing_provider": None,
+        "routing_contract": None,
+    }, cutoff=task.current_run_id))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        """Minimal spawned-process test double."""
+
+        pid = 4244
+
+    def fake_popen(cmd, *args, **kwargs):
+        """Capture worker argv without starting a process."""
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    kb._default_spawn(task, str(tmp_path))
+
+    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "mutable-model"
 
 
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):

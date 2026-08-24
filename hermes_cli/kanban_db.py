@@ -11806,12 +11806,16 @@ def _default_spawn(
                     "FROM task_runs WHERE id = ?",
                     (task.current_run_id,),
                 ).fetchone()
+                cutoff_row = _snap_conn.execute(
+                    "SELECT value FROM kanban_metadata "
+                    "WHERE key = 'migration_cutoff_id'"
+                ).fetchone()
             if run_row is not None:
                 snapshot_model = run_row["routing_model"]
                 snapshot_provider = run_row["routing_provider"]
-                if run_row["routing_contract"] is not None and (
-                    not snapshot_model or not snapshot_provider
-                ):
+                cutoff = int(cutoff_row["value"]) if cutoff_row is not None else -1
+                is_modern_run = task.current_run_id > cutoff
+                if is_modern_run and (not snapshot_model or not snapshot_provider):
                     raise RoutingContractError(
                         "incomplete frozen routing snapshot for modern run "
                         f"{task.current_run_id}"
