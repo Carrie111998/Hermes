@@ -12767,9 +12767,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
-    # =========================================================================
-    # Export and cleanup
-    # =========================================================================
+    def set_latest_assistant_platform_message_ids(
+        self,
+        session_id: str,
+        message_ids: Any,
+    ) -> bool:
+        """Attach one or more visible platform delivery IDs to latest reply."""
+        if not session_id:
+            return False
+        ids: List[str] = []
+
+        def _collect(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect(item)
+                return
+            text = str(value).strip()
+            if text and text != "__no_edit__" and text not in ids:
+                ids.append(text)
+
+        _collect(message_ids)
+        if not ids:
+            return False
+        stored_value = ids[0] if len(ids) == 1 else json.dumps(ids)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND active = 1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            row_id = row["id"] if hasattr(row, "keys") else row[0]
+            conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ?",
+                (stored_value, row_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
 
     def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
         """True when ``session`` is a branch, delegate, or tool child of its parent.
