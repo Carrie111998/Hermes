@@ -113,6 +113,35 @@ def _zai_overload_error():
     )
 
 
+def test_zai_overload_matches_all_glm_coding_models():
+    """The overload backoff must fire for every GLM model on the coding-plan
+    endpoint, not just glm-5.2 — glm-5.3 fell through to the plain 429 path
+    (3 fast retries, dead in ~10s) while the provider overload lasted minutes.
+    """
+    from agent.retry_utils import is_zai_coding_overload_error
+
+    err = _zai_overload_error()
+    for model in ("glm-5.2", "glm-5.3", "glm-4.5", "glm-4.5-air"):
+        assert is_zai_coding_overload_error(
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            model=model,
+            error=err,
+        ), f"overload handler missing for {model}"
+
+    # non-GLM models on the same endpoint keep the plain 429 path
+    assert not is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model="deepseek-v3",
+        error=err,
+    )
+    # GLM model on a different endpoint stays untouched
+    assert not is_zai_coding_overload_error(
+        base_url="https://openrouter.ai/api/v1",
+        model="glm-5.3",
+        error=err,
+    )
+
+
 
 
 
