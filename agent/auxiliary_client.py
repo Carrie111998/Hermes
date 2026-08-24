@@ -4308,6 +4308,33 @@ def _is_connection_error(exc: Exception) -> bool:
     return False
 
 
+def _is_server_error(exc: Exception) -> bool:
+    """Detect upstream 5xx failures that warrant provider fallback.
+
+    A 5xx means the provider endpoint was reached but could not serve the
+    request (worker crash, upstream overload, internal fault). That is a
+    provider-capacity failure, not a request constraint: retrying the same
+    provider is handled separately by the transient-retry path, and once
+    those retries are exhausted the request should be rerouted to a
+    fallback provider instead of aborting the auxiliary task.
+
+    Deliberately excludes 502/504 responses that carry an auth-shaped body —
+    some gateways proxy upstream auth failures as 502s; those are handled by
+    ``_is_auth_error`` first in the caller's classification chain.
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int) and 500 <= status < 600:
+        return True
+    # Some providers surface 5xx as plain exceptions with the code embedded.
+    msg = str(exc)[:300].lower()
+    return ("internal server error" in msg
+            or " bad gateway" in msg
+            or "service unavailable" in msg
+            or "gateway timeout" in msg)
+
+
 def _is_transient_transport_error(exc: Exception) -> bool:
     """Return True for a one-off transport blip worth retrying ON the
     same provider before any provider/model fallback.
@@ -9994,6 +10021,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_server_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10017,6 +10045,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_server_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10704,6 +10733,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_server_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -10719,6 +10749,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_server_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
