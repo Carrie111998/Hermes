@@ -312,9 +312,10 @@ function createStoreAdapter(
       return () => {
         listeners.delete(listener)
 
-        if (listeners.size === 0 && unsubscribeProvider) {
-          unsubscribeProvider()
+        if (listeners.size === 0) {
+          unsubscribeProvider?.()
           unsubscribeProvider = null
+          select(readValidProvider(entries))
         }
       }
     }

@@ -167,6 +167,46 @@ describe('Projects grouping contribution', () => {
     expect(result.current.sidebar?.snapshot).toBe(result.current.dialog?.snapshot)
   })
 
+  it('retries the highest-priority provider after every shared consumer unmounts', () => {
+    let primaryRecovered = false
+    let primarySubscribeCalls = 0
+    const primary = provider([{ id: 'primary', label: 'Primary', projectIds: ['a'] }])
+
+    primary.subscribe = () => {
+      primarySubscribeCalls += 1
+
+      if (!primaryRecovered) {
+        throw new Error('transient subscription failure')
+      }
+
+      return () => undefined
+    }
+
+    const fallback = provider([{ id: 'fallback', label: 'Fallback', projectIds: ['b'] }])
+    register(primary, 0)
+    register(fallback, 10)
+
+    const first = renderHook(() => useActiveProjectsGrouping())
+    const second = renderHook(() => useProjectsGrouping([project('a'), project('b')]))
+
+    expect(first.result.current?.contribution).toBe(fallback)
+    expect(second.result.current?.contribution).toBe(fallback)
+
+    first.unmount()
+    primaryRecovered = true
+    second.rerender()
+
+    expect(second.result.current?.contribution).toBe(fallback)
+
+    second.unmount()
+
+    const laterConsumer = renderHook(() => useActiveProjectsGrouping())
+
+    expect(laterConsumer.result.current?.contribution).toBe(primary)
+    expect(laterConsumer.result.current?.snapshot.groups[0].id).toBe('primary')
+    expect(primarySubscribeCalls).toBe(2)
+  })
+
   it('settles on a stable empty state when every valid provider throws while subscribing', () => {
     register({
       getSnapshot: () => ({ groups: [{ id: 'broken', label: 'Broken', projectIds: ['a'] }] }),
