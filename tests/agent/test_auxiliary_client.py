@@ -1134,7 +1134,15 @@ class TestExplicitProviderRouting:
         assert client is None
         assert model is None
         mock_openai.assert_not_called()
-        mock_mark.assert_called_once_with("openrouter", ttl=60)
+        # The quarantine reason must name the ACTUAL cause. A missing
+        # credential is not a payment failure, and reporting it as one tells
+        # the user to top up an account that was never billed.
+        mock_mark.assert_called_once_with(
+            "openrouter",
+            ttl=60,
+            reason="OpenRouter credential pool has no usable entries "
+                   "(credentials may be exhausted)",
+        )
 
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
@@ -1969,11 +1977,16 @@ class TestIsRateLimitError:
 class TestGetProviderChain:
     """_get_provider_chain() resolves functions at call time (testable)."""
 
-    def test_returns_four_entries(self):
+    def test_returns_three_entries(self):
         chain = _get_provider_chain()
-        assert len(chain) == 4
+        assert len(chain) == 3
         labels = [label for label, _ in chain]
-        assert labels == ["openrouter", "nous", "local/custom", "api-key"]
+        assert labels == ["openrouter", "local/custom", "api-key"]
+        # Nous is deliberately NOT in this chain - see _get_provider_chain
+        # docstring. No Nous credential exists in either auth store, so the
+        # hop only ever logged "no Nous authentication found" and then
+        # quarantined the label. Explicit `provider: nous` still resolves.
+        assert "nous" not in labels
         # Codex is deliberately NOT in this chain — see _get_provider_chain
         # docstring. ChatGPT-account Codex has a shifting model allow-list;
         # guessing a model to fall back on breaks more often than it helps.
@@ -2007,12 +2020,13 @@ class TestTryPaymentFallback:
     def test_skips_failed_provider(self):
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
-             patch("agent.auxiliary_client._try_nous", return_value=(mock_client, "nous-model")), \
+             patch("agent.auxiliary_client._try_custom_endpoint",
+                   return_value=(mock_client, "custom-model")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
             client, model, label = _try_payment_fallback("openrouter", task="compression")
         assert client is mock_client
-        assert model == "nous-model"
-        assert label == "nous"
+        assert model == "custom-model"
+        assert label == "local/custom"
 
     def test_returns_none_when_no_fallback(self):
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
@@ -2264,7 +2278,9 @@ class TestStaleFallbackCandidateSkip:
         assert result.choices[0].message.content == "openrouter-serves"
         assert mock_fb.call_count == 2
         assert mock_fb.call_args_list[1].kwargs.get("reason") == "stale fallback credential"
-        mock_mark.assert_called_once_with("anthropic")
+        mock_mark.assert_called_once_with(
+            "anthropic", reason="stale or unrefreshable credential"
+        )
         assert stale_fb.chat.completions.create.call_count == 1
         assert healthy_fb.chat.completions.create.call_count == 1
 
@@ -5375,6 +5391,90 @@ class TestAuxUnhealthyCache:
         _mark_provider_unhealthy("openrouter")
         assert _is_provider_unhealthy("openrouter") is True
 
+    def test_default_reason_is_payment(self, caplog):
+        """A bare mark (the genuine 402 branches) still reports payment."""
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy("openrouter")
+        assert "payment / credit error" in caplog.text
+
+    def test_explicit_reason_replaces_payment_wording(self, caplog):
+        """A missing credential must NOT be reported as a payment failure.
+
+        The quarantine itself is correct -- a provider with no credential
+        should be skipped -- but calling it a payment error tells the user
+        to top up an account that was never billed, and sends the same
+        wrong signal to anything reading provider health.
+        """
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy(
+                "nous", ttl=60, reason="no Nous credential configured"
+            )
+        assert "no Nous credential configured" in caplog.text
+        assert "payment" not in caplog.text
+
+    def test_repeat_mark_same_reason_is_not_re_warned(self, caplog):
+        """A permanently-unconfigured provider costs ONE warning per window.
+
+        Every auxiliary resolution walks the chain, so an absent credential
+        re-marks on each call. Before this, that emitted a fresh WARNING
+        every time -- 12 identical lines per gateway boot.
+        """
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "marking nous" in r.message]
+        assert len(warnings) == 1, f"expected 1 WARNING, got {len(warnings)}"
+
+    def test_reason_change_re_warns(self):
+        """A DIFFERENT reason is new information and must surface."""
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        import agent.auxiliary_client as ac
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        ac.logger.addHandler(handler)
+        ac.logger.setLevel(logging.DEBUG)
+        try:
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+            _mark_provider_unhealthy("nous", ttl=60, reason="payment / credit error")
+        finally:
+            ac.logger.removeHandler(handler)
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2
+
+    def test_skip_log_reports_recorded_reason(self, caplog):
+        """The skip trail must echo the real reason, not assume payment."""
+        import logging
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy, _log_skip_unhealthy,
+        )
+        _mark_provider_unhealthy("nous", ttl=60, reason="no Nous credential configured")
+        with caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+            _log_skip_unhealthy("nous", task="compression")
+        assert "no Nous credential configured" in caplog.text
+        assert "payment error" not in caplog.text
+
+    def test_reason_is_evicted_with_the_mark(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy, _is_provider_unhealthy,
+            _aux_unhealthy_reason,
+        )
+        import time
+        _mark_provider_unhealthy("openrouter", ttl=0.01, reason="no credential")
+        assert _aux_unhealthy_reason.get("openrouter") == "no credential"
+        time.sleep(0.02)
+        assert _is_provider_unhealthy("openrouter") is False
+        assert "openrouter" not in _aux_unhealthy_reason
+
     def test_ttl_expiry_evicts(self):
         from agent.auxiliary_client import (
             _mark_provider_unhealthy,
@@ -5405,18 +5505,18 @@ class TestAuxUnhealthyCache:
             _resolve_auto,
             _mark_provider_unhealthy,
         )
-        nous_client = MagicMock()
-        # Mark OpenRouter unhealthy → chain should skip it and pick nous.
+        custom_client = MagicMock()
+        # Mark OpenRouter unhealthy → chain should skip it and pick local/custom.
         _mark_provider_unhealthy("openrouter")
         with patch("agent.auxiliary_client._read_main_provider", return_value=""), \
              patch("agent.auxiliary_client._read_main_model", return_value=""), \
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "nous-model")), \
-             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_custom_endpoint",
+                   return_value=(custom_client, "custom-model")), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
             client, model = _resolve_auto()
-        assert client is nous_client
-        assert model == "nous-model"
+        assert client is custom_client
+        assert model == "custom-model"
         # The skipped provider's _try_* should NOT have been called at all.
         or_try.assert_not_called()
 
@@ -5428,21 +5528,21 @@ class TestAuxUnhealthyCache:
             _resolve_auto,
             _mark_provider_unhealthy,
         )
-        nous_client = MagicMock()
+        custom_client = MagicMock()
         _mark_provider_unhealthy("openrouter")
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4.6"), \
              patch("agent.auxiliary_client.resolve_provider_client") as step1, \
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
-             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_custom_endpoint",
+                   return_value=(custom_client, "c-model")), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
             client, model = _resolve_auto()
         # Step-1 was bypassed — resolve_provider_client never invoked
         step1.assert_not_called()
-        # Step-2 also skipped openrouter and landed on nous
+        # Step-2 also skipped openrouter and landed on local/custom
         or_try.assert_not_called()
-        assert client is nous_client
+        assert client is custom_client
 
     def test_payment_fallback_skips_unhealthy(self):
         """_try_payment_fallback also consults the unhealthy cache so a 402
@@ -5452,18 +5552,18 @@ class TestAuxUnhealthyCache:
             _try_payment_fallback,
             _mark_provider_unhealthy,
         )
-        nous_client = MagicMock()
+        api_client = MagicMock()
         # Mark BOTH the failed provider (openrouter) and a sibling (custom)
-        # unhealthy. The chain should still find nous.
+        # unhealthy. The chain should still find the api-key provider.
         _mark_provider_unhealthy("local/custom")
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
              patch("agent.auxiliary_client._try_custom_endpoint") as custom_try, \
-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+             patch("agent.auxiliary_client._resolve_api_key_provider",
+                   return_value=(api_client, "api-model")):
             client, model, label = _try_payment_fallback("openrouter", task="compression")
-        assert client is nous_client
-        assert label == "nous"
+        assert client is api_client
+        assert label == "api-key"
         # OR is skipped via skip_chain_labels (failed provider), custom via unhealthy cache.
         or_try.assert_not_called()
         custom_try.assert_not_called()
