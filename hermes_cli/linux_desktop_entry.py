@@ -109,12 +109,13 @@ def _resolve_hermes_bin_for_desktop_entry(
 
     Wraps :func:`hermes_cli.relaunch.resolve_hermes_bin` with one
     desktop-entry-specific rule: an ``argv[0]`` that points inside this
-    checkout is a launch-context artifact (the repo ``hermes`` script, or
-    ``python -m hermes_cli.main``'s interpreter), not a durable installed
-    launcher. Persisting it makes the entry a function of however the
-    previous launch happened — the bootstrap loop behind #90292's
-    incomplete fix. Skip argv[0]/relative candidates in that case and
-    fall through to PATH, where the shell installer's wrapper lives.
+    checkout is a launch-context artifact (the repo ``hermes`` script the
+    wrapper execs with, or an interpreter binary surfaced by programmatic
+    relaunch paths), not a durable installed launcher. Persisting it makes
+    the entry a function of however the previous launch happened — the
+    bootstrap loop behind #90292's incomplete fix. Skip argv[0]/relative
+    candidates in that case and fall through to PATH, where the shell
+    installer's wrapper lives.
 
     ``resolve_fn`` is injectable for tests.
     """
@@ -136,10 +137,12 @@ def _resolve_hermes_bin_for_desktop_entry(
         if path == checkout_root or checkout_root in path.parents:
             return True
         # The `python -m hermes_cli.main` relaunch context surfaces the
-        # interpreter itself as argv[0]; an interpreter is never a durable,
-        # launchable entry target (it would persist a bare `<python> desktop`).
-        # Compare against the *invoking* interpreter (argv[0]'s own file),
-        # not sys.executable — under test harnesses they differ.
+        # invoking interpreter (or a non-executable main.py, which the
+        # resolver already skips) as argv[0]; an interpreter is never a
+        # durable, launchable entry target (it would persist a bare
+        # `<python> desktop`). Compare against the *invoking* interpreter
+        # (argv[0]'s own file), not sys.executable — under test harnesses
+        # they differ.
         try:
             if path.samefile(original_argv0) and _is_interpreter(path):
                 return True
@@ -164,10 +167,33 @@ def _resolve_hermes_bin_for_desktop_entry(
     finally:
         sys.argv[0] = original_argv0
 
+    if rerouted is None:
+        # PATH had no `hermes` — common in stripped systemd user sessions
+        # and autostart relaunches where ~/.local/bin is absent from PATH.
+        # The installer's wrapper lives at a known XDG location; probe it
+        # directly before giving up, otherwise we'd silently persist the
+        # uv-pinned interpreter form this fix exists to prevent.
+        probe = _known_wrapper_candidates()
+        for candidate in probe:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+
     primary = resolve_fn()
     if primary and _inside_checkout(primary) and rerouted:
         return rerouted
     return primary
+
+
+def _known_wrapper_candidates():
+    """Durable installed-launcher locations, most likely first."""
+    home = Path.home()
+    data_home = os.environ.get("XDG_DATA_HOME")
+    candidates = [home / ".local" / "bin" / "hermes"]
+    if data_home:
+        candidates.append(
+            Path(data_home) / "hermes-agent" / "hermes-cli" / "bin" / "hermes"
+        )
+    return candidates
 
 
 def _project_root() -> Path:
