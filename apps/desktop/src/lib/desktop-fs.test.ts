@@ -149,13 +149,13 @@ describe('desktop filesystem facade', () => {
 
   it('pins remote filesystem reads to the active registry connection', async () => {
     $connection.set({ mode: 'remote', profile: 'default' } as never)
-    setApiRequestConnection('homelab-ssh')
+    setApiRequestConnection('remote-workstation')
 
-    await readDesktopFileText('/home/luke/inventory.md')
+    await readDesktopFileText('/srv/project/inventory.md')
 
     expect(api).toHaveBeenCalledWith({
-      connectionId: 'homelab-ssh',
-      path: '/api/fs/read-text?path=%2Fhome%2Fluke%2Finventory.md',
+      connectionId: 'remote-workstation',
+      path: '/api/fs/read-text?path=%2Fsrv%2Fproject%2Finventory.md',
       profile: 'default'
     })
   })
