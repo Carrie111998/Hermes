@@ -988,6 +988,13 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    # Close, shutdown, and orphan reaping all funnel here. Interrupt already
+    # calls _clear_pending, but unlimited Desktop clarify waits on ev.wait(None)
+    # and will leak the turn thread unless this chokepoint releases only the
+    # detached session's pending prompts before joining.
+    sid = str(session.get("_sid") or "")
+    if sid:
+        _clear_pending(sid)
     run_thread = session.get("_run_thread")
     if (
         end_reason != "tui_shutdown"
@@ -3504,9 +3511,9 @@ def _block(
     batch_answers: dict | None = None
     try:
         _emit(event, sid, payload)
-        # Natural Event semantics: None → wait forever (clarify configured with
-        # clarify_timeout <= 0, released only by a real answer or
-        # session.interrupt), 0 → return immediately, > 0 → bounded wait.
+        # Natural Event semantics: None → wait forever (Desktop/TUI clarify,
+        # released by a real answer, session.interrupt, or session teardown),
+        # 0 → return immediately, > 0 → bounded wait.
         answered = ev.wait(timeout)
     finally:
         with _prompt_lock:
@@ -3613,6 +3620,8 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
     multi_select) are forwarded; the tool-side normalized entries also carry
     result-assembly keys (id, choices_offered) the renderer must not see.
     The tool decodes the JSON reply via its batch answer parser.
+    Desktop/TUI waits indefinitely here; messaging adapters keep their
+    own finite configurable timeouts.
     """
     if questions:
         wire = [
@@ -3628,7 +3637,7 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
             "clarify.request",
             sid,
             {"questions": wire},
-            timeout=_clarify_timeout_seconds(),
+            timeout=None,
             batch_qids=[entry["qid"] for entry in questions],
         )
     # multi_select is a pass-through hint: renderers with checkbox
@@ -3644,7 +3653,7 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
             if multi_select
             else {"question": q, "choices": c}
         ),
-        timeout=_clarify_timeout_seconds(),
+        timeout=None,
     )
 
 

@@ -291,9 +291,14 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
 
 function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const messageRunning = useAuiState(selectMessageRunning)
+  const sessionId = useStore(useSessionView().$runtimeId)
+  const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
+  const request = useStore($request)
 
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
-  if (!messageRunning) {
+  // A sealed assistant message is not proof the backend request is gone.
+  // Keep the card interactive while a pending request remains; fall back
+  // only when both the message is no longer running and no request exists.
+  if (!messageRunning && !request) {
     return <ToolFallback {...props} />
   }
 

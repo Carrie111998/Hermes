@@ -11,10 +11,21 @@ import { $activeSessionId } from '@/store/session'
 
 import { ClarifyTool, readClarifyBatchResult, readClarifyResult } from './clarify-tool'
 
-// The live pending card only renders while its message is running. Force that so
-// keyboard-navigation tests can exercise ClarifyToolPending directly.
+const clarifyAuiState = vi.hoisted(() => ({ messageRunning: true }))
+
+// Default: the assistant message is still running so existing pending-card
+// tests exercise ClarifyToolPending. Individual tests can seal the message.
 vi.mock('@assistant-ui/react', () => ({
-  useAuiState: () => true
+  useAuiState: (
+    select?: (state: { message: { status?: { type: string } }; thread: { isRunning: boolean } }) => unknown
+  ) => {
+    const state = {
+      message: { status: { type: clarifyAuiState.messageRunning ? 'running' : 'complete' } },
+      thread: { isRunning: clarifyAuiState.messageRunning }
+    }
+
+    return typeof select === 'function' ? select(state) : clarifyAuiState.messageRunning
+  }
 }))
 
 afterEach(() => {
@@ -22,6 +33,7 @@ afterEach(() => {
   clearClarifyRequest()
   $activeSessionId.set(null)
   $gateway.set(null)
+  clarifyAuiState.messageRunning = true
   vi.clearAllMocks()
 })
 
@@ -629,5 +641,36 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('red')).toBeTruthy()
     expect(screen.getByText('Name?')).toBeTruthy()
     expect(screen.getByText('Skipped')).toBeTruthy()
+  })
+})
+
+describe('ClarifyTool sealed-message persistence', () => {
+  it('keeps a still-live backend request answerable after the assistant message is no longer marked running', async () => {
+    clarifyAuiState.messageRunning = false
+    const request = renderLiveClarify()
+
+    expect(screen.getByText('Which deployment target?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Continue/ })).toBeTruthy()
+    expect(document.querySelector('[data-slot="tool-block"]')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'staging',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('falls back when the message is not running and no pending request remains', () => {
+    clarifyAuiState.messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
+    expect(document.querySelector('[data-slot="tool-block"]')).toBeTruthy()
   })
 })

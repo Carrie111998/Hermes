@@ -18214,14 +18214,14 @@ def test_speak_text_with_barge_no_monitor_when_voice_mode_off(monkeypatch):
     assert not listened.is_set()
 
 
-def test_clarify_callback_uses_configured_timeout(monkeypatch):
-    """The TUI/desktop clarify bridge honors the canonical clarify timeout
-    (via _clarify_timeout_seconds) instead of the hardcoded _block default."""
+def test_desktop_clarify_block_ignores_positive_global_timeout(monkeypatch):
+    """A positive agent.clarify_timeout must not deadline the Desktop/TUI
+    clarify wait. Messaging adapters keep their own finite timeouts."""
     captured = {}
 
-    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 42)
+    monkeypatch.setattr("tools.clarify_gateway.get_clarify_timeout", lambda: 3600)
 
-    def fake_block(event, sid, payload, timeout=300):
+    def fake_block(event, sid, payload, timeout=300, batch_qids=None):
         captured.update(event=event, sid=sid, payload=payload, timeout=timeout)
         return "answer"
 
@@ -18231,8 +18231,76 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
 
     assert result == "answer"
     assert captured["event"] == "clarify.request"
-    assert captured["timeout"] == 42
+    assert captured["timeout"] is None
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
+
+
+def test_teardown_releases_parked_clarify_block_for_closed_session_only(monkeypatch):
+    """session.close must unpark that session's real _clarify_block and leave
+    an unrelated session's pending request untouched."""
+    monkeypatch.setattr(server, "_TURN_SETTLE_BEFORE_CLOSE_SECONDS", 0.2)
+
+    closed_sid = "sid-teardown-clarify"
+    other_sid = "sid-other-clarify"
+    other_ev = threading.Event()
+    parked = threading.Event()
+    box: dict = {}
+
+    def run_block():
+        parked.set()
+        box["answer"] = server._clarify_block(closed_sid, "Stay visible?", ["yes", "no"])
+
+    thread = threading.Thread(target=run_block, name="clarify-park-closed")
+    session = _session()
+    session["_run_thread"] = thread
+    server._sessions[closed_sid] = session
+    server._pending["other-clarify"] = (other_sid, other_ev)
+
+    try:
+        thread.start()
+        assert parked.wait(2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with server._prompt_lock:
+                if any(owner == closed_sid for owner, _ev in server._pending.values()):
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("closed session never registered a pending clarify")
+
+        resp = server.handle_request(
+            {
+                "id": "close-clarify",
+                "method": "session.close",
+                "params": {"session_id": closed_sid},
+            }
+        )
+        assert resp.get("result", {}).get("closed") is True
+
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "teardown left _clarify_block parked forever"
+        with server._prompt_lock:
+            assert not any(
+                owner == closed_sid for owner, _ev in server._pending.values()
+            )
+        assert not other_ev.is_set()
+        assert "other-clarify" not in server._answers
+    finally:
+        thread.join(timeout=0.1)
+        server._sessions.pop(closed_sid, None)
+        server._pending.pop("other-clarify", None)
+        server._answers.pop("other-clarify", None)
+        with server._prompt_lock:
+            stale = [
+                rid
+                for rid, (owner, ev) in list(server._pending.items())
+                if owner == closed_sid
+            ]
+            for rid in stale:
+                _owner, ev = server._pending.pop(rid)
+                ev.set()
+                server._answers.pop(rid, None)
+                server._pending_prompt_payloads.pop(rid, None)
 
 
 def test_clarify_callback_multi_select_hint(monkeypatch):
