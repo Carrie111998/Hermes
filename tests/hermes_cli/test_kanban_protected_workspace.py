@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,8 +19,14 @@ def isolated_kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    db_path = home / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    assert kb.kanban_db_path().resolve() == db_path.resolve()
+    assert kb.kanban_db_path().resolve().is_relative_to(tmp_path.resolve())
+    kb.init_db(db_path=db_path)
     return home
 
 
@@ -73,6 +80,34 @@ def _make_git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _make_directory_alias(target: Path, alias: Path, kind: str) -> Path:
+    if kind == "junction":
+        result = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(alias), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+    elif kind == "symlink":
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlink unavailable: {exc}")
+    else:
+        raise AssertionError(f"unknown alias kind {kind!r}")
+    assert os.path.samefile(target, alias)
+    return alias
+
+
+def _assert_isolated_temp_db() -> None:
+    db_path = kb.kanban_db_path().resolve()
+    assert os.environ.get("HERMES_KANBAN_DB")
+    assert db_path == Path(os.environ["HERMES_KANBAN_DB"]).expanduser().resolve()
+    hermes_home = Path(os.environ["HERMES_HOME"]).resolve()
+    assert db_path.is_relative_to(hermes_home)
+
+
 @pytest.mark.parametrize(
     "candidate",
     [
@@ -85,6 +120,132 @@ def test_normalize_workspace_root_handles_windows_case_slashes_and_trailing_sepa
     candidate: str,
 ) -> None:
     assert kb.normalize_workspace_root(candidate) == "c:/work/repo"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        r"\\?\C:\work\repo",
+        r"//?/C:/WORK/REPO/",
+        r"\\?\C:\Work\Repo\\",
+    ],
+)
+def test_normalize_workspace_root_strips_windows_extended_prefix(candidate: str) -> None:
+    assert kb.normalize_workspace_root(candidate) == "c:/work/repo"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        r"\\server\share",
+        "\\\\server\\share\\",
+        r"//SERVER/share//",
+    ],
+)
+def test_normalize_workspace_root_handles_unavailable_unc_share_separator(
+    candidate: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_resolve(*_args, **_kwargs):
+        raise OSError("network share is unavailable")
+
+    monkeypatch.setattr(Path, "resolve", unavailable_resolve)
+    assert kb.normalize_workspace_root(candidate) == "//server/share"
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("alias_kind", ["junction", "symlink"])
+def test_normalize_workspace_root_equates_windows_filesystem_aliases(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    primary = tmp_path / "physical-primary"
+    primary.mkdir()
+    alias = _make_directory_alias(primary, tmp_path / f"primary-{alias_kind}", alias_kind)
+
+    assert os.path.samefile(primary, alias)
+    assert kb.normalize_workspace_root(primary) == kb.normalize_workspace_root(alias)
+    assert kb.normalize_workspace_root(str(alias) + os.sep) == kb.normalize_workspace_root(
+        primary
+    )
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("alias_kind", ["junction", "symlink"])
+@pytest.mark.parametrize("entrypoint", ["manual", "embedded"])
+def test_windows_filesystem_alias_is_refused_before_run_or_spawn(
+    isolated_kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alias_kind: str,
+    entrypoint: str,
+) -> None:
+    import hermes_cli.profiles as profiles_module
+
+    _assert_isolated_temp_db()
+    primary = tmp_path / "physical-primary"
+    primary.mkdir()
+    alias = _make_directory_alias(primary, tmp_path / f"primary-{alias_kind}", alias_kind)
+
+    with kb.connect() as conn:
+        assert conn.execute("PRAGMA database_list").fetchone()["file"] == str(
+            kb.kanban_db_path().resolve()
+        )
+        assert os.path.samefile(primary, alias)
+        assert kb.normalize_workspace_root(primary) == kb.normalize_workspace_root(alias)
+
+        owner_id = kb.create_task(
+            conn,
+            title="physical primary owner",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(primary),
+        )
+        kb.protect_workspace(conn, primary, authorized_task_id=owner_id)
+        assert kb.claim_task(conn, owner_id, claimer="live-owner") is not None
+        alias_task_id = kb.create_task(
+            conn,
+            title="unauthorized alias writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(alias),
+        )
+
+        spawned: list[str] = []
+
+        def record_spawn(task, _workspace, board=None):
+            spawned.append(task.id)
+            return None
+
+        if entrypoint == "manual":
+            claimed = kb.claim_task(conn, alias_task_id, claimer="manual-alias")
+            assert claimed is None
+        else:
+            monkeypatch.setattr(profiles_module, "profile_exists", lambda _name: True)
+            monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+            monkeypatch.setattr(kb, "reap_worker_zombies", lambda: 0)
+            kb.dispatch_once(conn, spawn_fn=record_spawn, reconcile_orphans=False)
+
+        assert spawned == []
+        alias_task = kb.get_task(conn, alias_task_id)
+        assert alias_task is not None
+        assert alias_task.status == "blocked"
+        assert alias_task.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (alias_task_id,),
+        ).fetchone()[0] == 0
+        conflict = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'protected_workspace_conflict' "
+            "ORDER BY id DESC LIMIT 1",
+            (alias_task_id,),
+        ).fetchone()
+        assert conflict is not None
+        assert json.loads(conflict["payload"])["conflicting_task_ids"] == [
+            owner_id,
+            alias_task_id,
+        ]
 
 
 def test_protect_workspace_persists_exact_owner_tuple_on_one_board(
@@ -241,6 +402,205 @@ def test_manual_claim_redirects_worktree_root_before_claim(
         ).fetchall()
         kinds = [row["kind"] for row in events]
         assert kinds.index("protected_workspace_redirected") < kinds.index("claimed")
+
+
+@pytest.mark.parametrize("occupied_as", ["ordinary_directory", "wrong_branch_worktree"])
+@pytest.mark.parametrize("path_state", ["root_anchor", "persisted_canonical"])
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("entrypoint", ["manual", "embedded"])
+def test_protected_worktree_redirect_refuses_occupied_target_before_run_or_spawn(
+    isolated_kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    occupied_as: str,
+    path_state: str,
+    lane: str,
+    entrypoint: str,
+) -> None:
+    import hermes_cli.config as config_module
+    import hermes_cli.profiles as profiles_module
+
+    _assert_isolated_temp_db()
+    repo = _make_git_repo(tmp_path)
+    with kb.connect() as conn:
+        owner_id = kb.create_task(
+            conn,
+            title="occupied target root owner",
+            assignee="root-owner",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        kb.protect_workspace(conn, repo, authorized_task_id=owner_id)
+        assert kb.claim_task(conn, owner_id, claimer="live-root-owner") is not None
+
+        worktree_id = kb.create_task(
+            conn,
+            title=f"{lane} {path_state} {occupied_as} isolation candidate",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        intended_branch = f"feat/intended-{worktree_id}"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET branch_name=? WHERE id=?",
+                (intended_branch, worktree_id),
+            )
+            if lane == "review":
+                conn.execute(
+                    "UPDATE tasks SET status='review' WHERE id=?",
+                    (worktree_id,),
+                )
+
+        target = repo / ".worktrees" / worktree_id
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if occupied_as == "ordinary_directory":
+            target.mkdir()
+            (target / "occupied.txt").write_text("not a worktree\n", encoding="utf-8")
+        else:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "worktree",
+                    "add",
+                    "-b",
+                    f"occupied/{worktree_id}",
+                    str(target),
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        if path_state == "persisted_canonical":
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET workspace_path=? WHERE id=?",
+                    (str(target), worktree_id),
+                )
+
+        spawned: list[str] = []
+
+        def record_spawn(task, _workspace, board=None):
+            spawned.append(task.id)
+            return None
+
+        if entrypoint == "manual":
+            claimed = (
+                kb.claim_review_task(conn, worktree_id, claimer="manual-review")
+                if lane == "review"
+                else kb.claim_task(conn, worktree_id, claimer="manual-ready")
+            )
+            assert claimed is None
+        else:
+            monkeypatch.setattr(profiles_module, "profile_exists", lambda _name: True)
+            monkeypatch.setattr(
+                config_module,
+                "load_config",
+                lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+            )
+            monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+            monkeypatch.setattr(kb, "reap_worker_zombies", lambda: 0)
+            kb.dispatch_once(conn, spawn_fn=record_spawn, reconcile_orphans=False)
+
+        assert spawned == []
+        refused = kb.get_task(conn, worktree_id)
+        assert refused is not None
+        assert refused.status == "blocked"
+        assert refused.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (worktree_id,),
+        ).fetchone()[0] == 0
+        rejected = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'protected_workspace_claim_rejected' "
+            "ORDER BY id DESC LIMIT 1",
+            (worktree_id,),
+        ).fetchone()
+        assert rejected is not None
+        assert json.loads(rejected["payload"])["reason"] == "worktree_isolation_failed"
+
+
+def test_resolve_worktree_workspace_refuses_canonical_target_on_wrong_branch(
+    isolated_kanban_home: Path,
+    tmp_path: Path,
+) -> None:
+    repo = _make_git_repo(tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="canonical target must match intended branch",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        target = repo / ".worktrees" / task_id
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-b",
+                f"occupied/{task_id}",
+                str(target),
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        intended_branch = f"feat/{task_id}"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path=?, branch_name=? WHERE id=?",
+                (str(target), intended_branch, task_id),
+            )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+
+        with pytest.raises(RuntimeError, match=f"occupied.*{intended_branch}"):
+            kb.resolve_workspace(task)
+
+
+def test_manual_claim_revalidates_valid_persisted_protected_worktree(
+    isolated_kanban_home: Path,
+    tmp_path: Path,
+) -> None:
+    repo = _make_git_repo(tmp_path)
+    with kb.connect() as conn:
+        owner_id = kb.create_task(
+            conn,
+            title="persisted worktree root owner",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        kb.protect_workspace(conn, repo, authorized_task_id=owner_id)
+        worktree_id = kb.create_task(
+            conn,
+            title="valid persisted worktree",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feat/valid-persisted-worktree",
+        )
+        task = kb.get_task(conn, worktree_id)
+        assert task is not None
+        target = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worktree_id, target)
+
+        claimed = kb.claim_task(conn, worktree_id, claimer="manual-persisted")
+
+        assert claimed is not None
+        assert claimed.status == "running"
+        assert Path(claimed.workspace_path).resolve() == target.resolve()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (worktree_id,),
+        ).fetchone()[0] == 1
 
 
 def test_explicit_exact_tuple_allowlist_can_claim_protected_dir(

@@ -136,19 +136,62 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
-def normalize_workspace_root(path: Path | str) -> str:
-    """Return a stable comparison key for a workspace root.
+def _is_windows_absolute_path(raw: str) -> bool:
+    return ntpath.isabs(raw) and (
+        bool(ntpath.splitdrive(raw)[0]) or raw.startswith(("\\\\", "//"))
+    )
 
-    Windows paths are normalized with Windows semantics even when a board DB
-    is inspected from another platform (for example, during recovery). That
-    makes drive-letter case, slash direction, and trailing separators
-    irrelevant without making POSIX paths case-insensitive.
+
+def _is_windows_unc_path(raw: str) -> bool:
+    lowered = raw.replace("\\", "/").lower()
+    if lowered.startswith("//?/unc/"):
+        return True
+    return lowered.startswith("//") and not lowered.startswith("//?/")
+
+
+def _strip_windows_extended_prefix(normalized: str) -> str:
+    if normalized.startswith("//?/unc/"):
+        return "//" + normalized[8:]
+    if normalized.startswith("//?/"):
+        return normalized[4:]
+    return normalized
+
+
+def _normalize_windows_root_key(raw: str) -> str:
+    normalized = ntpath.normcase(ntpath.normpath(raw)).replace("\\", "/")
+    normalized = _strip_windows_extended_prefix(normalized)
+    if normalized.startswith("//"):
+        normalized = normalized.rstrip("/") or "//"
+    return normalized
+
+
+def _resolve_existing_local_windows_root(raw: str) -> str:
+    """Resolve junction/symlink aliases for existing local Windows roots only."""
+    if os.name != "nt" or _is_windows_unc_path(raw):
+        return raw
+    try:
+        candidate = Path(raw)
+        if not candidate.exists():
+            return raw
+        return str(candidate.resolve(strict=False))
+    except OSError:
+        return raw
+
+
+def normalize_workspace_root(path: Path | str) -> str:
+    """Return a stable physical comparison key for a workspace root.
+
+    Existing local roots are resolved before lexical normalization so a
+    symlink or Windows junction cannot give one directory multiple policy
+    identities. Windows paths still use Windows case/slash semantics, including
+    when a board DB is inspected from another platform where that path cannot
+    be resolved physically. UNC / unavailable-network paths stay lexical.
     """
     raw = os.path.expanduser(str(path).strip())
     if not raw:
         raise ValueError("workspace root is required")
-    if ntpath.isabs(raw) and (ntpath.splitdrive(raw)[0] or raw.startswith(("\\\\", "//"))):
-        return ntpath.normcase(ntpath.normpath(raw)).replace("\\", "/")
+    if _is_windows_absolute_path(raw):
+        return _normalize_windows_root_key(_resolve_existing_local_windows_root(raw))
     resolved = Path(raw).expanduser().resolve(strict=False)
     return os.path.normcase(str(resolved)).replace("\\", "/")
 
@@ -4753,15 +4796,29 @@ def _protected_workspace_claim_allowed(
         return False
     if not task["workspace_path"]:
         return True
-    normalized = normalize_workspace_root(task["workspace_path"])
+    workspace_normalized = normalize_workspace_root(task["workspace_path"])
     policy = conn.execute(
         "SELECT normalized_root, root_path, authorized_task_id, "
         "authorized_title, authorized_workspace_kind, is_git_root "
         "FROM protected_workspaces WHERE normalized_root = ?",
-        (normalized,),
+        (workspace_normalized,),
     ).fetchone()
+    persisted_isolated_path: Optional[Path] = None
+    if policy is None and task["workspace_kind"] == "worktree":
+        policies = conn.execute(
+            "SELECT normalized_root, root_path, authorized_task_id, "
+            "authorized_title, authorized_workspace_kind, is_git_root "
+            "FROM protected_workspaces WHERE is_git_root = 1"
+        ).fetchall()
+        for candidate in policies:
+            expected = Path(candidate["root_path"]) / ".worktrees" / task_id
+            if normalize_workspace_root(expected) == workspace_normalized:
+                policy = candidate
+                persisted_isolated_path = expected
+                break
     if policy is None:
         return True
+    normalized = policy["normalized_root"]
 
     _append_protected_workspace_conflict_if_needed(
         conn,
@@ -4770,53 +4827,81 @@ def _protected_workspace_claim_allowed(
         authorized_task_id=policy["authorized_task_id"],
     )
 
-    exact_owner = (
-        task["id"] == policy["authorized_task_id"]
-        and task["title"] == policy["authorized_title"]
-        and task["workspace_kind"] == policy["authorized_workspace_kind"]
-    )
-    if exact_owner:
-        return True
-
-    allow = conn.execute(
-        "SELECT title, workspace_kind FROM protected_workspace_allowlist "
-        "WHERE normalized_root = ? AND task_id = ?",
-        (normalized, task_id),
-    ).fetchone()
-    if (
-        allow is not None
-        and task["title"] == allow["title"]
-        and task["workspace_kind"] == allow["workspace_kind"]
-    ):
-        return True
-
-    if task["workspace_kind"] == "worktree" and bool(policy["is_git_root"]):
-        branch_name = (task["branch_name"] or "").strip() or f"wt/{task_id}"
-        isolated_path = Path(policy["root_path"]) / ".worktrees" / task_id
-        redirected = conn.execute(
-            "UPDATE tasks SET workspace_path = ?, branch_name = ? "
-            "WHERE id = ? AND status = ? AND claim_lock IS NULL",
-            (str(isolated_path), branch_name, task_id, expected_status),
-        )
-        if redirected.rowcount != 1:
-            return False
-        _append_event(
-            conn,
-            task_id,
-            "protected_workspace_redirected",
-            {
-                "normalized_root": normalized,
-                "workspace_path": str(isolated_path),
-                "branch_name": branch_name,
-                "source_status": expected_status,
-            },
-        )
-        return True
-
+    rejection_code = "exact_owner_required"
     reason = (
         f"protected workspace {policy['root_path']} is reserved for exact task "
         f"{policy['authorized_task_id']!r}"
     )
+    if persisted_isolated_path is not None:
+        branch_name = (task["branch_name"] or "").strip() or f"wt/{task_id}"
+        try:
+            _ensure_git_worktree(
+                Path(policy["root_path"]),
+                persisted_isolated_path,
+                branch_name,
+            )
+        except Exception as exc:
+            rejection_code = "worktree_isolation_failed"
+            reason = (
+                f"protected worktree isolation failed for {persisted_isolated_path} "
+                f"on branch {branch_name!r}: {exc}"
+            )
+        else:
+            return True
+    else:
+        exact_owner = (
+            task["id"] == policy["authorized_task_id"]
+            and task["title"] == policy["authorized_title"]
+            and task["workspace_kind"] == policy["authorized_workspace_kind"]
+        )
+        if exact_owner:
+            return True
+
+        allow = conn.execute(
+            "SELECT title, workspace_kind FROM protected_workspace_allowlist "
+            "WHERE normalized_root = ? AND task_id = ?",
+            (normalized, task_id),
+        ).fetchone()
+        if (
+            allow is not None
+            and task["title"] == allow["title"]
+            and task["workspace_kind"] == allow["workspace_kind"]
+        ):
+            return True
+
+        if task["workspace_kind"] == "worktree" and bool(policy["is_git_root"]):
+            branch_name = (task["branch_name"] or "").strip() or f"wt/{task_id}"
+            repo_root = Path(policy["root_path"])
+            isolated_path = repo_root / ".worktrees" / task_id
+            try:
+                _ensure_git_worktree(repo_root, isolated_path, branch_name)
+            except Exception as exc:
+                rejection_code = "worktree_isolation_failed"
+                reason = (
+                    f"protected worktree isolation failed for {isolated_path} on "
+                    f"branch {branch_name!r}: {exc}"
+                )
+            else:
+                redirected = conn.execute(
+                    "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+                    "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+                    (str(isolated_path), branch_name, task_id, expected_status),
+                )
+                if redirected.rowcount != 1:
+                    return False
+                _append_event(
+                    conn,
+                    task_id,
+                    "protected_workspace_redirected",
+                    {
+                        "normalized_root": normalized,
+                        "workspace_path": str(isolated_path),
+                        "branch_name": branch_name,
+                        "source_status": expected_status,
+                    },
+                )
+                return True
+
     kind = "capability"
     previous_kind = task["block_kind"]
     previous_recurrences = int(task["block_recurrences"] or 0)
@@ -4840,7 +4925,8 @@ def _protected_workspace_claim_allowed(
             "severity": "critical",
             "normalized_root": normalized,
             "authorized_task_id": policy["authorized_task_id"],
-            "reason": "exact_owner_required",
+            "reason": rejection_code,
+            "detail": reason,
             "source_status": expected_status,
         },
     )
@@ -8134,14 +8220,39 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
-    target = target.expanduser()
+def _worktree_checkout_matches(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+) -> bool:
+    """Return whether ``target`` is the intended linked worktree checkout."""
+    if not target.exists() or not _is_linked_worktree_checkout(target):
+        return False
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
-        target_common = _git_common_dir(target)
-        if target_common == repo_common:
+    target_common = _git_common_dir(target)
+    target_root = _git_toplevel(target)
+    if repo_common is None or target_common is None or target_root is None:
+        return False
+    return (
+        normalize_workspace_root(repo_common) == normalize_workspace_root(target_common)
+        and normalize_workspace_root(target_root) == normalize_workspace_root(target)
+        and _git_current_branch(target) == branch_name
+    )
+
+
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+    """Materialize and verify ``target`` as the intended linked worktree."""
+    repo_root = repo_root.expanduser().resolve(strict=False)
+    target = target.expanduser()
+    if target.exists():
+        if _worktree_checkout_matches(repo_root, target, branch_name):
             return
+        actual_branch = _git_current_branch(target)
+        raise RuntimeError(
+            f"worktree target {target} is occupied; expected a linked worktree "
+            f"of {repo_root} on branch {branch_name!r}, found branch "
+            f"{actual_branch!r}"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -8161,6 +8272,11 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+        )
+    if not _worktree_checkout_matches(repo_root, target, branch_name):
+        raise RuntimeError(
+            f"git created {target}, but it is not a linked worktree of "
+            f"{repo_root} on branch {branch_name!r}"
         )
 
 
@@ -8232,10 +8348,11 @@ def _resolve_worktree_workspace(
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise RuntimeError(
+            f"worktree target {requested_resolved} is occupied by branch "
+            f"{actual_branch!r}; expected branch {branch_name!r} and no safe "
+            "alternate linked-worktree target is available"
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
