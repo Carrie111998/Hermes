@@ -4910,6 +4910,9 @@ _LAZY_COMMAND_EXPORTS = {
         "_purge_stale_hermes_modules",
         "_format_venv_python_holders_message",
         "_gateway_prompt",
+        "_gateway_update_status_path",
+        "_write_gateway_update_status",
+        "_write_tauri_coordinator_outcome",
         "_get_origin_url",
         "_has_upstream_remote",
         "_install_psutil_android_compat",
@@ -4978,6 +4981,7 @@ _LAZY_COMMAND_EXPORTS = {
         "SKIP_UPSTREAM_PROMPT_FILE",
         "_PRE_UPDATE_SNAPSHOT_KEEP",
         "_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE",
+        "UPDATE_EXIT_INDEPENDENT_HANDOFF",
     ),
 }
 
@@ -6296,7 +6300,23 @@ def _missing_web_build_tool(output: str) -> str | None:
     return None
 
 
-def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
+_WEB_UI_BUILD_LOCK_TIMEOUT_SECONDS = 180.0
+
+
+def _web_build_allowed_by_update_marker() -> bool:
+    """Allow bundle mutation only outside, or within, our update transaction."""
+    from hermes_cli.update_lock import (
+        read_live_update,
+        update_claim_belongs_to_current_process,
+    )
+
+    holder = read_live_update()
+    return holder is None or update_claim_belongs_to_current_process(holder)
+
+
+def _build_web_ui(
+    web_dir: Path, *, fatal: bool = False, require_fresh: bool = False
+) -> bool:
     """Build the web UI frontend if npm is available, serializing across processes.
 
     Concurrent dashboard boots (e.g. the desktop app's retry loop after a
@@ -6305,7 +6325,9 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     other, none finished, the dist sentinel never advanced, and every new
     boot re-triggered the build. One process builds under an exclusive
     flock; the rest serve the existing dist (stale is acceptable) or, when
-    no dist exists yet, block until the builder finishes.
+    no dist exists yet, block until the builder finishes. ``require_fresh``
+    is the updater contract: wait a bounded time for the lock and never count
+    stale output as a successful build.
 
     Staleness is checked once, inside :func:`_do_build_web_ui`, after the
     lock is held — so a process that queued behind the builder skips the
@@ -6313,39 +6335,67 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """
     if not (web_dir / "package.json").exists():
         return True
-    try:
-        import fcntl
-    except ImportError:
-        # Windows: no flock — fall through to the unserialized build.
-        return _do_build_web_ui(web_dir, fatal=fatal)
     project_root = web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
     dist_index = project_root / "hermes_cli" / "web_dist" / "index.html"
+
+    def _defer_to_active_update() -> bool:
+        print("Web UI build deferred: another Hermes update owns this install.")
+        # An ordinary boot can keep serving the last complete bundle.  The
+        # updater's require_fresh contract and a first-ever build both fail
+        # closed instead of reporting success without producing an artifact.
+        return dist_index.exists() and not require_fresh
+
+    # Admission before the artifact lock keeps a builder from waiting behind
+    # an updater that already owns the transaction.  The recheck under the
+    # artifact lock below closes the inverse race: an updater may publish its
+    # marker after this check but before we become the bundle mutator.
+    if not _web_build_allowed_by_update_marker():
+        return _defer_to_active_update()
+
     try:
-        lock_file = open(project_root / ".web_ui_build.lock", "a", encoding="utf-8")
-    except OSError:
-        return _do_build_web_ui(web_dir, fatal=fatal)
-    try:
+        from hermes_cli.web_dist_lock import (
+            WebDistLockError,
+            WebDistLockTimeout,
+            web_dist_lock,
+        )
+
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            if dist_index.exists():
-                # Another process is already building — serve the current
-                # dist instead of piling a second build onto the same tree.
+            with web_dist_lock(project_root, timeout_seconds=0.0):
+                if not _web_build_allowed_by_update_marker():
+                    return _defer_to_active_update()
+                return _do_build_web_ui(
+                    web_dir, fatal=fatal, require_fresh=require_fresh
+                )
+        except WebDistLockTimeout:
+            if dist_index.exists() and not require_fresh:
+                # Another process is already mutating the bundle. Ordinary
+                # boots may keep serving the current generation.
                 return True
-            # No dist at all (first-ever build): wait for the builder.
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        return _do_build_web_ui(web_dir, fatal=fatal)
-    finally:
-        lock_file.close()
+            with web_dist_lock(
+                project_root,
+                timeout_seconds=_WEB_UI_BUILD_LOCK_TIMEOUT_SECONDS,
+            ):
+                if not _web_build_allowed_by_update_marker():
+                    return _defer_to_active_update()
+                return _do_build_web_ui(
+                    web_dir, fatal=fatal, require_fresh=require_fresh
+                )
+    except WebDistLockError as exc:
+        print(f"Web UI frontend not built: {exc}.")
+        return False
 
 
-def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
+def _do_build_web_ui(
+    web_dir: Path, *, fatal: bool = False, require_fresh: bool = False
+) -> bool:
     """Build the web UI frontend if npm is available.
 
     Args:
         web_dir: Path to the dashboard frontend source directory.
         fatal: If True, print error guidance and return False on failure
                instead of a soft warning (used by ``hermes web``).
+        require_fresh: If True, stale output is never accepted after a failed
+                       build (used by ``hermes update``).
 
     Returns True if the build succeeded or was skipped (no package.json).
     """
@@ -6479,7 +6529,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         # If a stale dist exists, serve it as a fallback instead of failing.
         # A stale UI is far better than no UI for non-interactive callers
         # (Windows Scheduled Tasks, CI) — issue #23817.
-        if dist_index.exists():
+        if dist_index.exists() and not require_fresh:
             _say("  ⚠ Web UI build failed — serving stale dist as fallback")
             if stderr_tail:
                 _say(f"  Build error:\n  {stderr_tail}")
@@ -8883,7 +8933,8 @@ def _reexec_dependency_sync_off_windows_shim() -> bool:
     the work it is waiting for. Windows has no exec to escape with either.
     The shell therefore returns while the install runs on; the child keeps the
     console and prints its own result, and ``--gateway`` writes the true exit
-    code to ``.update_exit_code`` for the gateway watcher.
+    code to the invocation's correlation-scoped status marker for the gateway
+    watcher (with the legacy generic marker only for uncorrelated callers).
 
     The child re-runs ``hermes update``, so the whole remaining flow — the
     dependency sync and the node/web/lazy-refresh tail behind it — still
@@ -10324,7 +10375,14 @@ def cmd_update(args):
         recommended_update_command_for_method,
     )
 
-    if is_managed():
+    # Recovery is driven by the external checkpoint, not by the candidate
+    # generation's current install marker.  A failed candidate can be
+    # misclassified (or have a newly-written package/image marker), so keep
+    # explicit rollback reachable through the normal update lock even then.
+    # Regular update/check admission remains unchanged.
+    explicit_rollback = getattr(args, "rollback", None) is not None
+
+    if is_managed() and not explicit_rollback:
         managed_error("update Hermes Agent")
         return
 
@@ -10351,11 +10409,13 @@ def cmd_update(args):
     # repository" text.  See format_docker_update_message() for the full
     # rationale and tag-pinning / config-persistence notes.
     install_method = detect_install_method(PROJECT_ROOT)
-    if install_method == "docker":
+    if install_method == "docker" and not explicit_rollback:
         print(format_docker_update_message())
         sys.exit(1)
 
-    if is_nix_install_method(install_method) or install_method == "apt":
+    if not explicit_rollback and (
+        is_nix_install_method(install_method) or install_method == "apt"
+    ):
         print(recommended_update_command_for_method(install_method))
         sys.exit(1)
 
@@ -10370,6 +10430,61 @@ def cmd_update(args):
         return
 
     gateway_mode = getattr(args, "gateway", False)
+    _gateway_update_marker_before = None
+
+    def _gateway_update_marker_snapshot():
+        if not gateway_mode:
+            return None
+        try:
+            marker = _self()._gateway_update_status_path()
+            if marker is None:
+                return None
+            payload = marker.read_text(encoding="utf-8").strip()
+            return (marker.stat().st_mtime_ns, payload)
+        except OSError:
+            return None
+
+    _gateway_update_marker_before = _gateway_update_marker_snapshot()
+
+    def _publish_gateway_update_terminal_status(code: int) -> None:
+        """Publish exactly one command-boundary outcome for bot callers.
+
+        Canary handoff exit 75 is deliberately nonterminal: the acknowledged
+        independent worker owns the eventual marker.  Every other return,
+        SystemExit, or exception may overwrite an optimistic legacy marker so
+        the watcher observes the command's final truth.
+        """
+        if not gateway_mode:
+            return
+        if code == getattr(_self(), "UPDATE_EXIT_INDEPENDENT_HANDOFF", 75):
+            return
+        if code == 0:
+            current = _gateway_update_marker_snapshot()
+            if current is not None and current != _gateway_update_marker_before:
+                try:
+                    if int(current[1]) != 0:
+                        # The implementation completed normally after writing
+                        # a truthful partial/failure outcome (for example a
+                        # Desktop/ZIP build failure). Do not overwrite it with
+                        # an optimistic command-return success.
+                        try:
+                            _self()._write_tauri_coordinator_outcome(
+                                int(current[1])
+                            )
+                        except Exception:
+                            pass
+                        return
+                except ValueError:
+                    pass
+        final_code = 0 if code == 0 else int(code or 1)
+        try:
+            _self()._write_gateway_update_status(final_code)
+        except Exception:
+            pass
+        try:
+            _self()._write_tauri_coordinator_outcome(final_code)
+        except Exception:
+            pass
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
     # writes to a closed stdout.  No-op in gateway mode.  See
@@ -10386,11 +10501,37 @@ def cmd_update(args):
         UpdateLock,
         describe_holder,
     )
+    from hermes_cli.update_coordinator import (
+        acquire_windows_coordinator_takeover,
+        handoff_windows_rollout_coordinator,
+        is_windows_coordinator_child,
+        schedule_windows_coordinator_cleanup,
+    )
 
     _update_lock = UpdateLock()
-    if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
+    _external_coordinator = is_windows_coordinator_child()
+    try:
+        if _external_coordinator:
+            _update_lock_acquired = acquire_windows_coordinator_takeover(
+                _update_lock,
+                project_root=Path(PROJECT_ROOT),
+            )
+        else:
+            _update_lock_acquired = _update_lock.acquire()
+    except BaseException:
+        _update_lock.release()
         _finalize_update_output(_update_io_state)
+        _publish_gateway_update_terminal_status(1)
+        if _external_coordinator:
+            schedule_windows_coordinator_cleanup(Path(PROJECT_ROOT))
+        raise
+    if not _update_lock_acquired:
+        print(describe_holder(_update_lock.holder))
+        _update_lock.release()
+        _finalize_update_output(_update_io_state)
+        _publish_gateway_update_terminal_status(UPDATE_EXIT_CONCURRENT)
+        if _external_coordinator:
+            schedule_windows_coordinator_cleanup(Path(PROJECT_ROOT))
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
     # Exit code for the Windows hand-off child's hard exit (see finally).
@@ -10398,6 +10539,19 @@ def cmd_update(args):
     # normal raise path so their traceback still prints.
     _update_handoff_exit_code: int | None = None
     try:
+        if not _external_coordinator:
+            _coordinator_handoff_code = handoff_windows_rollout_coordinator(
+                args,
+                update_lock=_update_lock,
+                gateway_mode=gateway_mode,
+                project_root=Path(PROJECT_ROOT),
+            )
+            if _coordinator_handoff_code is not None:
+                # The child owns the marker before this process exits and
+                # waits on our exact Win32 process handle before mutation.
+                # Gateway code 75 is nonterminal; terminal code 0 merely
+                # reports that the isolated coordinator was accepted.
+                sys.exit(_coordinator_handoff_code)
         _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
     except SystemExit as _update_exit:
         # Receipt boundary (#91283 review): the impl has many early
@@ -10416,6 +10570,8 @@ def cmd_update(args):
         _update_handoff_exit_code = (
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
+        _code = _update_exit.code if isinstance(_update_exit.code, int) else 1
+        _publish_gateway_update_terminal_status(_code)
         raise
     except BaseException as _update_exc:
         try:
@@ -10426,6 +10582,7 @@ def cmd_update(args):
             )
         except Exception:
             pass
+        _publish_gateway_update_terminal_status(1)
         raise
     else:
         try:
@@ -10435,9 +10592,12 @@ def cmd_update(args):
         except Exception:
             pass
         _update_handoff_exit_code = 0
+        _publish_gateway_update_terminal_status(0)
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
+        if _external_coordinator:
+            schedule_windows_coordinator_cleanup(Path(PROJECT_ROOT))
         # Windows hand-off child (#93581): the re-exec'd venv child cannot
         # rely on graceful interpreter shutdown — a leftover non-daemon
         # thread from the update tail keeps the console busy long after

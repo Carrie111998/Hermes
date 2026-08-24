@@ -31,7 +31,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -47,6 +49,21 @@ _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 # command; a module singleton lets the 7k-line updater record steps from
 # any depth without threading a handle through every helper.
 _current: Optional["UpdateReceipt"] = None
+_last_persistence_failure: Optional[dict[str, Any]] = None
+
+
+def last_persistence_failure() -> Optional[dict[str, Any]]:
+    """Return the most recent retryable receipt publication failure."""
+    return dict(_last_persistence_failure) if _last_persistence_failure else None
+
+
+def _safe_process_argv() -> list[str]:
+    try:
+        from hermes_cli.process_identity import redact_argv
+
+        return redact_argv(sys.argv)
+    except Exception:
+        return ["[REDACTED]"]
 
 
 def _utc_now_iso() -> str:
@@ -61,8 +78,10 @@ class UpdateReceipt:
             "schema": 1,
             "started_at": _utc_now_iso(),
             "finished_at": None,
-            "argv": list(sys.argv),
+            "argv": _safe_process_argv(),
             "pid": os.getpid(),
+            "correlation_id": None,
+            "origin": {},
             "outcome": "running",  # running | success | partial | failed
             "pre_update": {},
             "post_update": {},
@@ -70,6 +89,13 @@ class UpdateReceipt:
             "skips": [],
             "gateway_restart": {},
             "fleet": [],
+            # Phase 4 transaction facts.  These stay empty for the default
+            # (non-canary) updater, preserving the existing behavior while
+            # giving terminal, Desktop, Telegram, and Discord one typed
+            # receipt contract when rollout/rollback is enabled.
+            "checkpoint": {},
+            "canary": {},
+            "rollback": {},
         }
         try:
             from hermes_cli.build_info import get_code_identity
@@ -112,6 +138,21 @@ class UpdateReceipt:
             "phase_error": phase_error,
         }
 
+    def transaction_result(self, field: str, payload: dict[str, Any]) -> None:
+        """Merge a typed transaction section into this receipt."""
+        if field not in {"checkpoint", "canary", "rollback"}:
+            raise ValueError(f"unknown update transaction field: {field}")
+        current = self.data.get(field)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(dict(payload))
+        current["at"] = _utc_now_iso()
+        self.data[field] = current
+
+    def update_context(self, correlation_id: str, origin: dict[str, Any]) -> None:
+        self.data["correlation_id"] = str(correlation_id)
+        self.data["origin"] = dict(origin)
+
     def finalize(self, outcome: str) -> None:
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
@@ -125,8 +166,61 @@ class UpdateReceipt:
 
 def _receipt_dir() -> Path:
     from hermes_cli.config import get_hermes_home
+    from hermes_cli.update_rollout import validate_no_reparse_topology
 
-    return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
+    directory = get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
+    validate_no_reparse_topology(directory)
+    return directory
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish one complete receipt document with a same-directory replace."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        temp.unlink(missing_ok=True)
+
+
+def _atomic_create_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish an immutable complete receipt without replacing a winner."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A hard link is an atomic no-replace publication on POSIX and Windows.
+        # Readers can never observe a partially-written retained receipt.
+        os.link(temp, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        temp.unlink(missing_ok=True)
 
 
 def begin_update_receipt() -> None:
@@ -166,19 +260,51 @@ def record_gateway_restart(**kwargs: Any) -> None:
         logger.debug("Could not record gateway restart result: %s", exc)
 
 
+def _record_transaction(field: str, payload: dict[str, Any]) -> None:
+    """Attach a checkpoint/canary/rollback result. Never raises."""
+    try:
+        if _current is not None:
+            _current.transaction_result(field, payload)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record update %s result: %s", field, exc)
+
+
+def record_checkpoint(**payload: Any) -> None:
+    """Record the external pre-update checkpoint identity/state."""
+    _record_transaction("checkpoint", payload)
+
+
+def record_canary(**payload: Any) -> None:
+    """Record the canary-first rollout plan and health result."""
+    _record_transaction("canary", payload)
+
+
+def record_rollback(**payload: Any) -> None:
+    """Record an automatic or explicit rollback and its verification."""
+    _record_transaction("rollback", payload)
+
+
+def record_update_context(correlation_id: str, **origin: Any) -> None:
+    """Record stable invocation identity shared with bot pending state."""
+    try:
+        if _current is not None:
+            _current.update_context(correlation_id, dict(origin))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record update invocation context: %s", exc)
+
+
 def finalize_update_receipt(
     outcome: str, fleet: list | None = None, stop_reason: str = ""
 ) -> Optional[Path]:
-    """Finalize + persist the receipt. Returns the written path or None.
+    """Finalize + persist the receipt, retaining it across failed publication.
 
-    ``outcome`` is one of ``success`` / ``partial`` / ``failed`` /
-    ``refused``. Exactly-once by construction: the module singleton is
-    popped first, so a second call (e.g. the command-boundary safety net
-    after an inner path already finalized) is a no-op returning None.
+    The retained receipt is the primary durable record.  The in-memory receipt
+    is only cleared after that no-replace publication succeeds; a failed
+    retained write remains retryable.  A latest-pointer failure is reported
+    separately because the retained record is already durable.
     """
-    global _current
+    global _current, _last_persistence_failure
     receipt = _current
-    _current = None
     if receipt is None:
         return None
     try:
@@ -190,18 +316,55 @@ def finalize_update_receipt(
         directory = _receipt_dir()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = directory / f"update_{stamp}_{os.getpid()}.json"
-        path.write_text(
-            json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
+        correlation_id = str(receipt.data.get("correlation_id") or "")
+        correlation_token = "".join(
+            char if char.isalnum() or char in {"-", "_"} else "_"
+            for char in correlation_id
+        )[:64] or "uncorrelated"
+        path = directory / (
+            f"update_{stamp}_{os.getpid()}_{correlation_token}_"
+            f"{uuid.uuid4().hex}.json"
         )
-        # Stable pointer for the dashboard/desktop: latest receipt.
-        latest = directory / "latest.json"
+        receipt.data["persistence"] = {
+            "retained_write": "success",
+        }
         try:
-            latest.write_text(
-                json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
-            )
-        except OSError:
-            pass
+            _atomic_create_json(path, receipt.data)
+        except Exception as exc:
+            _last_persistence_failure = {
+                "stage": "retained_write",
+                "retryable": True,
+                "error": str(exc),
+            }
+            receipt.data["persistence"] = {
+                "retained_write": "failed",
+                "retryable": True,
+                "error": str(exc),
+            }
+            logger.warning("Could not retain update receipt: %s", exc)
+            return None
+        # The primary record is now durable; exactly-once callers must not
+        # publish it again, even if the convenience pointer cannot be written.
+        _current = None
+        latest = directory / "latest.json"
+        latest_payload = dict(receipt.data)
+        latest_payload["persistence"] = {
+            "retained_write": "success",
+            "latest_pointer": "success",
+            "retryable": False,
+        }
+        try:
+            _atomic_write_json(latest, latest_payload)
+        except Exception as exc:
+            _last_persistence_failure = {
+                "stage": "latest_pointer",
+                "retryable": True,
+                "retained_path": str(path),
+                "error": str(exc),
+            }
+            logger.warning("Could not update latest receipt pointer: %s", exc)
+        else:
+            _last_persistence_failure = None
         _prune_old_receipts(directory)
         return path
     except Exception as exc:  # pragma: no cover - defensive
@@ -245,8 +408,37 @@ def finalize_pending_update_receipt(
     return finalize_update_receipt(outcome, stop_reason=stop_reason)
 
 
+def _pending_receipt_correlations(directory: Path) -> Optional[set[str]]:
+    """Return bot correlations whose terminal delivery is still pending.
+
+    ``None`` means the action marker exists but could not be read; pruning then
+    fails closed rather than deleting the only receipt the reconnecting bot
+    may need to verify.
+    """
+
+    home = directory.parent.parent
+    correlations: set[str] = set()
+    for name in (".update_pending.claimed.json", ".update_pending.json"):
+        path = home / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        correlation_id = str(payload.get("correlation_id") or "").strip()
+        if correlation_id:
+            correlations.add(correlation_id)
+    return correlations
+
+
 def _prune_old_receipts(directory: Path) -> None:
     try:
+        pinned = _pending_receipt_correlations(directory)
+        if pinned is None:
+            return
         receipts = sorted(
             (p for p in directory.glob("update_*.json") if p.is_file()),
             key=lambda p: p.stat().st_mtime,
@@ -254,8 +446,15 @@ def _prune_old_receipts(directory: Path) -> None:
         )
         for stale in receipts[_RECEIPT_KEEP:]:
             try:
+                if pinned:
+                    payload = json.loads(stale.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(payload, dict)
+                        and str(payload.get("correlation_id") or "") in pinned
+                    ):
+                        continue
                 stale.unlink()
-            except OSError:
+            except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
     except Exception:
         pass
@@ -273,6 +472,44 @@ def read_latest_receipt() -> Optional[dict[str, Any]]:
         return None
 
 
+def read_receipt_for_correlation(correlation_id: str) -> Optional[dict[str, Any]]:
+    """Read the retained receipt for one exact invocation identity.
+
+    ``latest.json`` is only a dashboard convenience pointer and can advance
+    while a bot completion is waiting for its platform to reconnect.  Search
+    the immutable retained receipts when that pointer belongs to another run.
+    Never raises.
+    """
+
+    expected = str(correlation_id or "").strip()
+    if not expected:
+        return None
+    try:
+        latest = read_latest_receipt()
+        if isinstance(latest, dict) and str(latest.get("correlation_id") or "") == expected:
+            return latest
+
+        directory = _receipt_dir()
+        candidates = sorted(
+            (path for path in directory.glob("update_*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("correlation_id") or "") == expected
+            ):
+                return payload
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Fleet version verification
 # ---------------------------------------------------------------------------
@@ -283,7 +520,8 @@ def collect_fleet_versions(
     """Snapshot every profile's gateway code identity vs. the current tree.
 
     Returns one entry per profile home that has a ``gateway_state.json``
-    describing a gateway that is live — or that SHOULD be live::
+    whose persisted ``(pid, start_time)`` identifies the live process — or
+    that describes a gateway that should still be live::
 
         {"profile": str, "pid": int, "code_sha": str|None,
          "code_version": str|None, "state": "current"|"stale"|"unknown"|"down"}
@@ -320,7 +558,11 @@ def collect_fleet_versions(
         expected_sha = None
 
     try:
-        from gateway.status import _pid_exists, read_runtime_status
+        from gateway.status import (
+            _pid_exists,
+            read_runtime_status,
+            runtime_status_pid_incarnation_is_live,
+        )
         from hermes_cli.profiles import (
             _get_default_hermes_home,
             _get_profiles_root,
@@ -350,8 +592,9 @@ def collect_fleet_versions(
             except Exception:
                 identity = None
             if identity:
+                raw_pid = identity.get("pid")
                 try:
-                    pid = int(identity.get("pid"))
+                    pid = int(raw_pid) if raw_pid is not None else None
                 except (TypeError, ValueError):
                     pid = None
                 if pid is not None:
@@ -377,12 +620,14 @@ def collect_fleet_versions(
             record = read_runtime_status(status_path)
             if not record:
                 continue
-            pid = record.get("pid")
+            raw_pid = record.get("pid")
             try:
-                pid = int(pid)
+                pid = int(raw_pid) if raw_pid is not None else None
             except (TypeError, ValueError):
                 continue
-            if not _pid_exists(pid):
+            if pid is None:
+                continue
+            if not runtime_status_pid_incarnation_is_live(record):
                 # Dead PID: a DOWN row only when this exact pid was alive at
                 # update start AND the record still claims a running state —
                 # "the restart phase stopped it and nothing came back."
@@ -390,8 +635,14 @@ def collect_fleet_versions(
                 # from a long-dead gateway) keeps the historical no-row
                 # behavior so the feature's rollout can't false-positive.
                 gw_state = record.get("gateway_state")
+                try:
+                    pid_is_dead = not _pid_exists(pid)
+                except Exception:
+                    # An unavailable liveness probe is not proof of death.
+                    pid_is_dead = False
                 if (
-                    pid in _pre_restart
+                    pid_is_dead
+                    and pid in _pre_restart
                     and isinstance(gw_state, str)
                     and gw_state
                     and gw_state not in _NOT_EXPECTED_STATES

@@ -12,14 +12,20 @@ These tests pin user/role/global allowlist semantics, explicit allow-all
 handling, and fail-closed behavior so the parity cannot regress.
 """
 
+import asyncio
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from gateway.config import PlatformConfig
 
 # Trigger the shared discord mock from tests/gateway/conftest.py before
 # importing the production module.
 from plugins.platforms.discord.adapter import (  # noqa: E402
     ClarifyChoiceView,
+    DiscordAdapter,
     ExecApprovalView,
     ModelPickerView,
     SlashConfirmView,
@@ -134,6 +140,58 @@ def test_update_prompt_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
 
 
+@pytest.mark.asyncio
+async def test_update_prompt_response_is_correlation_bound_and_replay_inert(tmp_path):
+    pending = {
+        "correlation_id": "corr-1",
+        "user_id": "1",
+        "session_key": "session-1",
+        "origin_profile": "work",
+        "profile_home": "/profiles/work",
+        "control_home": str(tmp_path),
+        "install_root": "/project/hermes",
+        "install_id": "install-1",
+    }
+    prompt = {
+        "id": "prompt-1",
+        "kind": "update_confirmation",
+        "correlation_id": "corr-1",
+        "context": {
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(tmp_path),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        },
+    }
+    (tmp_path / ".update_pending.json").write_text(json.dumps(pending))
+    (tmp_path / ".update_prompt.json").write_text(json.dumps(prompt))
+    view = UpdatePromptView(
+        session_key="session-1",
+        prompt_id="prompt-1",
+        correlation_id="corr-1",
+        control_home=str(tmp_path),
+        allowed_user_ids={"1"},
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1, display_name="Operator", roles=[]),
+        message=SimpleNamespace(embeds=[]),
+        response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()),
+    )
+
+    await view._respond(interaction, "y", MagicMock(), "Yes")
+
+    assert json.loads((tmp_path / ".update_response").read_text()) == {
+        "answer": "yes",
+        "correlation_id": "corr-1",
+        "id": "prompt-1",
+    }
+    interaction.response.edit_message.assert_awaited_once()
+
+    await view._respond(interaction, "n", MagicMock(), "No")
+    assert "already" in interaction.response.send_message.call_args.args[0].lower()
+
+
 def test_clarify_choice_view_accepts_role_allowlist():
     view = ClarifyChoiceView(
         choices=["one", "two"],
@@ -195,6 +253,239 @@ def test_view_empty_allowlists_allow_with_explicit_allow_all(monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
     view = ExecApprovalView(session_key="s", allowed_user_ids=set())
     assert view._check_auth(_interaction(99999)) is True
+
+
+def _approval_interaction(user_id=1):
+    class _Embed:
+        footer = {}
+
+        def set_footer(self, *, text):
+            self.footer = {"text": text}
+
+    return SimpleNamespace(
+        user=SimpleNamespace(id=user_id, display_name="Operator", roles=[]),
+        message=SimpleNamespace(embeds=[_Embed()]),
+        response=SimpleNamespace(
+            edit_message=AsyncMock(),
+            send_message=AsyncMock(),
+        ),
+    )
+
+
+def _capture_component_route(adapter):
+    sent = {}
+
+    async def _send(**kwargs):
+        sent.update(kwargs)
+        return SimpleNamespace(id=9001)
+
+    channel = SimpleNamespace(send=AsyncMock(side_effect=_send))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_component_route_rejects_unauthorized_click():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"1"}
+    sent = _capture_component_route(adapter)
+
+    result = await adapter.send_exec_approval("555", "echo hi", "session-1")
+    assert result.success is True
+    view = sent["view"]
+    interaction = _approval_interaction(user_id=2)
+
+    with patch("tools.approval.resolve_gateway_approval") as resolve:
+        await view.allow_once(interaction, MagicMock())
+
+    resolve.assert_not_called()
+    assert view.resolved is False
+    interaction.response.send_message.assert_awaited_once()
+    assert "not authorized" in interaction.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_component_route_marks_mismatched_stale_click():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"1"}
+    sent = _capture_component_route(adapter)
+
+    result = await adapter.send_exec_approval("555", "echo hi", "session-1")
+    assert result.success is True
+    interaction = _approval_interaction()
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=0) as resolve:
+        await sent["view"].allow_once(interaction, MagicMock())
+
+    resolve.assert_called_once_with("session-1", "once")
+    assert sent["view"].resolved is True
+    interaction.response.edit_message.assert_awaited_once()
+    assert "expired" in interaction.message.embeds[0].footer["text"]
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_component_route_rejects_writer_failure(tmp_path):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"1"}
+    sent = _capture_component_route(adapter)
+
+    result = await adapter.send_update_prompt(
+        "555",
+        "Continue update?",
+        session_key="session-1",
+        prompt_id="prompt-1",
+        correlation_id="corr-1",
+        context={"control_home": str(tmp_path)},
+    )
+    assert result.success is True
+
+    interaction = _approval_interaction()
+    with patch(
+        "gateway.update_prompt_response.write_update_confirmation_response",
+        return_value=False,
+    ) as writer:
+        await sent["view"].yes_btn(interaction, MagicMock())
+
+    writer.assert_called_once()
+    assert sent["view"].resolved is False
+    interaction.response.edit_message.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    assert "stale" in interaction.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_component_route_allows_only_one_concurrent_writer(tmp_path):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"1", "2"}
+    sent = _capture_component_route(adapter)
+
+    result = await adapter.send_update_prompt(
+        "555",
+        "Continue update?",
+        session_key="session-1",
+        prompt_id="prompt-1",
+        correlation_id="corr-1",
+        context={"control_home": str(tmp_path)},
+    )
+    assert result.success is True
+    view = sent["view"]
+    first = _approval_interaction(user_id=1)
+    second = _approval_interaction(user_id=2)
+
+    with patch(
+        "gateway.update_prompt_response.write_update_confirmation_response",
+        return_value=True,
+    ) as writer:
+        await asyncio.gather(
+            view.yes_btn(first, MagicMock()),
+            view.no_btn(second, MagicMock()),
+        )
+
+    writer.assert_called_once()
+    assert view.resolved is True
+    assert first.response.edit_message.await_count + second.response.edit_message.await_count == 1
+    assert first.response.send_message.await_count + second.response.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_public_button_rejects_unauthorized_click():
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"1"})
+    interaction = _approval_interaction(user_id=2)
+
+    with patch("tools.approval.resolve_gateway_approval") as resolve:
+        await view.allow_once(interaction, MagicMock())
+
+    resolve.assert_not_called()
+    assert view.resolved is False
+    interaction.response.send_message.assert_awaited_once()
+    assert "not authorized" in interaction.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_public_button_marks_stale_resolution_without_approval():
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"1"})
+    interaction = _approval_interaction()
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=0) as resolve:
+        await view.allow_once(interaction, MagicMock())
+
+    resolve.assert_called_once_with("s", "once")
+    assert view.resolved is True
+    interaction.response.edit_message.assert_awaited_once()
+    assert "expired" in interaction.message.embeds[0].footer["text"]
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_resolution_logs_redacted_transport_error(caplog):
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"1"})
+    interaction = _approval_interaction()
+    secret = "synthetic-" + "discord-transport-" + "secret-1234567890"
+
+    with patch(
+        "tools.approval.resolve_gateway_approval",
+        side_effect=RuntimeError(
+            f"transport Authorization: Bearer {secret}"
+        ),
+    ):
+        with caplog.at_level("ERROR", logger="plugins.platforms.discord.adapter"):
+            await view.allow_once(interaction, MagicMock())
+
+    assert secret not in caplog.text
+    assert "Failed to resolve gateway approval from button" in caplog.text
+    assert "..." in caplog.text
+    interaction.response.edit_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_public_button_rejects_writer_failure(tmp_path):
+    view = UpdatePromptView(
+        session_key="s",
+        prompt_id="p",
+        correlation_id="corr",
+        control_home=str(tmp_path),
+        allowed_user_ids={"1"},
+    )
+    interaction = _approval_interaction()
+
+    with patch(
+        "gateway.update_prompt_response.write_update_confirmation_response",
+        return_value=False,
+    ) as writer:
+        await view.yes_btn(interaction, MagicMock())
+
+    writer.assert_called_once()
+    assert view.resolved is False
+    interaction.response.edit_message.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    assert "stale" in interaction.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_public_button_replay_is_inert(tmp_path):
+    view = UpdatePromptView(
+        session_key="s",
+        prompt_id="p",
+        correlation_id="corr",
+        control_home=str(tmp_path),
+        allowed_user_ids={"1"},
+    )
+    interaction = _approval_interaction()
+
+    with patch(
+        "gateway.update_prompt_response.write_update_confirmation_response",
+        return_value=True,
+    ) as writer:
+        await view.yes_btn(interaction, MagicMock())
+        await view.no_btn(interaction, MagicMock())
+
+    writer.assert_called_once()
+    assert view.resolved is True
+    assert interaction.response.edit_message.await_count == 1
+    assert interaction.response.send_message.await_count == 1
+    assert "already" in interaction.response.send_message.call_args.args[0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -277,4 +568,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-

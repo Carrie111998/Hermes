@@ -241,81 +241,370 @@ log_error() {
     echo -e "${RED}✗${NC} $1"
 }
 
+# Resolve the install-wide Hermes root used by every updater surface. Named
+# profiles share one checkout, so they must also share one update marker.
+install_hermes_root() {
+    local home="$HERMES_HOME"
+    local parent native_home="$HOME/.hermes"
+    case "$home" in
+        /*) ;;
+        *) home="$PWD/$home" ;;
+    esac
+    case "$home" in
+        "$native_home"|"$native_home"/*)
+            printf '%s\n' "$native_home"
+            return 0
+            ;;
+    esac
+    parent="$(dirname "$home")"
+    if [ "$(basename "$parent")" = "profiles" ]; then
+        dirname "$parent"
+    else
+        printf '%s\n' "$home"
+    fi
+}
+
+# Refuse lock paths containing symlink components. The marker is a security and
+# data-integrity boundary; following a user-controlled link could make the
+# installer claim or delete a file outside the Hermes root.
+install_lock_path_is_safe() {
+    local path="$1"
+    local part current="/"
+    local -a raw_parts normalized_parts
+    case "$path" in
+        /*) ;;
+        *) path="$PWD/$path" ;;
+    esac
+    IFS='/' read -r -a raw_parts <<< "$path"
+    for part in "${raw_parts[@]}"; do
+        case "$part" in
+            ""|.) continue ;;
+            ..)
+                if [ "${#normalized_parts[@]}" -eq 0 ]; then
+                    return 1
+                fi
+                unset "normalized_parts[$((${#normalized_parts[@]} - 1))]"
+                ;;
+            *) normalized_parts+=("$part") ;;
+        esac
+    done
+    for part in "${normalized_parts[@]}"; do
+        current="${current%/}/$part"
+        [ ! -L "$current" ] || return 1
+    done
+}
+
+install_pid_state() {
+    local pid="$1"
+    local kill_output kill_rc
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'unknown\n'
+        return 0
+    }
+    if kill_output="$(LC_ALL=C kill -0 "$pid" 2>&1)"; then
+        kill_rc=0
+    else
+        kill_rc=$?
+    fi
+    if [ "$kill_rc" -eq 0 ]; then
+        printf 'live\n'
+        return 0
+    fi
+    # Bash exposes no errno for kill(2). Under the C locale its own diagnostic
+    # distinguishes ESRCH (confirmed dead) from EPERM/other uncertainty. Only
+    # the former authorizes marker removal; every unfamiliar result fails shut.
+    case "$kill_output" in
+        *"No such process"*) printf 'dead\n' ;;
+        *"Operation not permitted"*|*"Permission denied"*) printf 'live\n' ;;
+        *) printf 'unknown\n' ;;
+    esac
+}
+
+install_pid_is_ancestor() {
+    local wanted="$1"
+    local current="${BASHPID:-$$}"
+    local parent steps=0
+    [[ "$wanted" =~ ^[1-9][0-9]*$ ]] || return 1
+    command -v ps >/dev/null 2>&1 || return 1
+    while [ "$current" -gt 1 ] 2>/dev/null && [ "$steps" -lt 128 ]; do
+        [ "$current" = "$wanted" ] && return 0
+        parent="$(ps -p "$current" -o ppid= 2>/dev/null | tr -d '[:space:]')" || return 1
+        [[ "$parent" =~ ^[1-9][0-9]*$ ]] || return 1
+        [ "$parent" != "$current" ] || return 1
+        current="$parent"
+        steps=$((steps + 1))
+    done
+    [ "$current" = "$wanted" ]
+}
+
+install_read_lock_marker() {
+    local marker="$1"
+    local raw_with_sentinel raw pid lease
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    raw_with_sentinel="$(LC_ALL=C command cat "$marker" 2>/dev/null || exit $?; printf '\034')" || return 1
+    raw="${raw_with_sentinel%$'\034'}"
+    [ "${raw_with_sentinel: -1}" = $'\034' ] || return 1
+    # The shared readers accept one optional final newline, but never extra
+    # records or blank lines.
+    [ "${raw: -1}" != $'\n' ] || raw="${raw%$'\n'}"
+    case "$raw" in
+        *$'\n'*) ;;
+        *) return 1 ;;
+    esac
+    pid="${raw%%$'\n'*}"
+    lease="${raw#*$'\n'}"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$lease" =~ ^[0-9]+$ ]] || return 1
+    [ "$pid" -le 4294967295 ] 2>/dev/null || return 1
+    [ "$lease" -le 9007199254740991 ] 2>/dev/null || return 1
+    printf '%s\n%s\n' "$pid" "$lease"
+}
+
+remove_confirmed_dead_install_lock() {
+    local marker="$1"
+    local root snapshot parsed marker_pid pid_state
+    local snapshot_payload_sentinel current_payload_sentinel
+    root="$(dirname "$marker")"
+    snapshot="$(umask 077; mktemp "$root/.hermes-update-in-progress.stale.snapshot.XXXXXX")" || return 2
+    rm -f "$snapshot" || return 2
+    if ! ln "$marker" "$snapshot" 2>/dev/null; then
+        return 1
+    fi
+    parsed="$(install_read_lock_marker "$snapshot" 2>/dev/null)" || {
+        rm -f "$snapshot"
+        return 2
+    }
+    snapshot_payload_sentinel="$(LC_ALL=C command cat "$snapshot" 2>/dev/null || exit $?; printf '\034')" || {
+        rm -f "$snapshot"
+        return 2
+    }
+    marker_pid="${parsed%%$'\n'*}"
+    pid_state="$(install_pid_state "$marker_pid")"
+    if [ "$pid_state" != "dead" ]; then
+        rm -f "$snapshot"
+        [ "$pid_state" = "live" ] && return 1
+        return 2
+    fi
+    # The snapshot is a hard link to the generation we proved dead. Re-check
+    # inode and complete bytes immediately before unlinking so a replacement
+    # owner is never removed.
+    current_payload_sentinel="$(LC_ALL=C command cat "$marker" 2>/dev/null || exit $?; printf '\034')" || {
+        rm -f "$snapshot"
+        return 1
+    }
+    if [ "$current_payload_sentinel" != "$snapshot_payload_sentinel" ] ||
+       [ ! "$marker" -ef "$snapshot" ] || ! cmp -s "$marker" "$snapshot" ||
+       [ ! "$marker" -ef "$snapshot" ]; then
+        rm -f "$snapshot"
+        return 1
+    fi
+    if ! rm -f "$marker"; then
+        rm -f "$snapshot"
+        return 2
+    fi
+    rm -f "$snapshot"
+    return 0
+}
+
+claim_install_update_lock_under_mutex() (
+    local marker="$1"
+    local claim="$2"
+    local mutex="${marker}.mutex"
+    local parsed marker_pid pid_state cleanup_rc=0
+
+    if ! command -v flock >/dev/null 2>&1; then
+        printf 'unavailable\n'
+        return 0
+    fi
+    if ! install_lock_path_is_safe "$mutex"; then
+        printf 'unavailable\n'
+        return 0
+    fi
+    # Python and Rust lock this exact sidecar with flock/fs2. Opening in append
+    # mode avoids truncating the shared inode before ownership is established.
+    if ! exec 9>>"$mutex" || ! flock -x -w 2 9 >/dev/null 2>&1; then
+        printf 'unavailable\n'
+        return 0
+    fi
+
+    if [ ! -e "$marker" ]; then
+        if ln "$claim" "$marker" 2>/dev/null; then
+            printf 'claimed\n'
+        else
+            printf 'retry\n'
+        fi
+        return 0
+    fi
+    parsed="$(install_read_lock_marker "$marker" 2>/dev/null)" || {
+        printf 'unavailable\n'
+        return 0
+    }
+    marker_pid="${parsed%%$'\n'*}"
+    pid_state="$(install_pid_state "$marker_pid")"
+    if [ "$pid_state" = "live" ]; then
+        printf 'retry\n'
+        return 0
+    fi
+    if [ "$pid_state" != "dead" ]; then
+        printf 'unavailable\n'
+        return 0
+    fi
+
+    remove_confirmed_dead_install_lock "$marker" || cleanup_rc=$?
+    if [ "$cleanup_rc" -gt 1 ]; then
+        printf 'unavailable\n'
+    elif [ "$cleanup_rc" -eq 1 ]; then
+        printf 'retry\n'
+    elif ln "$claim" "$marker" 2>/dev/null; then
+        # Publication occurs before releasing fd 9. A second cooperating
+        # contender must observe this live generation under the same mutex.
+        printf 'claimed\n'
+    else
+        printf 'retry\n'
+    fi
+)
+
+INSTALL_UPDATE_LOCK_MARKER=""
+INSTALL_UPDATE_LOCK_CLAIM=""
+INSTALL_UPDATE_LOCK_PAYLOAD=""
+INSTALL_UPDATE_LOCK_OWNED="no"
+INSTALL_UPDATE_LOCK_BORROWED="no"
+
+acquire_install_update_lock() {
+    local root marker owner_pid lease claim parsed marker_pid handoff_pid
+    local pid_state mutex_result attempt
+    root="$(install_hermes_root)"
+    marker="$root/.hermes-update-in-progress"
+    owner_pid="${BASHPID:-$$}"
+    lease="$(date +%s)"
+
+    if ! install_lock_path_is_safe "$root"; then
+        log_error "Update lock path contains a symbolic link; refusing to mutate the install."
+        return 2
+    fi
+    if ! mkdir -p "$root" || ! install_lock_path_is_safe "$marker"; then
+        log_error "Could not establish a safe Hermes update lock directory: $root"
+        return 2
+    fi
+
+    claim="$(umask 077; mktemp "$root/.hermes-update-in-progress.${owner_pid}.claim.XXXXXX")" || {
+        log_error "Could not stage the Hermes update lock claim."
+        return 2
+    }
+    INSTALL_UPDATE_LOCK_CLAIM="$claim"
+    INSTALL_UPDATE_LOCK_MARKER="$marker"
+    INSTALL_UPDATE_LOCK_PAYLOAD="${owner_pid}"$'\n'"${lease}"$'\n'
+    if ! printf '%s' "$INSTALL_UPDATE_LOCK_PAYLOAD" > "$claim"; then
+        rm -f "$claim"
+        INSTALL_UPDATE_LOCK_CLAIM=""
+        log_error "Could not write the Hermes update lock claim."
+        return 2
+    fi
+
+    # link(2) is an atomic no-replace publish. Readers observe either no marker
+    # or the complete two-line claim, never a truncated intermediate file.
+    for ((attempt = 0; attempt < 3; attempt++)); do
+        if ln "$claim" "$marker" 2>/dev/null; then
+            INSTALL_UPDATE_LOCK_OWNED="yes"
+            return 0
+        fi
+
+        parsed="$(install_read_lock_marker "$marker" 2>/dev/null)" || {
+            rm -f "$claim"
+            INSTALL_UPDATE_LOCK_CLAIM=""
+            log_error "Hermes update lock is malformed or unavailable; refusing to proceed."
+            return 2
+        }
+        marker_pid="${parsed%%$'\n'*}"
+        pid_state="$(install_pid_state "$marker_pid")"
+        handoff_pid="${HERMES_UPDATE_HANDOFF_PID:-}"
+        if [ "$pid_state" = "live" ] && {
+            [ "$marker_pid" = "$owner_pid" ] ||
+            { [[ "$handoff_pid" =~ ^[1-9][0-9]*$ ]] && [ "$marker_pid" = "$handoff_pid" ]; } ||
+            install_pid_is_ancestor "$marker_pid";
+        }; then
+            # The Tauri updater owns deletion. Its installer child runs under
+            # the same transaction and leaves the parent's marker untouched.
+            INSTALL_UPDATE_LOCK_BORROWED="yes"
+            rm -f "$claim"
+            INSTALL_UPDATE_LOCK_CLAIM=""
+            return 0
+        fi
+        if [ "$pid_state" = "live" ]; then
+            rm -f "$claim"
+            INSTALL_UPDATE_LOCK_CLAIM=""
+            log_error "Another Hermes update owns this install (PID $marker_pid)."
+            log_info "Wait for it to finish before retrying; no install files were changed."
+            return 2
+        fi
+        if [ "$pid_state" != "dead" ]; then
+            rm -f "$claim"
+            INSTALL_UPDATE_LOCK_CLAIM=""
+            log_error "Hermes update lock owner could not be proven dead; refusing to proceed."
+            return 2
+        fi
+        mutex_result="$(claim_install_update_lock_under_mutex "$marker" "$claim")"
+        if [ "$mutex_result" = "claimed" ]; then
+            INSTALL_UPDATE_LOCK_OWNED="yes"
+            return 0
+        fi
+        if [ "$mutex_result" = "unavailable" ]; then
+            rm -f "$claim"
+            INSTALL_UPDATE_LOCK_CLAIM=""
+            log_error "Could not lock the shared update mutex to retire the dead marker safely."
+            return 2
+        fi
+        # The marker changed under the shared mutex. Retry no-clobber
+        # publication and inspect the winning complete generation.
+    done
+
+    rm -f "$claim"
+    INSTALL_UPDATE_LOCK_CLAIM=""
+    log_error "Another updater won the Hermes update lock publication race."
+    return 2
+}
+
+release_install_update_lock() {
+    local current_with_sentinel current
+    if [ "$INSTALL_UPDATE_LOCK_BORROWED" = "yes" ]; then
+        INSTALL_UPDATE_LOCK_BORROWED="no"
+        return 0
+    fi
+    [ "$INSTALL_UPDATE_LOCK_OWNED" = "yes" ] || return 0
+    INSTALL_UPDATE_LOCK_OWNED="no"
+
+    # The retained hard link proves inode identity in addition to the exact
+    # payload check. A replacement owner is never removed, even if it races
+    # with shutdown after a handoff.
+    if [ -n "$INSTALL_UPDATE_LOCK_CLAIM" ] &&
+       [ -f "$INSTALL_UPDATE_LOCK_MARKER" ] &&
+       [ ! -L "$INSTALL_UPDATE_LOCK_MARKER" ] &&
+       [ "$INSTALL_UPDATE_LOCK_MARKER" -ef "$INSTALL_UPDATE_LOCK_CLAIM" ]; then
+        current_with_sentinel="$(LC_ALL=C command cat "$INSTALL_UPDATE_LOCK_MARKER" 2>/dev/null; printf '\034')"
+        current="${current_with_sentinel%$'\034'}"
+        if [ "$current" = "$INSTALL_UPDATE_LOCK_PAYLOAD" ] &&
+           [ "$INSTALL_UPDATE_LOCK_MARKER" -ef "$INSTALL_UPDATE_LOCK_CLAIM" ]; then
+            rm -f "$INSTALL_UPDATE_LOCK_MARKER"
+        fi
+    fi
+    [ -z "$INSTALL_UPDATE_LOCK_CLAIM" ] || rm -f "$INSTALL_UPDATE_LOCK_CLAIM"
+    INSTALL_UPDATE_LOCK_CLAIM=""
+}
+
+run_installer_with_update_lock() (
+    if ! acquire_install_update_lock; then
+        return 2
+    fi
+    trap 'rc=$?; trap - EXIT; release_install_update_lock; exit "$rc"' EXIT
+    "$@"
+)
+
 json_escape() {
     # Enough for short installer status strings; avoids requiring jq during
     # pre-install bootstrap.
     printf '%s' "$1" | tr '\n' ' ' | sed \
         -e 's/\\/\\\\/g' \
         -e 's/"/\\"/g'
-}
-
-# npm rewrites tracked package-lock.json files non-deterministically during
-# `npm install` / `npm run pack`. On a managed install those diffs are never
-# intentional, but they leave the checkout dirty — which forces `hermes update`
-# to autostash on every run and makes branch switches fragile. Restore them so
-# a fresh install ends with a clean tree. Best-effort; only touches lockfiles.
-restore_dirty_lockfiles() {
-    local repo="${1:-$INSTALL_DIR}"
-    [ -n "$repo" ] && [ -d "$repo/.git" ] || return 0
-    command -v git >/dev/null 2>&1 || return 0
-    local dirty
-    dirty=$(git -C "$repo" diff --name-only 2>/dev/null | grep 'package-lock\.json$' || true)
-    [ -z "$dirty" ] && return 0
-    echo "$dirty" | while IFS= read -r f; do
-        [ -n "$f" ] && git -C "$repo" checkout -- "$f" 2>/dev/null || true
-    done
-}
-
-# npm rewrites tracked package-lock.json files non-deterministically during
-# local builds. On a managed install those diffs are usually runtime churn, not
-# intentional user edits, so discard them before the repository-stage stash.
-# If package.json in the same directory is also dirty we keep both changes.
-discard_update_lockfile_churn() {
-    local repo="${1:-$INSTALL_DIR}"
-    [ -n "$repo" ] && [ -d "$repo/.git" ] || return 0
-    command -v git >/dev/null 2>&1 || return 0
-
-    local dirty_diff
-    dirty_diff=$(git -C "$repo" diff --name-only 2>/dev/null) || return 0
-    [ -n "$dirty_diff" ] || return 0
-
-    local dirty_package_dirs=""
-    while IFS= read -r path; do
-        case "$path" in
-            *package.json)
-                dirty_package_dirs="${dirty_package_dirs}$(dirname "$path")"$'\n'
-                ;;
-        esac
-    done <<EOF
-$dirty_diff
-EOF
-
-    local dirty_locks=""
-    local dirty_count=0
-    while IFS= read -r path; do
-        case "$path" in
-            *package-lock.json)
-                local lock_dir
-                lock_dir=$(dirname "$path")
-                case $'\n'"$dirty_package_dirs" in
-                    *$'\n'"$lock_dir"$'\n'*) continue ;;
-                esac
-                dirty_locks="${dirty_locks}${path}"$'\n'
-                dirty_count=$((dirty_count + 1))
-                ;;
-        esac
-    done <<EOF
-$dirty_diff
-EOF
-
-    [ "$dirty_count" -gt 0 ] || return 0
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        git -C "$repo" checkout -- "$path" 2>/dev/null || true
-    done <<EOF
-$dirty_locks
-EOF
-    log_info "Discarded npm lockfile churn (${dirty_count} file(s))"
 }
 
 emit_manifest() {
@@ -1338,6 +1627,742 @@ show_manual_install_hint() {
 # Installation
 # ============================================================================
 
+resolve_git_commit() {
+    local repo="$1"
+    local ref="$2"
+    local sha=""
+    if ! sha="$(git -C "$repo" rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+        return 1
+    fi
+    if [[ ! "$sha" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$sha"
+}
+
+git_commit_ref_state() {
+    local repo="$1"
+    local ref="$2"
+    local output rc
+    if output="$(git -C "$repo" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)"; then
+        if [[ "$output" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+            printf 'present\n'
+        else
+            printf 'unknown\n'
+        fi
+        return 0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 1 ]; then
+        printf 'absent\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+managed_update_boundary_matches() {
+    local repo="$1"
+    local branch="$2"
+    local head_sha="$3"
+    [ "$(git -C "$repo" branch --show-current 2>/dev/null || true)" = "$branch" ] &&
+        [ "$(resolve_git_commit "$repo" HEAD || true)" = "$head_sha" ]
+}
+
+managed_checkout_identity_matches() {
+    local repo="$1"
+    local branch="$2"
+    local head_sha="$3"
+    [ "$(git -C "$repo" branch --show-current 2>/dev/null || true)" = "$branch" ] &&
+        [ "$(resolve_git_commit "$repo" HEAD || true)" = "$head_sha" ]
+}
+
+managed_target_generation_matches() {
+    local repo="$1"
+    local branch="$2"
+    local expected_state="$3"
+    local expected_head="${4:-}"
+    local actual_state actual_head
+    actual_state="$(git_commit_ref_state "$repo" "refs/heads/$branch")"
+    [ "$actual_state" = "$expected_state" ] || return 1
+    if [ "$expected_state" = "present" ]; then
+        actual_head="$(resolve_git_commit "$repo" "refs/heads/$branch" || true)"
+        [ -n "$actual_head" ] && [ "$actual_head" = "$expected_head" ]
+    else
+        [ "$expected_state" = "absent" ]
+    fi
+}
+
+managed_switch_branch() {
+    local repo="$1"
+    local branch="$2"
+    git -C "$repo" switch -- "$branch"
+}
+
+adopt_managed_branch_generation() {
+    local repo="$1"
+    local branch="$2"
+    local old_head="$3"
+    local new_head="$4"
+    if ! managed_update_boundary_matches "$repo" "$branch" "$old_head" ||
+       ! managed_tracked_checkout_clean "$repo"; then
+        return 1
+    fi
+    git -C "$repo" switch --detach "$new_head" >/dev/null 2>&1 || return 1
+    if ! git -C "$repo" update-ref "refs/heads/$branch" "$new_head" "$old_head" \
+        >/dev/null 2>&1; then
+        managed_switch_branch "$repo" "$branch" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if managed_switch_branch "$repo" "$branch" >/dev/null 2>&1 &&
+       managed_update_boundary_matches "$repo" "$branch" "$new_head" &&
+       managed_tracked_checkout_clean "$repo"; then
+        return 0
+    fi
+    # Roll back only the generation installed above. If another writer moved
+    # the ref, its generation wins and we leave both recovery refs intact.
+    git -C "$repo" update-ref "refs/heads/$branch" "$old_head" "$new_head" \
+        >/dev/null 2>&1 || true
+    managed_switch_branch "$repo" "$branch" >/dev/null 2>&1 || true
+    return 1
+}
+
+managed_no_merge_metadata() {
+    local repo="$1"
+    local unmerged
+    [ "$(git_commit_ref_state "$repo" MERGE_HEAD)" = "absent" ] || return 1
+    unmerged="$(git -C "$repo" ls-files --unmerged 2>/dev/null)" || return 1
+    [ -z "$unmerged" ]
+}
+
+managed_tracked_checkout_clean() {
+    local repo="$1"
+    local tracked_status
+    managed_no_merge_metadata "$repo" || return 1
+    tracked_status="$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" || return 1
+    [ -z "$tracked_status" ]
+}
+
+managed_abort_merge() {
+    local repo="$1"
+    local branch="$2"
+    local head_sha="$3"
+    local merge_state
+    merge_state="$(git_commit_ref_state "$repo" MERGE_HEAD)"
+    if [ "$merge_state" = "present" ]; then
+        git -C "$repo" merge --abort >/dev/null 2>&1 || return 1
+    elif [ "$merge_state" != "absent" ]; then
+        return 1
+    fi
+    managed_update_boundary_matches "$repo" "$branch" "$head_sha" || return 1
+    [ "$(git_commit_ref_state "$repo" MERGE_HEAD)" = "absent" ] || return 1
+    managed_tracked_checkout_clean "$repo"
+}
+
+classify_local_history() {
+    local repo="$1"
+    local old_origin="$2"
+    local local_head="$3"
+    local ancestry_rc=0
+
+    if [ -z "$old_origin" ] || [ -z "$local_head" ]; then
+        printf 'unknown\n'
+        return 0
+    fi
+    if [ "$old_origin" = "$local_head" ]; then
+        printf 'none\n'
+        return 0
+    fi
+    if git -C "$repo" merge-base --is-ancestor "$old_origin" "$local_head" >/dev/null 2>&1; then
+        printf 'present\n'
+        return 0
+    else
+        ancestry_rc=$?
+    fi
+    if [ "$ancestry_rc" -ne 1 ]; then
+        printf 'unknown\n'
+        return 0
+    fi
+    if git -C "$repo" merge-base --is-ancestor "$local_head" "$old_origin" >/dev/null 2>&1; then
+        # A checkout behind the old remote tip has no local-only commits.
+        printf 'none\n'
+        return 0
+    else
+        ancestry_rc=$?
+    fi
+    if [ "$ancestry_rc" -eq 1 ]; then
+        printf 'present\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+create_update_recovery_ref() {
+    local repo="$1"
+    local head_sha="$2"
+    local stamp zero_oid suffix tail ref resolved
+    stamp="$(date -u +%Y%m%d-%H%M%S)"
+    printf -v zero_oid '%*s' "${#head_sha}" ''
+    zero_oid="${zero_oid// /0}"
+    for ((suffix = 0; suffix < 100; suffix++)); do
+        tail=""
+        [ "$suffix" -gt 0 ] && tail="-$suffix"
+        ref="refs/hermes-update-backups/pre-update-${stamp}-${head_sha:0:12}${tail}"
+        if git -C "$repo" update-ref "$ref" "$head_sha" "$zero_oid" >/dev/null 2>&1; then
+            resolved="$(resolve_git_commit "$repo" "$ref" || true)"
+            if [ "$resolved" = "$head_sha" ]; then
+                printf '%s\n' "$ref"
+                return 0
+            fi
+            return 1
+        fi
+    done
+    return 1
+}
+
+find_install_stash() {
+    local repo="$1"
+    local marker="$2"
+    local stash_sha subject
+    while IFS=$'\t' read -r stash_sha subject; do
+        if [ "$subject" = "$marker" ] || [ "${subject##*: }" = "$marker" ]; then
+            printf '%s\n' "$stash_sha"
+            return 0
+        fi
+    done < <(git -C "$repo" stash list --format='%H%x09%gs')
+    return 1
+}
+
+pin_install_stash() {
+    local repo="$1"
+    local stash_name="$2"
+    local stash_sha="$3"
+    local zero_oid suffix tail ref resolved
+    printf -v zero_oid '%*s' "${#stash_sha}" ''
+    zero_oid="${zero_oid// /0}"
+    for ((suffix = 0; suffix < 100; suffix++)); do
+        tail=""
+        [ "$suffix" -gt 0 ] && tail="-$suffix"
+        ref="refs/hermes-update-stashes/install-${stash_name#hermes-install-autostash-}${tail}"
+        if git -C "$repo" update-ref "$ref" "$stash_sha" "$zero_oid" >/dev/null 2>&1; then
+            resolved="$(resolve_git_commit "$repo" "$ref" || true)"
+            if [ "$resolved" = "$stash_sha" ]; then
+                printf '%s\n' "$ref"
+                return 0
+            fi
+            return 1
+        fi
+    done
+    return 1
+}
+
+restore_failed_install_update() {
+    local repo="$1"
+    local original_branch="$2"
+    local original_head="$3"
+    local target_branch="$4"
+    local target_head="$5"
+    local autostash_ref="$6"
+    local expected_mutated_head="${7:-}"
+    local target_was_created="${8:-no}"
+    local current_branch current_head merge_state rollback_ref
+
+    current_branch="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
+    current_head="$(resolve_git_commit "$repo" HEAD || true)"
+    if [ "$current_branch" = "$target_branch" ]; then
+        merge_state="$(git_commit_ref_state "$repo" MERGE_HEAD)"
+        if [ "$merge_state" = "present" ]; then
+            [ "$current_head" = "$target_head" ] || return 1
+            managed_abort_merge "$repo" "$target_branch" "$target_head" || return 1
+        elif [ "$merge_state" != "absent" ]; then
+            return 1
+        elif [ "$current_head" = "$target_head" ]; then
+            managed_tracked_checkout_clean "$repo" || return 1
+        elif [ -n "$expected_mutated_head" ] &&
+             [ "$current_head" = "$expected_mutated_head" ] &&
+             managed_tracked_checkout_clean "$repo"; then
+            # Preserve the rejected generation too, then restore the branch
+            # with an exact old-value CAS. A concurrent ref writer wins and is
+            # never overwritten.
+            rollback_ref="$(create_update_recovery_ref "$repo" "$current_head" || true)"
+            [ -n "$rollback_ref" ] || return 1
+            git -C "$repo" switch --detach "$target_head" >/dev/null 2>&1 || return 1
+            if ! git -C "$repo" update-ref "refs/heads/$target_branch" \
+                "$target_head" "$expected_mutated_head" >/dev/null 2>&1; then
+                managed_switch_branch "$repo" "$target_branch" >/dev/null 2>&1 || true
+                return 1
+            fi
+            managed_switch_branch "$repo" "$target_branch" >/dev/null 2>&1 || return 1
+            managed_update_boundary_matches "$repo" "$target_branch" "$target_head" || return 1
+        else
+            return 1
+        fi
+    elif [ "$current_branch" != "$original_branch" ] || [ "$current_head" != "$original_head" ]; then
+        return 1
+    fi
+    if [ -n "$original_branch" ]; then
+        [ "$(resolve_git_commit "$repo" "refs/heads/$original_branch" || true)" = "$original_head" ] || return 1
+        managed_switch_branch "$repo" "$original_branch" >/dev/null 2>&1 || return 1
+    else
+        git -C "$repo" switch --detach "$original_head" >/dev/null 2>&1 || return 1
+    fi
+    managed_checkout_identity_matches "$repo" "$original_branch" "$original_head" || return 1
+    if [ "$target_was_created" = "yes" ]; then
+        git -C "$repo" update-ref -d "refs/heads/$target_branch" "$target_head" \
+            >/dev/null 2>&1 || return 1
+        [ "$(git_commit_ref_state "$repo" "refs/heads/$target_branch")" = "absent" ] || return 1
+    fi
+
+    if [ -n "$autostash_ref" ]; then
+        if ! managed_tracked_checkout_clean "$repo"; then
+            log_error "Tracked checkout changed before autostash restore; refusing to overwrite it."
+            log_info "Your changes remain preserved in stash commit $autostash_ref."
+            return 1
+        fi
+        if ! git -C "$repo" stash apply --index "$autostash_ref" >/dev/null 2>&1; then
+            log_error "Could not restore the exact pre-update index and working tree."
+            log_error "The conflicted apply was left in place; automatic cleanup could erase concurrent edits."
+            log_info "Your changes remain preserved in stash commit $autostash_ref."
+            return 1
+        fi
+        log_warn "Restored local changes; retained recovery stash commit $autostash_ref."
+    fi
+    return 0
+}
+
+update_managed_checkout() (
+    local repo="$1"
+    local branch="$2"
+    local original_head old_origin new_origin remote_history ancestry_rc
+    local original_branch target_head target_state local_history autostash_ref=""
+    local installed_head="" observed_head=""
+    local fetch_ref="" tracking_ref expected_tracking zero_oid zero_branch
+    local stash_name recovery_ref stash_pin restore_output conflicted_files
+    local restore_now="yes" restore_ok="yes" restore_attempted="no"
+    local tracking_changed="no" update_success="no" target_was_created="no"
+
+    managed_update_cleanup() {
+        local rc=$? fetch_current
+        trap - EXIT
+        if [ "$update_success" != "yes" ] && [ "$tracking_changed" = "yes" ] && \
+           [ -n "$old_origin" ] && [ -n "$new_origin" ]; then
+            # Restore only the tracking generation this invocation installed.
+            # A concurrent writer wins the CAS and is never overwritten.
+            git -C "$repo" update-ref "$tracking_ref" "$old_origin" "$new_origin" \
+                >/dev/null 2>&1 || true
+        fi
+        if [ -n "$fetch_ref" ]; then
+            fetch_current="$(git -C "$repo" rev-parse --verify --quiet "$fetch_ref" 2>/dev/null || true)"
+            if [[ "$fetch_current" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+                git -C "$repo" update-ref -d "$fetch_ref" "$fetch_current" \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+        exit "$rc"
+    }
+    trap managed_update_cleanup EXIT
+
+    if [ -z "$branch" ] || [[ "$branch" == -* ]] || \
+       ! git -C "$repo" check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        log_error "Update refused: invalid or option-like branch name."
+        return 1
+    fi
+
+    original_head="$(resolve_git_commit "$repo" HEAD || true)"
+    old_origin="$(resolve_git_commit "$repo" "refs/remotes/origin/$branch" || true)"
+    if [ -z "$original_head" ]; then
+        log_error "Update refused: current HEAD is unavailable."
+        log_info "HEAD, index, and working tree were left untouched."
+        return 1
+    fi
+    original_branch="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
+    if [ -z "$original_branch" ]; then
+        recovery_ref="$(create_update_recovery_ref "$repo" "$original_head" || true)"
+        if [ -z "$recovery_ref" ] || \
+           [ "$(resolve_git_commit "$repo" "$recovery_ref" || true)" != "$original_head" ] || \
+           [ -n "$(git -C "$repo" branch --show-current 2>/dev/null || true)" ] || \
+           [ "$(resolve_git_commit "$repo" HEAD || true)" != "$original_head" ]; then
+            log_error "Update refused: detached HEAD could not be pinned safely."
+            return 1
+        fi
+        log_info "Preserved detached checkout at recovery ref: $recovery_ref"
+    fi
+
+    fetch_ref="refs/hermes-update-fetches/install-$(date -u +%Y%m%d%H%M%S)-$$-${RANDOM:-0}${RANDOM:-0}"
+    if ! git -C "$repo" fetch --no-tags --refmap= origin "+refs/heads/$branch:$fetch_ref"; then
+        log_error "Could not fetch origin/$branch."
+        return 1
+    fi
+    new_origin="$(resolve_git_commit "$repo" "$fetch_ref" || true)"
+    if [ -z "$new_origin" ]; then
+        log_error "Update refused: fetched origin/$branch tip could not be pinned."
+        log_info "HEAD, index, and working tree were left untouched."
+        return 1
+    fi
+    tracking_ref="refs/remotes/origin/$branch"
+    if [ -n "$old_origin" ]; then
+        expected_tracking="$old_origin"
+    else
+        printf -v zero_oid '%*s' "${#new_origin}" ''
+        expected_tracking="${zero_oid// /0}"
+    fi
+    if ! git -C "$repo" update-ref "$tracking_ref" "$new_origin" "$expected_tracking"; then
+        log_error "Update refused: origin/$branch changed concurrently after fetch."
+        log_info "HEAD, index, and working tree were left untouched."
+        return 1
+    fi
+    tracking_changed="yes"
+    if [ -z "$old_origin" ]; then
+        log_error "Update refused: the previous origin/$branch tip was unavailable."
+        log_info "The tracking ref was warmed from the pinned fetch; re-run the installer."
+        log_info "HEAD, index, and working tree were left untouched."
+        return 1
+    fi
+    if git -C "$repo" merge-base --is-ancestor "$old_origin" "$new_origin" >/dev/null 2>&1; then
+        remote_history="advanced"
+    else
+        ancestry_rc=$?
+        if [ "$ancestry_rc" -eq 1 ]; then
+            remote_history="rewritten"
+        else
+            log_error "Update refused: origin/$branch ancestry could not be proven."
+            log_info "HEAD, index, and working tree were left untouched."
+            return 1
+        fi
+    fi
+
+    target_state="$(git_commit_ref_state "$repo" "refs/heads/$branch")"
+    if [ "$target_state" = "present" ]; then
+        target_head="$(resolve_git_commit "$repo" "refs/heads/$branch" || true)"
+        [ -n "$target_head" ] || target_state="unknown"
+    else
+        target_head=""
+    fi
+    if [ "$target_state" = "unknown" ]; then
+        log_error "Update refused: local branch $branch existence could not be proven."
+        return 1
+    fi
+    if [ "$target_state" = "present" ]; then
+        local_history="$(classify_local_history "$repo" "$old_origin" "$target_head")"
+        if [ "$local_history" = "unknown" ]; then
+            log_error "Update refused: local $branch ancestry could not be proven."
+            log_info "HEAD, index, and working tree were left untouched."
+            return 1
+        fi
+        if [ "$remote_history" = "rewritten" ] && [ "$local_history" = "present" ]; then
+            log_error "Update refused: origin/$branch rewrote history while local commits exist."
+            log_info "HEAD, index, and working tree were left untouched."
+            return 1
+        fi
+    else
+        local_history="none"
+    fi
+
+    # Re-prove the exact local-branch generation after ancestry checks. This
+    # closes both present->moved and absent->created races before any checkout
+    # or stash mutation.
+    if ! managed_target_generation_matches \
+        "$repo" "$branch" "$target_state" "$target_head" ||
+       ! managed_checkout_identity_matches \
+        "$repo" "$original_branch" "$original_head"; then
+        log_error "Update refused: checkout or target branch changed during preflight."
+        return 1
+    fi
+
+    local unmerged_output status_output stash_output stash_rc
+    if ! unmerged_output="$(git -C "$repo" ls-files --unmerged 2>/dev/null)"; then
+        log_error "Update refused: the Git index could not be inspected."
+        return 1
+    fi
+    if [ -n "$unmerged_output" ]; then
+        log_error "Update refused: the Git index has unresolved conflicts."
+        log_info "Resolve or abort the existing operation, then re-run the installer."
+        return 1
+    fi
+    if ! status_output="$(git -C "$repo" status --porcelain --untracked-files=all 2>/dev/null)"; then
+        log_error "Update refused: checkout status could not be proven."
+        return 1
+    fi
+    if [ -n "$status_output" ]; then
+        stash_name="hermes-install-autostash-$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM:-0}"
+        log_info "Local changes detected, stashing before update..."
+        if stash_output="$(git -C "$repo" stash push --include-untracked -m "$stash_name" 2>&1)"; then
+            stash_rc=0
+        else
+            stash_rc=$?
+        fi
+        [ -n "$stash_output" ] && printf '%s\n' "$stash_output"
+        autostash_ref="$(find_install_stash "$repo" "$stash_name" || true)"
+        if [ -n "$autostash_ref" ]; then
+            stash_pin="$(pin_install_stash "$repo" "$stash_name" "$autostash_ref" || true)"
+            if [ -z "$stash_pin" ]; then
+                log_error "Could not pin the installer autostash recovery ref."
+                log_info "The stash remains reachable as commit $autostash_ref; update stopped."
+                return 1
+            fi
+        fi
+        if [ "$stash_rc" -ne 0 ]; then
+            log_error "Could not safely stash local changes; update stopped."
+            if [ -n "$autostash_ref" ]; then
+                log_info "The partial operation is pinned at $stash_pin ($autostash_ref)."
+            fi
+            return 1
+        fi
+        if [ -z "$autostash_ref" ]; then
+            log_error "Could not verify the installer's autostash; update stopped."
+            return 1
+        fi
+        if ! managed_checkout_identity_matches \
+                "$repo" "$original_branch" "$original_head" ||
+           ! managed_target_generation_matches \
+                "$repo" "$branch" "$target_state" "$target_head" ||
+           [ -n "$(git -C "$repo" status --porcelain --untracked-files=all 2>/dev/null || printf '__status_failed__')" ]; then
+            log_error "Update refused: checkout changed while local changes were being preserved."
+            log_info "Preserved installer autostash: $stash_pin ($autostash_ref)."
+            return 1
+        fi
+    fi
+
+    if ! managed_checkout_identity_matches \
+            "$repo" "$original_branch" "$original_head" ||
+       ! managed_target_generation_matches \
+            "$repo" "$branch" "$target_state" "$target_head" ||
+       ! managed_tracked_checkout_clean "$repo" ||
+       [ -n "$(git -C "$repo" status --porcelain --untracked-files=all 2>/dev/null || printf '__status_failed__')" ]; then
+        log_error "Update refused: checkout changed at the mutation boundary."
+        [ -z "$autostash_ref" ] || log_info "Preserved installer autostash: $stash_pin ($autostash_ref)."
+        return 1
+    fi
+
+    if [ -n "$target_head" ]; then
+        if ! managed_switch_branch "$repo" "$branch"; then
+            restore_failed_install_update \
+                "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" || true
+            log_error "Could not check out local branch $branch."
+            return 1
+        fi
+        if ! managed_update_boundary_matches "$repo" "$branch" "$target_head"; then
+            restore_failed_install_update \
+                "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" || true
+            log_error "Update refused: local $branch changed during preflight."
+            return 1
+        fi
+    else
+        printf -v zero_branch '%*s' "${#new_origin}" ''
+        zero_branch="${zero_branch// /0}"
+        if ! managed_target_generation_matches "$repo" "$branch" absent "" ||
+           ! git -C "$repo" update-ref "refs/heads/$branch" "$new_origin" "$zero_branch" ||
+           ! managed_switch_branch "$repo" "$branch"; then
+            git -C "$repo" update-ref -d "refs/heads/$branch" "$new_origin" \
+                >/dev/null 2>&1 || true
+            restore_failed_install_update \
+                "$repo" "$original_branch" "$original_head" "$branch" "$new_origin" "$autostash_ref" || true
+            log_error "Could not create local branch $branch at the pinned fetched commit."
+            return 1
+        fi
+        target_was_created="yes"
+        target_head="$new_origin"
+    fi
+    # This is the exact branch generation currently owned by the installer.
+    # It is advanced only by a mutation below, never inferred later from HEAD.
+    installed_head="$target_head"
+    if ! managed_update_boundary_matches "$repo" "$branch" "$target_head"; then
+        restore_failed_install_update \
+            "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" || true
+        log_error "Update refused: target branch changed at the mutation boundary."
+        return 1
+    fi
+
+    if [ "$target_head" != "$new_origin" ]; then
+        if [ "$remote_history" = "rewritten" ]; then
+            recovery_ref="$(create_update_recovery_ref "$repo" "$target_head" || true)"
+            if [ -z "$recovery_ref" ] || \
+               [ "$(resolve_git_commit "$repo" "$recovery_ref" || true)" != "$target_head" ] || \
+               ! adopt_managed_branch_generation "$repo" "$branch" "$target_head" "$new_origin"; then
+                restore_failed_install_update \
+                    "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" "$new_origin" || true
+                log_error "Could not adopt the confirmed rewritten remote tip."
+                return 1
+            fi
+            installed_head="$new_origin"
+            log_warn "Confirmed upstream rewrite with no local commits; adopted pinned commit $new_origin."
+        else
+            local target_to_new new_to_target
+            if git -C "$repo" merge-base --is-ancestor "$target_head" "$new_origin" >/dev/null 2>&1; then
+                target_to_new=0
+            else
+                target_to_new=$?
+            fi
+            if git -C "$repo" merge-base --is-ancestor "$new_origin" "$target_head" >/dev/null 2>&1; then
+                new_to_target=0
+            else
+                new_to_target=$?
+            fi
+            if [ "$target_to_new" -gt 1 ] || [ "$new_to_target" -gt 1 ]; then
+                restore_failed_install_update \
+                    "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" || true
+                log_error "Could not prove the pinned target's relationship to local $branch."
+                return 1
+            fi
+
+            if [ "$new_to_target" -eq 0 ]; then
+                managed_update_boundary_matches "$repo" "$branch" "$target_head" || return 1
+            elif [ "$target_to_new" -eq 0 ]; then
+                recovery_ref="$(create_update_recovery_ref "$repo" "$target_head" || true)"
+                if [ -z "$recovery_ref" ] || \
+                   [ "$(resolve_git_commit "$repo" "$recovery_ref" || true)" != "$target_head" ] || \
+                   ! adopt_managed_branch_generation "$repo" "$branch" "$target_head" "$new_origin"; then
+                    restore_failed_install_update \
+                        "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" "$new_origin" || true
+                    log_error "Pinned fast-forward failed or could not be verified."
+                    return 1
+                fi
+                installed_head="$new_origin"
+            elif [ "$local_history" = "present" ]; then
+                recovery_ref="$(create_update_recovery_ref "$repo" "$target_head" || true)"
+                if [ -z "$recovery_ref" ] || \
+                   [ "$(resolve_git_commit "$repo" "$recovery_ref" || true)" != "$target_head" ] || \
+                   ! managed_update_boundary_matches "$repo" "$branch" "$target_head"; then
+                    restore_failed_install_update \
+                        "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" || true
+                    log_error "Could not create a verified recovery ref; update stopped."
+                    return 1
+                fi
+                if ! git -C "$repo" merge --no-edit "$new_origin"; then
+                    if ! restore_failed_install_update \
+                        "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref"; then
+                        log_error "Merge recovery could not be verified; stash remains preserved."
+                        return 1
+                    fi
+                    [ "$(resolve_git_commit "$repo" "$recovery_ref" || true)" = "$target_head" ] || return 1
+                    log_error "Local commits conflict with the pinned fetched update; merge was aborted."
+                    log_info "Recovery ref: $recovery_ref"
+                    return 1
+                fi
+                local merged_head merge_parents merge_owned="no" merge_restore_ok="no"
+                merged_head="$(resolve_git_commit "$repo" HEAD || true)"
+                merge_parents="$(git -C "$repo" show -s --format='%P' "$merged_head" 2>/dev/null || true)"
+                if [ "${merge_parents%% *}" = "$target_head" ]; then
+                    case " $merge_parents " in
+                        *" $new_origin "*)
+                            installed_head="$merged_head"
+                            merge_owned="yes"
+                            ;;
+                    esac
+                fi
+                if [ "$merge_owned" != "yes" ] || \
+                   ! managed_update_boundary_matches "$repo" "$branch" "$merged_head" || \
+                   [ "$(resolve_git_commit "$repo" "$recovery_ref" || true)" != "$target_head" ] || \
+                   ! git -C "$repo" merge-base --is-ancestor "$target_head" "$merged_head" >/dev/null 2>&1 || \
+                   ! git -C "$repo" merge-base --is-ancestor "$new_origin" "$merged_head" >/dev/null 2>&1; then
+                    if [ "$merge_owned" = "yes" ] && restore_failed_install_update \
+                        "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" "$installed_head"; then
+                        merge_restore_ok="yes"
+                    fi
+                    [ "$merge_restore_ok" = "yes" ] || update_success="yes"
+                    log_error "Merged update postconditions could not be verified; stash remains preserved."
+                    return 1
+                fi
+                log_info "Merged the pinned fetched commit; recovery ref: $recovery_ref"
+            else
+                restore_failed_install_update \
+                    "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" || true
+                log_error "Update refused: repository history did not match a safe update case."
+                return 1
+            fi
+        fi
+    fi
+
+    local update_contains_origin_rc=0
+    observed_head="$(resolve_git_commit "$repo" HEAD || true)"
+    if [ -n "$installed_head" ] &&
+       git -C "$repo" merge-base --is-ancestor "$new_origin" "$installed_head" >/dev/null 2>&1; then
+        update_contains_origin_rc=0
+    else
+        update_contains_origin_rc=$?
+    fi
+    if [ -z "$installed_head" ] || [ "$observed_head" != "$installed_head" ] ||
+       [ "$update_contains_origin_rc" -ne 0 ] ||
+       ! managed_update_boundary_matches "$repo" "$branch" "$installed_head" ||
+       [ "$(resolve_git_commit "$repo" "refs/heads/$branch" || true)" != "$installed_head" ] ||
+       ! managed_tracked_checkout_clean "$repo"; then
+        if restore_failed_install_update \
+            "$repo" "$original_branch" "$original_head" "$branch" "$target_head" "$autostash_ref" "$installed_head" "$target_was_created"; then
+            log_error "Updated checkout failed post-validation and was rolled back safely."
+        else
+            # The branch could not be rolled back without overwriting a newer
+            # generation or dirty state. Keep its matching tracking ref and
+            # leave the recovery refs for manual repair.
+            update_success="yes"
+            log_error "Updated checkout failed post-validation; automatic rollback was refused."
+        fi
+        return 1
+    fi
+
+    # The code generation is now committed. A later stash-restore conflict is
+    # still a failed installer run, but the branch and tracking ref must remain
+    # on the same fetched generation.
+    update_success="yes"
+
+    if [ -n "$autostash_ref" ]; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            echo
+            log_warn "Local changes were stashed before updating."
+            log_warn "Restoring them may reapply local customizations onto the updated codebase."
+            printf "Restore local changes now? [Y/n] "
+            read -r restore_answer
+            case "$restore_answer" in
+                ""|y|Y|yes|YES|Yes) restore_now="yes" ;;
+                *) restore_now="no" ;;
+            esac
+        fi
+
+        if [ "$restore_now" = "yes" ]; then
+            log_info "Restoring local changes..."
+            if ! managed_tracked_checkout_clean "$repo"; then
+                restore_ok="no"
+                restore_output="Tracked checkout changed before restore; autostash was not applied."
+            else
+                restore_attempted="yes"
+                if restore_output="$(git -C "$repo" stash apply --index "$autostash_ref" 2>&1)"; then
+                    restore_ok="yes"
+                else
+                    restore_ok="no"
+                fi
+            fi
+            conflicted_files="$(git -C "$repo" diff --name-only --diff-filter=U || true)"
+            if [ "$restore_ok" = "yes" ] && [ -z "$conflicted_files" ]; then
+                log_warn "Local changes were restored on top of the updated codebase."
+                log_warn "Retained recovery stash commit $autostash_ref to avoid a reflog race."
+                log_warn "Review git diff / git status if Hermes behaves unexpectedly."
+            else
+                log_error "Update pulled new code, but restoring local changes hit conflicts."
+                [ -n "$restore_output" ] && printf '%s\n' "$restore_output"
+                printf '\nConflicted files:\n'
+                if [ -n "$conflicted_files" ]; then
+                    while IFS= read -r file; do
+                        [ -n "$file" ] && printf '  • %s\n' "$file"
+                    done <<EOF
+$conflicted_files
+EOF
+                else
+                    printf '  (see Git output above)\n'
+                fi
+                [ "$restore_attempted" = "yes" ] && \
+                    log_error "The conflicted apply was left in place; automatic cleanup could erase concurrent edits."
+                log_info "Your changes remain preserved in stash commit $autostash_ref."
+                log_info "Restore your changes later with: git stash apply --index $autostash_ref"
+                return 1
+            fi
+        else
+            log_info "Skipped restoring local changes."
+            log_info "Your changes remain preserved in stash commit $autostash_ref."
+        fi
+    fi
+
+    return 0
+)
+
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
@@ -1357,100 +2382,11 @@ clone_repo() {
         if [ -d "$INSTALL_DIR/.git" ]; then
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
-
-            local autostash_ref=""
-            discard_update_lockfile_churn "$INSTALL_DIR"
-            if [ -n "$(git status --porcelain)" ]; then
-                # A previously interrupted update can leave the index with
-                # unmerged entries. In that state `git stash` aborts with
-                # "could not write index" and the later `git checkout` aborts
-                # with "you need to resolve your current index first", failing
-                # the whole install at the repository stage. Clear the conflict
-                # markers with `git reset` first -- this keeps working-tree
-                # changes (they're still stashed just below) and only drops the
-                # index-level conflict state. Mirrors the `hermes update` path
-                # (#4735).
-                if [ -n "$(git ls-files --unmerged)" ]; then
-                    log_info "Clearing unmerged index entries from a previous conflict..."
-                    git reset -q
-                fi
-                local stash_name
-                stash_name="hermes-install-autostash-$(date -u +%Y%m%d-%H%M%S)"
-                log_info "Local changes detected, stashing before update..."
-                git stash push --include-untracked -m "$stash_name"
-                autostash_ref="stash@{0}"
-            fi
-
-            # Fetch only the target branch. A bare `git fetch origin` pulls
-            # every ref, and this repo carries thousands of auto-generated
-            # branches — on a non-single-branch checkout that turns each update
-            # into a multi-minute download that can stall the installer.
-            git remote set-branches origin "$BRANCH" 2>/dev/null || true
-            git fetch origin "$BRANCH"
-            git checkout "$BRANCH"
-            # Managed installs should follow origin/$BRANCH exactly. If the
-            # checkout has diverged (or has local-only commits), ff-only pull
-            # cannot succeed — mirror ``hermes update`` and reset to the
-            # fetched remote so bootstrap/install can recover.
-            if ! git pull --ff-only origin "$BRANCH"; then
-                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
-                git reset --hard "origin/$BRANCH"
-            fi
-
-            if [ -n "$autostash_ref" ]; then
-                local restore_now="yes"
-                if [ -t 0 ] && [ -t 1 ]; then
-                    echo
-                    log_warn "Local changes were stashed before updating."
-                    log_warn "Restoring them may reapply local customizations onto the updated codebase."
-                    printf "Restore local changes now? [Y/n] "
-                    read -r restore_answer
-                    case "$restore_answer" in
-                        ""|y|Y|yes|YES|Yes) restore_now="yes" ;;
-                        *) restore_now="no" ;;
-                    esac
-                fi
-
-                if [ "$restore_now" = "yes" ]; then
-                    log_info "Restoring local changes..."
-                    local restore_output=""
-                    local restore_ok="yes"
-                    if restore_output="$(git stash apply "$autostash_ref" 2>&1)"; then
-                        restore_ok="yes"
-                    else
-                        restore_ok="no"
-                    fi
-                    local conflicted_files=""
-                    conflicted_files="$(git diff --name-only --diff-filter=U || true)"
-                    if [ "$restore_ok" = "yes" ] && [ -z "$conflicted_files" ]; then
-                        git stash drop "$autostash_ref" >/dev/null
-                        log_warn "Local changes were restored on top of the updated codebase."
-                        log_warn "Review git diff / git status if Hermes behaves unexpectedly."
-                    else
-                        log_error "Update pulled new code, but restoring local changes hit conflicts."
-                        if [ -n "$restore_output" ]; then
-                            printf '%s\n' "$restore_output"
-                        fi
-                        if [ -n "$conflicted_files" ]; then
-                            printf '\nConflicted files:\n'
-                            while IFS= read -r file; do
-                                [ -n "$file" ] && printf '  • %s\n' "$file"
-                            done <<EOF
-$conflicted_files
-EOF
-                        fi
-                        printf '\n'
-                        log_info "Your stashed changes are preserved — nothing is lost."
-                        log_info "  Stash ref: $autostash_ref"
-                        git reset --hard HEAD >/dev/null 2>&1 || true
-                        log_info "Working tree reset to clean state."
-                        log_info "Restore your changes later with: git stash apply $autostash_ref"
-                    fi
-                else
-                    log_info "Skipped restoring local changes."
-                    log_info "Your changes are still preserved in git stash."
-                    log_info "Restore manually with: git stash apply $autostash_ref"
-                fi
+            local update_rc=0
+            update_managed_checkout "$INSTALL_DIR" "$BRANCH" || update_rc=$?
+            if [ "$update_rc" -ne 0 ]; then
+                log_error "Repository update stopped before dependency or build stages."
+                return "$update_rc"
             fi
         else
             log_error "Directory exists but is not a git repository: $INSTALL_DIR"
@@ -2433,7 +3369,6 @@ install_node_deps() {
                 cat "$npm_log" >&2
             fi
             rm -f "$npm_log"
-            restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
         rm -f "$npm_log"
@@ -2549,7 +3484,6 @@ install_node_deps() {
                 cat "$tui_npm_log" >&2
             fi
             rm -f "$tui_npm_log"
-            restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
         rm -f "$tui_npm_log"
@@ -2557,7 +3491,6 @@ install_node_deps() {
     fi
 
     # Keep the checkout clean so `hermes update` doesn't autostash every run.
-    restore_dirty_lockfiles "$INSTALL_DIR"
 }
 
 install_browser_use_cli() {
@@ -3423,7 +4356,6 @@ PYEOF
 
     # `npm install` + `npm run pack` rewrite lockfiles; restore them so the
     # checkout stays clean for the next `hermes update`.
-    restore_dirty_lockfiles "$INSTALL_DIR"
 }
 
 # Each --stage runs in its own process, so (unlike the monolithic main() where
@@ -3628,12 +4560,19 @@ main() {
     echo "git" > "$INSTALL_DIR/.install_method"
 }
 
-if [ "$MANIFEST_MODE" = true ]; then
-    emit_manifest
-elif [ -n "$STAGE_NAME" ]; then
-    run_stage_protocol "$STAGE_NAME"
-elif [ -n "$ENSURE_DEPS" ]; then
-    ensure_mode
-else
-    main
+# A downloaded installer is commonly executed through stdin (`curl ... | bash`
+# or `bash -s -- ...`). In that mode Bash leaves BASH_SOURCE[0] empty, while a
+# sourced helper has a real source path that differs from $0. Dispatch for both
+# direct-file and stdin execution, but remain inert when tests/tools source the
+# functions into an existing shell.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [ "$MANIFEST_MODE" = true ]; then
+        emit_manifest
+    elif [ -n "$STAGE_NAME" ]; then
+        run_installer_with_update_lock run_stage_protocol "$STAGE_NAME"
+    elif [ -n "$ENSURE_DEPS" ]; then
+        run_installer_with_update_lock ensure_mode
+    else
+        run_installer_with_update_lock main
+    fi
 fi

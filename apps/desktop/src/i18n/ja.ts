@@ -711,13 +711,17 @@ export const ja = defineLocale({
         'Hermes ランタイムは更新されましたが、デスクトップアプリ自体は古いビルドのままです。アプリを更新するまで、新しいインターフェース機能(Bot Mode など)は表示されません。下の更新を実行してアプリを再ビルドしてください。それでもこの警告が消えない場合は、最新のデスクトップインストーラーから再インストールしてください。',
       bundleOutOfSyncAction: 'インストーラーを入手',
       updates: '更新',
+      clientUpdates: 'デスクトップアプリ',
+      backendUpdates: '接続中のバックエンド',
       checkNow: '今すぐ確認',
       checking: '確認中…',
       seeWhatsNew: '新機能を見る',
       updateNow: '今すぐ更新',
+      restartGateway: 'ゲートウェイを再起動',
       releaseNotes: 'リリースノート',
       onLatest: '最新バージョンです。',
       installing: '更新をインストール中です。',
+      gatewayRestartRequired: 'ゲートウェイは古いコードで実行中のため、再起動が必要です。',
       cantUpdate: 'このビルドはアプリ内から更新できません。',
       cantReach: '更新サーバーに接続できませんでした。',
       tapCheck: '更新を探すには「今すぐ確認」を押してください。',
@@ -783,6 +787,67 @@ export const ja = defineLocale({
       replace: '置き換え',
       set: '設定',
       clear: 'クリア'
+    },
+    fleetUpdates: {
+      title: 'バックエンド群の更新',
+      intro:
+        '各行は登録済みバックエンドです。確認と操作はそのゲートウェイに固定され、同じインストールの別名は一度だけ更新されます。',
+      refresh: 'バックエンドを再確認',
+      updateAll: 'すべて更新',
+      updatingAll: 'すべて更新中…',
+      backendTitle: label => `${label} バックエンド`,
+      backendVersion: version => `バックエンド ${version}`,
+      deployment: kind => `インストール: ${kind}`,
+      deploymentKinds: {
+        cloud: 'クラウド管理',
+        desktop: 'デスクトップ管理',
+        external: '外部管理',
+        'git-venv': 'Git 仮想環境',
+        image: 'コンテナイメージ',
+        launchd: 'launchd サービス',
+        mutable: '更新可能なチェックアウト',
+        package: 'パッケージ管理',
+        systemd: 'systemd サービス',
+        unknown: '不明'
+      },
+      unknown: '不明',
+      checking: '確認中…',
+      notChecked: '未確認',
+      available: '更新あり',
+      current: 'バックエンドは最新',
+      failed: '確認に失敗',
+      cloudManaged: 'Hermes Cloud が管理',
+      manual: '手動更新',
+      partial: '一部のみ更新',
+      applying: 'バックエンドを更新中…',
+      updated: 'バックエンドを更新しました',
+      restartRequired: 'ゲートウェイの再起動が必要です',
+      restartGateway: 'ゲートウェイを再起動',
+      restarted: 'ゲートウェイを再起動しました',
+      applyBackend: 'バックエンドを更新',
+      copyCommand: '正確なコマンドをコピー',
+      retry: 'バックエンドを再試行',
+      manualToast: 'このバックエンドでは、表示された手動更新コマンドが必要です。',
+      partialToast: 'バックエンドの更新は一部のみ完了しました。再試行前にこの行を確認してください。',
+      availabilityUnknown: 'このバックエンドに更新があるか確認できませんでした。適用する前に再確認してください。',
+      cannotApply: 'このバックエンドでは更新を直接適用できません。',
+      checkFailed: 'バックエンドの更新確認に失敗しました。',
+      checkUnavailable: 'バックエンドの更新確認を利用できません。',
+      restartFailed: 'ゲートウェイの再起動に失敗しました。',
+      restartNoReturn: 'ゲートウェイが現在のコードで復帰しませんでした。',
+      restartRefused: 'ゲートウェイの再起動が拒否されました。',
+      sshOwnedServe: label =>
+        `${label} は Desktop の SSH ライフサイクルで提供されています。接続を解除し、そのホストで表示されたコマンドを実行してから再接続してください。`,
+      updateFailed: 'バックエンドの更新に失敗しました。',
+      updateNoReturn: '更新後にバックエンドが復帰しませんでした。',
+      updateRefused: 'バックエンドが更新を拒否しました。',
+      botContext: (profiles, platforms) =>
+        [
+          profiles.length ? `Bot プロファイル: ${profiles.join(', ')}` : '',
+          platforms.length ? `プラットフォーム: ${platforms.join(', ')}` : ''
+        ]
+          .filter(Boolean)
+          .join(' · ')
     },
     gateway: {
       loading: 'ゲートウェイ設定を読み込み中...',
@@ -2258,6 +2323,17 @@ export const ja = defineLocale({
     everythingSkipped: 'スキップ',
     everythingRowFailed: '更新に失敗しました',
     everythingFanoutFailedTitle: '他のインスタンスを更新できませんでした',
+    everythingBackendTitle: label => `${label} バックエンド`,
+    everythingBackendUpdated: 'バックエンドの更新が完了しました。',
+    everythingBackendRestarted: '現在のバックエンドコードでゲートウェイを再起動しました。',
+    everythingBackendPartial: 'バックエンドの更新は完了しましたが、追加の対応が必要です。',
+    everythingBackendManualCommand: command => `このバックエンドを手動で更新: ${command}`,
+    everythingBackendManual: 'このバックエンドは手動更新が必要です。',
+    everythingBackendManaged: 'このバックエンドは Hermes Cloud によって管理されています。',
+    restartSkewedGatewayTitle: 'バックエンドゲートウェイの再起動が必要です',
+    restartSkewedGatewayBody:
+      'このゲートウェイは古いバックエンドコードを実行中です。モデル変更や続行の前に、所有プロファイルだけを再起動してください。',
+    restartSkewedGateway: 'バックエンドゲートウェイを再起動',
     applyStatus: {
       preparing: 'バックエンドを更新しています…',
       pulling: 'バックエンドを更新中…',
@@ -2265,7 +2341,12 @@ export const ja = defineLocale({
       notAvailable: 'このバックエンドでは更新を利用できません。',
       failed: 'バックエンドの更新に失敗しました。',
       noReturn:
-        'バックエンドがオンラインに戻りませんでした。更新が完了していない可能性があります。バックエンドホストを確認してください。'
+        'バックエンドがオンラインに戻りませんでした。更新が完了していない可能性があります。バックエンドホストを確認してください。',
+      partial: 'バックエンドの更新は一部のみ完了しました。再試行前にバックエンドを確認してください。',
+      restartingSkewedGateway: '現在のコードで対象のバックエンドゲートウェイを再起動中…',
+      restartFailed: 'バックエンドゲートウェイの再起動に失敗しました。',
+      restartComplete: '現在のコードでバックエンドゲートウェイを再起動しました。',
+      restartNoReturn: 'バックエンドゲートウェイが現在のコードで復帰しませんでした。'
     }
   },
 

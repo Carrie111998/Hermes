@@ -23,6 +23,15 @@ export function getStatus(): Promise<StatusResponse> {
   })
 }
 
+/** Read status from one registered backend without consulting the renderer's
+ * ambient active connection. `local` intentionally routes to the local pool. */
+export function getScopedStatus(scope: ProfileScope): Promise<StatusResponse> {
+  return window.hermesDesktop.api<StatusResponse>({
+    ...capabilityScoped(scope),
+    path: '/api/status'
+  })
+}
+
 export function getLogs(params: {
   component?: string
   file?: string

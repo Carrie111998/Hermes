@@ -12,18 +12,63 @@ from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    current_sha = new_sha if commit_count == "0" else old_sha
+    state = {"head": current_sha, "tracking": current_sha}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+
+        if "check-ref-format --branch" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{cmd[-1]}\n", stderr=""
+            )
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
 
+        if "branch --show-current" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
+
+        if "rev-parse" in joined and "--is-shallow-repository" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+
         # git rev-parse --verify origin/{branch}  (check remote branch exists)
         if "rev-parse" in joined and "--verify" in joined:
-            rc = 0 if verify_ok else 128
+            ref = str(cmd[-1]).removesuffix("^{commit}")
+            if ref == "MERGE_HEAD":
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            if not verify_ok:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            if ref == "HEAD" or ref.startswith("refs/heads/"):
+                sha = state["head"]
+            elif ref.startswith("refs/hermes-update-fetches/"):
+                sha = new_sha
+            elif ref.startswith("refs/remotes/origin/"):
+                sha = state["tracking"]
+            else:
+                sha = old_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{sha}\n", stderr="")
+
+        if "rev-parse" in joined and str(cmd[-1]) == "HEAD":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{state['head']}\n", stderr=""
+            )
+
+        if "merge-base --is-ancestor" in joined:
+            ancestor, descendant = str(cmd[-2]), str(cmd[-1])
+            rc = 1 if ancestor == new_sha and descendant == old_sha else 0
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+
+        if "update-ref refs/remotes/origin/" in joined:
+            state["tracking"] = new_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        if "merge --ff-only" in joined:
+            state["head"] = str(cmd[-1])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         # git rev-list HEAD..origin/{branch} --count
         if "rev-list" in joined:
@@ -32,6 +77,8 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         # Fallback: return a successful CompletedProcess with empty stdout
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
+    side_effect.state = state
+    side_effect.new_sha = new_sha
     return side_effect
 
 
@@ -86,6 +133,19 @@ def _patch_gateway_discovery():
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
          patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _patch_web_build_for_update():
+    """This module exercises updater control flow, not the real web compiler.
+
+    The production updater now treats a missing/stale web bundle as a
+    fail-closed partial update, so these mocked end-to-end flows must declare
+    that their unrelated build leg succeeded. Dedicated web-build tests cover
+    strict failure and stale-bundle rejection.
+    """
+    with patch("hermes_cli.update_cmd._build_web_ui_for_update", return_value=True):
         yield
 
 
@@ -296,12 +356,20 @@ class TestCmdUpdateBranchFallback:
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+            sync_mock.return_value = False
             cmd_update(mock_args)
 
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_called_once_with(
+            expected_git_cmd,
+            PROJECT_ROOT,
+            push_origin=False,
+            expected_branch="main",
+            expected_head_sha="b" * 40,
+            origin_sha="b" * 40,
+        )
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -312,27 +380,22 @@ class TestCmdUpdateBranchFallback:
     ):
         """A fork sync that pulls code must continue through post-update work."""
         from hermes_cli import main as hm
-        from hermes_cli import update_cmd
 
-        mock_run.side_effect = _make_run_side_effect(
+        run_side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
         )
+        mock_run.side_effect = run_side_effect
 
-        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb:
-        # the sync moved HEAD). The NEXT two bracket the pull inside the
-        # normal update path (bbbbbbb -> ccccccc) — the head-moved no-op
-        # guard added after this PR exits 1 when that pair is equal, so the
-        # mock must show the pull advancing HEAD too.
-        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "ccccccc"])
+        upstream_sha = "c" * 40
+
+        def _move_to_pinned_upstream(*_args, **_kwargs):
+            run_side_effect.state["head"] = upstream_sha
+            return True
 
         with patch.object(
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(
-            update_cmd,
-            "_capture_head_sha",
-            side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
         ), patch(
             # The full post-update path runs the fleet version check, which
             # reads the REAL machine's profile gateway_state.json files —
@@ -356,7 +419,9 @@ class TestCmdUpdateBranchFallback:
             "hermes_cli.gateway._get_service_pids",
             return_value=set(),
         ), patch.object(
-            hm, "_sync_with_upstream_if_needed"
+            hm,
+            "_sync_with_upstream_if_needed",
+            side_effect=_move_to_pinned_upstream,
         ), patch.object(
             hm,
             "_reload_updated_runtime_modules",
@@ -656,24 +721,87 @@ class TestCmdUpdateBranchFlag:
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
 
+        old_sha = "a" * 40
+        new_sha = "b" * 40
+        state = {"head": old_sha, "tracking": old_sha, "branch": current_branch}
+
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
+            if "check-ref-format --branch" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{cmd[-1]}\n", stderr=""
+                )
+
             if "rev-parse" in joined and "--abbrev-ref" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
 
-            if "checkout" in joined and "-B" in joined:
-                rc = 128 if track_fails else 0
-                err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
-                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
+            if "branch --show-current" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
 
-            if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
+            if "fetch" in joined and "origin" in joined:
+                if track_fails:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        128,
+                        stdout="",
+                        stderr=f"fatal: couldn't find remote ref {target_branch}\n",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            if "rev-parse" in joined and "--is-shallow-repository" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+
+            if "rev-parse" in joined and "--verify" in joined:
+                ref = str(cmd[-1]).removesuffix("^{commit}")
+                if ref == "MERGE_HEAD":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+                if ref == "HEAD":
+                    sha = state["head"]
+                elif ref.startswith("refs/hermes-update-fetches/"):
+                    sha = new_sha
+                elif ref.startswith("refs/remotes/origin/"):
+                    sha = state["tracking"]
+                elif ref == f"refs/heads/{target_branch}":
+                    if checkout_fails:
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+                    sha = state["head"]
+                else:
+                    sha = old_sha
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{sha}\n", stderr="")
+
+            if "rev-parse" in joined and str(cmd[-1]) == "HEAD":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{state['head']}\n", stderr=""
+                )
+
+            if "merge-base --is-ancestor" in joined:
+                ancestor, descendant = str(cmd[-2]), str(cmd[-1])
+                rc = 1 if ancestor == new_sha and descendant == old_sha else 0
+                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+
+            if "update-ref refs/remotes/origin/" in joined:
+                state["tracking"] = new_sha
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            if "checkout" in joined and "-b" in joined:
+                state["branch"] = target_branch
+                state["head"] = str(cmd[-1])
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            if "checkout" in joined and "-b" not in joined and "rev-parse" not in joined:
                 rc = 128 if checkout_fails else 0
                 err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
+                if rc == 0:
+                    state["branch"] = target_branch
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "rev-list" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+
+            if "merge --ff-only" in joined:
+                state["head"] = str(cmd[-1])
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -682,7 +810,7 @@ class TestCmdUpdateBranchFlag:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_pulls_against_named_branch(self, mock_run, _mock_which, capsys):
-        """--branch bb/gui makes rev-list and pull target origin/bb/gui."""
+        """--branch bb/gui fetches only that branch and applies its pinned SHA."""
         mock_run.side_effect = self._branch_side_effect(
             current_branch="bb/gui", target_branch="bb/gui", commit_count="3"
         )
@@ -692,14 +820,14 @@ class TestCmdUpdateBranchFlag:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
-        # rev-list must compare against origin/bb/gui, not origin/main
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
-        assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
+        fetch_cmds = [c for c in commands if "fetch" in c and "origin" in c]
+        assert any("refs/heads/bb/gui:" in c for c in fetch_cmds), fetch_cmds
+        assert not any("refs/heads/main:" in c for c in fetch_cmds), fetch_cmds
 
-        # the ff-only merge must target origin/bb/gui
+        # The mutable tracking ref is never the merge authority.
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
-        assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
+        assert any("b" * 40 in c for c in merge_cmds), merge_cmds
+        assert not any("origin/" in c for c in merge_cmds), merge_cmds
 
 
     @patch("shutil.which", return_value=None)
@@ -720,7 +848,8 @@ class TestCmdUpdateBranchFlag:
         assert exc_info.value.code == 1
 
         out = capsys.readouterr().out
-        assert "does not exist locally or on origin" in out
+        assert "Failed to fetch updates from origin" in out
+        assert "couldn't find remote ref" in out
         assert "nonexistent" in out
 
 
@@ -1034,8 +1163,20 @@ class TestNodeRuntimeNpmResolution:
                 archive.writestr("hermes-agent-main/apps/desktop/package.json", "{}")
 
         def fail_git_fetch(command, **_kwargs):
+            if "check-ref-format" in command:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="main\n", stderr=""
+                )
             if "fetch" in command:
                 raise subprocess.CalledProcessError(1, command)
+            if "rev-parse" in command:
+                if "--abbrev-ref" in command:
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout="main\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"{'a' * 40}\n", stderr=""
+                )
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
         desktop_builds = []
@@ -1076,7 +1217,11 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
         monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
         monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
-        monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda _failures: None)
+        monkeypatch.setattr(
+            update_cmd,
+            "_finish_dashboard_update_cleanup",
+            lambda _failures, *, web_build_ok: None,
+        )
         monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path / "hermes-home")
 
         with (

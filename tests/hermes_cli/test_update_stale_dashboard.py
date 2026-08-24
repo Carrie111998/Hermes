@@ -729,6 +729,18 @@ class TestPostUpdateStaleModuleReload:
         mock_reload.assert_not_called()
         mock_kill.assert_not_called()
 
+    def test_web_build_failure_skips_reload_and_kill(self, capsys):
+        """A failed bundle build keeps the last usable dashboard generation."""
+        from hermes_cli import update_cmd
+
+        with patch.object(update_cmd, "_reload_process_scan_modules") as mock_reload, \
+             patch("hermes_cli.main._kill_stale_dashboard_processes") as mock_kill:
+            update_cmd._finish_dashboard_update_cleanup([], web_build_ok=False)
+
+        mock_reload.assert_not_called()
+        mock_kill.assert_not_called()
+        assert "web UI rebuild did not complete" in capsys.readouterr().out
+
     def test_reload_restores_missing_symbol(self):
         """Simulate the stale-module state: strip ``bounded_probe_run`` off
         the cached module object (what an old pre-#87134 module looks like)

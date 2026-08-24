@@ -1953,6 +1953,9 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Feishu message."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -1975,7 +1978,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 try:
                     response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
+                        chat_id=normalized_chat_id,
                         msg_type=msg_type,
                         payload=payload,
                         reply_to=reply_to,
@@ -1986,7 +1989,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
                     response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
+                        chat_id=normalized_chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
@@ -1999,7 +2002,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 ):
                     logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
                     response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
+                        chat_id=normalized_chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
@@ -2068,6 +2071,9 @@ class FeishuAdapter(BasePlatformAdapter):
         ``_handle_card_action_event`` can intercept them and call
         ``resolve_gateway_approval()`` to unblock the waiting agent thread.
         """
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -2108,7 +2114,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
             payload = json.dumps(card, ensure_ascii=False)
             response = await self._feishu_send_with_retry(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 msg_type="interactive",
                 payload=payload,
                 reply_to=None,
@@ -2120,7 +2126,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._approval_state[approval_id] = {
                     "session_key": session_key,
                     "message_id": result.message_id or "",
-                    "chat_id": chat_id,
+                    "chat_id": normalized_chat_id,
                 }
             return result
         except Exception as exc:
@@ -2163,20 +2169,29 @@ class FeishuAdapter(BasePlatformAdapter):
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
+        prompt_id: str = "",
+        correlation_id: str = "",
+        context: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive update prompt with Yes/No buttons."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         try:
-            prompt_id = next(self._update_prompt_counter)
+            card_prompt_id = next(self._update_prompt_counter)
+            callback_prompt_id = str(prompt_id or "")
             payload = json.dumps(
-                self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id),
+                self._build_update_prompt_card(
+                    prompt=prompt, default=default, prompt_id=card_prompt_id
+                ),
                 ensure_ascii=False,
             )
             response = await self._feishu_send_with_retry(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 msg_type="interactive",
                 payload=payload,
                 reply_to=None,
@@ -2185,10 +2200,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_update_prompt failed")
             if result.success:
-                self._update_prompt_state[prompt_id] = {
+                self._update_prompt_state[card_prompt_id] = {
                     "session_key": session_key,
+                    "prompt_id": callback_prompt_id,
+                    "correlation_id": str(correlation_id),
+                    "control_home": str((context or {}).get("control_home") or ""),
                     "message_id": result.message_id or "",
-                    "chat_id": chat_id,
+                    "chat_id": normalized_chat_id,
                 }
             return result
         except Exception as exc:
@@ -2229,12 +2247,6 @@ class FeishuAdapter(BasePlatformAdapter):
             ],
         }
 
-    @staticmethod
-    def _write_update_prompt_response(answer: str) -> None:
-        response_path = get_hermes_home() / ".update_response"
-        tmp_path = response_path.with_suffix(".tmp")
-        tmp_path.write_text(answer, encoding="utf-8")
-        tmp_path.replace(response_path)
 
     async def send_voice(
         self,
@@ -2304,6 +2316,9 @@ class FeishuAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file to Feishu."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(image_path):
@@ -2336,7 +2351,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     media_tag={"tag": "img", "image_key": image_key},
                 )
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type="post",
                     payload=post_payload,
                     reply_to=reply_to,
@@ -2344,7 +2359,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             else:
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type="image",
                     payload=json.dumps({"image_key": image_key}, ensure_ascii=False),
                     reply_to=reply_to,
@@ -2368,19 +2383,22 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Download a remote image then send it through the native Feishu image flow."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         try:
             image_path = await self._download_remote_image(image_url)
         except Exception as exc:
             logger.error("[Feishu] Failed to download image %s: %s", image_url, exc, exc_info=True)
             return await super().send_image(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 image_url=image_url,
                 caption=caption,
                 reply_to=reply_to,
                 metadata=metadata,
             )
         return await self.send_image_file(
-            chat_id=chat_id,
+            chat_id=normalized_chat_id,
             image_path=image_path,
             caption=caption,
             reply_to=reply_to,
@@ -2396,6 +2414,9 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Feishu has no native GIF bubble; degrade to a downloadable file."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         try:
             file_path, file_name = await self._download_remote_document(
                 animation_url,
@@ -2405,7 +2426,7 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to download animation %s: %s", animation_url, exc, exc_info=True)
             return await super().send_animation(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 animation_url=animation_url,
                 caption=caption,
                 reply_to=reply_to,
@@ -2413,7 +2434,7 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         degraded_caption = f"[GIF downgraded to file]\n{caption}" if caption else "[GIF downgraded to file]"
         return await self.send_document(
-            chat_id=chat_id,
+            chat_id=normalized_chat_id,
             file_path=file_path,
             file_name=file_name,
             caption=degraded_caption,
@@ -2797,9 +2818,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "").strip()
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        if not expected_chat_id or not callback_chat_id or callback_chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] Approval callback chat mismatch for %s (expected=%s, got=%s)",
                 approval_id,
@@ -2857,9 +2878,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "").strip()
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        if not expected_chat_id or not callback_chat_id or callback_chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] Update prompt callback chat mismatch for %s (expected=%s, got=%s)",
                 prompt_id,
@@ -2908,11 +2929,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._is_interactive_operator_authorized(open_id):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        callback_chat_id = str(chat_id or "").strip()
+        if not expected_chat_id or not callback_chat_id or expected_chat_id != callback_chat_id:
             logger.warning(
                 "[Feishu] Approval %s chat mismatch (expected=%s, got=%s)",
-                approval_id, expected_chat_id, chat_id,
+                approval_id, expected_chat_id, callback_chat_id,
             )
             return
         state = self._approval_state.pop(approval_id, None)
@@ -2932,7 +2954,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # already timed out (fail-closed deny) or was resolved via
                 # /approve. Correct the record so the user doesn't believe
                 # the command ran.
-                _chat = str(state.get("chat_id", "") or chat_id or "")
+                _chat = expected_chat_id or callback_chat_id
                 if _chat:
                     try:
                         await self.send(
@@ -2959,26 +2981,32 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        if open_id:
-            sender_id = SimpleNamespace(open_id=open_id, user_id="")
-            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
-                logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
-                return
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        callback_chat_id = str(chat_id or "").strip()
+        if not expected_chat_id or not callback_chat_id or expected_chat_id != callback_chat_id:
             logger.warning(
                 "[Feishu] Update prompt %s chat mismatch (expected=%s, got=%s)",
-                prompt_id,
-                expected_chat_id,
-                chat_id,
+                prompt_id, expected_chat_id, callback_chat_id,
             )
             return
-        state = self._update_prompt_state.pop(prompt_id, None)
-        if not state:
-            logger.debug("[Feishu] Update prompt %s already resolved while validating callback", prompt_id)
-            return
         try:
-            self._write_update_prompt_response(answer)
+            from gateway.update_prompt_response import write_update_confirmation_response
+
+            written = write_update_confirmation_response(
+                state.get("control_home", ""),
+                prompt_id=state.get("prompt_id", ""),
+                correlation_id=state.get("correlation_id", ""),
+                session_key=state.get("session_key", ""),
+                actor_id=open_id,
+                answer=answer,
+            )
+            if not written:
+                logger.warning(
+                    "[Feishu] Rejected stale or invalid update prompt %s",
+                    prompt_id,
+                )
+                return
+            self._update_prompt_state.pop(prompt_id, None)
             logger.info(
                 "Feishu update prompt resolved for session %s (answer=%s, user=%s)",
                 state["session_key"], answer, user_name,
@@ -4703,6 +4731,9 @@ class FeishuAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         outbound_message_type: str = "file",
     ) -> SendResult:
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(file_path):
@@ -4741,7 +4772,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "file_name": display_name,
                 }
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type="post",
                     payload=self._build_media_post_payload(caption=caption, media_tag=media_tag),
                     reply_to=reply_to,
@@ -4749,7 +4780,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             else:
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type=resolved_message_type,
                     payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
                     reply_to=reply_to,
@@ -4770,7 +4801,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     if thread_msg_id:
                         logger.info("[Feishu] Audio: retrying via reply API in thread")
                         message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
+                            chat_id=normalized_chat_id,
                             msg_type=resolved_message_type,
                             payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
                             reply_to=thread_msg_id,
@@ -4779,7 +4810,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     if not self._response_succeeded(message_response):
                         logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
                         message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
+                            chat_id=normalized_chat_id,
                             msg_type=resolved_message_type,
                             payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
                             reply_to=None,
@@ -4821,6 +4852,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("chat_id is required")
         effective_reply_to = reply_to
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
@@ -4997,6 +5031,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("chat_id is required")
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
         for attempt in range(_FEISHU_SEND_ATTEMPTS):

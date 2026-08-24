@@ -91,6 +91,27 @@ def test_source_churn_alongside_a_pyproject_edit_still_reinstalls(repo):
     assert _editable_install_is_current(GIT, repo, before) is False
 
 
+def test_uncommitted_pyproject_edit_forces_the_reinstall(repo):
+    """A reapplied rollout stash participates in dependency resolution."""
+    before = _head(repo)
+    (repo / "cli.py").write_text("x = 4\n")
+    _commit(repo, "source-only candidate")
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = 'hermes'\ndependencies = ['local-plugin']\n"
+    )
+
+    assert _editable_install_is_current(GIT, repo, before) is False
+
+
+def test_untracked_install_manifest_forces_the_reinstall(repo):
+    before = _head(repo)
+    (repo / "cli.py").write_text("x = 5\n")
+    _commit(repo, "source-only candidate")
+    (repo / "setup.cfg").write_text("[options]\ninstall_requires = local-plugin\n")
+
+    assert _editable_install_is_current(GIT, repo, before) is False
+
+
 def test_missing_pre_pull_sha_fails_closed(repo):
     """No SHA (ZIP swap, capture failure) means we cannot prove anything."""
     assert _editable_install_is_current(GIT, repo, None) is False

@@ -27,12 +27,16 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import textwrap
 import time as _time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -82,6 +86,11 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli",
         "hermes_cli.main",
         "hermes_cli.update_cmd",
+        # Transaction coordinator + live receipt hold state across the code
+        # swap. Purging either would load candidate-generation code into the
+        # pre-update coordinator or lose the in-progress durable receipt.
+        "hermes_cli.update_rollout",
+        "hermes_cli.update_receipt",
         "hermes_cli.hermes_logging",
     }
 )
@@ -306,6 +315,22 @@ _UPDATE_CRITICAL_FILES = (
     "hermes_constants.py",
 )
 
+
+def _rollout_requires_preapply_fleet_quiesce(
+    platform: str | None = None,
+) -> bool:
+    """Whether a rollout must drain the whole fleet before mutating disk.
+
+    Native Windows cannot replace mapped venv binaries, so it retains the
+    historical full pre-apply drain. POSIX can keep untouched old-generation
+    gateways available until the canary/batch coordinator reaches them.
+    Keeping this policy in a tiny pure helper makes that platform exception a
+    directly tested contract rather than an incidental inline branch.
+    """
+
+    return (sys.platform if platform is None else platform) == "win32"
+
+
 def _capture_head_sha(git_cmd, cwd) -> str | None:
     """Return the current HEAD SHA, or None if it can't be resolved."""
     try:
@@ -319,6 +344,820 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return result.stdout.strip() or None
     except (subprocess.CalledProcessError, OSError):
         return None
+
+
+_REMOTE_ADVANCED = "advanced"
+_REMOTE_REWRITTEN = "rewritten"
+_REMOTE_UNKNOWN = "unknown"
+
+_LOCAL_NONE = "none"
+_LOCAL_PRESENT = "present"
+_LOCAL_UNKNOWN = "unknown"
+
+_REF_PRESENT = "present"
+_REF_ABSENT = "absent"
+_REF_UNKNOWN = "unknown"
+
+
+def _resolve_commit(git_cmd, cwd, ref: str) -> str | None:
+    """Resolve ``ref`` to one immutable commit SHA, or ``None`` on any doubt."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-fA-F]{40,64}", sha) else None
+
+
+def _resolve_optional_commit(git_cmd, cwd, ref: str) -> tuple[str, str | None]:
+    """Distinguish a missing ref from a Git/object-resolution failure."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return _REF_UNKNOWN, None
+    if result.returncode == 1:
+        return _REF_ABSENT, None
+    if result.returncode != 0:
+        return _REF_UNKNOWN, None
+    sha = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+        return _REF_UNKNOWN, None
+    return _REF_PRESENT, sha
+
+
+def _ancestor_result(git_cmd, cwd, ancestor: str, descendant: str) -> int:
+    """Return git's exact ``merge-base --is-ancestor`` status.
+
+    Status 0 is proven ancestry, 1 is proven non-ancestry, and every other
+    status is an operational/graph error.  Callers must preserve that third
+    state: collapsing it into 1 is how a missing object becomes permission to
+    destroy a user's branch.
+    """
+    try:
+        result = subprocess.run(
+            git_cmd + ["merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return 2
+    return int(result.returncode)
+
+
+def _classify_remote_history(
+    git_cmd,
+    cwd,
+    old_origin_sha: str | None,
+    new_origin_sha: str | None,
+) -> str:
+    """Classify the fetched remote movement without guessing on errors."""
+    if not old_origin_sha or not new_origin_sha:
+        return _REMOTE_UNKNOWN
+    ancestry = _ancestor_result(git_cmd, cwd, old_origin_sha, new_origin_sha)
+    if ancestry == 0:
+        return _REMOTE_ADVANCED
+    if ancestry == 1:
+        return _REMOTE_REWRITTEN
+    return _REMOTE_UNKNOWN
+
+
+def _classify_remote_without_tracking_baseline(
+    git_cmd,
+    cwd,
+    target_ref_state: str,
+    target_local_sha: str | None,
+    fetched_sha: str | None,
+) -> tuple[str, str | None]:
+    """Classify a first scoped fetch and return its effective local anchor.
+
+    With no remote-tracking baseline, a new target branch is safe to create.
+    An existing target is safe only when its history and the immutable fetched
+    commit are directly comparable in either direction. Divergence remains
+    unknown and is refused without leaving the newly-created tracking ref
+    behind. When comparability is proven, the exact local target generation is
+    also the only honest baseline for apply-time local-history classification;
+    passing ``None`` there would discard the proof and make both safe fast-
+    forwards and already-integrated branches fail closed forever.
+    """
+    if fetched_sha is None:
+        return _REMOTE_UNKNOWN, None
+    if target_ref_state == _REF_ABSENT:
+        return _REMOTE_ADVANCED, None
+    if target_ref_state != _REF_PRESENT or target_local_sha is None:
+        return _REMOTE_UNKNOWN, None
+    local_to_fetched = _ancestor_result(
+        git_cmd, cwd, target_local_sha, fetched_sha
+    )
+    fetched_to_local = _ancestor_result(
+        git_cmd, cwd, fetched_sha, target_local_sha
+    )
+    if local_to_fetched == 0 or fetched_to_local == 0:
+        return _REMOTE_ADVANCED, target_local_sha
+    return _REMOTE_UNKNOWN, None
+
+
+def _classify_local_history(
+    git_cmd,
+    cwd,
+    old_origin_sha: str | None,
+    local_head_sha: str | None,
+) -> str:
+    """Whether local HEAD carries history beyond the pre-fetch remote tip."""
+    if not old_origin_sha or not local_head_sha:
+        return _LOCAL_UNKNOWN
+    if local_head_sha == old_origin_sha:
+        return _LOCAL_NONE
+    ancestry = _ancestor_result(git_cmd, cwd, old_origin_sha, local_head_sha)
+    if ancestry == 0:
+        return _LOCAL_PRESENT
+    if ancestry != 1:
+        return _LOCAL_UNKNOWN
+
+    reverse_ancestry = _ancestor_result(
+        git_cmd, cwd, local_head_sha, old_origin_sha
+    )
+    if reverse_ancestry == 0:
+        # A local checkout behind the old remote has no local-only commits.
+        return _LOCAL_NONE
+    if reverse_ancestry == 1:
+        return _LOCAL_PRESENT
+    return _LOCAL_UNKNOWN
+
+
+def _create_update_recovery_ref(git_cmd, cwd, head_sha: str) -> str | None:
+    """Create and verify a non-overwriting recovery ref at ``head_sha``."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    zero_oid = "0" * len(head_sha)
+    for suffix in range(100):
+        tail = "" if suffix == 0 else f"-{suffix}"
+        ref = (
+            "refs/hermes-update-backups/"
+            f"pre-update-{stamp}-{head_sha[:12]}{tail}"
+        )
+        try:
+            created = subprocess.run(
+                git_cmd + ["update-ref", ref, head_sha, zero_oid],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            return None
+        if created.returncode != 0:
+            continue
+        if _resolve_commit(git_cmd, cwd, ref) == head_sha:
+            return ref
+        return None
+    return None
+
+
+def _protect_detached_checkout(
+    git_cmd, cwd, expected_head_sha: str
+) -> str | None:
+    """Pin a detached checkout before switching to the managed branch.
+
+    Detached local commits have no branch owner and become GC-eligible after a
+    successful checkout.  Create a non-overwriting recovery ref, then re-prove
+    the exact detached identity so a concurrent checkout cannot silently widen
+    this transaction's authority.
+    """
+    try:
+        identity = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    if (
+        identity.returncode != 0
+        or identity.stdout.strip() != "HEAD"
+        or _resolve_commit(git_cmd, cwd, "HEAD") != expected_head_sha
+    ):
+        return None
+    recovery_ref = _create_update_recovery_ref(
+        git_cmd, cwd, expected_head_sha
+    )
+    if recovery_ref is None:
+        return None
+    try:
+        identity = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    if (
+        identity.returncode != 0
+        or identity.stdout.strip() != "HEAD"
+        or _resolve_commit(git_cmd, cwd, "HEAD") != expected_head_sha
+        or _resolve_commit(git_cmd, cwd, recovery_ref) != expected_head_sha
+    ):
+        return None
+    return recovery_ref
+
+
+def _abort_in_progress_merge(
+    git_cmd, cwd, expected_branch: str, expected_head_sha: str
+) -> bool:
+    """Abort a failed merge and prove a clean original tracked checkout."""
+    try:
+        aborted = subprocess.run(
+            git_cmd + ["merge", "--abort"],
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if aborted.returncode != 0:
+        return False
+    if not _update_boundary_matches(
+        git_cmd, cwd, expected_branch, expected_head_sha
+    ):
+        return False
+    merge_head_state, _ = _resolve_optional_commit(git_cmd, cwd, "MERGE_HEAD")
+    if merge_head_state != _REF_ABSENT:
+        return False
+    try:
+        unmerged = subprocess.run(
+            git_cmd + ["ls-files", "--unmerged"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        tracked_status = subprocess.run(
+            git_cmd + ["status", "--porcelain", "--untracked-files=no"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    return (
+        unmerged.returncode == 0
+        and not unmerged.stdout.strip()
+        and tracked_status.returncode == 0
+        and not tracked_status.stdout.strip()
+    )
+
+
+def _restore_original_checkout(
+    git_cmd,
+    cwd,
+    *,
+    original_branch: str,
+    original_head_sha: str,
+) -> bool:
+    """Return a clean/stashed transaction to its original branch or detach."""
+    try:
+        if original_branch == "HEAD":
+            restored = subprocess.run(
+                git_cmd + ["checkout", "--detach", original_head_sha],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        else:
+            restored = subprocess.run(
+                # ``--`` is supported by ``git switch`` and keeps an existing
+                # branch whose name starts with ``-`` from becoming an option.
+                # Update targets reject such names, but a checkout created by
+                # lower-level Git plumbing can still legitimately start there.
+                git_cmd + ["switch", "--", original_branch],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+    except OSError:
+        return False
+    if restored.returncode != 0:
+        return False
+    if _resolve_commit(git_cmd, cwd, "HEAD") != original_head_sha:
+        return False
+    try:
+        branch_result = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    return (
+        branch_result.returncode == 0
+        and branch_result.stdout.strip() == original_branch
+    )
+
+
+def _current_attached_branch(git_cmd, cwd) -> str | None:
+    try:
+        result = subprocess.run(
+            git_cmd + ["branch", "--show-current"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    branch = result.stdout.strip()
+    return branch if result.returncode == 0 and branch else None
+
+
+def _update_boundary_matches(
+    git_cmd, cwd, expected_branch: str, expected_head_sha: str
+) -> bool:
+    return (
+        _current_attached_branch(git_cmd, cwd) == expected_branch
+        and _resolve_commit(git_cmd, cwd, "HEAD") == expected_head_sha
+    )
+
+
+def _tracked_checkout_clean(git_cmd, cwd) -> bool:
+    """Prove that no tracked/index state would be overwritten by recovery."""
+    merge_head_state, _ = _resolve_optional_commit(git_cmd, cwd, "MERGE_HEAD")
+    if merge_head_state != _REF_ABSENT:
+        return False
+    try:
+        unmerged = subprocess.run(
+            git_cmd + ["ls-files", "--unmerged"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        status = subprocess.run(
+            git_cmd + ["status", "--porcelain", "--untracked-files=no"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    return (
+        unmerged.returncode == 0
+        and not unmerged.stdout.strip()
+        and status.returncode == 0
+        and not status.stdout.strip()
+    )
+
+
+def _validate_update_branch(git_cmd, cwd, branch: str) -> bool:
+    """Accept only an unambiguous, syntactically valid local branch name."""
+    if (
+        not branch
+        or branch.startswith("-")
+        or branch.startswith("refs/")
+    ):
+        return False
+    try:
+        checked = subprocess.run(
+            git_cmd + ["check-ref-format", "--branch", branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    # ``--branch`` accepts revision shorthand such as ``@{-1}`` and prints
+    # its resolved branch name.  Requiring byte-for-byte normalized output
+    # prevents a user-supplied revision expression from changing which remote
+    # ref is fetched or checked out. Fully-qualified ``refs/...`` forms are
+    # rejected above because this API expects the *branch name* only.
+    return checked.returncode == 0 and checked.stdout.strip() == branch
+
+
+def _delete_ref_if_exact(git_cmd, cwd, ref: str, expected_sha: str) -> bool:
+    """Delete only the exact ref generation owned by this invocation."""
+    try:
+        deleted = subprocess.run(
+            git_cmd + ["update-ref", "-d", ref, expected_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    if deleted.returncode != 0:
+        return False
+    state, _ = _resolve_optional_commit(git_cmd, cwd, ref)
+    return state == _REF_ABSENT
+
+
+def _resolve_ref_oid(git_cmd, cwd, ref: str) -> str | None:
+    """Resolve a ref's object id without requiring the object to parse."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    oid = result.stdout.strip()
+    return (
+        oid
+        if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", oid)
+        else None
+    )
+
+
+def _cleanup_owned_fetch_ref(
+    git_cmd, cwd, ref: str, expected_sha: str | None = None
+) -> bool:
+    """Remove a UUID-scoped fetch ref with an exact object-generation lease."""
+    owned_sha = expected_sha or _resolve_ref_oid(git_cmd, cwd, ref)
+    if owned_sha is None:
+        # A missing ref needs no cleanup. Operational ambiguity remains
+        # fail-closed: never issue an unleased deletion.
+        state, _ = _resolve_optional_commit(git_cmd, cwd, ref)
+        return state == _REF_ABSENT
+    return _delete_ref_if_exact(git_cmd, cwd, ref, owned_sha)
+
+
+def _rollback_ref_update(
+    git_cmd,
+    cwd,
+    *,
+    ref: str,
+    old_state: str,
+    old_sha: str | None,
+    new_sha: str,
+) -> bool:
+    """CAS-restore a ref changed by this invocation, preserving later writers."""
+    if old_state == _REF_ABSENT:
+        return _delete_ref_if_exact(git_cmd, cwd, ref, new_sha)
+    if old_state != _REF_PRESENT or old_sha is None:
+        return False
+    try:
+        restored = subprocess.run(
+            git_cmd + ["update-ref", ref, old_sha, new_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    return (
+        restored.returncode == 0
+        and _resolve_commit(git_cmd, cwd, ref) == old_sha
+    )
+
+
+def _commit_parents(git_cmd, cwd, commit_sha: str) -> list[str] | None:
+    """Return the exact ordered parent list for one immutable commit."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-list", "--parents", "-n", "1", commit_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    fields = result.stdout.strip().split()
+    if (
+        result.returncode != 0
+        or not fields
+        or fields[0] != commit_sha
+        or any(not re.fullmatch(r"[0-9a-fA-F]{40,64}", item) for item in fields)
+    ):
+        return None
+    return fields[1:]
+
+
+def _move_attached_branch_to_pinned_commit(
+    git_cmd,
+    cwd,
+    *,
+    branch: str,
+    expected_old_sha: str,
+    target_sha: str,
+) -> tuple[bool, str, str | None]:
+    """Move an attached branch by immutable SHA and exact compare-and-swap.
+
+    The worktree is first detached at the target, leaving the branch ref (and
+    any concurrent commit to it) durable.  Only then is the branch advanced or
+    rewound with ``update-ref <new> <expected-old>``.  This closes the classic
+    check-then-``reset --keep`` window where a clean concurrent commit could be
+    erased between the boundary check and reset.
+    """
+    if (
+        not _update_boundary_matches(git_cmd, cwd, branch, expected_old_sha)
+        or _resolve_commit(git_cmd, cwd, target_sha) != target_sha
+        or not _tracked_checkout_clean(git_cmd, cwd)
+    ):
+        return False, "boundary_changed", None
+
+    recovery_ref = _create_update_recovery_ref(git_cmd, cwd, expected_old_sha)
+    if recovery_ref is None:
+        return False, "recovery_ref_failed", None
+    if (
+        not _update_boundary_matches(git_cmd, cwd, branch, expected_old_sha)
+        or _resolve_commit(git_cmd, cwd, recovery_ref) != expected_old_sha
+        or not _tracked_checkout_clean(git_cmd, cwd)
+    ):
+        return False, "boundary_changed", recovery_ref
+
+    try:
+        detached = subprocess.run(
+            git_cmd + ["checkout", "--detach", target_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False, "detach_failed", recovery_ref
+    if (
+        detached.returncode != 0
+        or _current_attached_branch(git_cmd, cwd) is not None
+        or _resolve_commit(git_cmd, cwd, "HEAD") != target_sha
+        or _resolve_commit(git_cmd, cwd, recovery_ref) != expected_old_sha
+    ):
+        return False, "detach_failed", recovery_ref
+
+    branch_ref = f"refs/heads/{branch}"
+    try:
+        moved = subprocess.run(
+            git_cmd + ["update-ref", branch_ref, target_sha, expected_old_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        moved = subprocess.CompletedProcess([], 1, "", "")
+    if moved.returncode != 0:
+        # Another worktree may have advanced the branch. Reattach to whatever
+        # it now owns without changing that ref; the concurrent commit wins.
+        try:
+            subprocess.run(
+                git_cmd + ["switch", "--", branch],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            pass
+        return False, "branch_changed", recovery_ref
+
+    try:
+        attached = subprocess.run(
+            git_cmd + ["symbolic-ref", "HEAD", branch_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        attached = subprocess.CompletedProcess([], 1, "", "")
+    if (
+        attached.returncode != 0
+        or not _update_boundary_matches(git_cmd, cwd, branch, target_sha)
+        or _resolve_commit(git_cmd, cwd, recovery_ref) != expected_old_sha
+    ):
+        return False, "attach_postcondition_failed", recovery_ref
+    return True, "moved", recovery_ref
+
+
+def _capture_apply_generations(
+    git_cmd,
+    cwd,
+    *,
+    branch: str,
+    fork_sync_rollback_sha: str | None = None,
+    fork_sync_applied_sha: str | None = None,
+) -> tuple[str, str] | None:
+    """Capture one apply authority and its permitted rollback baseline.
+
+    Ordinarily both values are the same exact generation. They may differ only
+    for a separately-proven fork fast-forward owned by this transaction, whose
+    post-sync generation must still be checked out at this boundary.
+    """
+    admission_sha = _capture_head_sha(git_cmd, cwd)
+    if admission_sha is None:
+        return None
+    if fork_sync_rollback_sha is None:
+        return admission_sha, admission_sha
+    if (
+        fork_sync_applied_sha is None
+        or admission_sha != fork_sync_applied_sha
+        or not _update_boundary_matches(
+            git_cmd, cwd, branch, fork_sync_applied_sha
+        )
+    ):
+        return None
+    return fork_sync_rollback_sha, admission_sha
+
+
+def _apply_pinned_update(
+    git_cmd,
+    cwd,
+    *,
+    branch: str,
+    local_head_sha: str | None,
+    old_origin_sha: str | None,
+    new_origin_sha: str | None,
+    remote_history: str,
+) -> tuple[bool, str]:
+    """Apply one fetched target by SHA while preserving every local commit.
+
+    Returns ``(updated, outcome)``.  A false result is fail-closed: HEAD is
+    unchanged, except that ``merge_abort_failed`` explicitly reports that the
+    repository could not prove restoration and must be recovered manually.
+    """
+    if not local_head_sha or not new_origin_sha or remote_history == _REMOTE_UNKNOWN:
+        return False, "history_unknown"
+    if not _update_boundary_matches(git_cmd, cwd, branch, local_head_sha):
+        return False, "wrong_branch"
+    if local_head_sha == new_origin_sha:
+        # This also covers a just-created target branch. Exact equality needs
+        # no history inference and authorizes no mutation.
+        if not _update_boundary_matches(git_cmd, cwd, branch, local_head_sha):
+            return False, "head_changed"
+        return True, "already_integrated"
+
+    local_history = _classify_local_history(
+        git_cmd, cwd, old_origin_sha, local_head_sha
+    )
+    if local_history == _LOCAL_UNKNOWN:
+        return False, "history_unknown"
+    if remote_history == _REMOTE_REWRITTEN and local_history != _LOCAL_NONE:
+        return False, "rewrite_with_local_commits"
+    pinned_in_local = _ancestor_result(
+        git_cmd, cwd, new_origin_sha, local_head_sha
+    )
+    if pinned_in_local not in {0, 1}:
+        return False, "history_unknown"
+    if remote_history == _REMOTE_ADVANCED and pinned_in_local == 0:
+        # Local may be ahead while already containing the entire pinned remote
+        # target. There is nothing to integrate and no reason to rewrite HEAD.
+        if not _update_boundary_matches(git_cmd, cwd, branch, local_head_sha):
+            return False, "head_changed"
+        return True, "already_integrated"
+
+    if remote_history == _REMOTE_REWRITTEN:
+        moved, move_outcome, _ = _move_attached_branch_to_pinned_commit(
+            git_cmd,
+            cwd,
+            branch=branch,
+            expected_old_sha=local_head_sha,
+            target_sha=new_origin_sha,
+        )
+        if not moved:
+            return False, f"rewrite_{move_outcome}"
+        return True, "rewritten_remote_adopted"
+
+    head_to_target = _ancestor_result(git_cmd, cwd, local_head_sha, new_origin_sha)
+    if head_to_target == 0:
+        if not _update_boundary_matches(git_cmd, cwd, branch, local_head_sha):
+            return False, "head_changed"
+        try:
+            fast_forward = subprocess.run(
+                git_cmd + ["merge", "--ff-only", new_origin_sha],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            return False, "fast_forward_failed"
+        if fast_forward.returncode != 0:
+            return False, "fast_forward_failed"
+        if not _update_boundary_matches(git_cmd, cwd, branch, new_origin_sha):
+            return False, "fast_forward_postcondition_failed"
+        return True, "fast_forwarded"
+    if head_to_target != 1:
+        return False, "history_unknown"
+
+    if remote_history != _REMOTE_ADVANCED or local_history != _LOCAL_PRESENT:
+        return False, "history_unknown"
+
+    recovery_ref = _create_update_recovery_ref(git_cmd, cwd, local_head_sha)
+    if recovery_ref is None:
+        return False, "recovery_ref_failed"
+    if _resolve_commit(git_cmd, cwd, recovery_ref) != local_head_sha:
+        return False, "recovery_ref_changed"
+    if not _update_boundary_matches(git_cmd, cwd, branch, local_head_sha):
+        return False, "wrong_branch"
+    try:
+        merged = subprocess.run(
+            git_cmd + ["merge", "--no-edit", new_origin_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False, "merge_failed"
+    if merged.returncode == 0:
+        merged_head = _resolve_commit(git_cmd, cwd, "HEAD")
+        merged_parents = (
+            _commit_parents(git_cmd, cwd, merged_head)
+            if merged_head is not None
+            else None
+        )
+        if (
+            merged_head is None
+            or _current_attached_branch(git_cmd, cwd) != branch
+            or merged_parents != [local_head_sha, new_origin_sha]
+            or _resolve_commit(git_cmd, cwd, recovery_ref) != local_head_sha
+            or not _update_boundary_matches(git_cmd, cwd, branch, merged_head)
+        ):
+            return False, "merge_postcondition_failed"
+        return True, f"merged:{recovery_ref}"
+    if not _abort_in_progress_merge(git_cmd, cwd, branch, local_head_sha):
+        return False, "merge_abort_failed"
+    if _resolve_commit(git_cmd, cwd, recovery_ref) != local_head_sha:
+        return False, "merge_abort_failed"
+    return False, f"merge_conflict:{recovery_ref}"
 
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
@@ -355,9 +1194,19 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
     if not pre_pull_sha:
         return False
     try:
-        result = subprocess.run(
+        committed = subprocess.run(
             git_cmd
             + ["diff", "--name-only", f"{pre_pull_sha}..HEAD", "--"]
+            + list(_INSTALL_DEFINING_FILES),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        local = subprocess.run(
+            git_cmd
+            + ["status", "--porcelain=v1", "--untracked-files=all", "--"]
             + list(_INSTALL_DEFINING_FILES),
             cwd=cwd,
             capture_output=True,
@@ -365,9 +1214,96 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
         )
     except OSError:
         return False
-    if result.returncode != 0:
+    if committed.returncode != 0 or local.returncode != 0:
         return False
-    return not result.stdout.strip()
+    # Canary mode reapplies the transaction stash before this predicate. A
+    # local pyproject/lock/setup edit is therefore just as install-defining as
+    # a pulled commit; ignoring it would health-gate source against the old
+    # dependency graph. Porcelain status also catches staged and untracked
+    # install manifests.
+    return not committed.stdout.strip() and not local.stdout.strip()
+
+
+def _prepare_rollout_target_venv(
+    project_root: Path, venv_name: str
+) -> tuple[Path, Path]:
+    """Return a transaction-owned venv, creating an absent snapshot target.
+
+    A checkpoint may legitimately record that no project venv existed. The
+    candidate install must still never fall through uv's site-packages path
+    and mutate the external coordinator interpreter. Creating the recorded
+    target after checkpoint admission makes the new tree rollback-owned.
+    """
+
+    if venv_name not in {"venv", ".venv"}:
+        raise RuntimeError(f"checkpoint selected an invalid venv name: {venv_name!r}")
+    target = Path(project_root) / venv_name
+    from hermes_cli.update_rollout import validate_real_venv_root
+
+    target_exists = validate_real_venv_root(target, allow_missing=True)
+    if not target_exists:
+        env = dict(os.environ)
+        env.pop("PYTHONHOME", None)
+        env.pop("PYTHONPATH", None)
+        subprocess.run(
+            [sys.executable, "-I", "-m", "venv", str(target)],
+            cwd=project_root,
+            env=env,
+            check=True,
+        )
+    validate_real_venv_root(target)
+    interpreter = venv_python_path(target, windows=_m()._is_windows())
+    if not interpreter.is_file():
+        raise RuntimeError(f"rollout target venv has no interpreter: {interpreter}")
+    return target, interpreter
+
+
+def _should_prompt_for_stash_restore(
+    *,
+    has_stash: bool,
+    assume_yes: bool,
+    gateway_mode: bool,
+    rollout_enabled: bool,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> bool:
+    """Whether the legacy post-stash question can still be answered."""
+
+    if rollout_enabled and gateway_mode:
+        # The correlation-scoped bot confirmation is the only interactive
+        # boundary. Once approved, preapply quiescence stops the very gateway
+        # that relays prompt IPC, so the default stash policy must proceed
+        # deterministically (apply-and-retain unless keep/discard was chosen).
+        return False
+    return bool(
+        has_stash and not assume_yes and (gateway_mode or (stdin_tty and stdout_tty))
+    )
+
+
+def _rollout_dependency_install_is_current(
+    git_install_is_current: bool,
+    checkpoint_metadata: Optional[dict],
+    *,
+    project_root: Path,
+) -> bool:
+    """Require both current manifests and a healthy checkpoint-selected venv."""
+
+    dependency_state = (checkpoint_metadata or {}).get("dependency_state") or {}
+    if not git_install_is_current or not dependency_state.get("venv_present"):
+        return False
+    venv_name = str((checkpoint_metadata or {}).get("venv_name") or "venv")
+    if venv_name not in {"venv", ".venv"}:
+        return False
+    healthy, detail = _venv_core_imports_healthy(
+        Path(project_root) / venv_name,
+        fail_closed=True,
+    )
+    if not healthy:
+        logger.info(
+            "Rollout target venv requires dependency repair: %s",
+            detail or "core import probe did not pass",
+        )
+    return healthy
 
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
@@ -423,7 +1359,9 @@ _UPDATE_CRITICAL_MODULES = (
 )
 
 
-def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
+def _validate_critical_modules_import(
+    root, *, venv_name: str | None = None
+) -> tuple[bool, str | None, str | None]:
     """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
 
     ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
@@ -472,19 +1410,39 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
         "raise SystemExit(0)\n"
         % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
     )
+    from hermes_cli.update_rollout import validate_real_venv_root
+
     try:
         interpreter = sys.executable
-        try:
-            venv_python = venv_python_path(
-                Path(root) / "venv", windows=_m()._is_windows()
+        names = (venv_name,) if venv_name else ("venv", ".venv")
+        for name in names:
+            candidate = Path(root) / str(name)
+            try:
+                candidate_exists = validate_real_venv_root(
+                    candidate, allow_missing=True
+                )
+            except Exception as exc:
+                return False, str(candidate), str(exc)
+            if candidate_exists:
+                venv_python = venv_python_path(
+                    candidate, windows=_m()._is_windows()
+                )
+                if venv_python.exists():
+                    interpreter = str(venv_python)
+                    break
+        probe_env = dict(os.environ)
+        source_root = Path(__file__).resolve().parent.parent
+        probe_paths = [str(Path(root)), str(source_root)]
+        inherited_paths = probe_env.get("PYTHONPATH", "")
+        if inherited_paths:
+            probe_paths.extend(
+                item for item in inherited_paths.split(os.pathsep) if item
             )
-            if venv_python.exists():
-                interpreter = str(venv_python)
-        except Exception:
-            pass  # fall back to the running interpreter
+        probe_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(probe_paths))
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
+            env=probe_env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -501,7 +1459,14 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
         return False, module, detail
     return True, None, None
 
-def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
+def _gateway_prompt(
+    prompt_text: str,
+    default: str = "",
+    timeout: float = 300.0,
+    *,
+    kind: str = "prompt",
+    context: dict | None = None,
+) -> str:
     """File-based IPC prompt for gateway mode.
 
     Writes a prompt marker file so the gateway can forward the question to the
@@ -526,7 +1491,11 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
         "prompt": prompt_text,
         "default": default,
         "id": str(_uuid.uuid4()),
+        "kind": kind,
+        "context": dict(context or {}),
     }
+    if context and context.get("correlation_id"):
+        payload["correlation_id"] = context["correlation_id"]
     tmp = prompt_path.with_suffix(".tmp")
     tmp.write_text(_json.dumps(payload), encoding="utf-8")
     tmp.replace(prompt_path)
@@ -536,8 +1505,37 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     while _time.monotonic() < deadline:
         if response_path.exists():
             try:
-                answer = response_path.read_text(encoding="utf-8").strip()
+                raw_answer = response_path.read_text(encoding="utf-8").strip()
                 response_path.unlink(missing_ok=True)
+                if kind == "update_confirmation":
+                    # Mutation authorization is correlation-bound. A stale raw
+                    # response (or a callback for another prompt/profile) must
+                    # never approve this invocation.
+                    response = _json.loads(raw_answer)
+                    if not isinstance(response, dict):
+                        continue
+                    if str(response.get("id") or "") != payload["id"]:
+                        continue
+                    expected_correlation = str(
+                        payload.get("correlation_id") or ""
+                    )
+                    if str(response.get("correlation_id") or "") != expected_correlation:
+                        continue
+                    answer = str(response.get("answer") or "").strip()
+                else:
+                    # Existing config/stash prompts retain raw-response
+                    # compatibility. Structured responses are accepted when
+                    # adapters choose to use the stronger protocol.
+                    try:
+                        response = _json.loads(raw_answer)
+                    except ValueError:
+                        response = None
+                    if isinstance(response, dict):
+                        if response.get("id") not in (None, payload["id"]):
+                            continue
+                        answer = str(response.get("answer") or "").strip()
+                    else:
+                        answer = raw_answer
                 prompt_path.unlink(missing_ok=True)
                 return answer if answer else default
             except (OSError, ValueError):
@@ -549,6 +1547,1378 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     response_path.unlink(missing_ok=True)
     print(f"  (no response after {int(timeout)}s, using default: {default!r})")
     return default
+
+
+_UPDATE_CORRELATION_ENV = "HERMES_UPDATE_CORRELATION_ID"
+_UPDATE_TAURI_OUTCOME_ENV = "HERMES_UPDATE_TAURI_OUTCOME_PATH"
+_UPDATE_TAURI_READY_ENV = "HERMES_UPDATE_TAURI_READY_PATH"
+_UPDATE_INDEPENDENT_UNIT_ENV = "HERMES_UPDATE_INDEPENDENT_UNIT"
+_UPDATE_INDEPENDENT_LAUNCHD_ENV = "HERMES_UPDATE_INDEPENDENT_LAUNCHD"
+_UPDATE_WINDOWS_DETACHED_ENV = "HERMES_UPDATE_WINDOWS_DETACHED"
+_UPDATE_WORKER_READY_ENV = "HERMES_UPDATE_WORKER_READY"
+_UPDATE_OUTPUT_ENV = "HERMES_UPDATE_OUTPUT_PATH"
+_UPDATE_ORIGIN_PROFILE_ENV = "HERMES_UPDATE_ORIGIN_PROFILE"
+_UPDATE_ORIGIN_HOME_ENV = "HERMES_UPDATE_ORIGIN_HOME"
+UPDATE_EXIT_INDEPENDENT_HANDOFF = 75
+_UPDATE_CORRELATION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def _gateway_update_status_path() -> Optional[Path]:
+    """Return this invocation's bot/desktop terminal-status path.
+
+    Bot launches always carry a correlation id and therefore get a private
+    marker.  The generic filename remains only for legacy/manual callers that
+    do not carry correlation identity.  A malformed non-empty identity fails
+    closed instead of being interpolated into a path or falling back to the
+    uncorrelated compatibility marker.
+    """
+
+    home = get_hermes_home().resolve(strict=False)
+    correlation_id = os.environ.get(_UPDATE_CORRELATION_ENV, "").strip()
+    if not correlation_id:
+        return home / ".update_exit_code"
+    if _UPDATE_CORRELATION_RE.fullmatch(correlation_id) is None:
+        return None
+    return home / f".update_exit_code.{correlation_id}"
+
+
+def _atomic_write_update_text(path: Path, payload: str) -> None:
+    """Publish a complete update IPC value with same-directory replace."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        temp.unlink(missing_ok=True)
+
+
+def _write_gateway_update_status(code: int) -> None:
+    """Atomically write this invocation's stable integer outcome marker."""
+
+    try:
+        path = _gateway_update_status_path()
+        if path is not None:
+            _atomic_write_update_text(path, str(int(code)))
+    except (OSError, ValueError):
+        pass
+
+
+def _publish_gateway_update_handoff(
+    correlation_id: str,
+    *,
+    kind: str,
+    worker: str,
+) -> Path:
+    """Persist an independently-supervised worker identity for bot recovery."""
+
+    normalized = str(correlation_id or "").strip()
+    if _UPDATE_CORRELATION_RE.fullmatch(normalized) is None:
+        raise ValueError("invalid update handoff correlation")
+    if kind not in {"systemd", "launchd"} or not str(worker).strip():
+        raise ValueError("invalid update handoff worker identity")
+    path = get_hermes_home().resolve(strict=False) / f".update_handoff.{normalized}.json"
+    _atomic_write_update_text(
+        path,
+        json.dumps(
+            {
+                "correlation_id": normalized,
+                "kind": kind,
+                "worker": str(worker).strip(),
+            },
+            separators=(",", ":"),
+        ),
+    )
+    return path
+
+
+def _write_tauri_coordinator_outcome(code: int) -> None:
+    """Publish a copied coordinator's UUID-bound command-boundary outcome."""
+
+    # The Tauri updater cannot wait in the live project venv on Windows. Its
+    # copied coordinator therefore publishes the same terminal code to a
+    # one-run UUID path, binding exit 75 to the exact child Rust is awaiting.
+    # This is deliberately separate from optimistic compatibility markers:
+    # only cmd_update's outer boundary may call it.
+    if not os.environ.get("HERMES_UPDATE_COORDINATOR_SNAPSHOT", "").strip():
+        return
+    home = get_hermes_home().resolve(strict=False)
+    correlation_id = os.environ.get(_UPDATE_CORRELATION_ENV, "").strip().lower()
+    outcome_raw = os.environ.get(_UPDATE_TAURI_OUTCOME_ENV, "").strip()
+    if not correlation_id or not outcome_raw:
+        return
+    try:
+        import uuid as _uuid
+
+        if str(_uuid.UUID(correlation_id)) != correlation_id:
+            return
+        expected = home / f".update_exit_code.{correlation_id}"
+        supplied = Path(outcome_raw).expanduser().resolve(strict=False)
+        if supplied != expected:
+            return
+        _atomic_write_update_text(expected, str(int(code)))
+    except (OSError, ValueError):
+        pass
+
+
+def _new_update_context(*, gateway_mode: bool) -> tuple[str, dict]:
+    """Return correlation + origin facts shared by prompt and receipt."""
+    import uuid as _uuid
+
+    from hermes_cli.process_identity import install_id
+
+    correlation_id = (
+        os.environ.get(_UPDATE_CORRELATION_ENV, "").strip()
+        or str(_uuid.uuid4())
+    )
+    control_home = get_hermes_home().resolve()
+    origin_profile = os.environ.get(_UPDATE_ORIGIN_PROFILE_ENV, "").strip().lower()
+    origin_home_raw = os.environ.get(_UPDATE_ORIGIN_HOME_ENV, "").strip()
+    if gateway_mode and bool(origin_profile) != bool(origin_home_raw):
+        raise ValueError(
+            "gateway update origin requires both profile and profile home"
+        )
+    from hermes_cli.profiles import (
+        _get_default_hermes_home,
+        get_profile_dir,
+        normalize_profile_name,
+        validate_profile_name,
+    )
+
+    origin_home = Path(origin_home_raw).resolve() if origin_home_raw else control_home
+    if not origin_profile:
+        try:
+            root = _get_default_hermes_home().resolve()
+            if origin_home == root:
+                origin_profile = "default"
+            elif origin_home.parent == root / "profiles":
+                origin_profile = origin_home.name
+        except OSError:
+            origin_profile = ""
+    if origin_profile:
+        origin_profile = normalize_profile_name(origin_profile)
+        validate_profile_name(origin_profile)
+    if gateway_mode:
+        if not origin_profile:
+            raise ValueError("gateway update origin profile could not be resolved")
+        expected_home = get_profile_dir(origin_profile).resolve()
+        if origin_home != expected_home:
+            raise ValueError(
+                "gateway update origin profile/home mismatch: "
+                f"{origin_profile} resolves to {expected_home}, not {origin_home}"
+            )
+    origin = {
+        "surface": "gateway" if gateway_mode else "terminal",
+        "origin_profile": origin_profile or None,
+        "profile_home": str(origin_home),
+        "control_home": str(control_home),
+        "install_root": str(Path(_m().PROJECT_ROOT).resolve()),
+        "install_id": install_id(Path(_m().PROJECT_ROOT)),
+    }
+    try:
+        from hermes_cli.update_receipt import record_update_context
+
+        record_update_context(correlation_id, **origin)
+    except Exception:
+        pass
+    return correlation_id, origin
+
+
+def _verified_independent_update_unit() -> bool:
+    """Prove this worker runs in its dedicated transient systemd unit."""
+    unit = os.environ.get(_UPDATE_INDEPENDENT_UNIT_ENV, "").strip()
+    if not unit or not sys.platform.startswith("linux"):
+        return False
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return unit in cgroup and "hermes-gateway" not in cgroup
+
+
+def _launchd_user_domains() -> tuple[str, ...]:
+    """Return launchd's user domains without importing a Windows-only footgun.
+
+    ``os.getuid`` is not defined on Windows.  These callers are Darwin-only in
+    normal operation, but keeping the platform guard here also makes direct
+    calls from tests and recovery paths fail closed.
+    """
+
+    if sys.platform != "darwin":
+        return ()
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        return ()
+    try:
+        uid = int(getuid())
+    except (OSError, TypeError, ValueError):
+        return ()
+    return (f"gui/{uid}", f"user/{uid}")
+
+
+def _launchd_job_has_pid(label: str, pid: int) -> bool:
+    """Check both launchd user domains for one exact transient job PID."""
+
+    for domain in _launchd_user_domains():
+        try:
+            shown = subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if shown.returncode != 0:
+            continue
+        for line in shown.stdout.splitlines():
+            key, separator, value = line.strip().partition("=")
+            if separator and key.strip() == "pid":
+                try:
+                    if int(value.strip()) == pid:
+                        return True
+                except ValueError:
+                    continue
+    return False
+
+
+def _verified_independent_launchd_worker() -> bool:
+    """Prove this process is the PID owned by its transient launchd job."""
+
+    label = os.environ.get(_UPDATE_INDEPENDENT_LAUNCHD_ENV, "").strip()
+    if not label or sys.platform != "darwin":
+        return False
+    prefix = "ai.hermes.update."
+    suffix = label.removeprefix(prefix)
+    if (
+        not label.startswith(prefix)
+        or not suffix
+        or len(suffix) > 24
+        or not suffix.isalnum()
+    ):
+        return False
+    return _launchd_job_has_pid(label, os.getpid())
+
+
+def _windows_process_outside_job() -> bool:
+    """Return True only when Win32 proves this process escaped every job."""
+
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.argtypes = []
+        get_current_process.restype = wintypes.HANDLE
+        is_process_in_job = kernel32.IsProcessInJob
+        is_process_in_job.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        is_process_in_job.restype = wintypes.BOOL
+        in_job = wintypes.BOOL()
+        if not is_process_in_job(get_current_process(), None, ctypes.byref(in_job)):
+            return False
+        return not bool(in_job.value)
+    except Exception:
+        return False
+
+
+def _verified_independent_windows_worker() -> bool:
+    """Bind the slash launcher's breakaway proof to this update request."""
+
+    if sys.platform != "win32":
+        return False
+    correlation_id = os.environ.get(_UPDATE_CORRELATION_ENV, "").strip()
+    detached_id = os.environ.get(_UPDATE_WINDOWS_DETACHED_ENV, "").strip()
+    return bool(
+        correlation_id
+        and detached_id == correlation_id
+        and _windows_process_outside_job()
+    )
+
+
+def _validated_handoff_correlation() -> str:
+    """Return the normalized handoff identity or reject malformed input."""
+
+    correlation_id = os.environ.get(_UPDATE_CORRELATION_ENV, "").strip()
+    if (
+        correlation_id
+        and _UPDATE_CORRELATION_RE.fullmatch(correlation_id) is None
+    ):
+        raise RuntimeError("update handoff correlation id is malformed")
+    return correlation_id
+
+
+def _verified_independent_tauri_parent(correlation_id: str) -> bool:
+    """Prove this command is the direct child of the lock-owning Tauri updater.
+
+    Tauri already sits outside every gateway supervisor and waits for this
+    command's terminal result. Re-handing the transaction to systemd/launchd
+    would sever Rust's exact-child marker/outcome contract and make it
+    misinterpret exit 75 as a Windows coordinator takeover. The bypass is
+    therefore granted only when both UUID-bound Tauri paths, the direct parent
+    PID, and the live install-wide marker all name the same orchestration.
+    """
+
+    ready_raw = os.environ.get(_UPDATE_TAURI_READY_ENV, "").strip()
+    outcome_raw = os.environ.get(_UPDATE_TAURI_OUTCOME_ENV, "").strip()
+    if not ready_raw and not outcome_raw:
+        return False
+    if not ready_raw or not outcome_raw or not correlation_id:
+        raise RuntimeError("Tauri updater independence proof is incomplete")
+
+    try:
+        import uuid as _uuid
+
+        if str(_uuid.UUID(correlation_id)) != correlation_id:
+            raise ValueError("correlation is not a canonical UUID")
+        home = get_hermes_home().resolve(strict=False)
+        ready = Path(ready_raw).expanduser().resolve(strict=False)
+        outcome = Path(outcome_raw).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("Tauri updater independence proof is malformed") from exc
+
+    expected_ready = home / f".update_coordinator_ready.{correlation_id}"
+    expected_outcome = home / f".update_exit_code.{correlation_id}"
+    if ready != expected_ready or outcome != expected_outcome:
+        raise RuntimeError(
+            "Tauri updater independence proof is outside the control profile"
+        )
+
+    from hermes_cli.update_lock import (
+        HANDOFF_PID_ENV,
+        read_live_update,
+        update_marker_path,
+    )
+
+    parent_pid = os.getppid()
+    if os.environ.get(HANDOFF_PID_ENV, "") != str(parent_pid):
+        raise RuntimeError(
+            "Tauri updater independence proof does not name the direct parent"
+        )
+    handoff_pid = parent_pid
+    holder = read_live_update(path=update_marker_path())
+    if holder is None or holder.pid != handoff_pid:
+        raise RuntimeError(
+            "Tauri updater independence proof does not own the live update marker"
+        )
+    return True
+
+
+def _manual_update_command() -> str:
+    """Exact current invocation without the gateway-only transport flag."""
+    argv = [part for part in sys.argv[1:] if part != "--gateway"]
+    return " ".join(["hermes", *(shlex.quote(part) for part in argv)])
+
+
+def _validated_gateway_update_output_path() -> Optional[Path]:
+    output_raw = os.environ.get(_UPDATE_OUTPUT_ENV, "").strip()
+    if not output_raw:
+        return None
+    output_path = Path(output_raw).expanduser().resolve(strict=False)
+    control_home = get_hermes_home().resolve(strict=False)
+    if output_path.parent != control_home or output_path.name != ".update_output.txt":
+        raise RuntimeError(
+            "refusing independent worker output outside the control profile"
+        )
+    return output_path
+
+
+def _stop_transient_launchd_worker(label: str) -> None:
+    """Best-effort removal for an uncommitted launchd handoff."""
+
+    commands = [
+        ["launchctl", "bootout", f"{domain}/{label}"]
+        for domain in _launchd_user_domains()
+    ]
+    commands.append(["launchctl", "remove", label])
+    for command in commands:
+        try:
+            removed = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except BaseException:
+            continue
+        if removed.returncode == 0:
+            return
+
+
+def _launchd_rollout_worker_source() -> str:
+    """Return a launchctl-submit wrapper that can never failure-respawn.
+
+    ``launchctl submit`` keeps a job alive when its program fails. The wrapper
+    therefore owns the command boundary: it records Hermes' real outcome but
+    always reports zero to launchd. If launchd restarts it after SIGKILL, the
+    already-consumed env file is treated as a terminal failure and the retry
+    also exits zero instead of entering a permanent crash loop.
+    """
+
+    return textwrap.dedent(
+        r"""
+        import json
+        import os
+        import subprocess
+        import sys
+        import time
+        import traceback
+        from pathlib import Path
+
+        env_path = Path(sys.argv.pop(1)).resolve(strict=False)
+        launchd_label = sys.argv.pop(1)
+        home = env_path.parent
+        correlation_id = env_path.name.removeprefix(".update_worker_env.")
+        expected_label = "ai.hermes.update." + correlation_id.replace("-", "")[:24]
+        label_is_valid = launchd_label == expected_label
+        marker = home / (".update_exit_code." + correlation_id)
+
+        def snapshot():
+            try:
+                return (marker.stat().st_mtime_ns, marker.read_text(encoding="utf-8").strip())
+            except OSError:
+                return None
+
+        before = snapshot()
+        missing_env = not env_path.is_file()
+        rc = 1
+        try:
+            if not label_is_valid:
+                raise ValueError("launchd worker label does not match its correlation")
+            if missing_env:
+                raise FileNotFoundError(f"launchd worker environment is gone: {env_path}")
+            restored = json.loads(env_path.read_text(encoding="utf-8"))
+            env_path.unlink()
+            os.environ.update({str(key): str(value) for key, value in restored.items()})
+            os.chdir(os.environ.pop("HERMES_UPDATE_WORKING_DIRECTORY"))
+            from hermes_cli.main import main
+
+            ready = Path(os.environ["HERMES_UPDATE_WORKER_READY"])
+            stage = ready.with_name(ready.name + "." + str(os.getpid()) + ".tmp")
+            stage.write_text(
+                os.environ["HERMES_UPDATE_CORRELATION_ID"] + "\n" + str(os.getpid()),
+                encoding="utf-8",
+            )
+            os.replace(stage, ready)
+            time.sleep(float(os.environ.get("HERMES_UPDATE_WORKER_DELAY", "2.5")))
+            try:
+                main()
+            except SystemExit as exc:
+                rc = int(exc.code or 0) if isinstance(exc.code, (int, type(None))) else 1
+            else:
+                rc = 0
+        except BaseException:
+            rc = 1
+            try:
+                traceback.print_exc()
+            except BaseException:
+                pass
+        finally:
+            # Exit 75 is an acknowledged nested handoff, not a terminal
+            # outcome. Every other path owns a stable bot-watcher marker.
+            if rc != 75:
+                try:
+                    current = snapshot()
+                    preserve = missing_env and current is not None
+                    if rc == 0 and current is not None and current != before:
+                        try:
+                            preserve = int(current[1]) != 0
+                        except ValueError:
+                            preserve = False
+                    if not preserve:
+                        stage = marker.with_name(marker.name + "." + str(os.getpid()) + ".tmp")
+                        stage.write_text(str(int(rc)), encoding="utf-8")
+                        os.replace(stage, marker)
+                except OSError:
+                    pass
+
+        # The exact label remains available after the one-shot environment
+        # file is consumed. Deregister only the correlation-derived job, and
+        # do it after publishing Hermes' truthful terminal status.
+        if label_is_valid:
+            try:
+                subprocess.run(
+                    ["launchctl", "remove", launchd_label],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except BaseException:
+                pass
+
+        # launchctl-submit has KeepAlive-on-failure semantics. Hermes' real
+        # status is in the marker above; launchd must always observe success.
+        raise SystemExit(0)
+        """
+    ).strip()
+
+
+def _launchd_rollout_worker_environment(
+    *, home: Path, label: str, ready_path: Path, correlation_id: str
+) -> dict[str, str]:
+    """Minimal update environment; never persist provider/API credentials."""
+
+    safe_names = {
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "PATH",
+        "SSH_AUTH_SOCK",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TMPDIR",
+        "USER",
+    }
+    worker_env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in safe_names or name.startswith("LC_")
+    }
+    for name in (
+        _UPDATE_ORIGIN_PROFILE_ENV,
+        _UPDATE_ORIGIN_HOME_ENV,
+        _UPDATE_OUTPUT_ENV,
+    ):
+        value = os.environ.get(name)
+        if value:
+            worker_env[name] = value
+    worker_env.update({
+        "HERMES_HOME": str(home),
+        _UPDATE_CORRELATION_ENV: correlation_id,
+        _UPDATE_INDEPENDENT_LAUNCHD_ENV: label,
+        _UPDATE_WORKER_READY_ENV: str(ready_path),
+        "HERMES_UPDATE_WORKING_DIRECTORY": str(Path(_m().PROJECT_ROOT).resolve()),
+        "PYTHONUNBUFFERED": "1",
+    })
+    return worker_env
+
+
+def _handoff_launchd_rollout_worker(correlation_id: str) -> bool:
+    """Submit a one-shot launchd job and prove its exact child PID is live."""
+
+    label = f"ai.hermes.update.{correlation_id.replace('-', '')[:24]}"
+    home = get_hermes_home().resolve(strict=False)
+    ready_path = home / f".update_worker_ready.{correlation_id}"
+    env_path = home / f".update_worker_env.{correlation_id}"
+    output_path = _validated_gateway_update_output_path()
+    for path in (ready_path, env_path):
+        path.unlink(missing_ok=True)
+    ready_path.touch(mode=0o600)
+
+    worker_env = _launchd_rollout_worker_environment(
+        home=home,
+        label=label,
+        ready_path=ready_path,
+        correlation_id=correlation_id,
+    )
+    stage = env_path.with_name(f".{env_path.name}.{os.getpid()}.tmp")
+    try:
+        stage.touch(mode=0o600, exist_ok=False)
+        stage.write_text(json.dumps(worker_env), encoding="utf-8")
+        stage.chmod(0o600)
+        stage.replace(env_path)
+    except BaseException:
+        for path in (ready_path, env_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            stage.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Restore the minimal invoking environment before importing Hermes, then
+    # publish correlation + PID atomically. The parent acknowledges only when
+    # launchctl reports that same PID under this unique job label.
+    worker = _launchd_rollout_worker_source()
+    output_args: list[str] = []
+    if output_path is not None:
+        output_args = ["-o", str(output_path), "-e", str(output_path)]
+    command = [
+        "launchctl",
+        "submit",
+        "-l",
+        label,
+        *output_args,
+        "--",
+        sys.executable,
+        "-c",
+        worker,
+        str(env_path),
+        label,
+        *sys.argv[1:],
+    ]
+    launched = False
+    committed = False
+    try:
+        try:
+            submitted = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                "could not create an independent launchd canary worker; run "
+                f"from a terminal instead: {_manual_update_command()} ({exc})"
+            ) from exc
+        if submitted.returncode != 0:
+            detail = (
+                submitted.stderr or submitted.stdout or "launchctl submit failed"
+            ).strip()
+            raise RuntimeError(
+                "could not create an independent launchd canary worker; run "
+                f"from a terminal instead: {_manual_update_command()} ({detail})"
+            )
+        launched = True
+        deadline = _time.monotonic() + 5.0
+        active = False
+        ready = False
+        while _time.monotonic() < deadline:
+            try:
+                ready_lines = ready_path.read_text(encoding="utf-8").splitlines()
+                worker_pid = int(ready_lines[1])
+                ready = ready_lines[0] == correlation_id
+            except (OSError, IndexError, ValueError):
+                worker_pid = -1
+                ready = False
+            active = worker_pid > 0 and _launchd_job_has_pid(label, worker_pid)
+            if active and ready:
+                break
+            _time.sleep(0.1)
+        if not (active and ready):
+            raise RuntimeError(
+                "independent launchd canary worker did not acknowledge "
+                f"readiness; run from a terminal instead: {_manual_update_command()}"
+            )
+        _publish_gateway_update_handoff(
+            correlation_id,
+            kind="launchd",
+            worker=label,
+        )
+        os.environ[_UPDATE_CORRELATION_ENV] = correlation_id
+        print(
+            f"→ Canary update handed off to independent launchd job {label} "
+            f"(correlation {correlation_id})"
+        )
+        committed = True
+        return True
+    finally:
+        for path in (ready_path, env_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if launched and not committed:
+            _stop_transient_launchd_worker(label)
+
+
+def _handoff_gateway_rollout_worker_if_needed(config) -> bool:
+    """Move a gateway-origin transaction out of the gateway's cgroup.
+
+    Returns True only after a transient worker is provably active; the caller
+    then returns so cmd_update releases its lock before the worker's delayed
+    entry. Manual gateways are safe only when the slash launcher made this
+    process its own session leader. Every unverifiable supervisor fails closed
+    before confirmation/checkpoint/mutation.
+    """
+    if not getattr(config, "enabled", False):
+        return False
+    # Validate caller-provided identity before it can be interpolated into any
+    # worker, readiness, or environment path. Reuse this stripped value for
+    # every platform branch below.
+    correlation_id = _validated_handoff_correlation()
+    # A copied Windows coordinator proves job breakaway separately and may no
+    # longer have the original Tauri process as its direct parent. Keep that
+    # exact proof first; every other Tauri claim must pass the strict parent,
+    # marker, and UUID-path checks.
+    if _verified_independent_windows_worker():
+        return False
+    if _verified_independent_tauri_parent(correlation_id):
+        return False
+    if (
+        _verified_independent_update_unit()
+        or _verified_independent_launchd_worker()
+    ):
+        return False
+
+    supervisor = None
+    try:
+        from gateway.control_socket import identify_gateway
+
+        identity = identify_gateway(get_hermes_home(), timeout=1.0)
+        if identity:
+            supervisor = str(identity.get("supervisor") or "").lower()
+    except Exception:
+        supervisor = None
+
+    if supervisor in {"manual", "external"}:
+        if sys.platform == "win32":
+            raise RuntimeError(
+                "canary update worker did not prove Windows job breakaway; "
+                f"run from a terminal instead: {_manual_update_command()}"
+            )
+        try:
+            detached = os.getsid(0) == os.getpid()
+        except (AttributeError, OSError):
+            detached = False
+        if detached:
+            return False
+        raise RuntimeError(
+            "canary update worker is not detached from the gateway; run from a "
+            f"terminal instead: {_manual_update_command()}"
+        )
+
+    if supervisor == "launchd" and sys.platform == "darwin":
+        import uuid as _uuid
+
+        correlation_id = correlation_id or str(_uuid.uuid4())
+        return _handoff_launchd_rollout_worker(correlation_id)
+
+    if supervisor != "systemd" or not sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "cannot prove an independently supervised canary update worker "
+            f"for gateway supervisor {supervisor or 'unknown'}; run from a "
+            f"terminal instead: {_manual_update_command()}"
+        )
+
+    import uuid as _uuid
+
+    correlation_id = correlation_id or str(_uuid.uuid4())
+    unit = f"hermes-update-{correlation_id.replace('-', '')[:20]}.service"
+    ready_path = get_hermes_home() / f".update_worker_ready.{correlation_id}"
+    ready_path.unlink(missing_ok=True)
+    # Import the command boundary before acknowledging readiness.  ActiveState
+    # alone only proves that systemd started *something*; a broken candidate
+    # import could otherwise make the gateway parent exit 75 with nobody left
+    # to publish a terminal receipt/marker.
+    worker = (
+        "import os,time; from pathlib import Path; "
+        "from hermes_cli.main import main; "
+        "p=Path(os.environ['HERMES_UPDATE_WORKER_READY']); "
+        "t=p.with_name(p.name+'.'+str(os.getpid())+'.tmp'); "
+        "t.write_text(os.environ['HERMES_UPDATE_CORRELATION_ID'], encoding='utf-8'); "
+        "os.replace(t,p); time.sleep(2.5); main()"
+    )
+    origin_env_args = [
+        f"--setenv={name}={os.environ[name]}"
+        for name in (_UPDATE_ORIGIN_PROFILE_ENV, _UPDATE_ORIGIN_HOME_ENV)
+        if os.environ.get(name)
+    ]
+    output_property_args: list[str] = []
+    output_path = _validated_gateway_update_output_path()
+    if output_path is not None:
+        output_property_args = [
+            f"--property=StandardOutput=append:{output_path}",
+            f"--property=StandardError=append:{output_path}",
+        ]
+    ready_path.touch(mode=0o600)
+    command = [
+        "systemd-run",
+        "--user",
+        f"--unit={unit.removesuffix('.service')}",
+        "--collect",
+        "--quiet",
+        "--property=Type=exec",
+        f"--working-directory={Path(_m().PROJECT_ROOT).resolve()}",
+        f"--setenv=HERMES_HOME={get_hermes_home().resolve()}",
+        f"--setenv={_UPDATE_CORRELATION_ENV}={correlation_id}",
+        f"--setenv={_UPDATE_INDEPENDENT_UNIT_ENV}={unit}",
+        f"--setenv={_UPDATE_WORKER_READY_ENV}={ready_path}",
+        *output_property_args,
+        *origin_env_args,
+        sys.executable,
+        "-c",
+        worker,
+        *sys.argv[1:],
+    ]
+    try:
+        launched = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except BaseException as exc:
+        try:
+            ready_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                capture_output=True,
+                check=False,
+            )
+        except BaseException:
+            pass
+        if isinstance(exc, (FileNotFoundError, subprocess.TimeoutExpired)):
+            raise RuntimeError(
+                "could not create an independent canary update unit; run from a "
+                f"terminal instead: {_manual_update_command()} ({exc})"
+            ) from exc
+        raise
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout or "systemd-run failed").strip()
+        try:
+            ready_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                capture_output=True,
+                check=False,
+            )
+        except BaseException:
+            pass
+        raise RuntimeError(
+            "could not create an independent canary update unit; run from a "
+            f"terminal instead: {_manual_update_command()} ({detail})"
+        )
+    active = False
+    ready = False
+    committed = False
+    try:
+        deadline = _time.monotonic() + 5.0
+        while _time.monotonic() < deadline:
+            shown = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "--property=ActiveState",
+                    "--value",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            active = shown.returncode == 0 and shown.stdout.strip() in {
+                "active",
+                "activating",
+            }
+            try:
+                ready = ready_path.read_text(encoding="utf-8").strip() == correlation_id
+            except OSError:
+                ready = False
+            if active and ready:
+                break
+            _time.sleep(0.1)
+        if not (active and ready):
+            raise RuntimeError(
+                "independent canary update worker did not acknowledge readiness; "
+                f"run from a terminal instead: {_manual_update_command()}"
+            )
+        _publish_gateway_update_handoff(
+            correlation_id,
+            kind="systemd",
+            worker=unit,
+        )
+        os.environ[_UPDATE_CORRELATION_ENV] = correlation_id
+        print(
+            f"→ Canary update handed off to independent unit {unit} "
+            f"(correlation {correlation_id})"
+        )
+        committed = True
+        return True
+    finally:
+        try:
+            ready_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if not committed:
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    capture_output=True,
+                    check=False,
+                )
+            except BaseException:
+                # Preserve the original handshake error/control-flow event.
+                pass
+
+
+def _confirm_gateway_transaction(context: dict) -> bool:
+    """Require one explicit bot confirmation for this exact invocation."""
+    from hermes_cli.update_rollout import format_confirmation
+
+    answer = _gateway_prompt(
+        format_confirmation(context),
+        "n",
+        kind="update_confirmation",
+        context=context,
+    )
+    approved = answer.strip().lower() in {"y", "yes", "approve", "approved"}
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "gateway_update_confirmation",
+            approved,
+            (
+                f"correlation_id={context.get('correlation_id')} "
+                f"profile={context.get('profile_home')} "
+                f"install_id={context.get('install_id')}"
+            ),
+        )
+    except Exception:
+        pass
+    return approved
+
+
+def _finish_deferred_rollout_stash(
+    *,
+    git_cmd: list[str],
+    stash_ref: str,
+    discard_local_changes: bool,
+    keep_stash: bool,
+    prompt_for_restore: bool,
+    gw_input_fn,
+    defer_drop: bool = False,
+) -> bool:
+    """Settle the updater's autostash only after rollout/rollback is stable."""
+    if discard_local_changes:
+        return bool(
+            _m()._discard_stashed_changes(git_cmd, _m().PROJECT_ROOT, stash_ref)
+        )
+    elif keep_stash:
+        _m()._park_stashed_changes(stash_ref)
+        return False
+    else:
+        return bool(
+            _m()._restore_stashed_changes(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                stash_ref,
+                prompt_user=prompt_for_restore,
+                input_fn=gw_input_fn,
+                drop_after=not defer_drop,
+                restore_index=True,
+            )
+        )
+
+
+def _recover_rollout_transaction(
+    checkpoint: Path,
+    plan,
+    *,
+    config,
+    project_root: Path,
+    reason: str,
+    apply_started: bool,
+    fleet_quiesced: bool,
+    after_restore=None,
+) -> dict:
+    """Restore mutated disk or restart a merely-quiesced rollout fleet.
+
+    HEAD equality alone is not a transaction boundary: dependency repair can
+    replace the venv and a frontend build can replace the dashboard without
+    moving Git. Conversely, an early refusal after the pre-apply drain may
+    have changed no disk state at all, but still owes every stopped profile a
+    restart. This helper makes that distinction once for SystemExit,
+    subprocess failures, and unexpected exceptions.
+    """
+    from hermes_cli.update_rollout import (
+        dependency_state_matches_checkpoint,
+        read_checkpoint,
+        restart_and_verify_fleet,
+        restore_and_verify_fleet,
+        web_dist_state_matches_checkpoint,
+    )
+
+    metadata = read_checkpoint(checkpoint)
+    pre_sha = str(metadata["pre_sha"])
+    current_sha = _capture_head_sha(["git"], project_root)
+    try:
+        dependencies_match = dependency_state_matches_checkpoint(
+            checkpoint, project_root
+        )
+    except Exception:
+        # An unreadable live dependency state is not proof that it is intact.
+        dependencies_match = False
+    try:
+        web_dist_matches = web_dist_state_matches_checkpoint(
+            checkpoint, project_root
+        )
+    except Exception:
+        # The generated dashboard is part of the same disk generation. An
+        # unreadable bundle is not proof that the transaction left it intact.
+        web_dist_matches = False
+
+    disk_mutated = bool(
+        apply_started
+        or current_sha != pre_sha
+        or not dependencies_match
+        or not web_dist_matches
+    )
+    if disk_mutated:
+        result = dict(
+            restore_and_verify_fleet(
+                checkpoint,
+                plan,
+                config=config,
+                project_root=project_root,
+                after_restore=after_restore,
+                transaction_owned_reset=True,
+            )
+        )
+        result.update({
+            "reason": reason,
+            "recovery_only": False,
+            "disk_mutated": True,
+        })
+        return result
+
+    if fleet_quiesced:
+        result = dict(
+            restart_and_verify_fleet(
+                plan,
+                expected_sha=pre_sha,
+                config=config,
+                project_root=project_root,
+            )
+        )
+        result.update({
+            "attempted": True,
+            "restore_attempted": False,
+            "restored": False,
+            "reason": reason,
+            "recovery_only": True,
+            "disk_mutated": False,
+        })
+        return result
+
+    return {
+        "attempted": False,
+        "restore_attempted": False,
+        "restored": False,
+        "verified": True,
+        "reason": reason,
+        "recovery_only": False,
+        "disk_mutated": False,
+    }
+
+
+def _scan_live_dashboards_for_rollback() -> list[tuple[int, str]]:
+    """Strictly enumerate dashboard/serve processes, failing closed."""
+    from hermes_cli.dashboard_procs import _scan_dashboard_processes
+    from hermes_cli.update_rollout import RolloutError
+
+    try:
+        return list(_scan_dashboard_processes(_raise_on_error=True))
+    except Exception as exc:
+        raise RolloutError(
+            f"could not prove dashboard/serve processes are absent: {exc}"
+        ) from exc
+
+
+def _assert_no_live_dashboard_for_rollback() -> None:
+    """Refuse a rollback that would split live Python from restored disk."""
+
+    from hermes_cli.update_rollout import RolloutError
+
+    matches = _scan_live_dashboards_for_rollback()
+    if not matches:
+        return
+
+    detail = "; ".join(
+        f"pid {pid}: {command[:240]}" for pid, command in matches[:5]
+    )
+    raise RolloutError(
+        "live dashboard/serve process blocks rollback; stop it and retry "
+        f"({detail})"
+    )
+
+
+def _stop_dashboards_started_during_rollback() -> None:
+    """Stop and verify processes that raced checkpoint restoration.
+
+    A process admitted before the restored tree was fully in place may have
+    imported candidate Python.  Once restore returns, stopping every such
+    straggler is safe; any dashboard launched after the final strict scan sees
+    only the restored generation.  Manual processes remain stopped rather
+    than being respawned across the verification boundary.
+    """
+    from hermes_cli.update_rollout import RolloutError
+
+    matches = _scan_live_dashboards_for_rollback()
+    if not matches:
+        return
+
+    try:
+        _m()._kill_stale_dashboard_processes(
+            reason="it started while a checkpoint was being restored",
+            restart_managed=False,
+        )
+    except Exception as exc:
+        raise RolloutError(
+            f"could not stop dashboard/serve process admitted during rollback: {exc}"
+        ) from exc
+
+    survivors = _scan_live_dashboards_for_rollback()
+    if not survivors:
+        return
+    detail = "; ".join(
+        f"pid {pid}: {command[:240]}" for pid, command in survivors[:5]
+    )
+    raise RolloutError(
+        "dashboard/serve process remained live after restored-disk quiescence "
+        f"({detail})"
+    )
+
+
+def _cmd_update_rollback(args, gateway_mode: bool) -> None:
+    """Restore an explicit checkpoint through the same rollout kernel."""
+    from hermes_cli.update_receipt import (
+        begin_update_receipt,
+        finalize_update_receipt,
+        record_canary,
+        record_checkpoint,
+        record_gateway_restart,
+        record_rollback,
+    )
+    from hermes_cli.update_rollout import (
+        RolloutError,
+        load_rollout_config,
+        plan_from_checkpoint,
+        quiesce_rollout_fleet,
+        read_checkpoint,
+        restart_and_verify_fleet,
+        resolve_checkpoint,
+        restore_checkpoint,
+        rollout_confirmation_context,
+        validate_rollout_coordinator,
+        validate_rollout_plan,
+    )
+
+    print("⚕ Rolling back Hermes Agent...")
+    print()
+    begin_update_receipt()
+    correlation_id, _origin = _new_update_context(gateway_mode=gateway_mode)
+    reference = getattr(args, "rollback", None) or "latest"
+    current_sha = ""
+    try:
+        checkpoint = resolve_checkpoint(reference, Path(_m().PROJECT_ROOT))
+        metadata = read_checkpoint(checkpoint)
+        config = load_rollout_config(metadata.get("rollout") or {})
+        from hermes_cli.update_inventory import collect_runtime_inventory
+
+        current_plan = collect_runtime_inventory()
+        plan = plan_from_checkpoint(metadata, current_plan)
+        validate_rollout_plan(plan, config)
+        validate_rollout_coordinator(Path(_m().PROJECT_ROOT))
+        _assert_no_live_dashboard_for_rollback()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        if dirty.stdout.strip():
+            raise RolloutError(
+                "working tree has local changes; stash or commit them before rollback"
+            )
+        current_sha = _capture_head_sha(["git"], _m().PROJECT_ROOT)
+        if not current_sha:
+            raise RolloutError("could not capture the current Git identity")
+        record_checkpoint(
+            id=metadata.get("id"),
+            path=str(checkpoint),
+            pre_sha=metadata.get("pre_sha"),
+            dependency_state=metadata.get("dependency_state"),
+            web_dist_state=metadata.get("web_dist_state"),
+            status="selected",
+        )
+    except Exception as exc:
+        print(f"✗ Rollback refused: {exc}")
+        record_rollback(
+            mode="explicit", attempted=False, restored=False, error=str(exc)
+        )
+        finalize_update_receipt("refused", stop_reason="rollback_preflight_refused")
+        if gateway_mode:
+            _write_gateway_update_status(2)
+        sys.exit(2)
+
+    context = rollout_confirmation_context(
+        action="rollback",
+        project_root=Path(_m().PROJECT_ROOT),
+        plan=plan,
+        config=config,
+        checkpoint=checkpoint,
+        correlation_id=correlation_id,
+        origin=_origin,
+    )
+    if gateway_mode and not _confirm_gateway_transaction(context):
+        print("UPDATE_CONFIRMATION_REFUSED: rollback requires explicit approval")
+        record_rollback(
+            mode="explicit", attempted=False, restored=False, refused=True
+        )
+        finalize_update_receipt("refused", stop_reason="gateway_confirmation_refused")
+        _write_gateway_update_status(2)
+        sys.exit(2)
+
+    restored = None
+    quiesce = None
+    runtime_result: dict = {}
+    try:
+        quiesce = quiesce_rollout_fleet(plan, config=config)
+        if not quiesce.get("ok", False):
+            raise RolloutError(
+                "could not quiesce the complete saved fleet before restoring disk"
+            )
+        # Close the scan-to-mutation window. A manually launched dashboard can
+        # appear after confirmation while gateways are draining; restoring
+        # under it would leave candidate Python serving the checkpoint bundle.
+        _assert_no_live_dashboard_for_rollback()
+        restored = restore_checkpoint(checkpoint, Path(_m().PROJECT_ROOT))
+        # A manual dashboard can still win while restore stages the venv.  It
+        # may have imported candidate modules, so stop it after the atomic
+        # swaps and prove the process class absent before any runtime restart.
+        _stop_dashboards_started_during_rollback()
+        print(
+            f"  ✓ Restored checkpoint {metadata['id']} at "
+            f"{str(metadata['pre_sha'])[:12]}"
+        )
+        # Runtime modules imported while inventorying belong to the generation
+        # just replaced. Recovery restarts must import the restored sources.
+        _purge_stale_hermes_modules()
+        runtime_result = restart_and_verify_fleet(
+            plan,
+            expected_sha=str(metadata["pre_sha"]),
+            config=config,
+            project_root=Path(_m().PROJECT_ROOT),
+        )
+        record_canary(
+            enabled=True,
+            status="healthy" if runtime_result.get("verified") else "failed",
+            **runtime_result,
+        )
+        record_rollback(
+            mode="explicit",
+            attempted=True,
+            restored=True,
+            verified=bool(runtime_result.get("verified")),
+            quiesce=quiesce,
+            checkpoint=restored,
+            restarted_profiles=runtime_result.get("restarted_profiles", []),
+            errors=runtime_result.get("errors", []),
+        )
+        record_gateway_restart(
+            restarted_services=runtime_result.get("restarted_services", []),
+            relaunched_profiles=runtime_result.get("relaunched_profiles", []),
+            externally_supervised_profiles=runtime_result.get(
+                "externally_supervised_profiles", []
+            ),
+            killed_pids=runtime_result.get("killed_pids", []),
+            incomplete=not bool(runtime_result.get("verified")),
+        )
+        if not runtime_result.get("verified"):
+            raise RolloutError(
+                "restored disk, but one or more saved gateway profiles failed verification"
+            )
+    except BaseException as exc:
+        recovery_error = None
+        if quiesce is not None and not runtime_result:
+            attempted_profiles = list(quiesce.get("attempted_profiles", [])) or None
+            try:
+                runtime_result = restart_and_verify_fleet(
+                    plan,
+                    expected_sha=(
+                        str(metadata["pre_sha"])
+                        if restored and restored.get("restored")
+                        else current_sha
+                    ),
+                    config=config,
+                    project_root=Path(_m().PROJECT_ROOT),
+                    profiles=attempted_profiles,
+                )
+            except Exception as restart_exc:
+                recovery_error = f"{type(restart_exc).__name__}: {restart_exc}"
+        elif quiesce is None and not runtime_result:
+            try:
+                # A BaseException can interrupt the quiesce loop before it
+                # returns structured progress. Treat every saved profile as
+                # ambiguous and restart/verify the full pre-rollback fleet.
+                runtime_result = restart_and_verify_fleet(
+                    plan,
+                    expected_sha=current_sha,
+                    config=config,
+                    project_root=Path(_m().PROJECT_ROOT),
+                )
+            except Exception as restart_exc:
+                recovery_error = f"{type(restart_exc).__name__}: {restart_exc}"
+        record_rollback(
+            mode="explicit",
+            attempted=True,
+            restored=bool(restored and restored.get("restored")),
+            verified=False,
+            quiesce=quiesce,
+            restarted_profiles=runtime_result.get("restarted_profiles", []),
+            errors=runtime_result.get("errors", []),
+            error=str(exc),
+            recovery_error=recovery_error,
+        )
+        print(f"✗ Rollback or runtime verification failed: {exc}")
+        finalize_update_receipt(
+            "failed",
+            stop_reason=(
+                "rollback_verification_failed"
+                if restored and restored.get("restored")
+                else "rollback_failed"
+            ),
+        )
+        if gateway_mode:
+            _write_gateway_update_status(1)
+        if isinstance(exc, Exception):
+            sys.exit(1)
+        raise
+
+    receipt_path = finalize_update_receipt("success")
+    if receipt_path is not None:
+        print(f"  Receipt: {receipt_path}")
+    print("✓ Rollback complete and canary health verified.")
+    if gateway_mode:
+        _write_gateway_update_status(0)
 
 def _npm_bin_exists(bin_dir: Path, name: str) -> bool:
     """True when an npm bin shim for *name* exists (POSIX or Windows)."""
@@ -857,7 +3227,10 @@ def _reload_process_scan_modules() -> None:
 
 
 def _finish_dashboard_update_cleanup(
-    node_failures: list[str], already_restarted_units: "set[str] | None" = None
+    node_failures: list[str],
+    already_restarted_units: "set[str] | None" = None,
+    *,
+    web_build_ok: bool = True,
 ) -> None:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
@@ -866,10 +3239,13 @@ def _finish_dashboard_update_cleanup(
     directly, so a Serve-only install's freshly restarted process isn't
     found and restarted a second time here (review on #83595).
     """
-    if node_failures:
+    if node_failures or not web_build_ok:
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
-        print("    Node.js dependency refresh did not complete.")
+        if node_failures:
+            print("    Node.js dependency refresh did not complete.")
+        else:
+            print("    web UI rebuild did not complete.")
         return
 
     # The scan path lazy-imports symbols from _subprocess_compat; make sure
@@ -1461,18 +3837,24 @@ def _update_complete_message(pre_version: str | None) -> str:
 def _print_update_summary(
     *,
     node_failures: list,
+    web_build_ok: bool = True,
     desktop_build_ok: bool,
     pre_update_version: str | None,
 ) -> None:
-    """Final update banner. A failed Desktop rebuild is non-fatal for the
-    Python side, but must not print ``✓ Update complete!`` (#88251)."""
+    """Final update banner for every post-apply build surface.
+
+    A failed web or Desktop rebuild must never print ``✓ Update complete!``:
+    the Python checkout may be current while the user-facing bundle is stale.
+    """
     print()
-    if node_failures or not desktop_build_ok:
+    if node_failures or not web_build_ok or not desktop_build_ok:
         parts = []
         if node_failures:
             parts.append(
                 f"Node.js dependencies for {', '.join(node_failures)} did not refresh"
             )
+        if not web_build_ok:
+            parts.append("the web dashboard bundle was not rebuilt")
         if not desktop_build_ok:
             parts.append(
                 "the desktop app was not rebuilt and is still on the previous build"
@@ -1481,6 +3863,11 @@ def _print_update_summary(
         if node_failures:
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
+        elif not web_build_ok:
+            print("  The running dashboard was left untouched to avoid replacing it")
+            print(
+                "  with a missing or stale bundle. Fix npm and re-run `hermes update`."
+            )
         if not desktop_build_ok:
             print("  Run `hermes desktop` to retry the desktop rebuild.")
     else:
@@ -1488,11 +3875,35 @@ def _print_update_summary(
 
 
 def _write_gateway_update_exit_code(ok: bool) -> None:
-    path = get_hermes_home() / ".update_exit_code"
+    _write_gateway_update_status(0 if ok else 1)
+
+
+def _build_web_ui_for_update() -> bool:
+    """Build the dashboard bundle and make the result receipt-visible.
+
+    Update call sites must use ``fatal=True``. In soft mode, a missing npm
+    runtime intentionally returns success after printing a warning, which is
+    appropriate for an ordinary CLI boot but would let ``hermes update`` claim
+    success while ``web_dist`` remains missing/stale (#82614).
+    """
+    ok = bool(
+        _m()._build_web_ui(
+            _m().PROJECT_ROOT / "web", fatal=True, require_fresh=True
+        )
+    )
+
     try:
-        path.write_text("0" if ok else "1", encoding="utf-8")
-    except OSError:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "web_ui_build",
+            ok,
+            "dashboard bundle ready" if ok else "dashboard bundle rebuild failed",
+        )
+    except Exception:
         pass
+
+    return ok
 
 
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
@@ -1501,7 +3912,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
 
-    Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
+    Returns ``False`` when any post-apply user-facing build failed.
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
@@ -1799,7 +4210,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         _m().sys.exit(1)
 
     node_failures = _update_node_dependencies()
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    web_build_ok = _build_web_ui_for_update()
     desktop_build_ok = _rebuild_desktop_after_update(
         _m().PROJECT_ROOT / "apps" / "desktop",
         had_desktop_app_before_update=had_desktop_app_before_update,
@@ -1907,6 +4318,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
 
     _print_update_summary(
         node_failures=node_failures,
+        web_build_ok=web_build_ok,
         desktop_build_ok=desktop_build_ok,
         pre_update_version=pre_update_version,
     )
@@ -1920,32 +4332,42 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         logger.debug("Curator recent-run notice failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
-    _finish_dashboard_update_cleanup(node_failures)
+    _finish_dashboard_update_cleanup(node_failures, web_build_ok=web_build_ok)
     try:
         from hermes_cli.update_receipt import finalize_update_receipt
 
         finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
+            "success"
+            if (desktop_build_ok and web_build_ok and not node_failures)
+            else "partial"
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return desktop_build_ok
+    return desktop_build_ok and web_build_ok and not node_failures
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+
+def _stash_local_changes_if_needed(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    on_prepared=None,
+    on_created=None,
+) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
         capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     if not status.stdout.strip():
         return None
 
-    # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
-    # git stash will fail with "needs merge / could not write index".  Clear the
-    # conflict state with `git reset` so the stash can proceed.  Working-tree
-    # changes are preserved; only the index conflict markers are dropped.
+    # An unmerged index cannot be represented losslessly by git stash. Refuse
+    # before changing it instead of flattening the user's conflict stages with
+    # a plain reset.
     unmerged = subprocess.run(
         git_cmd + ["ls-files", "--unmerged"],
         cwd=cwd,
@@ -1953,21 +4375,22 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         text=True, encoding="utf-8", errors="replace",
     )
     if unmerged.stdout.strip():
-        print("→ Clearing unmerged index entries from a previous conflict...")
-        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
+        prefix = "Canary update" if on_prepared is not None or on_created is not None else "Update"
+        print(f"✗ {prefix} refused: the Git index has unresolved conflicts.")
+        print("  Resolve or abort the merge/rebase, then re-run `hermes update`.")
+        raise RuntimeError("cannot transactionally stash an unmerged Git index")
 
     from datetime import datetime, timezone
+    import uuid as _uuid
 
-    stash_name = datetime.now(timezone.utc).strftime(
-        "hermes-update-autostash-%Y%m%d-%H%M%S"
+    transaction_id = _uuid.uuid4().hex
+    stash_name = (
+        datetime.now(timezone.utc).strftime("hermes-update-autostash-%Y%m%d-%H%M%S-")
+        + transaction_id
     )
+    if on_prepared is not None:
+        on_prepared(stash_name)
     print("→ Local changes detected — stashing before update...")
-    prev_stash = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
     push = subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
         cwd=cwd,
@@ -1976,27 +4399,60 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     )
     if push.stdout.strip():
         print(push.stdout.strip())
-    stash_probe = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = (
-        stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
-    )
+    # Never infer ownership from refs/stash: another process may push between
+    # our command and a top-of-stack probe. Resolve only the UUID-bearing
+    # message created for this transaction, wherever it sits in the stack.
+    stash_ref = _find_stash_by_transaction_marker(git_cmd, cwd, stash_name)
+    stash_created = stash_ref is not None
+    if push.returncode == 0 and not stash_created:
+        print("✗ Update stopped: the autostash journal could not be verified.")
+        print(f"  Recovery marker: {stash_name}")
+        print("  No checkout or update operation was attempted.")
+        raise RuntimeError("successful stash push has no verifiable transaction entry")
+    if stash_created:
+        stash_pin_ref = f"refs/hermes-update-stashes/{transaction_id}"
+        zero_oid = "0" * len(stash_ref)
+        pinned = subprocess.run(
+            git_cmd + ["update-ref", stash_pin_ref, stash_ref, zero_oid],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if (
+            pinned.returncode != 0
+            or _resolve_commit(git_cmd, cwd, stash_pin_ref) != stash_ref
+        ):
+            print("✗ Update stopped: the autostash recovery ref could not be pinned.")
+            print(f"  Stash commit: {stash_ref}")
+            raise RuntimeError("could not pin transaction autostash")
+    if stash_created and on_created is not None:
+        on_created(stash_ref)
 
     if push.returncode != 0:
         if stash_created:
             # git stash push exits non-zero when it saved everything but could
             # not delete some swept untracked files from the working tree
             # (e.g. a root-owned directory: "warning: failed to remove ...:
-            # Permission denied").  The stash entry is complete — the changes
-            # are safe — so this is not a failure.  Leave the undeletable
-            # files in place and continue the update.
+            # Permission denied"). Continue only when the tracked/index state
+            # is independently proven clean. A nonzero push can also leave
+            # tracked edits (including concurrent writes) behind; resetting
+            # those would turn a recoverable refusal into data loss.
             if push.stderr.strip():
                 print(push.stderr.strip())
+            if not _tracked_checkout_clean(git_cmd, cwd):
+                print(
+                    "✗ Update stopped: the failed autostash left tracked or "
+                    "index changes in the checkout."
+                )
+                print(f"  Recovery stash: {stash_ref}")
+                print("  HEAD, index, and working tree were not reset.")
+                _print_retained_stash_pin_guidance()
+                raise RuntimeError(
+                    "nonzero stash push left an unclean tracked checkout"
+                )
             print(
                 "  ⚠ Some untracked files could not be removed from the "
                 "working tree (permission denied)."
@@ -2004,15 +4460,6 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
             print(
                 "    They were still saved to the stash and were left in "
                 "place — the update will continue."
-            )
-            # A partially-failed stash push also aborts its working-tree
-            # cleanup for TRACKED modifications — they are saved in the stash
-            # but still dirty the tree, which would break the checkout/pull
-            # that follows. Safe to reset: everything is in the stash entry.
-            subprocess.run(
-                git_cmd + ["reset", "--hard", "HEAD"],
-                cwd=cwd,
-                capture_output=True,
             )
         else:
             # No stash entry was created: the changes were NOT saved.  This
@@ -2030,6 +4477,33 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
 
     return stash_ref
 
+
+def _find_stash_by_transaction_marker(
+    git_cmd: list[str], cwd: Path, marker: str
+) -> Optional[str]:
+    """Resolve the unique stash created by an interrupted rollout helper."""
+    if not marker:
+        return None
+    listed = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x09%gs"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "git stash list failed").strip()
+        raise RuntimeError(f"could not inspect transaction stash journal: {detail}")
+    for line in listed.stdout.splitlines():
+        stash_sha, separator, subject = line.partition("\t")
+        exact_message = subject == marker or (
+            ": " in subject and subject.rsplit(": ", 1)[1] == marker
+        )
+        if separator and exact_message and stash_sha.strip():
+            return stash_sha.strip()
+    return None
+
 def _resolve_stash_selector(
     git_cmd: list[str], cwd: Path, stash_ref: str
 ) -> Optional[str]:
@@ -2045,6 +4519,65 @@ def _resolve_stash_selector(
         if commit.strip() == stash_ref:
             return selector.strip()
     return None
+
+
+def _release_stash_recovery_pins(
+    git_cmd: list[str], cwd: Path, stash_ref: str
+) -> bool:
+    """CAS-delete only hidden transaction pins for an applied stash commit.
+
+    The user-visible ``refs/stash`` reflog is intentionally untouched because
+    Git can delete older entries only by a positional selector. UUID-scoped
+    ``refs/hermes-update-stashes/*`` are ordinary refs, so they can be matched
+    by exact object id and deleted with a generation lease without racing an
+    unrelated stash or later writer.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", stash_ref):
+        return False
+    try:
+        listed = subprocess.run(
+            git_cmd
+            + [
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                "refs/hermes-update-stashes/",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    if listed.returncode != 0:
+        return False
+    matching_refs: list[str] = []
+    for line in listed.stdout.splitlines():
+        refname, separator, object_name = line.partition("\x00")
+        if (
+            separator
+            and object_name.strip() == stash_ref
+            and refname.startswith("refs/hermes-update-stashes/")
+        ):
+            matching_refs.append(refname)
+    return all(
+        _delete_ref_if_exact(git_cmd, cwd, refname, stash_ref)
+        for refname in matching_refs
+    )
+
+
+def _print_retained_stash_pin_guidance() -> None:
+    print(
+        "  A durable recovery pin may remain under "
+        "refs/hermes-update-stashes/ until restoration is verified."
+    )
+    print(
+        "  Inspect pins with: git for-each-ref "
+        "refs/hermes-update-stashes/"
+    )
+
 
 def _print_stash_cleanup_guidance(
     stash_ref: str, stash_selector: Optional[str] = None
@@ -2089,7 +4622,8 @@ def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
             return False
     return saw_untracked_error
 
-def _park_stashed_changes(stash_ref: str) -> None:
+
+def _park_stashed_changes(stash_ref: str, *, reason: str = "--keep-stash") -> None:
     """Leave a pre-update autostash parked instead of re-applying it.
 
     Used by ``hermes update --keep-stash`` (the desktop updater's mode): the
@@ -2098,9 +4632,17 @@ def _park_stashed_changes(stash_ref: str) -> None:
     lost — the entry stays in ``git stash`` with printed recovery guidance.
     """
     print()
-    print("ℹ️  Local changes were stashed before updating and were NOT re-applied (--keep-stash).")
+    print(
+        "ℹ️  Local changes were stashed before updating and were NOT "
+        f"re-applied ({reason})."
+    )
     print(f"  Stash ref: {stash_ref}")
     print(f"  Restore manually with: git stash apply {stash_ref}")
+    _print_retained_stash_pin_guidance()
+
+
+class StashRestoreSafetyError(RuntimeError):
+    """A transaction stash could not be restored to a proven-safe state."""
 
 
 def _restore_stashed_changes(
@@ -2109,7 +4651,15 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    drop_after: bool = True,
+    restore_index: bool = False,
+    raise_on_unsafe: bool = False,
 ) -> bool:
+    def _unsafe(message: str) -> bool:
+        if raise_on_unsafe:
+            raise StashRestoreSafetyError(message)
+        return False
+
     if prompt_user:
         print()
         print("⚠ Local changes were stashed before updating.")
@@ -2134,23 +4684,50 @@ def _restore_stashed_changes(
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
             print(f"Restore manually with: git stash apply {stash_ref}")
+            _print_retained_stash_pin_guidance()
             return False
 
     print("→ Restoring local changes...")
-    restore = subprocess.run(
-        git_cmd + ["stash", "apply", stash_ref],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    if not _tracked_checkout_clean(git_cmd, cwd):
+        print(
+            "✗ Local changes were not re-applied because the tracked checkout "
+            "changed after the update."
+        )
+        print(f"  Your changes remain preserved in stash {stash_ref}.")
+        _print_retained_stash_pin_guidance()
+        return _unsafe("tracked checkout changed before stash restore")
+    apply_args = ["stash", "apply"]
+    if restore_index:
+        # Failure recovery returns to the exact pre-update commit, so Git can
+        # also restore the original staged/unstaged split instead of flattening
+        # every edit into the working tree.
+        apply_args.append("--index")
+    try:
+        restore = subprocess.run(
+            git_cmd + apply_args + [stash_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as restore_exc:
+        print(f"✗ Could not invoke Git to restore local changes: {restore_exc}")
+        print(f"  Your changes remain preserved in stash {stash_ref}.")
+        _print_retained_stash_pin_guidance()
+        return _unsafe("could not invoke Git for stash restore")
 
     # Check for unmerged (conflicted) files — can happen even when returncode is 0
-    unmerged = subprocess.run(
-        git_cmd + ["diff", "--name-only", "--diff-filter=U"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        unmerged = subprocess.run(
+            git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as verify_exc:
+        print(f"✗ Could not verify the restored checkout: {verify_exc}")
+        print(f"  Recovery stash {stash_ref} was retained; inspect git status.")
+        _print_retained_stash_pin_guidance()
+        return _unsafe("could not verify stash restore")
     has_conflicts = bool(unmerged.stdout.strip())
 
     if restore.returncode != 0 and not has_conflicts and (
@@ -2182,99 +4759,89 @@ def _restore_stashed_changes(
         print("\nYour stashed changes are preserved — nothing is lost.")
         print(f"  Stash ref: {stash_ref}")
 
-        # Always reset to clean state — leaving conflict markers in source
-        # files makes hermes completely unrunnable (SyntaxError on import).
-        # The user's changes are safe in the stash for manual recovery.
-        subprocess.run(
-            git_cmd + ["reset", "--hard", "HEAD"],
-            cwd=cwd,
-            capture_output=True,
+        # A stash apply is not atomic: Git may have restored non-conflicting
+        # paths before reporting a conflict. Never run reset/checkout here;
+        # that would erase the only visible copy of those partially-applied
+        # edits or a concurrent index writer. Keep both the conflict state and
+        # the durable stash, and make the update pipeline stop before any
+        # dependency/build stages touch this mixed generation.
+        print(
+            "The conflicted checkout was left intact for manual resolution; "
+            "no automatic reset was attempted."
         )
-        print("Working tree reset to clean state.")
         print(f"Restore your changes later with: git stash apply {stash_ref}")
-        # Don't sys.exit — the code update itself succeeded, only the stash
-        # restore had conflicts.  Let cmd_update continue with pip install,
-        # skill sync, and gateway restart.
-        return False
+        _print_retained_stash_pin_guidance()
+        return _unsafe("stash restore produced conflicts")
 
-    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
-    if stash_selector is None:
+    if not drop_after:
         print(
-            "⚠ Local changes were restored, but Hermes couldn't find the stash entry to drop."
+            "  Local changes applied; preserving the stash until health verification."
         )
-        print(
-            "  The stash was left in place. You can remove it manually after checking the result."
-        )
-        _print_stash_cleanup_guidance(stash_ref)
-    else:
-        drop = subprocess.run(
-            git_cmd + ["stash", "drop", stash_selector],
-            cwd=cwd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if drop.returncode != 0:
-            print(
-                "⚠ Local changes were restored, but Hermes couldn't drop the saved stash entry."
-            )
-            if drop.stdout.strip():
-                print(drop.stdout.strip())
-            if drop.stderr.strip():
-                print(drop.stderr.strip())
-            print(
-                "  The stash was left in place. You can remove it manually after checking the result."
-            )
-            _print_stash_cleanup_guidance(stash_ref, stash_selector)
+        _print_retained_stash_pin_guidance()
+        return True
 
     print("⚠ Local changes were restored on top of the updated codebase.")
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
+    if _release_stash_recovery_pins(git_cmd, cwd, stash_ref):
+        print(
+            "  Released the hidden transaction pin; the user-visible stash "
+            "entry was retained to avoid a reflog-selector race."
+        )
+    else:
+        print("  The hidden recovery pin could not be released safely.")
+        _print_retained_stash_pin_guidance()
+    _print_stash_cleanup_guidance(stash_ref)
     return True
+
+
+def _drop_verified_stash(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
+    """Retain an applied rollout stash after its tree passes the health gate.
+
+    Git exposes arbitrary stash deletion only through the positional reflog
+    selector ``stash@{N}``. Another process can push/drop after selector
+    lookup and before deletion, shifting N and making an automatic drop erase
+    the wrong stash. Phase 4 therefore keeps its SHA-addressed recovery entry;
+    the applied working tree is already the committed transaction result.
+    """
+
+    print("⚠ Local changes were restored on top of the verified codebase.")
+    print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
+    if _release_stash_recovery_pins(git_cmd, cwd, stash_ref):
+        print(
+            "  Released the hidden transaction pin; the user-visible stash "
+            "entry was retained to avoid a concurrent reflog race."
+        )
+    else:
+        print("  The hidden recovery pin could not be released safely.")
+        _print_retained_stash_pin_guidance()
+    _print_stash_cleanup_guidance(stash_ref)
+    return False
 
 def _discard_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
     stash_ref: str,
 ) -> bool:
-    """Throw away a stash created before an update, without applying it.
+    """Keep stashed edits off the worktree without a selector-racy drop.
 
     Used only on a NON-interactive update when the user has set
     ``updates.non_interactive_local_changes: discard`` — i.e. they've opted out
-    of keeping local source edits on this machine. Drops the stash entry
-    instead of re-applying it, so the working tree stays clean at the freshly
-    pulled HEAD. Unlike ``git reset --hard`` + ``git clean -fd``, this only
-    affects what was stashed (tracked changes + the untracked files we
-    explicitly captured) — ignored paths like node_modules/venv/build outputs
-    are never touched, since they were never stashed.
-
-    Returns True if the stash was dropped, False on a git failure (in which
-    case the stash is left in place for safety).
+    of re-applying local source edits on this machine. The working tree stays
+    clean at the freshly pulled HEAD, while the immutable stash commit remains
+    as a recovery copy because Git exposes deletion only through a positional,
+    race-prone reflog selector.
     """
-    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
-    if stash_selector is None:
-        print(
-            "⚠ Configured to discard local changes on non-interactive update, "
-            "but Hermes couldn't find the stash entry to drop."
-        )
-        _print_stash_cleanup_guidance(stash_ref)
-        return False
-
-    drop = subprocess.run(
-        git_cmd + ["stash", "drop", stash_selector],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
+    del git_cmd, cwd
+    print(
+        "→ Kept local source changes off the updated worktree "
+        "(updates.non_interactive_local_changes=discard)."
     )
-    if drop.returncode != 0:
-        print(
-            "⚠ Configured to discard local changes, but Hermes couldn't drop "
-            "the saved stash entry."
-        )
-        if drop.stderr.strip():
-            print(f"  {drop.stderr.strip().splitlines()[0]}")
-        _print_stash_cleanup_guidance(stash_ref, stash_selector)
-        return False
-
-    print("→ Discarded local source changes (updates.non_interactive_local_changes=discard).")
+    print(
+        "  The SHA-addressed recovery stash was retained to avoid deleting an "
+        "unrelated stash during a reflog race."
+    )
+    _print_retained_stash_pin_guidance()
+    _print_stash_cleanup_guidance(stash_ref)
     return True
 
 OFFICIAL_REPO_URLS = {
@@ -2375,23 +4942,57 @@ def _mark_skip_upstream_prompt():
     except Exception:
         pass
 
-def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
-    """Attempt to push updated main to origin (sync fork).
+def _sync_fork_with_upstream(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    source_sha: str,
+    expected_origin_sha: str,
+    expected_branch: str = "main",
+) -> bool:
+    """Push one verified commit to a fork under an exact remote lease.
 
     Returns True if push succeeded, False otherwise.
     """
+    if (
+        expected_branch != "main"
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", source_sha)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", expected_origin_sha)
+        or _resolve_commit(git_cmd, cwd, source_sha) != source_sha
+        or not _update_boundary_matches(
+            git_cmd, cwd, expected_branch, source_sha
+        )
+    ):
+        return False
     try:
         result = subprocess.run(
-            git_cmd + ["push", "origin", "main", "--force-with-lease"],
+            git_cmd
+            + [
+                "push",
+                f"--force-with-lease=refs/heads/main:{expected_origin_sha}",
+                "origin",
+                f"{source_sha}:refs/heads/main",
+            ],
             cwd=cwd,
             capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.returncode == 0
     except Exception:
         return False
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
+
+def _sync_with_upstream_if_needed(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    push_origin: bool = True,
+    expected_branch: str | None = None,
+    expected_head_sha: str | None = None,
+    origin_sha: str | None = None,
+) -> bool:
     """Check if fork is behind upstream and sync if safe.
 
     This implements the fork upstream sync logic:
@@ -2405,7 +5006,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     if not has_upstream:
         # Check if user previously declined
         if _should_skip_upstream_prompt():
-            return
+            return False
 
         # Ask user if they want to add upstream
         print()
@@ -2429,82 +5030,203 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
-                return
+                return False
         else:
             print(
                 "  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later."
             )
             _mark_skip_upstream_prompt()
-            return
+            return False
 
-    # Fetch upstream main only. This sync compares upstream/main with
-    # origin/main, so there's no reason to pull every upstream ref — and a bare
-    # fetch drags in thousands of auto-generated branches.
+    expected_branch = expected_branch or _current_attached_branch(git_cmd, cwd)
+    expected_head_sha = expected_head_sha or _resolve_commit(git_cmd, cwd, "HEAD")
+    origin_sha = origin_sha or _resolve_commit(
+        git_cmd, cwd, "refs/remotes/origin/main"
+    )
+    if not expected_branch or not expected_head_sha or not origin_sha:
+        print("  ✗ Could not pin fork sync admission state. Skipping upstream sync.")
+        return False
+    if expected_branch != "main":
+        print("  ✗ Automatic upstream sync is restricted to the checked-out main branch.")
+        return False
+
+    old_upstream_state, old_upstream_sha = _resolve_optional_commit(
+        git_cmd, cwd, "refs/remotes/upstream/main"
+    )
+    if old_upstream_state == _REF_UNKNOWN:
+        print("  ✗ Could not pin the prior upstream tracking tip. Skipping sync.")
+        return False
+    import uuid as _upstream_uuid
+
+    upstream_fetch_ref = (
+        "refs/hermes-update-fetches/" + _upstream_uuid.uuid4().hex
+    )
     print()
     print("→ Fetching upstream...")
     try:
-        subprocess.run(
-            git_cmd + ["fetch", "upstream", "main", "--quiet"],
+        fetched = subprocess.run(
+            git_cmd
+            + [
+                "fetch",
+                "--no-tags",
+                "--refmap=",
+                "--quiet",
+                "upstream",
+                f"+refs/heads/main:{upstream_fetch_ref}",
+            ],
             cwd=cwd,
             capture_output=True,
-            check=True,
+            check=False,
         )
-    except subprocess.CalledProcessError:
+    except OSError:
+        fetched = None
+    if fetched is None or fetched.returncode != 0:
+        _cleanup_owned_fetch_ref(git_cmd, cwd, upstream_fetch_ref)
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
+        return False
 
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
-    upstream_ahead = _count_commits_between(
-        git_cmd, cwd, "origin/main", "upstream/main"
+    upstream_sha = _resolve_commit(git_cmd, cwd, upstream_fetch_ref)
+    if upstream_sha is None:
+        _cleanup_owned_fetch_ref(git_cmd, cwd, upstream_fetch_ref)
+        print("  ✗ Could not pin fetched upstream commit. Skipping upstream sync.")
+        return False
+    tracking_ref = "refs/remotes/upstream/main"
+    tracking_changed = False
+
+    def _finish_upstream_sync(result: bool, *, keep_tracking: bool = False) -> bool:
+        if tracking_changed and not keep_tracking:
+            if not _rollback_ref_update(
+                git_cmd,
+                cwd,
+                ref=tracking_ref,
+                old_state=old_upstream_state,
+                old_sha=old_upstream_sha,
+                new_sha=upstream_sha,
+            ):
+                print(
+                    "  ⚠ Upstream tracking ref changed again; its concurrent "
+                    "generation was preserved."
+                )
+        if not _cleanup_owned_fetch_ref(
+            git_cmd, cwd, upstream_fetch_ref, upstream_sha
+        ):
+            print("  ⚠ Could not remove the private upstream fetch ref safely.")
+        return result
+
+    expected_tracking = (
+        old_upstream_sha if old_upstream_sha is not None else "0" * len(upstream_sha)
     )
+    try:
+        tracking_update = subprocess.run(
+            git_cmd
+            + [
+                "update-ref",
+                "refs/remotes/upstream/main",
+                upstream_sha,
+                expected_tracking,
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        _cleanup_owned_fetch_ref(git_cmd, cwd, upstream_fetch_ref, upstream_sha)
+        print("  ✗ Could not update the upstream tracking ref; sync refused.")
+        return False
+    if tracking_update.returncode != 0:
+        _cleanup_owned_fetch_ref(git_cmd, cwd, upstream_fetch_ref, upstream_sha)
+        print("  ✗ Upstream tracking ref changed concurrently; sync refused.")
+        return False
+    tracking_changed = old_upstream_sha != upstream_sha
+    if old_upstream_state == _REF_ABSENT:
+        print("  ℹ Upstream tracking baseline initialized; rerun to verify its movement.")
+        return _finish_upstream_sync(False, keep_tracking=True)
 
-    if origin_ahead < 0 or upstream_ahead < 0:
-        print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return
+    origin_to_upstream = _ancestor_result(git_cmd, cwd, origin_sha, upstream_sha)
+    upstream_to_origin = _ancestor_result(git_cmd, cwd, upstream_sha, origin_sha)
+    if origin_to_upstream not in {0, 1} or upstream_to_origin not in {0, 1}:
+        print("  ✗ Could not prove fork/upstream ancestry. Skipping upstream sync.")
+        return _finish_upstream_sync(False)
 
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
+    if origin_to_upstream == 1:
+        origin_ahead = _count_commits_between(
+            git_cmd, cwd, upstream_sha, origin_sha
+        )
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
+        count_text = str(origin_ahead) if origin_ahead >= 0 else "unknown"
+        print(f"ℹ Your fork has {count_text} commit(s) not on upstream.")
         print("  Skipping upstream sync to preserve your changes.")
         print("  If you want to merge upstream changes, run:")
         print("    git pull upstream main")
-        return
+        return _finish_upstream_sync(False)
 
-    # If upstream is not ahead, fork is up to date
-    if upstream_ahead == 0:
+    if upstream_to_origin == 0:
         print("  ✓ Fork is up to date with upstream")
-        return
+        return _finish_upstream_sync(False)
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
+    upstream_ahead = _count_commits_between(
+        git_cmd, cwd, origin_sha, upstream_sha
+    )
     print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
+    count_text = str(upstream_ahead) if upstream_ahead >= 0 else "unknown"
+    print(f"→ Fork is {count_text} commit(s) behind upstream")
     print("→ Pulling from upstream...")
 
+    if (
+        not _update_boundary_matches(
+            git_cmd, cwd, expected_branch, expected_head_sha
+        )
+        or _ancestor_result(git_cmd, cwd, expected_head_sha, upstream_sha) != 0
+    ):
+        print("  ✗ Local branch/HEAD is not a safe pinned fast-forward boundary.")
+        return _finish_upstream_sync(False)
     try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
+        synced = subprocess.run(
+            git_cmd + ["merge", "--ff-only", upstream_sha],
             cwd=cwd,
-            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
-    except subprocess.CalledProcessError:
+    except OSError:
+        synced = subprocess.CompletedProcess([], 1, "", "")
+    if (
+        synced.returncode != 0
+        or not _update_boundary_matches(
+            git_cmd, cwd, expected_branch, upstream_sha
+        )
+    ):
         print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
+            "  ✗ Failed to apply the pinned upstream commit; sync stopped."
         )
-        return
+        return _finish_upstream_sync(False)
 
     print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
+    if not push_origin:
+        print("  ℹ Fork push deferred until local verification completes")
+        return _finish_upstream_sync(True, keep_tracking=True)
     print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
+    if _sync_fork_with_upstream(
+        git_cmd,
+        cwd,
+        source_sha=upstream_sha,
+        expected_origin_sha=origin_sha,
+        expected_branch=expected_branch,
+    ):
         print("  ✓ Fork synced with upstream")
     else:
         print(
             "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
         )
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+    return _finish_upstream_sync(True, keep_tracking=True)
 
 def _invalidate_update_cache():
     """Delete the update-check cache for ALL profiles so no banner
@@ -2620,6 +5342,103 @@ def _capture_active_tool_dependencies() -> list[str]:
         return []
 
 
+def _capture_rollout_active_optional_dependencies(
+    project_root: Path,
+) -> tuple[list[str], list[str]]:
+    """Snapshot optional state with the project venv, never the coordinator.
+
+    Windows canary rollout deliberately requires an external coordinator so
+    no mapped ``.pyd`` in the project venv can block its replacement.  Import
+    probes in that coordinator would therefore describe the wrong Python.
+    Execute the read-only probes with the exact existing project interpreter
+    selected by checkpoint creation (``venv`` before ``.venv``).  A missing
+    or incomplete venv is an empty snapshot; the checkpoint records its
+    absence and forces a complete candidate install later.
+    """
+
+    project = Path(project_root)
+    from hermes_cli.update_rollout import (
+        validate_no_reparse_topology,
+        validate_real_venv_root,
+    )
+
+    # Validate the project and candidate roots before resolving or selecting an
+    # interpreter.  On Windows, resolving/is_dir() on a junction can otherwise
+    # route the probe outside the install tree.
+    validate_no_reparse_topology(project)
+    project = project.resolve()
+    selected_venv: Path | None = None
+    for name in ("venv", ".venv"):
+        candidate = project / name
+        validate_no_reparse_topology(candidate)
+        if validate_real_venv_root(candidate, allow_missing=True):
+            selected_venv = candidate
+            break
+    if selected_venv is None:
+        return [], []
+    interpreter = venv_python_path(selected_venv, windows=_m()._is_windows())
+    if not interpreter.is_file():
+        raise RuntimeError(f"existing rollout venv has no interpreter: {interpreter}")
+
+    capture_script = (
+        "import json,sys;"
+        "sys.path.insert(0,sys.argv[1]);"
+        "from tools.lazy_deps import active_features;"
+        "from hermes_cli.tools_config import "
+        "active_restorable_python_tool_dependencies as active_tools;"
+        "print(json.dumps({'lazy_features':active_features(),"
+        "'tool_dependencies':active_tools()}))"
+    )
+    capture_env = dict(os.environ)
+    capture_env.pop("PYTHONHOME", None)
+    capture_env.pop("PYTHONPATH", None)
+    capture_env["VIRTUAL_ENV"] = str(interpreter.parent.parent)
+    try:
+        completed = subprocess.run(
+            [
+                str(interpreter),
+                "-I",
+                "-B",
+                "-c",
+                capture_script,
+                str(project),
+            ],
+            cwd=project,
+            env=capture_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "probe failed").strip()
+            raise RuntimeError(detail[:300])
+        payload = json.loads(completed.stdout)
+        lazy_features = payload.get("lazy_features")
+        tool_dependencies = payload.get("tool_dependencies")
+        if not isinstance(lazy_features, list) or not isinstance(
+            tool_dependencies, list
+        ):
+            raise ValueError("optional dependency probe returned invalid JSON")
+        return (
+            [item for item in lazy_features if isinstance(item, str)],
+            [item for item in tool_dependencies if isinstance(item, str)],
+        )
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeError(
+            "could not snapshot rollout optional dependencies with "
+            f"{interpreter}: {exc}"
+        ) from exc
+
+
 def _restore_active_tool_dependencies(
     dependencies: list[str],
     install_cmd_prefix: list[str],
@@ -2704,6 +5523,7 @@ def _refresh_active_lazy_features(
     *,
     env: dict[str, str] | None = None,
     features: list[str] | None = None,
+    explicit_target: bool = False,
 ) -> bool:
     """Refresh lazy-installed backends after a code update.
 
@@ -2750,6 +5570,14 @@ def _refresh_active_lazy_features(
     try:
         if features is None:
             results = lazy_deps.refresh_active_features(prompt=False)
+        elif explicit_target:
+            if install_cmd_prefix is None:
+                raise RuntimeError("explicit lazy refresh requires an installer")
+            results = lazy_deps.restore_features(
+                active,
+                install_cmd_prefix=install_cmd_prefix,
+                env=env,
+            )
         else:
             results = lazy_deps.restore_features(active)
     except Exception as exc:
@@ -2810,7 +5638,12 @@ def _refresh_active_lazy_features(
         )
     return False
 
-def _refresh_active_memory_provider_dependencies() -> None:
+
+def _refresh_active_memory_provider_dependencies(
+    install_cmd_prefix: list[str] | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
     """Refresh pip dependencies for the configured external memory provider.
 
     Memory-provider bridge packages are declared in each provider's
@@ -2854,7 +5687,15 @@ def _refresh_active_memory_provider_dependencies() -> None:
     print(f"→ Refreshing active memory provider dependencies ({provider})...")
 
     try:
-        _install_dependencies(provider, force=True)
+        if install_cmd_prefix is None:
+            _install_dependencies(provider, force=True)
+        else:
+            _install_dependencies(
+                provider,
+                force=True,
+                install_cmd_prefix=install_cmd_prefix,
+                env=env,
+            )
     except Exception as exc:
         print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
 
@@ -3022,7 +5863,7 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
     except OSError:
         logger.debug("Could not write npm lockfile hash cache")
 
-def _repair_node_deps_on_current_checkout(print_completion) -> None:
+def _repair_node_deps_on_current_checkout(print_completion) -> bool:
     """Repair Node deps on the ``commit_count == 0`` path (#77211).
 
     A current checkout does not imply healthy Node deps: a previous npm
@@ -3042,12 +5883,18 @@ def _repair_node_deps_on_current_checkout(print_completion) -> None:
         print_completion(
             "⚠ Checkout is current, but Node.js dependencies could not be repaired."
         )
-        return
+        return False
     # Pair the refresh with the web build like every other
     # _update_node_dependencies call site; it staleness-checks internally,
     # so this is a no-op when nothing changed.
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    web_build_ok = _build_web_ui_for_update()
+    if not web_build_ok:
+        print_completion(
+            "⚠ Checkout is current, but the web dashboard bundle could not be repaired."
+        )
+        return False
     print_completion("✓ Already up to date!")
+    return True
 
 
 def _update_node_dependencies() -> list[str]:
@@ -3892,7 +6739,12 @@ def _wait_for_windows_update_gateway_exit(
             pass
     return survivors
 
-def _venv_core_imports_healthy() -> tuple[bool, str]:
+
+def _venv_core_imports_healthy(
+    venv_dir: Optional[Path] = None,
+    *,
+    fail_closed: bool = False,
+) -> tuple[bool, str]:
     """Probe the project venv for the core imports the backend needs to boot.
 
     Runs a tiny import check inside the venv interpreter (NOT this process —
@@ -3905,12 +6757,24 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     the user's install stays broken no matter how many times they update
     (ryanc's incident, July 2026).
 
-    Returns ``(healthy, detail)``. Never raises; unknown states report
-    healthy so a probe failure can't force needless reinstalls.
+    ``venv_dir`` lets rollout probe the exact environment named by its
+    checkpoint (including ``.venv``) rather than whichever interpreter drives
+    the coordinator.  Returns ``(healthy, detail)`` and never raises. Legacy
+    no-op updates keep treating an unlaunchable probe as unknown/healthy;
+    transactional rollout passes ``fail_closed=True`` so unknown state forces
+    a candidate reinstall before the canary gate.
     """
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    venv_dir = Path(venv_dir) if venv_dir is not None else _m().PROJECT_ROOT / "venv"
+    try:
+        from hermes_cli.update_rollout import validate_real_venv_root
+
+        validate_real_venv_root(venv_dir, allow_missing=True)
+    except Exception as exc:
+        return False, str(exc)
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
     if not venv_python.exists():
+        if fail_closed:
+            return False, f"venv python missing ({venv_python})"
         # No venv interpreter at all. In a dev checkout that's normal (the
         # dev may run hermes from any interpreter), so report healthy to
         # avoid forcing reinstalls. But on a MANAGED install (the Windows
@@ -3939,16 +6803,22 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         "    except Exception as e: missing.append(f'{m}: {e}')\n"
         "print('\\n'.join(missing))\n"
     )
+    probe_env = dict(os.environ)
+    probe_env.pop("PYTHONHOME", None)
+    probe_env.pop("PYTHONPATH", None)
     try:
         result = subprocess.run(
-            [str(venv_python), "-c", check],
+            [str(venv_python), "-I", "-c", check],
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=60,
-            cwd=_m().PROJECT_ROOT,
+            cwd=venv_dir.parent,
+            env=probe_env,
         )
     except Exception as exc:
         logger.debug("venv health probe failed to run: %s", exc)
+        if fail_closed:
+            return False, f"venv health probe could not run: {exc}"
         return True, ""
 
     missing = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
@@ -4827,6 +7697,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
 
     try:
         from gateway.status import terminate_pid
+        from hermes_cli.process_identity import redact_argv
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -4919,32 +7790,44 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # downstream. Left alive, it trips the venv-holder guard and aborts the
     # update even though the gateway itself is stopped.
     launcher_pids = _m()._venv_launcher_ancestors(mapped_pids)
+    unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+
+    # Publish resume ownership before the first drain can stop anything. An
+    # interrupt inside this function must not strand gateways just because the
+    # caller has not yet received and registered the token.
+    unmapped: list[dict] = []
+    for pid in unmapped_pids:
+        argv = None
+        try:
+            argv = _capture_gateway_argv(int(pid))
+            if isinstance(argv, (list, tuple)):
+                argv = redact_argv(argv)
+        except Exception as exc:
+            logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
+        unmapped.append({"pid": int(pid), "argv": argv})
+    resume_token = {
+        "resume_needed": True,
+        "profiles": profiles,
+        "unmapped_pids": unmapped_pids,
+        "unmapped": unmapped,
+    }
+    import atexit as _atexit
+
+    _atexit.register(_m()._resume_windows_gateways_after_update, resume_token)
 
     print("→ Stopping Windows gateway process(es) before updating Hermes...")
     try:
         drain_timeout = max(float(_get_restart_drain_timeout()), 1.0)
     except Exception:
         drain_timeout = 10.0
-    survivors = _m()._wait_for_windows_update_gateway_exit(
-        mapped_pids,
-        timeout=drain_timeout,
-    )
-    unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
-
-    # Snapshot each unmapped gateway's command line *before* we force-kill it,
-    # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
-    # its own argv. Unmapped gateways are ones with no profile→PID-file mapping
-    # — e.g. a Windows Scheduled Task running ``pythonw.exe -m hermes_cli.main
-    # gateway run``. Without this snapshot they were force-killed and never
-    # restarted (the "Restart manually after update" dead-end from #50090).
-    unmapped: list[dict] = []
-    for pid in unmapped_pids:
-        argv = None
-        try:
-            argv = _capture_gateway_argv(int(pid))
-        except Exception as exc:
-            logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
-        unmapped.append({"pid": int(pid), "argv": argv})
+    try:
+        survivors = _m()._wait_for_windows_update_gateway_exit(
+            mapped_pids,
+            timeout=drain_timeout,
+        )
+    except BaseException:
+        _m()._resume_windows_gateways_after_update(resume_token)
+        raise
 
     # Stop drain survivors, unmapped gateways, and the pre-drain launcher
     # snapshot. ``terminate_pid(force=True)`` is a tree kill, so a launcher
@@ -4952,12 +7835,16 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # already exited with its drained worker raises ProcessLookupError below
     # and is skipped.
     force_killed = []
-    for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
-        try:
-            terminate_pid(int(pid), force=True)
-            force_killed.append(int(pid))
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    try:
+        for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
+            try:
+                terminate_pid(int(pid), force=True)
+                force_killed.append(int(pid))
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    except BaseException:
+        _m()._resume_windows_gateways_after_update(resume_token)
+        raise
 
     if profiles:
         print(f"  ✓ Paused gateway profile(s): {', '.join(sorted(profiles))}")
@@ -4974,12 +7861,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
             # denied, already gone): those still need a manual restart.
             print("    Restart manually after update: hermes gateway run")
 
-    return {
-        "resume_needed": True,
-        "profiles": profiles,
-        "unmapped_pids": unmapped_pids,
-        "unmapped": unmapped,
-    }
+    return resume_token
 
 def _cold_start_windows_gateway_after_update() -> None:
     """Start a fresh detached gateway after update when one is installed but down.
@@ -5498,46 +8380,9 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         )
 
 def _discard_lockfile_churn(git_cmd, repo_root):
-    """Restore tracked ``package-lock.json`` files that npm dirtied locally.
+    """Compatibility no-op: lockfile edits are user state and get stashed."""
 
-    npm rewrites lockfiles non-deterministically at install/build time. On a
-    managed install those diffs are never intentional, so we discard them so
-    ``hermes update`` sees a clean tree instead of autostashing every run.
-    Best-effort; only ever touches files named ``package-lock.json``.
-    """
-    try:
-        diff = subprocess.run(
-            git_cmd + ["diff", "--name-only"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if diff.returncode != 0:
-            return
-        dirty_package_dirs = {
-            Path(line.strip()).parent
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package.json")
-        }
-        dirty = [
-            line.strip()
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package-lock.json")
-            and Path(line.strip()).parent not in dirty_package_dirs
-        ]
-        if not dirty:
-            return
-        subprocess.run(
-            git_cmd + ["checkout", "--", *dirty],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=False,
-        )
-        print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
-        # Never let lockfile cleanup block an update.
-        pass
+    del git_cmd, repo_root
 
 def _normalize_managed_eol(git_cmd, repo_root):
     """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
@@ -5665,10 +8510,10 @@ def _rebuild_desktop_after_update(
     """Rebuild an installed Desktop app when its source or artifact changed.
 
     Returns ``False`` only when a rebuild was attempted and failed, so the
-    caller can withhold ``✓ Update complete!`` and (in gateway mode) write
-    a failing ``.update_exit_code`` (#88251). Every other outcome — nothing
-    to rebuild, up to date, build succeeded, Desktop never installed —
-    returns ``True``.
+    caller can withhold ``✓ Update complete!`` and (in gateway mode) write a
+    failing correlation-scoped terminal marker (#88251). Every other outcome
+    — nothing to rebuild, up to date, build succeeded, Desktop never installed
+    — returns ``True``.
     """
     # The release tree is ignored by git and can disappear during an update.
     # Its pre-update presence is enough to restore it; do not make people who
@@ -5738,11 +8583,60 @@ def _rebuild_desktop_after_update(
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
-    # A managed-runtime refresh can replace site-packages before the normal
-    # ``.[all]`` install runs. Snapshot while the old environment can still
-    # prove which optional backends the user had activated.
-    active_lazy_features = _m()._capture_active_lazy_features()
-    active_tool_dependencies = _m()._capture_active_tool_dependencies()
+    if gateway_mode:
+        from hermes_cli.update_rollout import (
+            load_rollout_config as _load_rollout_config,
+            read_checkpoint as _read_rollout_checkpoint,
+            resolve_checkpoint as _resolve_rollout_checkpoint,
+        )
+
+        try:
+            _rollback_ref = getattr(args, "rollback", None)
+            if _rollback_ref is not None:
+                _handoff_checkpoint = _resolve_rollout_checkpoint(
+                    _rollback_ref, Path(_m().PROJECT_ROOT)
+                )
+                _handoff_config = _load_rollout_config(
+                    _read_rollout_checkpoint(_handoff_checkpoint).get("rollout")
+                    or {}
+                )
+            else:
+                _handoff_config = _load_rollout_config()
+            if _handoff_gateway_rollout_worker_if_needed(_handoff_config):
+                # Nonterminal: the independently-supervised worker now owns
+                # prompt + receipt + .update_exit_code. The slash launcher
+                # must preserve pending state and ignore this distinct code.
+                sys.exit(UPDATE_EXIT_INDEPENDENT_HANDOFF)
+        except Exception as _handoff_exc:
+            # Refusal is durable and happens before active-dependency capture,
+            # prompt/checkpoint, fetch/stash, or runtime mutation.
+            from hermes_cli.update_receipt import (
+                begin_update_receipt,
+                finalize_update_receipt,
+                record_canary,
+            )
+
+            begin_update_receipt()
+            _new_update_context(gateway_mode=True)
+            record_canary(
+                enabled=True,
+                status="refused",
+                error=str(_handoff_exc),
+                worker_independent=False,
+            )
+            print(f"✗ Canary update refused before mutation: {_handoff_exc}")
+            finalize_update_receipt(
+                "refused", stop_reason="independent_worker_unavailable"
+            )
+            _write_gateway_update_status(2)
+            sys.exit(2)
+
+    if getattr(args, "rollback", None) is not None:
+        _cmd_update_rollback(args, gateway_mode)
+        return
+
+    active_lazy_features: list[str] = []
+    active_tool_dependencies: list[str] = []
 
     # Snapshot the pre-update version before any code is pulled so the
     # completion line can report the transition (prime-agent#630 port).
@@ -5802,6 +8696,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     except Exception as _receipt_exc:
         logger.debug("Update receipt unavailable: %s", _receipt_exc)
 
+    _update_correlation_id, _update_origin = _new_update_context(
+        gateway_mode=gateway_mode
+    )
+
     # Plan phase (#91277 Phase 2): snapshot the pre-update fleet — every
     # running Hermes runtime, its supervisor, and its running code version —
     # into the receipt, so a post-mortem can compare what the update SAW
@@ -5826,6 +8724,98 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"→ Fleet: {_n} running service(s) across profiles: {_profiles}")
     except Exception as _plan_exc:
         logger.debug("Update plan phase failed: %s", _plan_exc)
+
+    # Phase 4 (#44877): empty canary_profile is the feature flag, so the
+    # historical updater remains unchanged unless explicitly opted in.
+    from hermes_cli.update_rollout import (
+        capture_rollout_relaunch_argv,
+        create_checkpoint,
+        load_rollout_config,
+        read_checkpoint,
+        rollout_confirmation_context,
+        validate_rollout_coordinator,
+        validate_rollout_plan,
+    )
+
+    _rollout_config = load_rollout_config()
+    _rollout_checkpoint = None
+    _checkpoint_metadata = None
+    _rollout_stash_deferred = False
+    _rollout_fleet_quiesced = False
+    _rollout_apply_started = False
+    _rollout_transaction_terminal = False
+    try:
+        if _rollout_config.enabled:
+            if _pre_update_plan is None:
+                raise RuntimeError("could not collect a canary rollout plan")
+            validate_rollout_plan(_pre_update_plan, _rollout_config)
+            validate_rollout_coordinator(Path(_m().PROJECT_ROOT))
+            # The coordinator is intentionally outside the project venv on
+            # Windows.  Snapshot optional packages with the venv interpreter
+            # that checkpoint creation will copy, not with sys.executable.
+            (
+                active_lazy_features,
+                active_tool_dependencies,
+            ) = _capture_rollout_active_optional_dependencies(Path(_m().PROJECT_ROOT))
+            capture_rollout_relaunch_argv(_pre_update_plan)
+            from hermes_cli.update_receipt import record_canary
+
+            record_canary(
+                enabled=True,
+                status="planned",
+                canary_profile=_rollout_config.canary_profile,
+                rollout=_rollout_config.to_dict(),
+            )
+    except Exception as _rollout_plan_exc:
+        print(f"✗ Canary rollout refused before mutation: {_rollout_plan_exc}")
+        try:
+            from hermes_cli.update_receipt import finalize_update_receipt, record_canary
+
+            record_canary(
+                enabled=True,
+                status="refused",
+                error=str(_rollout_plan_exc),
+            )
+            finalize_update_receipt(
+                "refused", stop_reason="canary_plan_preflight_refused"
+            )
+        except Exception:
+            pass
+        if gateway_mode:
+            _write_gateway_update_status(2)
+        sys.exit(2)
+
+    if not _rollout_config.enabled:
+        # Preserve the historical in-process probes for non-rollout updates.
+        # A managed-runtime refresh can replace site-packages before the
+        # normal ``.[all]`` install, so capture before any mutation.
+        active_lazy_features = _m()._capture_active_lazy_features()
+        active_tool_dependencies = _m()._capture_active_tool_dependencies()
+
+    # Telegram and Discord enter this same command with --gateway. Require a
+    # confirmation for this correlation/profile/install every time, even when
+    # --yes was inherited; the answer is never persisted as an "always" bypass.
+    if gateway_mode:
+        _confirmation_context = rollout_confirmation_context(
+            action="update",
+            project_root=Path(_m().PROJECT_ROOT),
+            plan=_pre_update_plan,
+            config=_rollout_config,
+            correlation_id=_update_correlation_id,
+            origin=_update_origin,
+        )
+        if not _confirm_gateway_transaction(_confirmation_context):
+            print("UPDATE_CONFIRMATION_REFUSED: update requires explicit approval")
+            try:
+                from hermes_cli.update_receipt import finalize_update_receipt
+
+                finalize_update_receipt(
+                    "refused", stop_reason="gateway_confirmation_refused"
+                )
+            except Exception:
+                pass
+            _write_gateway_update_status(2)
+            sys.exit(2)
 
     # On Windows, abort early if another hermes.exe is holding the venv shim
     # open. Continuing would result in a string of WinError 32 warnings and
@@ -6031,19 +9021,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Discard npm lockfile churn before any stash/branch logic. npm rewrites
-    # tracked package-lock.json files non-deterministically at install/build
-    # time (platform-specific optional deps, ideallyInert annotations, etc.),
-    # which is never an intentional edit on a managed install but leaves the
-    # tree dirty — forcing an autostash on every update and making branch
-    # switches fragile. Restoring them first lets the common case (only
-    # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    # Same rationale, different generator: line-ending churn is machine-made
-    # dirt on a managed checkout, so clear it (and stop generating it) before
-    # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
-
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
@@ -6053,20 +9030,439 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print(f"  {origin_url}")
         print()
 
+    if use_zip_update and _rollout_config.enabled:
+        print("✗ Canary rollout refused: this checkout cannot use the ZIP updater.")
+        try:
+            from hermes_cli.update_receipt import finalize_update_receipt, record_canary
+
+            record_canary(
+                enabled=True,
+                status="refused",
+                error="canary rollout requires an intact Git checkout",
+            )
+            finalize_update_receipt(
+                "refused", stop_reason="canary_git_checkout_unavailable"
+            )
+        except Exception:
+            pass
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        if gateway_mode:
+            _write_gateway_update_status(2)
+        sys.exit(2)
+
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
         try:
-            desktop_build_ok = _update_via_zip(
+            update_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            if not _rollout_config.enabled:
+                _write_gateway_update_exit_code(update_build_ok)
+        if not update_build_ok:
+            sys.exit(1)
         return
 
+    # Windows cannot replace a venv while gateway processes map it, so that
+    # platform retains one pre-apply fleet drain. POSIX keeps untouched
+    # old-generation gateways serving: the rollout kernel drains only the
+    # canary, gates it, then advances bounded profile batches (#44877).
+    if _rollout_config.enabled:
+        _preapply_recovery = None
+        _quiesce_started = False
+        _preapply_quiesce = {
+            "ok": True,
+            "mode": "profile-staged",
+            "attempted_profiles": [],
+            "quiesced_profiles": [],
+            "workers": {
+                "ok": True,
+                "skipped": True,
+                "reason": "workers drain with each staged profile batch",
+            },
+            "errors": [],
+        }
+        _preapply_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        if not _preapply_sha:
+            print("✗ Canary update refused: could not capture pre-apply Git identity")
+            if gateway_mode:
+                _write_gateway_update_status(2)
+            sys.exit(2)
+        from hermes_cli.update_receipt import (
+            finalize_update_receipt,
+            record_canary,
+            record_gateway_restart,
+        )
+        from hermes_cli.update_rollout import (
+            quiesce_rollout_fleet_for_update,
+            restart_and_verify_fleet,
+        )
+
+        def _remember_preapply_recovery(recovery) -> None:
+            nonlocal _preapply_recovery
+            _preapply_recovery = dict(recovery)
+
+        try:
+            if _rollout_requires_preapply_fleet_quiesce():
+                _quiesce_started = True
+                _preapply_quiesce = quiesce_rollout_fleet_for_update(
+                    _pre_update_plan,
+                    expected_sha=_preapply_sha,
+                    config=_rollout_config,
+                    project_root=Path(_m().PROJECT_ROOT),
+                    recovery_callback=_remember_preapply_recovery,
+                )
+            record_canary(preapply_quiesce=_preapply_quiesce)
+            if not _preapply_quiesce.get("ok", False):
+                if _windows_gateway_resume is not None:
+                    _windows_gateway_resume["resume_needed"] = False
+                if _preapply_recovery is None:
+                    _preapply_recovery = dict(
+                        _preapply_quiesce.get("failure_recovery") or {}
+                    )
+                record_gateway_restart(
+                    restarted_services=_preapply_recovery.get("restarted_services", []),
+                    relaunched_profiles=_preapply_recovery.get(
+                        "relaunched_profiles", []
+                    ),
+                    externally_supervised_profiles=_preapply_recovery.get(
+                        "externally_supervised_profiles", []
+                    ),
+                    killed_pids=_preapply_recovery.get("killed_pids", []),
+                    incomplete=not bool(_preapply_recovery.get("verified")),
+                    phase_error="pre-apply fleet quiescence failed",
+                )
+                raise RuntimeError(
+                    "could not quiesce the complete fleet before update; "
+                    "the previous generation was restarted"
+                )
+            _rollout_fleet_quiesced = bool(
+                _preapply_quiesce.get("quiesced_profiles")
+            )
+            if _windows_gateway_resume is not None:
+                # The rollout plan now owns every restart. Prevent the legacy
+                # Windows pause token (also registered with atexit) from
+                # spawning a duplicate fleet after canary/rollback.
+                _windows_gateway_resume["resume_needed"] = False
+            # Revalidate at the actual transaction boundary. The external
+            # Windows coordinator may have imported more modules during
+            # backup/inventory; no live-venv mapping may appear between the
+            # admission guard and the first worktree/venv mutation.
+            validate_rollout_coordinator(Path(_m().PROJECT_ROOT))
+
+            # On Windows this snapshot follows the required full drain. On
+            # POSIX the checkpoint is taken while old-generation peers remain
+            # available; admission already rejects active Desktop sessions,
+            # and each gateway/worker group drains before its staged restart.
+            _rollout_checkpoint = create_checkpoint(
+                Path(_m().PROJECT_ROOT),
+                config=_rollout_config,
+                plan=_pre_update_plan,
+                prune=False,
+            )
+            _checkpoint_metadata = read_checkpoint(_rollout_checkpoint)
+            from hermes_cli.update_rollout import plan_from_checkpoint
+
+            _pre_update_plan = plan_from_checkpoint(
+                _checkpoint_metadata, _pre_update_plan
+            )
+            from hermes_cli.update_receipt import record_checkpoint
+
+            record_checkpoint(
+                id=_checkpoint_metadata.get("id"),
+                path=str(_rollout_checkpoint),
+                pre_sha=_checkpoint_metadata.get("pre_sha"),
+                pre_branch=_checkpoint_metadata.get("pre_branch"),
+                dependency_state=_checkpoint_metadata.get("dependency_state"),
+                web_dist_state=_checkpoint_metadata.get("web_dist_state"),
+                status="ready",
+            )
+            print(
+                f"→ Rollback checkpoint: {_checkpoint_metadata['id']} "
+                f"({str(_checkpoint_metadata['pre_sha'])[:12]})"
+            )
+        except BaseException as _quiesce_exc:
+            if _preapply_recovery is None and _quiesce_started:
+                try:
+                    if _windows_gateway_resume is not None:
+                        _windows_gateway_resume["resume_needed"] = False
+                    _preapply_recovery = restart_and_verify_fleet(
+                        _pre_update_plan,
+                        expected_sha=_preapply_sha,
+                        config=_rollout_config,
+                        project_root=Path(_m().PROJECT_ROOT),
+                    )
+                except Exception as _recovery_exc:
+                    logger.error("Pre-apply quiesce recovery failed: %s", _recovery_exc)
+            print(f"✗ Canary update stopped before apply: {_quiesce_exc}")
+            try:
+                if _rollout_checkpoint is None:
+                    from hermes_cli.update_receipt import record_checkpoint
+
+                    record_checkpoint(status="failed", error=str(_quiesce_exc))
+                record_canary(
+                    enabled=True,
+                    status="failed",
+                    error=str(_quiesce_exc),
+                )
+                finalize_update_receipt(
+                    "failed",
+                    stop_reason=(
+                        "checkpoint_creation_failed"
+                        if _rollout_checkpoint is None
+                        else "canary_preapply_quiesce_failed"
+                    ),
+                )
+            except Exception:
+                pass
+            if gateway_mode:
+                _write_gateway_update_status(1)
+            if isinstance(_quiesce_exc, Exception):
+                sys.exit(1)
+            raise
+
+    # Historical cleanup is intentionally skipped for rollout transactions:
+    # both helpers mutate pre-admission worktree/config state before the exact
+    # autostash journal exists. Rollout preserves those edits and gates the
+    # final tree instead.
+    try:
+        if not _rollout_config.enabled:
+            _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    except BaseException as _boundary_exc:
+        if _rollout_config.enabled:
+            try:
+                from hermes_cli.update_receipt import (
+                    finalize_update_receipt,
+                    record_rollback,
+                )
+
+                from hermes_cli.update_rollout import restart_and_verify_fleet
+
+                _boundary_recovery = restart_and_verify_fleet(
+                    _pre_update_plan,
+                    expected_sha=str(_checkpoint_metadata["pre_sha"]),
+                    config=_rollout_config,
+                    project_root=Path(_m().PROJECT_ROOT),
+                )
+                _boundary_recovery.update({
+                    "attempted": True,
+                    "restore_attempted": False,
+                    "restored": False,
+                    "reason": "pre-apply worktree normalization interrupted",
+                    "disk_mutated": True,
+                    "verified": False,
+                    "worktree_state": "unknown",
+                })
+                _boundary_recovery.setdefault("errors", []).append({
+                    "profile": "worktree-normalization",
+                    "error": (
+                        "fleet recovered without a destructive reset; "
+                        "known cleanup targets may be partially normalized"
+                    ),
+                })
+                record_rollback(**_boundary_recovery)
+                finalize_update_receipt(
+                    "failed", stop_reason="canary_preapply_boundary_interrupted"
+                )
+            except Exception as _boundary_recovery_exc:
+                logger.error(
+                    "Pre-apply transaction recovery failed: %s",
+                    _boundary_recovery_exc,
+                )
+            if gateway_mode:
+                _write_gateway_update_status(1)
+        raise
+
     # Fetch and pull
+    auto_stash_ref = None
+    _rollout_stash_marker = None
+    _rollout_dependency_only = False
+    _rollout_stash_applied = False
+    _rollout_stash_reapplied = False
+    _rollout_fork_push_pending: tuple[str, str, str] | None = None
+    _rollout_missing_upstream_noted = False
+    prompt_for_restore = False
+    # Git fetches land in UUID-scoped refs and update the familiar tracking
+    # ref only under an exact lease. Until the fetched generation passes the
+    # apply/syntax boundary, a failure must restore the old tracking baseline;
+    # otherwise a second invocation can misclassify the same rewrite as a
+    # normal/no-op update and bypass the local-history guard.
+    _origin_fetch_ref: str | None = None
+    _origin_fetch_sha: str | None = None
+    _origin_tracking_rollback: tuple[str, str, str | None, str] | None = None
+    _origin_generation_committed = False
+
+    def _rollout_stash_prepared(marker: str) -> None:
+        nonlocal _rollout_stash_marker
+        _rollout_stash_marker = marker
+
+    def _rollout_stash_created(stash_ref: str) -> None:
+        nonlocal auto_stash_ref
+        nonlocal _rollout_apply_started, _rollout_stash_deferred
+        auto_stash_ref = stash_ref
+        _rollout_apply_started = True
+        _rollout_stash_deferred = True
+
+    def _stash_for_update() -> Optional[str]:
+        if not _rollout_config.enabled:
+            return _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+        return _m()._stash_local_changes_if_needed(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            on_prepared=_rollout_stash_prepared,
+            on_created=_rollout_stash_created,
+        )
+
+    def _sync_fork_candidate(
+        *,
+        expected_branch: str,
+        expected_head_sha: str,
+        origin_sha: str,
+    ) -> bool:
+        nonlocal _rollout_fork_push_pending, _rollout_missing_upstream_noted
+        if _rollout_config.enabled and not _m()._has_upstream_remote(
+            git_cmd, _m().PROJECT_ROOT
+        ):
+            # Adding a remote, stamping a declined prompt, or pulling a newly
+            # discovered upstream after canary are all outside the checkpoint.
+            # Preserve the configured-origin transaction and leave optional
+            # upstream setup to a later manual update.
+            if not _rollout_missing_upstream_noted:
+                print(
+                    "  ℹ Canary mode skipped automatic upstream-remote setup; "
+                    "the configured origin remains the update authority."
+                )
+                _rollout_missing_upstream_noted = True
+            return False
+        moved = _m()._sync_with_upstream_if_needed(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            # A push is outside the reversible Git transaction. Defer it
+            # until syntax/canary verification has committed the local tree.
+            push_origin=False,
+            expected_branch=expected_branch,
+            expected_head_sha=expected_head_sha,
+            origin_sha=origin_sha,
+        )
+        if moved:
+            source_sha = _resolve_commit(git_cmd, _m().PROJECT_ROOT, "HEAD")
+            if (
+                source_sha is None
+                or not _update_boundary_matches(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    expected_branch,
+                    source_sha,
+                )
+            ):
+                return False
+            authority = (source_sha, origin_sha, expected_branch)
+            if (
+                _rollout_fork_push_pending is not None
+                and _rollout_fork_push_pending != authority
+            ):
+                return False
+            _rollout_fork_push_pending = authority
+        return bool(moved)
+
+    def _after_rollout_restore() -> None:
+        """Refresh imports and rebuild the user's final pre-update tree."""
+        nonlocal _rollout_stash_reapplied
+        _m()._purge_stale_hermes_modules()
+        # Recovery breadcrumbs are restored atomically by restore_checkpoint;
+        # do not erase a marker that predated this transaction.
+        _rollout_stash_reapplied = False
+        if _rollout_stash_deferred and auto_stash_ref is not None:
+            _rollout_stash_reapplied = bool(
+                _m()._restore_stashed_changes(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=False,
+                    input_fn=gw_input_fn,
+                    drop_after=False,
+                    restore_index=True,
+                )
+            )
+            if not _rollout_stash_reapplied:
+                # Disk rollback succeeded, so keep recovery moving and bring
+                # every old gateway back. The durable stash remains the
+                # manual recovery source; transaction verification is marked
+                # false below instead of stranding the fleet while stopped.
+                logger.error(
+                    "Rollback restored the checkpoint but could not reapply "
+                    "transaction autostash %s",
+                    auto_stash_ref,
+                )
+
+    def _recover_current_rollout(reason: str) -> dict:
+        nonlocal auto_stash_ref
+        nonlocal _rollout_apply_started, _rollout_stash_deferred
+        stash_lookup_error = None
+        if auto_stash_ref is None and _rollout_stash_marker:
+            try:
+                interrupted_stash = _find_stash_by_transaction_marker(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    _rollout_stash_marker,
+                )
+            except Exception as exc:
+                interrupted_stash = None
+                stash_lookup_error = f"{type(exc).__name__}: {exc}"
+            if interrupted_stash is not None:
+                auto_stash_ref = interrupted_stash
+        if auto_stash_ref is not None:
+            # Normalize callback state after an asynchronous exception at any
+            # instruction boundary inside `_rollout_stash_created`.
+            _rollout_apply_started = True
+            _rollout_stash_deferred = True
+        result = _recover_rollout_transaction(
+            _rollout_checkpoint,
+            _pre_update_plan,
+            config=_rollout_config,
+            project_root=Path(_m().PROJECT_ROOT),
+            reason=reason,
+            apply_started=_rollout_apply_started,
+            fleet_quiesced=_rollout_fleet_quiesced,
+            after_restore=_after_rollout_restore,
+        )
+        result["stash_reapplied"] = _rollout_stash_reapplied
+        if stash_lookup_error is not None:
+            # The marker is prepared before `git stash push`; at this point no
+            # checkout/apply step can have run without the created callback.
+            # Keep the worktree untouched, restart liveness, and report the
+            # journal ambiguity instead of either hard-resetting edits or
+            # stranding a drained fleet.
+            result["verified"] = False
+            result.setdefault("errors", []).append({
+                "profile": "transaction-autostash",
+                "error": f"stash journal could not be inspected: {stash_lookup_error}",
+            })
+        if (
+            _rollout_stash_deferred
+            and auto_stash_ref is not None
+            and not _rollout_stash_reapplied
+        ):
+            result["verified"] = False
+            result.setdefault("errors", []).append({
+                "profile": "transaction-autostash",
+                "error": (
+                    "checkpoint and fleet recovered, but local changes "
+                    f"remain parked in stash {auto_stash_ref}"
+                ),
+            })
+        elif (
+            result.get("verified")
+            and _rollout_stash_deferred
+            and _rollout_stash_reapplied
+            and auto_stash_ref is not None
+        ):
+            _m()._drop_verified_stash(git_cmd, _m().PROJECT_ROOT, auto_stash_ref)
+        return result
+
     try:
 
         # Resolve the target branch up front so the fetch can be scoped to it.
@@ -6075,6 +9471,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _m()._resolve_update_branch(args)
+        if not _validate_update_branch(git_cmd, _m().PROJECT_ROOT, branch):
+            print(f"✗ Update refused: invalid or ambiguous branch name {branch!r}.")
+            sys.exit(1)
 
         # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
         # crashed fetch) before the fetch — otherwise the update fails with
@@ -6086,9 +9485,46 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if cleared:
             print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
 
+        # Pin both local and remote authority BEFORE fetch.  The fetch mutates
+        # refs/remotes/origin/<branch>; without the old SHA there is no way to
+        # distinguish a normal advance from a rewrite, and without the local
+        # SHA a concurrent actor can silently change what this transaction is
+        # about between admission and apply.
+        pre_fetch_head_tip = _resolve_commit(
+            git_cmd, _m().PROJECT_ROOT, "HEAD"
+        )
+        pre_fetch_origin_state, pre_fetch_origin_tip = _resolve_optional_commit(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            f"refs/remotes/origin/{branch}",
+        )
+        if pre_fetch_head_tip is None:
+            print("✗ Update refused: current Git HEAD could not be resolved.")
+            sys.exit(1)
+        if pre_fetch_origin_state == _REF_UNKNOWN:
+            print(
+                f"✗ Update refused: origin/{branch} tracking state could not "
+                "be resolved."
+            )
+            sys.exit(1)
+
+        import uuid as _update_uuid
+
+        remote_tracking_ref = f"refs/remotes/origin/{branch}"
+        fetch_ref = (
+            "refs/hermes-update-fetches/" + _update_uuid.uuid4().hex
+        )
+        _origin_fetch_ref = fetch_ref
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd
+            + [
+                "fetch",
+                "--no-tags",
+                "--refmap=",
+                "origin",
+                f"+refs/heads/{branch}:{fetch_ref}",
+            ],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -6097,6 +9533,57 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
+        # This invocation owns ``fetch_ref``. Resolve that immutable authority,
+        # not the mutable remote-tracking ref another process can move between
+        # fetch completion and rev-parse.
+        post_fetch_origin_tip = _resolve_commit(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            fetch_ref,
+        )
+        _origin_fetch_sha = post_fetch_origin_tip
+        if post_fetch_origin_tip is not None:
+            expected_tracking_tip = (
+                pre_fetch_origin_tip
+                if pre_fetch_origin_tip is not None
+                else "0" * len(post_fetch_origin_tip)
+            )
+            tracking_update = subprocess.run(
+                git_cmd
+                + [
+                    "update-ref",
+                    remote_tracking_ref,
+                    post_fetch_origin_tip,
+                    expected_tracking_tip,
+                ],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if tracking_update.returncode != 0:
+                print(
+                    f"✗ Update refused: origin/{branch} changed concurrently "
+                    "after fetch."
+                )
+                print("  HEAD, index, and working tree were left untouched.")
+                sys.exit(1)
+            if pre_fetch_origin_tip != post_fetch_origin_tip:
+                _origin_tracking_rollback = (
+                    remote_tracking_ref,
+                    pre_fetch_origin_state,
+                    pre_fetch_origin_tip,
+                    post_fetch_origin_tip,
+                )
+        remote_history = _classify_remote_history(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            pre_fetch_origin_tip,
+            post_fetch_origin_tip,
+        )
+        apply_origin_baseline = pre_fetch_origin_tip
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -6106,6 +9593,46 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+
+        target_ref_state, target_local_tip = _resolve_optional_commit(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            f"refs/heads/{branch}",
+        )
+        if target_ref_state == _REF_UNKNOWN:
+            print(
+                f"✗ Update refused: could not determine whether local branch "
+                f"'{branch}' exists."
+            )
+            print("  HEAD, index, and working tree were left untouched.")
+            sys.exit(1)
+        if (
+            remote_history == _REMOTE_UNKNOWN
+            and pre_fetch_origin_state == _REF_ABSENT
+        ):
+            remote_history, apply_origin_baseline = (
+                _classify_remote_without_tracking_baseline(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    target_ref_state,
+                    target_local_tip,
+                    post_fetch_origin_tip,
+                )
+            )
+        if remote_history == _REMOTE_UNKNOWN:
+            print(
+                "✗ Update refused: could not prove how origin/"
+                f"{branch} moved during fetch."
+            )
+            print("  HEAD, index, and working tree were left untouched.")
+            sys.exit(1)
+        if current_branch == branch and (
+            target_ref_state != _REF_PRESENT
+            or target_local_tip != pre_fetch_head_tip
+        ):
+            print(f"✗ Update refused: local branch '{branch}' changed during preflight.")
+            print("  HEAD, index, and working tree were left untouched.")
+            sys.exit(1)
 
         # Parked-branch guard (2026-08-17 live incident): the checkout can be
         # left parked on a stale feature branch by earlier tooling. Blindly
@@ -6136,6 +9663,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #                    stale tree.
         parked_branch_switched = False
         in_place_update = False
+        checkout_switched = False
         if current_branch != branch and current_branch != "HEAD":
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
                 git_cmd, _m().PROJECT_ROOT, current_branch, branch
@@ -6173,18 +9701,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         "Could not read updates.parked_branch_strategy: %s", exc
                     )
                 if _in_place_configured and not switch_branch:
-                    # The merge source must exist upstream; --branch typos
-                    # previously surfaced through the checkout failing, which
-                    # does not run on this path.
-                    verify_ref = subprocess.run(
-                        git_cmd + ["rev-parse", "--verify", "--quiet", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if verify_ref.returncode != 0:
-                        print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                        sys.exit(1)
                     in_place_update = True
                     print(
                         f"  ℹ On branch '{current_branch}' — updating it in place from "
@@ -6204,54 +9720,248 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"(fully merged) — switching back to {branch}..."
                 )
 
+        if remote_history == _REMOTE_REWRITTEN:
+            if current_branch == "HEAD":
+                detached_history = _classify_local_history(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_fetch_origin_tip,
+                    pre_fetch_head_tip,
+                )
+                if detached_history != _LOCAL_NONE:
+                    reason = (
+                        "carries local history"
+                        if detached_history == _LOCAL_PRESENT
+                        else "has ancestry that could not be proven"
+                    )
+                    print(
+                        f"✗ Update refused: origin/{branch} rewrote history "
+                        f"while detached HEAD {reason}."
+                    )
+                    print("  HEAD, index, and working tree were left untouched.")
+                    sys.exit(1)
+            rewrite_candidate_tip = (
+                pre_fetch_head_tip
+                if in_place_update
+                else target_local_tip
+                if target_ref_state == _REF_PRESENT
+                else None
+            )
+            rewrite_local_history = (
+                _LOCAL_NONE
+                if rewrite_candidate_tip is None
+                else _classify_local_history(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_fetch_origin_tip,
+                    rewrite_candidate_tip,
+                )
+            )
+            if rewrite_local_history != _LOCAL_NONE:
+                checkout_name = current_branch if in_place_update else branch
+                reason = (
+                    "carries local history"
+                    if rewrite_local_history == _LOCAL_PRESENT
+                    else "has ancestry that could not be proven"
+                )
+                print(
+                    f"✗ Update refused: origin/{branch} rewrote history while "
+                    f"'{checkout_name}' {reason}."
+                )
+                print("  HEAD, index, and working tree were left untouched.")
+                sys.exit(1)
+
         if not in_place_update and current_branch != branch:
+            detached_recovery_ref = None
             if current_branch == "HEAD":
                 print(
                     f"  ⚠ Currently on detached HEAD — switching to {branch} "
                     "for update..."
                 )
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
-            checkout_result = subprocess.run(
-                git_cmd + ["checkout", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
-                track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
+                # This is the actual mutation boundary: pin and re-prove the
+                # detached commit immediately before stash/checkout, rather
+                # than relying on a preflight observation made many probes ago.
+                detached_recovery_ref = _protect_detached_checkout(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_fetch_head_tip,
                 )
-                if track_result.returncode != 0:
-                    # Restore the user's prior stash before bailing
-                    # so we don't leave them stranded in a weird state.
-                    if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
-                            git_cmd,
-                            _m().PROJECT_ROOT,
-                            auto_stash_ref,
-                            prompt_user=False,
-                            input_fn=gw_input_fn,
-                        )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                    if track_result.stderr.strip():
-                        print(f"  {track_result.stderr.strip().splitlines()[0]}")
+                if detached_recovery_ref is None:
+                    print(
+                        "✗ Update refused: detached HEAD could not be pinned "
+                        "at the checkout boundary."
+                    )
                     sys.exit(1)
-        else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+                print(
+                    "  ✓ Preserved detached checkout at recovery ref: "
+                    f"{detached_recovery_ref}"
+                )
+            # Stash before checkout so uncommitted work isn't lost
+            auto_stash_ref = _stash_for_update()
+            _rollout_apply_started = bool(_rollout_config.enabled)
+            if _rollout_config.enabled and auto_stash_ref is not None:
+                _rollout_stash_deferred = True
 
-        prompt_for_restore = (
-            auto_stash_ref is not None
-            and not assume_yes
-            and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
+            if current_branch == "HEAD" and (
+                _resolve_commit(git_cmd, _m().PROJECT_ROOT, "HEAD")
+                != pre_fetch_head_tip
+                or _current_attached_branch(git_cmd, _m().PROJECT_ROOT) is not None
+                or detached_recovery_ref is None
+                or _resolve_commit(
+                    git_cmd, _m().PROJECT_ROOT, detached_recovery_ref
+                )
+                != pre_fetch_head_tip
+            ):
+                print(
+                    "✗ Update refused: detached checkout changed at the "
+                    "stash-to-checkout boundary."
+                )
+                if auto_stash_ref is not None:
+                    print(f"  Local changes remain preserved in {auto_stash_ref}.")
+                sys.exit(1)
+
+            if target_ref_state == _REF_PRESENT:
+                try:
+                    checkout_result = subprocess.run(
+                        git_cmd + ["checkout", branch],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                except OSError as checkout_exc:
+                    checkout_result = subprocess.CompletedProcess(
+                        [], 1, "", str(checkout_exc)
+                    )
+            else:
+                # Re-prove absence immediately before creation. A failed
+                # checkout is never evidence that resetting an existing branch
+                # with ``-B`` is safe.
+                reprobe_state, _ = _resolve_optional_commit(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    f"refs/heads/{branch}",
+                )
+                if reprobe_state != _REF_ABSENT:
+                    checkout_result = subprocess.CompletedProcess([], 1, "", "")
+                else:
+                    try:
+                        checkout_result = subprocess.run(
+                            git_cmd
+                            + ["checkout", "-b", branch, post_fetch_origin_tip],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                    except OSError as checkout_exc:
+                        checkout_result = subprocess.CompletedProcess(
+                            [], 1, "", str(checkout_exc)
+                        )
+
+            checkout_ok = (
+                checkout_result.returncode == 0
+                and _update_boundary_matches(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    branch,
+                    target_local_tip
+                    if target_ref_state == _REF_PRESENT
+                    else post_fetch_origin_tip,
+                )
+            )
+            if not checkout_ok:
+                original_restored = _restore_original_checkout(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    original_branch=current_branch,
+                    original_head_sha=pre_fetch_head_tip,
+                )
+                if (
+                    original_restored
+                    and auto_stash_ref is not None
+                    and not _rollout_config.enabled
+                ):
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                        restore_index=True,
+                        raise_on_unsafe=True,
+                    )
+                elif auto_stash_ref is not None:
+                    print(
+                        f"  ℹ️  Local changes remain preserved in stash "
+                        f"{auto_stash_ref}."
+                    )
+                print(f"✗ Could not safely check out local branch '{branch}'.")
+                if checkout_result.stderr.strip():
+                    print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
+            checkout_switched = True
+        else:
+            auto_stash_ref = _stash_for_update()
+            _rollout_apply_started = bool(_rollout_config.enabled)
+            if _rollout_config.enabled and auto_stash_ref is not None:
+                _rollout_stash_deferred = True
+
+        if _rollout_config.enabled and auto_stash_ref is not None:
+            # The transaction owns this stash from creation onward. Any failed
+            # candidate restores it onto the checkpoint tree before old-code
+            # health verification, regardless of the success-only keep/discard
+            # policy selected for a completed update.
+            _rollout_stash_deferred = True
+
+        prompt_for_restore = _should_prompt_for_stash_restore(
+            has_stash=auto_stash_ref is not None,
+            assume_yes=assume_yes,
+            gateway_mode=gateway_mode,
+            rollout_enabled=_rollout_config.enabled,
+            stdin_tty=sys.stdin.isatty(),
+            stdout_tty=sys.stdout.isatty(),
         )
+        expected_apply_branch = current_branch if in_place_update else branch
+
+        def _restore_pre_update_checkout() -> bool:
+            if checkout_switched:
+                return _restore_original_checkout(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    original_branch=current_branch,
+                    original_head_sha=pre_fetch_head_tip,
+                )
+            return (
+                _current_attached_branch(git_cmd, _m().PROJECT_ROOT)
+                == expected_apply_branch
+                and _resolve_commit(git_cmd, _m().PROJECT_ROOT, "HEAD")
+                == pre_fetch_head_tip
+            )
+
+        def _restore_pre_apply_stash() -> None:
+            checkout_restored = _restore_pre_update_checkout()
+            if (
+                checkout_restored
+                and auto_stash_ref is not None
+                and not _rollout_config.enabled
+            ):
+                _m()._restore_stashed_changes(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=False,
+                    input_fn=gw_input_fn,
+                    restore_index=True,
+                    raise_on_unsafe=True,
+                )
+            elif auto_stash_ref is not None:
+                print(
+                    f"  ℹ️  Local changes remain preserved in stash "
+                    f"{auto_stash_ref}."
+                )
 
         # Check if there are updates. On shallow checkouts `rev-list --count`
         # walks the truncated graph and can report the entire remote ancestry
@@ -6259,66 +9969,186 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # The zero/nonzero gate is still sound (HEAD == origin/<branch> counts
         # 0), so keep it, but treat the shallow NUMBER as unknown and recover
         # the real one via the GitHub compare API when possible.
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
+        try:
+            result = subprocess.run(
+                git_cmd
+                + ["rev-list", f"HEAD..{post_fetch_origin_tip}", "--count"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            commit_count_text = result.stdout.strip()
+            if result.returncode != 0 or not commit_count_text.isdigit():
+                raise RuntimeError("git rev-list did not return a commit count")
+            commit_count = int(commit_count_text)
+        except (OSError, ValueError, RuntimeError) as count_exc:
+            _restore_pre_apply_stash()
+            print(f"✗ Update refused: fetched commits could not be counted ({count_exc}).")
+            sys.exit(1)
+        apply_head_tip = _resolve_commit(git_cmd, _m().PROJECT_ROOT, "HEAD")
+        if apply_head_tip is None:
+            _restore_pre_apply_stash()
+            print("✗ Update refused: current Git HEAD could not be re-verified.")
+            sys.exit(1)
+        tips_equal = apply_head_tip == post_fetch_origin_tip
+        pinned_in_head = _ancestor_result(
+            git_cmd, _m().PROJECT_ROOT, post_fetch_origin_tip, apply_head_tip
         )
-        commit_count = int(result.stdout.strip())
+        if pinned_in_head not in {0, 1}:
+            _restore_pre_apply_stash()
+            print("✗ Update refused: fetched commit ancestry could not be proven.")
+            sys.exit(1)
+        checkout_is_current = _update_boundary_matches(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            expected_apply_branch,
+            apply_head_tip,
+        ) and (
+            tips_equal
+            or (remote_history == _REMOTE_ADVANCED and pinned_in_head == 0)
+        )
+        if commit_count == 0 and not checkout_is_current:
+            # ``HEAD..target`` is empty when target is an ancestor of HEAD.
+            # That is a confirmed remote rewind, not an up-to-date checkout.
+            commit_count = -1
 
-        apply_is_shallow = (
-            subprocess.run(
+        try:
+            shallow_result = subprocess.run(
                 git_cmd + ["rev-parse", "--is-shallow-repository"],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
-            == "true"
-        )
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as shallow_exc:
+            _restore_pre_apply_stash()
+            print(f"✗ Update refused: shallow state could not be read ({shallow_exc}).")
+            sys.exit(1)
+        if shallow_result.returncode != 0:
+            _restore_pre_apply_stash()
+            print("✗ Update refused: shallow repository state could not be proven.")
+            sys.exit(1)
+        apply_is_shallow = shallow_result.stdout.strip() == "true"
         if commit_count > 0 and apply_is_shallow:
             from hermes_cli.banner import _github_compare_behind
 
-            head_sha = subprocess.run(
-                git_cmd + ["rev-parse", "HEAD"],
-                cwd=_m().PROJECT_ROOT, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
-            target_sha = subprocess.run(
-                git_cmd + ["rev-parse", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
-            counted = _github_compare_behind(head_sha, target_sha)
+            try:
+                counted = _github_compare_behind(
+                    apply_head_tip, post_fetch_origin_tip
+                )
+            except Exception as compare_exc:
+                _restore_pre_apply_stash()
+                print(
+                    "✗ Update refused: shallow history could not be compared "
+                    f"safely ({compare_exc})."
+                )
+                sys.exit(1)
             # counted == 0 means local-ahead (remote tip reachable from HEAD):
             # not behind, fall through to the up-to-date path.
             commit_count = counted if counted is not None else -1
 
-        # A fork can match origin while still trailing upstream. The sync can
-        # therefore advance HEAD even though the origin comparison found no
-        # commits. Detect that BEFORE taking the no-update return so dependency
-        # refreshes, gateway restarts, AND the fleet version matrix still run
-        # for the pulled code (#73108 — previously the sync lived inside the
-        # commit_count == 0 branch, which returns immediately after: an update
-        # that pulled hundreds of upstream commits printed "Already up to
-        # date!" and verified nothing).
-        if commit_count == 0 and is_fork and branch == "main":
-            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
-            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+        fork_sync_rollback_sha = None
+        fork_sync_applied_sha = None
+        fork_sync_attempted = False
+        if (
+            checkout_is_current
+            and commit_count == 0
+            and is_fork
+            and expected_apply_branch == branch == "main"
+        ):
+            # A fork can match origin while trailing upstream. Run that
+            # fast-forward from a separately pinned upstream ref before the
+            # no-update return, but keep the pre-sync SHA as the rollback
+            # baseline for the syntax guard below.
+            fork_sync_attempted = True
+            pre_sync_sha = apply_head_tip
+            fork_moved = _sync_fork_candidate(
+                expected_branch=expected_apply_branch,
+                expected_head_sha=pre_sync_sha,
+                origin_sha=post_fetch_origin_tip,
+            )
+            post_sync_sha = _resolve_commit(
+                git_cmd, _m().PROJECT_ROOT, "HEAD"
+            )
+            if fork_moved:
+                if (
+                    post_sync_sha is None
+                    or post_sync_sha == pre_sync_sha
+                    or _ancestor_result(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        pre_sync_sha,
+                        post_sync_sha,
+                    )
+                    != 0
+                    or not _update_boundary_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        expected_apply_branch,
+                        post_sync_sha,
+                    )
+                ):
+                    print(
+                        "✗ Update stopped: the checkout changed during the "
+                        "pinned fork sync."
+                    )
+                    sys.exit(1)
+                fork_sync_rollback_sha = pre_sync_sha
+                fork_sync_applied_sha = post_sync_sha
                 synced_count = _count_commits_between(
                     git_cmd,
                     _m().PROJECT_ROOT,
                     pre_sync_sha,
                     post_sync_sha,
                 )
-                # HEAD moving is itself proof of an update. Keep the update
-                # path active even if the informational count cannot be read.
                 commit_count = max(1, synced_count)
+                apply_head_tip = post_sync_sha
+            elif not _update_boundary_matches(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                expected_apply_branch,
+                pre_sync_sha,
+            ):
+                print(
+                    "✗ Update stopped: the checkout changed while checking "
+                    "the pinned upstream state."
+                )
+                sys.exit(1)
 
-        if commit_count == 0:
+        if (
+            checkout_is_current
+            and commit_count == 0
+            and not _update_boundary_matches(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                expected_apply_branch,
+                apply_head_tip,
+            )
+        ):
+            _restore_pre_apply_stash()
+            print(
+                "✗ Update stopped: the checkout changed before the no-update "
+                "boundary."
+            )
+            sys.exit(1)
+
+        # An opted-in transaction also owns dependency repair at an unchanged
+        # HEAD.  Route that case through the normal dependency sync + canary
+        # gate instead of returning early after an unverified in-place venv
+        # mutation.  The historical fast path remains unchanged by default.
+        _rollout_dependency_only = bool(
+            _rollout_config.enabled and checkout_is_current and commit_count == 0
+        )
+        if (
+            checkout_is_current
+            and commit_count == 0
+            and not _rollout_dependency_only
+        ):
             _invalidate_update_cache()
 
             # Restore stash and switch back to original branch if we moved.
@@ -6332,6 +10162,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
+                    restore_index=True,
+                    raise_on_unsafe=True,
                 )
             if parked_branch_switched:
                 if switch_block_reason.startswith("unmerged:"):
@@ -6354,6 +10186,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
                 )
+
+            # The immutable remote generation is now accepted by the exact
+            # checkout and any transaction stash has either been restored,
+            # intentionally parked by the user, or was never created.
+            _origin_generation_committed = True
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone
@@ -6390,6 +10227,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
+            current_repair_ok = True
             if handed_off_sync or not healthy:
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
@@ -6449,12 +10287,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
                     print("✓ Dependencies repaired!")
-                    _print_update_completion("✓ Update complete!")
+                    current_repair_ok = _repair_node_deps_on_current_checkout(
+                        _print_update_completion
+                    )
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
+                    current_repair_ok = False
             else:
-                _repair_node_deps_on_current_checkout(_print_update_completion)
+                current_repair_ok = _repair_node_deps_on_current_checkout(
+                    _print_update_completion
+                )
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -6465,10 +10308,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "long-lived processes still use the previous runtime."
                 )
                 print("  Restart each of them to pick up the repaired runtime.")
+            try:
+                from hermes_cli.update_receipt import finalize_update_receipt
+
+                finalize_update_receipt(
+                    "success" if current_repair_ok else "partial",
+                    stop_reason=""
+                    if current_repair_ok
+                    else "current_checkout_dependency_or_web_repair_failed",
+                )
+            except Exception as _receipt_exc:
+                logger.debug(
+                    "Update receipt finalize (current-checkout repair) failed: %s",
+                    _receipt_exc,
+                )
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            if gateway_mode:
+                _write_gateway_update_status(0 if current_repair_ok else 1)
+            if not current_repair_ok:
+                sys.exit(1)
             return
 
-        if commit_count > 0:
+        if _rollout_dependency_only:
+            print(
+                "→ Checkout is current; verifying dependencies through the canary gate"
+            )
+        elif commit_count > 0:
             print(f"→ Found {commit_count} new commit(s)")
         else:
             # Shallow checkout, exact count unrecoverable (offline/rate-limited
@@ -6482,95 +10347,175 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # orphan merge-conflict markers in hermes_cli/config.py bricked
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
-        pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        try:
-            # Merge the ref we already fetched above (→ Fetching updates...)
-            # instead of `git pull`, which performs a SECOND network fetch of
-            # the same branch (~0.5-1.5 s of redundant round-trip per update).
-            # `merge --ff-only origin/<branch>` is byte-identical in effect to
-            # `pull --ff-only origin <branch>` given the fresh tracking ref;
-            # the divergence fallback below is unchanged.
-            pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+        # ``fork_sync_rollback_sha`` predates an origin-current/upstream-ahead
+        # fast-forward. Keep it as the syntax rollback/dependency-diff baseline,
+        # while the pinned origin apply admits against the checkout's actual
+        # current generation.
+        apply_generations = _capture_apply_generations(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            branch=expected_apply_branch,
+            fork_sync_rollback_sha=fork_sync_rollback_sha,
+            fork_sync_applied_sha=fork_sync_applied_sha,
+        )
+        if apply_generations is None:
+            _restore_pre_apply_stash()
+            print(
+                "✗ Update refused: the exact transaction-owned apply "
+                "generation could not be proven."
             )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged. Before
-                # assuming an upstream force-push, check WHY: a checkout on a
-                # custom branch (local commits on top of origin/<branch>) also
-                # cannot fast-forward, and `reset --hard` here would silently
-                # discard that work. Merge instead and stop cleanly on
-                # conflict — an update must never destroy local commits.
-                _cur_branch = (
-                    subprocess.run(
-                        git_cmd + ["branch", "--show-current"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    ).stdout
-                    or ""
-                ).strip()
-                if _cur_branch and _cur_branch != branch:
+            sys.exit(1)
+        pre_pull_sha, apply_admission_sha = apply_generations
+        restore_stash_after_apply_failure = False
+        try:
+            update_succeeded, apply_outcome = _apply_pinned_update(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                branch=expected_apply_branch,
+                local_head_sha=apply_admission_sha,
+                old_origin_sha=apply_origin_baseline,
+                new_origin_sha=post_fetch_origin_tip,
+                remote_history=remote_history,
+            )
+            if not update_succeeded:
+                target_checkout_restored = (
+                    apply_outcome != "merge_abort_failed"
+                    and apply_admission_sha is not None
+                    and _update_boundary_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        expected_apply_branch,
+                        apply_admission_sha,
+                    )
+                    and _tracked_checkout_clean(git_cmd, _m().PROJECT_ROOT)
+                )
+                if (
+                    target_checkout_restored
+                    and pre_pull_sha is not None
+                    and pre_pull_sha != apply_admission_sha
+                ):
+                    rollback_moved, _, _ = _move_attached_branch_to_pinned_commit(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        branch=expected_apply_branch,
+                        expected_old_sha=apply_admission_sha,
+                        target_sha=pre_pull_sha,
+                    )
+                    target_checkout_restored = rollback_moved
+                restore_stash_after_apply_failure = bool(
+                    target_checkout_restored and _restore_pre_update_checkout()
+                )
+                if apply_outcome.startswith("merge_conflict:"):
+                    recovery_ref = apply_outcome.split(":", 1)[1]
                     print(
-                        f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
-                        f"merging origin/{branch} instead of resetting so local commits survive..."
+                        "✗ Merge conflict between local commits and the fetched "
+                        "update; the merge was aborted."
                     )
-                    # Best-effort safety tag; recovery anchor if anything goes wrong.
-                    subprocess.run(
-                        git_cmd
-                        + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        check=False,
+                    print(f"  Recovery ref: {recovery_ref}")
+                elif apply_outcome == "rewrite_with_local_commits":
+                    print(
+                        f"✗ Update refused: origin/{branch} rewrote history and "
+                        "the checked-out branch carries local commits."
                     )
-                    merge_result = subprocess.run(
-                        git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                elif apply_outcome == "merge_abort_failed":
+                    print(
+                        "✗ Update stopped: Git could not prove that the failed "
+                        "merge was fully aborted."
                     )
-                    if merge_result.returncode != 0:
-                        subprocess.run(
-                            git_cmd + ["merge", "--abort"],
-                            cwd=_m().PROJECT_ROOT,
-                            capture_output=True,
-                            check=False,
-                        )
-                        print(
-                            "✗ Merge conflict between local commits and upstream — "
-                            "update stopped, nothing was changed."
-                        )
-                        print(
-                            f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
-                            f"git merge origin/{branch}"
-                        )
-                        print(
-                            "  Then re-run the update. Local work is untouched."
-                        )
-                        sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
                     print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                        "✗ Update refused: the pinned Git update could not be "
+                        f"applied safely ({apply_outcome})."
                     )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                if restore_stash_after_apply_failure:
+                    print("  HEAD was restored to its exact pre-apply commit.")
+                else:
+                    print("  Inspect `git status` before attempting recovery.")
+                sys.exit(1)
+
+            if apply_outcome.startswith("merged:"):
+                print(
+                    "  ✓ Merged the pinned fetched commit while preserving "
+                    "local history."
+                )
+                print(f"  Recovery ref: {apply_outcome.split(':', 1)[1]}")
+            elif apply_outcome == "rewritten_remote_adopted":
+                print(
+                    "  ⚠ Confirmed upstream history rewrite with no local "
+                    "commits; adopted the pinned fetched commit."
+                )
+            origin_applied_head_sha = _resolve_commit(
+                git_cmd, _m().PROJECT_ROOT, "HEAD"
+            )
+            if (
+                origin_applied_head_sha is None
+                or not _update_boundary_matches(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    expected_apply_branch,
+                    origin_applied_head_sha,
+                )
+            ):
+                print(
+                    "✗ Update stopped: the applied checkout changed before "
+                    "post-update validation."
+                )
+                sys.exit(1)
+
+            if (
+                is_fork
+                and expected_apply_branch == branch == "main"
+                and not fork_sync_attempted
+            ):
+                fork_sync_attempted = True
+                fork_moved = _sync_fork_candidate(
+                    expected_branch=expected_apply_branch,
+                    expected_head_sha=origin_applied_head_sha,
+                    origin_sha=post_fetch_origin_tip,
+                )
+                post_sync_head_sha = _resolve_commit(
+                    git_cmd, _m().PROJECT_ROOT, "HEAD"
+                )
+                if (
+                    post_sync_head_sha is None
+                    or not _update_boundary_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        expected_apply_branch,
+                        post_sync_head_sha,
                     )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
-                        print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                        )
-                        sys.exit(1)
+                    or (
+                        fork_moved
+                        and post_sync_head_sha == origin_applied_head_sha
+                    )
+                    or (
+                        not fork_moved
+                        and post_sync_head_sha != origin_applied_head_sha
+                    )
+                ):
+                    print(
+                        "✗ Update stopped: the checkout changed during the "
+                        "pinned fork sync."
+                    )
+                    sys.exit(1)
+
+            applied_head_sha = _resolve_commit(
+                git_cmd, _m().PROJECT_ROOT, "HEAD"
+            )
+            if (
+                applied_head_sha is None
+                or not _update_boundary_matches(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    expected_apply_branch,
+                    applied_head_sha,
+                )
+            ):
+                print(
+                    "✗ Update stopped: the final applied generation could not "
+                    "be proven before syntax validation."
+                )
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -6590,39 +10535,120 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # ~6 lines so the user sees the actual SyntaxError text.
                     for line in str(syntax_error).splitlines()[:6]:
                         print(f"    {line}")
-                if pre_pull_sha:
+                rollback_boundary_ok = bool(
+                    pre_pull_sha
+                    and _update_boundary_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        expected_apply_branch,
+                        applied_head_sha,
+                    )
+                )
+                if pre_pull_sha and rollback_boundary_ok:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
-                    rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                    rollback_verified, rollback_outcome, _ = (
+                        _move_attached_branch_to_pinned_commit(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            branch=expected_apply_branch,
+                            expected_old_sha=applied_head_sha,
+                            target_sha=pre_pull_sha,
+                        )
                     )
-                    if rollback_result.returncode == 0:
-                        print("  ✓ Rollback complete — your install is unchanged.")
-                        print("  Try ``hermes update`` again later once a fix lands.")
+                    if rollback_verified:
+                        restore_stash_after_apply_failure = (
+                            _restore_pre_update_checkout()
+                        )
+                        if restore_stash_after_apply_failure:
+                            print("  ✓ Rollback complete — your install is unchanged.")
+                            print(
+                                "  Try ``hermes update`` again later once a fix lands."
+                            )
+                        else:
+                            print(
+                                "  ✗ Commit rollback succeeded, but the original "
+                                "checkout could not be restored."
+                            )
                     else:
                         print("  ✗ Rollback failed. Recover manually with:")
-                        print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
-                        if rollback_result.stderr.strip():
-                            print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+                        print(f"    cd {_m().PROJECT_ROOT} && git switch --detach {pre_pull_sha}")
+                        print(f"    (automatic CAS rollback refused: {rollback_outcome})")
+                elif pre_pull_sha:
+                    print()
+                    print(
+                        "  Automatic rollback refused because the checked-out "
+                        "branch or HEAD changed after validation began."
+                    )
+                    print("  Concurrent work was left untouched; inspect `git status`.")
                 else:
                     print()
                     print("  Could not capture pre-pull SHA — recover manually with:")
-                    print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
+                    print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --keep <prev-sha>")
                 sys.exit(1)
 
+            if _rollout_fork_push_pending and not _rollout_config.enabled:
+                print("→ Syncing verified fork state to origin...")
+                _fork_source, _fork_lease, _fork_branch = (
+                    _rollout_fork_push_pending
+                )
+                if _m()._sync_fork_with_upstream(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    source_sha=_fork_source,
+                    expected_origin_sha=_fork_lease,
+                    expected_branch=_fork_branch,
+                ):
+                    print("  ✓ Fork synced with upstream")
+                else:
+                    print(
+                        "  ℹ Verified local update is complete, but the fork "
+                        "could not be pushed."
+                    )
+                _rollout_fork_push_pending = None
+
             update_succeeded = True
+            _origin_generation_committed = True
         finally:
             if auto_stash_ref is not None:
-                # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
                 if not update_succeeded:
+                    if (
+                        restore_stash_after_apply_failure
+                        and not _rollout_config.enabled
+                    ):
+                        restored = _m()._restore_stashed_changes(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            auto_stash_ref,
+                            prompt_user=False,
+                            input_fn=gw_input_fn,
+                            restore_index=True,
+                            raise_on_unsafe=True,
+                        )
+                        if restored:
+                            print(
+                                "  ✓ Restored the exact pre-update index and "
+                                "working tree."
+                            )
+                    else:
+                        # A rollout restores its checkpoint and transaction
+                        # stash in the outer recovery boundary.  An unverified
+                        # merge abort likewise keeps the only safe copy parked.
+                        print(
+                            "  ℹ️  Local changes preserved in stash "
+                            f"(ref: {auto_stash_ref})"
+                        )
+                        print("  Restore manually with: git stash apply --index")
+                elif _rollout_config.enabled:
+                    # The transaction applies the configured success policy at
+                    # the canary boundary. On any failure it first restores the
+                    # checkpoint, then these edits, then verifies old-code
+                    # health against the exact pre-update source tree.
+                    _rollout_stash_deferred = True
                     print(
-                        f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
+                        f"  ℹ️  Local changes held in stash until canary verification "
+                        f"(ref: {auto_stash_ref})"
                     )
-                    print("  Restore manually with: git stash apply")
                 elif discard_local_changes:
                     # Non-interactive update + user opted into discarding local
                     # source edits (updates.non_interactive_local_changes:
@@ -6644,6 +10670,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         auto_stash_ref,
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
+                        restore_index=True,
+                        raise_on_unsafe=True,
                     )
 
         _invalidate_update_cache()
@@ -6659,7 +10687,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # and post-pull HEAD; if they match, surface the no-op instead of
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if (
+            not _rollout_dependency_only
+            and pre_pull_sha
+            and post_pull_sha == pre_pull_sha
+        ):
             print()
             print("✗ Code did not move — update was a no-op.")
             print(
@@ -6714,12 +10746,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
-        _m()._record_bytecode_fingerprint()
-        _m()._refresh_bootstrap_cache_scripts(branch)
-
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+        if not _rollout_config.enabled:
+            _m()._record_bytecode_fingerprint()
+            _m()._refresh_bootstrap_cache_scripts(branch)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -6729,6 +10758,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # holds a native extension the sync must rewrite, defer NOW — after
         # the code swap, so only the dependency install is pending and the
         # next fresh launch completes it via the marker.
+        #
+        # A rollout canary must exercise one coherent final tree. Reapply an
+        # approved transaction stash before dependency resolution so local
+        # pyproject/lock/plugin edits and the candidate venv cannot skew. The
+        # stash entry itself remains durable until terminal verification.
+        if (
+            _rollout_config.enabled
+            and _rollout_stash_deferred
+            and auto_stash_ref is not None
+            and not discard_local_changes
+            and not keep_stash
+            and not _rollout_stash_applied
+        ):
+            _rollout_stash_applied = _finish_deferred_rollout_stash(
+                git_cmd=git_cmd,
+                stash_ref=auto_stash_ref,
+                discard_local_changes=False,
+                keep_stash=False,
+                prompt_for_restore=prompt_for_restore,
+                gw_input_fn=gw_input_fn,
+                defer_drop=True,
+            )
+            if not _rollout_stash_applied:
+                raise RuntimeError(
+                    "could not apply transaction autostash before dependency sync"
+                )
         _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
         #
         # Drop the core-install breadcrumb BEFORE touching the venv. If the
@@ -6740,18 +10795,51 @@ def _cmd_update_impl(args, gateway_mode: bool):
         deps_current = _editable_install_is_current(
             git_cmd, _m().PROJECT_ROOT, pre_pull_sha
         )
+        if _rollout_config.enabled:
+            deps_current = _rollout_dependency_install_is_current(
+                deps_current,
+                _checkpoint_metadata,
+                project_root=Path(_m().PROJECT_ROOT),
+            )
         if deps_current:
             print("→ Python dependencies unchanged — skipping reinstall")
         else:
             print("→ Updating Python dependencies...")
-        from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+        from hermes_cli.managed_uv import (
+            ensure_uv,
+            repair_vulnerable_runtime,
+            update_managed_uv,
+        )
 
-        # Keep managed uv current — runs `uv self update` if we already have one.
-        update_managed_uv()
+        # The managed uv binary is outside the Git+venv+dashboard checkpoint. Its
+        # self-update is independently safe, but runtime repair is not: it can
+        # replace the live venv and therefore must complete before canary.
+        if not _rollout_config.enabled:
+            update_managed_uv()
+
+        target_venv_name = str((_checkpoint_metadata or {}).get("venv_name") or "venv")
+        if _rollout_config.enabled:
+            target_venv, target_python = _prepare_rollout_target_venv(
+                Path(_m().PROJECT_ROOT), target_venv_name
+            )
+        else:
+            target_venv = Path(_m().PROJECT_ROOT) / target_venv_name
+            target_python = Path(sys.executable)
 
         uv_bin = ensure_uv()
 
-        pip_cmd = [sys.executable, "-m", "pip"]
+        if _rollout_config.enabled and uv_bin:
+            repair = repair_vulnerable_runtime(
+                str(uv_bin),
+                project_root=Path(_m().PROJECT_ROOT),
+                venv_dir=target_venv,
+            )
+            if repair.status == "failed":
+                raise RuntimeError(
+                    f"managed Python runtime repair failed: {repair.detail}"
+                )
+
+        pip_cmd = [str(target_python), "-m", "pip"]
         if not uv_bin:
             uv_bin = _ensure_uv_for_termux(pip_cmd)
         install_group = "all"
@@ -6763,7 +10851,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             from hermes_cli.managed_uv import managed_python_env
 
             uv_env = managed_python_env()
-            uv_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
+            uv_env["VIRTUAL_ENV"] = str(target_venv)
             if _m()._is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)
@@ -6777,11 +10865,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     [uv_bin, "pip"], env=uv_env, group=install_group
                 )
         else:
-            # Use sys.executable to explicitly call the venv's pip module,
+            # Use the checkpoint-recorded venv interpreter explicitly,
             # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
             # Some environments lose pip inside the venv; bootstrap it back with
             # ensurepip before trying the editable install.
-            pip_cmd = [sys.executable, "-m", "pip"]
+            pip_cmd = [str(target_python), "-m", "pip"]
             try:
                 subprocess.run(
                     pip_cmd + ["--version"],
@@ -6791,7 +10879,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
             except subprocess.CalledProcessError:
                 subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                    [
+                        str(target_python),
+                        "-m",
+                        "ensurepip",
+                        "--upgrade",
+                        "--default-pip",
+                    ],
                     cwd=_m().PROJECT_ROOT,
                     check=True,
                 )
@@ -6834,8 +10928,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
-        _m()._record_bytecode_fingerprint()
-        _m()._refresh_bootstrap_cache_scripts(branch)
+        if not _rollout_config.enabled:
+            _m()._record_bytecode_fingerprint()
+            _m()._refresh_bootstrap_cache_scripts(branch)
         _m()._reload_updated_runtime_modules()
 
         # Upgrade pip before lazy refreshes — stale pip can fail source builds
@@ -6845,11 +10940,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Lazy refresh can corrupt the venv when a backend install fails.
         # Clear the lazy marker only when refresh/repair is confirmed healthy.
-        lazy_ok = _m()._refresh_active_lazy_features(
-            install_prefix,
-            env=lazy_env,
-            features=active_lazy_features,
-        )
+        if _rollout_config.enabled:
+            lazy_ok = _m()._refresh_active_lazy_features(
+                install_prefix,
+                env=lazy_env,
+                features=active_lazy_features,
+                explicit_target=True,
+            )
+        else:
+            lazy_ok = _m()._refresh_active_lazy_features(
+                install_prefix,
+                env=lazy_env,
+                features=active_lazy_features,
+            )
         if lazy_ok:
             _m()._clear_lazy_refresh_incomplete_marker()
         else:
@@ -6867,7 +10970,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Heal the active memory provider's bridge packages last — the core
         # reinstall + lazy refresh above may have stripped or downgraded
         # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
-        _m()._refresh_active_memory_provider_dependencies()
+        if _rollout_config.enabled:
+            _m()._refresh_active_memory_provider_dependencies(
+                install_prefix,
+                env=lazy_env,
+            )
+        else:
+            _m()._refresh_active_memory_provider_dependencies()
 
         # Everything that can legitimately produce a transient ImportError has
         # now run (bytecode sweep, dependency reinstall, lazy refresh), so a
@@ -6878,7 +10987,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # next run. A destructive reset would undo a good update over a state
         # that fixes itself.
         import_ok, failing_module, import_error = _validate_critical_modules_import(
-            _m().PROJECT_ROOT
+            _m().PROJECT_ROOT,
+            venv_name=(
+                str((_checkpoint_metadata or {}).get("venv_name") or "venv")
+                if _rollout_config.enabled
+                else None
+            ),
         )
         if not import_ok:
             print()
@@ -6887,8 +11001,185 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("    Run `hermes update` again — if it persists, reinstall:")
             print("    https://hermes-agent.nousresearch.com")
 
+        # Commit the Git+venv+generated-dashboard transaction before mutating
+        # external/user state such as Node dependency and Desktop build
+        # artifacts, bundled skills, profile .envs, or config migrations.
+        # Those operations are outside the checkpoint; running them first
+        # could leave old code beside new UI or config state after a failed
+        # canary.
+        _early_rollout_restart_result = None
+        if _rollout_config.enabled:
+            from hermes_cli.update_receipt import (
+                finalize_update_receipt,
+                record_canary,
+                record_rollback,
+            )
+            from hermes_cli.update_rollout import (
+                RolloutExecutionError,
+                capture_git_mutation_boundary,
+                restore_checkpoint,
+                run_canary_rollout,
+            )
+
+            _target_sha = _capture_head_sha(["git"], _m().PROJECT_ROOT)
+            if not _target_sha or _rollout_checkpoint is None:
+                raise RuntimeError("canary rollout cannot prove target SHA/checkpoint")
+
+            print()
+            print(
+                f"→ Canary [{_rollout_config.canary_profile}] first at "
+                f"{_target_sha[:12]}"
+            )
+
+            _early_rollout_git_boundary = None
+
+            def _restore_early_rollout(_checkpoint):
+                restored = restore_checkpoint(
+                    _checkpoint,
+                    Path(_m().PROJECT_ROOT),
+                    transaction_owned_reset=True,
+                    expected_git_boundary=_early_rollout_git_boundary,
+                )
+                _after_rollout_restore()
+                restored["stash_reapplied"] = _rollout_stash_reapplied
+                return restored
+
+            if (
+                _rollout_stash_deferred
+                and auto_stash_ref is not None
+                and not discard_local_changes
+                and not keep_stash
+                and not _rollout_stash_applied
+            ):
+                _rollout_stash_applied = _finish_deferred_rollout_stash(
+                    git_cmd=git_cmd,
+                    stash_ref=auto_stash_ref,
+                    discard_local_changes=False,
+                    keep_stash=False,
+                    prompt_for_restore=prompt_for_restore,
+                    gw_input_fn=gw_input_fn,
+                    defer_drop=True,
+                )
+
+            _early_rollout_git_boundary = capture_git_mutation_boundary(
+                Path(_m().PROJECT_ROOT)
+            )
+
+            try:
+                _early_rollout_restart_result = run_canary_rollout(
+                    _pre_update_plan,
+                    expected_sha=_target_sha,
+                    checkpoint=_rollout_checkpoint,
+                    config=_rollout_config,
+                    project_root=Path(_m().PROJECT_ROOT),
+                    rollback=_restore_early_rollout,
+                    rollback_git_boundary=_early_rollout_git_boundary,
+                    prequiesced_profiles=list(
+                        _preapply_quiesce.get("quiesced_profiles", [])
+                    ),
+                )
+                _rollout_transaction_terminal = True
+            except RolloutExecutionError as _rollout_exc:
+                _rollout_transaction_terminal = True
+                record_canary(**_rollout_exc.result)
+                _rollback = _rollout_exc.result.get("rollback", {})
+                if (
+                    _rollout_stash_deferred
+                    and auto_stash_ref is not None
+                    and not _rollback.get("stash_reapplied")
+                ):
+                    _rollback["verified"] = False
+                    _rollback.setdefault("errors", []).append({
+                        "profile": "transaction-autostash",
+                        "error": (
+                            "old fleet restarted, but local changes remain "
+                            f"parked in stash {auto_stash_ref}"
+                        ),
+                    })
+                record_rollback(**_rollback)
+                # The coordinator has completed its one recovery attempt.
+                # Commit that state before touching the durable stash so an
+                # interrupt cannot trigger a second hard-reset compensation.
+                if (
+                    _rollback.get("verified")
+                    and _rollback.get("stash_reapplied")
+                    and auto_stash_ref is not None
+                ):
+                    _m()._drop_verified_stash(
+                        git_cmd, _m().PROJECT_ROOT, auto_stash_ref
+                    )
+                elif auto_stash_ref is not None:
+                    print(
+                        f"  ℹ️  Local changes remain safely parked in "
+                        f"stash {auto_stash_ref}."
+                    )
+                finalize_update_receipt(
+                    "failed", stop_reason="canary_gate_failed_rollback_attempted"
+                )
+                _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                if gateway_mode:
+                    _write_gateway_update_status(1)
+                raise SystemExit(1) from _rollout_exc
+
+            record_canary(**_early_rollout_restart_result)
+            record_rollback(
+                attempted=False,
+                restored=False,
+                reason="canary rollout healthy",
+            )
+            # The verified generation is now committed. Stash disposition is
+            # a best-effort post-commit cleanup, never a rollback trigger.
+            try:
+                from hermes_cli.update_rollout import prune_checkpoints_after_commit
+
+                prune_checkpoints_after_commit(
+                    _rollout_checkpoint,
+                    keep=_rollout_config.checkpoint_keep,
+                )
+            except Exception as checkpoint_prune_exc:
+                logger.debug(
+                    "Could not apply checkpoint retention after commit: %s",
+                    checkpoint_prune_exc,
+                )
+            if _rollout_fork_push_pending:
+                print("→ Syncing verified fork state to origin...")
+                _fork_source, _fork_lease, _fork_branch = (
+                    _rollout_fork_push_pending
+                )
+                if _m()._sync_fork_with_upstream(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    source_sha=_fork_source,
+                    expected_origin_sha=_fork_lease,
+                    expected_branch=_fork_branch,
+                ):
+                    print("  ✓ Fork synced with upstream")
+                else:
+                    print(
+                        "  ℹ Verified local update is complete, but the fork "
+                        "could not be pushed."
+                    )
+            print(
+                f"  ✓ Canary healthy; rollout completed in "
+                f"{len(_early_rollout_restart_result.get('batches', []))} batch(es)"
+            )
+            if _rollout_stash_deferred and auto_stash_ref is not None:
+                if discard_local_changes:
+                    _m()._park_stashed_changes(
+                        auto_stash_ref,
+                        reason="concurrency-safe discard deferral",
+                    )
+                elif keep_stash:
+                    _m()._park_stashed_changes(auto_stash_ref)
+                elif _rollout_stash_applied:
+                    _m()._drop_verified_stash(
+                        git_cmd, _m().PROJECT_ROOT, auto_stash_ref
+                    )
+            _m()._record_bytecode_fingerprint()
+            _m()._refresh_bootstrap_cache_scripts(branch)
+
         node_failures = _update_node_dependencies()
-        _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+        web_build_ok = _build_web_ui_for_update()
 
         desktop_build_ok = _rebuild_desktop_after_update(
             desktop_dir,
@@ -7307,6 +11598,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         _print_update_summary(
             node_failures=node_failures,
+            web_build_ok=web_build_ok,
             desktop_build_ok=desktop_build_ok,
             pre_update_version=pre_update_version,
         )
@@ -7426,20 +11718,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # fallback ``systemctl restart`` path (see below) kills everything in
         # the cgroup (KillMode=mixed → SIGKILL to remaining processes),
         # including us and the wrapping bash shell.  The shell never reaches
-        # its ``printf $status > .update_exit_code`` epilogue, so the
-        # exit-code marker file would never be created.  The new gateway's
-        # update watcher would then poll for 30 minutes and send a spurious
-        # timeout message.
+        # its terminal-status epilogue, so the correlation-scoped marker file
+        # would never be created. The new gateway's update watcher would then
+        # continue waiting without a terminal outcome.
         #
         # Writing the marker here — after git pull + pip install succeed but
         # before we attempt the restart — ensures the new gateway sees it
-        # regardless of how we die. Gated on desktop_build_ok (#88251): a
-        # Desktop rebuild failure must not be reported as "0" — the gateway's
-        # /update watcher (gateway/run.py) polls this file.
+        # regardless of how we die. Gate on every post-apply build: neither a
+        # stale dashboard bundle nor a stale Desktop build may be reported as
+        # "0" to the gateway's receipt watcher (#82614/#88251).
+        post_apply_builds_ok = bool(
+            not node_failures and web_build_ok and desktop_build_ok
+        )
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            if not _rollout_config.enabled:
+                _write_gateway_update_exit_code(post_apply_builds_ok)
 
-        gateway_fleet_restart_incomplete = False
+        gateway_fleet_restart_incomplete = not post_apply_builds_ok
         # Snapshot of gateways running before we touch anything. Stays empty
         # until we successfully import the probe and are about to stop/drain —
         # so an exception raised before we touch any gateway keeps this empty
@@ -7458,6 +11753,50 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # freshly-restarted gateways to settle, and the phase's except
         # path forwards it to the update receipt.
         killed_pids: set = set()
+        failed_or_stale_units: list = []
+        relaunched_profiles: list = []
+        externally_supervised_profiles: list = []
+        _rollout_restart_result = _early_rollout_restart_result
+        _postcommit_rollout_restart_result = None
+
+        if _rollout_config.enabled and _early_rollout_restart_result is not None:
+            # Config/profile/skill migrations intentionally commit after the
+            # transactional canary. Restart and health-gate the complete fleet once
+            # more so the final persisted state—not merely the pre-migration
+            # process state—is what the receipt verifies.
+            from hermes_cli.update_receipt import record_canary
+            from hermes_cli.update_rollout import quiesce_restart_and_verify_fleet
+
+            _final_rollout_sha = _capture_head_sha(["git"], _m().PROJECT_ROOT)
+            if not _final_rollout_sha:
+                _postcommit_rollout_restart_result = {
+                    "verified": False,
+                    "errors": [
+                        {
+                            "profile": "fleet",
+                            "error": "could not capture final rollout SHA",
+                        }
+                    ],
+                }
+            else:
+                _postcommit_rollout_restart_result = quiesce_restart_and_verify_fleet(
+                    _pre_update_plan,
+                    expected_sha=_final_rollout_sha,
+                    config=_rollout_config,
+                    project_root=Path(_m().PROJECT_ROOT),
+                )
+            _postcommit_rollout_restart_result["post_commit"] = True
+            record_canary(post_commit_restart=_postcommit_rollout_restart_result)
+            _rollout_restart_result = _postcommit_rollout_restart_result
+            if not _postcommit_rollout_restart_result.get("verified", False):
+                gateway_fleet_restart_incomplete = True
+                print(
+                    "  ✗ Final fleet restart did not verify migrated "
+                    "configuration on every profile."
+                )
+
+        class _CanaryRestartHandled(Exception):
+            """Internal control flow: skip the historical restart block."""
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
@@ -7470,7 +11809,51 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # ImportError and abort this whole phase (2026-08-20 field failure:
         # new gateway.py ← stale cli_output missing line_input).
         _m()._purge_stale_hermes_modules()
+
+        if (
+            _rollout_config.enabled
+            and _rollout_restart_result is not None
+            and (
+                _rollout_restart_result is _early_rollout_restart_result
+                or _rollout_restart_result is _postcommit_rollout_restart_result
+            )
+        ):
+            from hermes_cli.update_receipt import record_gateway_restart
+
+            restarted_services = list(
+                _rollout_restart_result.get("restarted_services", [])
+            )
+            killed_pids = set(_rollout_restart_result.get("killed_pids", []))
+            relaunched_profiles = list(
+                _rollout_restart_result.get("relaunched_profiles", [])
+            )
+            externally_supervised_profiles = list(
+                _rollout_restart_result.get(
+                    "externally_supervised_profiles", []
+                )
+            )
+            _pre_restart_gateway_pids = [
+                int(runtime.pid)
+                for runtime in (_pre_update_plan.runtimes or [])
+                if getattr(runtime, "kind", "") == "gateway"
+                and getattr(runtime, "pid", None) is not None
+            ]
+            record_gateway_restart(
+                restarted_services=restarted_services,
+                relaunched_profiles=relaunched_profiles,
+                externally_supervised_profiles=externally_supervised_profiles,
+                killed_pids=sorted(killed_pids),
+                failed_units=[],
+                incomplete=not bool(_rollout_restart_result.get("verified")),
+                phase_error=(
+                    "post-commit fleet verification failed"
+                    if not _rollout_restart_result.get("verified")
+                    else None
+                ),
+            )
         try:
+            if _rollout_restart_result is not None:
+                raise _CanaryRestartHandled()
             from hermes_cli.gateway import (
                 is_macos,
                 supports_systemd_services,
@@ -8142,11 +12525,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if failed_or_stale_units:
                 gateway_fleet_restart_incomplete = True
                 if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    _write_gateway_update_status(1)
             _warn_incomplete_gateway_fleet_restart(failed_or_stale_units)
 
             try:
@@ -8209,6 +12588,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except Exception as _sweep_exc:
                 logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 
+        except _CanaryRestartHandled:
+            pass
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
             # An exception escaping the whole phase means the drain/restart
@@ -8228,11 +12609,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 gateway_fleet_restart_incomplete = True
                 _warn_gateway_restart_phase_aborted(e, _surviving)
                 if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    _write_gateway_update_status(1)
             try:
                 from hermes_cli.update_receipt import record_gateway_restart
 
@@ -8278,14 +12655,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Restart a managed dashboard through systemd, or stop stale manual
         # dashboard processes. Raw-killing a systemd-owned dashboard PID makes
         # systemd treat it as a clean stop, leaving the Cloudflare origin dead.
-        # Preserve the safety rule above: a failed Node refresh leaves the
-        # currently running dashboard untouched.
+        # Preserve the safety rule above: a failed Node refresh or web build
+        # leaves the currently running dashboard untouched.
         #
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
         _finish_dashboard_update_cleanup(
-            node_failures, already_restarted_units=set(restarted_services)
+            node_failures,
+            already_restarted_units=set(restarted_services),
+            web_build_ok=web_build_ok,
         )
 
         print()
@@ -8397,24 +12776,176 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Code update itself succeeded, but at least one gateway still
             # runs pre-update modules — surface that as a failed update so
             # automation / operators do not treat the fleet as healthy.
+            if gateway_mode:
+                _write_gateway_update_status(1)
             sys.exit(1)
+        if gateway_mode:
+            _write_gateway_update_status(0)
 
+    except SystemExit as e:
+        # Legacy early exits inside the apply block predate the transaction
+        # layer. Compensate code *or dependency* mutation, and restart a fleet
+        # that was drained before an otherwise pre-mutation refusal. Paths
+        # already finalized by the canary coordinator are left alone.
+        if (
+            _rollout_config.enabled
+            and not _rollout_transaction_terminal
+            and _rollout_checkpoint
+        ):
+            try:
+                from hermes_cli.update_receipt import (
+                    finalize_update_receipt,
+                    record_rollback,
+                )
+
+                _exit_rollback = _recover_current_rollout(
+                    f"early exit {e.code} inside rollout transaction"
+                )
+                record_rollback(**_exit_rollback)
+                finalize_update_receipt(
+                    "failed", stop_reason="canary_early_exit_compensated"
+                )
+            except Exception as _exit_rollback_exc:
+                try:
+                    record_rollback(
+                        attempted=True,
+                        restored=False,
+                        verified=False,
+                        reason=f"early exit {e.code} inside rollout transaction",
+                        error=str(_exit_rollback_exc),
+                    )
+                except Exception:
+                    pass
+        raise
+    except KeyboardInterrupt:
+        if (
+            _rollout_config.enabled
+            and not _rollout_transaction_terminal
+            and _rollout_checkpoint
+        ):
+            try:
+                from hermes_cli.update_receipt import (
+                    finalize_update_receipt,
+                    record_rollback,
+                )
+
+                _interrupt_rollback = _recover_current_rollout(
+                    "keyboard interrupt inside rollout transaction"
+                )
+                record_rollback(**_interrupt_rollback)
+                finalize_update_receipt(
+                    "failed", stop_reason="canary_interrupt_compensated"
+                )
+            except Exception as _interrupt_rollback_exc:
+                try:
+                    record_rollback(
+                        attempted=True,
+                        restored=False,
+                        verified=False,
+                        reason="keyboard interrupt inside rollout transaction",
+                        error=str(_interrupt_rollback_exc),
+                    )
+                except Exception:
+                    pass
+        raise
     except _shim_quarantine_error_type() as e:
         # Fail-closed shim contention (#87331): strict quarantine refused
         # BEFORE any installer ran — defer via marker, exit 2, no ZIP.
+        if _rollout_config.enabled and not _rollout_transaction_terminal:
+            from hermes_cli.update_receipt import (
+                finalize_update_receipt,
+                record_rollback,
+            )
+
+            try:
+                _shim_rollback = _recover_current_rollout(
+                    "shim quarantine failed inside rollout transaction"
+                )
+            except Exception as _shim_rollback_exc:
+                _shim_rollback = {
+                    "attempted": True,
+                    "restored": False,
+                    "verified": False,
+                    "reason": "shim quarantine failed inside rollout transaction",
+                    "error": str(_shim_rollback_exc),
+                }
+            record_rollback(**_shim_rollback)
+            finalize_update_receipt(
+                "failed", stop_reason="canary_shim_quarantine_failed"
+            )
+            if gateway_mode:
+                _write_gateway_update_status(1)
+            sys.exit(1)
         _refuse_update_for_contended_shims(e)
     except subprocess.CalledProcessError as e:
         stage = _format_update_failure_stage(e)
+        if _rollout_config.enabled and not _rollout_transaction_terminal:
+            from hermes_cli.update_receipt import (
+                finalize_update_receipt,
+                record_rollback,
+            )
+
+            print(f"✗ {stage}: {e}")
+            _print_called_process_error_tail(e)
+            _apply_rollback: dict = {
+                "attempted": False,
+                "restored": False,
+                "verified": False,
+                "reason": f"apply failure: {stage}",
+            }
+            try:
+                _apply_rollback = _recover_current_rollout(f"apply failure: {stage}")
+            except Exception as _apply_rollback_exc:
+                _apply_rollback.update({
+                    "attempted": True,
+                    "restored": False,
+                    "verified": False,
+                    "error": (
+                        f"{type(_apply_rollback_exc).__name__}: {_apply_rollback_exc}"
+                    ),
+                })
+            record_rollback(**_apply_rollback)
+            if _apply_rollback.get("verified"):
+                print(
+                    "  ✓ Previous generation restored/verified; no ZIP fallback used."
+                )
+            else:
+                print(
+                    "  ✗ Previous generation rollback is unverified; recover manually."
+                )
+            finalize_update_receipt(
+                "failed", stop_reason="canary_apply_failed_rollback_attempted"
+            )
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            if gateway_mode:
+                _write_gateway_update_status(1)
+            sys.exit(1)
+        if _rollout_config.enabled and _rollout_transaction_terminal:
+            print(f"✗ Post-canary update step failed: {stage}: {e}")
+            _print_called_process_error_tail(e)
+            try:
+                from hermes_cli.update_receipt import finalize_update_receipt
+
+                finalize_update_receipt(
+                    "partial", stop_reason="post_canary_step_failed"
+                )
+            except Exception:
+                pass
+            if gateway_mode:
+                _write_gateway_update_status(1)
+            sys.exit(1)
         if _should_zip_fallback_on_update_error(e):
             print(f"⚠ {stage}: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            desktop_build_ok = _update_via_zip(
+            update_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
             if gateway_mode:
-                _write_gateway_update_exit_code(desktop_build_ok)
+                _write_gateway_update_exit_code(update_build_ok)
+            if not update_build_ok:
+                sys.exit(1)
         else:
             print(f"✗ {stage}: {e}")
             _print_called_process_error_tail(e)
@@ -8437,6 +12968,118 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except Exception:
                 pass
             sys.exit(1)
+    except Exception as e:
+        if not _rollout_config.enabled or _rollout_transaction_terminal:
+            raise
+        print(
+            f"✗ Unexpected failure inside canary transaction: {type(e).__name__}: {e}"
+        )
+        _unexpected_rollback: dict = {
+            "attempted": True,
+            "restored": False,
+            "verified": False,
+            "reason": "unexpected exception inside rollout transaction",
+        }
+        try:
+            _unexpected_rollback = _recover_current_rollout(
+                "unexpected exception inside rollout transaction"
+            )
+        except Exception as _unexpected_rollback_exc:
+            _unexpected_rollback["error"] = (
+                f"{type(_unexpected_rollback_exc).__name__}: {_unexpected_rollback_exc}"
+            )
+        try:
+            from hermes_cli.update_receipt import (
+                finalize_update_receipt,
+                record_canary,
+                record_rollback,
+            )
+
+            record_canary(
+                enabled=True,
+                status="failed",
+                error=f"{type(e).__name__}: {e}",
+            )
+            record_rollback(**_unexpected_rollback)
+            finalize_update_receipt(
+                "failed", stop_reason="canary_unexpected_exception_compensated"
+            )
+        except Exception as _receipt_exc:
+            logger.error(
+                "Could not persist unexpected rollout failure receipt: %s",
+                _receipt_exc,
+            )
+        if _unexpected_rollback.get("verified"):
+            print("  ✓ Previous generation restored and verified.")
+        else:
+            print("  ✗ Previous generation recovery is unverified; recover manually.")
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        if gateway_mode:
+            _write_gateway_update_status(1)
+        raise SystemExit(1) from e
+    except BaseException as e:
+        if (
+            _rollout_config.enabled
+            and not _rollout_transaction_terminal
+            and _rollout_checkpoint
+        ):
+            try:
+                from hermes_cli.update_receipt import (
+                    finalize_update_receipt,
+                    record_rollback,
+                )
+
+                _base_rollback = _recover_current_rollout(
+                    f"{type(e).__name__} inside rollout transaction"
+                )
+                record_rollback(**_base_rollback)
+                finalize_update_receipt(
+                    "failed", stop_reason="canary_base_exception_compensated"
+                )
+            except Exception as recovery_exc:
+                logger.error(
+                    "Could not compensate %s inside rollout transaction: %s",
+                    type(e).__name__,
+                    recovery_exc,
+                )
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            if gateway_mode:
+                _write_gateway_update_status(1)
+        raise
+    finally:
+        if (
+            _origin_tracking_rollback is not None
+            and not _origin_generation_committed
+        ):
+            (
+                _tracking_ref,
+                _tracking_old_state,
+                _tracking_old_sha,
+                _tracking_new_sha,
+            ) = _origin_tracking_rollback
+            if not _rollback_ref_update(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                ref=_tracking_ref,
+                old_state=_tracking_old_state,
+                old_sha=_tracking_old_sha,
+                new_sha=_tracking_new_sha,
+            ):
+                logger.warning(
+                    "Could not CAS-restore %s after the update refused; a "
+                    "concurrent ref generation was left untouched",
+                    _tracking_ref,
+                )
+        if _origin_fetch_ref is not None and not _cleanup_owned_fetch_ref(
+            git_cmd,
+            _m().PROJECT_ROOT,
+            _origin_fetch_ref,
+            _origin_fetch_sha,
+        ):
+            logger.warning(
+                "Could not safely remove private update fetch ref %s",
+                _origin_fetch_ref,
+            )
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 

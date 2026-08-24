@@ -7,8 +7,10 @@ integration (install on join, play routing, ack) is tested with the standard
 ``object.__new__(DiscordAdapter)`` helper used elsewhere in the voice suite.
 """
 
+import logging
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -137,6 +139,57 @@ class TestPlayInVoiceChannelMixerPath:
         adapter._reset_voice_timeout.assert_called_once_with(111)
         # Legacy path must NOT have been used.
         vc.play.assert_not_called()
+
+
+class TestVoiceCallbackErrorRedaction:
+    @pytest.mark.asyncio
+    async def test_voice_mixer_callback_emits_redacted_error(self, caplog):
+        from plugins.platforms.discord import adapter as adapter_module
+
+        adapter = _make_adapter()
+        adapter._get_ambient_pcm = MagicMock(return_value=None)
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+
+        with caplog.at_level(logging.ERROR, logger=adapter_module.logger.name):
+            await adapter._install_voice_mixer(111, vc)
+            callback = vc.play.call_args.kwargs["after"]
+            callback(RuntimeError("DISCORD_TOKEN=voice-mixer-callback-secret"))
+
+        assert "DISCORD_TOKEN=***" in caplog.text
+        assert "voice-mixer-callback-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_legacy_voice_playback_callback_emits_redacted_error(
+        self, caplog, monkeypatch
+    ):
+        from plugins.platforms.discord import adapter as adapter_module
+
+        adapter = _make_adapter()
+        adapter._voice_clients[111] = MagicMock()
+        vc = adapter._voice_clients[111]
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        adapter._playback_timeout_for_audio = AsyncMock(return_value=1.0)
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+
+        source = object()
+        fake_discord = SimpleNamespace(
+            FFmpegPCMAudio=MagicMock(return_value=source),
+            PCMVolumeTransformer=MagicMock(side_effect=lambda value, volume: value),
+        )
+        monkeypatch.setattr(adapter_module, "discord", fake_discord)
+        monkeypatch.setattr(adapter_module, "resolve_ffmpeg_executable", lambda: "ffmpeg")
+        vc.play.side_effect = lambda _source, after: after(
+            RuntimeError("DISCORD_TOKEN=voice-playback-callback-secret")
+        )
+
+        with caplog.at_level(logging.ERROR, logger=adapter_module.logger.name):
+            assert await adapter.play_in_voice_channel(111, "/tmp/x.mp3") is True
+
+        assert "DISCORD_TOKEN=***" in caplog.text
+        assert "voice-playback-callback-secret" not in caplog.text
 
 
 class TestLeadSilence:

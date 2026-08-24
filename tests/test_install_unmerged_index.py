@@ -1,4 +1,4 @@
-"""Regression: installer fails when the existing checkout has an unmerged index.
+"""Regression: installers must fail closed on a pre-existing unmerged index.
 
 A previously interrupted update can leave ``$INSTALL_DIR`` with unmerged index
 entries (files in a conflicted, "needs merge" state). In that state the update
@@ -7,13 +7,13 @@ path's ``git stash`` aborts with "could not write index" and the following
 first" -- surfacing to GUI/bootstrap users as ``git checkout main failed
 (exit 1)`` and failing the whole install at the repository stage.
 
-The ``hermes update`` Python path already clears the conflict with ``git reset``
-before stashing (#4735); both installer scripts must do the same.
+An unmerged index cannot be represented losslessly by ``git stash``. Both
+installers therefore refuse before stash/checkout rather than resetting away
+the user's in-progress conflict resolution.
 """
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,25 +40,6 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _extract_autostash_block() -> str:
-    """Pull the autostash if-block from install.sh's update_repo()."""
-    text = INSTALL_SH.read_text()
-    m = re.search(
-        r'local autostash_ref="".*?\n            fi\n',
-        text,
-        re.DOTALL,
-    )
-    assert m is not None, "autostash block not found in install.sh"
-    return m.group(0)
-
-
-def _extract_install_sh_function(name: str) -> str:
-    text = INSTALL_SH.read_text()
-    match = re.search(rf"{name}\(\) \{{.*?\n\}}", text, re.DOTALL)
-    assert match is not None, f"{name}() not found in install.sh"
-    return match.group(0)
-
-
 def _make_unmerged_repo(repo: Path) -> None:
     """Leave ``repo`` with a conflicted (unmerged) index, as an interrupted
     update would."""
@@ -66,6 +47,11 @@ def _make_unmerged_repo(repo: Path) -> None:
     (repo / "f.txt").write_text("base\n")
     _git(repo, "add", "f.txt")
     _git(repo, "commit", "-m", "base")
+    _git(repo, "branch", "-M", "main")
+    remote = repo.parent / "origin.git"
+    _git(repo.parent, "init", "--bare", str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-u", "origin", "main")
     # Capture the default branch name only after the first commit exists
     # (rev-parse on an unborn HEAD errors).
     start = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
@@ -84,8 +70,18 @@ def _make_unmerged_repo(repo: Path) -> None:
     _git(repo, "merge", "feature", check=False)
 
 
-@pytest.mark.live_system_guard_bypass  # runs against a dedicated throwaway repo
-def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
+def _unmerged_snapshot(repo: Path) -> tuple[str, str, str, bytes, str]:
+    return (
+        _git(repo, "rev-parse", "HEAD").stdout.strip(),
+        _git(repo, "status", "--porcelain=v1", "-z").stdout,
+        _git(repo, "ls-files", "--stage").stdout,
+        (repo / "f.txt").read_bytes(),
+        _git(repo, "stash", "list", "--format=%H%x09%gs").stdout,
+    )
+
+
+@pytest.mark.live_system_guard_bypass
+def test_install_sh_refuses_unmerged_index_without_mutation(tmp_path: Path) -> None:
     repo = tmp_path / "hermes-agent"
     repo.mkdir()
     _make_unmerged_repo(repo)
@@ -95,61 +91,53 @@ def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
         "test setup failed to produce an unmerged index"
     )
 
-    block = _extract_autostash_block()
-    script = (
-        "set -e\n"
-        'log_info() { echo "INFO: $*"; }\n'
-        f'INSTALL_DIR="{repo}"\n'
-        f"{_extract_install_sh_function('discard_update_lockfile_churn')}\n"
-        "run() {\n"
-        f"{block}"
-        "}\n"
-        "run\n"
-        "echo BLOCK_OK\n"
-    )
+    before = _unmerged_snapshot(repo)
     res = subprocess.run(
-        ["bash", "-c", script], cwd=repo, capture_output=True, text=True
+        [
+            "bash",
+            "-c",
+            'installer=$1; repo=$2; set --; source "$installer"; '
+            'update_managed_checkout "$repo" main',
+            "unmerged-test",
+            str(INSTALL_SH),
+            str(repo),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
     )
 
-    # The block must complete (previously `git stash` failed with "could not
-    # write index" on the unmerged tree).
-    assert res.returncode == 0, res.stderr
-    assert "BLOCK_OK" in res.stdout
-    assert "Clearing unmerged index entries" in res.stdout
+    assert res.returncode != 0
+    assert "unresolved conflicts" in res.stdout
+    assert _unmerged_snapshot(repo) == before
 
-    # The conflict state is gone ...
-    assert _git(repo, "ls-files", "--unmerged").stdout.strip() == "", (
-        "unmerged entries should have been cleared"
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="needs PowerShell",
+)
+def test_install_ps1_refuses_unmerged_index_without_mutation(tmp_path: Path) -> None:
+    repo = tmp_path / "hermes-agent"
+    repo.mkdir()
+    _make_unmerged_repo(repo)
+    before = _unmerged_snapshot(repo)
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". '{INSTALL_PS1}'; "
+        f"Update-ManagedCheckout -Repo '{repo}' -Branch main"
     )
-    # ... and the local changes were preserved in a stash, not discarded.
-    assert _git(repo, "stash", "list").stdout.strip(), (
-        "local changes should be preserved in a stash"
+
+    res = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=repo,
+        capture_output=True,
+        text=True,
     )
 
-
-def test_install_ps1_clears_unmerged_index_before_stash() -> None:
-    """install.ps1 must clear an unmerged index before stash/checkout, and do
-    so *before* the stash push (order matters — the fix is a no-op otherwise)."""
-    text = INSTALL_PS1.read_text()
-    assert "ls-files --unmerged" in text, (
-        "install.ps1 must detect an unmerged index before updating"
-    )
-    idx_unmerged = text.index("ls-files --unmerged")
-    idx_reset = text.index("reset -q", idx_unmerged)
-    idx_stash = text.index("stash push --include-untracked")
-    assert idx_unmerged < idx_stash, (
-        "the unmerged-index clear must run before `git stash push`"
-    )
-    assert idx_reset < idx_stash, "`git reset` must run before `git stash push`"
-
-
-def test_install_sh_clears_unmerged_index_before_stash_source_order() -> None:
-    """Same ordering contract for install.sh's source."""
-    text = INSTALL_SH.read_text()
-    assert "ls-files --unmerged" in text
-    idx_unmerged = text.index("ls-files --unmerged")
-    idx_stash = text.index("stash push --include-untracked")
-    assert idx_unmerged < idx_stash
+    assert res.returncode != 0
+    assert _unmerged_snapshot(repo) == before
 
 
 def test_install_ps1_stops_venv_resident_processes_before_parking_venv() -> None:

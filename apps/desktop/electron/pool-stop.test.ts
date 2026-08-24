@@ -113,6 +113,25 @@ test('stopAll stops every pooled backend and resolves after all exits', async ()
   assert.equal(settled, true)
 })
 
+test('stopAll joins a backend already evicted into an in-flight stop', async () => {
+  const { addChild, exitResolvers, pool, stopper } = harness()
+  const child = addChild('already-stopping')
+  const first = stopper.stop('already-stopping')
+
+  assert.equal(pool.size, 0)
+  let allSettled = false
+  const all = stopper.stopAll().then(() => {
+    allSettled = true
+  })
+
+  await Promise.resolve()
+  assert.equal(allSettled, false, 'global teardown must join the evicted stop')
+
+  exitResolvers.get(child)?.()
+  await Promise.all([first, all])
+  assert.equal(allSettled, true)
+})
+
 test('a respawn can await the in-flight stop before reusing the key', async () => {
   const { addChild, exitResolvers, stopper } = harness()
   const child = addChild('selena')

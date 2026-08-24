@@ -41,15 +41,26 @@ import os
 import platform
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
 SPAWN_ENV_VAR = "HERMES_SPAWN"
 _TAG_VERSION = "v1"
 LEDGER_FILENAME = "spawn-ledger.json"
+LEDGER_LOCK_TIMEOUT_SECONDS = 2.0
 
 #: Purposes a reaper may treat as "safe to kill when the owner is gone".
 #: Interactive processes (chat, REPLs) are deliberately NOT in this set.
@@ -151,6 +162,10 @@ def parse_spawn_tag(raw: object) -> Optional[SpawnTag]:
 # Layer 2 — spawn ledger
 # ---------------------------------------------------------------------------
 
+class LedgerLockUnavailable(RuntimeError):
+    """The shared spawn ledger could not be locked safely."""
+
+
 @dataclass
 class LedgerEntry:
     pid: int
@@ -163,6 +178,53 @@ class LedgerEntry:
     argv: str
 
 
+_SENSITIVE_ARG_NAMES = frozenset(
+    {
+        "--api-key",
+        "--apikey",
+        "--token",
+        "--access-token",
+        "--refresh-token",
+        "--password",
+        "--passwd",
+        "--secret",
+        "--client-secret",
+        "--authorization",
+        "--auth-token",
+    }
+)
+
+
+def redact_argv(argv: object) -> list[str]:
+    """Return argv-shaped diagnostics with credential values removed."""
+    if not isinstance(argv, (list, tuple)):
+        return []
+    safe: list[str] = []
+    redact_next = False
+    for raw in argv:
+        token = str(raw)
+        lowered = token.split("=", 1)[0].lower()
+        if redact_next:
+            safe.append("[REDACTED]")
+            redact_next = False
+            continue
+        if lowered in _SENSITIVE_ARG_NAMES:
+            safe.append(token if "=" not in token else f"{lowered}=[REDACTED]")
+            if "=" not in token:
+                redact_next = True
+            continue
+        if "=" in token and lowered.split(".")[-1] in {
+            "api_key", "apikey", "token", "password", "secret", "authorization"
+        }:
+            safe.append(f"{token.split('=', 1)[0]}=[REDACTED]")
+            continue
+        if any(marker in lowered for marker in ("api_key", "apikey", "access_token", "refresh_token", "client_secret")):
+            safe.append("[REDACTED]")
+            continue
+        safe.append(token)
+    return safe
+
+
 def _ledger_path() -> Path:
     """Machine-root ledger path (shared by every profile of this install)."""
     try:
@@ -173,6 +235,68 @@ def _ledger_path() -> Path:
         from hermes_cli.config import get_hermes_home
 
         return Path(get_hermes_home()) / LEDGER_FILENAME
+
+
+def _ledger_lock_path(path: Path) -> Path:
+    """Persistent sibling lock; never lock the replaceable ledger itself."""
+    return path.with_suffix(path.suffix + ".lock")
+
+
+@contextmanager
+def _ledger_transaction_lock(path: Path):
+    """Acquire the shared ledger lock or fail closed.
+
+    Read-modify-replace is never allowed outside this cross-process lock.  A
+    missing locking backend, unsafe topology, open failure, or timeout is a
+    refusal rather than permission to continue unlocked.
+    """
+    if fcntl is None and msvcrt is None:
+        raise LedgerLockUnavailable("no cross-process ledger lock backend")
+
+    lock_path = _ledger_lock_path(path)
+    try:
+        from hermes_cli.update_rollout import validate_no_reparse_topology
+
+        validate_no_reparse_topology(path.parent)
+        validate_no_reparse_topology(path)
+        validate_no_reparse_topology(lock_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        validate_no_reparse_topology(lock_path)
+        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+            lock_path.write_text(" ", encoding="utf-8")
+        lock_file = lock_path.open("r+" if msvcrt else "a+", encoding="utf-8")
+    except LedgerLockUnavailable:
+        raise
+    except Exception as exc:
+        raise LedgerLockUnavailable(f"ledger lock initialization failed: {exc}") from exc
+
+    with lock_file:
+        deadline = time.monotonic() + LEDGER_LOCK_TIMEOUT_SECONDS
+        acquired = False
+        while not acquired:
+            try:
+                if fcntl:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except (BlockingIOError, OSError, PermissionError) as exc:
+                if time.monotonic() >= deadline:
+                    raise LedgerLockUnavailable("spawn ledger lock timed out") from exc
+                time.sleep(0.05)
+
+        try:
+            yield
+        finally:
+            try:
+                if fcntl:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                else:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                logger.debug("spawn ledger lock release failed", exc_info=True)
 
 
 def _read_ledger(path: Path) -> Optional[list[dict]]:
@@ -265,35 +389,40 @@ def register_self(purpose: str, *, project_root: Optional[Path] = None) -> bool:
     try:
         import sys as _sys
 
-        entry.argv = " ".join(_sys.argv[:6])
+        entry.argv = " ".join(redact_argv(_sys.argv[:6]))
     except Exception:
         pass
 
     path = _ledger_path()
-    with _LEDGER_LOCK:
-        entries = _read_ledger(path)
-        if entries is None:
-            _quarantine_ledger(path)
-            entries = []
-        pruned: list[dict] = []
-        for e in entries:
-            pid = e.get("pid")
-            if not isinstance(pid, int) or pid == entry.pid:
-                continue
-            alive = _pid_alive_matches(pid, e.get("create_time"))
-            if alive is False:
-                continue  # provably dead → prune
-            pruned.append(e)
-        pruned.append(asdict(entry))
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
-            tmp.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
-            return True
-        except OSError:
-            logger.debug("spawn ledger write failed", exc_info=True)
-            return False
+    try:
+        with _LEDGER_LOCK:
+            with _ledger_transaction_lock(path):
+                entries = _read_ledger(path)
+                if entries is None:
+                    _quarantine_ledger(path)
+                    entries = []
+                pruned: list[dict] = []
+                for e in entries:
+                    pid = e.get("pid")
+                    if not isinstance(pid, int) or pid == entry.pid:
+                        continue
+                    alive = _pid_alive_matches(pid, e.get("create_time"))
+                    if alive is False:
+                        continue  # provably dead → prune
+                    pruned.append(e)
+                pruned.append(asdict(entry))
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+                    tmp.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
+                    os.replace(tmp, path)
+                    return True
+                except OSError:
+                    logger.debug("spawn ledger write failed", exc_info=True)
+                    return False
+    except LedgerLockUnavailable as exc:
+        logger.warning("spawn ledger update refused: %s", exc)
+        return False
 
 
 def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
@@ -307,11 +436,16 @@ def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
     """
     want_install = install_id(project_root)
     path = _ledger_path()
-    with _LEDGER_LOCK:
-        entries = _read_ledger(path)
-        if entries is None:
-            _quarantine_ledger(path)
-            return []
+    try:
+        with _LEDGER_LOCK:
+            with _ledger_transaction_lock(path):
+                entries = _read_ledger(path)
+                if entries is None:
+                    _quarantine_ledger(path)
+                    return []
+    except LedgerLockUnavailable as exc:
+        logger.warning("spawn ledger read refused: %s", exc)
+        return []
     out: list[dict] = []
     for e in entries:
         if e.get("install") != want_install:

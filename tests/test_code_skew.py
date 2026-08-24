@@ -58,15 +58,15 @@ class TestModelSwitchSkewGuard:
         monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
         assert slash_commands._model_switch_skew_guard() is None
 
-    def test_guard_message_names_revs_and_restart(self, monkeypatch):
+    def test_guard_returns_revs_and_restart_signal(self, monkeypatch):
         from gateway import slash_commands
 
         monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
-        msg = slash_commands._model_switch_skew_guard()
-        assert msg is not None
-        assert "abc1234567" in msg
-        assert "def4567890" in msg
-        assert "hermes gateway restart" in msg
+        skew = slash_commands._model_switch_skew_guard()
+        assert skew is not None
+        assert skew.gateway_code_sha == "abc1234567"
+        assert skew.checkout_code_sha == "def4567890"
+        assert skew.gateway_restart_required is True
 
 
 class TestDashboardCodeSkewGuard:

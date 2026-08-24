@@ -488,6 +488,277 @@ function Write-Err {
     Write-Host "[X] $Message" -ForegroundColor Red
 }
 
+# Resolve the install-wide update lock root. Named profiles share one checkout,
+# so <root>\profiles\<name> must never receive a profile-private lock.
+function Get-InstallerUpdateRoot {
+    $candidate = [System.IO.Path]::GetFullPath($HermesHome)
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $nativeRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "hermes"))
+        $prefix = $nativeRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        if (($candidate -eq $nativeRoot) -or `
+            $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $nativeRoot
+        }
+    }
+
+    $parent = Split-Path -Parent $candidate
+    if ((Split-Path -Leaf $parent) -eq "profiles") {
+        return (Split-Path -Parent $parent)
+    }
+    return $candidate
+}
+
+function Test-InstallerReparsePoint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    } catch {
+        throw "Could not validate update-lock path $Path`: $_"
+    }
+}
+
+function Open-InstallerMarkerMutex {
+    param([Parameter(Mandatory = $true)][string]$MarkerPath)
+
+    $mutexPath = "$MarkerPath.mutex"
+    if ((Test-InstallerReparsePoint -Path (Split-Path -Parent $MarkerPath)) -or `
+        (Test-InstallerReparsePoint -Path $MarkerPath) -or `
+        (Test-InstallerReparsePoint -Path $mutexPath)) {
+        throw "The update marker path contains a reparse point; refusing to mutate it."
+    }
+
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    try {
+        $stream = [System.IO.File]::Open(
+            $mutexPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            $share
+        )
+    } catch {
+        throw "Could not open update marker mutex $mutexPath`: $_"
+    }
+
+    try {
+        if ($stream.Length -eq 0) {
+            $stream.WriteByte(0)
+            $stream.Flush($true)
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds(2)
+        while ($true) {
+            try {
+                $stream.Lock(0, 1)
+                return $stream
+            } catch [System.IO.IOException] {
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    throw "Timed out locking update marker mutex $mutexPath"
+                }
+                Start-Sleep -Milliseconds 50
+            }
+        }
+    } catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Close-InstallerMarkerMutex {
+    param($Stream)
+
+    if (-not $Stream) { return }
+    try { $Stream.Unlock(0, 1) } catch {}
+    $Stream.Dispose()
+}
+
+function Read-InstallerUpdateMarker {
+    param([Parameter(Mandatory = $true)][string]$MarkerPath)
+
+    if (-not (Test-Path -LiteralPath $MarkerPath)) {
+        return [PSCustomObject]@{ State = "absent"; Raw = ""; Pid = 0; Lease = 0 }
+    }
+    if (Test-InstallerReparsePoint -Path $MarkerPath) {
+        return [PSCustomObject]@{ State = "unavailable"; Raw = ""; Pid = 0; Lease = 0 }
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($MarkerPath)
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $raw = $utf8.GetString($bytes)
+    } catch {
+        return [PSCustomObject]@{ State = "unavailable"; Raw = ""; Pid = 0; Lease = 0 }
+    }
+
+    $match = [Regex]::Match($raw, '\A([1-9][0-9]*)\r?\n([0-9]+)(?:\r?\n)?\z')
+    if (-not $match.Success) {
+        return [PSCustomObject]@{ State = "malformed"; Raw = $raw; Pid = 0; Lease = 0 }
+    }
+    $pidValue = [uint64]0
+    $leaseValue = [uint64]0
+    if ((-not [uint64]::TryParse($match.Groups[1].Value, [ref]$pidValue)) -or `
+        (-not [uint64]::TryParse($match.Groups[2].Value, [ref]$leaseValue)) -or `
+        ($pidValue -gt [uint32]::MaxValue) -or `
+        ($leaseValue -gt 9007199254740991)) {
+        return [PSCustomObject]@{ State = "malformed"; Raw = $raw; Pid = 0; Lease = 0 }
+    }
+    return [PSCustomObject]@{
+        State = "present"
+        Raw = $raw
+        Pid = [uint32]$pidValue
+        Lease = [uint64]$leaseValue
+    }
+}
+
+function Test-InstallerPidAlive {
+    param([Parameter(Mandatory = $true)][uint32]$ProcessId)
+
+    try {
+        $null = Get-Process -Id $ProcessId -ErrorAction Stop
+        return $true
+    } catch {
+        if ($_.FullyQualifiedErrorId -like "NoProcessFoundForGivenId*") {
+            return $false
+        }
+        # Access-denied and indeterminate probes fail closed.
+        return $true
+    }
+}
+
+function Get-InstallerParentPid {
+    param([Parameter(Mandatory = $true)][uint32]$ProcessId)
+
+    try {
+        $proc = Get-CimInstance -ClassName Win32_Process `
+            -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($proc) { return [uint32]$proc.ParentProcessId }
+    } catch {
+        try {
+            $proc = Get-WmiObject -Class Win32_Process `
+                -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+            if ($proc) { return [uint32]$proc.ParentProcessId }
+        } catch {}
+    }
+    return [uint32]0
+}
+
+function Test-InstallerAncestorPid {
+    param([Parameter(Mandatory = $true)][uint32]$CandidatePid)
+
+    $cursor = [uint32]$PID
+    $seen = New-Object 'System.Collections.Generic.HashSet[uint32]'
+    for ($depth = 0; $depth -lt 64; $depth++) {
+        $parent = Get-InstallerParentPid -ProcessId $cursor
+        if ($parent -eq 0) { return $false }
+        if ($parent -eq $CandidatePid) { return $true }
+        if (-not $seen.Add($parent)) { return $false }
+        $cursor = $parent
+    }
+    return $false
+}
+
+function Enter-InstallerUpdateLock {
+    $root = Get-InstallerUpdateRoot
+    try {
+        [System.IO.Directory]::CreateDirectory($root) | Out-Null
+    } catch {
+        throw "Could not create update-lock directory $root`: $_"
+    }
+    $markerPath = Join-Path $root ".hermes-update-in-progress"
+    $mutex = Open-InstallerMarkerMutex -MarkerPath $markerPath
+    try {
+        $state = Read-InstallerUpdateMarker -MarkerPath $markerPath
+        if (($state.State -eq "malformed") -or ($state.State -eq "unavailable")) {
+            throw "The shared update marker is malformed or unreadable; refusing to update."
+        }
+        if ($state.State -eq "present") {
+            if (Test-InstallerPidAlive -ProcessId $state.Pid) {
+                $handoffPid = [uint32]0
+                $handoffMatches = (
+                    [uint32]::TryParse($env:HERMES_UPDATE_HANDOFF_PID, [ref]$handoffPid) `
+                    -and ($handoffPid -eq $state.Pid)
+                )
+                if (($state.Pid -eq [uint32]$PID) -or $handoffMatches -or `
+                    (Test-InstallerAncestorPid -CandidatePid $state.Pid)) {
+                    return [PSCustomObject]@{
+                        MarkerPath = $markerPath
+                        Payload = $state.Raw
+                        Borrowed = $true
+                    }
+                }
+                $script:InstallerLockContended = $true
+                throw "Another Hermes update is already running (pid $($state.Pid))."
+            }
+
+            # Only a strict, confirmed-dead snapshot can be reclaimed. Re-read
+            # its exact payload while holding the shared mutex before unlinking.
+            $current = Read-InstallerUpdateMarker -MarkerPath $markerPath
+            if (($current.State -ne "present") -or ($current.Raw -ne $state.Raw)) {
+                throw "The shared update marker changed during dead-owner cleanup."
+            }
+            [System.IO.File]::Delete($markerPath)
+        }
+
+        $lease = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $payload = "$PID`n$lease`n"
+        $tmp = "$markerPath.$PID.$([Guid]::NewGuid().ToString('N')).claim"
+        try {
+            $encoding = New-Object System.Text.UTF8Encoding($false)
+            $bytes = $encoding.GetBytes($payload)
+            $file = New-Object System.IO.FileStream(
+                $tmp,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $file.Write($bytes, 0, $bytes.Length)
+                $file.Flush($true)
+            } finally {
+                $file.Dispose()
+            }
+            # File.Move is an atomic no-replace publication when source and
+            # destination share a directory. Readers never observe a partial file.
+            [System.IO.File]::Move($tmp, $markerPath)
+        } finally {
+            if (Test-Path -LiteralPath $tmp) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $claimed = Read-InstallerUpdateMarker -MarkerPath $markerPath
+        if (($claimed.State -ne "present") -or ($claimed.Raw -ne $payload)) {
+            throw "The shared update marker claim could not be verified."
+        }
+        return [PSCustomObject]@{
+            MarkerPath = $markerPath
+            Payload = $payload
+            Borrowed = $false
+        }
+    } finally {
+        Close-InstallerMarkerMutex -Stream $mutex
+    }
+}
+
+function Exit-InstallerUpdateLock {
+    param($Lock)
+
+    if ((-not $Lock) -or $Lock.Borrowed) { return }
+    $mutex = $null
+    try {
+        $mutex = Open-InstallerMarkerMutex -MarkerPath $Lock.MarkerPath
+        $current = Read-InstallerUpdateMarker -MarkerPath $Lock.MarkerPath
+        if (($current.State -eq "present") -and `
+            ($current.Raw -eq $Lock.Payload) -and `
+            ($current.Pid -eq [uint32]$PID)) {
+            [System.IO.File]::Delete($Lock.MarkerPath)
+        }
+    } catch {
+        Write-Warn "Could not release the shared update marker safely: $_"
+    } finally {
+        Close-InstallerMarkerMutex -Stream $mutex
+    }
+}
+
 function Invoke-NativeWithRelaxedErrorAction {
     param([scriptblock]$Script)
 
@@ -502,37 +773,9 @@ function Invoke-NativeWithRelaxedErrorAction {
 function Discard-LockfileChurn {
     param([string]$Repo = $InstallDir)
 
-    if (-not $Repo -or -not (Test-Path (Join-Path $Repo ".git"))) { return }
-
-    try {
-        $diff = & git -c windows.appendAtomically=false -C $Repo diff --name-only 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $diff) { return }
-
-        $dirtyPackageDirs = [System.Collections.Generic.HashSet[string]]::new(
-            [System.StringComparer]::OrdinalIgnoreCase
-        )
-        foreach ($path in $diff) {
-            if ($path -like "*package.json") {
-                $null = $dirtyPackageDirs.Add((Split-Path $path -Parent))
-            }
-        }
-
-        $dirtyLocks = [System.Collections.Generic.List[string]]::new()
-        foreach ($path in $diff) {
-            if ($path -notlike "*package-lock.json") { continue }
-            $lockDir = Split-Path $path -Parent
-            if ($dirtyPackageDirs.Contains($lockDir)) { continue }
-            $dirtyLocks.Add($path)
-        }
-
-        if ($dirtyLocks.Count -eq 0) { return }
-        & git -c windows.appendAtomically=false -C $Repo checkout -- @($dirtyLocks) 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Info "Discarded npm lockfile churn ($($dirtyLocks.Count) file(s))"
-        }
-    } catch {
-        # Best-effort only; never let cleanup block the installer update path.
-    }
+    # Compatibility no-op. A lockfile-only edit is indistinguishable from
+    # intentional user work across staged/unstaged index generations.
+    $null = $Repo
 }
 # Inspect npm output for a TLS-trust failure and, if found, print actionable
 # remediation. npm/Node surface corporate MITM proxies and missing root CAs as
@@ -1995,8 +2238,1524 @@ function Install-SystemPackages {
 # Installation
 # ============================================================================
 
+# Resolve a ref to an exact commit ID.  Update decisions must never be made
+# from a symbolic ref that can move between the safety check and the mutation.
+function Resolve-ManagedGitCommit {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Ref
+    )
+
+    $resolved = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            rev-parse --verify "$Ref^{commit}" 2>$null
+    )
+    if (($LASTEXITCODE -ne 0) -or ($resolved.Count -ne 1)) { return $null }
+
+    $sha = $resolved[0].ToString().Trim()
+    if ($sha -notmatch '^[0-9a-fA-F]{40,64}$') { return $null }
+    return $sha.ToLowerInvariant()
+}
+
+function Assert-ManagedBranchName {
+    param([Parameter(Mandatory = $true)][string]$Branch)
+
+    if ([string]::IsNullOrWhiteSpace($Branch) -or $Branch.StartsWith("-")) {
+        throw "Invalid branch name '$Branch'; refusing to update."
+    }
+    $null = & git -c windows.appendAtomically=false check-ref-format `
+        --branch $Branch 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Invalid branch name '$Branch'; refusing to update."
+    }
+}
+
+function Assert-ManagedCommitPin {
+    param([Parameter(Mandatory = $true)][string]$Commit)
+
+    if ($Commit -notmatch '^[0-9a-fA-F]{40,64}$') {
+        throw "-Commit must be a full hexadecimal commit ID."
+    }
+}
+
+function Assert-ManagedTagName {
+    param([Parameter(Mandatory = $true)][string]$Tag)
+
+    if ([string]::IsNullOrWhiteSpace($Tag) -or $Tag.StartsWith("-")) {
+        throw "Invalid tag name '$Tag'; refusing to update."
+    }
+    $null = & git -c windows.appendAtomically=false check-ref-format `
+        "refs/tags/$Tag" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Invalid tag name '$Tag'; refusing to update."
+    }
+}
+
+# Preserve all three merge-base outcomes: 0 means ancestor, 1 means confirmed
+# non-ancestor, and anything else is an operational/graph error.  Callers must
+# fail closed on the third state instead of treating it as a force-push.
+function Get-ManagedGitAncestorStatus {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Ancestor,
+        [Parameter(Mandatory = $true)][string]$Descendant
+    )
+
+    $null = & git -c windows.appendAtomically=false -C $Repo `
+        merge-base --is-ancestor $Ancestor $Descendant 2>$null
+    return [int]$LASTEXITCODE
+}
+
+function Test-ManagedExactMergeCommit {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$MergeCommit,
+        [Parameter(Mandatory = $true)][string]$FirstParent,
+        [Parameter(Mandatory = $true)][string]$SecondParent
+    )
+
+    $line = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            rev-list --parents -n 1 $MergeCommit 2>$null
+    )
+    if (($LASTEXITCODE -ne 0) -or ($line.Count -ne 1)) { return $false }
+    $parts = @($line[0].ToString().Trim() -split '\s+')
+    return (
+        ($parts.Count -eq 3) `
+        -and ($parts[0].ToLowerInvariant() -eq $MergeCommit) `
+        -and ($parts[1].ToLowerInvariant() -eq $FirstParent) `
+        -and ($parts[2].ToLowerInvariant() -eq $SecondParent)
+    )
+}
+
+function Get-ManagedCurrentBranch {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    $branch = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            symbolic-ref --quiet --short HEAD 2>$null
+    )
+    if (($LASTEXITCODE -ne 0) -or ($branch.Count -ne 1)) { return "" }
+    return $branch[0].ToString().Trim()
+}
+
+function Get-ManagedCommitRefState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Ref
+    )
+
+    $null = & git -c windows.appendAtomically=false -C $Repo `
+        show-ref --verify --quiet $Ref 2>$null
+    $existsStatus = $LASTEXITCODE
+    if ($existsStatus -eq 1) {
+        return [PSCustomObject]@{ State = "absent"; Sha = "" }
+    }
+    if ($existsStatus -ne 0) {
+        return [PSCustomObject]@{ State = "unknown"; Sha = "" }
+    }
+    $listed = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            show-ref --verify --hash $Ref 2>$null
+    )
+    if (($LASTEXITCODE -ne 0) -or ($listed.Count -ne 1)) {
+        return [PSCustomObject]@{ State = "unknown"; Sha = "" }
+    }
+
+    $sha = $listed[0].ToString().Trim().ToLowerInvariant()
+    if ($sha -notmatch '^[0-9a-f]{40,64}$') {
+        return [PSCustomObject]@{ State = "unknown"; Sha = "" }
+    }
+    if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $sha) -ne $sha) {
+        return [PSCustomObject]@{ State = "unknown"; Sha = "" }
+    }
+    return [PSCustomObject]@{ State = "present"; Sha = $sha }
+}
+
+function Get-ManagedLocalBranchState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Branch
+    )
+
+    return (Get-ManagedCommitRefState -Repo $Repo -Ref "refs/heads/$Branch")
+}
+
+function Test-ManagedExpectedCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Branch,
+        [Parameter(Mandatory = $true)][string]$Head
+    )
+
+    return (
+        (Get-ManagedCurrentBranch -Repo $Repo) -eq $Branch `
+        -and (Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -eq $Head
+    )
+}
+
+function Assert-ManagedCheckoutGeneration {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [string]$ExpectedBranch,
+        [Parameter(Mandatory = $true)][string]$ExpectedHead,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+
+    $actualHead = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+    $actualBranch = Get-ManagedCurrentBranch -Repo $Repo
+    $detachedStateValid = $true
+    if (-not $ExpectedBranch) {
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            symbolic-ref --quiet HEAD 2>$null
+        $detachedStateValid = ($LASTEXITCODE -eq 1)
+    }
+    if (($actualHead -eq $ExpectedHead) -and `
+        ($actualBranch -eq $ExpectedBranch) -and $detachedStateValid) {
+        return
+    }
+
+    $unexpectedRef = ""
+    if ($actualHead) {
+        $unexpectedRef = New-ManagedUpdateRecoveryRef `
+            -Repo $Repo -Head $actualHead
+    }
+    $suffix = if ($unexpectedRef) {
+        " Unexpected HEAD retained at $unexpectedRef."
+    } else {
+        " Unexpected HEAD could not be pinned; leave the repository untouched."
+    }
+    throw "$Context changed from branch '$ExpectedBranch' at $ExpectedHead to branch '$actualBranch' at '$actualHead'.$suffix"
+}
+
+function Assert-ManagedSwitchSourceGeneration {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$ExpectedHead
+    )
+
+    $previous = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD@{1}"
+    if ($previous -eq $ExpectedHead) { return }
+    $unexpectedRef = ""
+    if ($previous) {
+        $unexpectedRef = New-ManagedUpdateRecoveryRef `
+            -Repo $Repo -Head $previous
+    }
+    $suffix = if ($unexpectedRef) {
+        " Intervening HEAD retained at $unexpectedRef."
+    } else {
+        " The intervening HEAD generation could not be pinned."
+    }
+    throw "Checkout source changed during branch switch.$suffix"
+}
+
+function Test-ManagedNoMergeMetadata {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    $null = & git -c windows.appendAtomically=false -C $Repo `
+        rev-parse --verify --quiet MERGE_HEAD 2>$null
+    if ($LASTEXITCODE -ne 1) { return $false }
+
+    $unmerged = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            ls-files --unmerged 2>$null
+    )
+    if (($LASTEXITCODE -ne 0) -or `
+        (-not [string]::IsNullOrWhiteSpace(($unmerged -join "`n")))) {
+        return $false
+    }
+
+    return $true
+}
+
+function Test-ManagedCleanMergeState {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    if (-not (Test-ManagedNoMergeMetadata -Repo $Repo)) { return $false }
+
+    $trackedStatus = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            status --porcelain --untracked-files=no 2>$null
+    )
+    return (
+        ($LASTEXITCODE -eq 0) `
+        -and [string]::IsNullOrWhiteSpace(($trackedStatus -join "`n"))
+    )
+}
+
+function New-ManagedUpdateRecoveryRef {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Head
+    )
+
+    $shortHead = $Head.Substring(0, [Math]::Min(12, $Head.Length))
+    $zeroOid = "0" * $Head.Length
+    $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss-fff")
+
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $suffix = if ($attempt -eq 0) { "" } else { "-$attempt" }
+        $recoveryRef = "refs/hermes-update-backups/pre-update-$stamp-$shortHead$suffix"
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            update-ref $recoveryRef $Head $zeroOid 2>$null
+        if ($LASTEXITCODE -ne 0) { continue }
+
+        $verified = Resolve-ManagedGitCommit -Repo $Repo -Ref $recoveryRef
+        if ($verified -eq $Head) { return $recoveryRef }
+        throw "Recovery ref $recoveryRef could not be verified; refusing to merge."
+    }
+
+    throw "Could not create a verified recovery ref; refusing to merge."
+}
+
+function New-ManagedStashRecoveryRef {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$StashSha
+    )
+
+    $shortSha = $StashSha.Substring(0, [Math]::Min(12, $StashSha.Length))
+    $zeroOid = "0" * $StashSha.Length
+    $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss-fff")
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $suffix = if ($attempt -eq 0) { "" } else { "-$attempt" }
+        $recoveryRef = "refs/hermes-update-stashes/install-$stamp-$shortSha$suffix"
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            update-ref $recoveryRef $StashSha $zeroOid 2>$null
+        if ($LASTEXITCODE -ne 0) { continue }
+        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $recoveryRef) -eq $StashSha) {
+            return $recoveryRef
+        }
+        throw "Autostash recovery ref $recoveryRef could not be verified."
+    }
+    throw "Could not create a durable ref for autostash $StashSha."
+}
+
+function Remove-ManagedStashRecoveryRef {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)]$Stash
+    )
+
+    if (-not $Stash.RecoveryRef) { return $true }
+    $state = Get-ManagedCommitRefState -Repo $Repo -Ref $Stash.RecoveryRef
+    if (($state.State -ne "present") -or ($state.Sha -ne $Stash.Sha)) {
+        return $false
+    }
+    $null = & git -c windows.appendAtomically=false -C $Repo `
+        update-ref -d $Stash.RecoveryRef $Stash.Sha 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    return ((Get-ManagedCommitRefState `
+        -Repo $Repo -Ref $Stash.RecoveryRef).State -eq "absent")
+}
+
+function Save-ManagedAutostash {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    # A unique marker lets us find our exact reflog entry even if another
+    # process creates a stash between `stash push` and inspection.  Never
+    # assume that refs/stash or stash@{0} still names the stash we created.
+    $stashMarker = "hermes-install-autostash-" + [Guid]::NewGuid().ToString("N")
+    Write-Info "Local changes detected, stashing before update..."
+    $stashOutput = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            stash push --include-untracked -m $stashMarker 2>&1
+    )
+    $pushExit = $LASTEXITCODE
+    # Inspect the unique marker even on non-zero exit: Git can create a
+    # complete stash and then fail while sweeping an undeletable untracked file.
+    $stash = Find-ManagedAutostash -Repo $Repo -Marker $stashMarker
+    if ($stash) {
+        $stashRecoveryRef = New-ManagedStashRecoveryRef `
+            -Repo $Repo -StashSha $stash.Sha
+        $stash = [PSCustomObject]@{
+            Sha = $stash.Sha
+            Marker = $stash.Marker
+            RecoveryRef = $stashRecoveryRef
+        }
+    }
+    if ($pushExit -ne 0) {
+        foreach ($line in $stashOutput) {
+            if ($line -and $line.ToString().Trim()) { Write-Host $line }
+        }
+        if ($stash) {
+            throw "Local changes were saved in immutable stash $($stash.Sha) and durable ref $($stash.RecoveryRef), but worktree cleanup failed. No checkout update was attempted."
+        }
+        throw "Could not stash local changes; no checkout update was attempted."
+    }
+
+    if (-not $stash) {
+        throw "Local changes were stashed with marker '$stashMarker', but its exact entry could not be resolved. No checkout update was attempted."
+    }
+    return $stash
+}
+
+function Find-ManagedAutostash {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Marker,
+        [string]$StashSha = ""
+    )
+
+    $entries = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            stash list '--format=%H%x09%gs' 2>$null
+    )
+    if ($LASTEXITCODE -ne 0) { return $null }
+
+    $subjectPattern = "(^|: )" + [Regex]::Escape($Marker) + '$'
+    foreach ($entry in $entries) {
+        $parts = $entry.ToString() -split "`t", 2
+        if ($parts.Count -ne 2) { continue }
+        $sha = $parts[0].Trim().ToLowerInvariant()
+        $subject = $parts[1].Trim()
+        if ($sha -notmatch '^[0-9a-f]{40,64}$') { continue }
+        if ($subject -notmatch $subjectPattern) { continue }
+        if ($StashSha -and ($sha -ne $StashSha)) { continue }
+        return [PSCustomObject]@{
+            Sha = $sha
+            Marker = $Marker
+        }
+    }
+    return $null
+}
+
+# Apply the exact stash commit with --index so staged and unstaged state is
+# reconstructed, not flattened into an all-unstaged worktree. Git exposes no
+# atomic "drop this stash iff it still has SHA X" operation, so the backup is
+# deliberately retained instead of resolving a mutable selector and racing a
+# concurrent stash push.
+function Restore-ManagedAutostash {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)]$Stash
+    )
+
+    if (-not (Test-ManagedCleanMergeState -Repo $Repo)) {
+        Write-Warn "Refusing to apply the autostash onto a dirty or unresolved checkout."
+        Write-Info "Immutable stash retained: $($Stash.Sha)"
+        return $false
+    }
+
+    Write-Info "Restoring local changes..."
+    $restoreOutput = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            stash apply --index $Stash.Sha 2>&1
+    )
+    $restoreExit = $LASTEXITCODE
+    $conflictedFiles = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            diff --name-only --diff-filter=U 2>$null
+    ) | Where-Object { $_ -and $_.ToString().Trim() }
+
+    if (($restoreExit -eq 0) -and ($conflictedFiles.Count -eq 0)) {
+        Write-Warn "The immutable autostash backup was retained after restoration."
+        Write-Info "Backup stash commit: $($Stash.Sha)"
+        if (-not (Remove-ManagedStashRecoveryRef -Repo $Repo -Stash $Stash)) {
+            Write-Warn "The redundant hidden recovery ref could not be removed safely."
+            Write-Info "After verifying the stash, remove it exactly with:"
+            Write-Info "  git update-ref -d $($Stash.RecoveryRef) $($Stash.Sha)"
+        }
+        Write-Info "Check git status before removing its matching stash-list entry manually."
+        return $true
+    }
+
+    Write-Err "Update pulled new code, but restoring local changes hit conflicts."
+    foreach ($line in $restoreOutput) {
+        if ($line -and $line.ToString().Trim()) { Write-Host $line }
+    }
+    if ($conflictedFiles.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Conflicted files:"
+        foreach ($file in $conflictedFiles) { Write-Host "  - $file" }
+    }
+    Write-Host ""
+    Write-Info "Your stashed changes are preserved -- nothing is lost."
+    Write-Info "  Stash commit: $($Stash.Sha)"
+    Write-Info "  Stash marker: $($Stash.Marker)"
+    Write-Info "  Durable recovery ref: $($Stash.RecoveryRef)"
+    Write-Info "  Exact ref cleanup after recovery: git update-ref -d $($Stash.RecoveryRef) $($Stash.Sha)"
+    # A failed apply can have installed a mix of staged, unstaged, untracked,
+    # and conflicted paths. Any automated reset would need a generation proof
+    # Git cannot provide across those surfaces. Leave the exact partial state
+    # visible, retain the immutable backup, and stop the installer.
+    Write-Warn "The conflicted worktree was left intact for manual recovery."
+    Write-Info "Restore your changes later with: git stash apply --index $($Stash.Sha)"
+    return $false
+}
+
+function Restore-ManagedOriginalCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$OriginalHead,
+        [string]$OriginalBranch,
+        [Parameter(Mandatory = $true)][string]$TargetBranch,
+        [Parameter(Mandatory = $true)][string]$TargetHead,
+        [switch]$AllowTargetRollback,
+        [switch]$TargetWasCreated,
+        [string]$RecoveryRef = "",
+        [string]$OriginalRecoveryRef = "",
+        [string]$OwnedTargetHead = ""
+    )
+
+    # Never auto-abort a failed merge or stash apply. Either can contain a mix
+    # of late user edits and transaction output that no Git command can
+    # generation-prove. A conflicted or dirty tree is retained for recovery.
+    if (-not (Test-ManagedCleanMergeState -Repo $Repo)) { return $false }
+    if ($RecoveryRef -and `
+        ((Resolve-ManagedGitCommit -Repo $Repo -Ref $RecoveryRef) -ne $TargetHead)) {
+        return $false
+    }
+    if ($OriginalRecoveryRef -and `
+        ((Resolve-ManagedGitCommit -Repo $Repo -Ref $OriginalRecoveryRef) -ne $OriginalHead)) {
+        return $false
+    }
+
+    $currentBranch = Get-ManagedCurrentBranch -Repo $Repo
+    $currentHead = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+    if (-not $currentHead) { return $false }
+
+    if ($AllowTargetRollback) {
+        if (-not $OwnedTargetHead) { return $false }
+        $targetState = Get-ManagedLocalBranchState -Repo $Repo -Branch $TargetBranch
+        if (($targetState.State -ne "present") -or `
+            ($targetState.Sha -ne $OwnedTargetHead) -or `
+            ($currentHead -ne $OwnedTargetHead) -or `
+            ($currentBranch -and ($currentBranch -ne $TargetBranch))) {
+            # A post-hook or concurrent process advanced either HEAD or the
+            # branch. That commit is not ours to discard.
+            return $false
+        }
+        if ($currentBranch) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                checkout --detach $OwnedTargetHead 2>$null
+            if (($LASTEXITCODE -ne 0) -or (Get-ManagedCurrentBranch -Repo $Repo) -or `
+                ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -ne $OwnedTargetHead)) {
+                return $false
+            }
+        }
+
+        if ($TargetWasCreated) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                update-ref -d "refs/heads/$TargetBranch" $OwnedTargetHead 2>$null
+            if ($LASTEXITCODE -ne 0) { return $false }
+            if ((Get-ManagedLocalBranchState `
+                -Repo $Repo -Branch $TargetBranch).State -ne "absent") { return $false }
+        } else {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                update-ref "refs/heads/$TargetBranch" $TargetHead $OwnedTargetHead 2>$null
+            if ($LASTEXITCODE -ne 0) { return $false }
+            $rolledBack = Get-ManagedLocalBranchState -Repo $Repo -Branch $TargetBranch
+            if (($rolledBack.State -ne "present") -or ($rolledBack.Sha -ne $TargetHead)) {
+                return $false
+            }
+        }
+    } elseif (($currentBranch -eq $TargetBranch) -and ($currentHead -ne $TargetHead)) {
+        return $false
+    }
+
+    if ($OriginalBranch) {
+        $originalState = Get-ManagedLocalBranchState -Repo $Repo -Branch $OriginalBranch
+        if (($originalState.State -ne "present") -or `
+            ($originalState.Sha -ne $OriginalHead)) { return $false }
+        if ((Get-ManagedCurrentBranch -Repo $Repo) -ne $OriginalBranch) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                switch -- $OriginalBranch 2>$null
+            if ($LASTEXITCODE -ne 0) { return $false }
+        }
+        if (-not (Test-ManagedExpectedCheckout `
+            -Repo $Repo -Branch $OriginalBranch -Head $OriginalHead)) { return $false }
+    } else {
+        $currentBranch = Get-ManagedCurrentBranch -Repo $Repo
+        $currentHead = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+        if ($currentBranch -or ($currentHead -ne $OriginalHead)) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                checkout --detach $OriginalHead 2>$null
+            if ($LASTEXITCODE -ne 0) { return $false }
+        }
+        if ((Get-ManagedCurrentBranch -Repo $Repo) -or `
+            ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -ne $OriginalHead)) {
+            return $false
+        }
+    }
+
+    if (-not (Test-ManagedCleanMergeState -Repo $Repo)) { return $false }
+    if ($RecoveryRef -and `
+        ((Resolve-ManagedGitCommit -Repo $Repo -Ref $RecoveryRef) -ne $TargetHead)) {
+        return $false
+    }
+    return $true
+}
+
+function Get-ManagedShallowState {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    $value = @(
+        & git -c windows.appendAtomically=false -C $Repo `
+            rev-parse --is-shallow-repository 2>$null
+    )
+    if (($LASTEXITCODE -ne 0) -or ($value.Count -ne 1)) { return "unknown" }
+    $normalized = $value[0].ToString().Trim().ToLowerInvariant()
+    if (($normalized -ne "true") -and ($normalized -ne "false")) {
+        return "unknown"
+    }
+    return $normalized
+}
+
+function Expand-ManagedPinHistory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Branch
+    )
+
+    $historyRef = "refs/hermes-update-fetches/history-" + `
+        [Guid]::NewGuid().ToString("N")
+    try {
+        $historyRefspec = "+refs/heads/${Branch}:$historyRef"
+        $historyOutput = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                fetch --unshallow --no-tags '--refmap=' origin $historyRefspec 2>&1
+        )
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($line in $historyOutput) {
+                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+            }
+            throw "Could not complete shallow history; refusing an unproven commit pin."
+        }
+        if ((Get-ManagedShallowState -Repo $Repo) -ne "false") {
+            throw "Repository history remains shallow; refusing an unproven commit pin."
+        }
+    } finally {
+        $historyState = Get-ManagedCommitRefState -Repo $Repo -Ref $historyRef
+        if ($historyState.State -eq "present") {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                update-ref -d $historyRef $historyState.Sha 2>$null
+        }
+    }
+}
+
+function Restore-ManagedPinnedOriginalCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$OriginalHead,
+        [string]$OriginalBranch,
+        [Parameter(Mandatory = $true)][string]$PinnedHead,
+        [Parameter(Mandatory = $true)][string]$RecoveryRef
+    )
+
+    if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $RecoveryRef) -ne $OriginalHead) {
+        return $false
+    }
+    if (-not (Test-ManagedCleanMergeState -Repo $Repo)) { return $false }
+    $currentHead = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+    $currentBranch = Get-ManagedCurrentBranch -Repo $Repo
+    if (($currentHead -ne $OriginalHead) -and ($currentHead -ne $PinnedHead)) {
+        return $false
+    }
+
+    if ($OriginalBranch) {
+        $originalState = Get-ManagedLocalBranchState -Repo $Repo -Branch $OriginalBranch
+        if (($originalState.State -ne "present") -or `
+            ($originalState.Sha -ne $OriginalHead)) { return $false }
+        if ($currentBranch -ne $OriginalBranch) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                switch -- $OriginalBranch 2>$null
+            if ($LASTEXITCODE -ne 0) { return $false }
+        }
+        return (Test-ManagedExpectedCheckout `
+            -Repo $Repo -Branch $OriginalBranch -Head $OriginalHead)
+    }
+
+    if ($currentBranch -or ($currentHead -ne $OriginalHead)) {
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            checkout --detach $OriginalHead 2>$null
+        if ($LASTEXITCODE -ne 0) { return $false }
+    }
+    return (
+        (-not (Get-ManagedCurrentBranch -Repo $Repo)) `
+        -and ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -eq $OriginalHead)
+    )
+}
+
+# Resolve -Commit / -Tag through a transaction-owned transport ref, copy the
+# peeled immutable commit into a private commit ref, and detach only that SHA.
+# No local tag or remote-tracking ref is update authority.
+function Set-ManagedPinnedCheckout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Branch,
+        [string]$Commit = "",
+        [string]$Tag = "",
+        [switch]$ForceCommit,
+        [switch]$AllowRestorePrompt
+    )
+
+    Assert-ManagedBranchName -Branch $Branch
+    if ($Commit) {
+        Assert-ManagedCommitPin -Commit $Commit
+    } elseif ($Tag) {
+        Assert-ManagedTagName -Tag $Tag
+    } else {
+        throw "Pinned checkout requires -Commit or -Tag."
+    }
+
+    $previousEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $transportRef = "refs/hermes-update-transports/install-" + `
+        [Guid]::NewGuid().ToString("N")
+    $fetchRef = "refs/hermes-update-fetches/install-pin-" + `
+        [Guid]::NewGuid().ToString("N")
+    $transportOid = ""
+    $fetchTip = ""
+    $autostash = $null
+    $recoveryRef = ""
+
+    try {
+        $originalHead = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+        if (-not $originalHead) { throw "Cannot resolve HEAD before pinning." }
+        $originalBranch = Get-ManagedCurrentBranch -Repo $Repo
+        if (-not $originalBranch) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                symbolic-ref --quiet HEAD 2>$null
+            if ($LASTEXITCODE -ne 1) {
+                throw "Could not determine the current branch state before pinning."
+            }
+        }
+
+        if ((Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef).State -ne "absent") {
+            throw "Could not reserve a private pin ref."
+        }
+        $pinRefspec = if ($Commit) {
+            "+${Commit}:$transportRef"
+        } else {
+            "+refs/tags/${Tag}:$transportRef"
+        }
+        $fetchOutput = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                fetch --no-tags '--refmap=' origin $pinRefspec 2>&1
+        )
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($line in $fetchOutput) {
+                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+            }
+            throw "Could not fetch the requested immutable pin."
+        }
+        $rawTransport = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                rev-parse --verify $transportRef 2>$null
+        )
+        if (($LASTEXITCODE -ne 0) -or ($rawTransport.Count -ne 1)) {
+            throw "Could not resolve the private transport ref."
+        }
+        $transportOid = $rawTransport[0].ToString().Trim().ToLowerInvariant()
+        if ($transportOid -notmatch '^[0-9a-f]{40,64}$') {
+            throw "The private transport ref did not contain an object ID."
+        }
+        $fetchTip = Resolve-ManagedGitCommit -Repo $Repo -Ref $transportRef
+        if (-not $fetchTip) { throw "The requested pin is not a commit." }
+        if ($Commit -and ($fetchTip -ne $Commit.ToLowerInvariant())) {
+            throw "The fetched commit does not match the exact requested commit ID."
+        }
+        $zeroOid = "0" * $fetchTip.Length
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            update-ref $fetchRef $fetchTip $zeroOid 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "Could not pin the fetched commit privately." }
+        $pinnedState = Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef
+        if (($pinnedState.State -ne "present") -or ($pinnedState.Sha -ne $fetchTip)) {
+            throw "The private pinned commit could not be verified."
+        }
+
+        if ($Commit -and (-not $ForceCommit)) {
+            $rollbackStatus = Get-ManagedGitAncestorStatus `
+                -Repo $Repo -Ancestor $fetchTip -Descendant $originalHead
+            if (($rollbackStatus -eq 1) -and `
+                ((Get-ManagedShallowState -Repo $Repo) -eq "true")) {
+                Expand-ManagedPinHistory -Repo $Repo -Branch $Branch
+                $rollbackStatus = Get-ManagedGitAncestorStatus `
+                    -Repo $Repo -Ancestor $fetchTip -Descendant $originalHead
+            }
+            if ($rollbackStatus -eq 0) {
+                if ($fetchTip -ne $originalHead) {
+                    Write-Warn "Ignoring -Commit $Commit`: the checkout is already newer."
+                    Write-Warn "Pass -ForceCommit to apply an intentional rollback."
+                    return
+                }
+            } elseif ($rollbackStatus -ne 1) {
+                throw "Could not verify commit-pin ancestry; refusing to update."
+            }
+            if ((Get-ManagedShallowState -Repo $Repo) -eq "unknown") {
+                throw "Could not verify repository depth; refusing to pin."
+            }
+        }
+
+        $unmerged = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                ls-files --unmerged 2>$null
+        )
+        if (($LASTEXITCODE -ne 0) -or `
+            (-not [string]::IsNullOrWhiteSpace(($unmerged -join "`n")))) {
+            throw "The checkout index is unresolved or unavailable; refusing to pin."
+        }
+        $status = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                status --porcelain --untracked-files=all 2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect local changes before pinning."
+        }
+        if (-not [string]::IsNullOrWhiteSpace(($status -join "`n"))) {
+            $autostash = Save-ManagedAutostash -Repo $Repo
+        }
+        $recoveryRef = New-ManagedUpdateRecoveryRef `
+            -Repo $Repo -Head $originalHead
+        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $recoveryRef) -ne $originalHead) {
+            throw "The original HEAD recovery ref could not be verified."
+        }
+        Assert-ManagedCheckoutGeneration -Repo $Repo `
+            -ExpectedBranch $originalBranch -ExpectedHead $originalHead `
+            -Context "Pinned checkout identity at the mutation boundary"
+        if (-not (Test-ManagedCleanMergeState -Repo $Repo)) {
+            throw "The checkout became dirty during pin preflight."
+        }
+
+        try {
+            $checkoutOutput = @(
+                & git -c windows.appendAtomically=false -C $Repo `
+                    checkout --detach $fetchTip 2>&1
+            )
+            if ($LASTEXITCODE -ne 0) {
+                foreach ($line in $checkoutOutput) {
+                    if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                }
+                throw "Could not check out the exact pinned commit."
+            }
+            Assert-ManagedSwitchSourceGeneration `
+                -Repo $Repo -ExpectedHead $originalHead
+            if ((Get-ManagedCurrentBranch -Repo $Repo) -or `
+                ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -ne $fetchTip) -or `
+                ((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) -or `
+                (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                throw "Pinned checkout postconditions failed."
+            }
+        } catch {
+            $pinError = $_
+            $restored = Restore-ManagedPinnedOriginalCheckout `
+                -Repo $Repo -OriginalHead $originalHead `
+                -OriginalBranch $originalBranch -PinnedHead $fetchTip `
+                -RecoveryRef $recoveryRef
+            if ($restored -and $autostash -and `
+                (Restore-ManagedAutostash -Repo $Repo -Stash $autostash)) {
+                $autostash = $null
+            }
+            if (-not $restored) {
+                throw "$pinError Original checkout restoration was refused; recovery ref: $recoveryRef"
+            }
+            if ($autostash) {
+                throw "$pinError Original checkout restored, but autostash restoration was refused."
+            }
+            throw $pinError
+        }
+
+        if ($autostash) {
+            $restoreNow = $true
+            if ($AllowRestorePrompt) {
+                try {
+                    $hasConsole = (
+                        [Environment]::UserInteractive `
+                        -and (-not [Console]::IsInputRedirected) `
+                        -and (-not [Console]::IsOutputRedirected) `
+                        -and ($Host.Name -eq "ConsoleHost")
+                    )
+                } catch { $hasConsole = $false }
+                if ($hasConsole) {
+                    $restoreAnswer = Read-Host "Restore local changes now? [Y/n]"
+                    if ($restoreAnswer -match '^(n|no)$') { $restoreNow = $false }
+                }
+            }
+            if ($restoreNow -and `
+                (Restore-ManagedAutostash -Repo $Repo -Stash $autostash)) {
+                Write-Warn "Local changes were restored on top of the pinned checkout."
+                $autostash = $null
+            } elseif ($restoreNow) {
+                throw "Pinned checkout completed, but autostash restoration requires manual recovery."
+            } else {
+                Write-Info "Skipped restoring local changes."
+                Write-Info "Immutable stash: $($autostash.Sha)"
+                Write-Info "Durable recovery ref: $($autostash.RecoveryRef)"
+                $autostash = $null
+            }
+        }
+    } finally {
+        if ($transportOid) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                update-ref -d $transportRef $transportOid 2>$null
+        }
+        if ($fetchRef) {
+            $privateState = Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef
+            if (($privateState.State -eq "present") -and `
+                ((-not $fetchTip) -or ($privateState.Sha -eq $fetchTip))) {
+                $null = & git -c windows.appendAtomically=false -C $Repo `
+                    update-ref -d $fetchRef $privateState.Sha 2>$null
+            }
+        }
+        if ($autostash) {
+            Write-Warn "Pinning stopped. Local changes remain in immutable stash $($autostash.Sha)."
+            Write-Info "Durable recovery ref: $($autostash.RecoveryRef)"
+        }
+        $ErrorActionPreference = $previousEAP
+    }
+}
+
+# Safely advance the managed branch using only immutable commit IDs.  All
+# ancestry and local-history checks happen before stash/checkout mutation.
+function Update-ManagedCheckout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Branch,
+        [switch]$AllowRestorePrompt
+    )
+
+    $previousEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $autostash = $null
+    $updateComplete = $false
+    $targetMovedByUpdate = $false
+    $targetWasCreated = $false
+    $recoveryRef = ""
+    $originalRecoveryRef = ""
+    $ownedTargetHead = ""
+    $fetchRef = ""
+    $fetchTip = ""
+    $trackingCasApplied = $false
+
+    try {
+        Assert-ManagedBranchName -Branch $Branch
+        $originalHead = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+        if (-not $originalHead) {
+            throw "Cannot resolve the current HEAD; refusing to update."
+        }
+
+        $originalBranch = Get-ManagedCurrentBranch -Repo $Repo
+        if (-not $originalBranch) {
+            $null = & git -c windows.appendAtomically=false -C $Repo `
+                symbolic-ref --quiet HEAD 2>$null
+            if ($LASTEXITCODE -ne 1) {
+                throw "Could not determine the current branch state; refusing to update."
+            }
+        }
+
+        $trackingRef = "refs/remotes/origin/$Branch"
+        $trackingState = Get-ManagedCommitRefState -Repo $Repo -Ref $trackingRef
+        if ($trackingState.State -eq "unknown") {
+            throw "Could not inspect the previous origin/$Branch tip; refusing to update."
+        }
+        $oldOriginTip = $trackingState.Sha
+
+        $targetState = Get-ManagedLocalBranchState -Repo $Repo -Branch $Branch
+        if ($targetState.State -eq "unknown") {
+            throw "Could not inspect the local $Branch ref; refusing to update."
+        }
+        $targetWasInitiallyPresent = ($targetState.State -eq "present")
+        $targetHead = $targetState.Sha
+
+        # Fetch exactly once into a transaction-owned ref.  The mutable
+        # origin/$Branch ref is never used as update authority after the fetch.
+        $fetchRef = "refs/hermes-update-fetches/install-" + `
+            [Guid]::NewGuid().ToString("N")
+        $fetchState = Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef
+        if ($fetchState.State -ne "absent") {
+            throw "Could not reserve a private fetch ref; refusing to update."
+        }
+        $fetchRefspec = "+refs/heads/${Branch}:$fetchRef"
+        $fetchOutput = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                fetch --no-tags '--refmap=' origin $fetchRefspec 2>&1
+        )
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($line in $fetchOutput) {
+                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+            }
+            throw "git fetch failed; the checkout was not changed."
+        }
+
+        $fetchTip = Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef
+        if (-not $fetchTip) {
+            throw "Cannot resolve the private fetched tip; refusing to update."
+        }
+        $pinnedFetchState = Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef
+        if (($pinnedFetchState.State -ne "present") -or `
+            ($pinnedFetchState.Sha -ne $fetchTip)) {
+            throw "The private fetched tip changed during pinning; refusing to update."
+        }
+        $zeroOid = "0" * $fetchTip.Length
+
+        $trackingWasAbsent = ($trackingState.State -eq "absent")
+        if ($trackingWasAbsent) {
+            # A first scoped fetch has no remote baseline. Anchor the decision
+            # to the immutable local target instead: a missing target is safe
+            # to create, and an existing target is safe only when the two tips
+            # are directly comparable in at least one direction.
+            $remoteRewritten = $false
+            if (-not $targetWasInitiallyPresent) {
+                $localHistory = $false
+            } else {
+                $localToFetched = Get-ManagedGitAncestorStatus `
+                    -Repo $Repo -Ancestor $targetHead -Descendant $fetchTip
+                $fetchedToLocal = Get-ManagedGitAncestorStatus `
+                    -Repo $Repo -Ancestor $fetchTip -Descendant $targetHead
+                if (($localToFetched -ne 0) -and ($fetchedToLocal -ne 0)) {
+                    throw "No origin/$Branch baseline exists and the local/fetched histories are not provably comparable; refusing to update."
+                }
+                $localHistory = (
+                    ($fetchedToLocal -eq 0) -and ($targetHead -ne $fetchTip)
+                )
+            }
+        } else {
+            $remoteStatus = Get-ManagedGitAncestorStatus `
+                -Repo $Repo -Ancestor $oldOriginTip -Descendant $fetchTip
+            if ($remoteStatus -eq 0) {
+                $remoteRewritten = $false
+            } elseif ($remoteStatus -eq 1) {
+                $remoteRewritten = $true
+            } else {
+                throw "Could not verify origin/$Branch history; refusing to update."
+            }
+
+            if ((-not $targetHead) -or ($targetHead -eq $oldOriginTip)) {
+                $localHistory = $false
+            } else {
+                $oldToLocal = Get-ManagedGitAncestorStatus `
+                    -Repo $Repo -Ancestor $oldOriginTip -Descendant $targetHead
+                if ($oldToLocal -eq 0) {
+                    # The local branch contains commits at or beyond the old tip.
+                    $localHistory = $true
+                } elseif ($oldToLocal -eq 1) {
+                    $localToOld = Get-ManagedGitAncestorStatus `
+                        -Repo $Repo -Ancestor $targetHead -Descendant $oldOriginTip
+                    if ($localToOld -eq 0) {
+                        # Merely behind the old remote: no local-only commits.
+                        $localHistory = $false
+                    } elseif ($localToOld -eq 1) {
+                        # Divergent histories contain local-only work.
+                        $localHistory = $true
+                    } else {
+                        throw "Could not classify reverse local $Branch ancestry; refusing to update."
+                    }
+                } else {
+                    throw "Could not classify local $Branch history; refusing to update."
+                }
+            }
+        }
+
+        if ($remoteRewritten -and $localHistory) {
+            throw "origin/$Branch was rewritten and local commits are present; refusing to discard them."
+        }
+
+        # Preserve normal remote-tracking behavior without surrendering
+        # authority to that mutable ref. The expected-old CAS detects races.
+        $expectedTrackingTip = if ($trackingWasAbsent) { $zeroOid } else { $oldOriginTip }
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            update-ref $trackingRef $fetchTip $expectedTrackingTip 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "origin/$Branch changed concurrently; refusing to update."
+        }
+        $trackingCasApplied = $true
+        $updatedTracking = Get-ManagedCommitRefState -Repo $Repo -Ref $trackingRef
+        if (($updatedTracking.State -ne "present") -or `
+            ($updatedTracking.Sha -ne $fetchTip)) {
+            throw "Updated origin/$Branch could not be verified; refusing to update."
+        }
+
+        # From here on the graph policy is known and it is safe to prepare the
+        # worktree.  Existing unmerged state cannot be stashed losslessly, so
+        # leave it untouched for the user instead of resetting the index.
+        $null = & git -c windows.appendAtomically=false -C $Repo `
+            config core.autocrlf false 2>$null
+        # Inspect the full index before any stash or checkout mutation.
+        $unmerged = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                ls-files --unmerged 2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect the Git index; refusing to update."
+        }
+        if (-not [string]::IsNullOrWhiteSpace(($unmerged -join "`n"))) {
+            throw "The checkout has unresolved conflicts; resolve them before updating."
+        }
+
+        $statusOut = @(
+            & git -c windows.appendAtomically=false -C $Repo `
+                status --porcelain --untracked-files=all 2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect local changes; refusing to update."
+        }
+        if (-not [string]::IsNullOrWhiteSpace(($statusOut -join "`n"))) {
+            $autostash = Save-ManagedAutostash -Repo $Repo
+        }
+
+        # Pin both the branch generation we may move and a detached/parked
+        # original HEAD before the first checkout. These refs are deliberately
+        # durable so reflog expiry cannot erase a user's prior commit.
+        if ($targetWasInitiallyPresent) {
+            $recoveryRef = New-ManagedUpdateRecoveryRef `
+                -Repo $Repo -Head $targetHead
+        }
+        if ($originalHead -eq $targetHead) {
+            $originalRecoveryRef = $recoveryRef
+        } else {
+            $originalRecoveryRef = New-ManagedUpdateRecoveryRef `
+                -Repo $Repo -Head $originalHead
+        }
+
+        try {
+            $currentTargetState = Get-ManagedLocalBranchState `
+                -Repo $Repo -Branch $Branch
+            Assert-ManagedCheckoutGeneration -Repo $Repo `
+                -ExpectedBranch $originalBranch -ExpectedHead $originalHead `
+                -Context "Checkout identity at the first mutation boundary"
+            $performedSwitch = $false
+            $checkoutExit = 0
+            if ($targetWasInitiallyPresent) {
+                if (($currentTargetState.State -ne "present") -or `
+                    ($currentTargetState.Sha -ne $targetHead)) {
+                    throw "The local $Branch tip changed during preflight; refusing to continue."
+                }
+                if (($originalBranch -eq $Branch) -and `
+                    ($originalHead -eq $targetHead)) {
+                    $checkoutOutput = @()
+                } else {
+                    $checkoutOutput = @(
+                        & git -c windows.appendAtomically=false -C $Repo `
+                            switch -- $Branch 2>&1
+                    )
+                    $checkoutExit = $LASTEXITCODE
+                    $performedSwitch = $true
+                }
+            } else {
+                if ($currentTargetState.State -ne "absent") {
+                    throw "The missing local $Branch branch appeared concurrently; refusing to continue."
+                }
+                $null = & git -c windows.appendAtomically=false -C $Repo `
+                    update-ref "refs/heads/$Branch" $fetchTip $zeroOid 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "The missing local $Branch branch appeared concurrently; refusing to continue."
+                }
+                $targetWasCreated = $true
+                $targetMovedByUpdate = $true
+                $ownedTargetHead = $fetchTip
+                Assert-ManagedCheckoutGeneration -Repo $Repo `
+                    -ExpectedBranch $originalBranch -ExpectedHead $originalHead `
+                    -Context "Checkout identity before attaching the new branch"
+                $checkoutOutput = @(
+                    & git -c windows.appendAtomically=false -C $Repo `
+                        switch -- $Branch 2>&1
+                )
+                $checkoutExit = $LASTEXITCODE
+                $performedSwitch = $true
+            }
+            if ($checkoutExit -ne 0) {
+                foreach ($line in $checkoutOutput) {
+                    if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                }
+                throw "git checkout $Branch failed."
+            }
+            if ($performedSwitch) {
+                Assert-ManagedSwitchSourceGeneration `
+                    -Repo $Repo -ExpectedHead $originalHead
+            }
+            if (-not $targetWasInitiallyPresent) {
+                $targetHead = $fetchTip
+            }
+            if (-not (Test-ManagedExpectedCheckout `
+                -Repo $Repo -Branch $Branch -Head $targetHead)) {
+                throw "The expected branch and HEAD could not be verified after checkout."
+            }
+            if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) {
+                throw "The private fetched tip changed before update application."
+            }
+
+            if (-not $targetWasInitiallyPresent) {
+                if (((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) -or `
+                    (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                    throw "The newly created branch is not in a clean pinned state."
+                }
+                if (-not (Test-ManagedExpectedCheckout `
+                    -Repo $Repo -Branch $Branch -Head $fetchTip)) {
+                    throw "The newly created branch changed before success."
+                }
+                $updateComplete = $true
+            } elseif ($remoteRewritten) {
+                # A confirmed rewrite with no local commits is the sole normal
+                # reset/adoption case. Never let an ancestor relationship turn it
+                # into a false-successful ff/no-op.
+                if ($localHistory) {
+                    throw "Rewritten remote unexpectedly reached the local-commit path."
+                }
+                if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) {
+                    throw "The private fetched tip changed before reset."
+                }
+                if (-not (Test-ManagedCleanMergeState -Repo $Repo)) {
+                    throw "The checkout became dirty after autostash; refusing reset."
+                }
+                if (-not (Test-ManagedExpectedCheckout `
+                    -Repo $Repo -Branch $Branch -Head $targetHead)) {
+                    throw "The expected checkout changed before rewritten-tip adoption."
+                }
+                Write-Warn "origin/$Branch was rewritten; adopting pinned tip $fetchTip."
+                $detachOutput = @(
+                    & git -c windows.appendAtomically=false -C $Repo `
+                        checkout --detach $targetHead 2>&1
+                )
+                if ($LASTEXITCODE -ne 0) {
+                    foreach ($line in $detachOutput) {
+                        if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                    }
+                    throw "Could not detach the exact pre-update branch tip."
+                }
+                if ((Get-ManagedCurrentBranch -Repo $Repo) -or `
+                    ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -ne $targetHead) -or `
+                    (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                    throw "Detached rewrite preconditions could not be verified."
+                }
+                $null = & git -c windows.appendAtomically=false -C $Repo `
+                    update-ref "refs/heads/$Branch" $fetchTip $targetHead 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "The local $Branch branch changed concurrently; refusing rewrite adoption."
+                }
+                $targetMovedByUpdate = $true
+                $ownedTargetHead = $fetchTip
+                $switchOutput = @(
+                    & git -c windows.appendAtomically=false -C $Repo `
+                        switch -- $Branch 2>&1
+                )
+                if ($LASTEXITCODE -ne 0) {
+                    foreach ($line in $switchOutput) {
+                        if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                    }
+                    throw "The rewritten branch moved safely, but could not be attached."
+                }
+                if (-not (Test-ManagedExpectedCheckout `
+                    -Repo $Repo -Branch $Branch -Head $fetchTip)) {
+                    throw "The rewritten remote tip could not be verified after reset."
+                }
+                if (((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) -or `
+                    (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                    throw "Rewritten-tip reset postconditions failed."
+                }
+                if (-not (Test-ManagedExpectedCheckout `
+                    -Repo $Repo -Branch $Branch -Head $fetchTip)) {
+                    throw "The rewritten-tip checkout changed before success."
+                }
+                $updateComplete = $true
+            } else {
+                # A local target may already contain the pinned fetched tip.
+                # Prove that case before deciding between ff and merge so an
+                # ahead branch is not mislabeled as divergence.
+                $alreadyIntegratedStatus = Get-ManagedGitAncestorStatus `
+                    -Repo $Repo -Ancestor $fetchTip -Descendant $targetHead
+                if ($alreadyIntegratedStatus -eq 0) {
+                    if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) {
+                        throw "The private fetched tip changed before success."
+                    }
+                    if (-not (Test-ManagedCleanMergeState -Repo $Repo)) {
+                        throw "The checkout became dirty after autostash; refusing success."
+                    }
+                    if (-not (Test-ManagedExpectedCheckout `
+                        -Repo $Repo -Branch $Branch -Head $targetHead)) {
+                        throw "The expected checkout changed before success."
+                    }
+                    Write-Info "Pinned fetched tip is already integrated; no merge needed."
+                    $updateComplete = $true
+                } elseif ($alreadyIntegratedStatus -eq 1) {
+                    # Choose ff vs merge from a tri-state graph probe before any
+                    # mutation, then re-check branch/HEAD immediately before it.
+                    $ffStatus = Get-ManagedGitAncestorStatus `
+                        -Repo $Repo -Ancestor $targetHead -Descendant $fetchTip
+                    if ($ffStatus -eq 0) {
+                        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) {
+                            throw "The private fetched tip changed before fast-forward."
+                        }
+                        if (-not (Test-ManagedCleanMergeState -Repo $Repo)) {
+                            throw "The checkout became dirty after autostash; refusing fast-forward."
+                        }
+                        if (-not (Test-ManagedExpectedCheckout `
+                            -Repo $Repo -Branch $Branch -Head $targetHead)) {
+                            throw "The expected checkout changed before fast-forward."
+                        }
+                        $ffOutput = @(
+                            & git -c windows.appendAtomically=false -C $Repo `
+                                checkout --detach $targetHead 2>&1
+                        )
+                        if ($LASTEXITCODE -ne 0) {
+                            foreach ($line in $ffOutput) {
+                                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                            }
+                            throw "Could not detach the exact pre-fast-forward tip."
+                        }
+                        if ((Get-ManagedCurrentBranch -Repo $Repo) -or `
+                            ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -ne $targetHead) -or `
+                            (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                            throw "Detached fast-forward preconditions could not be verified."
+                        }
+                        $null = & git -c windows.appendAtomically=false -C $Repo `
+                            update-ref "refs/heads/$Branch" $fetchTip $targetHead 2>$null
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "The local $Branch branch changed concurrently; refusing fast-forward."
+                        }
+                        $targetMovedByUpdate = $true
+                        $ownedTargetHead = $fetchTip
+                        $ffAttachOutput = @(
+                            & git -c windows.appendAtomically=false -C $Repo `
+                                switch -- $Branch 2>&1
+                        )
+                        if ($LASTEXITCODE -ne 0) {
+                            foreach ($line in $ffAttachOutput) {
+                                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                            }
+                            throw "The branch fast-forwarded safely, but could not be attached."
+                        }
+                        if (-not (Test-ManagedExpectedCheckout `
+                            -Repo $Repo -Branch $Branch -Head $fetchTip)) {
+                            throw "Fast-forward did not land on the exact pinned tip."
+                        }
+                        if (((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) -or `
+                            (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                            throw "Fast-forward postconditions failed."
+                        }
+                        if (-not (Test-ManagedExpectedCheckout `
+                            -Repo $Repo -Branch $Branch -Head $fetchTip)) {
+                            throw "The fast-forward checkout changed before success."
+                        }
+                        $updateComplete = $true
+                    } elseif ($ffStatus -eq 1) {
+                        if (-not $localHistory) {
+                            throw "History diverged without classified local commits; refusing to merge."
+                        }
+                        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $recoveryRef) -ne $targetHead) {
+                            throw "The pre-merge recovery ref could not be verified."
+                        }
+                        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) {
+                            throw "The private fetched tip changed before merge."
+                        }
+                        if (-not (Test-ManagedCleanMergeState -Repo $Repo)) {
+                            throw "The checkout became dirty after autostash; refusing merge."
+                        }
+                        if (-not (Test-ManagedExpectedCheckout `
+                            -Repo $Repo -Branch $Branch -Head $targetHead)) {
+                            throw "The expected checkout changed before merge."
+                        }
+                        $detachForMerge = @(
+                            & git -c windows.appendAtomically=false -C $Repo `
+                                checkout --detach $targetHead 2>&1
+                        )
+                        if ($LASTEXITCODE -ne 0) {
+                            foreach ($line in $detachForMerge) {
+                                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                            }
+                            throw "Could not detach the exact pre-merge tip."
+                        }
+                        if ((Get-ManagedCurrentBranch -Repo $Repo) -or `
+                            ((Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD") -ne $targetHead) -or `
+                            (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                            throw "Detached merge preconditions could not be verified."
+                        }
+                        $mergeOutput = @(
+                            & git -c windows.appendAtomically=false -C $Repo `
+                                merge --no-edit $fetchTip 2>&1
+                        )
+                        if ($LASTEXITCODE -ne 0) {
+                            foreach ($line in $mergeOutput) {
+                                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                            }
+                            throw "The pinned update conflicted; recovery ref: $recoveryRef"
+                        }
+                        $mergeResult = Resolve-ManagedGitCommit -Repo $Repo -Ref "HEAD"
+                        if (-not $mergeResult) { throw "The merge result could not be resolved." }
+                        $mergeRecoveryRef = New-ManagedUpdateRecoveryRef `
+                            -Repo $Repo -Head $mergeResult
+                        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $mergeRecoveryRef) -ne $mergeResult) {
+                            throw "The detached merge result could not be protected."
+                        }
+                        if (Get-ManagedCurrentBranch -Repo $Repo) {
+                            throw "The detached merge unexpectedly attached a branch."
+                        }
+                        if (-not (Test-ManagedExactMergeCommit `
+                            -Repo $Repo -MergeCommit $mergeResult `
+                            -FirstParent $targetHead -SecondParent $fetchTip)) {
+                            throw "Merge result $mergeResult is not the exact two-parent merge of $targetHead and $fetchTip; retained at $mergeRecoveryRef."
+                        }
+                        $localIntegrated = Get-ManagedGitAncestorStatus `
+                            -Repo $Repo -Ancestor $targetHead -Descendant $mergeResult
+                        $remoteIntegrated = Get-ManagedGitAncestorStatus `
+                            -Repo $Repo -Ancestor $fetchTip -Descendant $mergeResult
+                        if (($localIntegrated -ne 0) -or ($remoteIntegrated -ne 0)) {
+                            throw "The merge result does not contain both verified inputs."
+                        }
+                        if ((Resolve-ManagedGitCommit -Repo $Repo -Ref $recoveryRef) -ne $targetHead) {
+                            throw "The pre-merge recovery ref changed unexpectedly."
+                        }
+                        if (((Resolve-ManagedGitCommit -Repo $Repo -Ref $fetchRef) -ne $fetchTip) -or `
+                            (-not (Test-ManagedCleanMergeState -Repo $Repo))) {
+                            throw "Merge postconditions failed."
+                        }
+                        $null = & git -c windows.appendAtomically=false -C $Repo `
+                            update-ref "refs/heads/$Branch" $mergeResult $targetHead 2>$null
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "The local $Branch branch changed concurrently; merge result retained at $mergeRecoveryRef."
+                        }
+                        $targetMovedByUpdate = $true
+                        $ownedTargetHead = $mergeResult
+                        $mergeAttachOutput = @(
+                            & git -c windows.appendAtomically=false -C $Repo `
+                                switch -- $Branch 2>&1
+                        )
+                        if ($LASTEXITCODE -ne 0) {
+                            foreach ($line in $mergeAttachOutput) {
+                                if ($line -and $line.ToString().Trim()) { Write-Host $line }
+                            }
+                            throw "The merge branch moved safely, but could not be attached."
+                        }
+                        if (-not (Test-ManagedExpectedCheckout `
+                            -Repo $Repo -Branch $Branch -Head $mergeResult)) {
+                            throw "The merge checkout changed before success."
+                        }
+                        $updateComplete = $true
+                        Write-Warn "Local commits were preserved in a merge."
+                        Write-Info "Pre-update recovery ref: $recoveryRef"
+                    } else {
+                        throw "Could not verify local/remote divergence; refusing to update."
+                    }
+                } else {
+                    throw "Could not verify whether the fetched tip is already integrated; refusing to update."
+                }
+            }
+        } catch {
+            $applyError = $_
+            if (-not $updateComplete) {
+                $checkoutRestored = Restore-ManagedOriginalCheckout `
+                    -Repo $Repo -OriginalHead $originalHead `
+                    -OriginalBranch $originalBranch -TargetBranch $Branch `
+                    -TargetHead $(if ($targetHead) { $targetHead } else { $fetchTip }) `
+                    -AllowTargetRollback:$targetMovedByUpdate `
+                    -TargetWasCreated:$targetWasCreated `
+                    -RecoveryRef $recoveryRef `
+                    -OriginalRecoveryRef $originalRecoveryRef `
+                    -OwnedTargetHead $ownedTargetHead
+                if ($checkoutRestored -and $autostash) {
+                    if (Restore-ManagedAutostash -Repo $Repo -Stash $autostash) {
+                        $autostash = $null
+                    }
+                }
+                if (-not $checkoutRestored) {
+                    throw "$applyError Original checkout restoration failed; any autostash was preserved."
+                }
+                if ($autostash) {
+                    throw "$applyError Original HEAD was restored, but the autostash could not be reapplied."
+                }
+            }
+            throw $applyError
+        }
+
+        if ($autostash) {
+            $restoreNow = $true
+            $hasConsole = $false
+            if ($AllowRestorePrompt) {
+                try {
+                    $hasConsole = (
+                        [Environment]::UserInteractive `
+                        -and (-not [Console]::IsInputRedirected) `
+                        -and (-not [Console]::IsOutputRedirected) `
+                        -and ($Host.Name -eq "ConsoleHost")
+                    )
+                } catch { $hasConsole = $false }
+            }
+            if ($hasConsole) {
+                Write-Warn "Local changes were stashed before updating."
+                Write-Warn "Restoring them may reapply customizations onto updated code."
+                $restoreAnswer = Read-Host "Restore local changes now? [Y/n]"
+                if ($restoreAnswer -match '^(n|no)$') { $restoreNow = $false }
+            }
+
+            if ($restoreNow) {
+                if (Restore-ManagedAutostash -Repo $Repo -Stash $autostash) {
+                    Write-Warn "Local changes were restored on top of the updated codebase."
+                    Write-Warn "Review git diff / git status if Hermes behaves unexpectedly."
+                    $autostash = $null
+                } else {
+                    throw "Code updated, but the immutable autostash could not be restored safely."
+                }
+            } else {
+                Write-Info "Skipped restoring local changes."
+                Write-Info "Your changes are preserved in stash commit $($autostash.Sha)."
+                Write-Info "Restore with: git stash apply --index $($autostash.Sha)"
+                $autostash = $null
+            }
+        }
+    } finally {
+        if ($trackingCasApplied -and (-not $updateComplete)) {
+            if ($trackingWasAbsent) {
+                $null = & git -c windows.appendAtomically=false -C $Repo `
+                    update-ref -d $trackingRef $fetchTip 2>$null
+            } else {
+                $null = & git -c windows.appendAtomically=false -C $Repo `
+                    update-ref $trackingRef $oldOriginTip $fetchTip 2>$null
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "Could not roll origin/$Branch back with CAS after the failed update."
+            } else {
+                $rolledBackTracking = Get-ManagedCommitRefState `
+                    -Repo $Repo -Ref $trackingRef
+                $trackingRollbackVerified = if ($trackingWasAbsent) {
+                    $rolledBackTracking.State -eq "absent"
+                } else {
+                    ($rolledBackTracking.State -eq "present") -and `
+                        ($rolledBackTracking.Sha -eq $oldOriginTip)
+                }
+                if (-not $trackingRollbackVerified) {
+                    Write-Warn "origin/$Branch rollback could not be verified."
+                }
+            }
+        }
+        $retainPrivateFetch = $fetchRef -and (-not $updateComplete) -and `
+            (-not (Test-ManagedCleanMergeState -Repo $Repo))
+        if ($retainPrivateFetch) {
+            Write-Warn "Private fetched tip retained for conflicted-state recovery: $fetchRef"
+        } elseif ($fetchRef) {
+            $privateState = Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef
+            if (($privateState.State -eq "present") -and `
+                ((-not $fetchTip) -or ($privateState.Sha -eq $fetchTip))) {
+                $expectedPrivateTip = $privateState.Sha
+                $null = & git -c windows.appendAtomically=false -C $Repo `
+                    update-ref -d $fetchRef $expectedPrivateTip 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warn "Could not remove private fetch ref $fetchRef safely."
+                } else {
+                    $deletedState = Get-ManagedCommitRefState -Repo $Repo -Ref $fetchRef
+                    if ($deletedState.State -ne "absent") {
+                        Write-Warn "Private fetch ref $fetchRef deletion could not be verified."
+                    }
+                }
+            } elseif ($privateState.State -ne "absent") {
+                Write-Warn "Private fetch ref $fetchRef changed unexpectedly and was retained."
+            }
+        }
+        if ($autostash) {
+            Write-Warn "Update did not complete. Your local changes remain in git stash."
+            Write-Info "Restore with: git stash apply --index $($autostash.Sha)"
+        }
+        $ErrorActionPreference = $previousEAP
+    }
+}
+
 function Install-Repository {
     Write-Info "Installing to $InstallDir..."
+
+    Assert-ManagedBranchName -Branch $Branch
+    if ($Commit) { Assert-ManagedCommitPin -Commit $Commit }
+    if ((-not $Commit) -and $Tag) { Assert-ManagedTagName -Tag $Tag }
 
     $didUpdate = $false
 
@@ -2049,173 +3808,16 @@ function Install-Repository {
             # EAP=Stop.  We rely on $LASTEXITCODE for actual failures.
             $prevEAP = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
-            $autostashRef = ""
             try {
-                # This is a MANAGED checkout, not a repo the user edits. Git for
-                # Windows defaults to core.autocrlf=true, which renormalizes the
-                # repo's LF-only text files to CRLF in the working tree -- so
-                # tracked files (.envrc, AGENTS.md, agent/*.py, workflows, ...)
-                # show as locally modified even though nobody touched them. A
-                # bare `git checkout` then aborts with "Your local changes would
-                # be overwritten by checkout", which is exactly the failure GUI
-                # users hit on update. Pin autocrlf=false so the dirt is never
-                # created in the first place.
-                git -c windows.appendAtomically=false config core.autocrlf false 2>$null
-                Discard-LockfileChurn $InstallDir
-                # Preserve any real local changes before the checkout instead of
-                # discarding them with `reset --hard HEAD`. The old hard reset
-                # silently destroyed agent-edited source on managed clones (the
-                # #38542 data-loss class). Stash + restore mirrors install.sh:
-                # nothing is lost, and a failed restore leaves the work in a
-                # git stash for manual recovery. Untracked files are included so
-                # agent-created dirs (e.g. tinker-atropos/) survive too.
-                $statusOut = git -c windows.appendAtomically=false status --porcelain 2>$null
-                if (-not [string]::IsNullOrWhiteSpace(($statusOut -join "`n"))) {
-                    # A previously interrupted update can leave the index with
-                    # unmerged entries. In that state `git stash` aborts with
-                    # "could not write index" and the following `git checkout`
-                    # aborts with "you need to resolve your current index first"
-                    # -- the GUI "git checkout main failed (exit 1)" install
-                    # failure. Clear the conflict markers with `git reset` first:
-                    # working-tree changes are kept (and stashed just below); only
-                    # the index conflict state is dropped. Mirrors the `hermes
-                    # update` path (#4735).
-                    $unmergedOut = git -c windows.appendAtomically=false ls-files --unmerged 2>$null
-                    if (-not [string]::IsNullOrWhiteSpace(($unmergedOut -join "`n"))) {
-                        Write-Info "Clearing unmerged index entries from a previous conflict..."
-                        git -c windows.appendAtomically=false reset -q 2>$null
-                    }
-                    $stashName = "hermes-install-autostash-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-                    Write-Info "Local changes detected, stashing before update..."
-                    git -c windows.appendAtomically=false stash push --include-untracked -m "$stashName"
-                    if ($LASTEXITCODE -eq 0) { $autostashRef = "stash@{0}" }
-                }
-                git -c windows.appendAtomically=false fetch origin $Branch
-                if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
-                # Precedence: Commit > Tag > Branch.  Commit and Tag check
-                # out as detached HEAD intentionally -- they're meant to be
-                # reproducible pins, not branches the user pulls into.
-                if ($Commit) {
-                    # Make sure we have the commit locally (a tag-less commit
-                    # SHA isn't always reachable from any one branch fetch).
-                    git -c windows.appendAtomically=false fetch origin $Commit
-                    # A commit pin must never move an existing install
-                    # BACKWARDS. hermes-setup.exe bakes its build-time commit
-                    # into the binary (BUILD_PIN_COMMIT) and passes it as
-                    # -Commit on every install-mode run -- including the retry
-                    # the desktop's "Update didn't finish" screen kicks off. An
-                    # installer built months ago would otherwise rewind a
-                    # current checkout to its build commit, leaving ancient
-                    # code against a current venv (npm workspaces and Python
-                    # deps that no longer match: the #74xxx report). Skip the
-                    # pin when the target is already an ancestor of HEAD; a
-                    # fresh clone has no such ancestry and pins normally.
-                    $skipRollback = $false
-                    if (-not $ForceCommit) {
-                        git -c windows.appendAtomically=false merge-base --is-ancestor $Commit HEAD 2>$null
-                        $isAncestor = ($LASTEXITCODE -eq 0)
-                        $pinnedSha = (& git -c windows.appendAtomically=false rev-parse "$Commit^{commit}" 2>$null)
-                        $headSha = (& git -c windows.appendAtomically=false rev-parse HEAD 2>$null)
-                        $skipRollback = $isAncestor -and ($pinnedSha -ne $headSha)
-                    }
-                    if ($skipRollback) {
-                        Write-Warn "Ignoring -Commit $Commit`: the checkout is already newer."
-                        Write-Warn "Pinning to it would roll this install back. Pass -ForceCommit to override."
-                    } else {
-                        git -c windows.appendAtomically=false checkout --detach $Commit
-                        if ($LASTEXITCODE -ne 0) { throw "git checkout $Commit failed (exit $LASTEXITCODE)" }
-                    }
-                } elseif ($Tag) {
-                    git -c windows.appendAtomically=false fetch origin "refs/tags/${Tag}:refs/tags/${Tag}"
-                    git -c windows.appendAtomically=false checkout --detach "refs/tags/$Tag"
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout tag $Tag failed (exit $LASTEXITCODE)" }
+                if ((-not $Commit) -and (-not $Tag)) {
+                    Update-ManagedCheckout -Repo $InstallDir -Branch $Branch `
+                        -AllowRestorePrompt:(-not $NonInteractive)
                 } else {
-                    git -c windows.appendAtomically=false checkout $Branch
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed (exit $LASTEXITCODE)" }
-                    # Managed installs should follow origin/$Branch exactly. If
-                    # the checkout has diverged (or has local-only commits),
-                    # ff-only pull cannot succeed -- mirror ``hermes update`` and
-                    # reset to the fetched remote so bootstrap/install can recover.
-                    git -c windows.appendAtomically=false pull --ff-only origin $Branch
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
-                        git -c windows.appendAtomically=false reset --hard "origin/$Branch"
-                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
-                    }
-                }
-
-                if ($autostashRef) {
-                    # Default to restoring so work is never silently dropped.
-                    # Only prompt when we're certain a human can answer: an
-                    # interactive session AND a real, non-redirected console on
-                    # both stdin and stdout. The desktop "Update" button and
-                    # bootstrap run the installer without a usable console -- in
-                    # those cases Read-Host would hang or return empty, so we
-                    # skip the prompt and just restore (the safe default).
-                    $restoreNow = $true
-                    $hasConsole = $false
-                    try {
-                        $hasConsole = (
-                            [Environment]::UserInteractive `
-                            -and (-not [Console]::IsInputRedirected) `
-                            -and (-not [Console]::IsOutputRedirected) `
-                            -and ($Host.Name -eq "ConsoleHost")
-                        )
-                    } catch { $hasConsole = $false }
-                    if ($hasConsole) {
-                        Write-Warn "Local changes were stashed before updating."
-                        Write-Warn "Restoring them may reapply local customizations onto the updated codebase."
-                        $restoreAnswer = Read-Host "Restore local changes now? [Y/n]"
-                        if ($restoreAnswer -match '^(n|no)$') { $restoreNow = $false }
-                    }
-
-                    if ($restoreNow) {
-                        Write-Info "Restoring local changes..."
-                        $restoreOutput = @(git -c windows.appendAtomically=false stash apply $autostashRef 2>&1)
-                        $restoreExit = $LASTEXITCODE
-                        $conflictedFiles = @(
-                            git -c windows.appendAtomically=false diff --name-only --diff-filter=U 2>$null
-                        ) | Where-Object { $_ -and $_.ToString().Trim() }
-                        if (($restoreExit -eq 0) -and ($conflictedFiles.Count -eq 0)) {
-                            git -c windows.appendAtomically=false stash drop $autostashRef 2>$null
-                            Write-Warn "Local changes were restored on top of the updated codebase."
-                            Write-Warn "Review git diff / git status if Hermes behaves unexpectedly."
-                        } else {
-                            Write-Err "Update pulled new code, but restoring local changes hit conflicts."
-                            foreach ($line in $restoreOutput) {
-                                if ($line -and $line.ToString().Trim()) {
-                                    Write-Host $line
-                                }
-                            }
-                            if ($conflictedFiles.Count -gt 0) {
-                                Write-Host ""
-                                Write-Host "Conflicted files:"
-                                foreach ($file in $conflictedFiles) {
-                                    Write-Host "  - $file"
-                                }
-                            }
-                            Write-Host ""
-                            Write-Info "Your stashed changes are preserved -- nothing is lost."
-                            Write-Info "  Stash ref: $autostashRef"
-                            git -c windows.appendAtomically=false reset --hard HEAD 2>$null | Out-Null
-                            Write-Info "Working tree reset to clean state."
-                            Write-Info "Restore your changes later with: git stash apply $autostashRef"
-                        }
-                    } else {
-                        Write-Info "Skipped restoring local changes."
-                        Write-Info "Your changes are still preserved in git stash."
-                        Write-Info "Restore manually with: git stash apply $autostashRef"
-                    }
-                    $autostashRef = ""
+                    Set-ManagedPinnedCheckout -Repo $InstallDir -Branch $Branch `
+                        -Commit $Commit -Tag $Tag -ForceCommit:$ForceCommit `
+                        -AllowRestorePrompt:(-not $NonInteractive)
                 }
             } finally {
-                if ($autostashRef) {
-                    # We stashed but never reached the restore block (a fetch/
-                    # checkout/pull failure threw). Leave the stash in place and
-                    # tell the user how to recover it -- never silently drop it.
-                    Write-Warn "Update did not complete. Your local changes are preserved in git stash."
-                    Write-Info "Restore manually with: git stash apply $autostashRef"
-                }
                 $ErrorActionPreference = $prevEAP
                 Pop-Location
             }
@@ -2290,8 +3892,9 @@ function Install-Repository {
                     $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
                     $zipLabel = $Branch
                 }
-                $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
-                $extractPath = "$env:TEMP\hermes-agent-extract"
+                $zipToken = [Guid]::NewGuid().ToString("N")
+                $zipPath = "$env:TEMP\hermes-agent-$zipToken.zip"
+                $extractPath = "$env:TEMP\hermes-agent-extract-$zipToken"
 
                 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
                 if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
@@ -2322,34 +3925,57 @@ function Install-Repository {
                     # the shared path is idempotent and still covers git clones.
                     git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                     git remote add origin $RepoUrlHttps 2>$null
-                    $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
-                    Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
+                    $fetchLabel = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
+                    $zipPrivateRef = "refs/hermes-update-transports/zip-" + `
+                        [Guid]::NewGuid().ToString("N")
+                    $zipRefspec = if ($Commit) {
+                        "+${Commit}:$zipPrivateRef"
+                    } elseif ($Tag) {
+                        "+refs/tags/${Tag}:$zipPrivateRef"
+                    } else {
+                        "+refs/heads/${Branch}:$zipPrivateRef"
+                    }
+                    Write-Info "Fetching $fetchLabel so the ZIP checkout has a resolvable HEAD..."
                     $prevZipEAP = $ErrorActionPreference
                     $ErrorActionPreference = "Continue"
                     try {
-                        git -c windows.appendAtomically=false fetch --depth 1 origin $fetchRef 2>&1 | Out-Null
-                        if ($LASTEXITCODE -eq 0) {
-                            if ($Commit -or $Tag) {
-                                git -c windows.appendAtomically=false checkout -f --detach FETCH_HEAD 2>&1 | Out-Null
-                            } else {
-                                git -c windows.appendAtomically=false checkout -f -B $Branch FETCH_HEAD 2>&1 | Out-Null
-                            }
-                            if ($LASTEXITCODE -eq 0) {
-                                Write-Success "ZIP checkout pinned to $fetchRef"
-                            } else {
-                                # Checkout blocked, but FETCH_HEAD still has a SHA we can stamp with.
-                                $fetchSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
-                                if ($LASTEXITCODE -eq 0 -and $fetchSha) {
-                                    if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = ("$fetchSha").Trim() }
-                                    Write-Warn "ZIP checkout failed; seeded GITHUB_SHA from FETCH_HEAD for desktop stamp"
-                                } else {
-                                    Write-Warn "ZIP extract succeeded but git checkout failed -- desktop build may need `$env:GITHUB_SHA"
-                                }
-                            }
-                        } else {
-                            Write-Warn "ZIP extract succeeded but git fetch of $fetchRef failed -- desktop build may need `$env:GITHUB_SHA"
+                        $null = & git -c windows.appendAtomically=false `
+                            fetch --depth 1 --no-tags '--refmap=' origin $zipRefspec 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "ZIP extract succeeded but the exact fetch of $fetchLabel failed."
                         }
+                        $zipCommit = Resolve-ManagedGitCommit `
+                            -Repo $InstallDir -Ref $zipPrivateRef
+                        if (-not $zipCommit) {
+                            throw "ZIP fetch did not resolve to a commit."
+                        }
+                        if ($Commit -and ($zipCommit -ne $Commit.ToLowerInvariant())) {
+                            throw "ZIP fetch did not match the requested commit ID."
+                        }
+                        if ($Commit -or $Tag) {
+                            $null = & git -c windows.appendAtomically=false `
+                                checkout -f --detach $zipCommit 2>&1
+                        } else {
+                            $null = & git -c windows.appendAtomically=false `
+                                checkout -f -B $Branch $zipCommit 2>&1
+                        }
+                        if ($LASTEXITCODE -ne 0) {
+                            if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = $zipCommit }
+                            throw "ZIP checkout could not attach the exact fetched commit."
+                        }
+                        if ((Resolve-ManagedGitCommit -Repo $InstallDir -Ref "HEAD") -ne $zipCommit) {
+                            throw "ZIP checkout HEAD does not match the exact fetched commit."
+                        }
+                        Write-Success "ZIP checkout pinned to $zipCommit"
                     } finally {
+                        $zipObject = @(
+                            & git -c windows.appendAtomically=false -C $InstallDir `
+                                rev-parse --verify $zipPrivateRef 2>$null
+                        )
+                        if (($LASTEXITCODE -eq 0) -and ($zipObject.Count -eq 1)) {
+                            $null = & git -c windows.appendAtomically=false -C $InstallDir `
+                                update-ref -d $zipPrivateRef $zipObject[0].ToString().Trim() 2>$null
+                        }
                         $ErrorActionPreference = $prevZipEAP
                     }
                     Pop-Location
@@ -2391,20 +4017,10 @@ function Install-Repository {
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            if ($Commit) {
-                Write-Info "Pinning to commit $Commit..."
-                git -c windows.appendAtomically=false fetch origin $Commit
-                git -c windows.appendAtomically=false checkout --detach $Commit
-                if ($LASTEXITCODE -ne 0) {
-                    throw "git checkout $Commit failed (exit $LASTEXITCODE)"
-                }
-            } elseif ($Tag) {
-                Write-Info "Pinning to tag $Tag..."
-                git -c windows.appendAtomically=false fetch origin "refs/tags/${Tag}:refs/tags/${Tag}"
-                git -c windows.appendAtomically=false checkout --detach "refs/tags/$Tag"
-                if ($LASTEXITCODE -ne 0) {
-                    throw "git checkout tag $Tag failed (exit $LASTEXITCODE)"
-                }
+            if ($Commit -or $Tag) {
+                Set-ManagedPinnedCheckout -Repo $InstallDir -Branch $Branch `
+                    -Commit $Commit -Tag $Tag -ForceCommit:$ForceCommit `
+                    -AllowRestorePrompt:(-not $NonInteractive)
             }
         } finally {
             $ErrorActionPreference = $prevEAP
@@ -4802,20 +6418,14 @@ function Main {
 # iex` PowerShell session, and so failures in stage-driver mode produce a
 # structured JSON error frame instead of a bare exception.
 
-try {
-    if ($Ensure -ne "") {
-        if ($PSBoundParameters.ContainsKey("Stage")) {
-            Write-Err "Cannot use -Ensure and -Stage simultaneously"
-            exit 1
-        }
-        Invoke-EnsureMode -Deps $Ensure
-        exit 0
-    }
-    if ($PostInstall) {
-        Invoke-PostInstallMode
-        exit 0
-    }
+# Dot-sourcing is used by the installer policy E2E tests so they can invoke
+# Update-ManagedCheckout directly against temporary repositories.
+if ($MyInvocation.InvocationName -eq ".") { return }
 
+$script:InstallerUpdateLock = $null
+$script:InstallerLockContended = $false
+$script:InstallerRunFromFile = -not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)
+try {
     if ($ProtocolVersion) {
         Write-Output $InstallStageProtocolVersion
         exit 0
@@ -4839,6 +6449,24 @@ try {
             })
         }
         $payload | ConvertTo-Json -Depth 5 -Compress | Write-Output
+        exit 0
+    }
+
+    # Every mutating entrypoint takes the same install-wide marker. A Tauri
+    # parent (or another proven ancestor) keeps ownership while this child
+    # borrows it; stand-alone installers publish and later release their claim.
+    $script:InstallerUpdateLock = Enter-InstallerUpdateLock
+
+    if ($Ensure -ne "") {
+        if ($PSBoundParameters.ContainsKey("Stage")) {
+            Write-Err "Cannot use -Ensure and -Stage simultaneously"
+            exit 1
+        }
+        Invoke-EnsureMode -Deps $Ensure
+        exit 0
+    }
+    if ($PostInstall) {
+        Invoke-PostInstallMode
         exit 0
     }
 
@@ -4883,6 +6511,7 @@ try {
             }
             $err | ConvertTo-Json -Compress | Write-Output
         }
+        if ($script:InstallerLockContended) { exit 2 }
         exit 1
     }
 
@@ -4894,4 +6523,9 @@ try {
     Write-Host "  Invoke-WebRequest -Uri 'https://hermes-agent.nousresearch.com/install.ps1' -OutFile install.ps1" -ForegroundColor Yellow
     Write-Host "  .\install.ps1" -ForegroundColor Yellow
     Write-Host ""
+    if ($script:InstallerLockContended -and $script:InstallerRunFromFile) {
+        exit 2
+    }
+} finally {
+    Exit-InstallerUpdateLock -Lock $script:InstallerUpdateLock
 }

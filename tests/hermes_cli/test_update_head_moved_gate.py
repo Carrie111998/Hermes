@@ -16,28 +16,57 @@ import pytest
 from hermes_cli import main as hermes_main
 
 
-def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+def _make_head_moved_side_effect(pre_sha="a" * 40, post_sha="b" * 40):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
-    calls = {"n": 0}
+    state = {"head": pre_sha, "tracking": pre_sha, "branch": "main"}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
-        # git rev-parse --abbrev-ref HEAD  (get current branch)
-        if "rev-parse" in joined and "--abbrev-ref" in joined:
-            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if "check-ref-format --branch" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout=f"{cmd[-1]}\n", stderr=""
+            )
 
-        # git rev-list HEAD..origin/main --count  (behind count)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return SimpleNamespace(returncode=0, stdout=f"{state['branch']}\n", stderr="")
+        if "branch --show-current" in joined:
+            branch = "" if state["branch"] == "HEAD" else state["branch"]
+            return SimpleNamespace(returncode=0, stdout=f"{branch}\n", stderr="")
+        if "rev-parse" in joined and "--is-shallow-repository" in joined:
+            return SimpleNamespace(returncode=0, stdout="false\n", stderr="")
+        if "rev-parse" in joined and "--verify" in joined:
+            ref = str(cmd[-1]).removesuffix("^{commit}")
+            if ref == "MERGE_HEAD":
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if ref == "HEAD" or ref.startswith("refs/heads/"):
+                sha = state["head"]
+            elif ref.startswith("refs/hermes-update-fetches/"):
+                sha = post_sha
+            elif ref.startswith("refs/remotes/origin/"):
+                sha = state["tracking"]
+            else:
+                sha = pre_sha
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+        if "rev-parse" in joined and str(cmd[-1]) == "HEAD":
+            return SimpleNamespace(returncode=0, stdout=f"{state['head']}\n", stderr="")
+        if "merge-base --is-ancestor" in joined:
+            ancestor, descendant = str(cmd[-2]), str(cmd[-1])
+            rc = 1 if ancestor == post_sha and descendant == pre_sha else 0
+            return SimpleNamespace(returncode=rc, stdout="", stderr="")
+        if "update-ref refs/remotes/origin/" in joined:
+            state["tracking"] = post_sha
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "checkout" in joined:
+            state["branch"] = "HEAD" if "--detach" in cmd else "main"
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
 
-        # git rev-parse HEAD  — first call (pre-pull) returns pre_sha,
-        # subsequent calls (post-pull) return post_sha.
-        if joined.endswith("rev-parse HEAD"):
-            if calls["n"] == 0:
-                calls["n"] += 1
-                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+        if "merge --ff-only" in joined:
+            state["head"] = post_sha
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         # Everything else (merge, checkout, etc.) succeeds quietly.
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -45,24 +74,25 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     return side_effect
 
 
-def _make_head_pinned_side_effect(sha="abc123"):
+def _make_head_pinned_side_effect(sha="a" * 40):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
+    post_sha = "b" * 40
+    side_effect = _make_head_moved_side_effect(sha, post_sha)
+    stateful = {"detached": True}
 
-    def side_effect(cmd, **kwargs):
+    def pinned(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
-
-        if "rev-parse" in joined and "--abbrev-ref" in joined:
+        if "rev-parse" in joined and "--abbrev-ref" in joined and stateful["detached"]:
             return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
+        if "branch --show-current" in joined and stateful["detached"]:
+            return SimpleNamespace(returncode=0, stdout="\n", stderr="")
+        if "checkout" in joined:
+            stateful["detached"] = "--detach" in cmd
+        if "merge --ff-only" in joined:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return side_effect(cmd, **kwargs)
 
-        if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
-
-        if joined.endswith("rev-parse HEAD"):
-            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
-
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    return side_effect
+    return pinned
 
 
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
@@ -144,6 +174,6 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
 
     assert exc_info.value.code == 1
     out = capsys.readouterr().out
-    assert "Code did not move" in out
+    assert "pinned Git update could not be applied safely" in out
     assert "✓ Code updated!" not in out
-    assert "checkout main" in out
+    assert "HEAD was restored to its exact pre-apply commit" in out

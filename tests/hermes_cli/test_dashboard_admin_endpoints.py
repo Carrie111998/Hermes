@@ -805,7 +805,10 @@ class TestUpdateCheckEndpoint:
     def test_git_install_reports_behind_count(self, monkeypatch):
         import hermes_cli.web_server as ws
 
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(ws, "get_managed_system", lambda: None)
+        monkeypatch.setattr(ws, "_deployment_supervisors_cached", lambda: ())
         # Stub the shared checker so the contract is deterministic (no network).
         import hermes_cli.banner as banner
 
@@ -816,6 +819,8 @@ class TestUpdateCheckEndpoint:
         body = r.json()
         assert {
             "install_method",
+            "deployment_kind",
+            "deployment_class",
             "current_version",
             "behind",
             "update_available",
@@ -824,6 +829,8 @@ class TestUpdateCheckEndpoint:
             "message",
         } <= set(body)
         assert body["install_method"] == "git"
+        assert body["deployment_kind"] == "git-venv"
+        assert body["deployment_class"] == "mutable"
         assert body["behind"] == 5
         assert body["update_available"] is True
         # git/pip installs can apply the update in place from the dashboard.
@@ -845,10 +852,161 @@ class TestUpdateCheckEndpoint:
 
         body = self.client.get("/api/hermes/update/check").json()
         assert body["install_method"] == "managed-runtime"
+        assert body["deployment_kind"] == "image"
+        assert body["deployment_class"] == "image"
         assert body["can_apply"] is False
         assert body["update_available"] is False
         assert body["behind"] is None
+        assert body["update_command"] is None
         assert "managed outside this dashboard" in body["message"]
+
+    @pytest.mark.parametrize(
+        ("install_method", "deployment_kind", "deployment_class"),
+        [
+            ("docker", "image", "image"),
+            ("apt", "package", "package"),
+            ("nix", "package", "package"),
+            ("nixos", "package", "package"),
+            ("home-manager", "package", "package"),
+        ],
+    )
+    def test_install_shape_is_authoritative_before_runtime_owner(
+        self,
+        monkeypatch,
+        install_method,
+        deployment_kind,
+        deployment_class,
+    ):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: install_method)
+        monkeypatch.setattr(ws, "get_managed_system", lambda: "operator-managed")
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(
+            ws,
+            "_deployment_supervisors_cached",
+            lambda: pytest.fail("authoritative install shapes must not scan runtimes"),
+        )
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 0)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["deployment_kind"] == deployment_kind
+        assert body["deployment_class"] == deployment_class
+        assert body["can_apply"] is False
+
+    @pytest.mark.parametrize(
+        ("desktop", "supervisors", "deployment_kind", "deployment_class"),
+        [
+            (True, (), "desktop", "mutable"),
+            (False, ("systemd",), "systemd", "mutable"),
+            (False, ("launchd",), "launchd", "mutable"),
+            (False, (), "git-venv", "mutable"),
+            (False, ("external",), "external", "external"),
+        ],
+    )
+    def test_git_checkout_reports_runtime_owner(
+        self,
+        monkeypatch,
+        desktop,
+        supervisors,
+        deployment_kind,
+        deployment_class,
+    ):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(ws, "get_managed_system", lambda: None)
+        monkeypatch.setattr(ws, "_deployment_supervisors_cached", lambda: supervisors)
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 0)
+        if desktop:
+            monkeypatch.setenv("HERMES_DESKTOP", "1")
+        else:
+            monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["deployment_kind"] == deployment_kind
+        assert body["deployment_class"] == deployment_class
+        assert body["can_apply"] is (deployment_class == "mutable")
+        if deployment_kind == "external":
+            assert body["update_command"] is None
+
+    def test_explicit_managed_checkout_is_external(self, monkeypatch):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(
+            ws, "detect_install_method", lambda *a, **k: "operator-managed"
+        )
+        monkeypatch.setattr(ws, "get_managed_system", lambda: "operator-managed")
+        monkeypatch.setattr(
+            ws,
+            "_deployment_supervisors_cached",
+            lambda: pytest.fail("an explicit managed owner must not scan runtimes"),
+        )
+        monkeypatch.setattr(banner, "check_for_updates", lambda: None)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["deployment_kind"] == "external"
+        assert body["deployment_class"] == "external"
+        assert body["can_apply"] is False
+        assert body["update_command"] is None
+
+    @pytest.mark.parametrize(
+        ("behind", "message"),
+        [
+            (None, "Couldn't reach the update source"),
+            (0, "latest version"),
+        ],
+    )
+    def test_deployment_contract_is_stable_when_offline_or_current(
+        self, monkeypatch, behind, message
+    ):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(ws, "get_managed_system", lambda: None)
+        monkeypatch.setattr(ws, "_deployment_supervisors_cached", lambda: ())
+        monkeypatch.setattr(banner, "check_for_updates", lambda: behind)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["deployment_kind"] == "git-venv"
+        assert body["deployment_class"] == "mutable"
+        assert message in body["message"]
+
+    def test_runtime_inventory_probe_is_cached(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import hermes_cli.update_inventory as inventory
+        import hermes_cli.web_server as ws
+
+        calls = 0
+
+        def collect():
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                runtimes=[SimpleNamespace(supervisor="systemd")]
+            )
+
+        monkeypatch.setattr(inventory, "collect_runtime_inventory", collect)
+        ws._DEPLOYMENT_INVENTORY_CACHE.update(
+            {"ts": 0.0, "supervisors": (), "fn": None}
+        )
+
+        assert ws._deployment_supervisors_cached() == ("systemd",)
+        assert ws._deployment_supervisors_cached() == ("systemd",)
+        assert calls == 1
 
 
 

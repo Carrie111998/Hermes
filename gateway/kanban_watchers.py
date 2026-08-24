@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextvars import Context
 from pathlib import Path
@@ -187,6 +188,100 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    def _kanban_dispatch_gate(self) -> threading.Lock:
+        """Return the per-runner gate serialising dispatcher claim starts.
+
+        ``dispatch_once`` runs in a worker thread while lifecycle transitions
+        run on the gateway event-loop thread.  The gate closes the check/claim
+        race: once a drain has quiesced dispatch, a tick that was queued before
+        the transition re-checks the lifecycle state under this lock and cannot
+        start another claim.
+
+        GatewayRunner initialises the lock eagerly.  The lazy fallback keeps
+        partial ``object.__new__`` test runners and downstream mixin users
+        compatible.
+        """
+        gate = getattr(self, "_kanban_dispatch_gate_lock", None)
+        if gate is None:
+            gate = threading.Lock()
+            self._kanban_dispatch_gate_lock = gate
+        return gate
+
+    def _set_kanban_dispatch_quiesced(self, quiesced: bool) -> None:
+        """Enable/disable admission of new embedded-dispatcher claims."""
+        self._kanban_dispatch_quiesced = bool(quiesced)
+
+    def _kanban_dispatch_claims_blocked(self) -> bool:
+        """Return whether lifecycle state forbids a new dispatcher claim."""
+        return bool(
+            getattr(self, "_kanban_dispatch_quiesced", False)
+            or getattr(self, "_draining", False)
+            or getattr(self, "_external_drain_active", False)
+            or not getattr(self, "_running", False)
+        )
+
+    def _kanban_dispatch_once_if_allowed(
+        self, dispatch: Callable[[], Any]
+    ) -> Optional[Any]:
+        """Run one claim-producing dispatch call unless drain has begun.
+
+        The lifecycle predicate is intentionally checked *inside* the gate.
+        A dispatch already executing when drain begins may finish its current
+        claim, and is exposed to the drain through
+        ``_kanban_dispatch_claim_inflight_count``; every later caller is
+        rejected before it can touch ``dispatch_once``.
+        """
+        with self._kanban_dispatch_gate():
+            if self._kanban_dispatch_claims_blocked():
+                return None
+            self._kanban_dispatch_claim_inflight = True
+            try:
+                return dispatch()
+            finally:
+                self._kanban_dispatch_claim_inflight = False
+
+    def _kanban_dispatch_claim_inflight_count(self) -> int:
+        """Return 1 while an admitted ``dispatch_once`` call is still live."""
+        gate = getattr(self, "_kanban_dispatch_gate_lock", None)
+        gate_locked = bool(gate is not None and gate.locked())
+        return int(
+            gate_locked
+            or bool(getattr(self, "_kanban_dispatch_claim_inflight", False))
+        )
+
+    def _kanban_auto_decompose_inflight_count(self) -> int:
+        """Return the number of auto-decompose worker threads still running."""
+        lock = getattr(self, "_kanban_auto_decompose_counter_lock", None)
+        if lock is None:
+            return int(bool(getattr(self, "_kanban_auto_decompose_inflight", 0)))
+        with lock:
+            return max(0, int(getattr(self, "_kanban_auto_decompose_inflight", 0)))
+
+    def _kanban_auto_decompose_started(self) -> None:
+        lock = getattr(self, "_kanban_auto_decompose_counter_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._kanban_auto_decompose_counter_lock = lock
+        with lock:
+            self._kanban_auto_decompose_inflight = (
+                int(getattr(self, "_kanban_auto_decompose_inflight", 0)) + 1
+            )
+
+    def _kanban_auto_decompose_finished(self) -> None:
+        lock = getattr(self, "_kanban_auto_decompose_counter_lock", None)
+        if lock is None:
+            self._kanban_auto_decompose_inflight = 0
+            return
+        with lock:
+            self._kanban_auto_decompose_inflight = max(
+                0, int(getattr(self, "_kanban_auto_decompose_inflight", 0)) - 1
+            )
+
+    def _wait_for_kanban_dispatch_gate(self) -> None:
+        """Join an already-admitted dispatch before external drain proceeds."""
+        with self._kanban_dispatch_gate():
+            return
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
@@ -1493,17 +1588,20 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
-                    conn,
-                    board=slug,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
-                    failure_limit=failure_limit,
-                    stale_timeout_seconds=stale_timeout_seconds,
-                    default_assignee=default_assignee,
-                    max_in_progress_per_profile=max_in_progress_per_profile,
-                    reconcile_orphans=reconcile_orphans,
-                )
+                def _dispatch() -> object:
+                    return _kb.dispatch_once(
+                        conn,
+                        board=slug,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                        reconcile_orphans=reconcile_orphans,
+                    )
+
+                return self._kanban_dispatch_once_if_allowed(_dispatch)
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -1554,6 +1652,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
+                if self._kanban_dispatch_claims_blocked():
+                    break
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 out.append((slug, _tick_once_for_board(slug)))
             return out
@@ -1717,7 +1817,10 @@ class GatewayKanbanWatchersMixin:
                 # Global emergency stop (`hermes pause`): skip auto-decompose
                 # and dispatch entirely — no new workers while paused. Running
                 # workers finish naturally; zombie reaping above still runs.
-                if not _kanban_dispatch_allowed():
+                if self._kanban_dispatch_claims_blocked():
+                    ready_pending = False
+                    bad_ticks = 0
+                elif not _kanban_dispatch_allowed():
                     ready_pending = False
                     bad_ticks = 0
                 else:
@@ -1726,7 +1829,11 @@ class GatewayKanbanWatchersMixin:
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
-                        await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
+                        self._kanban_auto_decompose_started()
+                        try:
+                            await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
+                        finally:
+                            self._kanban_auto_decompose_finished()
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
@@ -1746,7 +1853,11 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
+                    ready_pending = (
+                        False
+                        if self._kanban_dispatch_claims_blocked()
+                        else await _to_thread_process_service(_ready_nonempty)
+                    )
                     if ready_pending and not any_spawned:
                         bad_ticks += 1
                     else:

@@ -6744,6 +6744,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _kanban_dispatch_quiesced: bool = False
+    _kanban_dispatch_claim_inflight: bool = False
+    _kanban_worker_probe_failed: bool = False
+    _kanban_worker_probe_error: Optional[str] = None
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -6923,6 +6927,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
         self._draining = False
+        self._kanban_dispatch_gate_lock = threading.Lock()
+        self._kanban_dispatch_quiesced = False
+        self._kanban_dispatch_claim_inflight = False
+        self._kanban_worker_probe_failed = False
+        self._kanban_worker_probe_error = None
+        self._kanban_worker_probe_error_logged_at = 0.0
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
         # External (NAS-driven) drain state — distinct from the shutdown
@@ -8586,15 +8596,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _active_kanban_worker_count(
+        self, *, fail_closed: Optional[bool] = None
+    ) -> int:
+        """Count live detached Kanban workers across every active board.
+
+        Kanban workers are separate OS processes and never enter the gateway's
+        ``_running_agents`` map.  During a shutdown or external update drain,
+        an unreadable board is therefore unsafe: returning zero could let an
+        update replace the environment under a worker we failed to observe.
+        Drain callers fail closed as one active unit until a later probe
+        succeeds or the bounded drain budget expires.  Outside drain, the
+        runtime-health path remains best-effort so a broken optional board
+        cannot break normal message handling.
+        """
+        if fail_closed is None:
+            fail_closed = bool(
+                getattr(self, "_draining", False)
+                or getattr(self, "_external_drain_active", False)
+            )
+        try:
+            from hermes_cli import kanban_db
+
+            active = len(kanban_db.active_worker_pids_all_boards())
+        except Exception as exc:
+            was_failed = bool(getattr(self, "_kanban_worker_probe_failed", False))
+            self._kanban_worker_probe_failed = True
+            self._kanban_worker_probe_error = f"{type(exc).__name__}: {exc}"
+            if fail_closed:
+                now = time.monotonic()
+                last_logged = float(
+                    getattr(self, "_kanban_worker_probe_error_logged_at", 0.0) or 0.0
+                )
+                if not was_failed or now - last_logged >= 5.0:
+                    logger.warning(
+                        "Kanban worker probe failed during drain; treating the "
+                        "unknown state as active so shutdown/update cannot "
+                        "report a graceful drain: %s",
+                        exc,
+                    )
+                    self._kanban_worker_probe_error_logged_at = now
+                return 1
+            logger.debug("Kanban worker probe unavailable outside drain: %s", exc)
+            return 0
+
+        self._kanban_worker_probe_failed = False
+        self._kanban_worker_probe_error = None
+        return max(0, active)
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_kanban_worker_count()
+            + self._kanban_dispatch_claim_inflight_count()
+            + self._kanban_auto_decompose_inflight_count()
         )
 
-    def _active_cron_job_count(self) -> int:
+    def _active_cron_job_count(self, *, fail_closed: bool = False) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
         own in-flight tracking (``cron.scheduler._running_job_ids``).
 
@@ -8605,16 +8666,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Without this, the shutdown drain is structurally blind to in-flight
         cron work: it can report ``active_at_start=0`` and proceed straight
         to killing tool subprocesses while a cron job's terminal command is
-        still running (#60432). Best-effort: returns 0 if the cron module
-        can't be imported (e.g. a minimal test double for this class).
+        still running (#60432).  Normal status reporting is best-effort;
+        ``fail_closed`` makes a probe failure count as one active unit during
+        shutdown so unknown work cannot be killed.
         """
         try:
             from cron.scheduler import get_running_job_ids
             return len(get_running_job_ids())
-        except Exception:
+        except Exception as exc:
+            if fail_closed:
+                logger.warning("Cron active-work probe failed during drain: %s", exc)
+                return 1
             return 0
 
-    def _active_api_run_count(self) -> int:
+    def _active_api_run_count(self, *, fail_closed: bool = False) -> int:
         """Count API-server work that is outside ``_running_agents``.
 
         The primary API server owns the sole HTTP listener. Secondary multiplex
@@ -8625,7 +8690,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
             helper = getattr(adapter, "active_agent_work_count", None)
             return max(0, int(helper())) if callable(helper) else 0
-        except Exception:
+        except Exception as exc:
+            if fail_closed:
+                logger.warning("API active-work probe failed during drain: %s", exc)
+                return 1
             return 0
 
     def _interrupt_api_server_runs(self, reason: str) -> int:
@@ -9172,12 +9240,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         whole point is to let them finish); only NEW turns are refused.
         """
         if self._external_drain_active:
+            self._set_kanban_dispatch_quiesced(True)
             return
+        # Close dispatcher admission before publishing the drain flag.  A
+        # queued dispatcher tick re-checks this under its claim gate, so an
+        # update cannot observe "draining" and then race a fresh worker claim.
+        self._set_kanban_dispatch_quiesced(True)
         self._external_drain_active = True
+        kanban_workers = self._active_kanban_worker_count(fail_closed=True)
+        dispatch_inflight = self._kanban_dispatch_claim_inflight_count()
+        auto_decompose_inflight = self._kanban_auto_decompose_inflight_count()
+        active_work = (
+            self._running_agent_count()
+            + self._active_cron_job_count()
+            + self._active_api_run_count()
+            + kanban_workers
+            + dispatch_inflight
+            + auto_decompose_inflight
+        )
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
-            "new turns; %d in-flight turn(s) will finish. Process stays up.",
-            self._active_work_count(),
+            "new turns and Kanban claims; %d in-flight work unit(s), including "
+            "%d Kanban worker(s), %d dispatch claim(s), and %d auto-decompose "
+            "thread(s), will finish. Process stays up.",
+            active_work,
+            kanban_workers,
+            dispatch_inflight,
+            auto_decompose_inflight,
         )
         # Flip the persisted lifecycle state so /api/status.gateway_busy /
         # gateway_drainable track the drain. Preserve active_agents (the
@@ -9202,6 +9291,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "to running (shutdown takes precedence)."
             )
             return
+        self._set_kanban_dispatch_quiesced(False)
         logger.info(
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
@@ -9228,6 +9318,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if drain_requested():
                     self._enter_external_drain()
+                    # Admission is closed, but a claim that already owns the
+                    # gate may still publish a worker. Join it before the
+                    # external poll surface can report drain completion.
+                    await asyncio.to_thread(self._wait_for_kanban_dispatch_gate)
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
                     # external caller polls this reversible drain state.
@@ -10640,29 +10734,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _drain_active_agents(
         self, timeout: float, cron_timeout: Optional[float] = None
     ) -> tuple[Dict[str, Any], bool]:
+        # This method is the common shutdown/update drain boundary.  Close
+        # embedded-dispatcher admission even for direct callers so no new
+        # Kanban claim can appear behind the initial active-work snapshot.
+        self._set_kanban_dispatch_quiesced(True)
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + timeout
+        background_deadline = started + (
+            timeout if cron_timeout is None else cron_timeout
+        )
         snapshot = self._snapshot_running_agents()
-        last_active_count = self._running_agent_count()
-        last_cron_count = self._active_cron_job_count()
-        last_api_count = self._active_api_run_count()
+        last_counts: Optional[tuple[int, int, int, int, int, int]] = None
         last_status_at = 0.0
 
-        def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
-            now = asyncio.get_running_loop().time()
-            active_count = self._running_agent_count()
-            cron_count = self._active_cron_job_count()
-            api_count = self._active_api_run_count()
+        def _counts() -> tuple[int, int, int, int, int, int]:
+            return (
+                self._running_agent_count(),
+                self._active_cron_job_count(fail_closed=True),
+                self._active_api_run_count(fail_closed=True),
+                self._active_kanban_worker_count(fail_closed=True),
+                self._kanban_dispatch_claim_inflight_count(),
+                self._kanban_auto_decompose_inflight_count(),
+            )
+
+        def _maybe_update_status(
+            counts: tuple[int, int, int, int, int, int], force: bool = False
+        ) -> None:
+            nonlocal last_counts, last_status_at
+            now = loop.time()
             if (
                 force
-                or active_count != last_active_count
-                or cron_count != last_cron_count
-                or api_count != last_api_count
+                or counts != last_counts
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
-                last_active_count = active_count
-                last_cron_count = cron_count
-                last_api_count = api_count
+                logger.debug(
+                    "Gateway drain progress: agents=%d cron=%d api=%d "
+                    "kanban_workers=%d kanban_dispatch_inflight=%d "
+                    "kanban_auto_decompose_inflight=%d "
+                    "kanban_probe_failed=%s",
+                    *counts,
+                    bool(getattr(self, "_kanban_worker_probe_failed", False)),
+                )
+                last_counts = counts
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -10671,45 +10787,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
-            _maybe_update_status(force=True)
+        # Detached Kanban workers are a third independent work class (#44877).
+        # An in-flight dispatch call is also included: it may have started just
+        # before admission closed and can publish a worker before returning.
+        counts = _counts()
+        if not any(counts):
+            _maybe_update_status(counts, force=True)
             return snapshot, False
 
-        _maybe_update_status(force=True)
+        _maybe_update_status(counts, force=True)
 
-        # Cron work drains on its own deadline. ``timeout``
+        # Background work (cron and Kanban) drains on its own deadline. ``timeout``
         # (``restart_drain_timeout``) defaults to 0 because interrupting a
         # chat turn is announced and resumable; a cron run killed mid-flight
         # is recorded in jobs.json as a permanent failure nobody is waiting
-        # on. Sharing one budget meant the default config could report
+        # on. A detached Kanban worker has the same non-resumable property.
+        # Sharing one budget meant the default config could report
         # ``timed_out=True`` after 0.00s with a cron job in flight and kill
         # it — the drain never even entered this loop (#82161).
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        deadline = started + timeout
-        cron_deadline = started + (timeout if cron_timeout is None else cron_timeout)
-
-        def _still_draining() -> bool:
-            now = loop.time()
-            if (
-                len(self._running_agents) or self._active_api_run_count()
-            ) and now < deadline:
+        def _still_draining(
+            current: tuple[int, int, int, int, int, int], now: float
+        ) -> bool:
+            (
+                active_count,
+                cron_count,
+                api_count,
+                kanban_count,
+                dispatch_count,
+                auto_decompose_count,
+            ) = current
+            if (active_count or api_count) and now < deadline:
                 return True
-            return bool(self._active_cron_job_count()) and now < cron_deadline
+            return bool(
+                cron_count or kanban_count or dispatch_count or auto_decompose_count
+            ) and (
+                now < background_deadline
+            )
 
         # Both budgets at 0 leave this loop unentered, which is the legacy
         # "interrupt immediately" behaviour — expressed as an expired
         # deadline rather than a special case, so the timed_out value below
         # is always computed from real state instead of asserted up front.
-        while _still_draining():
-            _maybe_update_status()
+        while _still_draining(counts, loop.time()):
+            _maybe_update_status(counts)
             await asyncio.sleep(0.1)
-        timed_out = (
-            bool(len(self._running_agents))
-            or bool(self._active_cron_job_count())
-            or bool(self._active_api_run_count())
-        )
-        _maybe_update_status(force=True)
+            counts = _counts()
+        # Use one final coherent sample for the verdict.  In particular, a
+        # probe error is represented as one active Kanban unit, so it is
+        # impossible to label an unknown/occupied board as gracefully drained.
+        counts = _counts()
+        timed_out = any(counts)
+        _maybe_update_status(counts, force=True)
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:
@@ -10727,6 +10855,90 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+
+    async def _terminate_active_kanban_workers(self, reason: str) -> int:
+        """Terminate detached Kanban workers before a timed-out replacement.
+
+        The drain probe observes worker PIDs, but those processes are outside
+        ``_running_agents`` and cannot receive ``request_hard_interrupt``. A
+        timed-out shutdown must therefore kill them explicitly; otherwise an
+        environment replacement leaves old workers executing against the old
+        checkout. Their durable running claims remain for the next dispatcher
+        tick to reclaim, which is the handoff boundary for a fresh gateway.
+        """
+        try:
+            from hermes_cli import kanban_db
+            from gateway.status import terminate_pid
+
+            pids = list(kanban_db.active_worker_pids_all_boards())
+        except Exception as exc:
+            logger.warning(
+                "Unable to enumerate Kanban workers during %s; refusing "
+                "environment replacement: %s",
+                reason,
+                exc,
+            )
+            raise RuntimeError(
+                f"Cannot safely replace the environment during {reason}: "
+                "Kanban worker enumeration failed"
+            ) from exc
+
+        for pid in pids:
+            try:
+                await asyncio.to_thread(terminate_pid, int(pid), force=False)
+            except ProcessLookupError as exc:
+                logger.debug("Kanban worker %s already exited or resisted SIGTERM: %s", pid, exc)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot safely replace the environment during {reason}: "
+                    f"failed to terminate Kanban worker {pid}"
+                ) from exc
+
+        loop = asyncio.get_running_loop()
+        grace_deadline = loop.time() + 2.0
+        remaining = pids
+        while remaining and loop.time() < grace_deadline:
+            await asyncio.sleep(0.1)
+            try:
+                live = set(kanban_db.active_worker_pids_all_boards())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Cannot safely replace the environment during {reason}: "
+                    "Kanban worker enumeration failed while waiting for termination"
+                ) from exc
+            remaining = [pid for pid in remaining if pid in live]
+
+        for pid in remaining:
+            try:
+                await asyncio.to_thread(terminate_pid, int(pid), force=True)
+            except ProcessLookupError as exc:
+                logger.debug("Kanban worker %s force termination failed: %s", pid, exc)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot safely replace the environment during {reason}: "
+                    f"failed to force-terminate Kanban worker {pid}"
+                ) from exc
+
+        try:
+            remaining = list(kanban_db.active_worker_pids_all_boards())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot safely replace the environment during {reason}: "
+                "Kanban worker enumeration failed after termination"
+            ) from exc
+        if remaining:
+            logger.error(
+                "Kanban worker termination incomplete during %s; live PIDs=%s",
+                reason,
+                remaining,
+            )
+            raise RuntimeError(
+                f"Cannot safely replace the environment during {reason}: "
+                f"Kanban workers remain alive ({remaining!r})"
+            )
+        else:
+            logger.info("Terminated %d detached Kanban worker(s) during %s", len(pids), reason)
+        return len(remaining)
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died.
@@ -11769,6 +11981,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Refuse new turns immediately while in-flight work finishes.
         # Keep ``_running`` True so adapters stay connected and the active
         # turn can still deliver its final response (#77184).
+        self._set_kanban_dispatch_quiesced(True)
         self._draining = True
 
         async def _run_restart() -> None:
@@ -14772,6 +14985,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._stop_task
             return
 
+        def _shutdown_kanban_worker_count() -> int:
+            helper = getattr(self, "_active_kanban_worker_count", None)
+            if not callable(helper):
+                # Compatibility for narrow shutdown test doubles and older
+                # mixin consumers that do not host the embedded dispatcher.
+                return 0
+            return max(0, int(helper(fail_closed=True)))
+
+        def _shutdown_kanban_dispatch_inflight_count() -> int:
+            helper = getattr(self, "_kanban_dispatch_claim_inflight_count", None)
+            return max(0, int(helper())) if callable(helper) else 0
+
         async def _stop_impl() -> None:
             def _kill_tool_subprocesses(phase: str) -> list:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
@@ -14856,13 +15081,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             def _shutdown_watchdog_snapshot() -> dict:
                 started = _stop_started_at_box.get("t")
+                active_agents = self._running_agent_count()
+                active_cron_jobs = self._active_cron_job_count()
+                active_api_runs = self._active_api_run_count()
+                active_kanban_workers = _shutdown_kanban_worker_count()
+                kanban_dispatch_inflight = (
+                    _shutdown_kanban_dispatch_inflight_count()
+                )
                 return {
                     "restart_requested": bool(self._restart_requested),
                     "draining": bool(self._draining),
                     "running": bool(self._running),
-                    "active_agents": self._running_agent_count(),
-                    "active_cron_jobs": self._active_cron_job_count(),
-                    "active_api_runs": self._active_api_run_count(),
+                    # Keep the existing active_agents key as the aggregate
+                    # runtime-status number, while retaining named components
+                    # for the watchdog dump's post-mortem detail.
+                    "active_agents": (
+                        active_agents
+                        + active_cron_jobs
+                        + active_api_runs
+                        + active_kanban_workers
+                    ),
+                    "active_chat_agents": active_agents,
+                    "active_cron_jobs": active_cron_jobs,
+                    "active_api_runs": active_api_runs,
+                    "active_kanban_workers": active_kanban_workers,
+                    "kanban_dispatch_inflight": kanban_dispatch_inflight,
+                    "kanban_worker_probe_failed": bool(
+                        getattr(self, "_kanban_worker_probe_failed", False)
+                    ),
+                    "kanban_worker_probe_error": getattr(
+                        self, "_kanban_worker_probe_error", None
+                    ),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -14899,6 +15148,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _phase_elapsed() -> float:
                 return time.monotonic() - _stop_started_at
 
+            # Stop dispatcher admission before changing lifecycle state.  A
+            # tick already admitted is included in _drain_active_agents; no
+            # later tick may create work behind the drain snapshot (#44877).
+            quiesce_kanban = getattr(self, "_set_kanban_dispatch_quiesced", None)
+            if callable(quiesce_kanban):
+                quiesce_kanban(True)
             self._running = False
             self._clear_plugin_message_injector()
             self._draining = True
@@ -14938,6 +15193,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _kanban_at_start = _shutdown_kanban_worker_count()
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
             # cost us the post-drain cleanup window (#82161).
@@ -14953,12 +15209,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 watchdog_delay=resolve_shutdown_watchdog_delay(timeout),
                 elapsed=_phase_elapsed(),
             )
-            if _cron_at_start and _cron_timeout > timeout:
+            if (_cron_at_start or _kanban_at_start) and _cron_timeout > timeout:
                 logger.info(
-                    "Shutdown drain: %d in-flight cron job(s) — waiting up to "
-                    "%.0fs for them (cron_drain_timeout=%.0fs, "
+                    "Shutdown drain: %d in-flight cron job(s), %d Kanban "
+                    "worker(s) — waiting up to %.0fs for background work "
+                    "(cron_drain_timeout=%.0fs, "
                     "restart_drain_timeout=%.0fs)",
                     _cron_at_start,
+                    _kanban_at_start,
                     _cron_timeout,
                     _cron_drain_cfg,
                     timeout,
@@ -14968,11 +15226,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout, _cron_timeout
             )
             _drain_elapsed = time.monotonic() - _drain_started_at
+            _kanban_now = _shutdown_kanban_worker_count()
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, "
+                "kanban_at_start=%d, kanban_now=%d, "
+                "kanban_probe_failed=%s)",
                 _phase_elapsed(),
                 _drain_elapsed,
                 timed_out,
@@ -14982,10 +15243,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _kanban_at_start,
+                _kanban_now,
+                bool(getattr(self, "_kanban_worker_probe_failed", False)),
             )
 
             if not timed_out:
-                # Drain completed gracefully — all running sessions finished.
+                # Drain completed gracefully — every observed work class,
+                # including detached Kanban workers, finished.
                 # Clear the pre-drain resume_pending markers so sessions that
                 # completed during the drain window don't carry a stale flag.
                 for _sk in _pre_drain_keys:
@@ -15001,12 +15266,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
-                    "interrupting remaining work.",
+                    "%d in-flight cron job(s), %d api_server run(s), and %d "
+                    "Kanban worker(s) (probe_failed=%s); interrupting or "
+                    "marking remaining work ungraceful.",
                     _drain_elapsed,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _kanban_now,
+                    bool(getattr(self, "_kanban_worker_probe_failed", False)),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -15045,6 +15313,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
+                remaining_kanban_workers = await self._terminate_active_kanban_workers(
+                    "gateway restart" if self._restart_requested else "gateway shutdown"
+                )
+                if remaining_kanban_workers:
+                    raise RuntimeError(
+                        "Refusing environment replacement while detached Kanban "
+                        f"workers remain ({remaining_kanban_workers})"
+                    )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 # Wait on API-server work too. The interrupt is cooperative:
                 # without this the settle window closes the instant
@@ -15285,8 +15561,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 logger.info(
                     "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
+                    "active or unverified work; next startup will suspend "
+                    "recently active sessions."
                 )
 
             # Track sessions that were active at shutdown for stuck-loop
@@ -17015,11 +17291,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response_path = _hermes_home / ".update_response"
                 prompt_path = _hermes_home / ".update_prompt.json"
                 try:
-                    tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text(response_text, encoding="utf-8")
-                    tmp.replace(response_path)
-                    prompt_path.unlink(missing_ok=True)
-                except OSError as e:
+                    prompt_data = json.loads(prompt_path.read_text(encoding="utf-8"))
+                    if prompt_data.get("kind") == "update_confirmation":
+                        from gateway.update_prompt_response import (
+                            write_update_confirmation_response,
+                        )
+
+                        written = write_update_confirmation_response(
+                            _hermes_home,
+                            prompt_id=str(prompt_data.get("id") or ""),
+                            correlation_id=str(prompt_data.get("correlation_id") or ""),
+                            session_key=_quick_key,
+                            actor_id=str(event.source.user_id or ""),
+                            answer=response_text,
+                        )
+                        if not written:
+                            return "✗ That update confirmation is invalid, stale, or already answered."
+                    else:
+                        tmp = response_path.with_suffix(".tmp")
+                        tmp.write_text(response_text, encoding="utf-8")
+                        tmp.replace(response_path)
+                        prompt_path.unlink(missing_ok=True)
+                except (OSError, ValueError) as e:
                     logger.warning("Failed to write update response: %s", e)
                     return f"✗ Failed to send response to update process: {e}"
                 _up_state.persistent.update_prompt_pending = False
@@ -17035,17 +17328,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response_path = _hermes_home / ".update_response"
                 prompt_path = _hermes_home / ".update_prompt.json"
                 try:
-                    tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text("", encoding="utf-8")
-                    tmp.replace(response_path)
-                    prompt_path.unlink(missing_ok=True)
+                    prompt_data = json.loads(prompt_path.read_text(encoding="utf-8"))
+                    if prompt_data.get("kind") == "update_confirmation":
+                        from gateway.update_prompt_response import (
+                            write_update_confirmation_response,
+                        )
+
+                        written = write_update_confirmation_response(
+                            _hermes_home,
+                            prompt_id=str(prompt_data.get("id") or ""),
+                            correlation_id=str(prompt_data.get("correlation_id") or ""),
+                            session_key=_quick_key,
+                            actor_id=str(event.source.user_id or ""),
+                            answer="no",
+                        )
+                        if not written:
+                            logger.warning(
+                                "Rejected cancellation for pending update prompt for %s; "
+                                "leaving prompt pending",
+                                _quick_key,
+                            )
+                            return (
+                                "⚠️ Pending update confirmation remains active; "
+                                "the command was not dispatched."
+                            )
+                    else:
+                        tmp = response_path.with_suffix(".tmp")
+                        tmp.write_text("", encoding="utf-8")
+                        tmp.replace(response_path)
+                        prompt_path.unlink(missing_ok=True)
                     logger.info(
                         "Recognized /%s during pending update prompt for %s; "
                         "cancelled prompt with default and dispatching command",
                         _recognized_cmd,
                         _quick_key,
                     )
-                except OSError as e:
+                except (OSError, ValueError) as e:
                     logger.warning(
                         "Failed to write cancel response for pending update prompt: %s",
                         e,
@@ -24011,6 +24329,241 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
+    def _update_adapter_for_pending(
+        self,
+        pending: dict,
+        platform: Platform,
+    ) -> Optional[BasePlatformAdapter]:
+        """Resolve the bot instance that owns a durable update marker.
+
+        Multiplexed profiles can have separate Telegram/Discord credentials,
+        so an origin-stamped marker must never fall back to the process-wide
+        adapter for the same platform.  Markers written before profile
+        attribution existed retain the legacy process-wide lookup.
+        """
+        origin_profile = str(pending.get("origin_profile") or "").strip()
+        if origin_profile:
+            return self._authorization_adapter(platform, origin_profile)
+        return (getattr(self, "adapters", None) or {}).get(platform)
+
+    @staticmethod
+    def _update_send_succeeded(result: Any) -> bool:
+        """Treat an explicit adapter ``success=False`` as a failed delivery."""
+        return getattr(result, "success", True) is not False
+
+    @staticmethod
+    def _try_update_notification_lock(home: Path):
+        """Take the cross-process, crash-released update delivery claim."""
+        from gateway.status import _try_acquire_file_lock
+
+        lock_path = home / ".update_notification.lock"
+        try:
+            handle = lock_path.open("a+", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Cannot open update notification claim: %s", exc)
+            return None
+        if _try_acquire_file_lock(handle):
+            return handle
+        handle.close()
+        return None
+
+    @staticmethod
+    def _release_update_notification_lock(handle) -> None:
+        from gateway.status import _release_file_lock
+
+        _release_file_lock(handle)
+        handle.close()
+
+    @staticmethod
+    def _update_status_path(home: Path, pending: dict) -> Optional[Path]:
+        """Resolve only the terminal marker owned by ``pending``."""
+
+        correlation_id = str(pending.get("correlation_id") or "").strip()
+        if not correlation_id:
+            return home / ".update_exit_code"
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", correlation_id) is None:
+            return None
+        return home / f".update_exit_code.{correlation_id}"
+
+    @staticmethod
+    def _read_owned_update_state(
+        pending_path: Path,
+        claimed_path: Path,
+        correlation_id: str,
+    ) -> Optional[dict]:
+        """Read the current marker only when it still owns this watcher."""
+
+        for state_path in (claimed_path, pending_path):
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            if not correlation_id or str(state.get("correlation_id") or "") == correlation_id:
+                return state
+        return None
+
+    @staticmethod
+    def _update_process_identity_state(
+        pid_value: object,
+        started_at_value: object,
+    ) -> Optional[bool]:
+        """True/False for an exact live/dead process identity; None if unsure."""
+
+        try:
+            pid = int(pid_value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if pid <= 0:
+            return None
+        try:
+            import psutil
+
+            process = psutil.Process(pid)
+            actual_started_at = float(process.create_time())
+        except Exception as exc:
+            try:
+                import psutil
+
+                if isinstance(exc, psutil.NoSuchProcess):
+                    return False
+                if isinstance(exc, (psutil.AccessDenied, psutil.ZombieProcess)):
+                    return None
+            except Exception:
+                pass
+            return None
+        try:
+            expected_started_at = float(started_at_value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # Match the tolerance used by the process-identity ledger. A recycled
+        # PID is the old launch identity being gone, never evidence it is live.
+        return abs(actual_started_at - expected_started_at) < 2.0
+
+    @classmethod
+    def _update_worker_definitively_gone(cls, pending: dict) -> bool:
+        """Prove an orphan without misclassifying a slow/live updater.
+
+        A live or unreadable install-wide update claim is authoritative. Only
+        when that claim is positively absent *and* the exact recorded child
+        (or pre-spawn owner) is positively gone may the watcher terminate the
+        bot action. Every uncertain probe remains fail-closed.
+        """
+
+        try:
+            from hermes_cli.update_lock import read_live_update
+
+            if read_live_update() is not None:
+                return False
+        except Exception:
+            return False
+
+        independent_state = cls._independent_update_worker_state(pending)
+        if independent_state is not False:
+            # True is live; None is unreadable/indeterminate. Both are
+            # authoritative and therefore fail closed.
+            return False
+
+        if str(pending.get("launch_state") or "") == "spawned":
+            state = cls._update_process_identity_state(
+                pending.get("launcher_pid"),
+                pending.get("launcher_started_at"),
+            )
+        else:
+            state = cls._update_process_identity_state(
+                pending.get("launcher_owner_pid"),
+                pending.get("launcher_owner_started_at"),
+            )
+        return state is False
+
+    @staticmethod
+    def _independent_update_worker_state(pending: dict) -> Optional[bool]:
+        """Tri-state liveness for a verified systemd/launchd handoff."""
+
+        correlation_id = str(pending.get("correlation_id") or "").strip()
+        control_home = str(pending.get("control_home") or "").strip()
+        if not correlation_id or not control_home:
+            return False
+        handoff_path = Path(control_home) / f".update_handoff.{correlation_id}.json"
+        try:
+            handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(handoff, dict)
+            or str(handoff.get("correlation_id") or "") != correlation_id
+        ):
+            return None
+        kind = str(handoff.get("kind") or "")
+        worker = str(handoff.get("worker") or "")
+        if kind == "systemd":
+            if not sys.platform.startswith("linux") or not re.fullmatch(
+                r"hermes-update-[A-Za-z0-9]+\.service", worker
+            ):
+                return None
+            try:
+                shown = subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        worker,
+                        "--property=ActiveState",
+                        "--value",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if shown.returncode != 0:
+                return None
+            state = shown.stdout.strip().lower()
+            if state in {"active", "activating", "deactivating", "reloading"}:
+                return True
+            if state in {"inactive", "failed", "dead"}:
+                return False
+            return None
+        if kind == "launchd":
+            # launchd liveness is not safely distinguishable from a query
+            # permission/domain failure here. Preserve the action on any
+            # uncertainty; its correlation marker still terminates normally.
+            return None
+        return None
+
+    @staticmethod
+    def _publish_update_status(path: Path, code: int) -> bool:
+        """Atomically publish a watcher-proven correlation terminal status."""
+
+        import tempfile
+
+        try:
+            fd, raw_temp = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+            )
+            temp = Path(raw_temp)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(str(int(code)))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp, path)
+                return True
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                temp.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            return False
+
 
 
     def _schedule_update_notification_watch(self) -> None:
@@ -24043,7 +24596,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending_path = _hermes_home / ".update_pending.json"
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
         prompt_path = _hermes_home / ".update_prompt.json"
 
         loop = asyncio.get_running_loop()
@@ -24054,6 +24606,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = None
         session_key = None
         metadata = None
+        pending: dict = {}
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
@@ -24066,7 +24619,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id = pending.get("message_id")
                     if platform_str and chat_id:
                         platform = Platform(platform_str)
-                        adapter = self.adapters.get(platform)
+                        adapter = self._update_adapter_for_pending(pending, platform)
                         metadata = self._thread_metadata_for_target(
                             platform,
                             chat_id,
@@ -24082,6 +24635,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+        expected_correlation = str(pending.get("correlation_id") or "").strip()
+        exit_code_path = self._update_status_path(_hermes_home, pending)
+        if exit_code_path is None:
+            logger.error("Update watcher: pending marker has an invalid correlation id")
+            return
+
         if not adapter or not chat_id:
             logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
             # Fall back to completion-only: wait for the exit code and send the
@@ -24091,13 +24650,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # until it actually delivers (returns True) instead of giving up
             # after the first completion check — otherwise a platform that
             # reconnects a few seconds after completion never gets notified.
-            while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
-                if exit_code_path.exists() and await self._send_update_notification():
+            while pending_path.exists() or claimed_path.exists():
+                current = self._read_owned_update_state(
+                    pending_path, claimed_path, expected_correlation
+                )
+                if current is None:
                     return
+                if exit_code_path.exists() and await self._send_update_notification(
+                    expected_correlation=expected_correlation,
+                ):
+                    return
+                if loop.time() >= deadline:
+                    if (
+                        not exit_code_path.exists()
+                        and self._update_worker_definitively_gone(current)
+                        and self._publish_update_status(exit_code_path, 1)
+                    ):
+                        logger.error(
+                            "Update worker %s disappeared without a terminal marker",
+                            expected_correlation or "legacy",
+                        )
+                    else:
+                        logger.warning(
+                            "Update watcher has waited %.0fs; a live or uncertain "
+                            "update owner remains authoritative, continuing to monitor",
+                            timeout,
+                        )
+                    deadline = loop.time() + timeout
                 await asyncio.sleep(poll_interval)
-            if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
-                exit_code_path.write_text("124", encoding="utf-8")
-                await self._send_update_notification()
             return
 
         def _strip_ansi(text: str) -> str:
@@ -24118,32 +24698,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_stream_time = loop.time()
         buffer = ""
 
-        async def _flush_buffer() -> None:
+        async def _flush_buffer() -> bool:
             """Send buffered output to the user."""
             nonlocal buffer, last_stream_time
             if not buffer.strip():
                 buffer = ""
-                return
+                return True
             # Chunk to fit message limits (Telegram: 4096, others: generous)
             clean = _strip_ansi(buffer).strip()
-            buffer = ""
-            last_stream_time = loop.time()
             if not clean:
-                return
+                buffer = ""
+                return True
             # Split into chunks if too long
             max_chunk = 3500
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
             for chunk in chunks:
                 try:
-                    await adapter.send(
+                    result = await adapter.send(
                         chat_id,
                         f"```\n{chunk}\n```",
                         metadata=_non_conversational_metadata(metadata, platform=platform),
                     )
+                    if not self._update_send_succeeded(result):
+                        logger.debug("Update stream adapter rejected delivery")
+                        return False
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
+                    return False
+            buffer = ""
+            last_stream_time = loop.time()
+            return True
 
-        while loop.time() < deadline:
+        while True:
+            current = self._read_owned_update_state(
+                pending_path, claimed_path, expected_correlation
+            )
+            if current is None:
+                # Another gateway process may have won the notification claim
+                # and completed cleanup, or a later action now owns the slot.
+                return
             # Check for completion
             if exit_code_path.exists():
                 # Read any remaining output
@@ -24154,37 +24747,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             buffer += chunk
                     except OSError:
                         pass
-                await _flush_buffer()
-
-                # Send final status
-                try:
-                    exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
-                    exit_code = int(exit_code_raw)
-                    if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
-                            "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
-                    else:
-                        await adapter.send(
-                            chat_id,
-                            "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
-                    logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
-                except Exception as e:
-                    logger.warning("Update final notification failed: %s", e)
-
-                # Cleanup
-                for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
-                    p.unlink(missing_ok=True)
-                (_hermes_home / ".update_response").unlink(missing_ok=True)
-                _up_done = self._peek_session_state(session_key)
-                if _up_done is not None:
-                    _up_done.persistent.update_prompt_pending = False
-                return
+                stream_delivered = await _flush_buffer()
+                if await self._send_update_notification(
+                    include_output=not stream_delivered,
+                    expected_correlation=expected_correlation,
+                ):
+                    return
+                await asyncio.sleep(poll_interval)
+                continue
 
             # Check for new output
             if output_path.exists():
@@ -24215,35 +24785,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     prompt_data = json.loads(prompt_path.read_text(encoding="utf-8"))
                     prompt_text = prompt_data.get("prompt", "")
                     default = prompt_data.get("default", "")
+                    prompt_id = str(prompt_data.get("id") or "")
+                    correlation_id = str(prompt_data.get("correlation_id") or "")
+                    prompt_kind = str(prompt_data.get("kind") or "prompt")
+                    prompt_context = prompt_data.get("context")
+                    if not isinstance(prompt_context, dict):
+                        prompt_context = {}
+                    if prompt_kind == "update_confirmation" and (
+                        not prompt_id
+                        or not correlation_id
+                        or correlation_id != str(pending.get("correlation_id") or "")
+                        or str(prompt_context.get("origin_profile") or "")
+                        != str(pending.get("origin_profile") or "")
+                        or str(prompt_context.get("profile_home") or "")
+                        != str(pending.get("profile_home") or "")
+                        or (
+                            pending.get("control_home")
+                            and str(prompt_context.get("control_home") or "")
+                            != str(pending.get("control_home") or "")
+                        )
+                        or (
+                            pending.get("install_id")
+                            and str(prompt_context.get("install_id") or "")
+                            != str(pending.get("install_id") or "")
+                        )
+                        or (
+                            pending.get("install_root")
+                            and str(prompt_context.get("install_root") or "")
+                            != str(pending.get("install_root") or "")
+                        )
+                    ):
+                        logger.warning("Ignoring mismatched update confirmation prompt")
+                        await asyncio.sleep(poll_interval)
+                        continue
                     if prompt_text:
                         # Flush any buffered output first so the user sees
                         # context before the prompt
                         await _flush_buffer()
                         # Try platform-native buttons first (Discord, Telegram)
                         sent_buttons = False
-                        if getattr(type(adapter), "send_update_prompt", None) is not None:
+                        if (
+                            prompt_kind == "update_confirmation"
+                            and getattr(type(adapter), "send_update_prompt", None) is not None
+                        ):
                             try:
-                                await adapter.send_update_prompt(
+                                prompt_result = await adapter.send_update_prompt(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
+                                    prompt_id=prompt_id,
+                                    correlation_id=correlation_id,
+                                    context=prompt_context,
                                     metadata=_non_conversational_metadata(metadata, platform=platform),
                                 )
-                                sent_buttons = True
+                                sent_buttons = bool(getattr(prompt_result, "success", False))
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
+                        prompt_delivered = sent_buttons
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
-                                chat_id,
-                                f"⚕ **Update needs your input:**\n\n"
-                                f"{prompt_text}{default_hint}\n\n"
-                                f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
-                                f"or type your answer directly.",
-                                metadata=_non_conversational_metadata(metadata, platform=platform),
-                            )
+                            try:
+                                prompt_result = await adapter.send(
+                                    chat_id,
+                                    f"⚕ **Update needs your input:**\n\n"
+                                    f"{prompt_text}{default_hint}\n\n"
+                                    f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
+                                    f"or type your answer directly.",
+                                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                                )
+                                prompt_delivered = self._update_send_succeeded(
+                                    prompt_result
+                                )
+                            except Exception as send_err:
+                                logger.debug("Text update prompt failed: %s", send_err)
+                        if not prompt_delivered:
+                            # Leave the prompt marker + session flag untouched;
+                            # the next poll (or restarted gateway) can retry.
+                            await asyncio.sleep(poll_interval)
+                            continue
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
                         # next watcher can recover by re-forwarding it from
@@ -24257,34 +24878,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
 
+            if loop.time() >= deadline:
+                if (
+                    not exit_code_path.exists()
+                    and self._update_worker_definitively_gone(current)
+                    and self._publish_update_status(exit_code_path, 1)
+                ):
+                    logger.error(
+                        "Update worker %s disappeared without a terminal marker",
+                        expected_correlation or "legacy",
+                    )
+                else:
+                    logger.warning(
+                        "Update watcher has waited %.0fs; a live or uncertain "
+                        "update owner remains authoritative, continuing to monitor",
+                        timeout,
+                    )
+                deadline = loop.time() + timeout
+
             await asyncio.sleep(poll_interval)
 
-        # Timeout
-        if not exit_code_path.exists():
-            logger.warning("Update watcher timed out after %.0fs", timeout)
-            exit_code_path.write_text("124", encoding="utf-8")
-            await _flush_buffer()
-            try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
-            except Exception:
-                pass
-            for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
-                p.unlink(missing_ok=True)
-            (_hermes_home / ".update_response").unlink(missing_ok=True)
-            _up_timeout_state = self._peek_session_state(session_key)
-            if _up_timeout_state is not None:
-                _up_timeout_state.persistent.update_prompt_pending = False
-
-    async def _send_update_notification(self) -> bool:
+    async def _send_update_notification(
+        self,
+        *,
+        include_output: bool = True,
+        expected_correlation: str = "",
+    ) -> bool:
         """If an update finished, notify the user.
 
         Returns False when the update is still running so a caller can retry
-        later. Returns True after a definitive send/skip decision.
+        later, another process owns delivery, or delivery failed. Returns True
+        only after a confirmed send or a definitive non-addressable skip.
 
         This is the legacy notification path used when the streaming watcher
         cannot resolve the adapter (e.g. after a gateway restart where the
@@ -24293,50 +24917,113 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending_path = _hermes_home / ".update_pending.json"
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
+        prompt_path = _hermes_home / ".update_prompt.json"
+        response_path = _hermes_home / ".update_response"
+        handoff_path: Optional[Path] = None
+        exit_code_path: Optional[Path] = None
 
         if not pending_path.exists() and not claimed_path.exists():
             return False
 
-        cleanup = True
-        active_pending_path = claimed_path
+        claim_handle = self._try_update_notification_lock(_hermes_home)
+        if claim_handle is None:
+            logger.debug("Update notification deferred: another process owns delivery")
+            return False
+
+        cleanup = False
+        claimed = False
         try:
-            if pending_path.exists():
+            if claimed_path.exists():
+                claimed = True
+            elif pending_path.exists():
                 try:
                     pending_path.replace(claimed_path)
                 except FileNotFoundError:
-                    if not claimed_path.exists():
-                        return True
-            elif not claimed_path.exists():
-                return True
+                    return False
+                claimed = True
+            else:
+                return False
 
             pending = json.loads(claimed_path.read_text(encoding="utf-8"))
+            actual_correlation = str(pending.get("correlation_id") or "").strip()
+            if expected_correlation and actual_correlation != expected_correlation:
+                logger.info("Update notification deferred: action ownership changed")
+                return False
+            if actual_correlation:
+                handoff_path = (
+                    _hermes_home / f".update_handoff.{actual_correlation}.json"
+                )
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             chat_type = pending.get("chat_type")
             thread_id = pending.get("thread_id")
             message_id = pending.get("message_id")
 
+            exit_code_path = self._update_status_path(_hermes_home, pending)
+            if exit_code_path is None:
+                logger.warning("Update notification deferred: invalid correlation id")
+                return False
             if not exit_code_path.exists():
                 logger.info("Update notification deferred: update still running")
-                cleanup = False
-                active_pending_path = pending_path
-                claimed_path.replace(pending_path)
                 return False
 
             exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
             exit_code = int(exit_code_raw)
+            receipt = None
+            receipt_missing = False
+            expected_correlation = str(pending.get("correlation_id") or "")
+            if expected_correlation:
+                from hermes_cli.update_receipt import read_receipt_for_correlation
+
+                try:
+                    candidate = read_receipt_for_correlation(expected_correlation)
+                except Exception:
+                    candidate = None
+                origin = candidate.get("origin") if isinstance(candidate, dict) else None
+                origin_mismatch = not isinstance(origin, dict)
+                if isinstance(origin, dict):
+                    for identity_key in (
+                        "origin_profile",
+                        "profile_home",
+                        "control_home",
+                        "install_root",
+                        "install_id",
+                    ):
+                        expected_value = str(pending.get(identity_key) or "")
+                        if expected_value and str(origin.get(identity_key) or "") != expected_value:
+                            origin_mismatch = True
+                            break
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate.get("correlation_id") != expected_correlation
+                    or not candidate.get("finished_at")
+                    or origin_mismatch
+                ):
+                    try:
+                        marker_age = time.time() - exit_code_path.stat().st_mtime
+                    except OSError:
+                        marker_age = 0.0
+                    if marker_age < 8.0:
+                        logger.info("Update notification deferred: correlated receipt not durable yet")
+                        return False
+                    receipt_missing = True
+                else:
+                    receipt = candidate
 
             # Read the captured update output
             output = ""
-            if output_path.exists():
+            if include_output and output_path.exists():
                 output = output_path.read_bytes().decode("utf-8", errors="replace")
 
             # Resolve adapter
+            if not platform_str or not chat_id:
+                logger.warning("Discarding malformed update notification target")
+                cleanup = True
+                return True
             platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
+            adapter = self._update_adapter_for_pending(pending, platform)
 
-            if not adapter and chat_id:
+            if not adapter:
                 # The update finished, but the target platform has not
                 # reconnected yet (common right after the restart that
                 # `hermes update` triggers). Treating "adapter missing" as a
@@ -24349,55 +25036,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Update notification deferred: %s adapter not connected yet",
                     platform_str,
                 )
-                cleanup = False
-                active_pending_path = pending_path
-                claimed_path.replace(pending_path)
                 return False
 
-            if adapter and chat_id:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=chat_type,
-                    reply_to_message_id=message_id,
-                    adapter=adapter,
+            metadata = self._thread_metadata_for_target(
+                platform,
+                chat_id,
+                thread_id,
+                chat_type=chat_type,
+                reply_to_message_id=message_id,
+                adapter=adapter,
+            )
+            # Strip ANSI escape codes for clean display
+            from tools.ansi_strip import strip_ansi
+            output = strip_ansi(output).strip()
+            outcome = str((receipt or {}).get("outcome") or "")
+            if receipt_missing:
+                msg = (
+                    "❌ Hermes update could not be verified: terminal marker "
+                    f"{exit_code}, correlated receipt missing."
                 )
-                # Strip ANSI escape codes for clean display
-                from tools.ansi_strip import strip_ansi
-                output = strip_ansi(output).strip()
-                if output:
-                    if len(output) > 3500:
-                        output = "…" + output[-3500:]
-                    if exit_code == 0:
-                        msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
-                    else:
-                        msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
-                elif exit_code == 0:
-                    msg = "✅ Hermes update finished successfully."
-                else:
-                    msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
-                logger.info(
-                    "Sent post-update notification to %s:%s (exit=%s)",
-                    platform_str,
-                    chat_id,
-                    exit_code,
-                )
+            elif outcome == "partial":
+                msg = "⚠️ Hermes update finished partially. Review the output before retrying."
+            elif outcome == "refused":
+                msg = "⚠️ Hermes update was refused before mutation."
+            elif exit_code == 0 and outcome in {"", "success"}:
+                msg = "✅ Hermes update finished and the gateway restarted successfully."
+            else:
+                msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+            if output:
+                if len(output) > 3500:
+                    output = "…" + output[-3500:]
+                msg += f"\n\n```\n{output}\n```"
+            if expected_correlation:
+                msg += f"\n\nCorrelation: `{expected_correlation}`"
+            result = await adapter.send(
+                chat_id,
+                msg,
+                metadata=_non_conversational_metadata(metadata, platform=platform),
+            )
+            if not self._update_send_succeeded(result):
+                logger.warning("Post-update adapter rejected delivery")
+                return False
+            cleanup = True
+            session_key = str(pending.get("session_key") or "")
+            if session_key:
+                session_state = self._peek_session_state(session_key)
+                if session_state is not None:
+                    session_state.persistent.update_prompt_pending = False
+            logger.info(
+                "Sent post-update notification to %s:%s (exit=%s)",
+                platform_str,
+                chat_id,
+                exit_code,
+            )
+            return True
         except Exception as e:
             logger.warning("Post-update notification failed: %s", e)
+            return False
         finally:
-            if cleanup:
-                active_pending_path.unlink(missing_ok=True)
-                claimed_path.unlink(missing_ok=True)
-                output_path.unlink(missing_ok=True)
-                exit_code_path.unlink(missing_ok=True)
-
-        return True
+            try:
+                if cleanup:
+                    for marker_path in (
+                        pending_path,
+                        claimed_path,
+                        output_path,
+                        prompt_path,
+                        response_path,
+                    ):
+                        try:
+                            marker_path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            logger.warning(
+                                "Could not clean delivered update marker %s: %s",
+                                marker_path,
+                                exc,
+                            )
+                    if exit_code_path is not None:
+                        try:
+                            exit_code_path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            logger.warning(
+                                "Could not clean delivered update marker %s: %s",
+                                exit_code_path,
+                                exc,
+                            )
+                    if handoff_path is not None:
+                        try:
+                            handoff_path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            logger.warning(
+                                "Could not clean delivered update handoff %s: %s",
+                                handoff_path,
+                                exc,
+                            )
+                elif claimed and claimed_path.exists() and not pending_path.exists():
+                    # Put deferred/retryable work back at its canonical name.
+                    # The advisory lock, not this rename, is the exclusivity
+                    # boundary.
+                    try:
+                        claimed_path.replace(pending_path)
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not restore deferred update marker: %s",
+                            exc,
+                        )
+            finally:
+                self._release_update_notification_lock(claim_handle)
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""

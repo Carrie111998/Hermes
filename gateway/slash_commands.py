@@ -69,14 +69,25 @@ def _int_value(value: Any) -> int:
         return 0
 
 
-def _model_switch_skew_guard() -> Optional[str]:
-    """Refuse a model switch when the gateway is running stale code.
+@dataclasses.dataclass(frozen=True)
+class GatewayCodeSkew:
+    """Structured stale-runtime signal for platform-neutral restart UX."""
+
+    gateway_code_sha: str
+    checkout_code_sha: str
+    gateway_restart_required: bool = True
+
+
+def _model_switch_skew_guard() -> Optional[GatewayCodeSkew]:
+    """Return structured code skew instead of a prose-only dead end.
 
     A long-lived gateway holds its modules in memory from boot. If the checkout
     changed underneath it (e.g. a manual ``git pull``), switching models can hit
     a first-time lazy import on a new code path and crash on a stale cached
     dependency — the cryptic ``cannot import name 'env_float' from 'utils'``.
-    Detect the drift and tell the user to restart instead.
+    Detect the drift before any model mutation. The caller owns the explicit,
+    profile-scoped restart action; no caller should infer an action by matching
+    this function's display text.
 
     Intentionally scoped to model switching — the known, highest-risk trigger.
     Any first-time lazy import on a stale process is technically exposed; we
@@ -88,13 +99,9 @@ def _model_switch_skew_guard() -> Optional[str]:
     if not skew:
         return None
     boot_rev, disk_rev = skew
-    return t(
-        "gateway.model.error_prefix",
-        error=(
-            f"This gateway is running code from {boot_rev} but the checkout on "
-            f"disk is now {disk_rev}. Switching models would risk a stale-module "
-            f"crash — restart the gateway to load the new code: hermes gateway restart"
-        ),
+    return GatewayCodeSkew(
+        gateway_code_sha=str(boot_rev),
+        checkout_code_sha=str(disk_rev),
     )
 
 
@@ -1711,6 +1718,46 @@ class GatewaySlashCommandsMixin:
             return t("gateway.draining", count=active_agents)
         return EphemeralReply(t("gateway.restart.restarting"))
 
+    async def _request_model_skew_restart(
+        self,
+        event: MessageEvent,
+        skew: GatewayCodeSkew,
+    ) -> Optional[str]:
+        """Offer an explicit restart after a model switch is blocked by skew.
+
+        The restart delegates to the same scoped gateway authority as
+        ``/restart``. The rejected model switch is deliberately not captured by
+        the confirmation handler, so it can never be replayed after restart.
+        """
+
+        async def _restart_current_gateway(choice: str):
+            if choice == "cancel":
+                return "🟡 Gateway restart cancelled. Model unchanged."
+            # The shared prompt has an "always" affordance for older platform
+            # adapters. Treat it as approval for this restart only; never save
+            # a bypass or broaden restart authority.
+            return await self._handle_restart_command(event)
+
+        prefix = self._typed_command_prefix_for(event.source.platform)
+        message = (
+            "⚠️ **Gateway restart required**\n\n"
+            f"The running gateway is at `{skew.gateway_code_sha}`, while the "
+            f"checkout is at `{skew.checkout_code_sha}`. The model was not "
+            "switched because loading new modules into the stale process is unsafe.\n\n"
+            "Restart only this gateway now to load the checked-out code. "
+            "Both **Approve Once** and **Always Approve** authorize this restart "
+            "only; no approval preference is saved. The model switch will not "
+            "be replayed automatically.\n\n"
+            f"_Text fallback: reply `{prefix}approve` or `{prefix}cancel`._"
+        )
+        return await self._request_slash_confirm(
+            event=event,
+            command="restart-stale-gateway",
+            title="Restart stale gateway",
+            message=message,
+            handler=_restart_current_gateway,
+        )
+
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""
         from hermes_cli.slash_exec import CommandContext, execute_command
@@ -1893,9 +1940,16 @@ class GatewaySlashCommandsMixin:
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
-                        skew_error = _model_switch_skew_guard()
-                        if skew_error:
-                            return skew_error
+                        skew = _model_switch_skew_guard()
+                        if skew:
+                            prompt_result = await _self._request_model_skew_restart(
+                                event,
+                                skew,
+                            )
+                            return prompt_result or (
+                                "Gateway restart confirmation sent. The model is "
+                                "unchanged and will not switch automatically after restart."
+                            )
                         # Offload the switch off the event loop — switch_model()
                         # can fall through to a synchronous models.dev HTTP fetch
                         # (requests.get, 15s timeout) on a cold/expired cache,
@@ -2202,9 +2256,9 @@ class GatewaySlashCommandsMixin:
             return "\n".join(lines)
 
         # Perform the switch
-        skew_error = _model_switch_skew_guard()
-        if skew_error:
-            return skew_error
+        skew = _model_switch_skew_guard()
+        if skew:
+            return await self._request_model_skew_restart(event, skew)
         # Offload the switch off the event loop — switch_model() can fall
         # through to a synchronous models.dev HTTP fetch (requests.get, 15s
         # timeout) on a cold/expired cache, which freezes the gateway
@@ -5968,12 +6022,21 @@ class GatewaySlashCommandsMixin:
         files are written so either the current gateway process or the next one
         can notify the user when the update finishes.
         """
-        from gateway.run import _hermes_home, _resolve_hermes_bin
+        from gateway.run import _hermes_home
         import json
-        import shutil
         import subprocess
+        import textwrap
+        import uuid
         from datetime import datetime
         from hermes_cli.config import is_managed, format_managed_message
+        from hermes_cli.process_identity import install_id
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            get_profile_dir,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+        from hermes_cli.runtime_launch import detached_python_env, resolve_project_python
 
         # Block non-messaging platforms (API server, webhooks, ACP)
         platform = event.source.platform
@@ -5997,123 +6060,272 @@ class GatewaySlashCommandsMixin:
         if not git_dir.exists():
             return t("gateway.update.not_git_repo")
 
-        hermes_cmd = _resolve_hermes_bin()
-        if not hermes_cmd:
-            return t("gateway.update.hermes_cmd_not_found")
-
         pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
+        prompt_path = _hermes_home / ".update_prompt.json"
+        response_path = _hermes_home / ".update_response"
+
+        origin_profile = str(getattr(event.source, "profile", "") or "").strip()
+        if not origin_profile:
+            resolver = getattr(self, "_profile_name_for_source", None)
+            if callable(resolver):
+                try:
+                    origin_profile = str(resolver(event.source) or "").strip()
+                except Exception:
+                    origin_profile = ""
+        if not origin_profile:
+            active_resolver = getattr(self, "_active_profile_name", None)
+            if callable(active_resolver):
+                try:
+                    origin_profile = str(active_resolver() or "").strip()
+                except Exception:
+                    origin_profile = ""
+        try:
+            origin_profile = normalize_profile_name(
+                origin_profile or get_active_profile_name() or "default"
+            )
+            validate_profile_name(origin_profile)
+        except ValueError as exc:
+            return f"✗ Refusing update from an invalid profile: {exc}"
+        profile_home = get_profile_dir(origin_profile).resolve()
+        control_home = _hermes_home.resolve()
+        correlation_id = str(uuid.uuid4())
+        exit_code_path = _hermes_home / f".update_exit_code.{correlation_id}"
+        install_root = project_root.resolve()
+        stable_install_id = install_id(install_root)
         session_key = self._session_key_for_source(event.source)
+
+        def _process_started_at(pid: int) -> float | None:
+            try:
+                import psutil
+
+                return float(psutil.Process(pid).create_time())
+            except Exception:
+                return None
+
         pending = {
+            "correlation_id": correlation_id,
             "platform": event.source.platform.value,
             "chat_id": event.source.chat_id,
             "chat_type": event.source.chat_type,
             "user_id": event.source.user_id,
             "session_key": session_key,
+            "origin_profile": origin_profile,
+            "profile_home": str(profile_home),
+            "control_home": str(control_home),
+            "install_root": str(install_root),
+            "install_id": stable_install_id,
             "timestamp": datetime.now().isoformat(),
+            # Crash-recovery identity for the short publish -> Popen -> commit
+            # window.  A watcher may declare an orphan only when both this
+            # exact owner/child identity and the install-wide update lock are
+            # positively absent; uncertainty remains fail-closed.
+            "launch_state": "starting",
+            "launcher_owner_pid": os.getpid(),
+            "launcher_owner_started_at": _process_started_at(os.getpid()),
         }
         if event.source.thread_id:
             pending["thread_id"] = event.source.thread_id
         if event.message_id:
             pending["message_id"] = event.message_id
-        _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
-        _tmp_pending.replace(pending_path)
-        exit_code_path.unlink(missing_ok=True)
-
-        # Spawn `hermes update --gateway` detached so it survives gateway restart.
-        # --gateway enables file-based IPC for interactive prompts (stash
-        # restore, config migration) so the gateway can forward them to the
-        # user instead of silently skipping them.
-        # Use setsid for portable session detach (works under system services
-        # where systemd-run --user fails due to missing D-Bus session).
-        # PYTHONUNBUFFERED ensures output is flushed line-by-line so the
-        # gateway can stream it to the messenger in near-real-time.
-        # Spawn `hermes update --gateway` detached so it survives gateway restart.
-        # --gateway enables file-based IPC for interactive prompts (stash
-        # restore, config migration) so the gateway can forward them to the
-        # user instead of silently skipping them.
-        # Use setsid for portable session detach (works under system services
-        # where systemd-run --user fails due to missing D-Bus session).
-        # PYTHONUNBUFFERED ensures output is flushed line-by-line so the
-        # gateway can stream it to the messenger in near-real-time.
-        #
-        # Windows: no bash/setsid chain.  Run `hermes update --gateway`
-        # directly via sys.executable; redirect stdout/stderr to the same
-        # output files via Popen file handles; write the exit code in a
-        # follow-up write.  A tiny Python watcher would be cleaner but
-        # we're already inside gateway/run.py's update path which is async,
-        # so the simplest correct thing is: launch an inline Python helper
-        # that runs the command and writes both outputs.
+        # The update kernel owns the correlation-scoped terminal marker,
+        # including the systemd canary handoff. The slash launcher must never
+        # publish rc=0 merely because the first process handed off to an
+        # independent worker.
+        _tmp_pending = pending_path.with_name(
+            f".update_pending.{correlation_id}.tmp"
+        )
+        published = False
+        admission_handle = None
         try:
+            # Finish every fallible preparation step before publishing the
+            # durable pending marker.  A resolver/env failure must not leave a
+            # phantom update that blocks every later /update invocation.
+            project_python = resolve_project_python(project_root)
+            boundary = textwrap.dedent(
+                """
+                import os
+                import sys
+                rc = 0
+                try:
+                    from hermes_cli.main import main
+                    main()
+                except SystemExit as exc:
+                    rc = int(exc.code or 0) if isinstance(exc.code, (int, type(None))) else 1
+                except BaseException:
+                    rc = 1
+                    raise
+                finally:
+                    if rc != 75:
+                        try:
+                            from hermes_constants import get_hermes_home
+                            home = get_hermes_home()
+                            correlation = os.environ.get(
+                                "HERMES_UPDATE_CORRELATION_ID", ""
+                            ).strip()
+                            marker = home / (
+                                ".update_exit_code." + correlation
+                                if correlation
+                                else ".update_exit_code"
+                            )
+                            if not marker.exists():
+                                tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+                                tmp.write_text(str(rc), encoding="utf-8")
+                                os.replace(tmp, marker)
+                        except OSError:
+                            pass
+                raise SystemExit(rc)
+                """
+            ).strip()
+            update_argv = [project_python, "-c", boundary, "update", "--gateway"]
+            update_env = detached_python_env()
+            update_env.update({
+                "HERMES_HOME": str(control_home),
+                "HERMES_UPDATE_CORRELATION_ID": correlation_id,
+                "HERMES_UPDATE_ORIGIN_PROFILE": origin_profile,
+                "HERMES_UPDATE_ORIGIN_HOME": str(profile_home),
+                "HERMES_UPDATE_OUTPUT_PATH": str(output_path.resolve()),
+                "PYTHONUNBUFFERED": "1",
+            })
             if sys.platform == "win32":
-                import textwrap
-                from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+                # The rollout coordinator verifies both this correlation and
+                # that CreateProcess actually escaped the gateway's job
+                # object. A copied external coordinator inherits the proof.
+                update_env["HERMES_UPDATE_WINDOWS_DETACHED"] = correlation_id
 
-                # Invoke the updater as a module under this interpreter rather
-                # than through hermes_cmd (venv\Scripts\hermes.exe): the shim
-                # launcher holds its own file open for the whole run, and the
-                # update has to replace it. Going through python.exe maps no
-                # shim, so the entry points can be rewritten freely.
-                helper = textwrap.dedent(
-                    """
-                    import os, subprocess, sys
-                    output_path = sys.argv[1]
-                    exit_code_path = sys.argv[2]
-                    cmd = sys.argv[3:]
-                    env = dict(os.environ)
-                    env["PYTHONUNBUFFERED"] = "1"
-                    with open(output_path, "wb") as f:
-                        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
-                        rc = proc.wait(timeout=3600)
-                    with open(exit_code_path, "w", encoding="utf-8") as f:
-                        f.write(str(rc))
-                    """
-                ).strip()
-                subprocess.Popen(
-                    [
-                        sys.executable, "-c", helper,
-                        str(output_path), str(exit_code_path),
-                        sys.executable, "-m", "hermes_cli.main",
-                        "update", "--gateway",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    **windows_detach_popen_kwargs(),
-                )
-            else:
-                hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
-                update_cmd = (
-                    f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
-                    f" > {shlex.quote(str(output_path))} 2>&1; "
-                    # Avoid `status=$?`: `status` is a read-only special parameter
-                    # in zsh, and this command string is copied/reused in macOS/zsh
-                    # operator wrappers. Keep the template zsh-safe even though this
-                    # specific subprocess currently runs under bash.
-                    f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}"
-                )
-                setsid_bin = shutil.which("setsid")
-                if setsid_bin:
-                    # Preferred: setsid creates a new session, fully detached
-                    subprocess.Popen(
-                        [setsid_bin, "bash", "-c", update_cmd],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
+            # Admission and notification cleanup share one OS-backed lock.
+            # Keep it across the no-slot check, no-clobber publication, and
+            # spawn so pending -> claimed delivery never reopens the action
+            # slot and two gateway processes cannot both launch an updater.
+            admission_handle = self._try_update_notification_lock(_hermes_home)
+            if admission_handle is None:
+                return "⚕ A Hermes update is already in progress."
+            if pending_path.exists() or claimed_path.exists():
+                return "⚕ A Hermes update is already in progress."
+
+            exit_code_path.unlink(missing_ok=True)
+            prompt_path.unlink(missing_ok=True)
+            response_path.unlink(missing_ok=True)
+            output_path.write_bytes(b"")
+
+            with _tmp_pending.open("x", encoding="utf-8") as pending_handle:
+                pending_handle.write(json.dumps(pending))
+                pending_handle.flush()
+                os.fsync(pending_handle.fileno())
+            # Atomic no-replace publish: a reader sees a complete inode and a
+            # non-cooperating/stale writer cannot clobber an admitted action.
+            os.link(_tmp_pending, pending_path)
+            _tmp_pending.unlink(missing_ok=True)
+            published = True
+
+            with output_path.open("ab", buffering=0) as output_handle:
+                if sys.platform == "win32":
+                    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+                    update_process = subprocess.Popen(
+                        update_argv,
+                        cwd=str(project_root),
+                        env=update_env,
+                        stdout=output_handle,
+                        stderr=subprocess.STDOUT,
+                        **windows_detach_popen_kwargs(),
                     )
                 else:
-                    # Fallback: start_new_session=True calls os.setsid() in child
-                    subprocess.Popen(
-                        ["bash", "-c", update_cmd],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
+                    import shutil
+
+                    setsid_bin = shutil.which("setsid")
+                    launch_argv = [setsid_bin, *update_argv] if setsid_bin else update_argv
+                    popen_kwargs = {
+                        "cwd": str(project_root),
+                        "env": update_env,
+                        "stdout": output_handle,
+                        "stderr": subprocess.STDOUT,
+                    }
+                    if not setsid_bin:
+                        popen_kwargs["start_new_session"] = True
+                    update_process = subprocess.Popen(launch_argv, **popen_kwargs)
+
+            child_pid_raw = getattr(update_process, "pid", None)
+            child_pid = (
+                child_pid_raw
+                if isinstance(child_pid_raw, int) and child_pid_raw > 0
+                else None
+            )
+            if child_pid is not None:
+                committed = dict(pending)
+                committed.update(
+                    {
+                        "launch_state": "spawned",
+                        "launcher_pid": child_pid,
+                        "launcher_started_at": _process_started_at(child_pid),
+                    }
+                )
+                committed_temp = pending_path.with_name(
+                    f".update_pending.{correlation_id}.spawned.tmp"
+                )
+                try:
+                    with committed_temp.open("x", encoding="utf-8") as pending_handle:
+                        pending_handle.write(json.dumps(committed))
+                        pending_handle.flush()
+                        os.fsync(pending_handle.fileno())
+                    os.replace(committed_temp, pending_path)
+                    pending = committed
+                except OSError:
+                    # The child is already live. Preserve the durable starting
+                    # reservation; orphan recovery will also consult the
+                    # install-wide update lock and therefore cannot race it.
+                    logger.warning(
+                        "Could not persist bot update child identity for %s",
+                        correlation_id,
+                        exc_info=True,
                     )
+                finally:
+                    committed_temp.unlink(missing_ok=True)
         except Exception as e:
-            pending_path.unlink(missing_ok=True)
-            exit_code_path.unlink(missing_ok=True)
+            _tmp_pending.unlink(missing_ok=True)
+            if published:
+                # Only remove state still owned by this invocation. Another
+                # gateway process may already have recovered/replaced the
+                # marker, and an old cleanup must never erase the new action.
+                removed_owned_marker = False
+                for state_path in (pending_path, claimed_path):
+                    try:
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                    except (FileNotFoundError, OSError, json.JSONDecodeError):
+                        continue
+                    if str(state.get("correlation_id") or "") == correlation_id:
+                        state_path.unlink(missing_ok=True)
+                        removed_owned_marker = True
+                if (
+                    removed_owned_marker
+                    and not pending_path.exists()
+                    and not claimed_path.exists()
+                ):
+                    for marker_path in (
+                        output_path,
+                        exit_code_path,
+                        prompt_path,
+                        response_path,
+                    ):
+                        marker_path.unlink(missing_ok=True)
+            elif admission_handle is not None and not (
+                pending_path.exists() or claimed_path.exists()
+            ):
+                # Preparation reached the reserved slot but failed before the
+                # pending inode was published. Remove only this invocation's
+                # correlation-scoped/shared scratch artifacts.
+                for marker_path in (
+                    output_path,
+                    exit_code_path,
+                    prompt_path,
+                    response_path,
+                ):
+                    marker_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
+        finally:
+            if admission_handle is not None:
+                self._release_update_notification_lock(admission_handle)
 
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")

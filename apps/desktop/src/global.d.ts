@@ -153,6 +153,9 @@ declare global {
         ) => Promise<{ ok: boolean; registry: DesktopConnectionsRegistry }>
         setLastUsed?: (id: string) => Promise<{ ok: boolean; registry: DesktopConnectionsRegistry }>
         test: (id: string) => Promise<DesktopConnectionTestResult>
+        // Drain/update/restore one Desktop-managed SSH install. External URL
+        // and cloud sources are refused without touching their processes.
+        updateManaged?: (id: string) => Promise<DesktopManagedConnectionUpdateResult>
         // Fan out `hermes update` to every eligible registered connection;
         // cloud entries are skipped (platform-managed), each row independent.
         // excludeIds skips connections the caller updates through another
@@ -573,6 +576,12 @@ export interface DesktopUpdateStatus {
   currentSha?: string
   /** Backend only: the version string the backend reports for itself. */
   currentVersion?: string
+  /** Backend only: structured gateway/checkout skew. Absent on older
+   * backends; never infer it from human-readable update messages. */
+  gatewayRestartRequired?: boolean
+  gatewayProfile?: string
+  gatewayCodeSha?: string
+  checkoutCodeSha?: string
   targetSha?: string
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
@@ -919,6 +928,37 @@ export interface DesktopConnectionUpdateResult {
   reason?: string
   detail?: string
   error?: string
+}
+
+export type DesktopManagedConnectionUpdateOutcome =
+  'updated' | 'update-failed' | 'restore-failed' | 'update-and-restore-failed' | 'refused'
+
+export interface DesktopManagedUpdateReceipt {
+  correlationId: string
+  // Additive receipt outcomes remain forward-compatible with newer updater
+  // kernels instead of making an older renderer reject their proof.
+  outcome: string
+  startedAt?: string
+  finishedAt?: string
+  preSha?: string
+  postSha?: string
+  preVersion?: string
+  postVersion?: string
+  stopReason?: string
+}
+
+export interface DesktopManagedConnectionUpdateResult {
+  connectionId: string
+  correlationId: string
+  ok: boolean
+  updateOk: boolean
+  restoreOk: boolean
+  outcome: DesktopManagedConnectionUpdateOutcome
+  exitCode: number | null
+  receipt: DesktopManagedUpdateReceipt | null
+  scopes: Array<{ profile: string; restored: boolean; error?: string }>
+  error?: string
+  message?: string
 }
 
 export interface DesktopSshResolveResult {

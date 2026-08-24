@@ -1106,13 +1106,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # The lifecycle gate stops the second tick as soon as the fake flips
+    # `_running=False`; it must not finish the already-queued dispatcher work
+    # and open another board after shutdown begins. The first tick's dispatch,
+    # ready probe, and auto-decompose probes account for these four opens.
+    assert calls["connect"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -1406,5 +1404,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

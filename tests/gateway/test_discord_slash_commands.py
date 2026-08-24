@@ -169,6 +169,70 @@ async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter)
     interaction.delete_original_response.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "admission_result",
+    [
+        "Updates for this managed runtime must be started from the dashboard.",
+        "Hermes is not running from a Git checkout.",
+        "Another update is already in progress.",
+    ],
+    ids=["managed-runtime", "non-git", "install-busy"],
+)
+async def test_update_slash_never_replaces_defer_with_false_success(
+    adapter, admission_result
+):
+    """The gateway receipt, not slash dispatch, decides update admission."""
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        guild_id=456,
+        user=SimpleNamespace(id=42, name="Jezza", display_name="Jezza"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter.handle_message = AsyncMock(return_value=admission_result)
+
+    await adapter._run_simple_slash(interaction, "/update")
+
+    adapter.handle_message.assert_awaited_once()
+    interaction.edit_original_response.assert_not_awaited()
+    interaction.delete_original_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_non_transactional_simple_slash_keeps_configured_ack(adapter):
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        guild_id=456,
+        user=SimpleNamespace(id=42, name="Jezza", display_name="Jezza"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter.handle_message = AsyncMock()
+
+    await adapter._run_simple_slash(interaction, "/reset", "Session reset~")
+
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Session reset~"
+    )
+    interaction.delete_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_update_slash_has_no_optimistic_ack(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["update"](interaction)
+
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/update")
+
+
 # ------------------------------------------------------------------
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------
@@ -600,5 +664,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
-

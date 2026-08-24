@@ -1,14 +1,117 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { test, vi } from 'vitest'
 
 import {
   backendCommandMatches,
   type BackendIdentity,
+  type BackendOwnershipEntry,
+  type BackendOwnershipStore,
   createBackendOwnership,
   createBackendShutdownCoordinator,
   parseBackendOwnership
 } from './backend-ownership'
+import { compareAndDeleteBackendOwnershipLock, publishBackendOwnershipLock } from './backend-ownership-lock'
+
+const mainSource = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8')
+
+function sourceSlice(startMarker: string, endMarker: string): string {
+  const start = mainSource.indexOf(startMarker)
+  assert.notEqual(start, -1, `missing source marker: ${startMarker}`)
+  const end = mainSource.indexOf(endMarker, start + startMarker.length)
+  return mainSource.slice(start, end === -1 ? undefined : end)
+}
+
+test('Electron backend lock cleanup uses a rename tombstone CAS, including malformed recovery', () => {
+  const transaction = sourceSlice('async function withBackendOwnershipLock', '\nfunction execText')
+
+  assert.match(transaction, /compareAndDeleteBackendOwnershipLock\(lockPath, rawOwner\)/)
+  assert.equal(transaction.split('compareAndDeleteBackendOwnershipLock(lockPath, `${contents}\\n`)').length - 1, 2)
+  assert.match(transaction, /publishBackendOwnershipLock\(lockPath, contents\)/)
+})
+
+test('replacement races remove the private tombstone without removing the replacement lock', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-backend-ownership-'))
+  const lockPath = path.join(directory, 'backend.lock')
+
+  try {
+    await writeFile(lockPath, 'old-owner\n')
+    let replacementPublished = false
+    const originalLink = (await import('node:fs/promises')).link
+    const replacementSafeFs = {
+      rename: (await import('node:fs/promises')).rename,
+      readFile,
+      unlink: (await import('node:fs/promises')).unlink,
+      link: async (tombstonePath: string, publicPath: string) => {
+        if (!replacementPublished) {
+          replacementPublished = true
+          await writeFile(publicPath, 'replacement-owner\n')
+        }
+        return originalLink(tombstonePath, publicPath)
+      }
+    }
+
+    assert.equal(await compareAndDeleteBackendOwnershipLock(lockPath, 'different-owner\n', replacementSafeFs as any), false)
+    assert.equal(await readFile(lockPath, 'utf8'), 'replacement-owner\n')
+    assert.deepEqual(
+      (await readdir(directory)).filter(name => name.endsWith('.tombstone')),
+      [],
+      'replacement races must not accumulate private tombstones'
+    )
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('malformed recovery cannot steal a delayed wx creator inode', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-backend-ownership-'))
+  const lockPath = path.join(directory, 'backend.lock')
+  let creatorReady!: () => void
+  let releaseCreator!: () => void
+  const creatorStarted = new Promise<void>(resolve => {
+    creatorReady = resolve
+  })
+  const release = new Promise<void>(resolve => {
+    releaseCreator = resolve
+  })
+
+  try {
+    await writeFile(lockPath, '{"pid":')
+    const fsModule = await import('node:fs/promises')
+    const delayedCreatorFs = {
+      writeFile: async (filePath: string, ...args: any[]) => {
+        const result = await (fsModule.writeFile as any)(filePath, ...args)
+        if (filePath.startsWith(`${lockPath}.`) && filePath.endsWith('.tmp')) {
+          creatorReady()
+          await release
+        }
+        return result
+      },
+      rename: fsModule.rename,
+      link: fsModule.link,
+      rm: fsModule.rm,
+      readFile: fsModule.readFile,
+      unlink: fsModule.unlink
+    }
+    const creator = publishBackendOwnershipLock(lockPath, 'valid-owner', delayedCreatorFs as any)
+
+    await creatorStarted
+    assert.equal(await compareAndDeleteBackendOwnershipLock(lockPath, '{"pid":'), true)
+    releaseCreator()
+    await creator
+
+    assert.equal(await readFile(lockPath, 'utf8'), 'valid-owner\n')
+    assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.tombstone')), [])
+  } finally {
+    releaseCreator?.()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 function memoryStore(initial = '') {
   let contents = initial
@@ -50,7 +153,7 @@ function deferred() {
   return { promise, resolve }
 }
 
-function createOwnership(store = memoryStore(), overrides: Partial<Parameters<typeof createBackendOwnership>[0]> = {}) {
+function createOwnership(store: BackendOwnershipStore = memoryStore(), overrides: Partial<Parameters<typeof createBackendOwnership>[0]> = {}) {
   return createBackendOwnership({
     matchesIdentity: async () => true,
     // Unknown parent (no record / legacy) preserves the pre-parent behaviour.
@@ -68,6 +171,145 @@ test('claim persists the caller-supplied exact identity before resolving', async
 
   assert.deepEqual(await ownership.claim(claim), claim)
   assert.deepEqual(parseBackendOwnership(store.value()), [claim])
+})
+
+test('claim persists immediately, then prunes stale ownership in one non-blocking batch', async () => {
+  const stale = ownershipEntry({ nonce: 'stale', pid: 40, startMarker: 'old-start' })
+  const uncertain = ownershipEntry({ nonce: 'uncertain', pid: 41, startMarker: 'unknown-start' })
+  const claim = ownershipEntry({ nonce: 'new', pid: 42, startMarker: 'new-start' })
+  const store = memoryStore(stored([stale, uncertain]))
+  const gate = deferred()
+  const inspect = vi.fn(async (entries: readonly BackendOwnershipEntry[]) => {
+    await gate.promise
+
+    return entries.map(entry => ({
+      identityMatches: entry.nonce === stale.nonce ? false : entry.nonce === uncertain.nonce ? undefined : true,
+      parentMatches: undefined
+    }))
+  })
+  const ownership = createOwnership(store, { inspect })
+
+  await ownership.claim(claim)
+
+  // Persistence is complete while the cold snapshot remains blocked.
+  assert.deepEqual(parseBackendOwnership(store.value()), [stale, uncertain, claim])
+  assert.equal(inspect.mock.calls.length, 1)
+
+  const compacted = ownership.compactStale()
+  gate.resolve()
+
+  assert.equal(await compacted, 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [uncertain, claim])
+  assert.deepEqual(inspect.mock.calls, [[[stale, uncertain, claim]]])
+})
+
+test('claim batch-compacts a large roster after persisting without blocking startup', async () => {
+  const old = Array.from({ length: 7 }, (_, index) =>
+    ownershipEntry({
+      nonce: `old-${index}`,
+      pid: 100 + index,
+      startMarker: `old-start-${index}`
+    })
+  )
+  const uncertain = old[old.length - 1]
+  const claim = ownershipEntry({ nonce: 'new', pid: 200, startMarker: 'new-start' })
+  const store = memoryStore(stored(old))
+  const gate = deferred()
+  const inspect = vi.fn(async (entries: readonly BackendOwnershipEntry[]) => {
+    await gate.promise
+
+    return entries.map(entry => ({
+      identityMatches: entry.nonce === uncertain.nonce ? undefined : entry.nonce === claim.nonce,
+      parentMatches: undefined
+    }))
+  })
+  const ownership = createOwnership(store, { inspect })
+
+  await ownership.claim(claim)
+
+  // The exact new claim is durable before the cold snapshot finishes.
+  assert.deepEqual(parseBackendOwnership(store.value()), [...old, claim])
+  assert.equal(inspect.mock.calls.length, 1)
+
+  const compacted = ownership.compactStale()
+  gate.resolve()
+
+  assert.equal(await compacted, old.length - 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [uncertain, claim])
+  assert.deepEqual(inspect.mock.calls, [[[...old, claim]]])
+})
+
+test('concurrent claims merge both children without a read-await-write lost update', async () => {
+  const stale = ownershipEntry({ nonce: 'stale', pid: 79, startMarker: 'stale-start' })
+  const store = memoryStore(stored([stale]))
+  const gate = deferred()
+  const inspect = vi.fn(async (entries: readonly BackendOwnershipEntry[]) => {
+    await gate.promise
+
+    return entries.map(entry => ({ identityMatches: entry.nonce !== stale.nonce, parentMatches: undefined }))
+  })
+  const ownership = createOwnership(store, { inspect })
+  const first = ownershipEntry({ nonce: 'first', pid: 80, startMarker: 'first-start' })
+  const second = ownershipEntry({ nonce: 'second', pid: 81, startMarker: 'second-start' })
+
+  await Promise.all([ownership.claim(first), ownership.claim(second)])
+
+  assert.equal(inspect.mock.calls.length, 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [stale, first, second])
+
+  const compacted = ownership.compactStale()
+  gate.resolve()
+
+  assert.equal(await compacted, 1)
+  assert.deepEqual(parseBackendOwnership(store.value()), [first, second])
+})
+
+test('ownership mutations use the store transaction boundary so separate interpreters cannot clobber rows', async () => {
+  let contents = stored([])
+  let transactions = 0
+  const store = {
+    read: () => contents,
+    write: (next: string) => {
+      contents = next
+    },
+    transaction: <T>(operation: () => T): T => {
+      transactions += 1
+      return operation()
+    }
+  }
+  const first = createOwnership(store)
+  const second = createOwnership(store)
+
+  await Promise.all([
+    first.claim(ownershipEntry({ pid: 80, nonce: 'first' })),
+    second.claim(ownershipEntry({ pid: 81, nonce: 'second' }))
+  ])
+
+  assert.ok(transactions >= 2)
+  assert.deepEqual(parseBackendOwnership(contents), [
+    ownershipEntry({ pid: 80, nonce: 'first' }),
+    ownershipEntry({ pid: 81, nonce: 'second' })
+  ])
+})
+
+test('an ownership read error is quarantined and never treated as an empty roster', async () => {
+  let quarantined = 0
+  let writes = 0
+  const ownership = createOwnership({
+    read: () => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+    },
+    write: () => {
+      writes += 1
+    },
+    quarantine: () => {
+      quarantined += 1
+    }
+  })
+
+  assert.deepEqual(await ownership.reapOrphans(), [])
+  assert.equal(quarantined, 1)
+  assert.equal(writes, 0)
 })
 
 test('incomplete claims and persisted records are rejected', async () => {
@@ -109,9 +351,8 @@ test('failed persistence awaits asynchronous cleanup of the exact identity', asy
     throw error
   })
 
-  await Promise.resolve()
+  await vi.waitFor(() => assert.deepEqual(stop.mock.calls, [[claim]]))
   assert.equal(rejected, false)
-  assert.deepEqual(stop.mock.calls, [[claim]])
 
   cleanup.resolve()
   await assert.rejects(result, expected)
@@ -151,6 +392,94 @@ test('startup reap preserves records when exact identity probing is uncertain or
   assert.deepEqual(await ownership.reapOrphans(), [])
   assert.equal(stop.mock.calls.length, 0)
   assert.deepEqual(parseBackendOwnership(store.value()), [uncertain, failed])
+})
+
+test('startup reap classifies the whole roster with one batch inspection', async () => {
+  const liveParent = {
+    ...ownershipEntry({ nonce: 'live-parent', pid: 60 }),
+    parentPid: 600,
+    parentStartMarker: 'parent-start'
+  }
+  const stale = ownershipEntry({ nonce: 'stale', pid: 61 })
+  const orphan = ownershipEntry({ nonce: 'orphan', pid: 62 })
+  const store = memoryStore(stored([liveParent, stale, orphan]))
+  const inspect = vi.fn(async () => [
+    { identityMatches: true, parentMatches: true },
+    { identityMatches: false, parentMatches: false },
+    { identityMatches: true, parentMatches: false }
+  ])
+  const stop = vi.fn()
+  const matchesIdentity = vi.fn(async () => assert.fail('batch inspection should replace scalar identity probes'))
+  const matchesParent = vi.fn(async () => assert.fail('batch inspection should replace scalar parent probes'))
+  const ownership = createOwnership(store, { inspect, matchesIdentity, matchesParent, stop })
+
+  assert.deepEqual(await ownership.reapOrphans(), [62])
+  assert.deepEqual(inspect.mock.calls, [[[liveParent, stale, orphan]]])
+  assert.equal(matchesIdentity.mock.calls.length, 0)
+  assert.equal(matchesParent.mock.calls.length, 0)
+  assert.deepEqual(stop.mock.calls, [[orphan]])
+  assert.deepEqual(parseBackendOwnership(store.value()), [liveParent])
+})
+
+test('startup reap overlaps scalar roster probes when a batch inspector is unavailable', async () => {
+  const first = ownershipEntry({ nonce: 'first', pid: 70 })
+  const second = ownershipEntry({ nonce: 'second', pid: 71 })
+  const gate = deferred()
+  let started = 0
+  const matchesIdentity = vi.fn(async () => {
+    started += 1
+    await gate.promise
+    return false
+  })
+  const ownership = createOwnership(memoryStore(stored([first, second])), {
+    matchesIdentity,
+    matchesParent: async () => false
+  })
+  const result = ownership.reapOrphans()
+
+  await vi.waitFor(() => assert.equal(started, 2))
+  gate.resolve()
+
+  assert.deepEqual(await result, [])
+})
+
+test('startup reap fresh-merges a backend claimed while inspection is pending', async () => {
+  const stale = ownershipEntry({ nonce: 'stale', pid: 72, startMarker: 'stale-start' })
+  const claimed = ownershipEntry({ nonce: 'claimed', pid: 73, startMarker: 'claimed-start' })
+  const store = memoryStore(stored([stale]))
+  const gate = deferred()
+  const inspect = vi.fn(async () => {
+    await gate.promise
+    return [{ identityMatches: false, parentMatches: false }]
+  })
+  const ownership = createOwnership(store, { inspect })
+  const reap = ownership.reapOrphans()
+
+  await vi.waitFor(() => assert.equal(inspect.mock.calls.length, 1))
+  await ownership.claim(claimed)
+  gate.resolve()
+
+  assert.deepEqual(await reap, [])
+  assert.deepEqual(parseBackendOwnership(store.value()), [claimed])
+})
+
+test('startup reap does not resurrect an entry released while inspection is pending', async () => {
+  const released = ownershipEntry({ nonce: 'released', pid: 74, startMarker: 'released-start' })
+  const store = memoryStore(stored([released]))
+  const gate = deferred()
+  const inspect = vi.fn(async () => {
+    await gate.promise
+    return [{ identityMatches: undefined, parentMatches: undefined }]
+  })
+  const ownership = createOwnership(store, { inspect })
+  const reap = ownership.reapOrphans()
+
+  await vi.waitFor(() => assert.equal(inspect.mock.calls.length, 1))
+  ownership.release(released)
+  gate.resolve()
+
+  assert.deepEqual(await reap, [])
+  assert.deepEqual(parseBackendOwnership(store.value()), [])
 })
 
 test('startup reap passes the full confirmed identity to stop', async () => {

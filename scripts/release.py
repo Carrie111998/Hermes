@@ -2180,8 +2180,16 @@ def bump_version(current: str, part: str) -> str:
     return f"{major}.{minor}.{patch}"
 
 
-def update_version_files(semver: str, calver_date: str):
-    """Update version strings in source files."""
+def update_version_files(semver: str, calver_date: str) -> list[Path]:
+    """Update every release version surface and return the exact write set.
+
+    The publish path stages this returned list.  Keeping the write set and the
+    stage set identical prevents a successfully rewritten Desktop manifest
+    from being omitted from the release commit (#68783/#90830; contributor
+    fixes #63167 and #68796).
+    """
+    updates: list[tuple[Path, str]] = []
+
     # Update __init__.py
     content = VERSION_FILE.read_text(encoding="utf-8")
     content = re.sub(
@@ -2194,7 +2202,7 @@ def update_version_files(semver: str, calver_date: str):
         f'__release_date__ = "{calver_date}"',
         content,
     )
-    VERSION_FILE.write_text(content, encoding="utf-8")
+    updates.append((VERSION_FILE, content))
 
     # Update pyproject.toml
     pyproject = PYPROJECT_FILE.read_text(encoding="utf-8")
@@ -2204,7 +2212,7 @@ def update_version_files(semver: str, calver_date: str):
         pyproject,
         flags=re.MULTILINE,
     )
-    PYPROJECT_FILE.write_text(pyproject, encoding="utf-8")
+    updates.append((PYPROJECT_FILE, pyproject))
 
     # Keep the desktop Electron app's package.json version in lockstep with the
     # Python package version. The desktop About panel reads the live Hermes
@@ -2212,14 +2220,38 @@ def update_version_files(semver: str, calver_date: str):
     # from this field, so it must track pyproject to avoid drift.
     desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
     if desktop_pkg.exists():
-        pkg_text = desktop_pkg.read_text(encoding="utf-8")
-        pkg_text = re.sub(
-            r'("version"\s*:\s*)"[^"]+"',
-            rf'\g<1>"{semver}"',
-            pkg_text,
-            count=1,
-        )
-        desktop_pkg.write_text(pkg_text, encoding="utf-8")
+        package_data = json.loads(desktop_pkg.read_text(encoding="utf-8"))
+        if not isinstance(package_data, dict):
+            raise ValueError(f"{desktop_pkg} must contain a JSON object")
+        package_data["version"] = semver
+        updates.append((desktop_pkg, json.dumps(package_data, indent=2) + "\n"))
+
+        # npm keeps a second copy of each workspace package version in the
+        # root lockfile.  Updating package.json alone leaves npm's canonical
+        # workspace metadata stale even when the release file is staged.
+        package_lock = REPO_ROOT / "package-lock.json"
+        if package_lock.exists():
+            lock_data = json.loads(package_lock.read_text(encoding="utf-8"))
+            packages = lock_data.get("packages") if isinstance(lock_data, dict) else None
+            desktop_entry = packages.get("apps/desktop") if isinstance(packages, dict) else None
+            if not isinstance(desktop_entry, dict):
+                raise ValueError(
+                    f"{package_lock} is missing packages['apps/desktop']"
+                )
+            desktop_entry["version"] = semver
+            updates.append((package_lock, json.dumps(lock_data, indent=2) + "\n"))
+
+    # Parse and validate every structured file before the first write so a
+    # malformed lockfile cannot leave the four version surfaces half-bumped.
+    for path, updated in updates:
+        path.write_text(updated, encoding="utf-8")
+
+    return [path for path, _updated in updates]
+
+
+def stage_version_files(paths: list[Path]):
+    """Stage exactly the paths returned by :func:`update_version_files`."""
+    return git_result("add", *(str(path) for path in paths))
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2555,12 +2587,11 @@ def main():
 
         # Update version files
         if args.bump:
-            update_version_files(new_version, calver_date)
+            updated_version_files = update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
-            add_result = git_result("add", *add_files)
+            add_result = stage_version_files(updated_version_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
                 return

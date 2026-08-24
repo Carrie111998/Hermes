@@ -611,3 +611,49 @@ def test_update_on_main_fast_path_unchanged(repo_pair, monkeypatch, capsys):
     head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
     remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
     assert head == remote
+
+
+def test_rev_list_failure_after_dirty_detached_switch_restores_exact_state(
+    repo_pair, monkeypatch, capsys
+):
+    """A post-stash admission error returns to the original detached tree."""
+    _git(repo_pair, "checkout", "-q", "--detach")
+    original_head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    (repo_pair / "a.txt").write_text("staged\n")
+    _git(repo_pair, "add", "a.txt")
+    with (repo_pair / "a.txt").open("a", encoding="utf-8") as handle:
+        handle.write("unstaged\n")
+    (repo_pair / "untracked.txt").write_text("untracked\n")
+    before_status = _git(repo_pair, "status", "--porcelain=v1", "-z").stdout
+    before_index = _git(repo_pair, "diff", "--cached", "--binary").stdout
+    before_worktree = _git(repo_pair, "diff", "--binary").stdout
+
+    _patch_update_flow(monkeypatch, repo_pair)
+    real_run = subprocess.run
+
+    def fail_update_count(command, **kwargs):
+        if "rev-list" in command and any(
+            str(arg).startswith("HEAD..") for arg in command
+        ):
+            return subprocess.CompletedProcess(
+                command, 2, stdout="", stderr="simulated graph failure"
+            )
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fail_update_count)
+    args = SimpleNamespace(branch=None, yes=True, force=False, force_venv=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    assert "fetched commits could not be counted" in capsys.readouterr().out
+    assert _git(repo_pair, "branch", "--show-current").stdout.strip() == ""
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == original_head
+    assert _git(repo_pair, "status", "--porcelain=v1", "-z").stdout == before_status
+    assert _git(repo_pair, "diff", "--cached", "--binary").stdout == before_index
+    assert _git(repo_pair, "diff", "--binary").stdout == before_worktree
+    assert (repo_pair / "untracked.txt").read_text() == "untracked\n"
+    assert "hermes-update-autostash-" in _git(
+        repo_pair, "stash", "list"
+    ).stdout

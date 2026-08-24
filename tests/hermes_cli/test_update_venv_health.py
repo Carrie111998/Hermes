@@ -26,6 +26,102 @@ import pytest
 from hermes_cli import main as cli_main
 
 
+def test_rollout_absent_venv_is_created_inside_transaction(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch()
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: False)
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    target, interpreter = update_cmd._prepare_rollout_target_venv(
+        tmp_path, "venv"
+    )
+
+    assert target == tmp_path / "venv"
+    assert interpreter == tmp_path / "venv" / "bin" / "python"
+    assert commands == [
+        [sys.executable, "-I", "-m", "venv", str(tmp_path / "venv")]
+    ]
+
+
+def test_rollout_target_venv_name_is_fail_closed(tmp_path):
+    import hermes_cli.update_cmd as update_cmd
+
+    with pytest.raises(RuntimeError, match="invalid venv name"):
+        update_cmd._prepare_rollout_target_venv(tmp_path, "../external")
+
+
+def test_absent_checkpoint_venv_forces_full_dependency_install(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    assert not update_cmd._rollout_dependency_install_is_current(
+        True,
+        {"dependency_state": {"venv_present": False}},
+        project_root=tmp_path,
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_venv_core_imports_healthy",
+        lambda *args, **kwargs: (True, ""),
+    )
+    assert update_cmd._rollout_dependency_install_is_current(
+        True,
+        {"dependency_state": {"venv_present": True}},
+        project_root=tmp_path,
+    )
+
+
+def test_existing_unhealthy_checkpoint_venv_forces_rollout_reinstall(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    interpreter = tmp_path / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    calls: list[tuple[list[str], dict]] = []
+
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: False)
+    monkeypatch.setenv("PYTHONHOME", "/coordinator/python")
+    monkeypatch.setenv("PYTHONPATH", "/coordinator/modules")
+
+    def fake_run(command, **kwargs):
+        calls.append((list(command), kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="fastapi: No module named 'fastapi'\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    assert not update_cmd._rollout_dependency_install_is_current(
+        True,
+        {
+            "venv_name": ".venv",
+            "dependency_state": {"venv_present": True},
+        },
+        project_root=tmp_path,
+    )
+    command, kwargs = calls[0]
+    assert command[:3] == [str(interpreter), "-I", "-c"]
+    assert kwargs["cwd"] == tmp_path
+    assert "PYTHONHOME" not in kwargs["env"]
+    assert "PYTHONPATH" not in kwargs["env"]
+
+
 # ---------------------------------------------------------------------------
 # _venv_core_imports_healthy
 # ---------------------------------------------------------------------------
@@ -125,6 +221,9 @@ def _run_update_until_guard(args):
 
     with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
+    ), patch(
+        "hermes_cli.update_cmd._new_update_context",
+        return_value=("guard-test", {}),
     ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
         cli_main, "_pause_windows_gateways_for_update", return_value=None
     ), patch.object(

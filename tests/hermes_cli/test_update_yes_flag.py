@@ -19,20 +19,57 @@ def _make_run_side_effect(
     branch="main", verify_ok=True, commit_count="1", dirty=False
 ):
     """Minimal subprocess.run side_effect for the update flow."""
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    state = {"head": old_sha, "tracking": old_sha, "branch": branch}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
-        if "rev-parse" in joined and "--abbrev-ref" in joined:
-            return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
-        if "rev-parse" in joined and "--verify" in joined:
+        if "check-ref-format --branch" in joined:
             return subprocess.CompletedProcess(
-                cmd, 0 if verify_ok else 128, stdout="", stderr=""
+                cmd, 0, stdout=f"{cmd[-1]}\n", stderr=""
             )
+
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
+        if "branch --show-current" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
+        if "rev-parse" in joined and "--is-shallow-repository" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+        if "rev-parse" in joined and "--verify" in joined:
+            if not verify_ok:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            ref = str(cmd[-1]).removesuffix("^{commit}")
+            if ref == "MERGE_HEAD":
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            if ref == "HEAD" or ref.startswith("refs/heads/"):
+                sha = state["head"]
+            elif ref.startswith("refs/hermes-update-fetches/"):
+                sha = new_sha
+            elif ref.startswith("refs/remotes/origin/"):
+                sha = state["tracking"]
+            else:
+                sha = old_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{sha}\n", stderr="")
+        if "rev-parse" in joined and str(cmd[-1]) == "HEAD":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{state['head']}\n", stderr=""
+            )
+        if "merge-base --is-ancestor" in joined:
+            ancestor, descendant = str(cmd[-2]), str(cmd[-1])
+            rc = 1 if ancestor == new_sha and descendant == old_sha else 0
+            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+        if "update-ref refs/remotes/origin/" in joined:
+            state["tracking"] = new_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if "rev-list" in joined:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{commit_count}\n", stderr=""
             )
+        if "merge --ff-only" in joined:
+            state["head"] = new_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         # `git status --porcelain` for dirty-tree detection during autostash.
         if "status" in joined and "--porcelain" in joined:
             out = " M hermes_cli/main.py\n" if dirty else ""
@@ -50,6 +87,7 @@ def _make_run_side_effect(
 class TestUpdateYesConfigMigration:
     """--yes auto-answers the config-migration prompt and skips API-key prompts."""
 
+    @patch("hermes_cli.update_cmd._build_web_ui_for_update", new=lambda: True)
     @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
@@ -91,6 +129,7 @@ class TestUpdateYesConfigMigration:
         # The "Would you like to configure them now?" prompt text never appears.
         assert "Would you like to configure them now?" not in out
 
+    @patch("hermes_cli.update_cmd._build_web_ui_for_update", new=lambda: True)
     @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
@@ -151,6 +190,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
     the exception escape and crash `hermes update` mid-flight.
     """
 
+    @patch("hermes_cli.update_cmd._build_web_ui_for_update", new=lambda: True)
     @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))

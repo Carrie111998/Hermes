@@ -166,3 +166,25 @@ test('Windows update tree-kills captured roots without pre-signalling the primar
   assert.deepEqual(primary.calls, [], 'the primary root must not be signalled before taskkill /T sees it')
   assert.deepEqual(pooled.calls, [])
 })
+
+test('Windows update exposes pooled teardown completion to the ownership cleanup boundary', async () => {
+  let finishPool!: () => void
+  const pooled = new Promise<void>(resolve => {
+    finishPool = resolve
+  })
+  const result = stopBackendTreesForUpdate({ pid: 101 }, {
+    forceKillProcessTree: () => {},
+    stopAllPoolBackends: () => pooled
+  })
+  let finished = false
+
+  Promise.resolve(result).then(() => {
+    finished = true
+  })
+  await Promise.resolve()
+  assert.equal(finished, false)
+
+  finishPool()
+  await result
+  assert.equal(finished, true)
+})

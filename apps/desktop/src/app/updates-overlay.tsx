@@ -34,6 +34,7 @@ import {
   checkBackendUpdates,
   checkUpdates,
   resetUpdateApplyState,
+  restartBackendGatewayForSkew,
   setUpdateOverlayOpen,
   type UpdateApplyState
 } from '@/store/updates'
@@ -58,7 +59,11 @@ export function UpdatesOverlay() {
   const checking = isBackend ? backendChecking : clientChecking
   const apply = isBackend ? backendApply : clientApply
   const check = isBackend ? checkBackendUpdates : checkUpdates
-  const install = isBackend ? applyBackendUpdate : applyUpdates
+  const install = isBackend
+    ? status?.gatewayRestartRequired
+      ? restartBackendGatewayForSkew
+      : applyBackendUpdate
+    : applyUpdates
 
   useEffect(() => {
     if (open && !status && !checking) {
@@ -192,6 +197,21 @@ function IdleView({
         }
         icon={<ErrorIcon />}
         title={u.checkFailedTitle}
+      />
+    )
+  }
+
+  if (target === 'backend' && status.gatewayRestartRequired) {
+    return (
+      <CenteredStatus
+        action={
+          <Button onClick={onInstall} size="sm">
+            {u.restartSkewedGateway}
+          </Button>
+        }
+        body={u.restartSkewedGatewayBody}
+        icon={<AlertCircle className="size-6 text-muted-foreground" />}
+        title={u.restartSkewedGatewayTitle}
       />
     )
   }

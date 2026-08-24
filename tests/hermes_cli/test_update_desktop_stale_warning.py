@@ -135,7 +135,9 @@ def test_summary_omits_success_banner_when_desktop_rebuild_failed(capsys):
 
 def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
     monkeypatch.setattr(
-        update_cmd, "_update_complete_message", lambda _v: "✓ Update complete! (v0.20.2)"
+        update_cmd,
+        "_update_complete_message",
+        lambda _v: "✓ Update complete! (v0.20.2)",
     )
     monkeypatch.setattr(update_cmd, "_branch_head_suffix", lambda *a, **k: "")
     _print_update_summary(
@@ -158,6 +160,19 @@ def test_summary_combines_node_and_desktop_failures(capsys):
     assert "Update complete" not in out
     assert "dashboard" in out
     assert "desktop app was not rebuilt" in out
+
+
+def test_summary_surfaces_web_bundle_failure_without_success_banner(capsys):
+    _print_update_summary(
+        node_failures=[],
+        web_build_ok=False,
+        desktop_build_ok=True,
+        pre_update_version="0.20.1",
+    )
+    out = capsys.readouterr().out
+    assert "Update complete" not in out
+    assert "web dashboard bundle was not rebuilt" in out
+    assert "running dashboard was left untouched" in out
 
 
 def test_gateway_exit_code_file_tracks_desktop_rebuild(tmp_path, monkeypatch):

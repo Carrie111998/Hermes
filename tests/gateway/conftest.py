@@ -284,6 +284,7 @@ def _ensure_discord_mock() -> None:
     discord_mod.Color = SimpleNamespace(
         orange=lambda: 1, green=lambda: 2, blue=lambda: 3,
         red=lambda: 4, purple=lambda: 5, greyple=lambda: 6,
+        dark_grey=lambda: 8,
         gold=lambda: 7,
     )
 

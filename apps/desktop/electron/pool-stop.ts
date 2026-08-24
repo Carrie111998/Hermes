@@ -40,7 +40,7 @@ export interface PoolStopper {
   inFlight: (key: string) => Promise<void> | undefined
   /** Stop one pooled backend; concurrent calls share the same promise. */
   stop: (key: string) => Promise<void>
-  /** Stop every pooled backend currently in the pool. */
+  /** Stop every pooled backend currently in the pool or already stopping. */
   stopAll: () => Promise<void>
 }
 
@@ -80,7 +80,15 @@ export function createPoolStopper(deps: PoolStopperDeps): PoolStopper {
     inFlight: key => stops.get(key),
     stop,
     stopAll: async () => {
-      await Promise.all([...deps.pool.keys()].map(stop))
+      // Entries are evicted before their bounded wait completes. A global
+      // shutdown/update that only walks the live pool therefore misses any
+      // stop already in flight and can exit while that child still owns the
+      // venv. Start every remaining pool stop, then join the complete current
+      // in-flight set (the newly-started promises are present there too).
+      const newlyStarted = [...deps.pool.keys()].map(stop)
+      const allStops = new Set([...stops.values(), ...newlyStarted])
+
+      await Promise.all(allStops)
     }
   }
 }

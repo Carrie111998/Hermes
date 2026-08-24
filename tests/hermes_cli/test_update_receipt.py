@@ -121,6 +121,50 @@ class TestReceiptLifecycle:
     def test_read_latest_receipt_missing(self, receipt_home):
         assert ur.read_latest_receipt() is None
 
+    def test_pruning_preserves_undelivered_bot_receipt(
+        self, receipt_home, monkeypatch
+    ):
+        monkeypatch.setattr(ur, "_RECEIPT_KEEP", 2)
+        directory = receipt_home / "logs" / "update_receipts"
+        directory.mkdir(parents=True)
+        for index in range(5):
+            correlation = "waiting" if index == 0 else f"other-{index}"
+            path = directory / f"update_{index}.json"
+            path.write_text(json.dumps({"correlation_id": correlation}))
+            os.utime(path, (1000 + index, 1000 + index))
+        (receipt_home / ".update_pending.json").write_text(
+            json.dumps({"correlation_id": "waiting"}), encoding="utf-8"
+        )
+
+        ur._prune_old_receipts(directory)
+
+        remaining = sorted(directory.glob("update_*.json"))
+        correlations = {
+            json.loads(path.read_text(encoding="utf-8"))["correlation_id"]
+            for path in remaining
+        }
+        assert correlations == {"waiting", "other-3", "other-4"}
+
+    def test_same_second_same_pid_receipts_keep_both_correlations(
+        self, receipt_home, monkeypatch
+    ):
+        """Retained receipts are immutable even in one long-lived process."""
+
+        monkeypatch.setattr(ur.time, "strftime", lambda _format: "20260823_120000")
+
+        ur.begin_update_receipt()
+        ur.record_update_context("corr-first", origin_profile="work")
+        first = ur.finalize_update_receipt("success")
+
+        ur.begin_update_receipt()
+        ur.record_update_context("corr-second", origin_profile="work")
+        second = ur.finalize_update_receipt("failed")
+
+        assert first is not None and second is not None and first != second
+        assert first.is_file() and second.is_file()
+        assert ur.read_receipt_for_correlation("corr-first")["outcome"] == "success"
+        assert ur.read_receipt_for_correlation("corr-second")["outcome"] == "failed"
+
 
 class TestCommandBoundaryFinalization:
     """Receipt lifetime is owned by the update-command boundary (#91283 review).
@@ -232,6 +276,7 @@ class TestFleetClassification:
         """Run collect_fleet_versions against one fake default profile."""
         home = tmp_path / "fleet_home"
         home.mkdir()
+        record = {**record, "start_time": record.get("start_time", 111)}
         (home / "gateway_state.json").write_text(
             json.dumps(record), encoding="utf-8"
         )
@@ -248,6 +293,9 @@ class TestFleetClassification:
             lambda: tmp_path / "nonexistent_profiles_root",
         )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            "gateway.status._get_process_start_time", lambda pid: 111
+        )
         return ur.collect_fleet_versions()
 
     def test_current_gateway(self, monkeypatch, tmp_path):

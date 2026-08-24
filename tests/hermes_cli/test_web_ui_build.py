@@ -281,6 +281,33 @@ class TestBuildWebUIRetryAndStaleFallback:
         assert "serving stale dist as fallback" in out
         assert "vite ENOMEM" in out  # combined output surfaced to user
 
+    def test_fresh_required_rejects_stale_dist_after_failed_build(
+        self, tmp_path, capsys
+    ):
+        """The updater must not report success over a stale dashboard bundle."""
+        web_dir, dist_dir = _make_web_dir(tmp_path)
+        _touch(dist_dir / "index.html", offset=-100)
+        _touch(web_dir / "src" / "App.tsx")
+
+        Subprocess = __import__("subprocess")
+        install_ok = Subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        build_fail = Subprocess.CompletedProcess(
+            [], 1, stdout="vite ENOMEM", stderr=""
+        )
+        with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+             patch("hermes_cli.main._time.sleep"), \
+             patch("hermes_cli.main.subprocess.run", return_value=install_ok), \
+             patch("hermes_cli.main._run_with_idle_timeout",
+                   side_effect=[build_fail, build_fail]):
+            result = _build_web_ui(
+                web_dir, fatal=True, require_fresh=True
+            )
+
+        assert result is False
+        out = capsys.readouterr().out
+        assert "serving stale dist as fallback" not in out
+        assert "Web UI build failed" in out
+
 
 class TestBuildWebUIFlock:
     """Cross-process build serialization (salvaged from PR #63455).
@@ -291,6 +318,89 @@ class TestBuildWebUIFlock:
     itself runs inside _do_build_web_ui, i.e. under the lock, so a process
     that queued behind a successful build skips the rebuild.
     """
+
+    def test_foreign_update_claim_prevents_bundle_mutation(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from hermes_cli.update_lock import UpdateHolder
+
+        web_dir, _ = _make_web_dir(tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4242, age_seconds=0),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_lock._is_ancestor_pid", lambda pid: False
+        )
+
+        with patch("hermes_cli.main._do_build_web_ui") as mock_build:
+            assert _build_web_ui(web_dir, require_fresh=True) is False
+
+        mock_build.assert_not_called()
+        assert "another Hermes update owns" in capsys.readouterr().out
+
+    def test_foreign_update_claim_allows_existing_bundle_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.update_lock import UpdateHolder
+
+        web_dir, dist_dir = _make_web_dir(tmp_path)
+        _touch(dist_dir / "index.html")
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4242, age_seconds=0),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_lock._is_ancestor_pid", lambda pid: False
+        )
+
+        with patch("hermes_cli.main._do_build_web_ui") as mock_build:
+            assert _build_web_ui(web_dir) is True
+
+        mock_build.assert_not_called()
+
+    @pytest.mark.parametrize("owner", ["self", "ancestor"])
+    def test_current_update_claim_may_build(self, tmp_path, monkeypatch, owner):
+        from hermes_cli.update_lock import UpdateHolder
+
+        web_dir, _ = _make_web_dir(tmp_path)
+        pid = os.getpid() if owner == "self" else 4242
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=pid, age_seconds=0),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_lock._is_ancestor_pid",
+            lambda candidate: owner == "ancestor" and candidate == pid,
+        )
+
+        with patch(
+            "hermes_cli.main._do_build_web_ui", return_value=True
+        ) as mock_build:
+            assert _build_web_ui(web_dir, require_fresh=True) is True
+
+        mock_build.assert_called_once()
+
+    def test_update_claim_winning_between_admission_and_lock_blocks_build(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import Mock
+
+        from hermes_cli.update_lock import UpdateHolder
+
+        web_dir, _ = _make_web_dir(tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            Mock(side_effect=[None, UpdateHolder(pid=4242, age_seconds=0)]),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_lock._is_ancestor_pid", lambda pid: False
+        )
+
+        with patch("hermes_cli.main._do_build_web_ui") as mock_build:
+            assert _build_web_ui(web_dir, require_fresh=True) is False
+
+        mock_build.assert_not_called()
 
 
 
@@ -325,6 +435,32 @@ class TestBuildWebUIFlock:
 
         assert result is True
         mock_run.assert_not_called()  # fresh after the wait -> no rebuild
+
+    def test_fresh_required_contended_lock_times_out_instead_of_serving_stale(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Updater lock contention is bounded and stale output is not success."""
+        import fcntl
+
+        web_dir, dist_dir = _make_web_dir(tmp_path)
+        _touch(dist_dir / "index.html", offset=-100)
+        _touch(web_dir / "src" / "App.tsx")
+        lock_path = tmp_path / ".web_ui_build.lock"
+        holder = open(lock_path, "a")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        monkeypatch.setattr(
+            "hermes_cli.main._WEB_UI_BUILD_LOCK_TIMEOUT_SECONDS", 0.0
+        )
+
+        try:
+            result = _build_web_ui(
+                web_dir, fatal=True, require_fresh=True
+            )
+        finally:
+            holder.close()
+
+        assert result is False
+        assert "timed out waiting" in capsys.readouterr().out
 
     def test_lock_file_is_gitignored(self):
         gitignore = Path(__file__).resolve().parents[2] / ".gitignore"
@@ -426,4 +562,3 @@ class TestBuildRecoversFromMissingToolchain:
         assert result is True
         assert mock_install.call_count == 1
         assert mock_build.call_count == 1
-

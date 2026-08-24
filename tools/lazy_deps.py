@@ -70,6 +70,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
 import site
 import subprocess
@@ -1019,7 +1020,13 @@ class InstallSpecsResult:
     stderr: str = ""
 
 
-def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> InstallSpecsResult:
+def install_specs(
+    specs: list[str] | tuple[str, ...],
+    *,
+    timeout: int = 300,
+    install_cmd_prefix: list[str] | tuple[str, ...] | None = None,
+    env: dict[str, str] | None = None,
+) -> InstallSpecsResult:
     """Install arbitrary (validated) pip specs through the lazy-install pipeline.
 
     This is the environment-aware install path for callers whose package
@@ -1033,6 +1040,11 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
       ``HERMES_LAZY_INSTALL_TARGET``, installs are redirected to the writable
       data-volume dir (``--target`` + core-venv constraints), then activated
       on ``sys.path`` so the packages import in this process immediately.
+    * **Explicit update target** — callers replacing a managed runtime may
+      provide ``install_cmd_prefix`` and ``env``.  The validated specs then
+      run through that exact installer instead of the coordinator process's
+      ``sys.executable``.  This is required when a canary rollout is
+      coordinated by an external Python process on Windows.
     * **Gated** — honors ``security.allow_lazy_installs`` and refuses to run
       when the venv is sealed with no durable target (never attempts a write
       to a read-only tree; reports *why* instead of surfacing EROFS/EACCES).
@@ -1068,13 +1080,41 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
         return InstallSpecsResult(ok=False, blocked=True, reason=reason)
 
     target = _lazy_install_target()
-    display = "uv pip install " + (
-        f"--target {target} " if target is not None else ""
-    ) + " ".join(cleaned)
+    if install_cmd_prefix is None:
+        display = "uv pip install " + (
+            f"--target {target} " if target is not None else ""
+        ) + " ".join(cleaned)
+    else:
+        prefix = [str(part) for part in install_cmd_prefix]
+        if not prefix:
+            return InstallSpecsResult(
+                ok=False,
+                blocked=True,
+                reason="refusing to install without an explicit command prefix",
+            )
+        display = shlex.join(prefix + ["install", *cleaned])
 
     logger.info("Installing pip specs %s (target=%s)", " ".join(cleaned), target or "venv")
     try:
-        result = _venv_pip_install(cleaned, timeout=timeout)
+        if install_cmd_prefix is None:
+            result = _venv_pip_install(cleaned, timeout=timeout)
+        else:
+            completed = subprocess.run(
+                prefix + ["install", *cleaned],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                env=env,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+            result = _InstallResult(
+                success=completed.returncode == 0,
+                stdout=completed.stdout or "",
+                stderr=completed.stderr or "",
+            )
     except Exception as exc:
         logger.warning("install_specs failed unexpectedly: %s", exc)
         return InstallSpecsResult(
@@ -1137,14 +1177,43 @@ def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:
     return _refresh_features(active_features(), prompt=prompt, restoring=False)
 
 
-def restore_features(features: list[str]) -> dict[str, str]:
+def restore_features(
+    features: list[str],
+    *,
+    install_cmd_prefix: list[str] | tuple[str, ...] | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Restore features captured before an explicit managed-runtime rebuild.
 
     Feature names are checked against :data:`LAZY_DEPS`, and installs remain
     subject to ``security.allow_lazy_installs``. An explicit opt-out therefore
     leaves the captured feature absent and reports it as skipped.
     """
-    return _refresh_features(features, prompt=False, restoring=True)
+    if install_cmd_prefix is None:
+        return _refresh_features(features, prompt=False, restoring=True)
+
+    results: dict[str, str] = {}
+    for feature in features:
+        specs = LAZY_DEPS.get(feature)
+        if not specs:
+            continue
+        unsupported = _unsupported_feature_reason(feature)
+        if unsupported:
+            results[feature] = f"skipped: {unsupported}"
+            continue
+        outcome = install_specs(
+            specs,
+            install_cmd_prefix=install_cmd_prefix,
+            env=env,
+        )
+        if outcome.ok:
+            results[feature] = "restored"
+        elif outcome.blocked:
+            results[feature] = f"skipped: {outcome.reason}"
+        else:
+            reason = outcome.stderr or outcome.reason or "package install failed"
+            results[feature] = f"failed: {reason}"
+    return results
 
 
 def _refresh_features(

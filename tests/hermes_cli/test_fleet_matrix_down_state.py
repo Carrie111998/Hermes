@@ -77,7 +77,11 @@ def test_live_gateway_rows_unchanged(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         {"pid": os.getpid(), "gateway_state": "running", "code_sha": "HEADSHA",
-         "kind": "hermes-gateway"},
+         "kind": "hermes-gateway", "start_time": 1234},
+    )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+    monkeypatch.setattr(
+        "gateway.status._get_process_start_time", lambda pid: 1234
     )
     fleet = ur.collect_fleet_versions(pre_restart_pids=[os.getpid()])
     assert len(fleet) == 1

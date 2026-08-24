@@ -49,6 +49,11 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
 
 export type UpdateClearanceOutcome = 'clear' | 'finished' | 'timeout'
 
+/** Only proven-open outcomes authorize a backend spawn. */
+export function clearanceAllowsBackendStart(outcome: UpdateClearanceOutcome): boolean {
+  return outcome === 'clear' || outcome === 'finished'
+}
+
 export interface WaitForUpdateClearanceOptions {
   timeoutMs: number
   pollMs: number
@@ -59,13 +64,14 @@ export interface WaitForUpdateClearanceOptions {
 }
 
 /**
- * Park until no update signal remains, or the deadline passes.
+ * Park until no update signal remains. The deadline applies only to the
+ * in-process flag; a live or uncertain on-disk marker is authoritative and
+ * keeps the caller parked for as long as it exists.
  *
  * Returns 'clear' when the gate was already open (no wait happened),
- * 'finished' when it opened during the wait, and 'timeout' when the deadline
- * expired with the gate still closed (callers proceed anyway — matching the
- * long-standing marker-gate behavior, since a wedged updater must not brick
- * the app forever).
+ * 'finished' when it opened during the wait, and 'timeout' only when the
+ * in-process flag remains set past its deadline. Callers must not spawn on a
+ * timeout; `clearanceAllowsBackendStart` centralizes that contract.
  */
 export async function waitForUpdateClearance(
   deps: UpdateGateDeps,
@@ -82,7 +88,11 @@ export async function waitForUpdateClearance(
 
   const deadline = now() + options.timeoutMs
 
-  while (reason && now() < deadline) {
+  while (reason) {
+    if (reason === 'update-in-flight' && now() >= deadline) {
+      return 'timeout'
+    }
+
     if (options.onWaitTick) {
       await options.onWaitTick(reason)
     }
@@ -91,5 +101,5 @@ export async function waitForUpdateClearance(
     reason = updateGateReason(deps)
   }
 
-  return reason ? 'timeout' : 'finished'
+  return 'finished'
 }

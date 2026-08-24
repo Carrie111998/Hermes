@@ -153,6 +153,25 @@ class TestFeishuExecApproval:
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_rejects_empty_or_whitespace_chat_id_before_sending(self, chat_id):
+        adapter = _make_adapter()
+
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+        ) as mock_send:
+            result = await adapter.send_exec_approval(
+                chat_id=chat_id,
+                command="echo test",
+                session_key="my-session-key",
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        assert adapter._approval_state == {}
+
 
 # ===========================================================================
 # send_update_prompt — interactive card with buttons
@@ -178,6 +197,9 @@ class TestFeishuUpdatePrompt:
                 prompt="Restore stashed changes after update?",
                 default="y",
                 session_key="agent:main:feishu:group:oc_12345",
+                prompt_id="prompt-up-1",
+                correlation_id="corr-up-1",
+                context={"control_home": "/tmp/hermes"},
                 metadata={"thread_id": "th_1"},
             )
 
@@ -195,6 +217,48 @@ class TestFeishuUpdatePrompt:
         assert "Default: `y`" in card["elements"][0]["content"]
         actions = card["elements"][1]["actions"]
         assert [a["value"]["hermes_update_prompt_action"] for a in actions] == ["y", "n"]
+        state = next(iter(adapter._update_prompt_state.values()))
+        assert state["prompt_id"] == "prompt-up-1"
+        assert state["correlation_id"] == "corr-up-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", ["", " \t\n"])
+    async def test_rejects_empty_or_whitespace_chat_id_before_sending(self, chat_id):
+        adapter = _make_adapter()
+
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+        ) as mock_send:
+            result = await adapter.send_update_prompt(
+                chat_id=chat_id,
+                prompt="Restore stashed changes after update?",
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        assert adapter._update_prompt_state == {}
+
+    @pytest.mark.asyncio
+    async def test_normalizes_chat_id_before_sending_and_storing(self):
+        adapter = _make_adapter()
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_up_trimmed"),
+        )
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_send:
+            result = await adapter.send_update_prompt(
+                chat_id="  oc_trimmed  ",
+                prompt="Continue?",
+            )
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+        state = next(iter(adapter._update_prompt_state.values()))
+        assert state["chat_id"] == "oc_trimmed"
 
 
 # ===========================================================================
@@ -426,6 +490,245 @@ class TestCardActionCallbackResponse:
         assert 8 in adapter._update_prompt_state
         mock_submit.assert_not_called()
 
+    def test_update_prompt_empty_stored_chat_id_rejects_nonempty_callback(
+        self, _patch_callback_card_types
+    ):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
+        adapter._update_prompt_state[9] = {
+            "session_key": "sess-up-9",
+            "message_id": "msg_up_009",
+            "chat_id": "",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 9},
+            chat_id="oc_callback",
+            open_id="ou_bob",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 9 in adapter._update_prompt_state
+        mock_submit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("stored_chat_id", "callback_chat_id"),
+        [("   ", "oc_expected"), ("oc_expected", " \t\n")],
+    )
+    def test_update_prompt_rejects_whitespace_chat_ids(
+        self,
+        stored_chat_id,
+        callback_chat_id,
+        _patch_callback_card_types,
+    ):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
+        adapter._update_prompt_state[10] = {
+            "session_key": "sess-up-10",
+            "message_id": "msg_up_010",
+            "chat_id": stored_chat_id,
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 10},
+            chat_id=callback_chat_id,
+            open_id="ou_bob",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 10 in adapter._update_prompt_state
+        mock_submit.assert_not_called()
+
+    def test_update_prompt_missing_callback_chat_id_returns_no_card(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
+        adapter._update_prompt_state[9] = {
+            "session_key": "sess-up-9",
+            "message_id": "msg_up_009",
+            "chat_id": "oc_expected",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 9},
+            chat_id="",
+            open_id="ou_bob",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 9 in adapter._update_prompt_state
+        mock_submit.assert_not_called()
+
+
+class TestFeishuOutboundChatIdValidation:
+    """Outbound text and media sends reject missing chat IDs before I/O."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_send_rejects_empty_or_whitespace_chat_id_before_sending(self, chat_id):
+        adapter = _make_adapter()
+
+        with patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock) as mock_send:
+            result = await adapter.send(chat_id=chat_id, content="hello")
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_normalizes_chat_id_before_sending(self):
+        adapter = _make_adapter()
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_text"))
+
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock, return_value=response
+        ) as mock_send:
+            result = await adapter.send(chat_id="  oc_trimmed  ", content="hello")
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_send_image_file_rejects_empty_chat_id_before_file_io(self, chat_id, tmp_path):
+        adapter = _make_adapter()
+        with (
+            patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock) as mock_send,
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock) as mock_blocking,
+        ):
+            result = await adapter.send_image_file(
+                chat_id=chat_id,
+                image_path=str(tmp_path / "missing.png"),
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        mock_blocking.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_normalizes_chat_id_before_sending(self, tmp_path):
+        adapter = _make_adapter()
+        image_path = tmp_path / "image.png"
+        image_path.write_bytes(b"image")
+        upload_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="img_1"))
+        message_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_image"))
+        adapter._build_image_upload_body = MagicMock(return_value=object())
+        adapter._build_image_upload_request = MagicMock(return_value=object())
+
+        with (
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock, return_value=upload_response),
+            patch.object(
+                adapter,
+                "_feishu_send_with_retry",
+                new_callable=AsyncMock,
+                return_value=message_response,
+            ) as mock_send,
+        ):
+            result = await adapter.send_image_file(
+                chat_id="  oc_trimmed  ",
+                image_path=str(image_path),
+            )
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_uploaded_file_message_rejects_empty_chat_id_before_file_io(self, chat_id, tmp_path):
+        adapter = _make_adapter()
+        with (
+            patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock) as mock_send,
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock) as mock_blocking,
+        ):
+            result = await adapter._send_uploaded_file_message(
+                chat_id=chat_id,
+                file_path=str(tmp_path / "missing.txt"),
+                reply_to=None,
+                metadata=None,
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        mock_blocking.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uploaded_file_message_normalizes_chat_id_before_sending(self, tmp_path):
+        adapter = _make_adapter()
+        file_path = tmp_path / "note.txt"
+        file_path.write_text("file")
+        upload_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(file_key="file_1"))
+        message_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_file"))
+        adapter._build_file_upload_body = MagicMock(return_value=object())
+        adapter._build_file_upload_request = MagicMock(return_value=object())
+
+        with (
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock, return_value=upload_response),
+            patch.object(
+                adapter,
+                "_feishu_send_with_retry",
+                new_callable=AsyncMock,
+                return_value=message_response,
+            ) as mock_send,
+        ):
+            result = await adapter._send_uploaded_file_message(
+                chat_id="  oc_trimmed  ",
+                file_path=str(file_path),
+                reply_to=None,
+                metadata=None,
+            )
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", ["send_image", "send_animation"])
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_media_url_wrappers_reject_empty_chat_id_before_download(self, method_name, chat_id):
+        adapter = _make_adapter()
+        downloader = "_download_remote_image" if method_name == "send_image" else "_download_remote_document"
+
+        with patch.object(adapter, downloader, new_callable=AsyncMock) as mock_download:
+            if method_name == "send_image":
+                result = await adapter.send_image(chat_id=chat_id, image_url="https://example.test/image.png")
+            else:
+                result = await adapter.send_animation(chat_id=chat_id, animation_url="https://example.test/image.gif")
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_download.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_transport_rejects_whitespace_chat_id_before_network(self):
+        adapter = _make_adapter()
+
+        with patch.object(adapter, "_run_blocking", new_callable=AsyncMock) as mock_blocking:
+            with pytest.raises(ValueError, match="chat_id is required"):
+                await adapter._send_raw_message(
+                    chat_id=" \t\n",
+                    msg_type="text",
+                    payload=json.dumps({"text": "hello"}),
+                    reply_to=None,
+                    metadata=None,
+                )
+
+        mock_blocking.assert_not_called()
+
 
 class TestResolveUpdatePrompt:
     """Test update prompt resolution persists the response file."""
@@ -435,15 +738,43 @@ class TestResolveUpdatePrompt:
         adapter = _make_adapter()
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         (tmp_path / ".hermes").mkdir()
+        control_home = tmp_path / ".hermes"
+        (control_home / ".update_pending.json").write_text(json.dumps({
+            "correlation_id": "corr-1",
+            "user_id": "ou_user1",
+            "session_key": "sess-up-1",
+            "origin_profile": "work",
+            "profile_home": "/profiles/work",
+            "control_home": str(control_home),
+            "install_root": "/project/hermes",
+            "install_id": "install-1",
+        }))
+        (control_home / ".update_prompt.json").write_text(json.dumps({
+            "id": "prompt-1",
+            "kind": "update_confirmation",
+            "correlation_id": "corr-1",
+            "context": {
+                "origin_profile": "work",
+                "profile_home": "/profiles/work",
+                "control_home": str(control_home),
+                "install_root": "/project/hermes",
+                "install_id": "install-1",
+            },
+        }))
         adapter._update_prompt_state[1] = {
             "session_key": "sess-up-1",
+            "prompt_id": "prompt-1",
+            "correlation_id": "corr-1",
+            "control_home": str(control_home),
             "message_id": "msg_up_003",
             "chat_id": "oc_12345",
         }
 
-        await adapter._resolve_update_prompt(1, "y", "Alice")
+        await adapter._resolve_update_prompt(
+            1, "y", "Alice", open_id="ou_user1", chat_id="oc_12345"
+        )
 
-        assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
+        assert json.loads((tmp_path / ".hermes" / ".update_response").read_text())["answer"] == "yes"
         assert 1 not in adapter._update_prompt_state
 
 

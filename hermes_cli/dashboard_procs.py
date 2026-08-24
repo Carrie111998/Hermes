@@ -28,6 +28,7 @@ def _m():
 def _scan_dashboard_processes(
     *,
     exclude_pids: set[int] | None = None,
+    _raise_on_error: bool = False,
 ) -> list[tuple[int, str]]:
     """Return matching ``dashboard``/``serve`` processes with their cmdlines.
 
@@ -92,6 +93,10 @@ def _scan_dashboard_processes(
                 errors="ignore",
             )
             if result is None or result.returncode != 0 or result.stdout is None:
+                if _raise_on_error:
+                    raise RuntimeError(
+                        "Windows dashboard process inventory did not complete"
+                    )
                 return []
             current_cmd = ""
             for line in result.stdout.split("\n"):
@@ -121,7 +126,13 @@ def _scan_dashboard_processes(
                 text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
-            if result.returncode == 0:
+            if result.returncode != 0:
+                if _raise_on_error:
+                    raise RuntimeError(
+                        "dashboard process inventory command failed: "
+                        f"exit {result.returncode}"
+                    )
+            else:
                 for line in getattr(result, "stdout", "").split("\n"):
                     stripped = line.strip()
                     if not stripped or "grep" in stripped:
@@ -136,7 +147,11 @@ def _scan_dashboard_processes(
                     command = parts[1]
                     if any(p in command for p in patterns) and pid != self_pid:
                         dashboard_processes.append((pid, command))
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        if _raise_on_error:
+            raise RuntimeError(
+                f"dashboard process inventory failed: {exc}"
+            ) from exc
         return []
 
     if exclude_pids:
@@ -1018,4 +1033,3 @@ def _reap_orphaned_desktop_local_serves(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-

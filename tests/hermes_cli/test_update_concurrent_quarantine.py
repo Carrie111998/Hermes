@@ -262,6 +262,72 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     assert "Restart manually after update" not in captured
 
 
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_windows_gateway_interrupt_resumes_from_prepublished_token(
+    _winp,
+    monkeypatch,
+    tmp_path,
+):
+    import atexit
+
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+
+    class AbortPause(BaseException):
+        pass
+
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    profile_proc = SimpleNamespace(profile="work", path=profile_home, pid=101)
+    registrations: list[tuple] = []
+    resumed: list[dict] = []
+
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [101])
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_profile_gateway_processes",
+        lambda **_k: [profile_proc],
+    )
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 0.1)
+    monkeypatch.setattr(cli_main, "_venv_launcher_ancestors", lambda pids: [])
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AbortPause()),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_resume_windows_gateways_after_update",
+        resumed.append,
+    )
+    monkeypatch.setattr(
+        atexit,
+        "register",
+        lambda callback, *args: registrations.append((callback, args)),
+    )
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("force termination must not run")
+        ),
+    )
+
+    with pytest.raises(AbortPause):
+        cli_main._pause_windows_gateways_for_update()
+
+    expected = {
+        "resume_needed": True,
+        "profiles": {"work": 101},
+        "unmapped_pids": [],
+        "unmapped": [],
+    }
+    assert resumed == [expected]
+    assert registrations == [
+        (cli_main._resume_windows_gateways_after_update, (expected,))
+    ]
+
+
 # ---------------------------------------------------------------------------
 # venv-side launcher ancestors (the uv launcher/worker split)
 #
@@ -514,7 +580,6 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
 # ---------------------------------------------------------------------------
 # cmd_update integration — concurrent-instance gate
 # ---------------------------------------------------------------------------
-
 
 
 

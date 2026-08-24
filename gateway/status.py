@@ -1225,6 +1225,48 @@ def runtime_status_pid_is_live(record: Optional[dict[str, Any]]) -> bool:
     return True
 
 
+def runtime_status_pid_incarnation_is_live(
+    record: Optional[dict[str, Any]],
+) -> bool:
+    """Strictly prove that a runtime snapshot names the live incarnation.
+
+    This is deliberately separate from :func:`runtime_status_pid_is_live`.
+    UI and legacy status readers historically degrade to PID-only liveness
+    when either start-time fingerprint is unavailable.  Update inventory and
+    verification are proof surfaces: admitting an unverified or recycled PID
+    can make a mixed-generation fleet look healthy, so every identity fact is
+    mandatory here and every probe failure is a negative result.
+    """
+    if not isinstance(record, dict):
+        return False
+
+    pid = record.get("pid")
+    recorded_start = record.get("start_time")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(recorded_start, int)
+        or isinstance(recorded_start, bool)
+        or recorded_start < 0
+    ):
+        return False
+
+    try:
+        if not _pid_exists(pid):
+            return False
+        current_start = _get_process_start_time(pid)
+    except Exception:
+        return False
+
+    return (
+        isinstance(current_start, int)
+        and not isinstance(current_start, bool)
+        and current_start >= 0
+        and current_start == recorded_start
+    )
+
+
 def parse_active_agents(raw: Any) -> int:
     """Coerce a persisted ``active_agents`` value to a clamped non-negative int.
 

@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { updateGateReason, waitForUpdateClearance } from './update-gate'
+import { clearanceAllowsBackendStart, updateGateReason, waitForUpdateClearance } from './update-gate'
 
 function deps(marker: boolean, inFlight: boolean) {
   return {
@@ -128,10 +128,10 @@ test('parks across the flag→marker handoff without a gap', async () => {
   assert.deepEqual(reasons, ['update-in-flight', 'update-in-flight', 'marker', 'marker', 'marker'])
 })
 
-test('returns timeout when the gate never opens', async () => {
+test('returns timeout for a wedged in-process flag and forbids backend spawn', async () => {
   let clock = 0
 
-  const outcome = await waitForUpdateClearance(deps(true, false), {
+  const outcome = await waitForUpdateClearance(deps(false, true), {
     now: () => clock,
     pollMs: 10,
     sleep: async ms => {
@@ -141,4 +141,31 @@ test('returns timeout when the gate never opens', async () => {
   })
 
   assert.equal(outcome, 'timeout')
+  assert.equal(clearanceAllowsBackendStart(outcome), false)
+})
+
+test('live marker remains authoritative beyond the deadline', async () => {
+  let clock = 0
+  let marker = true
+  let polls = 0
+
+  const outcome = await waitForUpdateClearance(
+    { hasLiveMarker: () => marker, isUpdateInFlight: () => false },
+    {
+      now: () => clock,
+      pollMs: 10,
+      sleep: async ms => {
+        clock += ms
+        polls += 1
+        if (polls === 8) {
+          marker = false
+        }
+      },
+      timeoutMs: 50
+    }
+  )
+
+  assert.ok(clock > 50, 'the marker is never bypassed by wall clock')
+  assert.equal(outcome, 'finished')
+  assert.equal(clearanceAllowsBackendStart(outcome), true)
 })

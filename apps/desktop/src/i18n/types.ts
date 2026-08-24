@@ -550,13 +550,17 @@ export interface Translations {
       bundleOutOfSyncDesc: string
       bundleOutOfSyncAction: string
       updates: string
+      clientUpdates: string
+      backendUpdates: string
       checkNow: string
       checking: string
       seeWhatsNew: string
       updateNow: string
+      restartGateway: string
       releaseNotes: string
       onLatest: string
       installing: string
+      gatewayRestartRequired: string
       cantUpdate: string
       cantReach: string
       tapCheck: string
@@ -686,6 +690,59 @@ export interface Translations {
       saving: string
       cancel: string
       empty: string
+    }
+    fleetUpdates: {
+      title: string
+      intro: string
+      refresh: string
+      updateAll: string
+      updatingAll: string
+      backendTitle: (label: string) => string
+      backendVersion: (version: string) => string
+      deployment: (kind: string) => string
+      deploymentKinds: {
+        cloud: string
+        desktop: string
+        external: string
+        'git-venv': string
+        image: string
+        launchd: string
+        mutable: string
+        package: string
+        systemd: string
+        unknown: string
+      }
+      unknown: string
+      checking: string
+      notChecked: string
+      available: string
+      current: string
+      failed: string
+      cloudManaged: string
+      manual: string
+      partial: string
+      applying: string
+      updated: string
+      restartRequired: string
+      restartGateway: string
+      restarted: string
+      applyBackend: string
+      copyCommand: string
+      retry: string
+      manualToast: string
+      partialToast: string
+      availabilityUnknown: string
+      cannotApply: string
+      checkFailed: string
+      checkUnavailable: string
+      restartFailed: string
+      restartNoReturn: string
+      restartRefused: string
+      sshOwnedServe: (label: string) => string
+      updateFailed: string
+      updateNoReturn: string
+      updateRefused: string
+      botContext: (profiles: string[], platforms: string[]) => string
     }
     gateway: {
       loading: string
@@ -2192,6 +2249,16 @@ export interface Translations {
     everythingSkipped: string
     everythingRowFailed: string
     everythingFanoutFailedTitle: string
+    everythingBackendTitle: (label: string) => string
+    everythingBackendUpdated: string
+    everythingBackendRestarted: string
+    everythingBackendPartial: string
+    everythingBackendManualCommand: (command: string) => string
+    everythingBackendManual: string
+    everythingBackendManaged: string
+    restartSkewedGatewayTitle: string
+    restartSkewedGatewayBody: string
+    restartSkewedGateway: string
     applyStatus: {
       preparing: string
       pulling: string
@@ -2199,6 +2266,11 @@ export interface Translations {
       notAvailable: string
       failed: string
       noReturn: string
+      partial: string
+      restartingSkewedGateway: string
+      restartFailed: string
+      restartComplete: string
+      restartNoReturn: string
     }
   }
 

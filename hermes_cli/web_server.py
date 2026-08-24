@@ -46,6 +46,7 @@ import urllib.parse
 import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
+from hermes_cli.runtime_launch import detached_python_env, resolve_project_python
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -66,6 +67,7 @@ from hermes_cli.config import (
     get_config_path,
     get_env_path,
     get_hermes_home,
+    get_managed_system,
     get_process_hermes_home,
     load_config,
     load_env,
@@ -2471,6 +2473,145 @@ def _dashboard_local_update_managed_externally() -> bool:
     return True
 
 
+DashboardDeploymentKind = Literal[
+    "image",
+    "package",
+    "desktop",
+    "systemd",
+    "launchd",
+    "git-venv",
+    "external",
+    "unknown",
+]
+DashboardDeploymentClass = Literal[
+    "image",
+    "package",
+    "mutable",
+    "external",
+    "unknown",
+]
+
+_IMAGE_INSTALL_METHODS = frozenset({"docker", "container", "image", "managed-runtime"})
+_PACKAGE_INSTALL_METHODS = frozenset({"apt", "nix", "nixos", "home-manager", "package"})
+_DEPLOYMENT_INVENTORY_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "supervisors": (),
+    "fn": None,
+}
+_DEPLOYMENT_INVENTORY_CACHE_LOCK = threading.Lock()
+_DEPLOYMENT_INVENTORY_CACHE_TTL = 30.0
+
+
+def _deployment_supervisors_cached() -> Tuple[str, ...]:
+    """Return normalized runtime supervisors without rescanning per request.
+
+    ``collect_runtime_inventory`` is the canonical fleet probe, but it can
+    enumerate profiles, query control sockets, and fall back to process scans.
+    The update-check endpoint may be refreshed repeatedly by Desktop, so keep
+    that work behind a short TTL. Tracking the collector function identity
+    also makes monkeypatched tests and live module replacement invalidate the
+    cache immediately.
+    """
+    from hermes_cli.update_inventory import collect_runtime_inventory
+
+    fn = collect_runtime_inventory
+    now = time.monotonic()
+    if (
+        _DEPLOYMENT_INVENTORY_CACHE["fn"] is fn
+        and now - _DEPLOYMENT_INVENTORY_CACHE["ts"] < _DEPLOYMENT_INVENTORY_CACHE_TTL
+    ):
+        return _DEPLOYMENT_INVENTORY_CACHE["supervisors"]
+
+    with _DEPLOYMENT_INVENTORY_CACHE_LOCK:
+        now = time.monotonic()
+        if (
+            _DEPLOYMENT_INVENTORY_CACHE["fn"] is fn
+            and now - _DEPLOYMENT_INVENTORY_CACHE["ts"] < _DEPLOYMENT_INVENTORY_CACHE_TTL
+        ):
+            return _DEPLOYMENT_INVENTORY_CACHE["supervisors"]
+
+        try:
+            plan = fn()
+            supervisors = tuple(
+                sorted(
+                    {
+                        str(getattr(runtime, "supervisor", "") or "").strip().lower()
+                        for runtime in plan.runtimes
+                        if str(getattr(runtime, "supervisor", "") or "").strip()
+                    }
+                )
+            )
+        except Exception:
+            _log.exception("Deployment-kind runtime inventory failed")
+            supervisors = ()
+
+        _DEPLOYMENT_INVENTORY_CACHE.update(
+            {"ts": now, "supervisors": supervisors, "fn": fn}
+        )
+        return supervisors
+
+
+def _dashboard_deployment_kind(install_method: str) -> DashboardDeploymentKind:
+    """Classify this backend using the #91277 deployment-kind table.
+
+    Install shape is authoritative: an image or package stays image/package
+    even when a Desktop or service supervisor launched it. For mutable source
+    installs, direct process provenance wins, then the shared runtime inventory
+    fills in gateway supervisor ownership. Unknown installs remain unknown
+    unless an explicit managed-system or external-supervisor signal proves
+    operator ownership.
+    """
+    method = str(install_method or "").strip().lower()
+    if method in _IMAGE_INSTALL_METHODS:
+        return "image"
+    if method in _PACKAGE_INSTALL_METHODS:
+        return "package"
+
+    if os.getenv("HERMES_DESKTOP") == "1":
+        return "desktop"
+
+    managed_system = get_managed_system()
+    if managed_system:
+        managed_method = managed_system.strip().lower().replace(" ", "-")
+        if managed_method in _PACKAGE_INSTALL_METHODS:
+            return "package"
+        return "external"
+
+    # The dashboard itself may be the supervised runtime (with no gateway yet),
+    # so retain the same self-declared service signals used by the gateway
+    # control socket before consulting the fleet inventory.
+    if os.getenv("INVOCATION_ID"):
+        return "systemd"
+    if sys.platform == "darwin" and (
+        os.getenv("XPC_SERVICE_NAME", "").startswith("ai.hermes")
+        or os.getenv("LAUNCHD_SOCKET")
+    ):
+        return "launchd"
+
+    supervisors = set(_deployment_supervisors_cached())
+    if "desktop" in supervisors:
+        return "desktop"
+    if "systemd" in supervisors:
+        return "systemd"
+    if "launchd" in supervisors:
+        return "launchd"
+    if supervisors.intersection({"external", "external-supervisor"}):
+        return "external"
+
+    if method == "git":
+        return "git-venv"
+    return "unknown"
+
+
+def _dashboard_deployment_class(
+    deployment_kind: DashboardDeploymentKind,
+) -> DashboardDeploymentClass:
+    """Collapse detailed kinds for clients that only need update ownership."""
+    if deployment_kind in {"desktop", "systemd", "launchd", "git-venv"}:
+        return "mutable"
+    return deployment_kind
+
+
 def _managed_files_policy(request: Request, *, create_root: bool = True) -> ManagedFilesPolicy:
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
@@ -3618,12 +3759,161 @@ def _status_platform_key_allowed(
 # onto the public endpoint.
 _PRIVATE_PLATFORM_ENTRY_KEYS = frozenset({"writer_pid", "writer_start_time"})
 
+# Code identity is safe to expose on the otherwise-public status endpoint in
+# the same way the release version is: it identifies the Hermes build, not the
+# host.  Keep the grammar narrow anyway so a hand-edited runtime file or a
+# remote health response can never turn this field into an arbitrary string.
+# Seven characters is git's conventional minimum useful abbreviation; 64
+# covers SHA-256 repositories while preserving today's full SHA-1 values.
+_PUBLIC_CODE_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+_PUBLIC_GATEWAY_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_STATUS_GATEWAY_IDENTITY_TIMEOUT = 0.5
+
 
 def _public_platform_entry(value: Any) -> Any:
     """Strip writer-identity stamps from a platform entry before projection."""
     if not isinstance(value, dict):
         return value
     return {k: v for k, v in value.items() if k not in _PRIVATE_PLATFORM_ENTRY_KEYS}
+
+
+def _public_code_sha(value: Any) -> Optional[str]:
+    """Return a normalized commit identity suitable for public status data."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if _PUBLIC_CODE_SHA_RE.fullmatch(normalized) else None
+
+
+def _public_gateway_profile(value: Any) -> Optional[str]:
+    """Return a validated public profile label, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return (
+        normalized
+        if _PUBLIC_GATEWAY_PROFILE_RE.fullmatch(normalized)
+        else None
+    )
+
+
+def _code_shas_equal(left: str, right: str) -> bool:
+    """Compare full or safely-abbreviated git object identities."""
+    if len(left) > len(right):
+        left, right = right, left
+    return right.startswith(left)
+
+
+def _status_gateway_code_identity(
+    *,
+    target_home: Path,
+    liveness_source: str,
+    liveness_pid: Any,
+    local_runtime: Any,
+    remote_health_body: Any,
+) -> Dict[str, Any]:
+    """Build the public gateway/checkout skew contract for one profile.
+
+    This helper is synchronous because every authoritative probe can block:
+    the gateway control socket, process-identity validation, and fresh git /
+    build metadata reads.  ``get_status`` always runs it in a worker thread.
+
+    The live gateway's own control socket is authoritative.  Older gateways
+    without that socket may fall back to a runtime record only after the
+    record's PID, start fingerprint, command line, and target HERMES_HOME have
+    been validated as the live writer.  A cross-container detailed-health
+    response is usable only when that HTTP response was the liveness rung that
+    answered this request.  Dead/stale state files are therefore never a
+    source of skew.
+    """
+    result: Dict[str, Any] = {}
+
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        checkout_identity = get_code_identity(refresh=True) or {}
+    except Exception:
+        checkout_identity = {}
+    checkout_sha = _public_code_sha(checkout_identity.get("sha"))
+    if checkout_sha:
+        result["checkout_code_sha"] = checkout_sha
+
+    socket_identity: Optional[dict[str, Any]] = None
+    try:
+        from gateway.control_socket import identify_gateway
+
+        candidate = identify_gateway(
+            target_home, timeout=_STATUS_GATEWAY_IDENTITY_TIMEOUT
+        )
+        if isinstance(candidate, dict):
+            socket_identity = candidate
+    except Exception:
+        socket_identity = None
+
+    gateway_sha = _public_code_sha(
+        (socket_identity or {}).get("code_sha")
+    )
+    gateway_profile = _public_gateway_profile(
+        (socket_identity or {}).get("profile")
+    )
+
+    # Fill fields absent from the live socket using one of two equally live,
+    # identity-owned sources.  Never borrow the local record when the HTTP
+    # health rung answered: in a split-container deployment its PID belongs to
+    # another namespace, and the local file can be an old shared-volume copy.
+    fallback_identity: Optional[dict[str, Any]] = None
+    if liveness_source == "health":
+        if (
+            isinstance(remote_health_body, dict)
+            and remote_health_body.get("gateway_state") is not None
+        ):
+            # /health/detailed is served by the gateway process itself.  The
+            # simple /health response has no gateway_state and is deliberately
+            # not accepted as an identity source.
+            fallback_identity = remote_health_body
+    elif isinstance(local_runtime, dict):
+        try:
+            owned_pid = get_runtime_status_running_pid(
+                local_runtime, expected_home=target_home
+            )
+            expected_pid = int(liveness_pid) if liveness_pid is not None else None
+        except (TypeError, ValueError, OSError):
+            owned_pid = None
+            expected_pid = None
+        except Exception:
+            owned_pid = None
+            expected_pid = None
+        if owned_pid is not None and (
+            expected_pid is None or owned_pid == expected_pid
+        ):
+            fallback_identity = local_runtime
+
+    if fallback_identity is not None:
+        if gateway_sha is None:
+            gateway_sha = _public_code_sha(fallback_identity.get("code_sha"))
+        if gateway_profile is None:
+            gateway_profile = _public_gateway_profile(
+                fallback_identity.get("profile")
+            )
+            if gateway_profile is None:
+                try:
+                    from gateway.status import _profile_label_for_home
+
+                    gateway_profile = _public_gateway_profile(
+                        _profile_label_for_home(target_home)
+                    )
+                except Exception:
+                    gateway_profile = None
+
+    if gateway_sha:
+        result["gateway_code_sha"] = gateway_sha
+    if gateway_profile:
+        result["gateway_profile"] = gateway_profile
+    if gateway_sha and checkout_sha:
+        result["gateway_restart_required"] = not _code_shas_equal(
+            gateway_sha, checkout_sha
+        )
+    return result
 
 
 def _merge_profile_gateway_platforms(
@@ -3925,6 +4215,33 @@ async def get_status(profile: Optional[str] = None):
             "auth_flows": auth_flows,
             "nous_session_valid": nous_session_valid,
         }
+
+        # Running-code vs. checkout identity (#69754).  A successful update
+        # can move the shared checkout while a long-lived gateway keeps the
+        # old modules resident; this structured contract lets Desktop offer a
+        # targeted restart instead of another update.  All probes run in a
+        # worker: local socket I/O, process ownership checks, and fresh git /
+        # baked-build reads are blocking.  The helper emits only sanitized
+        # commit/profile values (no PID/path), so these fields remain safe on
+        # this public endpoint even when dashboard auth is engaged.
+        try:
+            target_home = profile_dir if profile_dir is not None else get_hermes_home()
+            status.update(
+                await run_in_threadpool(
+                    functools.partial(
+                        _status_gateway_code_identity,
+                        target_home=target_home,
+                        liveness_source=liveness.source,
+                        liveness_pid=liveness.pid,
+                        local_runtime=local_runtime,
+                        remote_health_body=remote_health_body,
+                    )
+                )
+            )
+        except Exception:
+            # Identity is update guidance, not liveness.  A probe failure must
+            # omit the optional fields rather than break /api/status.
+            _log.debug("gateway code-identity status probe failed", exc_info=True)
 
         # Stable per-install identity (see get_install_id above). First call
         # may touch disk, so keep it off the event loop; afterwards it is a
@@ -4500,6 +4817,7 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
 _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
 _ACTION_IDS: Dict[str, str] = {}
+_ACTION_UPDATE_LOCKS: Dict[str, Any] = {}
 
 # A finished ``gateway-restart`` child does not mean the gateway is back: the
 # child exits as soon as it has handed the restart to the supervisor (or to the
@@ -4565,17 +4883,44 @@ def _record_completed_action(name: str, message: str, exit_code: int = 1) -> Non
     _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": None}
 
 
+def _release_update_admission(name: str, lock: Any = None) -> None:
+    """Release a dashboard-held install marker after the child exits."""
+    owned = _ACTION_UPDATE_LOCKS.pop(name, None)
+    if owned is not None and (lock is None or owned is lock):
+        lock = owned
+    if lock is not None:
+        try:
+            lock.release()
+        except Exception:
+            _log.debug("Could not release dashboard update admission lock", exc_info=True)
+
+
+def _watch_update_admission(proc: Any, lock: Any) -> None:
+    try:
+        while True:
+            poll = getattr(proc, "poll", None)
+            if not callable(poll) or poll() is not None:
+                break
+            time.sleep(0.25)
+    finally:
+        _release_update_admission("hermes-update", lock)
+
+
 def _dashboard_spawn_executable() -> str:
     """Interpreter for detached dashboard actions.
 
-    Returns ``sys.executable`` on every platform.  On Windows the spawn
-    below carries ``windows_detach_flags()`` (CREATE_NO_WINDOW), so the
-    console python owns a single hidden console that its own subprocess
-    spawns inherit — the action stays invisible without resorting to
-    console-less pythonw.exe, which would make every console-subsystem
-    descendant flash its own conhost (#54220/#56747).
+    Prefer the checkout venv over ``sys.executable``.  SSH remote backends can
+    run on a dependency-less uv base interpreter with the venv site-packages
+    injected into ``sys.path``; a detached child of that base interpreter does
+    not inherit the injection and fails on its first third-party import
+    (#90026, contributor fix #90030).
+
+    Layouts without a project venv retain the previous ``sys.executable``
+    fallback.  On Windows the spawn below still carries
+    ``windows_detach_flags()`` (CREATE_NO_WINDOW), so console descendants stay
+    hidden without resorting to ``pythonw.exe`` (#54220/#56747).
     """
-    return sys.executable
+    return resolve_project_python(PROJECT_ROOT, current_executable=sys.executable)
 
 
 def _spawn_hermes_action(
@@ -4586,8 +4931,10 @@ def _spawn_hermes_action(
 ) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
-    Uses the running interpreter's ``hermes_cli.main`` module so the action
-    inherits the same venv/PYTHONPATH the web server is using.
+    Uses ``hermes_cli.main`` under the checkout venv when available.  Any
+    absolute import roots injected into the serving process are also carried
+    through ``PYTHONPATH``; ``sys.path`` mutations are not inherited by Python
+    subprocesses on their own.
     """
     log_file_name = _ACTION_LOG_FILES[name]
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4604,7 +4951,8 @@ def _spawn_hermes_action(
     # trip the in-process restart-loop guard and exit 1 — silently failing the
     # dashboard's auto-restart paths. The gateway's own restart watcher already
     # drops it (gateway/run.py); mirror that here (#52470).
-    action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+    action_env = detached_python_env(os.environ)
+    action_env["HERMES_NONINTERACTIVE"] = "1"
     action_env.pop("_HERMES_GATEWAY", None)
 
     popen_kwargs: Dict[str, Any] = {
@@ -4992,6 +5340,21 @@ async def update_hermes():
             "update_command": message,
         }
 
+    from hermes_cli.update_lock import UpdateLock, read_live_update
+
+    marker_holder = read_live_update()
+    if marker_holder is not None:
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "update_in_progress",
+            "holder_pid": marker_holder.pid,
+            "message": marker_holder.unavailable_reason
+            or "Another Hermes update already owns the install marker.",
+            "retryable": True,
+        }
+
     existing = _ACTION_PROCS.get("hermes-update")
     if existing is not None and existing.poll() is None:
         response = {
@@ -5005,16 +5368,52 @@ async def update_hermes():
             response["action_id"] = action_id
         return response
 
+    admission = UpdateLock()
+    if not admission.acquire():
+        holder = admission.holder
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "update_admission_unavailable",
+            "holder_pid": holder.pid if holder is not None else None,
+            "message": holder.unavailable_reason
+            if holder is not None and holder.unavailable_reason
+            else "Could not establish the install-wide update marker.",
+            "retryable": True,
+        }
+
     action_id = secrets.token_hex(16)
     try:
         proc = _spawn_hermes_action(
             ["update"],
             "hermes-update",
-            env_overrides={"HERMES_ACTION_ID": action_id},
+            env_overrides={
+                "HERMES_ACTION_ID": action_id,
+                # One identity from HTTP start through the detached updater's
+                # durable receipt.  Without this alias, a dashboard restart
+                # loses its in-memory action map and the receipt cannot prove
+                # it belongs to the action Desktop is polling.
+                "HERMES_UPDATE_CORRELATION_ID": action_id,
+            },
         )
     except Exception as exc:
+        admission.release()
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
+
+    if callable(getattr(proc, "poll", None)):
+        _ACTION_UPDATE_LOCKS["hermes-update"] = admission
+        threading.Thread(
+            target=_watch_update_admission,
+            args=(proc, admission),
+            name="hermes-update-admission",
+            daemon=True,
+        ).start()
+    else:
+        # Test doubles and unusual launch wrappers do not expose liveness;
+        # never leave the install marker wedged in that case.
+        admission.release()
     return {
         "ok": True,
         "pid": proc.pid,
@@ -5087,6 +5486,10 @@ async def check_hermes_update(force: bool = False):
 
     Returns:
         install_method: 'apt' | 'git' | 'docker' | 'nix' | 'nixos' | 'unknown'
+        deployment_kind: canonical runtime/update shape from the Phase-4
+                         deployment table
+        deployment_class: coarse image/package/mutable/external/unknown class
+                          retained for clients that do not need supervisor detail
         current_version: installed Hermes version string
         behind: commits behind upstream (>=1), 0 if up to date,
                 -1 if behind by an unknown count, or null if the
@@ -5106,11 +5509,15 @@ async def check_hermes_update(force: bool = False):
     if _dashboard_local_update_managed_externally():
         return {
             "install_method": "managed-runtime",
+            "deployment_kind": "image",
+            "deployment_class": "image",
             "current_version": __version__,
             "behind": None,
             "update_available": False,
             "can_apply": False,
-            "update_command": "managed outside dashboard",
+            # Guidance is not an executable command. Keep this null so clients
+            # render an operator-managed state instead of a bogus Copy button.
+            "update_command": None,
             "message": (
                 "Hermes updates are managed outside this dashboard in "
                 "containerized environments."
@@ -5118,14 +5525,22 @@ async def check_hermes_update(force: bool = False):
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
+    deployment_kind = await asyncio.to_thread(
+        _dashboard_deployment_kind, install_method
+    )
+    deployment_class = _dashboard_deployment_class(deployment_kind)
     update_command = recommended_update_command_for_method(install_method)
+    if deployment_kind == "external":
+        update_command = None
 
     payload: Dict[str, Any] = {
         "install_method": install_method,
+        "deployment_kind": deployment_kind,
+        "deployment_class": deployment_class,
         "current_version": __version__,
         "behind": None,
         "update_available": False,
-        "can_apply": install_method == "git",
+        "can_apply": deployment_class == "mutable",
         "update_command": update_command,
         "message": None,
     }
@@ -5734,6 +6149,8 @@ async def get_action_status(name: str, lines: int = 200):
             _ACTION_PROCS.pop(name, None)
             _ACTION_COMMANDS.pop(name, None)
             _ACTION_IDS.pop(name, None)
+            if name == "hermes-update":
+                _release_update_admission(name)
 
     response = {
         "name": name,
@@ -5767,7 +6184,7 @@ def _latest_update_receipt_summary() -> Optional[Dict[str, Any]]:
         if not receipt:
             return None
         fleet = receipt.get("fleet") or []
-        return {
+        summary: Dict[str, Any] = {
             "outcome": receipt.get("outcome"),
             "started_at": receipt.get("started_at"),
             "finished_at": receipt.get("finished_at"),
@@ -5778,6 +6195,20 @@ def _latest_update_receipt_summary() -> Optional[Dict[str, Any]]:
                 {str(e.get("state")) for e in fleet if isinstance(e, dict)}
             ),
         }
+        correlation_id = receipt.get("correlation_id")
+        if isinstance(correlation_id, str) and correlation_id:
+            summary["correlation_id"] = correlation_id
+        stop_reason = receipt.get("stop_reason")
+        if isinstance(stop_reason, str) and stop_reason:
+            summary["stop_reason"] = stop_reason
+        refusal = receipt.get("refusal")
+        if isinstance(refusal, dict):
+            # Copy so a caller cannot mutate a module-cached receipt object.
+            summary["refusal"] = dict(refusal)
+        persistence = receipt.get("persistence")
+        if isinstance(persistence, dict):
+            summary["persistence"] = dict(persistence)
+        return summary
     except Exception:
         return None
 
@@ -17752,12 +18183,10 @@ def mount_spa(application: FastAPI):
     # SPA, even if a dist is lying around from a prior `dashboard`/build. Take
     # the no-frontend path so only the JSON-RPC/WS/API surface is reachable.
     _headless = os.environ.get("HERMES_SERVE_HEADLESS") == "1"
-    if _headless or not WEB_DIST.exists():
+    if _headless:
         _msg = (
             "Headless backend (hermes serve): web UI disabled — use "
             "`hermes dashboard` for the browser UI."
-            if _headless
-            else "Frontend not built. Run: cd web && npm run build"
         )
 
         @application.get("/{full_path:path}")
@@ -17871,7 +18300,17 @@ def mount_spa(application: FastAPI):
         index.html. Without this header every dashboard load re-validated
         each chunk; with it the browser serves reloads straight from its
         HTTP cache.
+
+        ``web_dist`` may be absent when a long-running ``--skip-build``
+        dashboard mounts this app.  Starlette normally validates the static
+        directory once on its first request and raises permanently when it is
+        missing.  Skip only that one-time assertion: ``get_response`` still
+        performs a fresh, traversal-safe lookup on every request, so assets
+        start serving as soon as a later build appears (#82614/#82666).
         """
+
+        async def check_config(self) -> None:
+            return None
 
         async def get_response(self, path: str, scope):
             response = await super().get_response(path, scope)
@@ -17880,7 +18319,9 @@ def mount_spa(application: FastAPI):
             return response
 
     application.mount(
-        "/assets", _ImmutableAssetFiles(directory=WEB_DIST / "assets"), name="assets"
+        "/assets",
+        _ImmutableAssetFiles(directory=WEB_DIST / "assets", check_dir=False),
+        name="assets",
     )
 
     @application.get("/{full_path:path}")

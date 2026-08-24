@@ -1,9 +1,10 @@
-"""Regression: installer autostash restore conflicts must not abort the run.
+"""Regression: installer autostash conflicts preserve an exact recovery path.
 
 An interrupted/repeated managed install can leave local tracked edits in the
 checkout. If upstream then changes the same lines, ``git stash apply`` conflicts
-during the repository-update stage. Both installers must leave the stash intact,
-reset the worktree clean, and complete the real repository stage.
+during the repository-update stage. The Bash installer stops before dependency
+stages and leaves both the conflict and an immutable stash recovery ref in
+place; it never runs a broad reset that could erase a concurrent edit.
 """
 
 from __future__ import annotations
@@ -40,7 +41,8 @@ def _make_conflicted_managed_checkout(tmp_path: Path) -> Path:
     seed.mkdir()
     _git(seed, "init")
     (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
-    _git(seed, "add", "tracked.txt")
+    (seed / "staged.txt").write_text("base staged\n", encoding="utf-8")
+    _git(seed, "add", "tracked.txt", "staged.txt")
     _git(seed, "commit", "-m", "base")
     _git(seed, "branch", "-M", "main")
 
@@ -53,6 +55,9 @@ def _make_conflicted_managed_checkout(tmp_path: Path) -> Path:
     _git(tmp_path, "clone", "--branch", "main", str(remote), str(managed))
 
     (managed / "tracked.txt").write_text("local edit\n", encoding="utf-8")
+    (managed / "staged.txt").write_text("local staged edit\n", encoding="utf-8")
+    _git(managed, "add", "staged.txt")
+    (managed / "untracked.txt").write_text("local untracked\n", encoding="utf-8")
 
     upstream = tmp_path / "upstream"
     _git(tmp_path, "clone", "--branch", "main", str(remote), str(upstream))
@@ -63,19 +68,47 @@ def _make_conflicted_managed_checkout(tmp_path: Path) -> Path:
     return managed
 
 
-def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
+def _assert_ps_conflict_stopped_safely(repo: Path, output: str) -> None:
     assert "restoring local changes hit conflicts" in output
     assert "Conflicted files:" in output
     assert "tracked.txt" in output
-    assert "Working tree reset to clean state." in output
-    assert "Restore your changes later with: git stash apply stash@{0}" in output
-    assert _git(repo, "status", "--porcelain").stdout.strip() == ""
+    assert "conflicted worktree was left intact" in output
+    assert "Durable recovery ref:" in output
+    assert "Restore your changes later with: git stash apply --index" in output
+    status = _git(repo, "status", "--porcelain").stdout
+    assert "UU tracked.txt" in status
+    assert "M  staged.txt" in status
+    assert "?? untracked.txt" in status
     assert _git(repo, "stash", "list").stdout.strip(), "stash must be preserved"
-    content = (repo / "tracked.txt").read_text(encoding="utf-8")
-    assert content == "upstream edit\n", content
-    # No conflict markers must be left in tracked source — they would crash
-    # the backend on import (SyntaxError on the <<<<<<< line).
-    assert "<<<<<<<" not in content and ">>>>>>>" not in content
+    pins = _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/hermes-update-stashes/",
+    ).stdout.strip()
+    assert pins, "the exact stash must remain reachable outside the stash reflog"
+
+
+def _assert_bash_conflict_stopped_safely(repo: Path, output: str) -> None:
+    assert "restoring local changes hit conflicts" in output
+    assert "Conflicted files:" in output
+    assert "tracked.txt" in output
+    assert "conflicted apply was left in place" in output
+    assert "Restore your changes later with: git stash apply --index" in output
+    status = _git(repo, "status", "--porcelain").stdout
+    assert "UU tracked.txt" in status
+    assert "M  staged.txt" in status
+    assert "?? untracked.txt" in status
+    assert (repo / "staged.txt").read_text(encoding="utf-8") == "local staged edit\n"
+    assert (repo / "untracked.txt").read_text(encoding="utf-8") == "local untracked\n"
+    assert _git(repo, "stash", "list").stdout.strip(), "stash must be preserved"
+    pins = _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/hermes-update-stashes/",
+    ).stdout.strip()
+    assert pins, "the exact stash must remain reachable outside the stash reflog"
 
 
 @pytest.mark.live_system_guard_bypass
@@ -83,7 +116,7 @@ def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
     shutil.which("git") is None or shutil.which("bash") is None,
     reason="needs git and bash",
 )
-def test_install_sh_repository_stage_recovers_from_autostash_conflict(
+def test_install_sh_repository_stage_stops_safely_on_autostash_conflict(
     tmp_path: Path,
 ) -> None:
     managed = _make_conflicted_managed_checkout(tmp_path)
@@ -100,8 +133,8 @@ def test_install_sh_repository_stage_recovers_from_autostash_conflict(
         text=True,
     )
 
-    assert result.returncode == 0, result.stderr
-    _assert_conflict_was_recovered(managed, result.stdout)
+    assert result.returncode != 0
+    _assert_bash_conflict_stopped_safely(managed, result.stdout)
 
 
 @pytest.mark.live_system_guard_bypass
@@ -109,7 +142,7 @@ def test_install_sh_repository_stage_recovers_from_autostash_conflict(
     shutil.which("git") is None or POWERSHELL is None,
     reason="needs git and PowerShell",
 )
-def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
+def test_install_ps1_repository_stage_stops_safely_on_autostash_conflict(
     tmp_path: Path,
 ) -> None:
     managed = _make_conflicted_managed_checkout(tmp_path)
@@ -132,8 +165,8 @@ def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
         text=True,
     )
 
-    assert result.returncode == 0, result.stderr
-    _assert_conflict_was_recovered(managed, result.stdout)
+    assert result.returncode != 0
+    _assert_ps_conflict_stopped_safely(managed, result.stdout)
 
 
 @pytest.mark.live_system_guard_bypass
@@ -141,13 +174,14 @@ def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
     shutil.which("git") is None or shutil.which("bash") is None,
     reason="needs git and bash",
 )
-def test_install_sh_repository_stage_clean_apply_drops_stash(
+def test_install_sh_repository_stage_clean_apply_retains_recovery_stash(
     tmp_path: Path,
 ) -> None:
-    """Happy path: a non-conflicting restore must still apply and drop the stash.
+    """A clean restore applies edits and retains the immutable recovery copy.
 
-    The conflict-recovery fix must not regress the normal path — when stash apply
-    succeeds cleanly, the stash should be dropped and local changes restored.
+    Git can only delete stash entries through a positional selector. Retaining
+    the SHA-addressed entry avoids a concurrent stash push/drop deleting the
+    wrong recovery copy.
     """
     seed = tmp_path / "seed"
     seed.mkdir()
@@ -188,8 +222,8 @@ def test_install_sh_repository_stage_clean_apply_drops_stash(
 
     assert result.returncode == 0, result.stderr
     assert "Local changes were restored on top of the updated codebase." in result.stdout
-    # Stash must be dropped on a clean apply — not preserved.
-    assert _git(managed, "stash", "list").stdout.strip() == "", "stash must be dropped on clean apply"
+    stashes = _git(managed, "stash", "list", "--format=%H %gs").stdout.strip()
+    assert "hermes-install-autostash-" in stashes
     # Local changes must be present in the working tree.
     assert (managed / "local-only.txt").read_text(encoding="utf-8") == "local edit\n"
     assert (managed / "tracked.txt").read_text(encoding="utf-8") == "upstream edit\n"

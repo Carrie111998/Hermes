@@ -24,7 +24,7 @@ import {
   setRememberedSessionId
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
-import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
+import { openUpdateOverlayFor, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
 import { isHudWindow, isSecondaryWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -73,7 +73,10 @@ export function useDesktopIntegrations({
     // Background MCP health: HTTP/SSE servers only (never spawns stdio),
     // notifies on transitions into needs-auth/error with a Sign in action.
     startMcpHealthChecker()
-    const unsubscribe = window.hermesDesktop?.onOpenUpdatesRequested?.(() => openUpdatesWindow())
+    // The native menu item is specifically the Desktop client's updater. A
+    // remote connection must not silently retarget that OS-level command to
+    // the backend — backend updates have their own explicit row/overlay.
+    const unsubscribe = window.hermesDesktop?.onOpenUpdatesRequested?.(() => openUpdateOverlayFor('client'))
 
     return () => {
       unsubscribe?.()

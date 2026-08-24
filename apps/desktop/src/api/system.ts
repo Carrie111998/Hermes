@@ -134,7 +134,15 @@ export function runCurator(): Promise<ActionResponse> {
   })
 }
 
-export function restartGateway(): Promise<ActionResponse> {
+export function restartGateway(scope?: ProfileScope): Promise<ActionResponse> {
+  if (scope !== undefined) {
+    return window.hermesDesktop.api<ActionResponse>({
+      ...capabilityScoped(scope),
+      path: '/api/gateway/restart',
+      method: 'POST'
+    })
+  }
+
   return hermesApi<ActionResponse>({
     ...profileScoped(),
     path: '/api/gateway/restart',
@@ -142,7 +150,15 @@ export function restartGateway(): Promise<ActionResponse> {
   })
 }
 
-export function updateHermes(): Promise<ActionResponse> {
+export function updateHermes(scope?: ProfileScope): Promise<ActionResponse> {
+  if (scope !== undefined) {
+    return window.hermesDesktop.api<ActionResponse>({
+      ...capabilityScoped(scope),
+      path: '/api/hermes/update',
+      method: 'POST'
+    })
+  }
+
   return hermesApi<ActionResponse>({
     ...profileScoped(),
     path: '/api/hermes/update',
@@ -153,7 +169,14 @@ export function updateHermes(): Promise<ActionResponse> {
 /** Query the connected backend's own update state. In remote mode this is the
  *  authoritative source for the backend's behind-count + "what's changed",
  *  distinct from the Electron client clone's git state. */
-export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
+export function checkHermesUpdate(force = false, scope?: ProfileScope): Promise<BackendUpdateCheckResponse> {
+  if (scope !== undefined) {
+    return window.hermesDesktop.api<BackendUpdateCheckResponse>({
+      ...capabilityScoped(scope),
+      path: `/api/hermes/update/check${force ? '?force=true' : ''}`
+    })
+  }
+
   return hermesApi<BackendUpdateCheckResponse>({
     ...profileScoped(),
     path: `/api/hermes/update/check${force ? '?force=true' : ''}`

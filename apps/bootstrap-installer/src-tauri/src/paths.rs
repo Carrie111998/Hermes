@@ -16,6 +16,7 @@
 //! writes to one place and the installer reads from another, breaking
 //! the bootstrap-complete check.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -87,7 +88,35 @@ pub fn installer_dest() -> PathBuf {
 /// Electron desktop — which resolves HERMES_HOME identically and pins it into
 /// the updater's env — agrees on the exact path.
 pub fn update_in_progress_marker() -> PathBuf {
-    hermes_home().join(".hermes-update-in-progress")
+    install_hermes_root(&hermes_home()).join(".hermes-update-in-progress")
+}
+
+/// Named profile homes share one checkout under the containing Hermes root.
+/// Keep their update marker install-wide so Rust, Python, and Electron cannot
+/// acquire independent claims while mutating that same tree.
+fn install_hermes_root(home: &Path) -> PathBuf {
+    if home
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(is_profiles_dir)
+    {
+        return home
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(home)
+            .to_path_buf();
+    }
+    home.to_path_buf()
+}
+
+#[cfg(target_os = "windows")]
+fn is_profiles_dir(name: &OsStr) -> bool {
+    name.to_string_lossy().eq_ignore_ascii_case("profiles")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_profiles_dir(name: &OsStr) -> bool {
+    name == OsStr::new("profiles")
 }
 
 /// Copy the currently-running installer binary to `installer_dest()` so it's
@@ -213,4 +242,39 @@ pub fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_hermes_root;
+    use std::path::Path;
+
+    #[test]
+    fn named_profiles_share_the_install_hermes_root() {
+        let root = Path::new("root");
+        assert_eq!(
+            install_hermes_root(&root.join("profiles").join("alpha")),
+            root
+        );
+        assert_eq!(
+            install_hermes_root(&root.join("profiles").join("beta")),
+            root
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn named_profiles_share_the_install_hermes_root_case_insensitively_on_windows() {
+        let root = Path::new("root");
+        assert_eq!(
+            install_hermes_root(&root.join("Profiles").join("alpha")),
+            root
+        );
+    }
+
+    #[test]
+    fn custom_non_profile_home_stays_unchanged() {
+        let home = Path::new("custom-hermes");
+        assert_eq!(install_hermes_root(home), home);
+    }
 }
