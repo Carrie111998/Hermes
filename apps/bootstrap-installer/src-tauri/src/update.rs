@@ -2429,6 +2429,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rust_marker_mutex_contends_with_python_fcntl() {
+        use std::io::{BufRead, BufReader};
+        use std::sync::mpsc;
+
+        let dir = unique_tmp_dir("python-rust-marker-mutex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        let lock_path = marker_mutex_path(&marker);
+        let lock_path_text = lock_path.to_str().expect("temporary path must be UTF-8");
+        let python_script = r#"
+import fcntl
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, "a+b") as lock_file:
+    if os.fstat(lock_file.fileno()).st_size == 0:
+        lock_file.write(b"x")
+        lock_file.flush()
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    print("READY", flush=True)
+    sys.stdin.read()
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+"#;
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", python_script, lock_path_text])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Linux CI must provide python3 for mutex interop coverage");
+        let stdout = child.stdout.take().expect("Python stdout must be piped");
+        let mut ready = BufReader::new(stdout);
+        let mut line = String::new();
+        ready
+            .read_line(&mut line)
+            .expect("Python mutex holder must report readiness");
+        assert_eq!(line.trim(), "READY");
+
+        let marker_for_rust = marker.clone();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let acquire_thread = std::thread::spawn(move || {
+            let result = MarkerMutex::acquire(&marker_for_rust);
+            acquired_tx.send(()).expect("acquisition thread receiver exists");
+            result
+        });
+
+        // The Python fcntl lock must prevent Rust flock from acquiring the
+        // same sidecar until the Python process is released.
+        let was_blocked = acquired_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err();
+        let mut stdin = child.stdin.take().expect("Python stdin must be piped");
+        stdin
+            .write_all(b"release")
+            .expect("release token must reach Python");
+        drop(stdin);
+        let child_status = child.wait().expect("Python mutex holder must exit");
+        let rust_result = acquire_thread
+            .join()
+            .expect("Rust acquisition thread must not panic");
+
+        assert!(was_blocked, "Rust acquired the mutex while Python held it");
+        assert!(child_status.success(), "Python mutex holder failed");
+        assert!(rust_result.is_ok(), "Rust must acquire after Python releases");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn update_marker_guard_never_deletes_malformed_self_pid_state() {
         let dir = unique_tmp_dir("marker-guard-malformed-self");
