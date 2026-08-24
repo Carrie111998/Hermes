@@ -9,8 +9,10 @@ import logging
 import os
 import sys
 import threading
+import time
 import contextvars
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
@@ -1464,6 +1466,31 @@ def _load_skill_usage(skills_dir: Path) -> dict[str, int]:
     return out
 
 
+def _load_skill_created(skills_dir: Path) -> dict[str, "datetime | None"]:
+    """Skill name -> parsed created_at from the .usage.json sidecar (best-effort).
+
+    Powers the '(new)' freshness badge + recency boost so a brand-new skill
+    surfaces once for its first load, then usage ranking takes over. Best
+    effort — a missing/unparseable created_at just means no freshness signal.
+    """
+    usage_path = skills_dir / ".usage.json"
+    try:
+        data = json.loads(usage_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, "datetime | None"] = {}
+    for name, rec in data.items():
+        try:
+            ts = rec.get("created_at")
+            dt = datetime.fromisoformat(ts) if ts else None
+            if dt is not None and dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            out[name] = dt
+        except (TypeError, ValueError):
+            out[name] = None
+    return out
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1507,6 +1534,16 @@ def build_skills_system_prompt(
     except OSError:
         usage_mtime = 0.0
     usage = _load_skill_usage(skills_dir)
+    created = _load_skill_created(skills_dir)
+    _fresh_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+
+    def _is_fresh(name: str) -> bool:
+        dt = created.get(name)
+        return bool(dt and dt >= _fresh_cutoff)
+
+    def _created_ts(name: str) -> float:
+        dt = created.get(name)
+        return dt.timestamp() if dt else 0.0
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1517,6 +1554,7 @@ def build_skills_system_prompt(
         tuple(sorted(compact_categories or ())),
         platform,
         usage_mtime,
+        int(time.time()) // 86400,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1679,9 +1717,12 @@ def build_skills_system_prompt(
         def _cat_usage(cat: str) -> int:
             return max((usage.get(n, 0) for n, _ in skills_by_category[cat]), default=0)
 
+        def _cat_fresh(cat: str) -> bool:
+            return any(_is_fresh(n) for n, _ in skills_by_category[cat])
+
         for category in sorted(
             skills_by_category.keys(),
-            key=lambda c: (-_cat_usage(c), c),
+            key=lambda c: (-_cat_usage(c), -int(_cat_fresh(c)), c),
         ):
             # Deduplicate and sort skills within each category
             seen = set()
@@ -1696,13 +1737,25 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}:")
             for name, desc in sorted(
                 skills_by_category[category],
-                key=lambda x: (-usage.get(x[0], 0), x[0]),
+                key=lambda x: (
+                    0 if usage.get(x[0], 0) else 1,
+                    0 if (not usage.get(x[0], 0) and _is_fresh(x[0])) else 1,
+                    -usage.get(x[0], 0),
+                    -int(_is_fresh(x[0])),
+                    -_created_ts(x[0]) if (not usage.get(x[0], 0) and _is_fresh(x[0])) else 0.0,
+                    x[0],
+                ),
             ):
                 if name in seen:
                     continue
                 seen.add(name)
                 _uses = usage.get(name, 0)
-                _suffix = f" (used {_uses})" if _uses else ""
+                _bits = []
+                if _uses:
+                    _bits.append(f"used {_uses}")
+                if _is_fresh(name):
+                    _bits.append("new")
+                _suffix = f" ({', '.join(_bits)})" if _bits else ""
                 if desc:
                     index_lines.append(f"    - {name}{_suffix}: {desc}")
                 else:
