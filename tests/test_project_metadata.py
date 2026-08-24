@@ -1,7 +1,11 @@
 """Regression tests for packaging metadata in pyproject.toml."""
 
 from pathlib import Path
+import sys
 import tomllib
+
+import pytest
+from packaging.markers import Marker, default_environment
 
 def _load_optional_dependencies():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
@@ -15,6 +19,31 @@ def _load_package_data():
     with pyproject_path.open("rb") as handle:
         tool = tomllib.load(handle)["tool"]
     return tool["setuptools"]["package-data"]
+
+
+def _load_uv_lock():
+    lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
+    with lock_path.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def _locked_package(name):
+    packages = [package for package in _load_uv_lock()["package"] if package["name"] == name]
+    assert len(packages) == 1, f"expected one {name!r} package in uv.lock, got {packages}"
+    return packages[0]
+
+
+def _wake_marker_environment(version):
+    environment = default_environment()
+    environment.update(
+        {
+            "python_version": f"{version[0]}.{version[1]}",
+            "python_full_version": f"{version[0]}.{version[1]}.0",
+            "extra": "wake",
+            "sys_platform": "linux",
+        }
+    )
+    return environment
 
 
 def test_matrix_extra_not_in_all():
@@ -54,6 +83,75 @@ def test_wake_openwakeword_has_explicit_python_compatibility_boundary():
         spec.startswith("openwakeword==0.6.0")
         and spec != "openwakeword==0.6.0; python_version < '3.12'"
         for spec in wake
+    )
+
+
+def test_wake_lock_markers_select_openwakeword_only_on_supported_python():
+    """The committed lock must select the CPython 3.11 wake stack only."""
+    optional_dependencies = _load_optional_dependencies()
+    project_spec = next(
+        spec for spec in optional_dependencies["wake"] if spec.startswith("openwakeword==")
+    )
+    project_marker = Marker(project_spec.split(";", 1)[1].strip())
+
+    locked_root = _locked_package("hermes-agent")
+    locked_spec = next(
+        requirement
+        for requirement in locked_root["metadata"]["requires-dist"]
+        if requirement["name"] == "openwakeword"
+    )
+    locked_marker = Marker(locked_spec["marker"])
+
+    for version in ((3, 11),):
+        environment = _wake_marker_environment(version)
+        assert project_marker.evaluate(environment) is True
+        assert locked_marker.evaluate(environment) is True
+    for version in ((3, 12), (3, 13), (3, 14)):
+        environment = _wake_marker_environment(version)
+        assert project_marker.evaluate(environment) is False
+        assert locked_marker.evaluate(environment) is False
+
+    assert locked_spec["specifier"] == "==0.6.0"
+    assert locked_spec["marker"] == "python_full_version < '3.12' and extra == 'wake'"
+
+    openwakeword = _locked_package("openwakeword")
+    tflite_dependency = next(
+        dependency
+        for dependency in openwakeword["dependencies"]
+        if dependency["name"] == "tflite-runtime"
+    )
+    assert tflite_dependency["marker"] == "sys_platform == 'linux'"
+
+
+def test_tflite_lock_contains_supported_cp311_linux_architectures():
+    """The lock retains all three published CPython 3.11 Linux wheels."""
+    wheels = _locked_package("tflite-runtime")["wheels"]
+    wheel_urls = [wheel["url"] for wheel in wheels]
+    for architecture in ("x86_64", "aarch64", "armv7l"):
+        assert any("cp311" in url and architecture in url for url in wheel_urls), architecture
+    assert not any("cp312" in url or "cp313" in url or "cp314" in url for url in wheel_urls)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or sys.implementation.name != "cpython"
+    or sys.version_info[:2] != (3, 11),
+    reason="wake import smoke runs on CPython 3.11 Linux only",
+)
+def test_supported_wake_runtime_import_smoke():
+    """Import the locked tflite/openWakeWord path when the wake extra is present.
+
+    Lean test environments intentionally do not install the optional ``wake``
+    extra. On a CPython 3.11 Linux job that does install it, both imports must
+    succeed; otherwise this test reports an explicit, actionable skip.
+    """
+    pytest.importorskip(
+        "tflite_runtime.interpreter",
+        reason="install the optional wake extra to run the CPython 3.11 smoke",
+    )
+    pytest.importorskip(
+        "openwakeword.model",
+        reason="install the optional wake extra to run the CPython 3.11 smoke",
     )
 
 
