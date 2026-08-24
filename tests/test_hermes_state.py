@@ -1637,6 +1637,26 @@ class TestSanitizeTitle:
         assert SessionDB.sanitize_title("hello\x00world") == "helloworld"
         assert SessionDB.sanitize_title("\x07\x08test\x1b") == "test"
 
+    def test_zero_width_space_keeps_word_gap(self):
+        # #93968: a title pasted from a web page or chat app often carries
+        # U+200B where a visible space should be. It must normalize to a
+        # real space, not be deleted (which glued the words together).
+        assert SessionDB.sanitize_title("Alpha\u200bBeta") == "Alpha Beta"
+        assert SessionDB.sanitize_title("a\u200bb") == "a b"
+
+    def test_zero_width_nbsp_mid_string_becomes_space(self):
+        # U+FEFF mid-string is a zero-width no-break space; leading/trailing
+        # occurrences are handled by the final .strip().
+        assert SessionDB.sanitize_title("a\ufeffb") == "a b"
+        assert SessionDB.sanitize_title("\ufeffMy Project") == "My Project"
+
+    def test_joiners_and_directional_marks_still_removed(self):
+        # U+200C/U+200D joiners and U+202E directional override are format
+        # controls, not spaces — they stay in the delete set.
+        assert SessionDB.sanitize_title("a\u200cb") == "ab"
+        assert SessionDB.sanitize_title("a\u200db") == "ab"
+        assert SessionDB.sanitize_title("a\u202eb") == "ab"
+
 
 
 

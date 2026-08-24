@@ -9115,8 +9115,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Validate and sanitize a session title.
 
         - Strips leading/trailing whitespace
-        - Removes ASCII control characters (0x00-0x1F, 0x7F) and problematic
-          Unicode control chars (zero-width, RTL/LTR overrides, etc.)
+        - Removes ASCII control characters (0x00-0x1F, 0x7F)
+        - Normalizes zero-width space characters (U+200B, U+FEFF) to plain
+          spaces so pasted titles keep their visible word gaps
+        - Removes remaining problematic Unicode control chars (joiners,
+          RTL/LTR overrides, etc.)
         - Collapses internal whitespace runs to single spaces
         - Normalizes empty/whitespace-only strings to None
         - Enforces MAX_TITLE_LENGTH
@@ -9136,12 +9139,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # normalized to spaces by the whitespace collapsing step below
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
 
+        # Zero-width spaces (U+200B, and U+FEFF when it appears mid-string)
+        # are word separators in text pasted from web pages and chat apps.
+        # Convert them to a real space before the whitespace collapse so a
+        # title like "a\u200bb" keeps its visible word gap instead of being
+        # silently stored as "ab" (#93968).
+        cleaned = cleaned.replace('\u200b', ' ').replace('\ufeff', ' ')
+
         # Remove problematic Unicode control characters:
-        # - Zero-width chars (U+200B-U+200F, U+FEFF)
-        # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
+        # - Joiners and directional marks (U+200C-U+200F)
+        # - Line/paragraph separators (U+2028-U+2029), directional
+        #   overrides (U+202A-U+202E), isolates (U+2066-U+2069)
         # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
         cleaned = re.sub(
-            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
+            r'[\u200c-\u200f\u2028-\u202e\u2060-\u2069\ufffc\ufff9-\ufffb]',
             '', cleaned,
         )
 
