@@ -134,7 +134,9 @@ test('buildPosixCleanupScript waits for the PID, runs the uninstall module, remo
     hermesHome: '/home/x/.hermes'
   })
 
-  assert.match(script, /^#!\/bin\/bash/)
+  // The generated script starts with `#!/usr/bin/env bash`; the runner below
+  // resolves bash explicitly either way.
+  assert.match(script, /^#!\/usr\/bin\/env bash/)
   assert.match(script, /pid=4321/)
   assert.match(script, /kill -0 "\$pid"/)
   // bounded wait (~30s), not unbounded
