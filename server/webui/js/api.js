@@ -89,6 +89,8 @@ export const routes = {
   'company.updateSalesPreferences': ['PATCH', '/company/sales-preferences'],
   'company.getEmailTemplates':      ['GET',   '/company/email-templates'],
   'company.updateEmailTemplates':   ['PATCH', '/company/email-templates'],
+  'company.getResearchProfile':     ['GET',   '/company/research-profile'],
+  'company.putResearchProfile':     ['PUT',   '/company/research-profile'],
 
   // 7.5 Onboarding
   'onboarding.status':              ['GET',   '/onboarding/status'],
@@ -101,6 +103,7 @@ export const routes = {
   'onboarding.updateTargetMarkets':    ['PATCH', '/onboarding/target-markets'],
   'onboarding.updateIntegrations':     ['PATCH', '/onboarding/integrations'],
   'onboarding.reviewBrain':            ['PATCH', '/onboarding/brain-review'],
+  'onboarding.researchProfile':         ['POST',  '/onboarding/research-profile'],
   'onboarding.complete':            ['POST',  '/onboarding/complete'],
 
   // 7.6 Documents

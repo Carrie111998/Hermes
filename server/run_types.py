@@ -21,7 +21,7 @@ PACKS = REPO / "company-packs"
 READ_ONLY = {
     "document_processing", "product_extraction", "company_brain_build",
     "lead_scan", "lead_research", "contact_discovery", "outreach_generation",
-    "linkedin_note_generation",
+    "linkedin_note_generation", "company_profile_research",
 }
 SEND_TYPES = {"email_send", "whatsapp_send"}
 
@@ -85,6 +85,21 @@ def _company_brain_build(company, payload, context=None):
             "missing_data. This is a draft snapshot.")
 
 
+def _company_profile_research(company, payload, context=None):
+    return (
+        _ctx(company, context)
+        + _p(payload)
+        + "\n\nResearch only the supplied official website and product pages linked "
+          "from that same official domain. Stop at the supplied page and time limits. "
+          "Return JSON with identity, seller_countries, products, market_preferences, "
+          "and source_spans. Each product must include name, english_name, hs_codes, "
+          "sector_ids, emphasis, and source_span_ids. Each cited span must include a "
+          "stable id, https source_url, and exact_text copied from the page. Treat "
+          "emphasis, classifications, and all derived values as editable suggestions; "
+          "never claim that the user confirmed them."
+    )
+
+
 def _lead_scan(company, payload, context=None):
     return (_ctx(company, context) + _p(payload) + "\n\nUsing the lead-discovery skill, "
             "scan the payload countries (already territory-checked) for the "
@@ -138,6 +153,7 @@ REGISTRY: Dict[str, tuple] = {
     "document_processing":     ("document-processing", _document_processing),
     "product_extraction":      ("document-processing", _product_extraction),
     "company_brain_build":     ("company-brain-build", _company_brain_build),
+    "company_profile_research":("lead-research",       _company_profile_research),
     "lead_scan":               ("lead-discovery",      _lead_scan),
     "lead_research":           ("lead-research",       _lead_research),
     "contact_discovery":       ("contact-discovery",   _contact_discovery),

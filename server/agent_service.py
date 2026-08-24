@@ -12,6 +12,7 @@ import queue
 import subprocess
 import threading
 import time
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,9 @@ OUTPUT_KEYS: dict[str, set[str]] = {
     "company_brain_build": {
         "product_understanding", "ideal_customer_profile", "buyer_roles",
         "market_assumptions", "sales_arguments", "business_rules_digest", "missing_data",
+    },
+    "company_profile_research": {
+        "identity", "seller_countries", "products", "market_preferences", "source_spans",
     },
     "lead_scan": {"leads"},
     "lead_research": {"profile", "fit", "signals", "approach_angle", "score_inputs"},
@@ -66,6 +70,17 @@ def validate_payload(run_type: str, payload: dict, db: Database, company_id: str
         )
     if not isinstance(payload, dict):
         raise HTTPException(422, "payload must be an object")
+    if run_type == "company_profile_research":
+        website = payload.get("official_website")
+        parsed = urlsplit(str(website or ""))
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise HTTPException(422, "company_profile_research requires an official https website")
+        pages = payload.get("max_pages")
+        seconds = payload.get("max_seconds")
+        if not isinstance(pages, int) or not 1 <= pages <= 8:
+            raise HTTPException(422, "company profile research is limited to 8 pages")
+        if not isinstance(seconds, int) or not 10 <= seconds <= 120:
+            raise HTTPException(422, "company profile research is limited to 120 seconds")
     if run_type == "lead_scan":
         countries = payload.get("countries") or []
         if not 1 <= len(countries) <= 5:
@@ -146,6 +161,17 @@ class StubRunExecutor(BaseRunExecutor):
             context=service.company_context(run["company_id"]),
         )
         values = {key: _stub_value(key) for key in OUTPUT_KEYS[run_type]}
+        if run_type == "company_profile_research":
+            values.update({
+                "identity": {
+                    "name": service.company_name(run["company_id"]),
+                    "website": run["payload"]["official_website"],
+                },
+                "seller_countries": [],
+                "products": [],
+                "market_preferences": {},
+                "source_spans": [],
+            })
         if run_type == "outreach_generation":
             draft = run["payload"].get("draft_content") or {}
             values.update({
@@ -160,7 +186,7 @@ class StubRunExecutor(BaseRunExecutor):
 
 
 def _stub_value(key: str):
-    if key in {"records", "rejects", "products", "leads", "contacts", "cc", "signals", "missing_data"}:
+    if key in {"records", "rejects", "products", "leads", "contacts", "cc", "signals", "missing_data", "source_spans"}:
         return []
     if key == "qa_verdict":
         return {"pass": True, "failures": []}
@@ -358,6 +384,25 @@ class AgentRunService:
         missing = OUTPUT_KEYS[run_type] - set(output)
         if missing:
             raise ValueError(f"run output missing fields: {sorted(missing)}")
+        if run_type == "company_profile_research":
+            spans = output.get("source_spans")
+            products = output.get("products")
+            if not isinstance(spans, list) or not isinstance(products, list):
+                raise ValueError("company profile products and source spans must be lists")
+            span_ids: set[str] = set()
+            for span in spans:
+                if not isinstance(span, dict):
+                    raise ValueError("source span must be an object")
+                span_id = str(span.get("id") or "").strip()
+                exact_text = str(span.get("exact_text") or "").strip()
+                source_url = str(span.get("source_url") or "")
+                if not span_id or len(exact_text) < 3 or not source_url.startswith("https://"):
+                    raise ValueError("source span requires id, https source_url, and exact text")
+                span_ids.add(span_id)
+            for product in products:
+                references = product.get("source_span_ids") if isinstance(product, dict) else None
+                if not isinstance(references, list) or not references or not set(references) <= span_ids:
+                    raise ValueError("each derived product requires a valid exact source span")
 
     def _sync_parent_status(self, run: dict, status: str) -> None:
         payload = run["payload"]

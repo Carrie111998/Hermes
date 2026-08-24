@@ -96,6 +96,60 @@ function arrayOf(value) {
   return Array.isArray(value) ? value : [];
 }
 
+export function researchProfileStep(
+  { derived = false, confirmed = false, products = [] } = {},
+  { onConfirm } = {},
+) {
+  if (!derived) return el('section', { hidden: true });
+  const rows = products.map(product => {
+    const name = input({ value: product.name || '', required: true });
+    const englishName = input({ value: product.english_name || '', required: true });
+    const emphasis = input({
+      value: product.emphasis ?? 1,
+      type: 'number',
+      min: '0',
+      max: '1',
+      step: '0.05',
+    });
+    return {
+      node: el('li', {},
+        el('strong', {}, product.english_name || product.name || 'Derived product'),
+        field('Product name', name, { required: true }),
+        field('English name', englishName, { required: true }),
+        field('Research emphasis (0–1)', emphasis)),
+      value: () => ({
+        ...product,
+        name: name.value.trim(),
+        english_name: englishName.value.trim(),
+        emphasis: Number(emphasis.value),
+      }),
+    };
+  });
+  const confirm = button(confirmed ? 'Research profile confirmed' : 'Confirm research profile', {
+    kind: confirmed ? '' : 'primary',
+    icon: 'check',
+    disabled: confirmed || !rows.length,
+  });
+  confirm.addEventListener('click', async () => {
+    setBusy(confirm, true, 'Saving…');
+    try {
+      await onConfirm?.(rows.map(row => row.value()));
+    } catch {
+      setBusy(confirm, false);
+      toast("We couldn't confirm the research profile. Try again.", 'error');
+    }
+  });
+  return el('section', { class: 'ifz-setup-research-profile' },
+    el('h3', {}, confirmed ? 'Research profile confirmed' : 'Confirm research profile'),
+    el('p', {}, confirmed
+      ? 'These are the products and priorities used for lead research.'
+      : 'Review every suggestion. Edit product names and research emphasis before confirming.'),
+    rows.length
+      ? el('ul', { class: 'ifz-setup-product-list' }, rows.map(row => row.node))
+      : el('p', {}, 'No supported products were found. Add products manually or research again.'),
+    confirm);
+}
+
 function completedSteps(status) {
   if (Array.isArray(status?.completed_steps)) return new Set(status.completed_steps);
   return new Set(arrayOf(status?.steps)
@@ -313,6 +367,7 @@ export async function mount(root, ctx) {
     selectedCountries: [],
     countryStates: [],
     runtime: undefined,
+    researchProfileSuggestion: null,
     known: {
       brain: true,
       mailbox: true,
@@ -386,6 +441,7 @@ export async function mount(root, ctx) {
         call('leadMap.selectedCountries'),
         call('leadMap.countries'),
         fetch('/health').then(response => response.ok ? response.json() : undefined),
+        call('company.getResearchProfile'),
       ]);
       if (disposed) return;
 
@@ -420,6 +476,14 @@ export async function mount(root, ctx) {
       state.selectedCountries = itemsOf(optionalValue(8, []));
       state.countryStates = itemsOf(optionalValue(9, []));
       state.runtime = optionalValue(10, undefined);
+      const confirmedResearchProfile = optionalValue(11, null);
+      if (!state.researchProfileSuggestion && confirmedResearchProfile?.profile) {
+        state.researchProfileSuggestion = {
+          ...confirmedResearchProfile.profile,
+          derived: true,
+          confirmed: true,
+        };
+      }
 
       if (allRequiredComplete(state.onboarding) && !isSetupComplete(state.onboarding)) {
         state.onboarding = await call('onboarding.complete');
@@ -764,6 +828,36 @@ export async function mount(root, ctx) {
     const catalogFile = input({ type: 'file', accept: '.csv,.json,application/json' });
     const importError = errorLine();
     const importCatalog = button('Import catalog', { icon: 'file', disabled: true });
+    const officialWebsite = input({
+      type: 'url',
+      value: state.profile.website || '',
+      placeholder: 'https://example.com',
+    });
+    const researchWebsite = button('Research official website', { icon: 'search' });
+    researchWebsite.addEventListener('click', async () => {
+      if (!officialWebsite.value.trim().startsWith('https://')) {
+        officialWebsite.focus();
+        showError(error, 'Add the official https website first.');
+        return;
+      }
+      setBusy(researchWebsite, true, 'Researching…');
+      try {
+        const run = await call('onboarding.researchProfile', {
+          body: { official_website: officialWebsite.value.trim() },
+        });
+        const completed = await waitForRun(run, { timeoutMs: 120000, intervalMs: 500 });
+        if (completed?.status !== 'succeeded') throw new Error('failed');
+        state.researchProfileSuggestion = {
+          ...completed.output,
+          derived: true,
+          confirmed: false,
+        };
+        render();
+      } catch {
+        setBusy(researchWebsite, false);
+        showError(error, "We couldn't research that website. You can still add products manually.");
+      }
+    });
     catalogFile.addEventListener('change', () => {
       importCatalog.disabled = !catalogFile.files?.[0];
       importError.hidden = true;
@@ -824,9 +918,39 @@ export async function mount(root, ctx) {
           hint: 'Add the products you want the agent to match with buyers.',
         });
 
+    const profileSuggestion = state.researchProfileSuggestion
+      ? researchProfileStep(state.researchProfileSuggestion, {
+          onConfirm: async products => {
+            const suggestion = state.researchProfileSuggestion;
+            await call('company.putResearchProfile', {
+              body: {
+                identity: suggestion.identity,
+                seller_countries: suggestion.seller_countries,
+                products,
+                market_preferences: suggestion.market_preferences || {},
+                research_exclusions: suggestion.research_exclusions || {},
+                hidden_label_ids: suggestion.hidden_label_ids || [],
+                hidden_label_provenance: suggestion.hidden_label_provenance || {},
+                source_ids: suggestion.source_ids || [],
+                evidence_ids: suggestion.evidence_ids || [],
+                confirmations: { ...(suggestion.confirmations || {}), products: true, emphasis: true },
+                playbook_versions: suggestion.playbook_versions || {},
+              },
+            });
+            state.researchProfileSuggestion = { ...suggestion, products, confirmed: true };
+            render();
+            toast('Research profile confirmed.', 'success');
+          },
+        })
+      : null;
+
     return el('div', {},
       el('p', { class: 'ifz-setup-editor-intro' },
         'Keep this list focused on products you can actively export.'),
+      el('div', { class: 'ifz-setup-editor-actions' },
+        field('Official website', officialWebsite),
+        researchWebsite),
+      profileSuggestion,
       el('div', { class: 'ifz-setup-editor-actions' },
         field('Import product catalog (CSV or JSON)', catalogFile),
         importCatalog),

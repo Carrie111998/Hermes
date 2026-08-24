@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from pydantic import BaseModel, field_validator
+from urllib.parse import urlsplit
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import Database, json_dump, json_load, now
@@ -92,6 +94,46 @@ for _step in STEPS:
     _register_step(_step)
 
 
+class OfficialWebsiteInput(BaseModel):
+    official_website: str
+
+    @field_validator("official_website")
+    @classmethod
+    def require_official_https_url(cls, value: str) -> str:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("official_website must be an https URL")
+        return value.strip().rstrip("/")
+
+
+@router.post("/research-profile", status_code=202)
+def research_profile(
+    body: OfficialWebsiteInput,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+    x_company_id: str | None = Header(default=None),
+):
+    """Start bounded research whose output remains an editable suggestion."""
+    company_id = _company(principal, x_company_id)
+    run = request.app.state.runs.create(
+        company_id,
+        "company_profile_research",
+        {
+            "official_website": body.official_website,
+            "max_pages": 8,
+            "max_seconds": 120,
+        },
+    )
+    request.app.state.db.activity(
+        company_id,
+        principal.id,
+        "company_research_profile_requested",
+        "agent_run",
+        run["id"],
+    )
+    return request.app.state.runs.start(company_id, run["id"])
+
+
 @router.post("/complete")
 def complete_onboarding(request: Request, principal: Principal = Depends(current_principal),
                         x_company_id: str | None = Header(default=None)):
@@ -111,4 +153,3 @@ def complete_onboarding(request: Request, principal: Principal = Depends(current
     )
     request.app.state.db.activity(company_id, principal.id, "onboarding_completed", "onboarding", company_id)
     return _status(request.app.state.db, company_id)
-

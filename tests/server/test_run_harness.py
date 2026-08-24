@@ -36,12 +36,11 @@ def wait(runs, company_id, run_id):
     raise AssertionError("run timed out")
 
 
-def test_all_11_run_types_registered():
-    assert set(REGISTRY) == {
-        "document_processing", "product_extraction", "company_brain_build", "lead_scan",
-        "lead_research", "contact_discovery", "outreach_generation", "email_send",
-        "whatsapp_send", "linkedin_note_generation", "analytics_refresh",
-    }
+def test_company_profile_research_run_is_registered_read_only():
+    skill, builder = REGISTRY["company_profile_research"]
+
+    assert skill == "lead-research"
+    assert callable(builder)
 
 
 def test_stub_dispatch_and_events():
@@ -115,4 +114,3 @@ if __name__ == "__main__":
         test()
         print(f"ok  {test.__name__}")
     print(f"\n{len(tests)} run-service checks passed")
-

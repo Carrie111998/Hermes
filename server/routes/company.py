@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import Database, json_dump, json_load, now
+from ..lead_research.models import CompanyResearchProfile
+from ..lead_research.profiles import ProfileRepository
 from ..schemas import DataPatch
 
 
@@ -30,6 +32,36 @@ def _put_section(db: Database, company_id: str, section: str, patch: dict) -> di
         (company_id, section, json_dump(merged), now()),
     )
     return _get_section(db, company_id, section)
+
+
+@router.get("/research-profile")
+def research_profile(request: Request, principal: Principal = Depends(current_principal),
+                     x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    profile = ProfileRepository(request.app.state.db).current(company_id)
+    if profile is None:
+        raise HTTPException(404, "Confirmed research profile not found")
+    return profile
+
+
+@router.put("/research-profile")
+def put_research_profile(
+    body: CompanyResearchProfile,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+    x_company_id: str | None = Header(default=None),
+):
+    company_id = _scope(principal, x_company_id)
+    profile = ProfileRepository(request.app.state.db).create_version(company_id, principal.id, body)
+    request.app.state.db.activity(
+        company_id,
+        principal.id,
+        "company_research_profile_confirmed",
+        "company_profile_version",
+        profile.id,
+        {"version": profile.version},
+    )
+    return profile
 
 
 @router.get("/profile")
@@ -89,4 +121,3 @@ def patch_email_templates(body: DataPatch, request: Request,
     request.app.state.db.activity(company_id, principal.id, "email_templates_updated",
                                   "company", company_id)
     return result
-
