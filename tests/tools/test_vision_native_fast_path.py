@@ -200,6 +200,33 @@ class TestHandleVisionAnalyzeFastPath:
         assert not (isinstance(result, dict) and result.get("_multimodal") is True), \
             "Fast path fired for unknown provider; should have fallen through"
 
+    def test_codex_account_backend_uses_aux_vision_for_tool_images(self, tmp_path):
+        """ChatGPT Codex rejects data-URL images inside function outputs."""
+        img = tmp_path / "x.png"
+        img.write_bytes(_TINY_PNG)
+
+        async def _aux_sentinel(*args, **kwargs):
+            return '{"sentinel": "aux-path"}'
+
+        from agent.auxiliary_client import set_runtime_main, clear_runtime_main
+        set_runtime_main("openai-codex", "gpt-5.6-sol")
+        try:
+            with patch(
+                "agent.image_routing.decide_image_input_mode",
+                return_value="native",
+            ), patch(
+                "tools.vision_tools.vision_analyze_tool",
+                side_effect=_aux_sentinel,
+            ) as mock_aux:
+                result = asyncio.get_event_loop().run_until_complete(
+                    _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                )
+        finally:
+            clear_runtime_main()
+
+        assert result == '{"sentinel": "aux-path"}'
+        mock_aux.assert_awaited_once()
+
     def test_supports_vision_override_bypasses_provider_allowlist(self, tmp_path):
         """supports_vision=true enables the fast path on an unlisted provider."""
         img = tmp_path / "x.png"
