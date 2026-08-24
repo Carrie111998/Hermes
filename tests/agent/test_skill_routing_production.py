@@ -121,12 +121,13 @@ def test_default_adaptive_depth_and_non_default_exact_limits():
 
     assert 1 <= len(exact["skills"]) <= 3
     assert exact["skills"][0]["name"] == "deploy-helper"
-    assert 1 <= len(strong["skills"]) <= 3
+    assert len(strong["skills"]) == 1
     assert strong["skills"][0]["name"] == "deploy-helper"
+    assert all(skill["score"] > 0.0 for skill in strong["skills"])
     assert len(ambiguous["skills"]) == 8
-    assert len(unmatched["skills"]) == 8
+    assert unmatched["skills"] == []
     assert len(rank_skills(candidates, "deploy-helper", limit=4)["skills"]) == 4
-    assert len(rank_skills(candidates[:2], "unmatched", limit=8)["skills"]) == 2
+    assert rank_skills(candidates[:2], "unmatched", limit=8)["skills"] == []
     assert rank_skills([], "unmatched", limit=8)["skills"] == []
 
 
@@ -173,4 +174,4 @@ def test_unicode_normalization_and_input_order_are_deterministic(query):
 
     assert forward == reverse
     assert forward["skills"][0]["name"] == "café"
-    assert len(forward["skills"]) == 2
+    assert len(forward["skills"]) == 1
