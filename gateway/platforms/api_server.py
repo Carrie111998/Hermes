@@ -3161,7 +3161,18 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
+        """GET /health — simple health check.
+
+        Requires the same Bearer as every other route when API_SERVER_KEY is
+        configured (#90315): an unauthenticated 200 made the listener look
+        open while chat was gated, and contradicted the documented
+        key-required contract. Without a configured key the endpoint stays
+        open (plain orchestrator probes keep working) — ``_check_auth``
+        already implements exactly that split.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
         return web.json_response(
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
