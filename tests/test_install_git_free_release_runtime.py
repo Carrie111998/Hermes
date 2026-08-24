@@ -20,10 +20,10 @@ COMMIT = "a" * 40
 INSTALLER_COMMIT = "b" * 40
 
 
-def _release_manifest(path: Path, *, valid: bool = True) -> None:
+def _release_manifest(path: Path, *, valid: bool = True, commit: str = COMMIT) -> None:
     payload = {
         "schema": "hermes-agent-release/v1" if valid else "unexpected/v1",
-        "commit": COMMIT,
+        "commit": commit,
         "final_runtime_git_free": True,
     }
     (path / ".hermes-release.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -103,3 +103,16 @@ def test_bootstrap_marker_prefers_verified_release_commit(tmp_path: Path) -> Non
     assert marker["pinnedCommit"] == COMMIT
     assert marker["pinnedCommit"] != INSTALLER_COMMIT
     assert re.fullmatch(r"[0-9a-f]{40}", marker["pinnedCommit"])
+    assert "Ignoring installer --commit" in result.stdout
+
+
+def test_bootstrap_marker_normalizes_uppercase_release_commit(tmp_path: Path) -> None:
+    install_dir = tmp_path / "hermes-agent"
+    install_dir.mkdir()
+    _release_manifest(install_dir, commit="A" * 40)
+
+    result = _write_marker(install_dir)
+
+    assert result.returncode == 0, result.stderr
+    marker = json.loads((install_dir / ".hermes-bootstrap-complete").read_text(encoding="utf-8"))
+    assert marker["pinnedCommit"] == COMMIT

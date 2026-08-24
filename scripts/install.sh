@@ -1249,7 +1249,27 @@ pinned_git_free_release_commit() {
     local manifest="$INSTALL_DIR/.hermes-release.json"
     [ -f "$manifest" ] || return 1
 
-    python3 - "$manifest" <<'PY'
+    # The repository bootstrap stage runs in a fresh shell, so PYTHON_PATH from
+    # prerequisites is not guaranteed to survive. Prefer Hermes' persisted
+    # uv-managed Python, then fall back to an explicitly available interpreter.
+    local validator_python=""
+    if [ -n "${PYTHON_PATH:-}" ] && [ -x "$PYTHON_PATH" ]; then
+        validator_python="$PYTHON_PATH"
+    elif [ -x "$HERMES_HOME/bin/uv" ]; then
+        validator_python="$("$HERMES_HOME/bin/uv" python find "$PYTHON_VERSION" 2>/dev/null || true)"
+    elif command -v python3 >/dev/null 2>&1; then
+        validator_python="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        validator_python="$(command -v python)"
+    fi
+
+    if [ -z "$validator_python" ] || [ ! -x "$validator_python" ]; then
+        log_error "Cannot validate $manifest: no Python runtime is available."
+        log_info "Run the prerequisites stage first or install Python $PYTHON_VERSION."
+        return 2
+    fi
+
+    "$validator_python" - "$manifest" <<'PY'
 import json
 import re
 import sys
@@ -1269,7 +1289,7 @@ if (
 ):
     raise SystemExit(1)
 
-print(commit)
+print(commit.lower())
 PY
 }
 
@@ -1388,17 +1408,25 @@ EOF
                     log_info "Restore manually with: git stash apply $autostash_ref"
                 fi
             fi
-        elif release_commit="$(pinned_git_free_release_commit)"; then
-            # A reviewed release runtime is immutable by design.  Keep its
-            # source, venv and local patches untouched; subsequent stages may
-            # build the desktop from this exact pinned tree.
-            log_info "Existing pinned git-free release runtime found; preserving commit $release_commit"
-            cd "$INSTALL_DIR"
-            return 0
         else
-            log_error "Directory exists but is not a git repository: $INSTALL_DIR"
-            log_info "Remove it or choose a different directory with --dir"
-            exit 1
+            local release_status=0
+            release_commit="$(pinned_git_free_release_commit)" || release_status=$?
+            if [ "$release_status" -eq 0 ]; then
+                # A reviewed release runtime is immutable by design. Keep its
+                # source, venv and local patches untouched; subsequent stages may
+                # build the desktop from this exact pinned tree.
+                log_info "Existing pinned git-free release runtime found; preserving commit $release_commit"
+                cd "$INSTALL_DIR"
+                return 0
+            elif [ "$release_status" -eq 2 ]; then
+                # Do not mask an unavailable validator as a generic non-Git
+                # directory error; the helper already emitted the actionable fix.
+                exit 1
+            else
+                log_error "Directory exists but is not a git repository: $INSTALL_DIR"
+                log_info "Remove it or choose a different directory with --dir"
+                exit 1
+            fi
         fi
     else
         # Try SSH first (for private repo access), fall back to HTTPS
@@ -2775,7 +2803,19 @@ write_bootstrap_marker() {
     # write one the desktop will reject -- an absent marker is a clean
     # "bootstrap needed", a malformed one is a confusing half-state.
     local pinned_commit=""
-    pinned_commit="$(pinned_git_free_release_commit)" || pinned_commit="$INSTALL_COMMIT"
+    local release_commit=""
+    local release_status=0
+    release_commit="$(pinned_git_free_release_commit)" || release_status=$?
+    if [ "$release_status" -eq 0 ]; then
+        pinned_commit="$release_commit"
+        if [ -n "$INSTALL_COMMIT" ]; then
+            log_warn "Ignoring installer --commit $INSTALL_COMMIT; git-free release manifest pins $pinned_commit."
+        fi
+    elif [ "$release_status" -eq 2 ]; then
+        return 1
+    else
+        pinned_commit="$INSTALL_COMMIT"
+    fi
     if [ -z "$pinned_commit" ]; then
         pinned_commit=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null) || pinned_commit=""
     fi

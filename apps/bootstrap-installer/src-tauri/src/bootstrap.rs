@@ -275,7 +275,7 @@ fn pinned_git_free_release_commit(install_root: &Path) -> Option<String> {
         && manifest.get("final_runtime_git_free")?.as_bool() == Some(true)
         && valid_commit
     {
-        Some(commit.to_string())
+        Some(commit.to_ascii_lowercase())
     } else {
         None
     }
@@ -1135,7 +1135,8 @@ mod tests {
     #[test]
     fn bootstrap_marker_prefers_verified_git_free_release_provenance() {
         let root = unique_tmp_dir("git-free-release-marker");
-        let release_commit = "a".repeat(40);
+        let release_commit = "A".repeat(40);
+        let canonical_release_commit = "a".repeat(40);
         std::fs::write(
             root.join(".hermes-release.json"),
             format!(
@@ -1150,7 +1151,7 @@ mod tests {
 
         let marker = write_bootstrap_complete_marker(&root, &pin).unwrap();
 
-        assert_eq!(marker["pinnedCommit"], release_commit);
+        assert_eq!(marker["pinnedCommit"], canonical_release_commit);
         let _ = std::fs::remove_dir_all(&root);
     }
 
