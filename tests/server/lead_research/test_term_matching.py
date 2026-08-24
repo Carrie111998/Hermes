@@ -234,7 +234,7 @@ def _campaign_harness(tmp_path, sector_ids):
         buyer_types=["distributor"], enabled_source_ids=[definition.source_id],
     )
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         ("camp_1", "cmp_1", config.name, "draft", 1,
          json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )

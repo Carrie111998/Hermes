@@ -19,6 +19,25 @@ def make_research_client():
     provider = deterministic_provider(definition)
     registry = ProviderRegistry([definition], {definition.source_id: provider})
     app.state.lead_research = LeadResearchService(app.state.db, registry=registry)
+    confirmed = client.put(
+        "/api/v1/company/research-profile",
+        headers=headers,
+        json={
+            "identity": {"name": "Acme", "website": "https://acme.test"},
+            "seller_countries": ["TR"],
+            "products": [{
+                "id": "prd_fixture_appliance",
+                "name": "Ev aleti",
+                "english_name": "Household appliance",
+                "hs_codes": ["8516"],
+                "sector_ids": ["household-appliances"],
+                "emphasis": 1,
+            }],
+            "market_preferences": {"target_countries": ["DE", "AT"], "languages": ["de", "en"]},
+            "playbook_versions": {"household-appliances": "1"},
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
     candidates = [
         {
             "source_record_id": f"buyer-{country.lower()}-{index}",

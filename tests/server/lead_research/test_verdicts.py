@@ -214,7 +214,7 @@ def _run_campaign(tmp_path, verifier_type):
         enabled_source_ids=[definition.source_id],
     )
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (campaign_id, company_id, config.name, "draft", 1, json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )
     CandidateRepository(db).import_file(
@@ -336,7 +336,7 @@ def test_a_rerun_with_a_domainless_verifier_does_not_duplicate_the_identity(tmp_
         enabled_source_ids=[definition.source_id],
     )
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (campaign_id, company_id, config.name, "draft", 1,
          json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )

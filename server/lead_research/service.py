@@ -12,7 +12,8 @@ from .candidates import CandidateRecord, CandidateRepository
 from .enrichment import FeaturePlanner, satisfied_playbook_fields
 from .identity import IdentityResolver
 from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
-from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchResultData
+from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchReadiness, ResearchResultData
+from .profiles import ProfileRepository
 from .qualification import EligibilityService
 from .registry import ProviderRegistry, build_registry
 from .scoring import attainable_dimensions, score_lead
@@ -74,6 +75,60 @@ class LeadResearchService:
 
     def ensure_catalog(self, company_id: str) -> None:
         self.registry.ensure_tenant(self.db, company_id, now())
+
+    def validate_readiness(self, company_id: str, config: CampaignConfig) -> ResearchReadiness:
+        """Name every unmet precondition instead of failing one field at a time."""
+        missing: list[str] = []
+        profile = ProfileRepository(self.db).current(company_id)
+        if profile is None:
+            missing.append("confirmed_profile")
+        else:
+            identity = profile.profile.identity
+            if not (
+                identity.get("official_domain")
+                or identity.get("website")
+                or identity.get("admin_identity_exception") == "true"
+            ):
+                missing.append("identity_or_admin_exception")
+            if not (config.seller_countries or profile.profile.seller_countries):
+                missing.append("seller_country")
+            if not (
+                config.product_terms
+                or config.product_ids
+                or config.sector_ids
+                or config.hs_codes
+                or profile.profile.products
+            ):
+                missing.append("product_scope")
+        if not config.target_countries:
+            missing.append("target_market")
+        self.ensure_catalog(company_id)
+        available = {
+            source["source_id"] for source in self.catalog(company_id) if source.get("available")
+        }
+        if not available.intersection(config.enabled_source_ids):
+            missing.append("runnable_candidate_source")
+        return ResearchReadiness(ready=not missing, missing=missing)
+
+    def discovery_query(self, campaign_id: str, company_id: str) -> DiscoveryQuery:
+        row = self.db.one(
+            "SELECT config,scope_snapshot FROM research_campaigns WHERE id=? AND company_id=?",
+            (campaign_id, company_id),
+        )
+        if not row:
+            raise KeyError("campaign not found")
+        config = CampaignConfig.model_validate(json_load(row["config"], {}))
+        snapshot = json_load(row["scope_snapshot"], {})
+        return DiscoveryQuery(
+            campaign_id=campaign_id,
+            seller_countries=snapshot.get("seller_countries", config.seller_countries),
+            target_countries=snapshot.get("target_countries", config.target_countries),
+            sector_ids=snapshot.get("sector_ids", config.sector_ids),
+            hs_codes=snapshot.get("hs_codes", config.hs_codes),
+            product_terms=snapshot.get("product_terms", self._product_terms(company_id, config)),
+            buyer_types=snapshot.get("buyer_types", config.buyer_types),
+            max_records=config.max_qualified_leads_per_country * 3,
+        )
 
     def start(self, company_id: str, campaign_id: str) -> dict:
         """Queue a campaign and return without waiting for it.
@@ -264,6 +319,10 @@ class LeadResearchService:
         return estimate.model_copy(update={
             "corpus_candidates": len(selected),
             "unmatched_terms": sorted(term for term, count in matches.items() if not count),
+            "indexed_candidates": len(selected),
+            "discoverable_candidates": estimate.named_candidate_range,
+            "unavailable_sources": estimate.unavailable_source_ids,
+            "unmapped_market_terms": sorted(term for term, count in matches.items() if not count),
         })
 
     def _lead_ids_by_organization(self, company_id: str) -> dict[str, str]:
@@ -565,6 +624,7 @@ class LeadResearchService:
             target_countries=config.target_countries,
             sector_ids=config.sector_ids,
             hs_codes=config.hs_codes,
+            product_terms=config.product_terms,
             buyer_types=config.buyer_types,
         ))
         cutoffs = {}
@@ -846,7 +906,7 @@ class LeadResearchService:
         return extra, still_missing, spent
 
     def _product_terms(self, company_id: str, config: CampaignConfig) -> list[str]:
-        terms = [*config.sector_ids, *config.hs_codes]
+        terms = [*config.product_terms, *config.sector_ids, *config.hs_codes]
         if config.product_ids:
             rows = self.db.all(
                 "SELECT name FROM products WHERE company_id=? AND id IN ({})".format(
@@ -1150,6 +1210,7 @@ class LeadResearchService:
                     target_countries=[country],
                     sector_ids=config.sector_ids,
                     hs_codes=config.hs_codes,
+                    product_terms=product_terms,
                     buyer_types=config.buyer_types,
                     max_records=config.max_qualified_leads_per_country * 3,
                 )

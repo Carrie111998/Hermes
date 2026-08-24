@@ -23,7 +23,7 @@ export async function mount(root, ctx) {
     const term = query.trim().toLowerCase();
     const rows = campaigns.filter(campaign => {
       const config = campaign.config || {};
-      const haystack = [campaign.name, ...(config.target_countries || []), ...(config.sector_ids || []), ...(config.product_ids || [])]
+      const haystack = [campaign.name, ...(config.target_countries || []), ...(config.sector_ids || []), ...(config.product_ids || []), ...(config.product_terms || [])]
         .join(' ').toLowerCase();
       return (status === 'all' || campaign.status === status) && (!term || haystack.includes(term));
     });

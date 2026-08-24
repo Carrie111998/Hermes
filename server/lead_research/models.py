@@ -127,6 +127,7 @@ class DiscoveryQuery(ApiModel):
     target_countries: list[str]
     sector_ids: list[str] = Field(default_factory=list)
     hs_codes: list[str] = Field(default_factory=list)
+    product_terms: list[str] = Field(default_factory=list)
     buyer_types: list[str] = Field(default_factory=list)
     max_records: int = Field(default=100, ge=1, le=10_000)
 
@@ -390,6 +391,7 @@ class CampaignConfig(ApiModel):
     sector_ids: list[str] = Field(default_factory=list)
     hs_codes: list[str] = Field(default_factory=list)
     product_ids: list[str] = Field(default_factory=list)
+    product_terms: list[str] = Field(default_factory=list)
     buyer_types: list[str] = Field(default_factory=lambda: ["importer", "distributor"])
     enabled_source_ids: list[str] = Field(min_length=1)
     precision_profile: Literal["high_precision", "balanced", "exploratory"] = "high_precision"
@@ -422,11 +424,29 @@ class CampaignConfig(ApiModel):
             raise ValueError("countries must use ISO alpha-2 codes")
         return normalized
 
+    @field_validator("product_terms")
+    @classmethod
+    def normalize_product_terms(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            term = " ".join(str(item).split())
+            key = term.casefold()
+            if term and key not in seen:
+                normalized.append(term)
+                seen.add(key)
+        return normalized
+
     @model_validator(mode="after")
     def scope_is_specific(self):
-        if not (self.sector_ids or self.hs_codes or self.product_ids):
-            raise ValueError("at least one sector, HS code, or product is required")
+        if not (self.sector_ids or self.hs_codes or self.product_ids or self.product_terms):
+            raise ValueError("select a sector, HS code, company product, or enter a product name")
         return self
+
+
+class ResearchReadiness(ApiModel):
+    ready: bool
+    missing: list[str] = Field(default_factory=list)
 
 
 class LeadScore(ApiModel):
@@ -464,3 +484,7 @@ class CampaignEstimate(ApiModel):
     # computed, rather than zero.
     corpus_candidates: int | None = None
     unmatched_terms: list[str] = Field(default_factory=list)
+    indexed_candidates: int | None = None
+    discoverable_candidates: list[int] | None = None
+    unavailable_sources: list[str] = Field(default_factory=list)
+    unmapped_market_terms: list[str] = Field(default_factory=list)

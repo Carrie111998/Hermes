@@ -8,6 +8,7 @@ export const DEFAULT_RESEARCH_CONFIG = {
   sector_ids: [],
   hs_codes: [],
   product_ids: [],
+  product_terms: [],
   buyer_types: ['importer', 'distributor'],
   enabled_source_ids: [],
   precision_profile: 'high_precision',

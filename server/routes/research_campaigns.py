@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from ..auth import Principal, company_scope, current_principal, require_admin
 from ..db import json_dump, json_load, new_id, now
 from ..lead_research.models import CampaignConfig
+from ..lead_research.profiles import ProfileRepository
 from ..lead_research.sectors import load_sectors
 from ..lead_research.service import CampaignAlreadyRunning
 from ..lead_research.storage import EvidenceRepository
@@ -37,8 +38,79 @@ def _serialize(row) -> dict:
         "id": row["id"], "company_id": row["company_id"], "name": row["name"],
         "status": row["status"], "version": row["version"], "config": json_load(row["config"], {}),
         "estimate": json_load(row["estimate"], None), "run_id": row["run_id"],
+        "profile_version_id": row["profile_version_id"],
+        "scope_snapshot": json_load(row["scope_snapshot"], {}),
+        "created_by": row["created_by"], "updated_by": row["updated_by"],
         "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
+
+
+def _campaign_contract(request: Request, company_id: str, raw: dict, profile_id: str | None = None):
+    profiles = ProfileRepository(request.app.state.db)
+    profile = profiles.get(company_id, profile_id) if profile_id else profiles.current(company_id)
+    if profile is None:
+        raise HTTPException(409, detail={"message": "Confirm the company research profile first", "missing": ["confirmed_profile"]})
+    values = dict(raw)
+    values.setdefault("seller_countries", profile.profile.seller_countries)
+    try:
+        config = CampaignConfig.model_validate(values)
+    except Exception as exc:
+        raise HTTPException(422, detail={"path": "config", "message": str(exc)}) from exc
+    product_by_id = {str(product.get("id")): product for product in profile.profile.products}
+    missing_products = [product_id for product_id in config.product_ids if product_id not in product_by_id]
+    if missing_products:
+        raise HTTPException(422, detail={
+            "path": "product_ids",
+            "message": f"Products are not present in profile {profile.id}: {', '.join(missing_products)}",
+        })
+    resolved = [
+        str(product_by_id[product_id].get("english_name") or product_by_id[product_id].get("name")).strip()
+        for product_id in config.product_ids
+    ]
+    merged_terms: list[str] = []
+    seen: set[str] = set()
+    for term in [*config.product_terms, *resolved]:
+        key = term.casefold()
+        if term and key not in seen:
+            merged_terms.append(term)
+            seen.add(key)
+    config = config.model_copy(update={"product_terms": merged_terms})
+    snapshot = {
+        "profile_version_id": profile.id,
+        "seller_countries": list(config.seller_countries),
+        "target_countries": list(config.target_countries),
+        "sector_ids": list(config.sector_ids),
+        "hs_codes": list(config.hs_codes),
+        "product_ids": list(config.product_ids),
+        "product_terms": list(config.product_terms),
+        "buyer_types": list(config.buyer_types),
+    }
+    return profile, config, snapshot
+
+
+def _insert_campaign(request: Request, company_id: str, actor_id: str, raw: dict,
+                     profile_id: str | None = None):
+    profile, config, snapshot = _campaign_contract(request, company_id, raw, profile_id)
+    request.app.state.lead_research.ensure_catalog(company_id)
+    unknown = sorted(set(config.enabled_source_ids) - set(request.app.state.lead_research.registry.definitions))
+    if unknown:
+        raise HTTPException(422, detail={"path": "enabled_source_ids", "message": f"Unknown sources: {', '.join(unknown)}"})
+    readiness = request.app.state.lead_research.validate_readiness(company_id, config)
+    if not readiness.ready:
+        raise HTTPException(409, detail={"message": "Research campaign is not ready", "missing": readiness.missing})
+    campaign_id, stamp = new_id("rc"), now()
+    request.app.state.db.execute(
+        "INSERT INTO research_campaigns("
+        "id,company_id,name,status,version,config,estimate,run_id,profile_version_id,"
+        "scope_snapshot,created_by,updated_by,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            campaign_id, company_id, config.name, "draft", 1,
+            json_dump(config.model_dump(mode="json")), None, None, profile.id,
+            json_dump(snapshot), actor_id, actor_id, stamp, stamp,
+        ),
+    )
+    return _serialize(_row(request, company_id, campaign_id))
 
 
 def _with_source_availability(campaign: dict, catalog: list[dict]) -> dict:
@@ -147,22 +219,7 @@ def create_campaign(body: dict[str, Any], request: Request,
                     principal: Principal = Depends(current_principal),
                     x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
-    raw = body.get("config", body)
-    try:
-        config = CampaignConfig.model_validate(raw)
-    except Exception as exc:
-        raise HTTPException(422, detail={"path": "config", "message": str(exc)}) from exc
-    request.app.state.lead_research.ensure_catalog(company_id)
-    unknown = sorted(set(config.enabled_source_ids) - set(request.app.state.lead_research.registry.definitions))
-    if unknown:
-        raise HTTPException(422, detail={"path": "enabled_source_ids", "message": f"Unknown sources: {', '.join(unknown)}"})
-    campaign_id, stamp = new_id("rc"), now()
-    request.app.state.db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (campaign_id, company_id, config.name, "draft", 1, json_dump(config.model_dump(mode="json")),
-         None, None, stamp, stamp),
-    )
-    return _serialize(_row(request, company_id, campaign_id))
+    return _insert_campaign(request, company_id, principal.id, body.get("config", body))
 
 
 @router.get("/research-campaigns/{campaign_id}")
@@ -186,15 +243,16 @@ def patch_campaign(campaign_id: str, body: CampaignPatch, request: Request,
         raise HTTPException(409, detail={"message": "Campaign changed on the server", "current": _serialize(current)})
     if current["status"] not in {"draft", "failed", "cancelled"}:
         raise HTTPException(409, "Only draft, failed, or cancelled campaigns can be edited")
-    try:
-        config = CampaignConfig.model_validate(body.config)
-    except Exception as exc:
-        raise HTTPException(422, detail={"path": "config", "message": str(exc)}) from exc
+    _, config, snapshot = _campaign_contract(
+        request, company_id, body.config, current["profile_version_id"],
+    )
     self_version = current["version"] + 1
     request.app.state.db.execute(
-        "UPDATE research_campaigns SET name=?,config=?,version=?,estimate=NULL,updated_at=? "
+        "UPDATE research_campaigns SET name=?,config=?,scope_snapshot=?,version=?,"
+        "estimate=NULL,updated_by=?,updated_at=? "
         "WHERE id=? AND company_id=?",
-        (config.name, json_dump(config.model_dump(mode="json")), self_version, now(), campaign_id, company_id),
+        (config.name, json_dump(config.model_dump(mode="json")), json_dump(snapshot),
+         self_version, principal.id, now(), campaign_id, company_id),
     )
     return get_campaign(campaign_id, request, principal, x_company_id)
 
@@ -224,6 +282,10 @@ def start_campaign(campaign_id: str, request: Request,
     row = _row(request, company_id, campaign_id)
     if row["status"] not in {"draft", "failed", "cancelled", "partial", "completed", "succeeded"}:
         raise HTTPException(409, "Campaign cannot start from its current state")
+    config = CampaignConfig.model_validate(json_load(row["config"], {}))
+    readiness = request.app.state.lead_research.validate_readiness(company_id, config)
+    if not readiness.ready:
+        raise HTTPException(409, detail={"message": "Research campaign is not ready", "missing": readiness.missing})
     # Queued, not run: a campaign is hundreds of blocking HTTP fetches, so
     # running it here held the request open for the whole campaign and any proxy
     # timeout killed it mid-run, leaving the campaign `running` forever. Poll
@@ -260,7 +322,9 @@ def clone_campaign(campaign_id: str, request: Request,
                    x_company_id: str | None = Header(default=None)):
     original = get_campaign(campaign_id, request, principal, x_company_id)
     config = {**original["config"], "name": f"{original['name']} copy"}
-    return create_campaign(config, request, principal, x_company_id)
+    return _insert_campaign(
+        request, original["company_id"], principal.id, config, original["profile_version_id"],
+    )
 
 
 @router.delete("/research-campaigns/{campaign_id}", status_code=204)

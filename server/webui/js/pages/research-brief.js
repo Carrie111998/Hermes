@@ -20,6 +20,27 @@ const itemsOf = value => (Array.isArray(value) ? value : value?.items || []);
 // watches. The API's own ceiling is 25.
 const MAX_MARKETS = 10;
 
+export function readResearchBrief({
+  productTerms = [], sectorIds = [], hsCodes = [], productIds = [],
+} = {}) {
+  const normalized = [];
+  const seen = new Set();
+  for (const value of productTerms) {
+    const term = String(value || '').trim().replace(/\s+/g, ' ');
+    const key = term.toLocaleLowerCase();
+    if (term && !seen.has(key)) {
+      seen.add(key);
+      normalized.push(term);
+    }
+  }
+  return {
+    product_terms: normalized,
+    sector_ids: sectorIds.filter(Boolean),
+    hs_codes: hsCodes.filter(Boolean),
+    product_ids: productIds.filter(Boolean),
+  };
+}
+
 function defaultWeights() {
   return {
     product_sector_fit: 25,
@@ -41,12 +62,30 @@ function sourceSummary(sources) {
         'No research source is connected yet. An administrator has to enable one before a search can find anything.'),
     };
   }
-  return {
+  const selected = new Set(ready.map(source => source.source_id));
+  const summary = {
     ok: true,
-    ids: ready.map(source => source.source_id),
-    node: el('p', { class: 'ifz-hint' },
-      `Searching ${ready.map(source => source.display_name).join(', ')}.`),
+    ids: [...selected],
+    canDiscover: ready.some(source =>
+      source.capabilities?.includes('candidate_discovery')
+      || source.source_id !== 'customer-list-corpus'),
+    node: null,
   };
+  summary.node = el('fieldset', { class: 'ifz-research-source-brief' },
+    el('legend', {}, 'Sources'),
+    el('p', { class: 'ifz-hint' },
+      'Choose among sources your administrator has already made runnable.'),
+    ready.map(source => {
+      const control = el('input', { type: 'checkbox', checked: true });
+      control.addEventListener('change', () => {
+        if (control.checked) selected.add(source.source_id);
+        else selected.delete(source.source_id);
+        summary.ids = [...selected];
+        summary.ok = summary.ids.length > 0;
+      });
+      return el('label', { class: 'ifz-row' }, control, el('span', {}, source.display_name));
+    }));
+  return summary;
 }
 
 export async function mount(root, ctx) {
@@ -69,16 +108,28 @@ export async function mount(root, ctx) {
     markets: countryCodes.slice(0, MAX_MARKETS),
     weights: defaultWeights(),
     research_each_lead: true,
+    product_terms: [],
   };
 
   const nameInput = el('input', { type: 'text', placeholder: 'Nordic distributors, Q3' });
   nameInput.addEventListener('input', () => { brief.name = nameInput.value; });
 
   const sectorSelect = select(
-    sectorList.map(sector => ({ value: sector.sector_id, label: sector.name })),
+    [
+      { value: '', label: 'No sector selected' },
+      ...sectorList.map(sector => ({ value: sector.sector_id, label: sector.name })),
+    ],
     { value: brief.sector_id },
   );
   sectorSelect.addEventListener('change', () => { brief.sector_id = sectorSelect.value; });
+
+  const productTerms = el('input', {
+    type: 'text',
+    placeholder: 'industrial valve, food packaging machine',
+  });
+  productTerms.addEventListener('input', () => {
+    brief.product_terms = productTerms.value.split(/[,\n]/).map(value => value.trim()).filter(Boolean);
+  });
 
   const marketChips = chipSelect(
     countryCodes.map(code => ({ value: code, label: countryName(code) || code })),
@@ -98,10 +149,16 @@ export async function mount(root, ctx) {
   async function submit() {
     if (!sources.ok) return;
     if (!brief.markets.length) return toast('Choose at least one market.', 'error');
-    if (!brief.sector_id) return toast('Choose a sector.', 'error');
+    if (!brief.sector_id && !brief.product_terms.length) {
+      return toast('Choose a sector or enter a product name.', 'error');
+    }
     if (weightTotal(brief.weights) !== 100) return toast('Weights must total exactly 100.', 'error');
 
     const sector = sectorList.find(item => item.sector_id === brief.sector_id);
+    const scope = readResearchBrief({
+      productTerms: brief.product_terms,
+      sectorIds: brief.sector_id ? [brief.sector_id] : [],
+    });
     setBusy(run, true, 'Searching…');
     try {
       const campaign = await call('researchCampaigns.create', {
@@ -110,11 +167,13 @@ export async function mount(root, ctx) {
             name: brief.name.trim() || `${sector?.name || 'Lead'} search`,
             seller_countries: configuration.default_seller_countries || ['TR'],
             target_countries: brief.markets,
-            sector_ids: [brief.sector_id],
+            ...scope,
             // Buyer roles come from the sector rather than a free-text box:
             // eligibility intersects this list with what evidence actually
             // says, so a term nobody publishes silently rejects everyone.
-            buyer_types: sector?.buyer_types?.length ? sector.buyer_types : undefined,
+            buyer_types: sector?.buyer_types?.length
+              ? sector.buyer_types
+              : ['importer', 'distributor'],
             enabled_source_ids: sources.ids,
             scoring: { weights: brief.weights },
             enrichment: { research_each_lead: brief.research_each_lead },
@@ -125,7 +184,7 @@ export async function mount(root, ctx) {
       // matches none of them cannot produce a lead however long it runs. Saying
       // so here costs one call and saves a search that was already decided.
       const estimate = await call('researchCampaigns.estimate', { params: { campaignId: campaign.id } });
-      if (estimate?.corpus_candidates === 0) {
+      if (estimate?.corpus_candidates === 0 && !sources.canDiscover) {
         toast(
           `No companies in ${brief.markets.join(', ')} match ${sector?.name || 'this sector'}. `
           + 'Nothing was searched. Try another market or sector.',
@@ -160,6 +219,9 @@ export async function mount(root, ctx) {
         body: el('div', { class: 'ifz-form-grid' },
           field('Name this search', nameInput, { hint: 'Optional. Helps you find it again.' }),
           field('Sector', sectorSelect, { hint: 'Decides the buyer roles and the evidence worth chasing.', required: true }),
+          field('Product names', productTerms, {
+            hint: 'Plain names are accepted. Separate several products with commas.',
+          }),
           field('Markets', marketChips.children.length
             ? marketChips
             : emptyState({

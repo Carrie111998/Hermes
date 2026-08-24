@@ -19,13 +19,15 @@ function sentenceList(items) { return items?.length ? items.join(', ') : 'None s
 
 export async function mount(root, ctx) {
   const campaignId = ctx.params.campaignId;
-  const [campaign, configuration, sectorsRes, sourcesRes, modelsRes] = await Promise.all([
+  const [campaign, configuration, sectorsRes, sourcesRes, modelsRes, researchProfile] = await Promise.all([
     campaignId ? call('researchCampaigns.get', { params: { campaignId } }) : Promise.resolve(null),
     call('research.configuration'), call('research.sectors'), call('dataSources.catalog'), call('research.modelProfiles'),
+    call('company.getResearchProfile').catch(() => null),
   ]);
   const sectors = unwrap(sectorsRes);
   const sources = unwrap(sourcesRes);
   const modelProfiles = unwrap(modelsRes);
+  const companyProducts = researchProfile?.profile?.products || [];
   const state = createResearchState({ campaign });
   if (!campaign) {
     const prefilled = (ctx.query.countries || '').split(',').map(value => value.trim().toUpperCase()).filter(Boolean);
@@ -33,6 +35,7 @@ export async function mount(root, ctx) {
     state.updateConfig({
       target_countries: prefilled,
       enabled_source_ids: available.slice(0, 1),
+      seller_countries: researchProfile?.profile?.seller_countries || ['TR'],
     });
   }
   let active = 0;
@@ -51,8 +54,8 @@ export async function mount(root, ctx) {
       if (cfg.name.trim().length < 3) errors.push(['name', 'Campaign name must contain at least 3 characters.']);
       if (!cfg.seller_countries.length) errors.push(['seller', 'Select at least one seller country.']);
       if (!cfg.target_countries.length) errors.push(['targets', 'Select at least one target country.']);
-      if (!(cfg.sector_ids.length || cfg.hs_codes.length || cfg.product_ids.length)) {
-        errors.push(['sectors', 'Select a sector, HS code, or tenant product.']);
+      if (!(cfg.sector_ids.length || cfg.hs_codes.length || cfg.product_ids.length || cfg.product_terms.length)) {
+        errors.push(['sectors', 'Select a sector, HS code, company product, or enter a product name.']);
       }
       if (!cfg.buyer_types.length) errors.push(['buyers', 'Select at least one plausible buyer type.']);
     }
@@ -100,6 +103,21 @@ export async function mount(root, ctx) {
     max.addEventListener('input', () => update({ max_qualified_leads_per_country: Number(max.value) }));
     const hs = input({ value: cfg.hs_codes.join(', '), placeholder: '8418, 8516' });
     hs.addEventListener('change', () => update({ hs_codes: hs.value.split(',').map(value => value.trim()).filter(Boolean) }));
+    const productPicker = chipSelect(
+      companyProducts.map(product => ({
+        value: product.id,
+        label: product.english_name || product.name,
+      })),
+      cfg.product_ids,
+      { onChange: value => update({ product_ids: value }) },
+    );
+    const productTerms = input({
+      value: cfg.product_terms.join(', '),
+      placeholder: 'industrial valve, packaging machine',
+    });
+    productTerms.addEventListener('change', () => update({
+      product_terms: productTerms.value.split(',').map(value => value.trim()).filter(Boolean),
+    }));
     return el('div', { class: 'ifz-research-stack' },
       el('div', { class: 'ifz-research-step-intro' },
         el('span', { class: 'ifz-research-step-no' }, '01'),
@@ -112,6 +130,8 @@ export async function mount(root, ctx) {
         el('div', { class: 'ifz-row' }, button('Select on map', { kind: 'ghost', icon: 'map', onClick: () => ctx.navigate('/app/buyers?map=1') })),
         field('Sectors', sectorPicker, { hint: 'Canonical taxonomy controls classification coverage and applicable features.' }),
         field('HS codes', hs, { hint: 'Optional narrowing; interpreted against HS 2022.' }),
+        field('Company products', productPicker, { hint: 'Resolved from the confirmed company research profile.' }),
+        field('Plain product names', productTerms, { hint: 'Useful when a formal sector or HS code is not known.' }),
         field('Buyer types', buyers, { required: true }),
         field('Precision profile', precision),
         field('Maximum qualified leads per target country', max, { hint: 'A hard ceiling, not a forecast.' })) }),
@@ -221,6 +241,7 @@ export async function mount(root, ctx) {
           el('dt', {}, 'Seller'), el('dd', {}, sentenceList(cfg.seller_countries)),
           el('dt', {}, 'Targets'), el('dd', {}, sentenceList(cfg.target_countries)),
           el('dt', {}, 'Sectors'), el('dd', {}, sentenceList(cfg.sector_ids)),
+          el('dt', {}, 'Products'), el('dd', {}, sentenceList(cfg.product_terms)),
           el('dt', {}, 'Buyer types'), el('dd', {}, sentenceList(cfg.buyer_types)),
           el('dt', {}, 'Ceiling'), el('dd', {}, `Up to ${cfg.max_qualified_leads_per_country} qualified leads per country`)) }),
         card({ title: 'Evidence & scoring', body: el('dl', { class: 'ifz-review-list' },

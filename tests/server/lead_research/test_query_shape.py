@@ -134,7 +134,7 @@ def _run(db, *, campaign_id="camp_1", verify_workers=1, reuse=False):
     )
     stamp = now()
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (campaign_id, "cmp_1", config.name, "draft", 1,
          json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )
@@ -194,7 +194,7 @@ def test_two_candidates_resolving_to_one_company_still_share_a_lead(harness):
     )
     stamp = now()
     harness.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         ("camp_1", "cmp_1", config.name, "draft", 1,
          json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )

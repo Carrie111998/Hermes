@@ -20,6 +20,19 @@ const SECTORS = [{
   buyer_types: ['importer', 'distributor', 'retailer', 'brand', 'wholesaler'],
 }];
 
+test('brief accepts a product name without sector or HS selection', async () => {
+  const { readResearchBrief } = await import('../../../server/webui/js/pages/research-brief.js');
+  const brief = readResearchBrief({
+    productTerms: [' industrial valve ', 'Industrial Valve'],
+    sectorIds: [],
+    hsCodes: [],
+    productIds: [],
+  });
+
+  assert.deepEqual(brief.product_terms, ['industrial valve']);
+  assert.deepEqual(brief.sector_ids, []);
+});
+
 function baseResponses(overrides = {}) {
   return {
     '/api/v1/data-sources/catalog': [
@@ -70,11 +83,13 @@ test('the brief runs against sources the tenant already has, and says which', as
   assert.doesNotMatch(text, /Customer list corpus/);
 });
 
-// Source access is admin-owned. A customer choosing providers would be
-// choosing something they cannot install, enable, or pay for.
-test('the customer is never asked to pick sources', async () => {
+// Source access is admin-owned, but a customer can choose which already-runnable
+// sources this campaign should spend time against.
+test('the customer can select runnable sources but cannot configure unavailable ones', async () => {
   const root = await mountBrief(baseResponses());
-  assert.equal(byText(root, 'label, .ifz-label', 'Sources'), null);
+  assert.ok(byText(root, 'legend', 'Sources'));
+  assert.match(root.textContent, /Tenders European|Tenders Electronic Daily/);
+  assert.doesNotMatch(root.textContent, /Customer list corpus/);
   assert.doesNotMatch(root.textContent, /Install|Enable|Uninstall/);
 });
 
@@ -130,7 +145,7 @@ test('no markets means Setup, not an empty search', async () => {
 // none of them cannot produce a lead however long it runs. It used to run
 // anyway, succeed, and show an empty list — indistinguishable from a market
 // with no buyers in it.
-test('a brief that matches no candidate is not started', async () => {
+test('a public discovery source still runs when the local index has no candidate', async () => {
   const posts = [];
   const navigated = [];
   const root = await mountBrief(baseResponses(), {
@@ -146,8 +161,8 @@ test('a brief that matches no candidate is not started', async () => {
   await nextTurn();
 
   assert.ok(posts.some(entry => entry.url.endsWith('/estimate')), 'the brief must check first');
-  assert.equal(posts.some(entry => entry.url.endsWith('/start')), false, 'nothing may be searched');
-  assert.deepEqual(navigated, [], 'the customer stays on the brief to change it');
+  assert.equal(posts.some(entry => entry.url.endsWith('/start')), true, 'public discovery must still run');
+  assert.deepEqual(navigated, ['/app/research']);
 });
 
 test('a brief that matches candidates still starts', async () => {

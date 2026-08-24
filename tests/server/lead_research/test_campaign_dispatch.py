@@ -21,6 +21,58 @@ from tests.server.lead_research.fakes import deterministic_provider, fixture_def
 from tests.server.lead_research.test_vertical_slice import campaign_body, make_research_client
 
 
+def _research_profile(seller_countries=None):
+    return {
+        "identity": {"name": "Acme", "website": "https://acme.test"},
+        "seller_countries": seller_countries or ["TR"],
+        "products": [{
+            "id": "prd_valve",
+            "name": "Vana",
+            "english_name": "Valve",
+            "hs_codes": ["8481"],
+            "sector_ids": ["industrial-machinery"],
+            "emphasis": 1,
+        }],
+        "market_preferences": {"target_countries": ["DE"], "languages": ["de", "en"]},
+        "playbook_versions": {"industrial-machinery": "1"},
+    }
+
+
+def test_campaign_freezes_profile_and_plain_product_terms():
+    app, client, headers, company_id = make_research_client()
+    profile = client.put(
+        "/api/v1/company/research-profile", headers=headers, json=_research_profile(),
+    ).json()
+
+    created = client.post(
+        "/api/v1/research-campaigns",
+        headers=headers,
+        json={
+            "config": {
+                "name": "German valve distributors",
+                "target_countries": ["DE"],
+                "product_terms": ["industrial valve"],
+                "product_ids": ["prd_valve"],
+                "buyer_types": ["distributor"],
+                "enabled_source_ids": ["fixture-directory"],
+            }
+        },
+    )
+
+    assert created.status_code == 201, created.text
+    campaign = created.json()
+    assert campaign["profile_version_id"] == profile["id"]
+    assert campaign["scope_snapshot"]["product_terms"] == ["industrial valve", "Valve"]
+
+    client.put(
+        "/api/v1/company/research-profile",
+        headers=headers,
+        json=_research_profile(["TR", "DE"]),
+    )
+    query = app.state.lead_research.discovery_query(campaign["id"], company_id)
+    assert query.product_terms == ["industrial valve", "Valve"]
+
+
 class BlockingVerifier:
     """Holds inside the first candidate until the test releases it."""
 

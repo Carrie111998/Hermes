@@ -315,7 +315,7 @@ def test_a_company_with_no_website_can_now_be_a_strong_fit_end_to_end(tmp_path):
         enabled_source_ids=[notice.source_id, web.source_id],
     )
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (campaign_id, company_id, config.name, "draft", 1,
          json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )

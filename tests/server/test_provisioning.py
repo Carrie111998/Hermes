@@ -101,7 +101,7 @@ def test_provisioning_refuses_to_delete_a_preexisting_research_result(db):
     stamp = now()
     campaign_id = "campaign_existing"
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (campaign_id, result["company_id"], "Existing campaign", "succeeded", 1, "{}", None, None, stamp, stamp),
     )
     db.execute(

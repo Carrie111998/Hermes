@@ -125,7 +125,7 @@ def _campaign(db, campaign_id, definition, **config_overrides) -> CampaignConfig
     })
     stamp = now()
     db.execute(
-        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO research_campaigns(id,company_id,name,status,version,config,estimate,run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (campaign_id, "cmp_1", config.name, "draft", 1,
          json_dump(config.model_dump(mode="json")), None, None, stamp, stamp),
     )

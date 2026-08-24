@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS research_campaigns (
     status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1,
     config TEXT NOT NULL, estimate TEXT, run_id TEXT,
     profile_version_id TEXT REFERENCES company_profile_versions(id),
+    scope_snapshot TEXT,
     created_by TEXT REFERENCES users(id), updated_by TEXT REFERENCES users(id),
     created_at REAL NOT NULL, updated_at REAL NOT NULL
 );

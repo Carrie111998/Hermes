@@ -26,6 +26,7 @@ create index if not exists ix_company_profile_versions_current
 
 alter table research_campaigns
   add column if not exists profile_version_id text references company_profile_versions(id),
+  add column if not exists scope_snapshot text,
   add column if not exists created_by text references users(id),
   add column if not exists updated_by text references users(id);
 

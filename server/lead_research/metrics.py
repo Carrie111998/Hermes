@@ -16,7 +16,8 @@ def estimate_campaign(config: CampaignConfig, providers, history=None) -> Campai
     query = DiscoveryQuery(
         campaign_id="estimate", seller_countries=config.seller_countries,
         target_countries=config.target_countries, sector_ids=config.sector_ids,
-        hs_codes=config.hs_codes, buyer_types=config.buyer_types,
+        hs_codes=config.hs_codes, product_terms=config.product_terms,
+        buyer_types=config.buyer_types,
     )
     for provider in providers:
         estimate = provider.discover(query)
