@@ -149,6 +149,65 @@ enum MarkerAcquireError {
 const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
 const MAX_SAFE_MARKER_INTEGER: u64 = (1_u64 << 53) - 1;
 
+/// Reject links and Windows reparse points anywhere in an existing marker
+/// topology. Missing leaves/parents are allowed because the first claim may
+/// create them, but every existing component is inspected with lstat semantics
+/// before marker I/O. This mirrors Python's validate_no_reparse_topology.
+fn validate_no_reparse_topology(path: &Path) -> Result<(), String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("cannot inspect marker path {path:?}: {err}"))?
+            .join(path)
+    };
+    let mut existing = Vec::new();
+    let mut current = absolute;
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => existing.push(current.clone()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!("cannot inspect marker path {current:?}: {err}"));
+            }
+        }
+        let parent = current.parent().unwrap_or(&current);
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+
+    for component in existing {
+        let metadata = std::fs::symlink_metadata(&component).map_err(|err| {
+            format!("cannot inspect marker path {component:?}: {err}")
+        })?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!(
+                    "marker path contains a link or reparse point: {component:?}"
+                ));
+            }
+        }
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "marker path contains a link or reparse point: {component:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a marker and its mutex path before either can be opened.
+fn validate_marker_io_topology(marker: &Path, lock_path: &Path) -> Result<(), String> {
+    validate_no_reparse_topology(marker)?;
+    validate_no_reparse_topology(lock_path)?;
+    Ok(())
+}
+
 /// The pid + age of a confirmed-live update holding the marker.
 #[derive(Debug)]
 struct MarkerOwner {
@@ -169,6 +228,9 @@ enum StrictMarkerState {
 }
 
 fn strict_marker_state(path: &Path) -> StrictMarkerState {
+    if let Err(error) = validate_no_reparse_topology(path) {
+        return StrictMarkerState::Unavailable(error);
+    }
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -309,11 +371,15 @@ struct MarkerMutex {
 impl MarkerMutex {
     fn acquire(marker: &Path) -> Result<Self, String> {
         let lock_path = marker_mutex_path(marker);
+        validate_marker_io_topology(marker, &lock_path)?;
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 format!("could not create update-lock directory {parent:?}: {err}")
             })?;
         }
+        // Recheck after creating missing parents and immediately before the
+        // mutex open; a newly inserted junction must not redirect marker I/O.
+        validate_marker_io_topology(marker, &lock_path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -413,6 +479,8 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
+        validate_no_reparse_topology(path)?;
+        validate_no_reparse_topology(&temp)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -424,6 +492,8 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
         file.sync_all()
             .map_err(|err| format!("could not sync marker temp {temp:?}: {err}"))?;
         drop(file);
+        validate_no_reparse_topology(path)?;
+        validate_no_reparse_topology(&temp)?;
 
         #[cfg(windows)]
         {
@@ -456,7 +526,7 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
         }
         Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() && validate_no_reparse_topology(&temp).is_ok() {
         let _ = std::fs::remove_file(&temp);
     }
     result
@@ -473,6 +543,8 @@ fn create_marker_no_clobber(path: &Path, pid: u32, lease_at: u64) -> Result<(), 
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
+        validate_no_reparse_topology(path)?;
+        validate_no_reparse_topology(&temp)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -484,6 +556,8 @@ fn create_marker_no_clobber(path: &Path, pid: u32, lease_at: u64) -> Result<(), 
         file.sync_all()
             .map_err(|err| format!("could not sync marker claim {temp:?}: {err}"))?;
         drop(file);
+        validate_no_reparse_topology(path)?;
+        validate_no_reparse_topology(&temp)?;
 
         // A hard link publishes the already-complete inode atomically and
         // fails if Python/Electron/Rust created the destination first.
@@ -491,7 +565,9 @@ fn create_marker_no_clobber(path: &Path, pid: u32, lease_at: u64) -> Result<(), 
             .map_err(|err| format!("could not publish update marker {path:?}: {err}"))?;
         Ok(())
     })();
-    let _ = std::fs::remove_file(&temp);
+    if validate_no_reparse_topology(&temp).is_ok() {
+        let _ = std::fs::remove_file(&temp);
+    }
     result
 }
 
@@ -684,6 +760,9 @@ impl UpdateMarkerGuard {
             }
             StrictMarkerState::Dead(dead_pid) => {
                 tracing::debug!(?path, dead_pid, "reclaiming dead update marker owner");
+                validate_no_reparse_topology(&path).map_err(|err| {
+                    MarkerAcquireError::Unavailable(err)
+                })?;
                 std::fs::remove_file(&path).map_err(|err| {
                     MarkerAcquireError::Unavailable(format!(
                         "could not remove dead update marker {path:?}: {err}"
@@ -792,6 +871,11 @@ impl UpdateMarkerGuard {
                 self.owned = false;
                 return;
             }
+        }
+        if let Err(err) = validate_no_reparse_topology(&self.path) {
+            tracing::error!(path = ?self.path, %err, "could not validate completed update marker");
+            self.owned = false;
+            return;
         }
         if let Err(err) = std::fs::remove_file(&self.path) {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -2399,6 +2483,63 @@ mod tests {
         assert!(marker.is_dir(), "an uncertain marker is never reclaimed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn marker_guard_rejects_windows_junction_marker_and_parent_topology() {
+        fn junction(link: &Path, target: &Path) {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("spawn mklink");
+            assert!(
+                output.status.success(),
+                "mklink failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn remove_junction(link: &Path) {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "rmdir"])
+                .arg(link)
+                .output()
+                .expect("spawn rmdir");
+            assert!(output.status.success(), "rmdir junction failed");
+        }
+
+        let root = unique_tmp_dir("marker-junction");
+        let target = root.join("marker-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let marker_link = root.join(".hermes-update-in-progress");
+        junction(&marker_link, &target);
+        let marker_error = UpdateMarkerGuard::acquire(marker_link.clone())
+            .err()
+            .expect("a junction marker must be rejected before marker I/O");
+        assert!(matches!(
+            marker_error,
+            MarkerAcquireError::Unavailable(reason) if reason.contains("reparse point")
+        ));
+        remove_junction(&marker_link);
+
+        let parent_target = root.join("parent-target");
+        std::fs::create_dir_all(&parent_target).unwrap();
+        let parent_link = root.join("linked-parent");
+        junction(&parent_link, &parent_target);
+        let nested_marker = parent_link.join(".hermes-update-in-progress");
+        let parent_error = UpdateMarkerGuard::acquire(nested_marker)
+            .err()
+            .expect("a junction marker parent must be rejected before marker I/O");
+        assert!(matches!(
+            parent_error,
+            MarkerAcquireError::Unavailable(reason) if reason.contains("reparse point")
+        ));
+        remove_junction(&parent_link);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

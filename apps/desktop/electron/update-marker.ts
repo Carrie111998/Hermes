@@ -40,6 +40,73 @@ export function markerPath(hermesHome) {
   return path.join(installRoot, '.hermes-update-in-progress')
 }
 
+/**
+ * Reject links/reparse points in the marker path topology before any marker
+ * open/read/write. `lstatSync` is the Node equivalent of Python's lstat walk;
+ * the realpath comparison additionally catches Windows junctions on Node
+ * versions that expose them as ordinary directories rather than symlinks.
+ */
+function assertNoReparseTopology(filePath: string, { allowMissing = true } = {}) {
+  const absolute = path.resolve(filePath)
+  let current = absolute
+  let first = true
+
+  while (true) {
+    let metadata
+    try {
+      metadata = fs.lstatSync(current)
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        if (first && !allowMissing) {
+          throw new Error(`Marker path was not found: ${filePath}`)
+        }
+        const parent = path.dirname(current)
+        if (parent === current) {
+          break
+        }
+        current = parent
+        first = false
+        continue
+      }
+      throw new Error(`Could not inspect marker path ${current}: ${String(err)}`)
+    }
+
+    const normalizedCurrent = absolutePathForComparison(current)
+    let isReparse = metadata.isSymbolicLink()
+    if (!isReparse && process.platform === 'win32') {
+      try {
+        isReparse = absolutePathForComparison(fs.realpathSync.native(current)) !== normalizedCurrent
+      } catch {
+        // The lstat result is still authoritative if realpath is unavailable.
+      }
+    }
+    if (isReparse) {
+      throw new Error(`Marker path contains a link or reparse point: ${current}`)
+    }
+
+    const parent = path.dirname(current)
+    if (parent === current) {
+      break
+    }
+    current = parent
+    first = false
+  }
+}
+
+function absolutePathForComparison(value: string) {
+  return path.resolve(value).toLowerCase()
+}
+
+function unavailableMarker(reason: unknown) {
+  return {
+    pid: null,
+    ageMs: Infinity,
+    leaseExpired: true,
+    unavailable: true,
+    reason: String(reason)
+  }
+}
+
 // True only if a host process with this pid is currently alive. Signal 0 does
 // not deliver a signal — it just probes existence/permission. ESRCH => dead;
 // EPERM => alive but owned by another user (still "alive" for our purposes).
@@ -89,19 +156,14 @@ export function readLiveUpdateMarker(
   let raw
 
   try {
+    assertNoReparseTopology(file, { allowMissing: true })
     raw = fs.readFileSync(file, 'utf8')
   } catch (err) {
     if (err && err.code === 'ENOENT') {
       return null
     }
 
-    return {
-      pid: null,
-      ageMs: Infinity,
-      leaseExpired: true,
-      unavailable: true,
-      reason: `Update marker is unreadable: ${String(err)}`
-    }
+    return unavailableMarker(`Update marker is unreadable: ${String(err)}`)
   }
 
   const wire = /^([1-9][0-9]*)\r?\n([0-9]+)(?:\r?\n)?$/.exec(String(raw))
@@ -183,12 +245,19 @@ export function writeUpdateMarker(
   let tempFd
 
   try {
+    // Validate the destination topology before creating a staging file. The
+    // second validation immediately before linkSync closes the replacement
+    // race if a parent or marker is swapped while the payload is staged.
+    assertNoReparseTopology(file, { allowMissing: true })
+    assertNoReparseTopology(temp, { allowMissing: true })
     tempFd = fs.openSync(temp, 'wx', 0o600)
     fs.writeFileSync(tempFd, `${pid}\n${acquiredAt}\n`, 'utf8')
     fs.fsyncSync(tempFd)
     fs.closeSync(tempFd)
     tempFd = undefined
 
+    assertNoReparseTopology(file, { allowMissing: true })
+    assertNoReparseTopology(temp, { allowMissing: false })
     // linkSync is atomic and refuses an existing destination. Readers can
     // observe only the complete staged inode, never an empty/truncated body.
     fs.linkSync(temp, file)
@@ -205,9 +274,11 @@ export function writeUpdateMarker(
       }
     }
     try {
+      assertNoReparseTopology(temp, { allowMissing: true })
       fs.unlinkSync(temp)
     } catch {
-      // The temp may never have been created or is already gone.
+      // The temp may never have been created, is already gone, or its parent
+      // became a reparse point; never follow an unvalidated cleanup path.
     }
   }
 }

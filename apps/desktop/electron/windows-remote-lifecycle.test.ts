@@ -145,14 +145,20 @@ test('Windows probe validates Hermes and Python topology before selection', asyn
     'C:\\\\h\\\\hermes.exe'
   )
 
-  const explicitCheck = script.indexOf('if($explicit){Assert-NoReparse $explicit $false}')
+  const explicitCheck = script.indexOf('if($explicit){Assert-NoReparse $explicit $false;')
+  const explicitPythonCheck = script.indexOf('Assert-NoReparse $explicitPython $false')
   const fallbackJoin = script.indexOf('Join-Path $hermesHome')
+  const candidatePythonCheck = script.indexOf('Assert-NoReparse $candidatePython $true')
+  const candidateSelection = script.indexOf('Get-Item -LiteralPath $candidate')
   const pythonJoin = script.indexOf('$python=[IO.Path]::Combine')
   const pythonCheck = script.indexOf('Assert-NoReparse $python $false')
   const output = script.indexOf('[ordered]@{')
 
   assert.ok(explicitCheck >= 0)
-  assert.ok(explicitCheck < fallbackJoin)
+  assert.ok(explicitCheck < explicitPythonCheck)
+  assert.ok(explicitPythonCheck < fallbackJoin)
+  assert.ok(candidatePythonCheck >= 0)
+  assert.ok(candidatePythonCheck < candidateSelection)
   assert.ok(pythonJoin >= 0)
   assert.ok(pythonJoin < pythonCheck)
   assert.ok(pythonCheck < output)

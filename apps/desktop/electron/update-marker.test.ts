@@ -14,6 +14,7 @@
 
 import fs from 'fs'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import os from 'os'
 import path from 'path'
 
@@ -36,6 +37,24 @@ function tmpHome(tag) {
 
 function writeMarker(home, pid, startedAtSec) {
   fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}`)
+}
+
+function createJunction(link, target) {
+  if (process.platform !== 'win32') {
+    return false
+  }
+  execFileSync('cmd.exe', ['/d', '/c', 'mklink', '/J', link, target], {
+    stdio: 'ignore'
+  })
+  return true
+}
+
+function removeJunction(link) {
+  if (process.platform === 'win32') {
+    execFileSync('cmd.exe', ['/d', '/c', 'rmdir', link], {
+      stdio: 'ignore'
+    })
+  }
 }
 
 const ALIVE: typeof process.kill = () => true // injected kill that "succeeds" => pid alive
@@ -141,6 +160,48 @@ test('unreadable marker => conservative busy sentinel', () => {
   assert.ok(result?.unavailable)
   assert.equal(result.pid, null)
   assert.ok(fs.statSync(markerPath(home)).isDirectory())
+})
+
+test('Windows junction at the marker path is rejected before Electron reads or writes it', () => {
+  if (process.platform !== 'win32') {
+    return
+  }
+  const home = tmpHome('junction-marker')
+  const target = path.join(home, 'junction-target')
+  const marker = markerPath(home)
+  fs.mkdirSync(target)
+  assert.equal(createJunction(marker, target), true)
+  try {
+    const result = readLiveUpdateMarker(home, { kill: ALIVE })
+    assert.ok(result?.unavailable)
+    assert.match(result.reason, /link or reparse point/)
+    writeUpdateMarker(home, 4242)
+    assert.equal(fs.statSync(marker).isDirectory(), true)
+  } finally {
+    removeJunction(marker)
+  }
+  fs.rmSync(home, { recursive: true, force: true })
+})
+
+test('Windows junction in the marker parent topology is rejected fail closed', () => {
+  if (process.platform !== 'win32') {
+    return
+  }
+  const root = tmpHome('junction-parent-root')
+  const target = tmpHome('junction-parent-target')
+  const linkedHome = path.join(root, 'linked-home')
+  assert.equal(createJunction(linkedHome, target), true)
+  try {
+    const result = readLiveUpdateMarker(linkedHome, { kill: ALIVE })
+    assert.ok(result?.unavailable)
+    assert.match(result.reason, /link or reparse point/)
+    writeUpdateMarker(linkedHome, 4242)
+    assert.equal(fs.existsSync(markerPath(linkedHome)), false)
+  } finally {
+    removeJunction(linkedHome)
+    fs.rmSync(root, { recursive: true, force: true })
+    fs.rmSync(target, { recursive: true, force: true })
+  }
 })
 
 test('isPidAlive: own pid is alive, impossible pid is dead', () => {

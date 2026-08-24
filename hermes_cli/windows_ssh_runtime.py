@@ -424,17 +424,18 @@ def _resolve_direct_interpreter(python_entry: str) -> tuple[str, list[str]]:
 def spawn_backend(payload: dict[str, Any]) -> dict[str, Any]:
     configured_path = str(payload["hermesPath"])
     _validate_no_reparse_path(configured_path, label="Hermes path")
+    hermes_path = os.path.abspath(configured_path)
+    venv_dir = os.path.dirname(hermes_path)
+    python_entry = os.path.join(venv_dir, "python.exe")
+    _validate_no_reparse_path(python_entry, label="Hermes Python runtime")
+
     ownership_id = _ownership(str(payload["ownershipId"]))
     spawn_nonce = _nonce(str(payload["spawnNonce"]))
-    hermes_path = os.path.abspath(configured_path)
     token_path = str(_token_path(ownership_id, spawn_nonce))
     log_path = _log_path(ownership_id, spawn_nonce)
     profile = str(payload.get("profile") or "")
     if len(profile) > 256 or any(ch in profile for ch in "\x00\r\n"):
         raise ValueError("invalid profile")
-    venv_dir = os.path.dirname(hermes_path)
-    python_entry = os.path.join(venv_dir, "python.exe")
-    _validate_no_reparse_path(python_entry, label="Hermes Python runtime")
     base_python, sys_path = _resolve_direct_interpreter(python_entry)
     _validate_no_reparse_path(base_python, label="base Python interpreter")
     # Seed sys.path IN-PROCESS via a -c bootstrap rather than exporting PYTHONPATH:
