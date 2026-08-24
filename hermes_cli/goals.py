@@ -424,13 +424,14 @@ def parse_contract(text: str) -> Tuple[str, GoalContract]:
 # Autonomous-mode + file-goal input resolution
 # ──────────────────────────────────────────────────────────────────────
 
-# Flags that opt a goal into autonomous mode. Accepted anywhere in the arg
-# (leading or trailing) so both `/goal --auto <text>` and `/goal <text> --auto`
-# work. Only the DASHED forms are flags: bare words like "auto"/"autonomous"
-# are indistinguishable from English (e.g. "autonomous drone pipeline") and are
-# treated as ordinary goal text. The config default / GOAL_AUTONOMOUS env cover
-# hands-free use without an explicit flag.
-_AUTONOMOUS_FLAGS = {"--auto", "--autonomous"}
+# Autonomous-mode switches. The DASHED forms (--auto/--autonomous) are
+# unambiguous and accepted anywhere in the argument. The BARE keywords
+# (auto/autonomous) are accepted ONLY as the leading token — a subcommand-style
+# keyword like `/goal draft ...`, matching the `/fast on` toggle feel — so
+# ordinary prose that merely contains "auto"/"autonomous" later on (e.g.
+# "ship the autonomous drone") is never silently altered.
+_AUTONOMOUS_DASH_FLAGS = {"--auto", "--autonomous"}
+_AUTONOMOUS_BARE_KEYWORDS = {"auto", "autonomous"}
 
 # Upper bound on a goal file we will read inline, so a stray huge/binary file
 # path can never flood the goal text. A real GOAL.md is a handful of KB.
@@ -459,10 +460,13 @@ def resolve_goal_input(
 
     Two additive behaviours on top of plain goal text:
 
-      * ``--auto`` / ``--autonomous`` (long form ``autonomous``) anywhere in the
-        argument opts the goal into autonomous mode and is stripped from the
-        text. ``autonomous_default`` (from config) seeds the flag when no
-        explicit switch is present.
+      * Autonomous mode: a leading bare keyword (``auto`` / ``autonomous``,
+        subcommand-style like ``/goal auto ship it``) or a ``--auto`` /
+        ``--autonomous`` flag anywhere in the argument opts the goal in and is
+        stripped from the text. A bare keyword that is NOT leading stays part of
+        the goal (so "ship the autonomous drone" is untouched).
+        ``autonomous_default`` (from config) seeds the flag when no explicit
+        switch is present.
       * If what remains is a single path-like token pointing at a readable file,
         the file's contents become the goal text (the ``GOAL.md`` pattern). A
         missing/oversized/unreadable file falls back to treating the token
@@ -476,9 +480,18 @@ def resolve_goal_input(
     autonomous = bool(autonomous_default)
 
     tokens = text.split()
+    # Bare keyword only counts as a switch when it's the LEADING token, so a
+    # subcommand-style `/goal auto ship it` or `/goal autonomous ./GOAL.md`
+    # enables autonomous mode while prose like "ship the autonomous drone" does
+    # not. The token is consumed only in the leading position.
+    if tokens and tokens[0].lower() in _AUTONOMOUS_BARE_KEYWORDS:
+        autonomous = True
+        tokens = tokens[1:]
+
+    # Dashed flags (--auto/--autonomous) are unambiguous and stripped anywhere.
     kept: List[str] = []
     for tok in tokens:
-        if tok.lower() in _AUTONOMOUS_FLAGS:
+        if tok.lower() in _AUTONOMOUS_DASH_FLAGS:
             autonomous = True
             continue
         kept.append(tok)

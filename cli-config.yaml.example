@@ -1132,12 +1132,14 @@ goals:
   max_turns: 20
 
   # Default autonomous mode for new goals. When true, every /goal is created
-  # in autonomous mode without needing the explicit --auto flag. Off by
-  # default so /goal keeps its plain per-turn-judge behaviour. Override for a
-  # single session with the GOAL_AUTONOMOUS=1 env var, or per goal with
-  # `/goal --auto <text>`. Autonomous mode is the trigger the optional engine
-  # expansions (session-recycle, decision log, deception check, council gate)
-  # hang off in follow-up releases; on its own it is an inert marker.
+  # in autonomous mode without needing the explicit switch. Off by default so
+  # /goal keeps its plain per-turn-judge behaviour. Turn it on per goal with a
+  # leading keyword `/goal auto <text-or-file>` (or `/goal autonomous ...`, or
+  # the `--auto` flag); override the default for one session with
+  # GOAL_AUTONOMOUS=1 (or =0 to force off). Autonomous mode is the trigger the
+  # optional engine expansions (session-recycle, decision log, deception check,
+  # council gate) hang off in follow-up releases; on its own it is an inert
+  # marker.
   autonomous: false
 
 # =============================================================================

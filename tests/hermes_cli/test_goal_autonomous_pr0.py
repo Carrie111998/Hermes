@@ -44,24 +44,33 @@ class TestResolveGoalInputFlags:
         assert text == "ship the widget"
         assert autonomous is True
 
-    def test_long_autonomous_flag_word(self):
+    def test_leading_bare_keyword_auto_enables(self):
+        # Subcommand-style: `/goal auto ship it` enables autonomous mode and
+        # consumes the leading keyword (like `/goal draft ...`).
         from hermes_cli.goals import resolve_goal_input
 
-        text, autonomous, _ = resolve_goal_input("--autonomous do the thing")
+        text, autonomous, _ = resolve_goal_input("auto ship the widget")
+        assert text == "ship the widget"
+        assert autonomous is True
+
+    def test_leading_bare_keyword_autonomous_enables(self):
+        from hermes_cli.goals import resolve_goal_input
+
+        text, autonomous, _ = resolve_goal_input("autonomous do the thing")
         assert text == "do the thing"
         assert autonomous is True
 
-    def test_bare_word_autonomous_is_NOT_a_flag(self):
-        # Regression: bare "autonomous"/"auto" are English, not flags — a goal
-        # like "autonomous drone pipeline" must keep its first word and stay
-        # non-autonomous. Only the dashed forms toggle the mode.
+    def test_non_leading_bare_autonomous_is_NOT_a_switch(self):
+        # Regression: a bare keyword that is not the leading token stays part of
+        # the goal — "ship the autonomous drone" keeps every word and is not
+        # autonomous. Only a LEADING bare keyword (or a dashed flag) toggles.
         from hermes_cli.goals import resolve_goal_input
 
-        text, autonomous, _ = resolve_goal_input("autonomous drone pipeline")
-        assert text == "autonomous drone pipeline"
+        text, autonomous, _ = resolve_goal_input("ship the autonomous drone")
+        assert text == "ship the autonomous drone"
         assert autonomous is False
 
-    def test_bare_word_auto_trailing_is_NOT_a_flag(self):
+    def test_non_leading_bare_auto_trailing_is_NOT_a_switch(self):
         from hermes_cli.goals import resolve_goal_input
 
         text, autonomous, _ = resolve_goal_input("wire the relay to auto")
@@ -119,6 +128,18 @@ class TestResolveGoalInputFile:
             "--auto GOAL.md", cwd=str(tmp_path)
         )
         assert text == "autonomous file goal"
+        assert autonomous is True
+        assert "loaded goal from" in note
+
+    def test_leading_keyword_plus_file_loads_and_sets_autonomous(self, tmp_path):
+        # The user-facing combined form: `/goal auto ./GOAL.md`.
+        from hermes_cli.goals import resolve_goal_input
+
+        (tmp_path / "GOAL.md").write_text("keyword file goal")
+        text, autonomous, note = resolve_goal_input(
+            "auto GOAL.md", cwd=str(tmp_path)
+        )
+        assert text == "keyword file goal"
         assert autonomous is True
         assert "loaded goal from" in note
 
