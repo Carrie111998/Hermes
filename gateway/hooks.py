@@ -56,6 +56,9 @@ import yaml
 from hermes_cli.config import get_hermes_home
 
 
+COMMAND_REWRITE_METADATA_SUPPORTED = True
+
+
 HOOKS_DIR = get_hermes_home() / "hooks"
 
 
