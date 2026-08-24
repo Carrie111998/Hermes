@@ -906,6 +906,20 @@ def bump_use(
             reused=facts["reused"],
             reuse_after_patch=facts["reuse_after_patch"],
         )
+        try:
+            from hermes_wisdom.qualification import record_successful_use
+
+            record_successful_use(
+                skill_name,
+                task_id=task_id,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.debug(
+                "Wisdom use qualification failed for %s",
+                skill_name,
+                exc_info=True,
+            )
 
 
 def bump_patch(
@@ -936,6 +950,20 @@ def bump_patch(
             task_id=task_id,
             session_id=session_id,
         )
+        try:
+            from hermes_wisdom.qualification import record_mutation_async
+
+            record_mutation_async(
+                skill_name,
+                task_id=task_id,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.debug(
+                "Wisdom mutation qualification failed for %s",
+                skill_name,
+                exc_info=True,
+            )
 
 
 def record_created(
@@ -964,6 +992,20 @@ def record_created(
             task_id=task_id,
             session_id=session_id,
         )
+        try:
+            from hermes_wisdom.qualification import record_mutation_async
+
+            record_mutation_async(
+                skill_name,
+                task_id=task_id,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.debug(
+                "Wisdom create qualification failed for %s",
+                skill_name,
+                exc_info=True,
+            )
 
 
 def record_installed(skill_name: str) -> None:

@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import type { Translations } from './types'
+import { wisdomCopy } from './wisdom-copy'
 
 export const zh: Translations = {
   common: {
@@ -1415,6 +1416,9 @@ export const zh: Translations = {
   },
 
   skills: {
+    collective: wisdomCopy,
+    tabCollective: '集体智慧',
+    searchCollective: '搜索集体智慧...',
     tabSkills: '技能',
     tabToolsets: '工具集',
     configuringProfile: '正在配置：',

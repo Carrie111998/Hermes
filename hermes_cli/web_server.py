@@ -1646,6 +1646,11 @@ from hermes_cli.web_models import (  # noqa: F401
     CuratorPause,
     LearningNodeRef,
     LearningNodeEdit,
+    WisdomSuggestRequest,
+    WisdomReviewRequest,
+    WisdomDecisionRequest,
+    WisdomInstallPlanRequest,
+    WisdomInstallApplyRequest,
     DebugShareRequest,
     TTSSpeakRequest,
     OAuthSubmitBody,
@@ -15255,6 +15260,152 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
+
+
+# ---------------------------------------------------------------------------
+# Collective Wisdom — one profile-scoped BFF for dashboard and desktop.
+# Gateway bearer tokens and the Gateway base URL never leave this process.
+# ---------------------------------------------------------------------------
+
+
+def _wisdom_http_error(exc: Exception) -> HTTPException:
+    from hermes_wisdom.client import WisdomError
+    from hermes_wisdom.package import PackagePolicyError
+
+    if isinstance(exc, WisdomError):
+        status = {
+            3: 403,
+            4: 404,
+            5: 409,
+            6: 422,
+            7: 409,
+            8: 503,
+        }.get(exc.exit_code, 500)
+        return HTTPException(status_code=status, detail=str(exc))
+    if isinstance(exc, PackagePolicyError):
+        return HTTPException(status_code=422, detail=str(exc))
+    _log.exception("Collective Wisdom request failed")
+    return HTTPException(status_code=500, detail="Collective Wisdom request failed")
+
+
+async def _run_wisdom(profile: Optional[str], fn):
+    def run():
+        with _profile_scope(profile):
+            from hermes_wisdom.service import WisdomService
+
+            return fn(WisdomService())
+
+    try:
+        return await asyncio.to_thread(run)
+    except Exception as exc:
+        raise _wisdom_http_error(exc) from exc
+
+
+@app.get("/api/wisdom/status")
+async def get_wisdom_status(profile: Optional[str] = None):
+    return await _run_wisdom(profile, lambda service: service.status())
+
+
+@app.get("/api/wisdom/candidates")
+async def get_wisdom_candidates(profile: Optional[str] = None):
+    return await _run_wisdom(
+        profile, lambda service: {"candidates": service.scan_candidates()}
+    )
+
+
+@app.get("/api/wisdom/events")
+async def get_wisdom_events(
+    profile: Optional[str] = None, session_id: Optional[str] = None
+):
+    def read(_service):
+        from hermes_wisdom.store import WisdomStore
+
+        return {
+            "events": WisdomStore().local_events(
+                kind="wisdom.candidate", session_id=session_id
+            )
+        }
+
+    return await _run_wisdom(profile, read)
+
+
+@app.get("/api/wisdom/drafts")
+async def get_wisdom_drafts(profile: Optional[str] = None):
+    return await _run_wisdom(
+        profile,
+        lambda service: {
+            "drafts": [
+                draft.model_dump(mode="json") for draft in service.client.list_drafts()
+            ]
+        },
+    )
+
+
+@app.get("/api/wisdom/discovery")
+async def get_wisdom_discovery(profile: Optional[str] = None):
+    return await _run_wisdom(profile, lambda service: service.list_skills())
+
+
+@app.get("/api/wisdom/skills/{skill_id}")
+async def get_wisdom_skill(skill_id: str, profile: Optional[str] = None):
+    return await _run_wisdom(profile, lambda service: service.show(skill_id))
+
+
+@app.post("/api/wisdom/suggest")
+async def post_wisdom_suggest(body: WisdomSuggestRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.suggest(
+            body.skill,
+            description=body.description,
+            system_specification=body.system_specification,
+            allow_private_secret_review=body.send_for_owner_only_server_review,
+        ),
+    )
+
+
+@app.post("/api/wisdom/review")
+async def post_wisdom_review(body: WisdomReviewRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.review(
+            body.draft_id, acknowledge=body.acknowledge, portal=False
+        ),
+    )
+
+
+@app.post("/api/wisdom/approve")
+async def post_wisdom_approve(body: WisdomDecisionRequest):
+    return await _run_wisdom(
+        body.profile, lambda service: service.approve(body.draft_id)
+    )
+
+
+@app.post("/api/wisdom/decline")
+async def post_wisdom_decline(body: WisdomDecisionRequest):
+    return await _run_wisdom(
+        body.profile, lambda service: service.decline(body.draft_id)
+    )
+
+
+@app.post("/api/wisdom/install/plan")
+async def post_wisdom_install_plan(body: WisdomInstallPlanRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.install_plan(
+            body.reference, update_mode=body.update_mode
+        ),
+    )
+
+
+@app.post("/api/wisdom/install/apply")
+async def post_wisdom_install_apply(body: WisdomInstallApplyRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.install_apply(
+            body.receipt, accept_partial=body.accept_partial
+        ),
+    )
 
 
 app.include_router(_skills_routes.router)

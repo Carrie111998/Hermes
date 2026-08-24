@@ -1,4 +1,5 @@
 import { defineLocale } from "./define-locale";
+import { wisdomCopy } from "./wisdom-copy";
 
 export const ar = defineLocale({
   common: {
@@ -305,6 +306,7 @@ export const ar = defineLocale({
   },
 
   skills: {
+    wisdom: wisdomCopy,
     title: "المهارات",
     searchPlaceholder: "بحث في المهارات ومجموعات الأدوات...",
     enabledOf: "{enabled}/{total} مفعلة",

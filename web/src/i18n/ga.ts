@@ -1,4 +1,5 @@
 import type { Translations } from "./types";
+import { wisdomCopy } from "./wisdom-copy";
 
 export const ga: Translations = {
   common: {
@@ -368,6 +369,7 @@ export const ga: Translations = {
   },
 
   skills: {
+    wisdom: wisdomCopy,
     title: "Scileanna",
     searchPlaceholder: "Cuardaigh scileanna agus toolsets...",
     enabledOf: "{enabled}/{total} cumasaithe",

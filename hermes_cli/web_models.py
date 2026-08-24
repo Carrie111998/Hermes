@@ -289,6 +289,37 @@ class LearningNodeEdit(BaseModel):
     profile: Optional[str] = None
 
 
+class WisdomSuggestRequest(BaseModel):
+    skill: Optional[str] = None
+    description: Optional[str] = None
+    system_specification: Optional[Dict[str, Any]] = None
+    send_for_owner_only_server_review: bool = False
+    profile: Optional[str] = None
+
+
+class WisdomReviewRequest(BaseModel):
+    draft_id: str
+    acknowledge: bool = False
+    profile: Optional[str] = None
+
+
+class WisdomDecisionRequest(BaseModel):
+    draft_id: str
+    profile: Optional[str] = None
+
+
+class WisdomInstallPlanRequest(BaseModel):
+    reference: str
+    update_mode: Optional[str] = None
+    profile: Optional[str] = None
+
+
+class WisdomInstallApplyRequest(BaseModel):
+    receipt: str
+    accept_partial: bool = False
+    profile: Optional[str] = None
+
+
 # --- from web_server.py (originally lines 3786-3792) ---
 
 class DebugShareRequest(BaseModel):
@@ -738,4 +769,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-
