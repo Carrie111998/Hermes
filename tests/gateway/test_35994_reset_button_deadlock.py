@@ -17,6 +17,7 @@ import threading
 import time
 from datetime import datetime
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -198,3 +199,46 @@ async def test_reset_completes_when_cleanup_times_out(caplog):
     ), "expected the timeout warning to be logged"
     runner.session_store.reset_session.assert_called_once()
     assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_propagates_confirmed_command_metadata(monkeypatch):
+    """Only the event that actually reaches native reset emits its attached intent."""
+    runner = _make_runner_with_cached_agent(lambda: None)
+    event = _make_event("/new")
+    event.metadata = {
+        "session_commands": {"action": "newall", "nonce": "confirmed-nonce"}
+    }
+    lifecycle_calls = []
+    hook_emit = cast(AsyncMock, runner.hooks.emit)
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda event_type, **context: lifecycle_calls.append((event_type, context)),
+    )
+
+    await runner._handle_reset_command(event)
+
+    reset_emits = [
+        call for call in hook_emit.await_args_list if call.args[0] == "session:reset"
+    ]
+    end_emits = [
+        call for call in hook_emit.await_args_list if call.args[0] == "session:end"
+    ]
+    assert len(end_emits) == 1
+    assert end_emits[0].args[1]["command_metadata"] == event.metadata
+    assert len(reset_emits) == 1
+    assert reset_emits[0].args[1]["command_metadata"] == event.metadata
+    assert lifecycle_calls == [
+        (
+            "on_session_reset",
+            {
+                "session_id": "sess-new",
+                "platform": "telegram",
+                "reason": "new_session",
+                "old_session_id": "sess-old",
+                "new_session_id": "sess-new",
+                "command_metadata": event.metadata,
+            },
+        )
+    ]
