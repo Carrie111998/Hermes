@@ -166,7 +166,9 @@ def test_non_desktop_sources_never_inject(tmp_path, platform):
     assert agent.tools == []
 
 
-@pytest.mark.parametrize("platform", ["cli", "tui", "cron", "kanban", "subagent"])
+@pytest.mark.parametrize(
+    "platform", ["cli", "tui", "webui", "cron", "kanban", "subagent"]
+)
 def test_non_desktop_sources_still_refuse_to_send(tmp_path, platform):
     """Defense in depth: a forged send from any non-Desktop source is refused."""
     home = _managed_home(tmp_path)
