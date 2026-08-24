@@ -1015,6 +1015,29 @@ class TestOptOutToggleAndRemove:
             # non-bundled local skill never considered
             assert (skills_dir / "mine" / "SKILL.md").exists()
 
+    def test_remove_keeps_plain_name_v1_manifest_entry(self, tmp_path):
+        """An unbaselined v1 entry is never safe for opt-out deletion."""
+        from tools.skills_sync import remove_pristine_bundled_skills
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        dest = skills_dir / "alpha"
+        shutil.copytree(bundled / "alpha", dest)
+        manifest_file = skills_dir / ".bundled_manifest"
+        manifest_file.write_text("alpha\n", encoding="utf-8")
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+            result = remove_pristine_bundled_skills()
+
+        assert result["removed"] == []
+        assert result["skipped"] == [
+            {"name": "alpha", "reason": "user-modified (kept)"}
+        ]
+        assert (dest / "SKILL.md").exists()
+        assert manifest_file.read_text(encoding="utf-8") == "alpha\n"
+
 
 class TestUpdateBackupRecovery:
     """Regression tests for backup handling in the bundled-update path.

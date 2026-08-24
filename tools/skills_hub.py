@@ -35,7 +35,10 @@ import httpx
 import yaml
 
 from tools.skills_guard import (
-    ScanResult, content_hash, TRUSTED_REPOS,
+    ScanResult,
+    TRUSTED_REPOS,
+    content_hash,
+    legacy_content_hash,
 )
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
@@ -4071,6 +4074,18 @@ class HubLockFile:
         data["installed"].pop(name, None)
         self.save(data)
 
+    def migrate_content_hash(
+        self, name: str, expected_hash: str, canonical_hash: str
+    ) -> bool:
+        """Replace a proven legacy hash without clobbering concurrent changes."""
+        data = self.load()
+        entry = data.get("installed", {}).get(name)
+        if not entry or entry.get("content_hash", "") != expected_hash:
+            return False
+        entry["content_hash"] = canonical_hash
+        self.save(data)
+        return True
+
     def get_installed(self, name: str) -> Optional[dict]:
         data = self.load()
         return data["installed"].get(name)
@@ -4422,6 +4437,36 @@ def bundle_content_hash(bundle: SkillBundle) -> str:
     return f"sha256:{h.hexdigest()[:16]}"
 
 
+def legacy_bundle_content_hash(bundle: SkillBundle) -> str:
+    """Reproduce the pre-cache-filter hash for an in-memory Hub bundle."""
+    h = hashlib.sha256()
+    normalized = {
+        rel_path.replace("\\", "/"): content
+        for rel_path, content in bundle.files.items()
+    }
+    for rel_path in sorted(normalized):
+        h.update(rel_path.encode("utf-8"))
+        h.update(b"\x00")
+        content = normalized[rel_path]
+        h.update(content if isinstance(content, bytes) else content.encode("utf-8"))
+    return f"sha256:{h.hexdigest()[:16]}"
+
+
+def resolve_hub_lock_tree_hash(recorded_hash: str, skill_path: Path) -> Optional[str]:
+    """Return the canonical tree hash when a Hub lock hash is proven valid.
+
+    Compatibility is deliberately evidence-based: a legacy hash is accepted
+    only when it exactly matches the old cache-inclusive identity of the
+    current installed tree.  Arbitrary stale or corrupt hashes return ``None``.
+    """
+    canonical_hash = content_hash(skill_path)
+    if recorded_hash == canonical_hash:
+        return canonical_hash
+    if recorded_hash == legacy_content_hash(skill_path):
+        return canonical_hash
+    return None
+
+
 def _source_matches(source: SkillSource, source_name: str) -> bool:
     aliases = {
         "skills.sh": "skills-sh",
@@ -4487,7 +4532,50 @@ def check_for_skill_updates(
 
         current_hash = entry.get("content_hash", "")
         latest_hash = bundle_content_hash(bundle)
-        status = "up_to_date" if current_hash == latest_hash else "update_available"
+        resolved_tree_hash = None
+        install_path = None
+        try:
+            install_path = _resolve_lock_install_path(
+                entry.get("install_path", ""), entry.get("name", "")
+            )
+            if install_path.is_dir():
+                resolved_tree_hash = resolve_hub_lock_tree_hash(
+                    current_hash, install_path
+                )
+        except (OSError, ValueError):
+            pass
+
+        if current_hash == latest_hash:
+            status = "up_to_date"
+        elif resolved_tree_hash is not None:
+            # The installed tree proves this was a real old-format lock hash.
+            # Re-baseline to its canonical identity before do_update performs
+            # its independent local-edit check.
+            lock.migrate_content_hash(
+                entry.get("name", ""), current_hash, resolved_tree_hash
+            )
+            status = (
+                "up_to_date"
+                if resolved_tree_hash == latest_hash
+                else "update_available"
+            )
+        elif current_hash == legacy_bundle_content_hash(bundle):
+            # A refreshed generated cache can prevent the local tree from
+            # reproducing the old hash.  The remote bundle still proves the
+            # recorded cache-inclusive identity.  Migrate only when canonical
+            # disk content also matches remote, preserving real-edit guards.
+            status = "up_to_date"
+            if install_path is not None and install_path.is_dir():
+                try:
+                    disk_hash = content_hash(install_path)
+                except OSError:
+                    disk_hash = None
+                if disk_hash == latest_hash:
+                    lock.migrate_content_hash(
+                        entry.get("name", ""), current_hash, latest_hash
+                    )
+        else:
+            status = "update_available"
         results.append({
             "name": entry.get("name", ""),
             "identifier": identifier,

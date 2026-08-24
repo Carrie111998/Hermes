@@ -1,5 +1,6 @@
 """Tests for tools/skills_hub.py — source adapters, lock file, taps, dedup logic."""
 
+import hashlib
 import json
 import time
 from typing import List, Optional
@@ -561,6 +562,99 @@ class TestCheckForSkillUpdates:
         assert len(results) == 1
         assert results[0]["name"] == "demo-skill"
         assert results[0]["status"] == "update_available"
+
+    @staticmethod
+    def _legacy_cache_inclusive_hash(skill_dir):
+        hasher = hashlib.sha256()
+        for path in sorted(skill_dir.rglob("*")):
+            if path.is_file():
+                hasher.update(path.relative_to(skill_dir).as_posix().encode("utf-8"))
+                hasher.update(b"\x00")
+                hasher.update(path.read_bytes())
+        return f"sha256:{hasher.hexdigest()[:16]}"
+
+    def test_legacy_cache_hash_is_accepted_and_migrated_with_remote_proof(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_guard import content_hash
+        import tools.skills_hub as hub
+
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "category" / "demo-skill"
+        cache = skill_dir / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("same content", encoding="utf-8")
+        cache_file = cache / "helper.cpython-313.pyc"
+        cache_file.write_bytes(b"original-cache")
+        legacy_hash = self._legacy_cache_inclusive_hash(skill_dir)
+        cache_file.write_bytes(b"regenerated-cache")
+
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="demo-skill",
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+            scan_verdict="pass",
+            skill_hash=legacy_hash,
+            install_path="category/demo-skill",
+            files=["SKILL.md", "scripts/__pycache__/helper.cpython-313.pyc"],
+        )
+        source = MagicMock()
+        source.source_id.return_value = "github"
+        source.fetch.return_value = SkillBundle(
+            name="demo-skill",
+            files={
+                "SKILL.md": "same content",
+                "scripts/__pycache__/helper.cpython-313.pyc": b"original-cache",
+            },
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+        monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results[0]["status"] == "up_to_date"
+        assert lock.get_installed("demo-skill")["content_hash"] == content_hash(
+            skill_dir
+        )
+
+    def test_corrupt_lock_hash_is_not_accepted_or_migrated(self, tmp_path, monkeypatch):
+        import tools.skills_hub as hub
+
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "demo-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("same content", encoding="utf-8")
+        corrupt_hash = "sha256:0000000000000000"
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="demo-skill",
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+            scan_verdict="pass",
+            skill_hash=corrupt_hash,
+            install_path="demo-skill",
+            files=["SKILL.md"],
+        )
+        source = MagicMock()
+        source.source_id.return_value = "github"
+        source.fetch.return_value = SkillBundle(
+            name="demo-skill",
+            files={"SKILL.md": "same content"},
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+        monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results[0]["status"] == "update_available"
+        assert lock.get_installed("demo-skill")["content_hash"] == corrupt_hash
 
 class TestCreateSourceRouter:
 

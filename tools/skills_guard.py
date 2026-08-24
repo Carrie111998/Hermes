@@ -923,6 +923,16 @@ def full_content_hash(skill_path: Path) -> str:
     return f"sha256:{_content_digest(skill_path, include_generated=True)}"
 
 
+def legacy_content_hash(skill_path: Path) -> str:
+    """Reproduce the pre-cache-filter Hub lock hash.
+
+    New lock entries use :func:`content_hash`.  This legacy shape exists only
+    to prove that an existing lock hash came from a concrete current tree;
+    callers must not use it as the identity for new installs.
+    """
+    return f"sha256:{_content_digest(skill_path, include_generated=True)[:16]}"
+
+
 def _finding_dict(finding: Finding) -> dict:
     return {key: getattr(finding, key) for key in (
         "pattern_id", "severity", "category", "file", "line", "match", "description"
