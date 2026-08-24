@@ -7887,6 +7887,27 @@ async function harvestStrandedUntilSettled(group, members, thread) {
  *  Appends, bumps the room epoch (supersedes any running loop at its next
  *  member boundary), and starts the turn drive for the target thread.
  *  Returns the thread id the message landed in. */
+// Slash commands typed in a group room have no handler: the room composer
+// submits verbatim into sendToGroupChat, so "/new" lands in every member's
+// session as literal chat text (#93947). The 1:1 composer reroutes /new via
+// its middleware; rooms have no such path and reset semantics are ambiguous
+// at room scope (member sessions are keyed per-room, shared across threads).
+// Until a design decision lands, reject slash-style input visibly instead of
+// delivering it as a prompt the bots answer literally.
+const GROUP_SLASH_INPUT_RE = /^\/\S/
+
+function isGroupSlashInput(text) {
+  return GROUP_SLASH_INPUT_RE.test(String(text || '').trim())
+}
+
+function notifyGroupSlashUnsupported() {
+  host.notify?.({
+    kind: 'info',
+    title: 'Slash commands aren’t supported in group rooms',
+    message: 'The text was not sent — it would reach every bot as a literal message.'
+  })
+}
+
 function sendToGroupChat(group, members, text, thread, images) {
   const trimmed = String(text || '').trim()
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
@@ -12807,6 +12828,12 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       return
     }
 
+    if (isGroupSlashInput(text)) {
+      notifyGroupSlashUnsupported()
+
+      return
+    }
+
     const before = groupComposerDraftSnapshot(composerKeyRef.current)
     const cleared = updateComposerDraft(current => ({
       ...current,
@@ -12834,6 +12861,12 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     const images = imagesFor(thread)
 
     if (!text && !images.length) {
+      return
+    }
+
+    if (isGroupSlashInput(text)) {
+      notifyGroupSlashUnsupported()
+
       return
     }
 
