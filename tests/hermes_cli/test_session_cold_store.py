@@ -12,6 +12,7 @@ import stat
 import pytest
 
 import hermes_cli.session_cold_store as cold_store
+from hermes_accounting_locks import PendingSessionAccountingError
 from hermes_cli.session_cold_store import (
     plan_archived_lineage,
     purge_archived_lineage,
@@ -191,6 +192,82 @@ def test_purge_tombstone_blocks_cross_instance_session_resurrection(
     finally:
         late_writer.close()
         purge_db.close()
+
+
+def test_purge_tombstone_blocks_cross_instance_gateway_routes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    archive_root = tmp_path / "archive"
+    purge_db = SessionDB(db_path)
+    late_writer = SessionDB(db_path)
+    survivor_entry = json.dumps({"session_id": "survivor"})
+    try:
+        purge_db.create_session("terminal", source="cli")
+        purge_db.append_message("terminal", role="user", content="stored")
+        purge_db.end_session("terminal", "completed")
+        assert purge_db.set_session_archived("terminal", True)
+        late_writer.save_gateway_routing_entry(
+            "existing-key", survivor_entry, scope="test"
+        )
+        store_archived_lineage(purge_db, "terminal", archive_root)
+        purge_archived_lineage(purge_db, "terminal", archive_root)
+
+        tombstoned_entry = json.dumps({"session_id": "terminal"})
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            late_writer.save_gateway_routing_entry(
+                "new-key", tombstoned_entry, scope="test"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            late_writer.save_gateway_routing_entry(
+                "existing-key", tombstoned_entry, scope="test"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            late_writer.replace_gateway_routing_entries(
+                {"replacement-key": tombstoned_entry}, scope="test"
+            )
+
+        assert late_writer.load_gateway_routing_entries(scope="test") == {
+            "existing-key": survivor_entry
+        }
+    finally:
+        late_writer.close()
+        purge_db.close()
+
+
+def test_lineage_accounting_lock_rejects_late_queue_and_releases_after_flush(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    archive_db = SessionDB(db_path)
+    accounting_db = SessionDB(db_path)
+    try:
+        archive_db.create_session("terminal", source="cli")
+        archive_db.end_session("terminal", "completed")
+        assert archive_db.set_session_archived("terminal", True)
+
+        with cold_store._exclusive_lineage_accounting_locks(
+            archive_db, "terminal"
+        ):
+            with pytest.raises(
+                PendingSessionAccountingError, match="locked for cold archive"
+            ):
+                accounting_db.queue_token_counts(
+                    "terminal", input_tokens=1, model="late-model"
+                )
+            assert not accounting_db._token_queue
+
+        accounting_db.queue_token_counts(
+            "terminal", input_tokens=2, model="settled-model"
+        )
+        assert accounting_db.flush_token_counts(timeout=10)
+        with cold_store._exclusive_lineage_accounting_locks(
+            archive_db, "terminal"
+        ):
+            pass
+    finally:
+        accounting_db.close()
+        archive_db.close()
 
 
 def test_purge_rolls_back_tombstone_when_source_delete_fails(

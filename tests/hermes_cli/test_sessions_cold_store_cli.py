@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -494,6 +495,58 @@ def test_cold_archive_yes_runs_store_verify_purge_serially_and_keeps_snapshot(
     }
     assert _session_rows() == [("unrelated", 0)]
     assert _message_rows() == [("unrelated", "keep this row")]
+
+
+def test_cold_archive_refuses_cross_instance_pending_accounting(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "cold-root"
+    before_sessions = _session_rows()
+    accounting_owner = SessionDB()
+    entered_apply = threading.Event()
+    release_apply = threading.Event()
+    original_apply = accounting_owner._apply_token_batch
+
+    def blocked_apply(batch):
+        entered_apply.set()
+        if not release_apply.wait(10):
+            raise AssertionError("test did not release blocked accounting")
+        return original_apply(batch)
+
+    monkeypatch.setattr(accounting_owner, "_apply_token_batch", blocked_apply)
+    try:
+        accounting_owner.queue_token_counts(
+            "lineage-terminal",
+            input_tokens=7,
+            model="pending-model",
+            billing_provider="pending-provider",
+            api_call_count=1,
+        )
+        assert entered_apply.wait(5)
+
+        code, out, err = _run_cli(
+            monkeypatch,
+            capsys,
+            "sessions",
+            "cold-archive",
+            str(archive_root),
+            "--session-id",
+            "lineage-terminal",
+            "--yes",
+        )
+
+        assert code == 1
+        assert err == ""
+        assert "pending token accounting" in out
+        assert not archive_root.exists()
+        assert _session_rows() == before_sessions
+    finally:
+        release_apply.set()
+        accounting_owner.flush_token_counts(timeout=10)
+        accounting_owner.close()
 
 
 def test_cold_archive_resolution_database_error_fails_closed(

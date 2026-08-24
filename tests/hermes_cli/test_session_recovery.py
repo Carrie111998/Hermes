@@ -363,6 +363,8 @@ def test_recovery_removes_rows_that_conflict_with_cold_archive_tombstones(
         "system_prompts_removed": 0,
         "gateway_routes_removed": 0,
         "gateway_routes_unverifiable": 0,
+        "state_meta_removed": 0,
+        "async_delegations_removed": 0,
         "messages_removed": 1,
         "session_model_usage_removed": 0,
         "compression_locks_removed": 0,
@@ -479,6 +481,77 @@ def test_recovery_removes_only_routes_targeting_tombstoned_ids(
         }
         assert recovered.get_session("cold-purged") is None
         assert recovered.get_session("survivor") is not None
+    finally:
+        recovered.close()
+
+
+def test_recovery_removes_state_and_delegation_references_to_tombstones(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-soft-references.db"
+    output = tmp_path / "recovered-soft-references.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("cold-purged", source="cli")
+        db.create_session("survivor", source="cli")
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "cold-purged", "4" * 64, 103.0),
+        )
+        db._conn.executemany(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+            [
+                ("goal:cold-purged", "stale"),
+                ("loop:cold-purged", "stale"),
+                ("heartbeat:cold-purged", "stale"),
+                ("goal:survivor", "keep"),
+                ("other:cold-purged", "keep"),
+            ],
+        )
+        db._conn.executemany(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, parent_session_id, origin_session_id, "
+            "state, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("by-origin", "cold-purged", None, "", "completed", 1.0, 2.0),
+                ("by-parent", "survivor", "cold-purged", "", "completed", 1.0, 2.0),
+                ("by-origin-id", "survivor", None, "cold-purged", "completed", 1.0, 2.0),
+                ("keep", "survivor", None, "survivor", "completed", 1.0, 2.0),
+            ],
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    reconciliation = report["tombstone_reconciliation"]
+    assert reconciliation["state_meta_removed"] == 3
+    assert reconciliation["async_delegations_removed"] == 3
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered._conn is not None
+        meta = recovered._conn.execute(
+            "SELECT key, value FROM state_meta WHERE key IN (?, ?, ?, ?, ?) "
+            "ORDER BY key",
+            (
+                "goal:cold-purged",
+                "loop:cold-purged",
+                "heartbeat:cold-purged",
+                "goal:survivor",
+                "other:cold-purged",
+            ),
+        ).fetchall()
+        assert [tuple(row) for row in meta] == [
+            ("goal:survivor", "keep"),
+            ("other:cold-purged", "keep"),
+        ]
+        delegations = recovered._conn.execute(
+            "SELECT delegation_id FROM async_delegations ORDER BY delegation_id"
+        ).fetchall()
+        assert [str(row[0]) for row in delegations] == ["keep"]
     finally:
         recovered.close()
 

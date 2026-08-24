@@ -19,16 +19,15 @@ import stat
 from typing import Any, Iterator
 
 from hermes_state import SessionDB, resolved_max_export_messages
+from hermes_accounting_locks import exclusive_lineage_accounting_locks
+from hermes_cli.session_reference_contract import (
+    ASYNC_DELEGATION_SESSION_COLUMNS,
+    STATE_META_SESSION_NAMESPACES,
+)
 
 
 _ARCHIVE_FORMAT = "hermes-cold-archive-store-spike/v1"
 _MAX_SQLITE_IN_PARAMS = 500
-_STATE_META_SESSION_NAMESPACES = ("goal", "loop", "heartbeat")
-_ASYNC_DELEGATION_SESSION_COLUMNS = (
-    "origin_session",
-    "parent_session_id",
-    "origin_session_id",
-)
 _COORDINATION_SESSION_REFERENCES = (
     ("compression_locks", "session_id"),
     ("session_turn_leases", "conversation_id"),
@@ -423,6 +422,17 @@ def _exclusive_cold_archive_root_lock(archive_root: Path) -> Iterator[None]:
             os.close(lock_fd)
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+@contextmanager
+def _exclusive_lineage_accounting_locks(
+    db: SessionDB,
+    terminal_id: str,
+) -> Iterator[None]:
+    """Exclude cross-process queued accounting across Store→Verify→Purge."""
+    plan = _read_store_plan(db, terminal_id)
+    with exclusive_lineage_accounting_locks(db.db_path, plan.physical_ids):
+        yield
 
 
 def _write_text_fsync_at(directory_fd: int, name: str, text: str) -> None:
@@ -885,7 +895,7 @@ def _reject_state_meta_references(
 ) -> None:
     """Reject goal/loop/heartbeat keys owned by any covered session."""
     _required_table_columns(conn, "state_meta", ("key",))
-    for namespace in _STATE_META_SESSION_NAMESPACES:
+    for namespace in STATE_META_SESSION_NAMESPACES:
         for ids in _id_chunks(physical_ids):
             keys = tuple(f"{namespace}:{session_id}" for session_id in ids)
             placeholders = ",".join("?" for _ in keys)
@@ -907,9 +917,9 @@ def _reject_async_delegation_references(
     conn: sqlite3.Connection, physical_ids: tuple[str, ...]
 ) -> None:
     """Reject durable delegation rows naming any covered session."""
-    required_columns = ("delegation_id", *_ASYNC_DELEGATION_SESSION_COLUMNS)
+    required_columns = ("delegation_id", *ASYNC_DELEGATION_SESSION_COLUMNS)
     _required_table_columns(conn, "async_delegations", required_columns)
-    for column in _ASYNC_DELEGATION_SESSION_COLUMNS:
+    for column in ASYNC_DELEGATION_SESSION_COLUMNS:
         quoted_column = _quoted_identifier(column)
         for ids in _id_chunks(physical_ids):
             placeholders = ",".join("?" for _ in ids)

@@ -33,6 +33,11 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli.session_reference_contract import (
+    ASYNC_DELEGATION_SESSION_COLUMNS,
+    STATE_META_SESSION_NAMESPACES,
+)
+
 # Hermes session ids are timestamps: 20260812_135332_ab12cd. This is the
 # strongest sentinel available for classifying schema-less rows.
 SESSION_ID_PATTERN = re.compile(r"^\d{8}_\d{6}_")
@@ -347,9 +352,10 @@ def _copy_direct_tables(
         "sessions",
         "messages",
         "session_model_usage",
+        "state_meta",
+        "gateway_routing",
         "cold_archive_tombstones",
         "compression_locks",
-        "gateway_routing",
         "async_delegations",
     ):
         source_columns = _table_columns(lf_conn, table)
@@ -377,6 +383,8 @@ def _copy_direct_tables(
 
 def reconcile_cold_archive_tombstones(
     destination: sqlite3.Connection,
+    *,
+    rejected_prompt_hashes: set[str] | None = None,
 ) -> dict[str, int]:
     """Remove recovered hot rows whose IDs carry cold-archive authority."""
 
@@ -386,6 +394,8 @@ def reconcile_cold_archive_tombstones(
         "system_prompts_removed": 0,
         "gateway_routes_removed": 0,
         "gateway_routes_unverifiable": 0,
+        "state_meta_removed": 0,
+        "async_delegations_removed": 0,
         "messages_removed": 0,
         "session_model_usage_removed": 0,
         "compression_locks_removed": 0,
@@ -410,12 +420,34 @@ def reconcile_cold_archive_tombstones(
                 "AND system_prompt_hash IS NOT NULL"
             ).fetchall()
         }
+        prompt_hashes.update(rejected_prompt_hashes or ())
         parent_cursor = destination.execute(
             "UPDATE sessions SET parent_session_id = NULL "
             "WHERE parent_session_id IN ("
             "SELECT session_id FROM cold_archive_tombstones)"
         )
         result["sessions_parent_cleared"] = parent_cursor.rowcount
+
+        if _table_columns(destination, "state_meta"):
+            for namespace in STATE_META_SESSION_NAMESPACES:
+                cursor = destination.execute(
+                    "DELETE FROM state_meta WHERE key IN ("
+                    "SELECT ? || ':' || session_id "
+                    "FROM cold_archive_tombstones)",
+                    (namespace,),
+                )
+                result["state_meta_removed"] += cursor.rowcount
+
+        if _table_columns(destination, "async_delegations"):
+            predicates = " OR ".join(
+                f'"{column}" IN (SELECT session_id '
+                "FROM cold_archive_tombstones)"
+                for column in ASYNC_DELEGATION_SESSION_COLUMNS
+            )
+            cursor = destination.execute(
+                f"DELETE FROM async_delegations WHERE {predicates}"
+            )
+            result["async_delegations_removed"] = cursor.rowcount
 
         if _table_columns(destination, "gateway_routing"):
             route_rows = destination.execute(
@@ -499,6 +531,7 @@ def map_lost_and_found_rows(
         "insert_conflicts": 0,
         "lost_and_found_tables": [],
     }
+    rejected_session_prompts: set[tuple[str, str]] = set()
 
     dest.execute("BEGIN IMMEDIATE")
     try:
@@ -508,6 +541,10 @@ def map_lost_and_found_rows(
         messages_columns = _table_columns(dest, "messages")
         usage_columns = _table_columns(dest, "session_model_usage")
         tombstone_columns = _table_columns(dest, "cold_archive_tombstones")
+        try:
+            system_prompt_hash_index = sessions_columns.index("system_prompt_hash")
+        except ValueError:
+            system_prompt_hash_index = -1
         sessions_defaults = _notnull_defaults(dest, "sessions")
         messages_defaults = _notnull_defaults(dest, "messages")
         usage_defaults = _notnull_defaults(dest, "session_model_usage")
@@ -548,6 +585,18 @@ def map_lost_and_found_rows(
                 if kind is None:
                     report["unmapped_rows"] += 1
                     continue
+                rejected_prompt_candidate: tuple[str, str] | None = None
+                if (
+                    kind == "sessions"
+                    and system_prompt_hash_index >= 0
+                    and len(cells) > system_prompt_hash_index
+                    and isinstance(cells[0], str)
+                    and isinstance(cells[system_prompt_hash_index], str)
+                ):
+                    rejected_prompt_candidate = (
+                        cells[0],
+                        cells[system_prompt_hash_index],
+                    )
                 try:
                     if kind == "cold_archive_tombstones":
                         inserted = _insert_prefix_row(
@@ -597,6 +646,8 @@ def map_lost_and_found_rows(
                             sessions_defaults,
                         )
                 except sqlite3.DatabaseError:
+                    if rejected_prompt_candidate is not None:
+                        rejected_session_prompts.add(rejected_prompt_candidate)
                     report["unmapped_rows"] += 1
                     continue
                 if inserted:
@@ -604,8 +655,24 @@ def map_lost_and_found_rows(
                         "sessions" if kind == "sessions" else kind
                     ] += 1
                 else:
+                    if rejected_prompt_candidate is not None:
+                        rejected_session_prompts.add(rejected_prompt_candidate)
                     report["insert_conflicts"] += 1
-        report["tombstone_reconciliation"] = reconcile_cold_archive_tombstones(dest)
+        tombstoned_ids = {
+            str(row[0])
+            for row in dest.execute(
+                "SELECT session_id FROM cold_archive_tombstones"
+            ).fetchall()
+        }
+        rejected_prompt_hashes = {
+            prompt_hash
+            for session_id, prompt_hash in rejected_session_prompts
+            if session_id in tombstoned_ids
+        }
+        report["tombstone_reconciliation"] = reconcile_cold_archive_tombstones(
+            dest,
+            rejected_prompt_hashes=rejected_prompt_hashes,
+        )
         dest.execute("COMMIT")
     except BaseException:
         dest.execute("ROLLBACK")

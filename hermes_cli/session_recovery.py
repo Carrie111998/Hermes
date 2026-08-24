@@ -35,9 +35,9 @@ _CANONICAL_TABLES = (
     "sessions",
     "messages",
     "session_model_usage",
+    "gateway_routing",
     "cold_archive_tombstones",
     "compression_locks",
-    "gateway_routing",
     "async_delegations",
 )
 

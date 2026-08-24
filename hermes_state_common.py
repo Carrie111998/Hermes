@@ -505,6 +505,32 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
+CREATE TRIGGER IF NOT EXISTS gateway_routing_reject_cold_archive_tombstone_insert
+BEFORE INSERT ON gateway_routing
+WHEN CASE
+    WHEN json_valid(NEW.entry_json) THEN EXISTS (
+        SELECT 1 FROM cold_archive_tombstones
+        WHERE session_id = json_extract(NEW.entry_json, '$.session_id')
+    )
+    ELSE 0
+END
+BEGIN
+    SELECT RAISE(ABORT, 'gateway route targets a cold-archived session ID');
+END;
+
+CREATE TRIGGER IF NOT EXISTS gateway_routing_reject_cold_archive_tombstone_update
+BEFORE UPDATE OF entry_json ON gateway_routing
+WHEN CASE
+    WHEN json_valid(NEW.entry_json) THEN EXISTS (
+        SELECT 1 FROM cold_archive_tombstones
+        WHERE session_id = json_extract(NEW.entry_json, '$.session_id')
+    )
+    ELSE 0
+END
+BEGIN
+    SELECT RAISE(ABORT, 'gateway route targets a cold-archived session ID');
+END;
+
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0

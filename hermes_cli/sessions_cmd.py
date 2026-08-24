@@ -942,13 +942,16 @@ def cmd_sessions(args, sessions_parser=None):
 
         from hermes_cli.session_cold_store import (
             _exclusive_cold_archive_root_lock,
+            _exclusive_lineage_accounting_locks,
             purge_archived_lineage,
             store_archived_lineage,
             verify_archived_lineage,
         )
 
         try:
-            with _exclusive_cold_archive_root_lock(archive_root):
+            with _exclusive_cold_archive_root_lock(
+                archive_root
+            ), _exclusive_lineage_accounting_locks(db, resolved_session_id):
                 try:
                     stored = store_archived_lineage(
                         db, resolved_session_id, archive_root
