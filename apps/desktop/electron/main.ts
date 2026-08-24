@@ -15409,10 +15409,11 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
-  // Warm the login-shell PATH resolution immediately so it usually completes
-  // before the backend start path awaits the same single-flight promise.
-  void ensureLoginShellPath()
+app.whenReady().then(async () => {
+  // Resolve the login-shell PATH before any startup path can resolve tools.
+  // The updater may be triggered before backend startup, so fire-and-forget
+  // warmup leaves a NixOS GUI launch with a race against the current PATH.
+  await ensureLoginShellPath()
 
   const systemCa = installWindowsSystemCaTrust(tls)
 
