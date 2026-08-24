@@ -15,6 +15,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):

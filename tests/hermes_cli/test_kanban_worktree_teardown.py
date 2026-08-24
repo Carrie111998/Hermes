@@ -18,6 +18,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 def _git(*args: str, cwd: str | None = None) -> str:
     result = subprocess.run(

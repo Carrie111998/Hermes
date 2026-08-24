@@ -21,6 +21,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 WORKER_HOOKS = (
     "on_kanban_worker_spawned",
     "on_kanban_worker_exited",
@@ -142,7 +144,7 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["assignee"] == "worker"
-    assert kw["worker_pid"] is None
+    assert isinstance(kw["worker_pid"], int)
     assert kw["heartbeat_stale"] is False
     assert kw["retry_status"] == "ready"
     assert kw["run_id"] is not None
@@ -173,7 +175,7 @@ def test_raising_callbacks_never_break_worker_lifecycle(
 
             kb.claim_task(conn, tid)
             conn.execute(
-                "UPDATE tasks SET claim_expires = ?, worker_pid = NULL "
+                "UPDATE tasks SET claim_expires = ? "
                 "WHERE id = ?",
                 (int(time.time()) - 100, tid),
             )

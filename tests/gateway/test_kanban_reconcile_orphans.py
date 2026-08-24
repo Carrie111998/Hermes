@@ -28,6 +28,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -52,6 +54,11 @@ def conn(kanban_home):
 def _orphan_running(conn, tid, *, claim_lock=None, claim_expires=None,
                     worker_pid=None):
     """Force a task into running with (partially) broken claim bookkeeping."""
+    current = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()
+    if current is not None and current["current_run_id"] is None:
+        assert kb.claim_task(conn, tid, claimer="synthetic:worker") is not None
     conn.execute(
         "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
         "worker_pid=? WHERE id=?",

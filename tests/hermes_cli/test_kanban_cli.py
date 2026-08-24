@@ -13,6 +13,8 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -131,8 +133,6 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
 def test_run_slash_reclaim_running_task(kanban_home):
     import re
-    import time
-    import secrets
     from hermes_cli import kanban_db as kb
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
@@ -140,29 +140,17 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert m
     tid = m.group(1)
 
-    # Simulate a running claim outside TTL.
+    # Use the real claim path; the lifecycle fixture supplies the exact
+    # synthetic Linux PID/identity pair required by guarded reclaim.
     conn = kb.connect()
     try:
-        lock = secrets.token_hex(4)
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, int(time.time()) + 3600, 4242, tid),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (tid, lock, int(time.time()) + 3600, 4242, int(time.time())),
-        )
-        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (rid, tid))
-        conn.commit()
+        claimed = kb.claim_task(conn, tid, claimer="test:worker")
+        assert claimed is not None
     finally:
         conn.close()
 
     out = kc.run_slash(f"reclaim {tid} --reason 'test'")
     assert "Reclaimed" in out, out
-    # Status back to ready.
     out2 = kc.run_slash(f"show {tid}")
     assert "ready" in out2.lower()
 

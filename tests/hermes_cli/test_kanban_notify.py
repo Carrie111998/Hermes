@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -820,15 +822,13 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     finally:
         conn.close()
 
-    import os
-    os.environ["HERMES_KANBAN_TASK"] = tid
-    try:
-        kt._handle_complete({
-            "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
-        })
-    finally:
-        os.environ.pop("HERMES_KANBAN_TASK", None)
+    import json
+    completed = json.loads(kt._handle_complete({
+        "task_id": tid,
+        "summary": "one real, one ghost",
+        "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
+    }))
+    assert completed.get("ok") is True
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
