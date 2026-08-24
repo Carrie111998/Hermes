@@ -26,7 +26,7 @@ function connectionCacheKey(connection: HermesConnection | null) {
       ? connection.remoteIdentity || connection.remoteHost || ''
       : connection.baseUrl || ''
 
-  return `${connection.mode || 'local'}:${connection.remoteKind || ''}:${connection.profile || ''}:${target}`
+  return `${connection.mode || 'local'}:${connection.remoteKind || ''}:${connection.connectionId || ''}:${connection.profile || ''}:${target}`
 }
 
 export function desktopFsCacheKey(connection: HermesConnection | null = $connection.get()) {
@@ -37,10 +37,15 @@ export function isDesktopFsRemoteMode() {
   return $connection.get()?.mode === 'remote'
 }
 
-// Active profile for FS/git REST calls. Without it the Electron api bridge
-// hits the primary (local) backend even when the user switched to a remote profile.
+// Active profile and registered connection for FS/git REST calls. Without
+// both, Electron can fall back to the legacy profile route and read from a
+// different gateway than the session that produced the path.
 export function desktopFsProfile(): string | undefined {
   return $connection.get()?.profile || undefined
+}
+
+export function desktopFsConnectionId(): string | undefined {
+  return $connection.get()?.connectionId || undefined
 }
 
 function fsPath(endpoint: string, filePath: string) {
@@ -58,9 +63,16 @@ function bridge() {
 }
 
 function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  return bridge().api<T>(
-    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
-  )
+  const connectionId = desktopFsConnectionId()
+  const profile = desktopFsProfile()
+
+  const route = {
+    ...(connectionId ? { connectionId } : {}),
+    path,
+    ...(profile ? { profile } : {})
+  }
+
+  return bridge().api<T>(body ? { ...route, body, method: 'POST' } : route)
 }
 
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {

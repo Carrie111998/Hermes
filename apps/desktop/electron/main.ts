@@ -4978,7 +4978,13 @@ function downloadViaTokenToFile(url, token, ctx, options: any = {}) {
       parsed,
       {
         method: 'GET',
-        headers: options.bearer ? { Authorization: `Bearer ${options.bearer}` } : { 'X-Hermes-Session-Token': token }
+        headers: {
+          ...headersForRemoteRequest(url),
+          ...(options.headers || {}),
+          ...(options.bearer
+            ? { Authorization: 'Bearer ' + options.bearer }
+            : { 'X-Hermes-Session-Token': token })
+        }
       },
       res => {
         // Headers arrived — the connection phase is done. Drop the idle timeout
@@ -7384,6 +7390,13 @@ function downloadViaOauthSessionToFile(url, ctx, options: any = {}) {
       redirect: 'follow'
     } as any)
 
+    for (const [name, value] of Object.entries({
+      ...headersForRemoteRequest(url),
+      ...(options.headers || {})
+    })) {
+      request.setHeader(name, String(value))
+    }
+
     let settled = false
 
     const timer = setTimeout(() => {
@@ -7510,16 +7523,24 @@ async function saveGatewayFile(payload: any = {}) {
   }
 
   const profile = payload.profile || null
-  const connection = await ensureBackend(profile)
+  const connectionId = String(payload.connectionId || '').trim()
+
+  const connection = connectionId
+    ? await ensureRegistryBackend(connectionId, profile)
+    : await ensureBackend(profile)
+
   const suggested = String(payload.suggestedName || '').trim()
   const fallbackName = path.basename(filePath) || suggested || 'download'
   const ctx = { suggested, fallbackName }
 
-  const requestPath = pathWithGlobalRemoteProfile(
-    `/api/fs/download?path=${encodeURIComponent(filePath)}`,
-    profile,
-    profileRouteOptions(profile)
-  )
+  const routePath = requestPath =>
+    connectionId
+      ? connection.sharedRemote
+        ? pathWithProfileScope(requestPath, profile)
+        : translateSelfProfileQuery(requestPath, profile, connection.remoteProfile)
+      : pathWithGlobalRemoteProfile(requestPath, profile, profileRouteOptions(profile))
+
+  const requestPath = routePath(`/api/fs/download?path=${encodeURIComponent(filePath)}`)
 
   const url = `${connection.baseUrl}${requestPath}`
 
@@ -7527,20 +7548,23 @@ async function saveGatewayFile(payload: any = {}) {
     const auth = await gatedFileAuth(connection)
 
     if (auth.kind === 'bearer') {
-      return await downloadViaTokenToFile(url, auth.token, ctx, { bearer: auth.token })
+      return await downloadViaTokenToFile(url, auth.token, ctx, {
+        bearer: auth.token,
+        headers: connection.headers
+      })
     }
 
     if (auth.kind === 'cookie') {
-      return await downloadViaOauthSessionToFile(url, ctx)
+      return await downloadViaOauthSessionToFile(url, ctx, { headers: connection.headers })
     }
 
-    return await downloadViaTokenToFile(url, auth.token, ctx)
+    return await downloadViaTokenToFile(url, auth.token, ctx, { headers: connection.headers })
   } catch (error) {
     // Desktop and the remote gateway update independently. A gateway predating
     // /api/fs/download 404s here; fall back (ONLY on 404) to the older capped
     // data-URL route so downloads keep working against older backends.
     if (isNotFoundError(error)) {
-      return await saveGatewayFileViaDataUrl(connection, profile, filePath, ctx)
+      return await saveGatewayFileViaDataUrl(connection, profile, filePath, ctx, routePath)
     }
 
     throw error
@@ -7551,23 +7575,23 @@ async function saveGatewayFile(payload: any = {}) {
 // `/api/fs/read-data-url` route, decode it, and save. Bounded by the gateway's
 // data-URL cap, so it only serves smaller files — enough to keep older gateways
 // working until they gain the streaming route.
-async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any = {}) {
-  const requestPath = pathWithGlobalRemoteProfile(
-    `/api/fs/read-data-url?path=${encodeURIComponent(filePath)}`,
-    profile,
-    profileRouteOptions(profile)
-  )
+async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any = {}, routePath?) {
+  const fallbackPath = `/api/fs/read-data-url?path=${encodeURIComponent(filePath)}`
+
+  const requestPath = routePath
+    ? routePath(fallbackPath)
+    : pathWithGlobalRemoteProfile(fallbackPath, profile, profileRouteOptions(profile))
 
   const url = `${connection.baseUrl}${requestPath}`
   const auth = await gatedFileAuth(connection)
   let json: any
 
   if (auth.kind === 'bearer') {
-    json = await fetchJson(url, null, { bearer: auth.token })
+    json = await fetchJson(url, null, { bearer: auth.token, headers: connection.headers })
   } else if (auth.kind === 'cookie') {
-    json = await fetchJsonViaOauthSession(url)
+    json = await fetchJsonViaOauthSession(url, { headers: connection.headers })
   } else {
-    json = await fetchJson(url, auth.token)
+    json = await fetchJson(url, auth.token, { headers: connection.headers })
   }
 
   const dataUrl = json?.dataUrl

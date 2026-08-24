@@ -208,6 +208,7 @@ export async function downloadGatewayMediaFile(
   }
 
   return window.hermesDesktop.saveGatewayFile({
+    connectionId: conn?.connectionId,
     path: file,
     profile: conn?.profile,
     suggestedName: mediaName(file)

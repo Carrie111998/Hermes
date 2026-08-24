@@ -46,6 +46,15 @@ test('oauth transport streams to disk instead of buffering the whole body', () =
   assert.doesNotMatch(fn, /chunks\.push/)
 })
 
+test('download transports preserve registered connection headers', () => {
+  const token = extract('function downloadViaTokenToFile', '\nfunction ')
+  const oauth = extract('function downloadViaOauthSessionToFile', '\nasync function finalizeGatewayDownload')
+
+  assert.match(token, /\.\.\.\(options\.headers \|\| \{\}\)/)
+  assert.match(oauth, /options\.headers/)
+  assert.match(oauth, /request\.setHeader/)
+})
+
 test('finalizeGatewayDownload prompts a save dialog then streams the response', () => {
   const fn = extract('async function finalizeGatewayDownload', '\nfunction readGatewayErrorText')
 
@@ -61,6 +70,18 @@ test('saveGatewayFile falls back to the data-url route only on 404', () => {
   assert.match(fn, /\/api\/fs\/download\?path=/)
   assert.match(fn, /isNotFoundError\(error\)/)
   assert.match(fn, /saveGatewayFileViaDataUrl\(/)
+})
+
+test('saveGatewayFile pins downloads to a registered connection when supplied', () => {
+  const fn = extract('async function saveGatewayFile', '\nasync function saveGatewayFileViaDataUrl')
+  const fallback = extract('async function saveGatewayFileViaDataUrl', '// Mint a single-use WS ticket')
+
+  assert.match(fn, /payload\.connectionId/)
+  assert.match(fn, /ensureRegistryBackend\(connectionId, profile\)/)
+  assert.match(fn, /pathWithProfileScope/)
+  assert.match(fn, /translateSelfProfileQuery/)
+  assert.match(fn, /headers: connection\.headers/)
+  assert.match(fallback, /headers: connection\.headers/)
 })
 
 test('data-url fallback reads the capped route and decodes it', () => {

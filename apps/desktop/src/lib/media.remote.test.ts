@@ -225,7 +225,7 @@ describe('downloadGatewayMediaFile', () => {
   beforeEach(() => {
     saveGatewayFile.mockClear()
     vi.stubGlobal('window', { hermesDesktop: { saveGatewayFile } })
-    $connection.set({ mode: 'remote', profile: 'docker-gw' } as never)
+    $connection.set({ mode: 'remote', profile: 'docker-gw', connectionId: 'ssh-gateway' } as never)
   })
 
   afterEach(() => {
@@ -240,6 +240,7 @@ describe('downloadGatewayMediaFile', () => {
     })
 
     expect(saveGatewayFile).toHaveBeenCalledWith({
+      connectionId: 'ssh-gateway',
       path: '/Users/me/project/a b.md',
       profile: 'docker-gw',
       suggestedName: 'a b.md'

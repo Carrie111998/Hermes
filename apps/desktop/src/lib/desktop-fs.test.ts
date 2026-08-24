@@ -144,6 +144,18 @@ describe('desktop filesystem facade', () => {
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
   })
 
+  it('pins remote preview reads to the active registered connection', async () => {
+    $connection.set({ mode: 'remote', profile: 'opus-manager', connectionId: 'ssh-gateway' } as never)
+
+    await readDesktopFileText('/home/hermes/review.md')
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'ssh-gateway',
+      path: '/api/fs/read-text?path=%2Fhome%2Fhermes%2Freview.md',
+      profile: 'opus-manager'
+    })
+  })
+
   it('keys SSH filesystem caches by stable host identity instead of the forwarded port', () => {
     $connection.set({
       mode: 'remote',
@@ -163,6 +175,32 @@ describe('desktop filesystem facade', () => {
     expect(desktopFsCacheKey()).toBe(first)
     expect(first).toContain('operator@remote-box')
     expect(first).not.toContain('41001')
+  })
+
+  it('separates SSH filesystem caches by registered connection while ignoring forwarded-port churn', () => {
+    const base = {
+      mode: 'remote',
+      remoteKind: 'ssh',
+      remoteHost: 'operator@remote-box',
+      profile: 'opus-manager'
+    }
+
+    const first = desktopFsCacheKey({ ...base, baseUrl: 'http://127.0.0.1:41001', connectionId: 'gateway-a' } as never)
+
+    const reconnected = desktopFsCacheKey({
+      ...base,
+      baseUrl: 'http://127.0.0.1:52002',
+      connectionId: 'gateway-a'
+    } as never)
+
+    const otherConnection = desktopFsCacheKey({
+      ...base,
+      baseUrl: 'http://127.0.0.1:41001',
+      connectionId: 'gateway-b'
+    } as never)
+
+    expect(reconnected).toBe(first)
+    expect(otherConnection).not.toBe(first)
   })
 
   it('separates SSH filesystem caches by ownership and profile', () => {
