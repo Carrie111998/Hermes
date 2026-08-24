@@ -11,6 +11,7 @@ import {
   chatMessageText,
   completeOpenTimelineParts,
   type GatewayEventPayload,
+  isRedeliveredAssistantText,
   mergeFinalAssistantText,
   reasoningPart,
   renderMediaTags,
@@ -502,6 +503,29 @@ export function useMessageStream({
 
         if (!authoritativeText) {
           return state
+        }
+
+        // The gateway can redeliver a message.interim (reconnect replay), and
+        // the standalone append below would paint the same commentary twice
+        // (#93926): each copy gets a fresh id, so nothing downstream can
+        // dedupe it. Drop restatements of recent assistant text; genuinely
+        // new commentary never matches. already_streamed is deliberately NOT
+        // a suppression signal here: it marks events whose text was also
+        // streamed as deltas, and when no bubble is open those deltas are
+        // gone — the event is the only durable copy and must append.
+        if (
+          !state.streamId ||
+          !state.messages.some(m => m.id === state.streamId)
+        ) {
+          // No open streaming bubble (or its id dangles post-rehydration):
+          // this event will take the standalone-append path below, so
+          // redelivery must be dropped here instead.
+          if (isRedeliveredAssistantText(state.messages, authoritativeText)) {
+            return {
+              ...state,
+              sawAssistantPayload: true
+            }
+          }
         }
 
         const streamId = state.streamId
