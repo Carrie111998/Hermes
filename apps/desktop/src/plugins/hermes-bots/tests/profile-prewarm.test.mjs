@@ -52,6 +52,8 @@ function renderBotRow(input = 'alpha') {
     ROSTER_KEY: ['hermes-bots', 'roster'],
     $botMeta: atom({}),
     $botUnread: atom({}),
+    $botAttention: atom({}),
+    BOT_ATTENTION_HINTS: {},
     $botChatFocused: atom(false),
     $botsHomeFronted: atom(false),
     $focusedBotOwner: atom({ connectionId: 'local', profile: 'default' }),
@@ -106,7 +108,9 @@ function renderBotRow(input = 'alpha') {
     A2A_PREFIX_RE: /^$/,
     // Mid-turn state of the FOCUSED chat — what the row's typing dots read.
     $workingChats: atom([]),
+    $stalledChats: atom([]),
     botOwnsWorkingChat: () => false,
+    botOwnsStalledChat: () => false,
     useEffect: () => undefined,
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
@@ -252,6 +256,8 @@ test('behavior: remote default never opens the same-name local chat', async () =
     ROSTER_KEY: ['hermes-bots', 'roster'],
     $botMeta: atom({ default: { chat: 'this-device-chat' } }),
     $botUnread: atom({}),
+    $botAttention: atom({}),
+    BOT_ATTENTION_HINTS: {},
     $botChatFocused: atom(false),
     $botsHomeFronted: atom(false),
     $focusedBotOwner: atom({ connectionId: 'mac-mini', profile: 'default' }),
@@ -297,7 +303,9 @@ test('behavior: remote default never opens the same-name local chat', async () =
     A2A_PREFIX_RE: /^$/,
     // Mid-turn state of the FOCUSED chat — what the row's typing dots read.
     $workingChats: atom([]),
+    $stalledChats: atom([]),
     botOwnsWorkingChat: () => false,
+    botOwnsStalledChat: () => false,
     useEffect: () => undefined,
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {

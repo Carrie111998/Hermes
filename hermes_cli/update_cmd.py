@@ -226,6 +226,68 @@ def _run_migrate_config_fresh(*, interactive: bool = False, quiet: bool = False)
     return migrate_config(interactive=interactive, quiet=quiet)
 
 
+def _migrate_sibling_profile_configs() -> list[tuple[str, int, int]]:
+    """Migrate every SIBLING profile's config.yaml to the current version.
+
+    #91277 Phase 2 (fleet-wide config migration; #20438/#54926/#79048): the
+    shared checkout serves every profile, but ``hermes update`` historically
+    migrated only the active profile's config — siblings drifted versions
+    until their gateway hit a config the new code couldn't read.
+
+    Per profile home (skipping the active one, already migrated by the
+    caller): scope config reads/writes via the context-local HERMES_HOME
+    override (thread-safe — never ``os.environ``), check the version, and
+    run the NON-INTERACTIVE, quiet migration. Prompt-requiring settings are
+    left for the profile's own next interactive session, identical to the
+    gateway-mode contract for the active profile.
+
+    Returns ``[(profile_name, from_version, to_version), ...]`` for profiles
+    actually migrated. Never raises; a failing profile is skipped (its own
+    startup migration remains the fallback).
+    """
+    migrated: list[tuple[str, int, int]] = []
+    try:
+        from hermes_constants import (
+            get_process_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.profiles import _get_profiles_root, _PROFILE_ID_RE
+
+        active_home = get_process_hermes_home()
+        root = _get_profiles_root()
+        if not root.is_dir():
+            return migrated
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
+                continue
+            try:
+                if entry.resolve() == Path(active_home).resolve():
+                    continue
+            except OSError:
+                continue
+            if not (entry / "config.yaml").is_file():
+                continue  # profile never configured — nothing to migrate
+            token = set_hermes_home_override(entry)
+            try:
+                current_ver, latest_ver = _run_config_check_fresh()
+                if current_ver >= latest_ver:
+                    continue
+                _run_migrate_config_fresh(interactive=False, quiet=True)
+                after_ver, _ = _run_config_check_fresh()
+                if after_ver > current_ver:
+                    migrated.append((entry.name, current_ver, after_ver))
+            except Exception as exc:
+                logger.debug(
+                    "Config migration for profile %s failed: %s", entry.name, exc
+                )
+            finally:
+                reset_hermes_home_override(token)
+    except Exception as exc:
+        logger.debug("Sibling profile enumeration failed: %s", exc)
+    return migrated
+
+
 # Critical files that Hermes must be able to import immediately after an
 # update/install. Most are imported on every CLI startup; ``web_server.py``
 # is the desktop/dashboard backend path that a fresh Windows install launches
@@ -7184,6 +7246,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print("  ✓ Configuration is up to date")
 
+        # Fleet-wide config migration (#91277 Phase 2; #20438 earliest report,
+        # #54926, #79048): the shared checkout serves EVERY profile, but the
+        # migration above only touched the active profile's config.yaml.
+        # Sibling profiles kept their old _config_version and silently
+        # drifted (field repro: sibling gateway restarted onto new code but
+        # stayed at config v33 vs v37). Run the same NON-INTERACTIVE safe
+        # migration for every sibling profile home, scoped via the
+        # context-local HERMES_HOME override (never os.environ — other
+        # threads must not see it).
+        try:
+            _migrated_siblings = _migrate_sibling_profile_configs()
+            for _name, _from_ver, _to_ver in _migrated_siblings:
+                print(
+                    f"  ✓ Profile '{_name}': config format updated "
+                    f"(v{_from_ver} → v{_to_ver})"
+                )
+        except Exception as exc:
+            logger.debug("Sibling config migration failed: %s", exc)
+
         # Safety net: config-version migrations have been observed to leave
         # cron/jobs.json valid-but-empty, silently dropping every scheduled
         # job (issue #34600). The desktop scheduler can also overwrite with
@@ -8222,11 +8303,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print_fleet_version_matrix,
             )
 
-            # A brief settle window: freshly restarted gateways need a
-            # moment to rewrite gateway_state.json with their new identity.
+            # Cross-platform "we expected fleet rows" signal (#93406). The
+            # old (restarted_services or killed_pids) condition never fires
+            # on Windows: the pause/resume phase populates neither list, so
+            # a healthy resumed gateway yielded zero rows and exit 0.
+            _fleet_rows_expected = _m()._fleet_probe_expected_runtimes(
+                _pre_update_plan,
+                _pre_restart_gateway_pids,
+                _windows_gateway_resume,
+                restarted_services,
+                killed_pids,
+            )
+            # A brief settle window: freshly restarted/resumed gateways need
+            # a moment to rewrite gateway_state.json with their new identity.
             # Skipped when the restart phase touched nothing (no gateways
             # were running) — nothing to settle.
-            if restarted_services or killed_pids:
+            if _fleet_rows_expected:
                 _time.sleep(2.0)
             # Pass the pre-restart PID snapshot so a gateway the restart
             # phase stopped WITHOUT a verified replacement shows as a DOWN
@@ -8235,6 +8327,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 pre_restart_pids=_pre_restart_gateway_pids
             )
             if print_fleet_version_matrix(_fleet_snapshot):
+                gateway_fleet_restart_incomplete = True
+            elif not _fleet_snapshot and _fleet_rows_expected:
+                # Fleet probe returned zero rows even though at least one
+                # gateway runtime was (or may have been) live pre-update —
+                # POSIX restart bookkeeping, the pre-restart PID snapshot,
+                # the pre-update plan inventory, or the Windows pause/resume
+                # token all count as that signal.  Every failure path inside
+                # collect_fleet_versions() is swallowed via logger.debug(),
+                # so an empty list is indistinguishable from a healthy fleet
+                # in the current output.  Treat it as verification failure
+                # so the receipt records "partial" and the exit code is 1
+                # (#93406).
+                print(
+                    "\n⚠ Fleet version check returned no rows even though"
+                    " gateway runtimes were expected — verification incomplete."
+                )
                 gateway_fleet_restart_incomplete = True
         except Exception as _fleet_exc:
             logger.debug("Fleet version verification failed: %s", _fleet_exc)
@@ -8351,6 +8459,61 @@ def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:
         return True
     # surviving == []: safe only if we know nothing was running beforehand.
     return pre_restart_pids is None or bool(pre_restart_pids)
+
+
+def _fleet_probe_expected_runtimes(
+    pre_update_plan,
+    pre_restart_pids,
+    windows_resume_token,
+    restarted_services,
+    killed_pids,
+) -> bool:
+    """Whether the post-update fleet probe should have produced rows.
+
+    The zero-rows fail-open (#93406): ``collect_fleet_versions()`` swallows
+    every probe failure via ``logger.debug()`` and ``print_fleet_version_matrix([])``
+    early-returns ``False``, so an empty snapshot reads as \"healthy fleet\" and
+    the update exits 0.  An empty snapshot is only proof-of-safety when NOTHING
+    says a gateway existed before the update.  Any of these signals means at
+    least one runtime was (or may have been) live pre-update, so zero rows is
+    verification failure, not health:
+
+    * ``restarted_services`` / ``killed_pids`` — the POSIX restart phase
+      touched live gateways.
+    * ``pre_restart_pids`` non-empty, or ``None`` (pre-state unreadable —
+      cannot prove nothing was running; same contract as
+      ``_restart_phase_failure_is_incomplete``, #78574).
+    * the pre-update plan inventoried ≥1 runtime.
+    * the Windows pause/resume token carries paused ``profiles`` or
+      ``unmapped`` entries — ``_pause_windows_gateways_for_update`` /
+      ``_resume_windows_gateways_after_update`` populate NEITHER
+      ``restarted_services`` NOR ``killed_pids``, which is exactly why the
+      original ``(restarted_services or killed_pids)`` guard never fires on
+      Windows.
+
+    The same condition gates the 2.0s settle sleep: a freshly resumed Windows
+    gateway needs the settle window to rewrite ``gateway_state.json`` just
+    like a systemd-restarted one.
+
+    Note this keys ONLY on zero-rows-despite-expected-runtimes.  A non-empty
+    snapshot — including rows in ``unknown`` state — is still judged solely by
+    ``print_fleet_version_matrix``.
+    """
+    if restarted_services or killed_pids:
+        return True
+    if pre_restart_pids is None or pre_restart_pids:
+        return True
+    try:
+        if pre_update_plan is not None and pre_update_plan.runtimes:
+            return True
+    except Exception:
+        pass
+    if isinstance(windows_resume_token, dict) and (
+        windows_resume_token.get("profiles")
+        or windows_resume_token.get("unmapped")
+    ):
+        return True
+    return False
 
 
 def _print_items(items, label, key, fallback_key=None):
