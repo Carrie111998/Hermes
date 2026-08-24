@@ -83,7 +83,7 @@ def format_usage_text(report: dict[str, Any]) -> str:
         return f"{name}      unknown ({report.get('reason') or 'no official quota source'})"
     if status != "ok":
         return f"{name}      unavailable"
-    header = f"📈 Account limits"
+    header = "📈 Account limits"
     plan = report.get("plan")
     lines = [header, f"Provider: {provider} ({plan})" if plan else f"Provider: {provider}"]
     for window in report.get("windows") or []:
@@ -128,9 +128,15 @@ def usage_command(args) -> int:
     if as_json:
         print(json.dumps({"providers": official + [grok]}, indent=2))
         return 0
-    for report in official:
-        if report.get("status") == "ok":
+    ok_reports = [report for report in official if report.get("status") == "ok"]
+    if not ok_reports:
+        print("No official quota sources are signed in.")
+        for report in official:
             print(format_usage_text(report))
+        print(format_usage_text(grok))
+        return 0
+    for report in ok_reports:
+        print(format_usage_text(report))
     print(format_usage_text(grok))
     return 0
 

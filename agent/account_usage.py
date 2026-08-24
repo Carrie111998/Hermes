@@ -72,23 +72,26 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     return None
 
 
-def _format_reset(dt: Optional[datetime]) -> str:
+def _format_reset(dt: Optional[datetime], *, include_local: bool = True) -> str:
     if not dt:
         return "unknown"
     local_dt = dt.astimezone()
     delta = dt - _utc_now()
     total_seconds = int(delta.total_seconds())
     if total_seconds <= 0:
-        return f"now ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
-    hours, rem = divmod(total_seconds, 3600)
-    minutes = rem // 60
-    if hours >= 24:
-        days, hours = divmod(hours, 24)
-        rel = f"in {days}d {hours}h"
-    elif hours > 0:
-        rel = f"in {hours}h {minutes}m"
+        rel = "now"
     else:
-        rel = f"in {minutes}m"
+        hours, rem = divmod(total_seconds, 3600)
+        minutes = rem // 60
+        if hours >= 24:
+            days, hours = divmod(hours, 24)
+            rel = f"in {days}d {hours}h"
+        elif hours > 0:
+            rel = f"in {hours}h {minutes}m"
+        else:
+            rel = f"in {minutes}m"
+    if not include_local:
+        return rel
     return f"{rel} ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
 
 
@@ -953,9 +956,7 @@ def compact_account_usage_line(snapshot: AccountUsageSnapshot) -> str:
         remaining = max(0, round(100.0 - float(window.used_percent)))
         bit = f"{window.label} {remaining}% left"
         if window.reset_at:
-            rel = _format_reset(window.reset_at)
-            # Drop the local-clock parenthetical for one-line status surfaces.
-            bit += f", resets {rel.split(' (', 1)[0]}"
+            bit += f", resets {_format_reset(window.reset_at, include_local=False)}"
         elif window.detail:
             bit += f" · {window.detail}"
         parts.append(bit)
