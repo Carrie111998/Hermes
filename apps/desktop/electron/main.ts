@@ -5383,6 +5383,12 @@ function runRenderTitleJob(rawUrl) {
     const parsed = sanitizableTitleUrl(rawUrl)
 
     if (!app.isReady() || !parsed) {
+      if (!app.isReady()) {
+        rememberLog(`Link title fetch skipped (app not ready): ${String(rawUrl || '').slice(0, 120)}`)
+      } else {
+        rememberLog(`Link title fetch skipped (not a valid http(s) URL): ${String(rawUrl || '').slice(0, 120)}`)
+      }
+
       return resolve('')
     }
 
@@ -5483,7 +5489,7 @@ function fetchLinkTitle(rawUrl) {
     return Promise.resolve('')
   }
 
-  const url = String(rawUrl).trim()
+  const url = parsed.href
   const key = canonicalTitleCacheKey(url)
 
   if (!key) {

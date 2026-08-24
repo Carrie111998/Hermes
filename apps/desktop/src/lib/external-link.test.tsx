@@ -90,6 +90,18 @@ describe('external link helpers', () => {
       expect(normalizeExternalUrl('@url:https://example.com/x')).toBe('https://example.com/x')
     })
 
+    it('peels trailing punctuation from the bare form (review follow-up)', () => {
+      expect(normalizeExternalUrl('@url:https://example.com.')).toBe('https://example.com')
+      expect(normalizeExternalUrl('@url:https://example.com/x,')).toBe('https://example.com/x')
+    })
+
+    it('does NOT unwrap @file/@folder — local paths must not become links', () => {
+      // The wrapper keeps these inert downstream rather than promoting a bare
+      // path to a link value (#93893 review, point 1).
+      expect(normalizeExternalUrl('@file:`/home/user/report.md`')).toBe('@file:`/home/user/report.md`')
+      expect(isTitleFetchable('@file:`/home/user/report.md`')).toBe(false)
+    })
+
     it('leaves plain URLs and non-directive text untouched', () => {
       expect(normalizeExternalUrl('https://example.com')).toBe('https://example.com')
       expect(normalizeExternalUrl('not a directive but @url: is mentioned mid-sentence')).toBe(

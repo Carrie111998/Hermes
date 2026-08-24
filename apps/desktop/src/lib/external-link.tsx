@@ -27,13 +27,10 @@ const LOCAL_HOST_RE = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?$/
 const ERROR_TITLE_RE =
   /\b(?:access denied|attention required|captcha|error|forbidden|just a moment|not found|request blocked|too many requests)\b/i
 
-// Wire-format directive wrapper, e.g. `@url:`https://x`` — the chip markup can
-// reach this module verbatim from transcript text that was never parsed into
-// chips (artifacts scan raw message text; third-party callers pass stored
-// strings). Handing the wrapper to `new URL()` yields a bogus host
-// (`@url`), which is how ERR_NAME_NOT_RESOLVED noise leaked into the main
-// process (#93893).
-const DIRECTIVE_WRAPPER_RE = /^@(?:url|image|file|folder):(`[^`\n]*`|"[^"\n]*"|'[^'\n]*'|(\S+))/
+// Wire-format directive wrapper. Only link-ish kinds unwrap here — `@file:` /
+// `@folder:` values are local paths, and unwrapping those would turn an
+// obviously-inert token into a plausible-looking link value (#93893 review).
+const DIRECTIVE_WRAPPER_RE = /^@(?:url|image):(`[^`\n]*`|"[^"\n]*"|'[^'\n]*'|\S+)/
 
 export function normalizeExternalUrl(value: string): string {
   let trimmed = value.trim()
@@ -46,7 +43,9 @@ export function normalizeExternalUrl(value: string): string {
     trimmed = (
       inner.length >= 2 && (inner[0] === '`' || inner[0] === '"' || inner[0] === "'") && inner.at(-1) === inner[0]
         ? inner.slice(1, -1)
-        : inner
+        : // Bare (unquoted) form: peel trailing prose punctuation so
+          // `@url:https://example.com.` doesn't keep the dot as a host segment.
+          inner.replace(/[.,;:!?)\]}'"]+$/, '')
     ).trim()
   }
 
