@@ -36,7 +36,8 @@ Paco routes Home Team agents, sessions, tasks, tools, channels, approvals,
 runtime health, and workspace activity through the existing MC-02/04/05/10
 and HOS-04 authorities. Forge routes tenant-safe Player work, runs, usage,
 connections, approvals, outcomes, and sanitized health through MC-20/22/23/24
-and the existing SaaS authorities. Atlas publishes bounded worker/process,
+and the existing SaaS authorities. Governed Digital Experience work remains on
+the existing DE/Project Builder authorities and approval gates. Atlas publishes bounded worker/process,
 host-metric, deployment, recovery, and failure health through the read-only
 MC-29 observer. Locker Room consumes customer-safe MC-20 and health
 projections. None of these mappings creates a new store or execution engine.
