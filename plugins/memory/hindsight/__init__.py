@@ -401,6 +401,30 @@ REFLECT_SCHEMA = {
     },
 }
 
+UPDATE_MEMORY_SCHEMA = {
+    "name": "hindsight_update_memory",
+    "description": (
+        "Correct or time-anchor a memory already stored via hindsight_retain. "
+        "Use occurred_start/occurred_end to set when the fact actually happened "
+        "(retain always stamps write time, not event time), and/or text/context "
+        "to fix the stored content. Only world/experience facts can be curated — "
+        "observations are derived and regenerate from their sources, so updating "
+        "one has no effect. Timestamps are ISO-8601 strings; pass an empty string "
+        "to clear a field, omit a field to leave it unchanged."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of the memory to update, as returned by hindsight_recall."},
+            "occurred_start": {"type": "string", "description": "ISO-8601 timestamp for when the fact started/occurred. Empty string clears it."},
+            "occurred_end": {"type": "string", "description": "ISO-8601 timestamp for when the fact ended. Empty string clears it."},
+            "text": {"type": "string", "description": "Corrected memory text, replacing the stored fact."},
+            "context": {"type": "string", "description": "Corrected short label for the memory."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -2170,7 +2194,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, UPDATE_MEMORY_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -2242,6 +2266,39 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
+
+        elif tool_name == "hindsight_update_memory":
+            memory_id = args.get("memory_id", "")
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            # Only include fields the caller actually passed, so omitted
+            # fields are left unchanged server-side rather than cleared.
+            # An explicit empty string is still forwarded (clears the field).
+            update_fields = {
+                key: args[key]
+                for key in ("occurred_start", "occurred_end", "text", "context")
+                if key in args
+            }
+            if not update_fields:
+                return tool_error(
+                    "At least one of occurred_start, occurred_end, text, or context "
+                    "must be provided."
+                )
+            try:
+                from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
+                request = UpdateMemoryRequest(**update_fields)
+                logger.debug("Tool hindsight_update_memory: bank=%s, memory_id=%s, fields=%s",
+                             self._bank_id, memory_id, sorted(update_fields.keys()))
+                self._run_hindsight_operation(
+                    lambda client: client.memory.update_memory(
+                        bank_id=self._bank_id, memory_id=memory_id, update_memory_request=request
+                    )
+                )
+                logger.debug("Tool hindsight_update_memory: success")
+                return json.dumps({"result": "Memory updated successfully."})
+            except Exception as e:
+                logger.warning("hindsight_update_memory failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to update memory: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 
