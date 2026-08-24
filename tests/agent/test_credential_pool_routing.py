@@ -516,11 +516,10 @@ class TestFailureAttribution:
     def test_classified_billing_403_recorded_on_entry(self, tmp_path, monkeypatch):
         """A billing-classified 403 must reach the pool as `billing`, not a bare 403.
 
-        `error_classifier` maps OpenRouter's `key limit exceeded` 403 (and xAI
-        spending-limit blocks) to FailoverReason.billing, but the pool only
-        ever saw the raw status — so a sole-credential pool gave a spent
-        account the 60s transient cooldown and re-failed every minute. The
-        recovery path now forwards the classified reason so the pool can size
+        Providers such as xAI can return spending-limit blocks as 403, but the
+        pool only ever saw the raw status — so a sole-credential pool gave a
+        spent account the 60s transient cooldown and re-failed every minute.
+        The recovery path forwards the classified reason so the pool can size
         the bench correctly.
         """
         from agent.error_classifier import FailoverReason
@@ -545,6 +544,34 @@ class TestFailureAttribution:
         assert failed.last_status == "exhausted"
         assert failed.failure_reason == "billing"
 
+    def test_classified_key_limit_403_rotates_and_records_distinct_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """A per-key cap rotates credentials without becoming account billing."""
+        from agent.error_classifier import FailoverReason
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+        )
+        agent = self._agent(pool, failing_key="key-b")
+        agent._is_entitlement_failure = MagicMock(return_value=False)
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=403,
+            has_retried_429=False,
+            classified_reason=FailoverReason.key_limit,
+        )
+
+        failed = {e.id: e for e in pool.entries()}["cred-1"]
+        assert recovered is True
+        assert failed.last_status == "exhausted"
+        assert failed.failure_reason == "key_limit"
+        agent._swap_credential.assert_called_once()
+
     def test_unclassified_403_records_no_billing_reason(self, tmp_path, monkeypatch):
         """An unclassified 403 stays transient — no billing verdict is invented."""
         pool = self._make_pool(
@@ -562,4 +589,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-
