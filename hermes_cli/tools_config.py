@@ -1550,7 +1550,8 @@ def _run_cua_driver_installer(
             "https://raw.githubusercontent.com/trycua/cua/main/"
             "libs/cua-driver/scripts/install.sh"
         )
-        manual_hint = f'/bin/bash -c "$(curl -fsSL {install_url})"'
+        # Keep the manual hint portable too; `/bin/bash` is absent on NixOS/musl.
+        manual_hint = f'bash -c "$(curl -fsSL {install_url})"'
         fd, script_path = _tempfile.mkstemp(prefix="cua-driver-install-", suffix=".sh")
         os.close(fd)
         try:

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 import shutil as _shutil_mod
 from unittest.mock import patch
@@ -1012,6 +1013,13 @@ class TestInstallerNoShell:
     lane already takes it — the old ``platform.system`` → "Linux" fake was
     asserting a branch the host had already selected.
     """
+
+    def test_posix_manual_hint_uses_portable_bash(self):
+        from hermes_cli import tools_config
+
+        source = Path(tools_config.__file__).read_text(encoding="utf-8")
+        assert "manual_hint = f'bash -c" in source
+        assert "manual_hint = f'/bin/bash -c" not in source
 
     def _run(self, download_rc=0):
         from unittest.mock import MagicMock
