@@ -1132,6 +1132,44 @@ class TestToolsEndpoint:
         assert explicit is False
         assert data[0]["provenance"]["added_below_explicit_config"] is False
 
+    def test_tool_catalog_attributes_explicit_composite_members(self):
+        schema = {
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {}},
+        }
+        entry = types.SimpleNamespace(toolset="file")
+        with patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"file"},
+        ), patch(
+            "model_tools.get_tool_definitions",
+            return_value=[schema],
+        ), patch(
+            "tools.registry.registry.get_registered_toolset_aliases",
+            return_value={},
+        ), patch(
+            "tools.registry.registry.get_entry",
+            return_value=entry,
+        ), patch.object(
+            APIServerAdapter,
+            "_dynamic_platform_tool_definitions",
+            return_value=([], {}),
+        ):
+            data, enabled, explicit = APIServerAdapter._model_tool_catalog(
+                {"platform_toolsets": {"api_server": ["hermes-api-server"]}},
+                "api_server",
+            )
+
+        assert enabled == ["file"]
+        assert explicit is True
+        assert data[0]["provenance"] == {
+            "source": "configurable",
+            "toolset": "file",
+            "requested_toolsets": ["file", "hermes-api-server"],
+            "source_server": None,
+            "added_below_explicit_config": False,
+        }
+
     def test_dynamic_tool_catalog_loads_available_configured_providers(self):
         memory_provider = types.SimpleNamespace(
             is_available=lambda: True,

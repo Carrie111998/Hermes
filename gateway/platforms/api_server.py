@@ -4205,6 +4205,22 @@ class APIServerAdapter(BasePlatformAdapter):
         for name in sorted(enabled):
             requested_by_canonical.setdefault(aliases.get(name, name), []).append(name)
 
+        if explicit_names:
+            from toolsets import TOOLSETS, resolve_toolset
+
+            for explicit_name in sorted(explicit_names):
+                if explicit_name not in TOOLSETS:
+                    continue
+                composite_tools = set(resolve_toolset(explicit_name))
+                for canonical_toolset, requested_names in requested_by_canonical.items():
+                    static_tools = set(
+                        resolve_toolset(canonical_toolset, include_registry=False)
+                    )
+                    if static_tools and static_tools.issubset(composite_tools):
+                        explicit_canonical.add(canonical_toolset)
+                        if explicit_name not in requested_names:
+                            requested_names.append(explicit_name)
+
         data: List[Dict[str, Any]] = []
         for definition in definitions:
             schema = definition.get("function") or {}
