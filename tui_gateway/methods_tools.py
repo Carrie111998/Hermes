@@ -2367,6 +2367,29 @@ def _(rid, params: dict) -> dict:
         _mcp_reset_profile(token)
 
 
+@method("mcp.servers.oauth.cancel")
+def _(rid, params: dict) -> dict:
+    """Cancel a session-backed MCP OAuth flow and release its listener."""
+    name = str(params.get("name") or "").strip()
+    if not name:
+        return _err(rid, 4063, "name required")
+    session_id = str(params.get("session_id") or "").strip()
+    if not session_id:
+        return _err(rid, 4063, "session_id required")
+    token, err = _mcp_resolve_profile(rid, params)
+    if err:
+        return err
+    try:
+        from tui_gateway import mcp_oauth_sessions
+
+        result = mcp_oauth_sessions.cancel_flow(session_id, name)
+        return _ok(rid, {"ok": True, **result})
+    except Exception as e:
+        return _err(rid, 5024, str(e))
+    finally:
+        _mcp_reset_profile(token)
+
+
 @method("skills.reload")
 def _(rid, params: dict) -> dict:
     try:

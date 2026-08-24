@@ -69,4 +69,55 @@ describe('completeMcpDesktopOAuth', () => {
     expect(result.status).toBe('approved')
     expect(status).toHaveBeenCalledTimes(2)
   })
+
+  it('cancels the server flow when opening the authorization URL fails', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined)
+
+    await expect(
+      completeMcpDesktopOAuth({
+        serverName: 'reports',
+        start: vi.fn().mockResolvedValue({
+          flow_id: 'flow-open-failure',
+          server_name: 'reports',
+          status: 'authorization_required',
+          authorization_url: 'https://idp.example/authorize',
+          error: null
+        }),
+        status: vi.fn(),
+        openExternal: vi.fn().mockRejectedValue(new Error('browser unavailable')),
+        cancel,
+        sleep: async () => {}
+      })
+    ).rejects.toThrow('browser unavailable')
+
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(cancel).toHaveBeenCalledWith('flow-open-failure')
+  })
+
+  it('cancels the server flow after terminal polling failure', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined)
+    const status = vi.fn().mockRejectedValue(new Error('gateway unavailable'))
+
+    await expect(
+      completeMcpDesktopOAuth({
+        serverName: 'reports',
+        start: vi.fn().mockResolvedValue({
+          flow_id: 'flow-poll-failure',
+          server_name: 'reports',
+          status: 'authorization_required',
+          authorization_url: 'https://idp.example/authorize',
+          error: null
+        }),
+        status,
+        openExternal: vi.fn().mockResolvedValue(undefined),
+        cancel,
+        sleep: async () => {},
+        maxPollFailures: 2
+      })
+    ).rejects.toThrow('gateway unavailable')
+
+    expect(status).toHaveBeenCalledTimes(2)
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(cancel).toHaveBeenCalledWith('flow-poll-failure')
+  })
 })

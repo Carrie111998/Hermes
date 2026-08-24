@@ -12,11 +12,8 @@ import { Codicon } from '@/components/ui/codicon'
 import { Input } from '@/components/ui/input'
 import {
   addMcpServer,
-  authMcpServer,
-  cancelMcpOAuthFlow,
   getActionStatus,
   getMcpCatalog,
-  getMcpOAuthFlow,
   installMcpCatalogEntry,
   type McpCatalogEntry,
   removeMcpServer,
@@ -26,8 +23,9 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { AlertCircle, CheckCircle2, Loader2 } from '@/lib/icons'
 import { brandFor, brandGlyphStyle } from '@/lib/mcp-brands'
-import { completeMcpDesktopOAuth, McpOAuthCancelled } from '@/lib/mcp-dashboard-oauth'
+import { McpOAuthCancelled } from '@/lib/mcp-dashboard-oauth'
 import { directoryEntry } from '@/lib/mcp-directory'
+import { completeRoutedMcpDesktopOAuth } from '@/lib/mcp-oauth-routing'
 import { prettyName } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
@@ -272,12 +270,9 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       }
 
       if (action === 'authorize') {
-        const flow = await completeMcpDesktopOAuth({
+        const flow = await completeRoutedMcpDesktopOAuth({
           serverName: server,
-          start: authMcpServer,
-          status: getMcpOAuthFlow,
           cancelled: () => cancelRef.current,
-          cancel: cancelMcpOAuthFlow,
           openExternal: url => window.hermesDesktop.openExternal(url)
         })
 
@@ -319,12 +314,9 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         let flow
 
         try {
-          flow = await completeMcpDesktopOAuth({
+          flow = await completeRoutedMcpDesktopOAuth({
             serverName: known.name,
-            start: authMcpServer,
-            status: getMcpOAuthFlow,
             cancelled: () => cancelRef.current,
-            cancel: cancelMcpOAuthFlow,
             openExternal: url => window.hermesDesktop.openExternal(url)
           })
         } catch (error) {
