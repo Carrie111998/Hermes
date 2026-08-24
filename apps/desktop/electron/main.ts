@@ -33,7 +33,7 @@ import {
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
-import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
+import { dashboardFallbackArgs, serveBackendArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
@@ -10479,7 +10479,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-  const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
+  const backendArgs = serveBackendArgs(profile)
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
@@ -10533,10 +10533,13 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   entry.process = child
   entry.token = token
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
 
+  // Observe output before the Windows ownership marker probe. A child that
+  // exits during that probe must leave its real startup error in desktop.log
+  // instead of being masked by the follow-up Get-Process failure.
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
+  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
 
   let ready = false
   let rejectStart = null
@@ -10814,7 +10817,7 @@ async function startHermes() {
 
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
+    const backendArgs = serveBackendArgs()
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
     // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
@@ -10909,6 +10912,12 @@ async function startHermes() {
       })
     )
 
+    // Start logging before ownership persistence: on Windows an immediately
+    // exiting child can disappear while processStartMarker() starts PowerShell.
+    // Its stderr remains the actionable failure even if that marker probe then
+    // reports only that the PID no longer exists.
+    hermesProcess.stdout.on('data', rememberLog)
+    hermesProcess.stderr.on('data', rememberLog)
     await claimBackendChild(hermesProcess, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
     const processOwner = backendConnectionState.attachProcess(connectionAttempt, hermesProcess)
 
@@ -10919,8 +10928,6 @@ async function startHermes() {
       throw new Error('Hermes backend start was superseded by a newer connection attempt.')
     }
 
-    hermesProcess.stdout.on('data', rememberLog)
-    hermesProcess.stderr.on('data', rememberLog)
     let backendReady = false
     let rejectBackendStart = null
 
