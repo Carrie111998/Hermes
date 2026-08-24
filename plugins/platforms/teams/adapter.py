@@ -750,6 +750,22 @@ def check_teams_requirements() -> bool:
     return ensure_and_bind("platform.teams", _import, globals(), prompt=False)
 
 
+def _chat_type_for_conversation(conv: "Any") -> str:
+    """Map a Teams conversation's ``conversation_type`` to Hermes's chat_type.
+
+    Shared by the message path and the card-action auth path so a click's
+    authorization is scoped the same way a message from the same conversation
+    would be -- group/channel policy must see group/channel, not a hardcoded
+    "dm" that would let it skip group-scoped allowlists.
+    """
+    conv_type = getattr(conv, "conversation_type", None) or ""
+    if conv_type == "groupChat":
+        return "group"
+    if conv_type == "channel":
+        return "channel"
+    return "dm"
+
+
 class TeamsAdapter(BasePlatformAdapter):
     """Microsoft Teams adapter using the microsoft-teams-apps SDK."""
 
@@ -926,15 +942,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
         # Determine chat type from conversation
         conv = activity.conversation
-        conv_type = getattr(conv, "conversation_type", None) or ""
-        if conv_type == "personal":
-            chat_type = "dm"
-        elif conv_type == "groupChat":
-            chat_type = "group"
-        elif conv_type == "channel":
-            chat_type = "channel"
-        else:
-            chat_type = "dm"
+        chat_type = _chat_type_for_conversation(conv)
 
         # Build source
         from_account = activity.from_
@@ -1082,31 +1090,41 @@ class TeamsAdapter(BasePlatformAdapter):
         if not clicker_id:
             return False
 
+        conversation = getattr(ctx.activity, "conversation", None)
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
-                conversation = getattr(ctx.activity, "conversation", None)
                 source = self.build_source(
                     chat_id=str(getattr(conversation, "id", "") or clicker_id),
-                    chat_type="dm",
+                    chat_type=_chat_type_for_conversation(conversation),
                     user_id=clicker_id,
                     user_name=str(getattr(from_account, "name", "") or "") or None,
                     guild_id=getattr(conversation, "tenant_id", None) or self._tenant_id,
                 )
                 return bool(auth_fn(source))
             except Exception:
-                logger.debug(
+                logger.warning(
                     "[teams] Falling back to env-only card-action auth for %s",
                     clicker_id,
                     exc_info=True,
                 )
+        else:
+            logger.warning(
+                "[teams] No gateway runner reachable from card action for %s — "
+                "falling back to env-only auth",
+                clicker_id,
+            )
 
         # Fallback when the runner isn't reachable: same default-deny posture
         # as before -- require an explicit allowlist or TEAMS_ALLOW_ALL_USERS
-        # opt-in, matched against the raw AAD/conversation ID.
-        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
-        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
+        # opt-in, matched against the raw AAD/conversation ID. Scope-aware
+        # reads: under multiplexing, os.environ holds the DEFAULT profile's
+        # values, so a secondary-profile Teams bot must not fall back to it.
+        allowed_csv = (_get_scoped_secret("TEAMS_ALLOWED_USERS", "") or "").strip()
+        allow_all = (_get_scoped_secret("TEAMS_ALLOW_ALL_USERS", "") or "").strip().lower() in {
+            "1", "true", "yes",
+        }
         if allow_all:
             return True
         if not allowed_csv:
