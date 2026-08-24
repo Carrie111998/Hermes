@@ -12225,7 +12225,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("delivery ledger update failed", exc_info=True)
         return redelivered
 
-    async def _redeliver_pending_obligations(self) -> int:
+    async def _redeliver_pending_obligations(
+        self,
+        platform: Optional[Platform] = None,
+    ) -> int:
         """Claim + redeliver in one call — composition of
         :meth:`_claim_pending_obligations` and
         :meth:`_redeliver_claimed_obligations`.
@@ -12235,7 +12238,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         so the DB half can run inline before the abandonable send task.
         """
         return await self._redeliver_claimed_obligations(
-            await self._claim_pending_obligations()
+            await self._claim_pending_obligations(platform=platform)
         )
 
     async def _schedule_resume_pending_sessions(self, platform=None) -> int:
