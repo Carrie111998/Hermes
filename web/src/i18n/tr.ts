@@ -321,7 +321,7 @@ export const tr: Translations = {
     nameRequired: "Ad gereklidir",
     nameRule:
       "Yalnızca küçük harfler, rakamlar, _ ve - kullanılabilir; harf veya rakamla başlamalı; en fazla 64 karakter.",
-    invalidName: "Geçersiz profil adı",    
+    invalidName: "Geçersiz profil adı",
     cloneFrom: "Profilden yapılandırmayı klonla",
     cloneFromNone: "Hiçbiri (boş)",
     allProfiles: "Profiller",
