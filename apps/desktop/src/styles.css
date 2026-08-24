@@ -413,7 +413,7 @@
     --dt-sidebar-bg: var(--ui-bg-sidebar);
     --dt-sidebar-border: var(--ui-stroke-secondary);
     --dt-user-bubble: var(--ui-chat-bubble-background);
-    --dt-user-bubble-border: color-mix(in srgb, var(--ui-accent) 40%, var(--ui-stroke-tertiary));
+    --dt-user-bubble-border: color-mix(in srgb, var(--ui-accent) 65%, var(--ui-stroke-tertiary));
 
     --dt-font-sans:
       'Segoe WPC', 'Segoe UI', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif,
@@ -528,6 +528,7 @@
     --theme-mix-card: 38%;
     --theme-mix-elevated: 46%;
     --theme-mix-bubble: 68%;
+    --theme-bubble-seed: color-mix(in srgb, var(--ui-accent) 20%, var(--theme-neutral-chrome));
     --theme-neutral-chrome: #0d0d0e;
     --theme-neutral-sidebar: #0a0a0b;
     --theme-neutral-card: #161618;
