@@ -2756,7 +2756,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Gemini REST endpoint rejects the keyword outright
         # (`Completions.create() got an unexpected keyword argument
         # 'stream_options'`), so omit it only for that endpoint.
-        if not is_native_gemini_base_url(agent.base_url):
+        # ox-alpha-free's provider rejects stream_options with 503.
+        if not is_native_gemini_base_url(agent.base_url) and not getattr(agent, 'model', '').startswith('ox-alpha'):
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = _set_request_client(
             agent._create_request_openai_client(
