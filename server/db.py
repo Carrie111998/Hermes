@@ -278,6 +278,7 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("research_campaigns", "updated_by", "TEXT REFERENCES users(id)"),
     ("candidate_datasets", "owner_company_id", "TEXT REFERENCES companies(id)"),
     ("candidate_datasets", "visibility", "TEXT"),
+    ("candidate_records", "search_text", "TEXT"),
     ("organizations", "shared_organization_id", "TEXT REFERENCES shared_organizations(id)"),
     ("evidence_records", "shared_evidence_id", "TEXT REFERENCES shared_evidence_records(id)"),
     ("feature_claims", "shared_fact_id", "TEXT REFERENCES shared_facts(id)"),

@@ -1636,6 +1636,10 @@ class LeadResearchService:
         resolver = IdentityResolver(self.db, company_id)
         eligibility = EligibilityService()
         metrics = {key: 0 for key in FUNNEL_KEYS}
+        # Review candidates stay visible and may become operational leads, but
+        # they have not earned the strong-fit verdict represented by the
+        # qualified funnel stage.
+        metrics["review_leads"] = 0
         partitions: dict[tuple[str, str], dict] = {}
         processing_error: dict | None = None
         # Bound before the try so a campaign that fails early still reports
@@ -2248,7 +2252,10 @@ class LeadResearchService:
                                     sorted(official_domains | independent_domains), claims,
                                     lead_ids,
                                 )
-                                metrics["qualified_leads"] += 1
+                                if evaluated_verdict.kind == "strong_fit":
+                                    metrics["qualified_leads"] += 1
+                                else:
+                                    metrics["review_leads"] += 1
                                 stage = "result"
                                 result_id = repo.upsert_result(
                                     campaign_id=campaign_id,

@@ -529,3 +529,17 @@ def test_nonempty_outcome_has_no_zero_result_explanation():
         failed_source_ids=[],
         unmapped_markets=[],
     ) is None
+
+
+def test_review_outcome_has_no_zero_result_explanation():
+    assert zero_result_explanation(
+        status="succeeded",
+        metrics={
+            "qualified_leads": 0,
+            "review_leads": 1,
+            "named_candidates": 1,
+            "eligible_companies": 1,
+        },
+        failed_source_ids=[],
+        unmapped_markets=[],
+    ) is None

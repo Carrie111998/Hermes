@@ -126,8 +126,10 @@ def test_research_campaign_vertical_slice_and_tenant_scope():
     metrics = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/metrics", headers=headers,
     ).json()[0]
-    assert metrics["raw_records"] >= metrics["named_candidates"] >= metrics["qualified_leads"] > 0
-    assert metrics["resolved_organizations"] >= metrics["eligible_companies"] >= metrics["qualified_leads"]
+    assert metrics["qualified_leads"] == 0
+    assert metrics["review_leads"] == len(results)
+    assert metrics["raw_records"] >= metrics["named_candidates"] >= metrics["review_leads"] > 0
+    assert metrics["resolved_organizations"] >= metrics["eligible_companies"] >= metrics["review_leads"]
 
     leads = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/leads", headers=headers,

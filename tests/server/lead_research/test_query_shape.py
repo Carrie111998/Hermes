@@ -151,14 +151,14 @@ def _run(db, *, campaign_id="camp_1", verify_workers=1, reuse=False):
 def test_the_lead_table_is_read_once_per_run_not_once_per_candidate(harness):
     """The regression this file exists for.
 
-    Six candidates all qualify here. Every one of them used to trigger its own
-    full read of the lead table.
+    Six candidates all reach the review lead list here. Every one of them used
+    to trigger its own full read of the lead table.
     """
     counting = CountingDatabase(harness)
 
     result = _run(counting)
 
-    assert result["metrics"]["qualified_leads"] == 6
+    assert result["metrics"]["review_leads"] == 6
     assert counting.matching("FROM leads WHERE company_id=?") == 1
 
 

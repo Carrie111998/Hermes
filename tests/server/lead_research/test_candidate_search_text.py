@@ -14,6 +14,7 @@ stay correct — only to get faster.
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -96,6 +97,41 @@ def test_an_unstored_row_is_still_selected(db):
     _import(repo, [ATLAS])
     db.execute("UPDATE candidate_records SET search_text=NULL")
 
+    selected = repo.select(countries=["DE"], product_terms=["oven"], limit=10)
+
+    assert [record.source_record_id for record in selected] == ["atlas-1"]
+
+
+def test_legacy_database_migration_keeps_corpus_selectable(tmp_path):
+    """An existing corpus predates search_text but must survive an app upgrade."""
+    path = tmp_path / "legacy-candidates.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE candidate_datasets (
+            dataset_id TEXT NOT NULL, version TEXT NOT NULL, source_filename TEXT NOT NULL,
+            raw_hash TEXT NOT NULL, imported_at REAL NOT NULL, record_count INTEGER NOT NULL,
+            PRIMARY KEY(dataset_id, version)
+        );
+        CREATE TABLE candidate_records (
+            dataset_id TEXT NOT NULL, version TEXT NOT NULL, source_record_id TEXT NOT NULL,
+            company_name TEXT NOT NULL, normalized_name TEXT NOT NULL, country TEXT NOT NULL,
+            domain TEXT, data TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(dataset_id, version, source_record_id)
+        );
+        INSERT INTO candidate_datasets
+        VALUES('kitchen-appliances','1','legacy.csv','abc',0,1);
+        INSERT INTO candidate_records
+        VALUES(
+            'kitchen-appliances','1','atlas-1','Atlas Kitchens GmbH',
+            'atlas kitchens gmbh','DE','atlas.example.test',
+            '{"aliases":[],"categories":["Built-in ovens"]}'
+        );
+        """
+    )
+    connection.close()
+
+    repo = CandidateRepository(Database(path))
     selected = repo.select(countries=["DE"], product_terms=["oven"], limit=10)
 
     assert [record.source_record_id for record in selected] == ["atlas-1"]

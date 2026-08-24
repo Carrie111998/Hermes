@@ -35,7 +35,10 @@ def zero_result_explanation(
     failure outranks downstream counters; otherwise the first stage that
     eliminated the remaining supply explains the empty outcome.
     """
-    if int(metrics.get("qualified_leads", 0) or 0) > 0:
+    if (
+        int(metrics.get("qualified_leads", 0) or 0)
+        + int(metrics.get("review_leads", 0) or 0)
+    ) > 0:
         return None
     if status == "cancelled":
         return "campaign_cancelled"
