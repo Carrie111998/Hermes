@@ -3275,6 +3275,13 @@ def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -
     return resolve_ephemeral_system_prompt(cfg)
 
 
+def platform_toolsets_explicitly_empty(config: dict, platform: str) -> bool:
+    """Return whether a platform is explicitly configured with no toolsets."""
+    platforms = config.get("platform_toolsets") if isinstance(config, dict) else None
+    toolsets = platforms.get(platform) if isinstance(platforms, dict) else None
+    return isinstance(toolsets, list) and not toolsets
+
+
 def read_raw_config() -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 

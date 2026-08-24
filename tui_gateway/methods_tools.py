@@ -1494,14 +1494,20 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
+        enabled_toolsets = (
+            getattr(session["agent"], "enabled_toolsets", None)
             if session
-            else set(_load_enabled_toolsets() or [])
+            else _load_enabled_toolsets()
+        )
+        enabled = set(enabled_toolsets or [])
+        disabled = set(
+            getattr(session["agent"], "disabled_toolsets", None) or []
+            if session
+            else []
         )
 
         items = []
-        for name in sorted(get_all_toolsets().keys()):
+        for name in sorted(get_all_toolsets()):
             info = get_toolset_info(name)
             if not info:
                 continue
@@ -1510,7 +1516,8 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": name not in disabled
+                    and (enabled_toolsets is None or name in enabled),
                     "tools": info["resolved_tools"],
                 }
             )
@@ -1532,8 +1539,16 @@ def _(rid, params: dict) -> dict:
         )
         # Pre-assembly list: /tools is a discovery surface and must show
         # tools deferred behind the tool_search bridge (same as the CLI).
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True,
-                                     skip_tool_search_assembly=True)
+        tools = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=(
+                getattr(session["agent"], "disabled_toolsets", None)
+                if session
+                else None
+            ),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):
@@ -1637,14 +1652,20 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
+        enabled_toolsets = (
+            getattr(session["agent"], "enabled_toolsets", None)
             if session
-            else set(_load_enabled_toolsets() or [])
+            else _load_enabled_toolsets()
+        )
+        enabled = set(enabled_toolsets or [])
+        disabled = set(
+            getattr(session["agent"], "disabled_toolsets", None) or []
+            if session
+            else []
         )
 
         items = []
-        for name in sorted(get_all_toolsets().keys()):
+        for name in sorted(get_all_toolsets()):
             info = get_toolset_info(name)
             if not info:
                 continue
@@ -1653,7 +1674,8 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": name not in disabled
+                    and (enabled_toolsets is None or name in enabled),
                 }
             )
         return _ok(rid, {"toolsets": items})

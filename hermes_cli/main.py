@@ -3292,6 +3292,38 @@ def cmd_chat(args):
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
 
+    # Set behavior flags before imports freeze them.
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "ignore_user_config", False):
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    if getattr(args, "ignore_rules", False):
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+    if getattr(args, "source", None):
+        os.environ["HERMES_SESSION_SOURCE"] = args.source
+
+    _pin_kanban_board_env()
+    _confirm_startup_expensive_model_override(args)
+
+    # Resolve tools while update checks, skill sync, and cli.py imports run.
+    _early_tool_resolution = None
+    if (
+        not use_tui
+        and not getattr(args, "worktree", False)
+        and os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1"
+    ):
+        from hermes_cli.tool_resolution import start_cli_tool_resolution
+
+        _tool_config = None
+        if args.toolsets is None:
+            # A loaded empty policy returns a completed Future.
+            from hermes_cli.config import load_config
+
+            _tool_config = load_config()
+        _early_tool_resolution = start_cli_tool_resolution(
+            args.toolsets, config=_tool_config
+        )
+
     # Start update check in background (runs while other init happens).
     # On Termux this imports rich/prompt_toolkit in the foreground and then
     # competes for CPU on single-core devices, so keep it opt-in there.
@@ -3351,34 +3383,6 @@ def cmd_chat(args):
             target=_skills_sync_bg, name="bundled-skills-sync", daemon=True
         ).start()
 
-    # --yolo: bypass all dangerous command approvals.
-    # Also set in main() before _prepare_agent_startup() — that is the
-    # authoritative site because it runs before tool imports freeze
-    # _YOLO_MODE_FROZEN.  This redundant set is a safety net for callers
-    # that invoke cmd_chat directly (e.g. subcommand dispatch).
-    if getattr(args, "yolo", False):
-        os.environ["HERMES_YOLO_MODE"] = "1"
-
-    # --ignore-user-config: make load_cli_config() / load_config() skip the
-    # user's ~/.hermes/config.yaml and return built-in defaults. Set BEFORE
-    # importing cli (which runs `CLI_CONFIG = load_cli_config()` at module
-    # import time). Credentials in .env are still loaded — this flag only
-    # ignores behavioral/config settings.
-    if getattr(args, "ignore_user_config", False):
-        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-
-    # --ignore-rules: skip auto-injection of AGENTS.md/SOUL.md/.cursorrules
-    # (rules), memory entries, and any preloaded skills coming from user config.
-    # Maps to AIAgent(skip_context_files=True, skip_memory=True).
-    if getattr(args, "ignore_rules", False):
-        os.environ["HERMES_IGNORE_RULES"] = "1"
-
-    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
-    if getattr(args, "source", None):
-        os.environ["HERMES_SESSION_SOURCE"] = args.source
-
-    _pin_kanban_board_env()
-    _confirm_startup_expensive_model_override(args)
 
     if use_tui:
         _launch_tui(
@@ -3399,7 +3403,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
-    # Import and run the CLI
     from cli import main as cli_main
 
     # --query-file: read the single query from a file (or stdin via '-') so
@@ -3450,6 +3453,7 @@ def cmd_chat(args):
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    kwargs["_prefetched_tool_resolution"] = _early_tool_resolution
 
     try:
         cli_main(**kwargs)

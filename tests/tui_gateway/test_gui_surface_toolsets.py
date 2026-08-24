@@ -12,6 +12,8 @@ session's own ``source`` (``session.create``'s ``source: 'desktop'``), so the
 answer is identical on every connection topology.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 import tui_gateway.server as server
@@ -112,8 +114,54 @@ class TestResolverPlumbing:
         assert "desktop_ui" in desktop
         assert "desktop_ui" not in tui
 
+    def test_explicit_empty_config_beats_focus_and_gui_surfaces(self, no_desktop_env):
+        import agent.coding_context as cc
+        import hermes_cli.config as config_mod
+
+        no_desktop_env.setattr(cc, "coding_selection", lambda **_: ["coding"])
+        no_desktop_env.setattr(
+            config_mod, "load_config", lambda: {"platform_toolsets": {"cli": []}}
+        )
+
+        assert server._load_enabled_toolsets("desktop") == []
+        assert server._load_enabled_toolsets("tui") == []
+
     def test_explicit_env_pin_still_wins(self, no_desktop_env):
         """HERMES_TUI_TOOLSETS is an operator override; surface can't re-add."""
         no_desktop_env.setenv("HERMES_TUI_TOOLSETS", "web,memory")
 
         assert server._load_enabled_toolsets("desktop") == ["web", "memory"]
+
+
+def test_zero_tool_inspectors_agree_with_the_live_agent(monkeypatch):
+    agent = SimpleNamespace(enabled_toolsets=[], tools=[], model="test-model")
+    session = {"agent": agent, "session_key": "empty-tools", "source": "desktop"}
+    monkeypatch.setitem(server._sessions, "empty-tools", session)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    try:
+        shown = server._methods["tools.show"](
+            "show-empty", {"session_id": "empty-tools"}
+        )
+        listed = server._methods["tools.list"](
+            "list-empty", {"session_id": "empty-tools"}
+        )
+        info = server._session_info(agent, session)
+    finally:
+        server._sessions.pop("empty-tools", None)
+
+    assert shown["result"] == {"sections": [], "total": 0}
+    assert not any(row["enabled"] for row in listed["result"]["toolsets"])
+    assert info["tools"] == {}
+
+
+def test_preview_agent_preserves_any_explicit_empty_selection(monkeypatch):
+    agent = SimpleNamespace(
+        enabled_toolsets=(), model="test-model", provider="test-provider"
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._ephemeral_preview_agent_kwargs(agent, "empty-preview")
+
+    assert kwargs["enabled_toolsets"] == []

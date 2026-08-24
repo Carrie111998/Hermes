@@ -5262,17 +5262,23 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     cfg = None
     fallback_notice = None
 
-    # Coding posture (base Hermes): with no explicit pin, collapse to the
-    # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
-    # The desktop app and `hermes --tui` both land here. See
-    # agent/coding_context.py. No config is loaded yet at this point, so we let
-    # coding_selection() load it lazily (cli.py passes its already-resolved
-    # CLI_CONFIG instead, purely to avoid a redundant read).
+    # Resolve config first so an empty policy remains empty.
     if not explicit:
+        try:
+            from hermes_cli.config import (
+                load_config,
+                platform_toolsets_explicitly_empty,
+            )
+
+            cfg = load_config()
+            if platform_toolsets_explicitly_empty(cfg, "cli"):
+                return []
+        except Exception:
+            cfg = None
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform=session_platform)
+            selection = coding_selection(platform=session_platform, config=cfg)
             if selection is not None:
                 # Fold in the client-surface toolsets here too: the focus-mode
                 # coding posture returns before the fallback path that normally
@@ -5388,7 +5394,8 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         if fallback_notice is not None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
-            return None
+            # Only None selects AIAgent defaults; [] remains deny-all.
+            return []
         # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other
         # platform would carry their schema for nothing), so the platform
         # recovery above — which keys off hermes-cli's tool universe — can't
@@ -7285,6 +7292,7 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    parent_toolsets = getattr(agent, "enabled_toolsets", None)
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -7295,12 +7303,11 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
-        "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        # Detached background tasks declare platform="tui" below: they have no
-        # UI session id, so a renderer-routed event has nowhere to land. Resolve
-        # their toolsets against that same platform rather than the gateway
-        # process's, so they never carry GUI schema they cannot use.
-        or _load_enabled_toolsets("tui"),
+        "enabled_toolsets": (
+            parent_toolsets
+            if parent_toolsets is not None
+            else _load_enabled_toolsets("tui")
+        ),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -7329,7 +7336,12 @@ def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     kwargs = _background_agent_kwargs(agent, task_id)
     kwargs.update(
         {
-            "enabled_toolsets": ["terminal", "file"],
+            "enabled_toolsets": (
+                []
+                if kwargs["enabled_toolsets"] is not None
+                and not kwargs["enabled_toolsets"]
+                else ["terminal", "file"]
+            ),
             "session_db": None,
             "skip_memory": True,
         }

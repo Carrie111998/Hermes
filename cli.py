@@ -46,6 +46,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
+_TOOL_SURFACE_RESOLUTION_TIMEOUT_S = 30.0
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -54,6 +55,9 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
+from hermes_cli.tool_resolution import (
+    get_cli_tool_definitions as get_tool_definitions,
+)
 from agent.interrupt_compat import request_hard_interrupt
 
 # prompt_toolkit for fixed input area TUI
@@ -889,14 +893,6 @@ def AIAgent(*args, **kwargs):
     from run_agent import AIAgent as _AIAgent
 
     return _AIAgent(*args, **kwargs)
-
-
-def get_tool_definitions(*args, **kwargs):
-    from hermes_cli.mcp_startup import wait_for_mcp_discovery
-    from model_tools import get_tool_definitions as _get_tool_definitions
-
-    wait_for_mcp_discovery()
-    return _get_tool_definitions(*args, **kwargs)
 
 
 def get_toolset_for_tool(*args, **kwargs):
@@ -8395,7 +8391,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
-        self.console.clear()
         ctx_len = None
         if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
             ctx_len = self.agent.context_compressor.context_length
@@ -8405,119 +8400,80 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         term_width = shutil.get_terminal_size().columns
         use_compact = self.compact or term_width < 80
         
+        resolution = None
+        resolution_failure = None
+        tools = []
+        from hermes_cli.tool_resolution import (
+            ToolResolutionRequest,
+            start_tool_surface_resolution,
+        )
+
+        request = ToolResolutionRequest.from_lists(
+            self.enabled_toolsets, self.disabled_toolsets
+        )
+        pending = getattr(self, "_startup_tool_resolution", None)
+        if pending is None or pending[0] != request:
+            pending = start_tool_surface_resolution(
+                self.enabled_toolsets, self.disabled_toolsets
+            )
+            self._startup_tool_resolution = pending
+        if pending is not None:
+            resolution = pending[1]
+            try:
+                tools = resolution.result(timeout=_TOOL_SURFACE_RESOLUTION_TIMEOUT_S)
+            except TimeoutError as exc:
+                resolution_failure = exc
+            except Exception:
+                logger.debug("tool resolution prefetch failed", exc_info=True)
+                pending = start_tool_surface_resolution(
+                    self.enabled_toolsets, self.disabled_toolsets
+                )
+                self._startup_tool_resolution = pending
+                if pending is not None:
+                    resolution = pending[1]
+                    try:
+                        tools = resolution.result(timeout=_TOOL_SURFACE_RESOLUTION_TIMEOUT_S)
+                    except Exception as exc:
+                        resolution_failure = exc
+
+        if resolution_failure is not None:
+            logger.warning("tool resolution failed; using zero model-callable tools")
+            self.enabled_toolsets = []
+            pending = start_tool_surface_resolution([], self.disabled_toolsets)
+            self._startup_tool_resolution = pending
+            resolution = pending[1] if pending is not None else None
+            tools = []
+
+        self.console.clear()
+
         if use_compact:
             self._console_print(_build_compact_banner())
-            self._show_status()
+            self._show_status(resolved_tools=tools)
         else:
-            # Warm-launch fast path: replay last launch's tool panel when the
-            # snapshot fingerprint (config.yaml + .env + checkout rev +
-            # toolsets) is unchanged, skipping the ~0.5-0.9s cold
-            # get_tool_definitions walk. The agent's REAL tool list is still
-            # computed fresh at first message; a background refresh below
-            # re-verifies the snapshot so any drift self-heals next launch.
-            from hermes_cli.banner import (
-                compute_toolset_availability,
-                load_banner_snapshot,
-                save_banner_snapshot,
+            cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            build_welcome_banner(
+                console=self.console,
+                model=self.model,
+                cwd=cwd,
+                tools=tools,
+                session_id=self.session_id,
+                context_length=ctx_len,
+                provider=self.provider,
             )
 
-            snapshot = None
-            try:
-                snapshot = load_banner_snapshot(self.enabled_toolsets)
-            except Exception:
-                snapshot = None
+        if resolution_failure is not None:
+            self._console_print(
+                "[yellow]⚠ Tool discovery did not finish; continuing with zero "
+                "model-callable tools for this session.[/]"
+            )
 
-            # Get terminal working directory (where commands will execute)
-            cwd = os.getenv("TERMINAL_CWD", os.getcwd())
-
-            if snapshot is not None:
-                self._defer_tool_warnings = True
-                toolset_map = snapshot["toolset_map"]
-                build_welcome_banner(
-                    console=self.console,
-                    model=self.model,
-                    cwd=cwd,
-                    tools=snapshot["tools"],
-                    enabled_toolsets=self.enabled_toolsets,
-                    session_id=self.session_id,
-                    get_toolset_for_tool=lambda name: toolset_map.get(name),
-                    context_length=ctx_len,
-                    provider=self.provider,
-                    availability=snapshot["availability"],
-                    skills_by_category=snapshot.get("skills_by_category"),
-                )
-
-                def _refresh_banner_snapshot() -> None:
-                    try:
-                        from model_tools import get_toolset_for_tool
-                        tools = get_tool_definitions(
-                            enabled_toolsets=self.enabled_toolsets, quiet_mode=True
-                        )
-                        availability = compute_toolset_availability(self.enabled_toolsets)
-                        tmap = {
-                            t["function"]["name"]: get_toolset_for_tool(t["function"]["name"])
-                            for t in tools
-                        }
-                        for item in availability.get("unavailable_toolsets", []):
-                            for name in item.get("tools", []):
-                                tmap.setdefault(
-                                    name, item.get("id", item.get("name", ""))
-                                )
-                        save_banner_snapshot(
-                            tools, self.enabled_toolsets, availability, tmap
-                        )
-                    except Exception:
-                        logger.debug("banner snapshot refresh failed", exc_info=True)
-
-                threading.Thread(
-                    target=_refresh_banner_snapshot,
-                    name="banner-snapshot-refresh",
-                    daemon=True,
-                ).start()
-            else:
-                # Cold path: compute everything live, then persist the snapshot
-                # so the next launch replays it.
-                from model_tools import get_toolset_for_tool
-                tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-                availability = compute_toolset_availability(self.enabled_toolsets)
-
-                build_welcome_banner(
-                    console=self.console,
-                    model=self.model,
-                    cwd=cwd,
-                    tools=tools,
-                    enabled_toolsets=self.enabled_toolsets,
-                    session_id=self.session_id,
-                    context_length=ctx_len,
-                    provider=self.provider,
-                    availability=availability,
-                )
-                try:
-                    tmap = {
-                        t["function"]["name"]: get_toolset_for_tool(t["function"]["name"])
-                        for t in tools
-                    }
-                    for item in availability.get("unavailable_toolsets", []):
-                        for name in item.get("tools", []):
-                            tmap.setdefault(name, item.get("id", item.get("name", "")))
-                    save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap)
-                except Exception:
-                    logger.debug("banner snapshot save failed", exc_info=True)
-        
-        # Tool discovery is intentionally deferred on the Termux bare prompt
-        # path; availability warnings are shown once tools are initialized.
-        # On the snapshot fast path (warm launch), the check walks every
-        # check_fn (~180ms) — run it in the background refresh thread instead
-        # and let its output land above the prompt (patch_stdout-safe).
-        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
-            if getattr(self, "_defer_tool_warnings", False):
-                threading.Thread(
-                    target=self._show_tool_availability_warnings,
-                    name="tool-availability-warnings",
-                    daemon=True,
-                ).start()
-            else:
-                self._show_tool_availability_warnings()
+        # Finish diagnostics before prompt_toolkit takes terminal ownership.
+        if (
+            resolution is not None
+            and getattr(self, "_diagnosed_tool_resolution", None) is not resolution
+        ):
+            self._show_tool_availability_warnings()
+            self._diagnosed_tool_resolution = resolution
 
         # Warn about low context lengths (common with local servers). Keep
         # this tied to the runtime guard so guidance cannot drift again.
@@ -9109,34 +9065,59 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return user_text or "What do you see in this image?"
 
     def _show_tool_availability_warnings(self):
-        """Show warnings about disabled tools due to missing API keys."""
+        """Show requirement diagnostics for the selected toolsets only."""
+        selection = self.enabled_toolsets
+        if selection is not None and not selection:
+            return
         try:
-            from model_tools import check_tool_availability
-            
-            available, unavailable = check_tool_availability()
-            
-            # Filter to only those missing API keys (not system deps)
-            api_key_missing = [u for u in unavailable if u["missing_vars"]]
-            
+            from model_tools import check_tool_availability, get_toolset_for_tool
+            from toolsets import resolve_toolset
+
+            selected = None
+            if selection is not None:
+                selected = {
+                    toolset
+                    for name in selection
+                    for tool in resolve_toolset(str(name))
+                    if (toolset := get_toolset_for_tool(tool))
+                }
+                disabled = {
+                    toolset
+                    for name in self.disabled_toolsets or []
+                    for tool in resolve_toolset(str(name))
+                    if (toolset := get_toolset_for_tool(tool))
+                }
+                selected.difference_update(disabled)
+            _, unavailable = check_tool_availability(toolsets=selected)
+
+            api_key_missing = [
+                (item, item.get("missing_vars", item.get("env_vars", [])))
+                for item in unavailable
+                if item.get("missing_vars", item.get("env_vars", []))
+            ]
+
             if api_key_missing:
                 self._console_print()
                 self._console_print("[yellow]⚠️  Some tools disabled (missing API keys):[/]")
-                for item in api_key_missing:
-                    tools_str = ", ".join(item["tools"][:2])  # Show first 2 tools
-                    if len(item["tools"]) > 2:
-                        tools_str += f", +{len(item['tools'])-2} more"
-                    self._console_print(f"   [dim]• {item['name']}[/] [dim italic]({', '.join(item['missing_vars'])})[/]")
+                for item, missing_vars in api_key_missing:
+                    self._console_print(f"   [dim]• {item['name']}[/] [dim italic]({', '.join(missing_vars)})[/]")
                 self._console_print("[dim]   Run 'hermes setup' to configure[/]")
         except Exception:
             pass  # Don't crash on import errors
     
-    def _show_status(self):
+    def _show_status(self, resolved_tools=None):
         """Show compact startup status line."""
         # Avoid pulling the full tool registry into the bare Termux prompt path.
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
             tool_status = "tools deferred"
+        elif resolved_tools is not None:
+            tool_status = f"{len(resolved_tools)} tools"
         else:
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+            tools = get_tool_definitions(
+                enabled_toolsets=self.enabled_toolsets,
+                disabled_toolsets=self.disabled_toolsets,
+                quiet_mode=True,
+            )
             tool_count = len(tools) if tools else 0
             tool_status = f"{tool_count} tools"
 
@@ -9435,8 +9416,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Pre-assembly list: /tools is a discovery/inspection surface, so it
         # must show the full catalog including tools deferred behind the
         # tool_search bridge (users check this to verify an MCP installed).
-        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True,
-                                     skip_tool_search_assembly=True)
+        tools = get_tool_definitions(
+            enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=self.disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
         
         if not tools:
             print("(;_;) No tools available")
@@ -12072,7 +12057,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self.compact or term_w < 80:
                     cc.print(_build_compact_banner())
                 else:
-                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                    tools = get_tool_definitions(
+                        enabled_toolsets=self.enabled_toolsets,
+                        disabled_toolsets=self.disabled_toolsets,
+                        quiet_mode=True,
+                    )
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
@@ -12082,7 +12071,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         model=self.model,
                         cwd=cwd,
                         tools=tools,
-                        enabled_toolsets=self.enabled_toolsets,
                         session_id=self.session_id,
                         context_length=ctx_len,
                         provider=self.provider,
@@ -21068,6 +21056,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    _prefetched_tool_resolution=None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21134,22 +21123,6 @@ def main(
         use_worktree = worktree or w or CLI_CONFIG.get("worktree", False)
         wt_info = None
         if use_worktree:
-            # Overlap tool discovery with the network/subprocess-bound
-            # worktree setup (base fetch + parallel `git worktree add`
-            # release the GIL for most of their wall time). show_banner()
-            # then hits the warm cache instead of paying ~0.4s serially.
-            # Only done on the -w path: on plain `hermes` there is no I/O
-            # wait to hide and the extra thread just contends for CPU.
-            def _prewarm_tools() -> None:
-                try:
-                    import model_tools as _mt
-                    _mt.get_tool_definitions(quiet_mode=True)
-                except Exception:
-                    logger.debug("tool prewarm failed", exc_info=True)
-
-            threading.Thread(
-                target=_prewarm_tools, name="tool-prewarm", daemon=True
-            ).start()
             # Worktree creation itself (~0.2-0.6s of git subprocess wall
             # time) runs concurrently with the rest of startup; join right
             # after HermesCLI construction, before anything consumes
@@ -21209,38 +21182,45 @@ def main(
     # Handle query shorthand
     query = query or q
     
-    # Parse toolsets - handle both string and tuple/list inputs
-    # Default to hermes-cli toolset which includes cronjob management tools
-    toolsets_list = None
-    if toolsets:
-        if isinstance(toolsets, str):
-            toolsets_list = [t.strip() for t in toolsets.split(",")]
-        elif isinstance(toolsets, (list, tuple)):
-            # Fire may pass multiple --toolsets as a tuple
-            toolsets_list = []
-            for t in toolsets:
-                if isinstance(t, str):
-                    toolsets_list.extend([x.strip() for x in t.split(",")])
-                else:
-                    toolsets_list.append(str(t))
+    prefetched_future = None
+    prefetched_request = None
+    if _prefetched_tool_resolution is not None:
+        prefetched_request, prefetched_future = _prefetched_tool_resolution
+
+    from hermes_cli.tool_resolution import resolve_cli_toolsets
+
+    toolsets_list: list[str]
+    if prefetched_request is None:
+        toolsets_list = resolve_cli_toolsets(toolsets, CLI_CONFIG)
+    elif prefetched_request.enabled_toolsets is None:
+        toolsets_list = resolve_cli_toolsets(None, CLI_CONFIG)
     else:
-        # Coding posture (base Hermes): with no explicit --toolsets, collapse
-        # to the coding toolset (+ enabled MCP servers) when sitting in a code
-        # workspace. See agent/coding_context.py.
-        _coding = None
-        try:
-            from agent.coding_context import coding_selection
-            _coding = coding_selection(platform="cli", config=CLI_CONFIG)
-        except Exception:
-            _coding = None
-        if _coding is not None:
-            toolsets_list = _coding
-        else:
-            # Use the shared resolver so MCP servers are included at runtime
-            from hermes_cli.tools_config import _get_platform_tools
-            toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
+        toolsets_list = list(prefetched_request.enabled_toolsets)
     
     parsed_skills = _parse_skills_argument(skills)
+
+    from agent.skill_utils import parse_config_string_list
+
+    if query is not None or image is not None:
+        # One-shot mode has no banner to consume the prefetch.
+        if prefetched_future is not None:
+            try:
+                prefetched_future.result(timeout=_TOOL_SURFACE_RESOLUTION_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning("tool resolution timed out; using zero tools for this run")
+                toolsets_list = []
+            except Exception:
+                logger.debug("early tool resolution failed", exc_info=True)
+        _startup_tool_resolution = None
+    elif prefetched_request is not None and prefetched_future is not None:
+        _startup_tool_resolution = (prefetched_request, prefetched_future)
+    else:
+        from hermes_cli.tool_resolution import start_tool_surface_resolution
+
+        _startup_tool_resolution = start_tool_surface_resolution(
+            toolsets_list,
+            parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets")),
+        )
 
     # Create CLI instance
     cli = HermesCLI(
@@ -21259,6 +21239,8 @@ def main(
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
+    if _startup_tool_resolution is not None:
+        cli._startup_tool_resolution = _startup_tool_resolution
 
     if parsed_skills:
         # Load the skill payloads in the background: skill_view walks the

@@ -802,199 +802,37 @@ def _display_toolset_name(toolset_name: str) -> str:
     )
 
 
-# =========================================================================
-# Banner snapshot — warm-launch fast path
-# =========================================================================
-# The banner's tool panel needs the full tool registry (get_tool_definitions:
-# tools/*.py discovery + every check_fn), which costs ~0.5-0.9s cold and is
-# the single largest chunk of CLI time-to-banner. The tool list shown in the
-# banner is a pure function of (config.yaml, .env, code checkout, enabled
-# toolsets), so we snapshot the rendered inputs to disk after each launch
-# and replay them on the next one when the fingerprint matches. The agent's
-# REAL tool list is still computed fresh at first message (agent init) —
-# the snapshot only feeds the cosmetic startup panel, and a background
-# refresh re-verifies it right after the banner renders (see
-# cli.show_banner), so a stale panel self-heals within one launch.
-
-_BANNER_SNAPSHOT_VERSION = 1
-
-
-def _banner_snapshot_path() -> Path:
-    return get_hermes_home() / "cache" / "banner_snapshot.json"
-
-
-def banner_snapshot_fingerprint() -> Optional[str]:
-    """Fingerprint the inputs the banner tool panel depends on."""
-    import hashlib
-    parts = [f"v{_BANNER_SNAPSHOT_VERSION}"]
-    try:
-        from hermes_cli.config import get_config_path
-        for p in (get_config_path(), get_hermes_home() / ".env"):
-            try:
-                st = p.stat()
-                parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
-            except OSError:
-                parts.append(f"{p.name}:absent")
-    except Exception:
-        return None
-    # Code checkout: version + git HEAD when available (post-update change).
-    parts.append(str(VERSION))
-    state = get_git_banner_state()
-    if state:
-        parts.append(str(state.get("local", "")))
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
-
-
-def load_banner_snapshot(enabled_toolsets: List[str] = None) -> Optional[Dict[str, Any]]:
-    """Return the stored banner snapshot when its fingerprint is current."""
-    try:
-        blob = json.loads(_banner_snapshot_path().read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(blob, dict):
-        return None
-    fp = banner_snapshot_fingerprint()
-    if not fp or blob.get("fingerprint") != fp:
-        return None
-    if blob.get("enabled_toolsets") != sorted(enabled_toolsets or []):
-        return None
-    tools = blob.get("tools")
-    toolset_map = blob.get("toolset_map")
-    availability = blob.get("availability")
-    if not isinstance(tools, list) or not isinstance(toolset_map, dict) \
-            or not isinstance(availability, dict):
-        return None
-    if not isinstance(blob.get("skills_by_category"), dict):
-        return None
-    return blob
-
-
-def save_banner_snapshot(
-    tools: List[dict],
-    enabled_toolsets: List[str],
-    availability: Dict[str, Any],
-    toolset_map: Dict[str, str],
-) -> None:
-    """Persist the banner tool panel inputs for next launch (best-effort)."""
-    fp = banner_snapshot_fingerprint()
-    if not fp:
-        return
-    payload = {
-        "fingerprint": fp,
-        "enabled_toolsets": sorted(enabled_toolsets or []),
-        "tools": [
-            {"function": {"name": t["function"]["name"]}}
-            for t in tools
-            if isinstance(t, dict) and t.get("function", {}).get("name")
-        ],
-        "toolset_map": toolset_map,
-        "availability": {
-            "unavailable_toolsets": availability.get("unavailable_toolsets", []),
-            "lazy_tools": list(availability.get("lazy_tools", [])),
-            "disabled_tools": list(availability.get("disabled_tools", [])),
-        },
-        "skills_by_category": get_available_skills(),
-    }
-    path = _banner_snapshot_path()
-    try:
-        import os as _os
-        import tempfile as _tempfile
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = _tempfile.mkstemp(dir=str(path.parent), prefix=".banner_snap.")
-        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-        _os.replace(tmp, path)
-    except Exception:
-        pass
-
-
-def compute_toolset_availability(enabled_toolsets: List[str] = None) -> Dict[str, Any]:
-    """Compute the banner's toolset-availability payload.
-
-    Returns ``{"unavailable_toolsets": [...], "lazy_tools": [...],
-    "disabled_tools": [...]}`` — the exact inputs ``build_welcome_banner``
-    needs to annotate disabled/lazy tools. Split out so the result can be
-    snapshotted to disk and replayed on the next launch without importing
-    ``model_tools`` (see ``load_banner_snapshot``).
-    """
-    from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
-
-    enabled_toolsets = enabled_toolsets or []
-    _, unavailable_toolsets = check_tool_availability(quiet=True)
-    # The availability check walks the GLOBAL toolset registry, so it includes
-    # toolsets that aren't part of this agent's platform set at all (e.g.
-    # `discord`, `feishu_doc` on a CLI session). Those must never surface in the
-    # banner's "Available Tools" — they aren't exposed to the agent. Restrict to
-    # toolsets actually enabled for this agent; a toolset that's enabled but
-    # currently has unmet deps legitimately shows as disabled/lazy below.
-    _enabled_ts = {str(t) for t in enabled_toolsets}
-    if _enabled_ts:
-        unavailable_toolsets = [
-            item for item in unavailable_toolsets
-            if str(item.get("id", item.get("name", ""))) in _enabled_ts
-        ]
-    disabled_tools = set()
-    # Tools whose toolset has a check_fn are lazy-initialized (e.g. honcho,
-    # homeassistant) — they show as unavailable at banner time because the
-    # check hasn't run yet, but they aren't misconfigured.
-    lazy_tools = set()
-    for item in unavailable_toolsets:
-        toolset_name = item.get("name", "")
-        ts_req = TOOLSET_REQUIREMENTS.get(toolset_name, {})
-        tools_in_ts = item.get("tools", [])
-        if ts_req.get("check_fn"):
-            lazy_tools.update(tools_in_ts)
-        else:
-            disabled_tools.update(tools_in_ts)
-    return {
-        "unavailable_toolsets": unavailable_toolsets,
-        "lazy_tools": sorted(lazy_tools),
-        "disabled_tools": sorted(disabled_tools),
-    }
-
-
-def build_welcome_banner(console: "Console", model: str, cwd: str,
-                         tools: List[dict] = None,
-                         enabled_toolsets: List[str] = None,
+def build_welcome_banner(console: "Console", model: Optional[str], cwd: str,
+                         tools: Optional[List[dict]] = None,
                          session_id: str = None,
                          get_toolset_for_tool=None,
-                         context_length: int = None,
-                         provider: str = None,
-                         availability: Dict[str, Any] = None,
-                         skills_by_category: Dict[str, List[str]] = None):
+                         context_length: Optional[int] = None,
+                         provider: Optional[str] = None,
+                         skills_by_category: Optional[Dict[str, List[str]]] = None):
     """Build and print a welcome banner with caduceus on left and info on right.
 
     Args:
         console: Rich Console instance.
         model: Current model name.
         cwd: Current working directory.
-        tools: List of tool definitions.
-        enabled_toolsets: List of enabled toolset names.
+        tools: Model-callable tool definitions to group and display.
         session_id: Session identifier.
         get_toolset_for_tool: Callable to map tool name -> toolset name.
         context_length: Model's context window size in tokens.
         provider: Active provider id. When ``"moa"``, ``model`` is a MoA
             preset name and the banner renders the aggregator instead of a
             bare model slug.
-        availability: Optional precomputed result of
-            ``compute_toolset_availability`` (e.g. replayed from the banner
-            snapshot). When provided together with ``get_toolset_for_tool``,
-            this function performs no ``model_tools`` import at all.
     """
     from rich.panel import Panel
     from rich.table import Table
     if get_toolset_for_tool is None:
-        from model_tools import get_toolset_for_tool
+        if tools:
+            from model_tools import get_toolset_for_tool
+        else:
+            get_toolset_for_tool = lambda _name: None
 
     tools = tools or []
-    enabled_toolsets = enabled_toolsets or []
-
-    if availability is None:
-        availability = compute_toolset_availability(enabled_toolsets)
-    unavailable_toolsets = availability.get("unavailable_toolsets", [])
-    lazy_tools = set(availability.get("lazy_tools", []))
-    disabled_tools = set(availability.get("disabled_tools", []))
-    _enabled_ts = {str(t) for t in enabled_toolsets}
+    model = model or ""
 
     layout_table = Table.grid(padding=(0, 2))
     layout_table.add_column("left", justify="center")
@@ -1064,20 +902,14 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     right_lines = [f"[bold {accent}]Available Tools[/]"]
     toolsets_dict: Dict[str, list] = {}
+    callable_names = set()
 
     for tool in tools:
         tool_name = tool["function"]["name"]
+        callable_names.add(tool_name)
         toolset = _display_toolset_name(get_toolset_for_tool(tool_name) or "other")
         toolsets_dict.setdefault(toolset, []).append(tool_name)
 
-    for item in unavailable_toolsets:
-        toolset_id = item.get("id", item.get("name", "unknown"))
-        display_name = _display_toolset_name(toolset_id)
-        if display_name not in toolsets_dict:
-            toolsets_dict[display_name] = []
-        for tool_name in item.get("tools", []):
-            if tool_name not in toolsets_dict[display_name]:
-                toolsets_dict[display_name].append(tool_name)
 
     sorted_toolsets = sorted(toolsets_dict.keys())
     display_toolsets = sorted_toolsets[:8]
@@ -1087,12 +919,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         tool_names = toolsets_dict[toolset]
         colored_names = []
         for name in sorted(tool_names):
-            if name in disabled_tools:
-                colored_names.append(f"[red]{name}[/]")
-            elif name in lazy_tools:
-                colored_names.append(f"[yellow]{name}[/]")
-            else:
-                colored_names.append(f"[{text}]{name}[/]")
+            colored_names.append(f"[{text}]{name}[/]")
 
         tools_str = ", ".join(colored_names)
         if len(", ".join(sorted(tool_names))) > 45:
@@ -1108,10 +935,6 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             for name in short_names:
                 if name == "...":
                     colored_names.append("[dim]...[/]")
-                elif name in disabled_tools:
-                    colored_names.append(f"[red]{name}[/]")
-                elif name in lazy_tools:
-                    colored_names.append(f"[yellow]{name}[/]")
                 else:
                     colored_names.append(f"[{text}]{name}[/]")
             tools_str = ", ".join(colored_names)
@@ -1127,6 +950,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     # startup path). When neither config.yaml nor the persisted plugin
     # key cache mentions any MCP server, skip the section outright.
     mcp_status = []
+    _has_native_mcp = False
     try:
         from hermes_cli.config import load_config as _load_cfg
         _has_native_mcp = bool((_load_cfg() or {}).get("mcp_servers"))
@@ -1179,11 +1003,9 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     right_lines.append("")
     right_lines.append(f"[bold {accent}]Available Skills[/]")
-    # The skills catalog is only reachable when the `skills` toolset is enabled
-    # (it exposes skill_view / skill_manage). When it's disabled — e.g. a Blank
-    # Slate install — the agent literally cannot load any skill, so advertising
-    # the on-disk catalog here is misleading. Reflect the real state instead.
-    _skills_enabled = (not _enabled_ts) or ("skills" in _enabled_ts)
+    _skills_enabled = bool(
+        callable_names & {"skill_view", "skill_manage", "skills_list"}
+    )
     if _skills_enabled:
         if skills_by_category is None:
             skills_by_category = get_available_skills()
