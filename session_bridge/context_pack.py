@@ -475,6 +475,14 @@ class ContextPackBuilder:
                         [dict(row) for row in profile_messages],
                         database._decode_content,
                     ))
+            if not profile_matches:
+                # A root shadow row whose profile database no longer carries the
+                # session. Measured 2026-08-24, 3 of the 38 shadows in the live
+                # root database dangle this way (cron_* rows from 2026-07-27/29).
+                # That is ABSENT, not ambiguous -- reporting ambiguity sends a
+                # reader hunting for a second copy that does not exist, and
+                # build() already raises KeyError for a source it cannot resolve.
+                raise KeyError(request.source_session_id)
             if len(profile_matches) != 1:
                 raise ValueError("profile-native source identity is ambiguous")
             session, message_records, decode_content = profile_matches[0]

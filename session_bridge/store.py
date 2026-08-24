@@ -9459,6 +9459,13 @@ class SessionBridgeStore:
                         [dict(row) for row in profile_messages],
                         database._decode_content,
                     ))
+            if not profile_matches:
+                # A root shadow row whose profile database no longer carries the
+                # session. Measured 2026-08-24, 3 of the 38 shadows in the live
+                # root database dangle this way. That is ABSENT, not ambiguous --
+                # and this method already raises KeyError above for a root row it
+                # cannot find, so an absent source keeps one error kind.
+                raise KeyError(source_id)
             if len(profile_matches) != 1:
                 raise ValueError("sidebar source identity is ambiguous")
             session, message_records, decode_content = profile_matches[0]
