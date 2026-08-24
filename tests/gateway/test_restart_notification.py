@@ -13,6 +13,7 @@ from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
+    RestartTestAdapter,
     make_restart_runner,
     make_restart_source,
 )
@@ -690,3 +691,106 @@ async def test_schedule_deferred_retry_noop_without_markers(tmp_path, monkeypatc
     runner._schedule_deferred_lifecycle_retry()
 
     assert runner._deferred_lifecycle_retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_boot_sends_retain_planned_marker_on_partial_degraded_refusal(
+    tmp_path, monkeypatch
+):
+    """Multi-target case: one home channel delivered, another refused with
+    send_path_degraded — the marker must survive so the deferred retry can
+    still reach the refused target (#66589)."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    pending_path = tmp_path / ".restart_pending.json"
+    pending_path.write_text("{}")
+
+    runner, tg_adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-tg",
+        name="TG Home",
+    )
+    runner.config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True, token="***")
+    runner.config.platforms[Platform.DISCORD].home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="home-dc",
+        name="DC Home",
+    )
+    dc_adapter = RestartTestAdapter()
+    dc_adapter.send = AsyncMock(
+        return_value=SendResult(success=False, error="send_path_degraded", retryable=True),
+    )
+    runner.adapters[Platform.DISCORD] = dc_adapter
+    tg_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="1"))
+    runner._claim_pending_obligations = AsyncMock(return_value=[])
+    runner._redeliver_claimed_obligations = AsyncMock()
+
+    await runner._await_startup_boot_sends(planned_restart_notification_pending=True)
+
+    # The degraded refusal keeps the marker even though telegram succeeded.
+    assert pending_path.exists()
+    assert runner._last_home_notify_degraded == 1
+    assert runner._last_home_notify_delivered == {("telegram", "home-tg", None)}
+
+
+@pytest.mark.asyncio
+async def test_deferred_retry_skips_already_delivered_home_targets(tmp_path, monkeypatch):
+    """The deferred retry re-sends only to targets refused at startup."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    pending_path = tmp_path / ".restart_pending.json"
+    pending_path.write_text("{}")
+
+    runner, tg_adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-tg",
+        name="TG Home",
+    )
+    runner.config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True, token="***")
+    runner.config.platforms[Platform.DISCORD].home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="home-dc",
+        name="DC Home",
+    )
+    dc_adapter = RestartTestAdapter()
+    dc_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="2"))
+    runner.adapters[Platform.DISCORD] = dc_adapter
+    tg_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="1"))
+    # Startup delivered to telegram before a discord refusal retained the marker.
+    runner._last_home_notify_delivered = {("telegram", "home-tg", None)}
+
+    await runner._retry_deferred_lifecycle_notifications()
+
+    assert not pending_path.exists()
+    tg_adapter.send.assert_not_awaited()
+    dc_adapter.send.assert_awaited_once()
+    dc_call = dc_adapter.send.await_args
+    assert dc_call is not None
+    assert dc_call.args[0] == "home-dc"
+
+
+@pytest.mark.asyncio
+async def test_deferred_retry_waits_for_in_flight_boot_sends(tmp_path, monkeypatch):
+    """A boot send that outlived the restore gate owns the markers; the
+    deferred retry must wait for it instead of racing a duplicate send."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="1"))
+
+    async def finish_boot_send():
+        await asyncio.sleep(0.1)
+        notify_path.unlink(missing_ok=True)
+
+    runner._boot_sends_task = asyncio.create_task(finish_boot_send())
+
+    await runner._retry_deferred_lifecycle_notifications()
+
+    # The boot task consumed the marker; the retry must not double-send.
+    adapter.send.assert_not_awaited()
+    assert not notify_path.exists()
