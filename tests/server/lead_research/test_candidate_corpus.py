@@ -141,7 +141,8 @@ def test_candidate_import_cli_emits_only_corpus_identity(monkeypatch, tmp_path, 
     monkeypatch.setattr(command.Settings, "load", lambda: Settings(database_path=tmp_path / "cli.db"))
 
     command.main([
-        "import-candidates", "--dataset-id", "kitchen-appliances", "--version", "2026-08", "--file", str(source),
+        "import-candidates", "--dataset-id", "kitchen-appliances", "--version", "2026-08",
+        "--file", str(source), "--visibility", "service-public",
     ])
 
     captured = capsys.readouterr()

@@ -5,12 +5,13 @@ import csv
 import io
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal, require_admin
 from ..db import json_dump, json_load, new_id, now
 from ..lead_research.models import CampaignConfig
+from ..lead_research.candidates import CandidateRepository
 from ..lead_research.profiles import ProfileRepository
 from ..lead_research.sectors import load_sectors
 from ..lead_research.service import CampaignAlreadyRunning
@@ -18,6 +19,8 @@ from ..lead_research.storage import EvidenceRepository
 
 
 router = APIRouter(tags=["lead-research"])
+
+MAX_CANDIDATE_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
 class CampaignPatch(BaseModel):
@@ -31,6 +34,39 @@ class PurgeRequest(BaseModel):
 
 def _scope(principal: Principal, header: str | None) -> str:
     return company_scope(principal, header)
+
+
+@router.post("/candidate-datasets", status_code=201)
+async def upload_candidate_dataset(
+    file: UploadFile,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+    x_company_id: str | None = Header(default=None),
+):
+    company_id = _scope(principal, x_company_id)
+    content = await file.read(MAX_CANDIDATE_UPLOAD_BYTES + 1)
+    if len(content) > MAX_CANDIDATE_UPLOAD_BYTES:
+        raise HTTPException(413, "Candidate dataset exceeds the 20 MB upload limit")
+    filename = file.filename or "candidates.csv"
+    report = CandidateRepository(request.app.state.db).import_file(
+        f"tenant-{company_id}-{new_id('dataset')}",
+        "1",
+        filename,
+        content,
+        owner_company_id=company_id,
+        visibility="tenant_private",
+    )
+    request.app.state.db.activity(
+        company_id, principal.id, "candidate_dataset_uploaded", "candidate_dataset",
+        report.dataset_id, {"records": report.record_count},
+    )
+    return {
+        "dataset_id": report.dataset_id,
+        "version": report.version,
+        "record_count": report.record_count,
+        "raw_hash": report.raw_hash,
+        "visibility": "tenant_private",
+    }
 
 
 def _serialize(row) -> dict:

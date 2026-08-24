@@ -11,7 +11,7 @@ import hashlib
 import io
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from ..db import json_dump, json_load, now
@@ -33,6 +33,8 @@ PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS
 ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY
 UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW
 """.split())
+
+CandidateVisibility = Literal["service_public", "tenant_private", "licensed_private"]
 
 
 def searchable_term(value: Any) -> str:
@@ -396,24 +398,42 @@ def _parse_rows(filename: str, content: bytes) -> list[CandidateRecord]:
 
 
 class CandidateRepository:
-    """Repository for shared corpus data, intentionally without a company id."""
+    """Repository that unions shared corpora with only the caller's private rows."""
 
     def __init__(self, db):
         self.db = db
 
-    def import_file(self, dataset_id: str, version: str, filename: str, content: bytes) -> CandidateImportReport:
+    def import_file(
+        self,
+        dataset_id: str,
+        version: str,
+        filename: str,
+        content: bytes,
+        *,
+        owner_company_id: str | None = None,
+        visibility: CandidateVisibility = "service_public",
+    ) -> CandidateImportReport:
         dataset_id, version = _clean(dataset_id), _clean(version)
         if not dataset_id or not version:
             raise CandidateImportValidationError("dataset_id and version are required")
+        if visibility not in {"service_public", "tenant_private", "licensed_private"}:
+            raise CandidateImportValidationError("invalid candidate dataset visibility")
+        if visibility == "service_public" and owner_company_id is not None:
+            raise CandidateImportValidationError("service_public datasets cannot have an owner")
+        if visibility != "service_public" and not owner_company_id:
+            raise CandidateImportValidationError("private candidate datasets require an owner company")
         candidates = _parse_rows(filename, content)
         digest = hashlib.sha256(content).hexdigest()
         try:
             with self.db.transaction() as conn:
                 conn.execute(
                     "INSERT INTO candidate_datasets("
-                    "dataset_id,version,source_filename,raw_hash,imported_at,record_count) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (dataset_id, version, filename, digest, now(), len(candidates)),
+                    "dataset_id,version,owner_company_id,visibility,source_filename,raw_hash,"
+                    "imported_at,record_count) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        dataset_id, version, owner_company_id, visibility, filename,
+                        digest, now(), len(candidates),
+                    ),
                 )
                 for record in candidates:
                     conn.execute(
@@ -472,7 +492,7 @@ class CandidateRepository:
                     )
             written += len(rows)
 
-    def _current_versions(self) -> dict[str, str]:
+    def _current_versions(self, company_id: str | None = None) -> dict[str, str]:
         """The newest version of every imported dataset, keyed by dataset id.
 
         Versions are free text, so "10" must not sort below "9": numeric ones
@@ -483,14 +503,24 @@ class CandidateRepository:
             return (1, float(version), "") if version.isdigit() else (0, 0.0, version)
 
         newest: dict[str, str] = {}
-        for row in self.db.all("SELECT DISTINCT dataset_id,version FROM candidate_records"):
+        visibility_sql = (
+            "d.visibility='service_public' OR d.owner_company_id=?"
+            if company_id else "d.visibility='service_public'"
+        )
+        params = (company_id,) if company_id else ()
+        for row in self.db.all(
+            "SELECT DISTINCT r.dataset_id,r.version FROM candidate_records r "
+            "JOIN candidate_datasets d ON d.dataset_id=r.dataset_id AND d.version=r.version "
+            f"WHERE ({visibility_sql})",
+            params,
+        ):
             dataset_id, version = row["dataset_id"], row["version"]
             if dataset_id not in newest or rank(version) > rank(newest[dataset_id]):
                 newest[dataset_id] = version
         return newest
 
     def term_match_counts(
-        self, *, countries: list[str], product_terms: list[str]
+        self, *, countries: list[str], product_terms: list[str], company_id: str | None = None
     ) -> dict[str, int]:
         """How many candidates each term matches on its own.
 
@@ -504,16 +534,16 @@ class CandidateRepository:
         if not counts:
             return {}
         folded = {str(term): searchable_term(term) for term in counts}
-        for row, data in self._rows(countries):
+        for row, data in self._rows(countries, company_id):
             haystack = _row_search_text(row, data)
             for term, needle in folded.items():
                 if matches_term(needle, haystack):
                     counts[term] += 1
         return counts
 
-    def _rows(self, countries: list[str]):
+    def _rows(self, countries: list[str], company_id: str | None = None):
         """Current-version rows for these countries, decoded once."""
-        current = self._current_versions()
+        current = self._current_versions(company_id)
         if not current:
             return
         normalized = {
@@ -538,6 +568,7 @@ class CandidateRepository:
     def select(
         self,
         *,
+        company_id: str | None = None,
         countries: list[str],
         product_terms: list[str],
         limit: int,
@@ -561,7 +592,7 @@ class CandidateRepository:
         if limit < 1:
             return []
         skip = exclude or set()
-        current = self._current_versions()
+        current = self._current_versions(company_id)
         normalized_countries = {str(value).strip().upper() for value in countries if str(value).strip()}
         invalid_countries = normalized_countries - ISO_ALPHA_2
         if invalid_countries:

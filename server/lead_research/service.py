@@ -309,9 +309,10 @@ class LeadResearchService:
             return estimate
         terms = self._product_terms(company_id, config)
         matches = self.candidates.term_match_counts(
-            countries=config.target_countries, product_terms=terms,
+            company_id=company_id, countries=config.target_countries, product_terms=terms,
         )
         selected = self.candidates.select(
+            company_id=company_id,
             countries=config.target_countries,
             product_terms=terms,
             limit=config.max_qualified_leads_per_country * max(1, len(config.target_countries)) * 3,
@@ -1173,6 +1174,7 @@ class LeadResearchService:
                 if cancelled:
                     break
                 candidates = self.candidates.select(
+                    company_id=company_id,
                     countries=[country],
                     product_terms=product_terms,
                     limit=config.max_qualified_leads_per_country * 3,
@@ -1190,6 +1192,7 @@ class LeadResearchService:
                             "country": country,
                             "terms": product_terms,
                             "term_matches": self.candidates.term_match_counts(
+                                company_id=company_id,
                                 countries=[country], product_terms=product_terms,
                             ),
                             "message": (

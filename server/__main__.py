@@ -99,10 +99,19 @@ def main(argv=None) -> None:
     provision.add_argument("--email", required=True)
     provision.add_argument("--password-file", type=Path, required=True)
     provision.add_argument("--profile", type=Path, required=True)
-    candidates = sub.add_parser("import-candidates", help="Import a private service-only candidate corpus")
+    candidates = sub.add_parser("import-candidates", help="Import a candidate corpus with explicit visibility")
     candidates.add_argument("--dataset-id", required=True)
     candidates.add_argument("--version", required=True)
     candidates.add_argument("--file", type=Path, required=True)
+    ownership = candidates.add_mutually_exclusive_group(required=True)
+    ownership.add_argument(
+        "--visibility", choices=("service-public",),
+        help="Make this corpus available to every tenant",
+    )
+    ownership.add_argument(
+        "--owner-company-id",
+        help="Keep this corpus private to one company",
+    )
     backfill = sub.add_parser(
         "backfill-candidate-search",
         help="Fill search_text for corpora imported before that column existed",
@@ -178,6 +187,8 @@ def main(argv=None) -> None:
         try:
             report = CandidateRepository(db).import_file(
                 args.dataset_id, args.version, args.file.name, args.file.read_bytes(),
+                owner_company_id=args.owner_company_id,
+                visibility="tenant_private" if args.owner_company_id else "service_public",
             )
             # Candidate rows are intentionally never echoed to stdout.
             print(json.dumps({

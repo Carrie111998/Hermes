@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS research_results (
 CREATE TABLE IF NOT EXISTS candidate_datasets (
     dataset_id TEXT NOT NULL,
     version TEXT NOT NULL,
+    owner_company_id TEXT REFERENCES companies(id),
+    visibility TEXT NOT NULL DEFAULT 'service_public'
+        CHECK(visibility IN ('service_public','tenant_private','licensed_private')),
     source_filename TEXT NOT NULL,
     raw_hash TEXT NOT NULL,
     imported_at REAL NOT NULL,
@@ -141,4 +144,12 @@ WHEN OLD.status IN ('confirmed','superseded')
 BEGIN
     SELECT RAISE(ABORT, 'confirmed company profiles are immutable');
 END;
+"""
+
+
+# Existing SQLite databases add visibility/ownership after SCHEMA runs. Any
+# index that names those columns must therefore run after COLUMN_MIGRATIONS.
+POST_COLUMN_SCHEMA = """
+CREATE INDEX IF NOT EXISTS ix_candidate_datasets_visibility_owner
+    ON candidate_datasets(visibility, owner_company_id, dataset_id, version);
 """

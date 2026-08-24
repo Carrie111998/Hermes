@@ -248,7 +248,10 @@ CREATE INDEX IF NOT EXISTS ix_chat_sessions_tenant ON chat_sessions(company_id, 
 # Lead research is an application capability, not a model tool. Keeping its SQL
 # in a focused module avoids growing this already-dense product schema while
 # ensuring a fresh SQLite database is fully usable in one initialization pass.
-from .lead_research.schema import SCHEMA as LEAD_RESEARCH_SCHEMA
+from .lead_research.schema import (
+    POST_COLUMN_SCHEMA as LEAD_RESEARCH_POST_COLUMN_SCHEMA,
+    SCHEMA as LEAD_RESEARCH_SCHEMA,
+)
 
 SCHEMA = SCHEMA + "\n" + LEAD_RESEARCH_SCHEMA
 
@@ -271,6 +274,8 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("research_campaigns", "scope_snapshot", "TEXT"),
     ("research_campaigns", "created_by", "TEXT REFERENCES users(id)"),
     ("research_campaigns", "updated_by", "TEXT REFERENCES users(id)"),
+    ("candidate_datasets", "owner_company_id", "TEXT REFERENCES companies(id)"),
+    ("candidate_datasets", "visibility", "TEXT"),
 )
 
 
@@ -317,6 +322,13 @@ class Database:
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                 if column not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            # Candidate datasets predate ownership. Their original contract was
+            # service-wide, so preserving that visibility is the only safe,
+            # non-surprising backfill; a NULL must never mean "visible to all".
+            conn.execute(
+                "UPDATE candidate_datasets SET visibility='service_public' WHERE visibility IS NULL"
+            )
+            conn.executescript(LEAD_RESEARCH_POST_COLUMN_SCHEMA)
             conn.commit()
 
     @contextlib.contextmanager
