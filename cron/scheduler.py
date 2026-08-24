@@ -7118,32 +7118,42 @@ def _run_one_job_body(
             )
             unresolved_origin = False
             try:
-                delivery_attempted = True
-                delivery_error = _deliver_result(
-                    job,
-                    # Composed exactly like the normal failure delivery above.
-                    # mark_job_run below records THIS run in failure_streak
-                    # whichever layer failed, so a job that fails before the
-                    # run body every tick builds a streak nobody is ever told
-                    # about: its alerts only ever leave through here, and the
-                    # nudge only ever left through there (#88655).
-                    _summarize_cron_failure_for_delivery(job, _err_text)
-                    + _failure_streak_nudge(job),
-                    adapters=adapters,
-                    loop=loop,
-                )
+                # Keep the ownership check and the external send atomic. Without
+                # this fence, a replacement can claim between the pre-check above
+                # and _deliver_result(), allowing a stale owner to send an alert.
+                with _side_effect_fence() as owns_delivery:
+                    if not owns_delivery:
+                        logger.warning(
+                            "Job '%s': skipping failure alert after fire claim ownership loss",
+                            job["id"],
+                        )
+                    else:
+                        delivery_attempted = True
+                        delivery_error = _deliver_result(
+                            job,
+                            # Composed exactly like the normal failure delivery above.
+                            # mark_job_run below records THIS run in failure_streak
+                            # whichever layer failed, so a job that fails before the
+                            # run body every tick builds a streak nobody is ever told
+                            # about: its alerts only ever leave through here, and the
+                            # nudge only ever left through there (#88655).
+                            _summarize_cron_failure_for_delivery(job, _err_text)
+                            + _failure_streak_nudge(job),
+                            adapters=adapters,
+                            loop=loop,
+                        )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
                 logger.error(
                     "Delivery failed for job %s: %s", job["id"], delivery_exc
                 )
-            if not delivery_error and normalized_deliver == "origin":
+            if delivery_attempted and not delivery_error and normalized_deliver == "origin":
                 unresolved_origin = not _resolve_delivery_targets(job)
-            if delivery_error:
+            if delivery_attempted and delivery_error:
                 delivery_outcome = "failed"
-            elif unresolved_origin:
+            elif delivery_attempted and unresolved_origin:
                 delivery_outcome = "not_configured"
-            elif normalized_deliver != "local":
+            elif delivery_attempted and normalized_deliver != "local":
                 delivery_outcome = "delivered"
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
