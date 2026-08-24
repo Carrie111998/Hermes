@@ -345,6 +345,16 @@ class TestContentHash:
         h2 = content_hash(tmp_path)
         assert h1 != h2
 
+    def test_ignores_generated_python_cache_files(self, tmp_path):
+        (tmp_path / "SKILL.md").write_text("same content")
+        baseline = content_hash(tmp_path)
+        cache = tmp_path / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "helper.cpython-313.pyc").write_bytes(b"generated")
+        (tmp_path / "scripts" / "helper.pyc").write_bytes(b"generated")
+
+        assert content_hash(tmp_path) == baseline
+
 
 # ---------------------------------------------------------------------------
 # _unicode_char_name

@@ -46,7 +46,7 @@ for _stream in (sys.stdout, sys.stderr):
         except (ValueError, TypeError):
             pass
 from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import is_excluded_skill_path, is_generated_skill_path
 from typing import Dict, List, Optional, Set, Tuple
 from utils import atomic_replace, atomic_write_text
 
@@ -292,7 +292,9 @@ def _dir_hash(directory: Path) -> str:
     hasher = hashlib.md5()
     try:
         for fpath in sorted(directory.rglob("*")):
-            if fpath.is_file():
+            if fpath.is_file() and not is_generated_skill_path(
+                fpath.relative_to(directory)
+            ):
                 rel = fpath.relative_to(directory)
                 hasher.update(str(rel).encode("utf-8"))
                 hasher.update(fpath.read_bytes())
@@ -317,7 +319,9 @@ def _skill_file_list(skill_dir: Path) -> List[str]:
     files: List[str] = []
     for fpath in sorted(skill_dir.rglob("*")):
         if fpath.is_file():
-            files.append(fpath.relative_to(skill_dir).as_posix())
+            rel = fpath.relative_to(skill_dir).as_posix()
+            if not is_generated_skill_path(rel):
+                files.append(rel)
     return files
 
 

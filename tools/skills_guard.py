@@ -45,6 +45,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
 
+from agent.skill_utils import is_generated_skill_path
+
 
 SCANNER_VERSION = "skills-guard-v2"
 
@@ -899,6 +901,7 @@ def _content_digest(skill_path: Path) -> str:
             (file_path.relative_to(skill_path).as_posix(), file_path)
             for file_path in skill_path.rglob("*")
             if file_path.is_file()
+            and not is_generated_skill_path(file_path.relative_to(skill_path))
         )
         for rel, file_path in entries:
             h.update(rel.encode("utf-8") + b"\x00")

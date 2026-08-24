@@ -528,6 +528,10 @@ class TestCheckForSkillUpdates:
         (skill_dir / "SKILL.md").write_text("same content")
         (skill_dir / "references").mkdir()
         (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        cache = skill_dir / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "helper.cpython-313.pyc").write_bytes(b"generated")
+        (skill_dir / "scripts" / "helper.pyc").write_bytes(b"generated")
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 

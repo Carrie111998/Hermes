@@ -16,6 +16,7 @@ from tools.skills_sync import (
     _discover_bundled_skills,
     _compute_relative_dest,
     _dir_hash,
+    _skill_file_list,
     sync_skills,
     reset_bundled_skill,
     restore_official_optional_skill,
@@ -82,6 +83,20 @@ class TestDirHash:
         assert isinstance(_dir_hash(empty), str) and len(_dir_hash(empty)) == 32
         # A nonexistent dir hashes as empty content rather than raising.
         assert isinstance(_dir_hash(tmp_path / "nope"), str)
+
+    def test_ignores_generated_python_cache_files(self, tmp_path):
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("# Test")
+
+        baseline = _dir_hash(skill)
+        cache = skill / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "helper.cpython-313.pyc").write_bytes(b"generated")
+        (skill / "scripts" / "helper.pyc").write_bytes(b"generated")
+
+        assert _dir_hash(skill) == baseline
+        assert _skill_file_list(skill) == ["SKILL.md"]
 
 
 class TestDiscoverBundledSkills:

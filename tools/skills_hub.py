@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import is_excluded_skill_path, is_generated_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunparse
 
@@ -4407,6 +4407,7 @@ def bundle_content_hash(bundle: SkillBundle) -> str:
     normalized = {
         rel_path.replace("\\", "/"): content
         for rel_path, content in bundle.files.items()
+        if not is_generated_skill_path(rel_path)
     }
     for rel_path in sorted(normalized):
         # Include the path so swapping file contents between two paths
