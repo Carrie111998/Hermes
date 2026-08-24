@@ -89,8 +89,11 @@ def test_deepseek_v4_pro_pricing_entry_exists():
 
     Before this fix, deepseek-v4-pro sessions showed as unknown cost
     in hermes insights because the _OFFICIAL_DOCS_PRICING table had no
-    entry for that model.  See #24218.  Rates track the 2026-07 price cut
-    ($1.74/$3.48 → $0.435/$0.87).
+    entry for that model.  See #24218.  Rates track DeepSeek's official
+    pricing page as of the 2026-08-16 change (verified against
+    api-docs.deepseek.com/quick_start/pricing on 2026-08-24); entries
+    carry OFF-PEAK rates — peak hours bill exactly double and the
+    estimator has no time-of-day axis.
     """
     entry = get_pricing_entry(
         "deepseek-v4-pro",
@@ -100,9 +103,23 @@ def test_deepseek_v4_pro_pricing_entry_exists():
     assert entry is not None
     assert entry.input_cost_per_million is not None
     assert entry.output_cost_per_million is not None
-    assert float(entry.input_cost_per_million) == 0.435
-    assert float(entry.output_cost_per_million) == 0.87
-    assert float(entry.cache_read_cost_per_million) == 0.003625
+    assert float(entry.input_cost_per_million) == 0.66
+    assert float(entry.output_cost_per_million) == 1.98
+    assert float(entry.cache_read_cost_per_million) == 0.022
+
+
+def test_deepseek_vision_exp_prices_as_v4_flash():
+    """Invariant: deepseek-v4-flash-vision-exp bills at flash rates — image
+    tokens convert to input tokens on the same table (official docs)."""
+    flash = get_pricing_entry("deepseek-v4-flash", provider="deepseek")
+    assert flash is not None
+    entry = get_pricing_entry(
+        "deepseek-v4-flash-vision-exp", provider="deepseek"
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million == flash.input_cost_per_million
+    assert entry.output_cost_per_million == flash.output_cost_per_million
+    assert entry.cache_read_cost_per_million == flash.cache_read_cost_per_million
 
 
 

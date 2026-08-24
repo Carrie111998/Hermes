@@ -506,52 +506,69 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="anthropic-pricing-2026-05",
     ),
     # DeepSeek
-    # Snapshot of https://api-docs.deepseek.com/quick_start/pricing (2026-07).
+    # Snapshot of https://api-docs.deepseek.com/quick_start/pricing (2026-08-24),
+    # after the 2026-08-16 rate change. DeepSeek now bills PEAK hours
+    # (01:00-04:00 and 06:00-10:00 UTC, Mon-Fri) at exactly DOUBLE the rates
+    # below; the estimator has no time-of-day axis, so these rows carry the
+    # OFF-PEAK rates — treat estimates as an off-peak floor.
     # deepseek-chat / deepseek-reasoner are deprecated 2026-07-24 and now alias
     # deepseek-v4-flash's non-thinking / thinking modes — same rates.
     (
         "deepseek",
         "deepseek-chat",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        cache_read_cost_per_million=Decimal("0.0028"),
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-offpeak",
     ),
     (
         "deepseek",
         "deepseek-reasoner",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        cache_read_cost_per_million=Decimal("0.0028"),
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-offpeak",
     ),
     (
         "deepseek",
         "deepseek-v4-pro",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.435"),
-        output_cost_per_million=Decimal("0.87"),
-        cache_read_cost_per_million=Decimal("0.003625"),
+        input_cost_per_million=Decimal("0.66"),
+        output_cost_per_million=Decimal("1.98"),
+        cache_read_cost_per_million=Decimal("0.022"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-offpeak",
     ),
     (
         "deepseek",
         "deepseek-v4-flash",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        cache_read_cost_per_million=Decimal("0.0028"),
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-offpeak",
+    ),
+    (
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+    ): PricingEntry(
+        # Image tokens are billed as input tokens at the flash rates (docs:
+        # "Vision: Token Usage").
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
+        source="official_docs_snapshot",
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+        pricing_version="deepseek-pricing-2026-08-offpeak",
     ),
     # Google Gemini
     (
