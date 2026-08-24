@@ -2228,8 +2228,9 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
 
     verdict = "done"
     reason = ""
+    transport_failed = False
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _parse_failed, _, transport_failed = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
         )
@@ -2241,6 +2242,20 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
             judge_exc,
             exc_info=True,
         )
+        return None
+    if transport_failed:
+        # A judge transport failure is transient — judge_goal already fails
+        # open (returns a "continue" verdict). Log a warning and proceed on
+        # the completion path rather than wedging the goal_mode worker. Only
+        # transport_failed=True is allowed to fail open; a parse failure or
+        # any other reliable non-"done" verdict still rejects below.
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "goal judge transport failed (unreachable), allowing completion: %s",
+            reason,
+        )
+        return None
     return reason if verdict != "done" else None
 
 
