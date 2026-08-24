@@ -147,6 +147,11 @@ class CronScheduler(ABC):
         """
         return provider_supports_force_fire(self)
 
+    @property
+    def supports_scheduled_fire(self) -> bool:
+        """Whether manual intent can flow through ``fire_due`` safely."""
+        return provider_supports_scheduled_fire(self)
+
     def fire_due(
         self,
         job_id: str,
@@ -154,6 +159,7 @@ class CronScheduler(ABC):
         adapters: Any = None,
         loop: Any = None,
         force: bool = False,
+        scheduled_fire: bool = True,
     ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
@@ -167,12 +173,22 @@ class CronScheduler(ABC):
         the job itself failed. Returns False only if the claim was lost
         (another machine/retry won it) or the job no longer exists.
         """
-        claimed_job = self.claim_fire(job_id, force=force)
+        claimed_job = self.claim_fire(
+            job_id,
+            force=force,
+            scheduled_fire=scheduled_fire,
+        )
         if claimed_job is None:
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+    def claim_fire(
+        self,
+        job_id: str,
+        *,
+        force: bool = False,
+        scheduled_fire: bool = True,
+    ) -> dict | None:
         """Durably claim one fire and create its audit attempt before dispatch.
 
         Webhook transports call this synchronously before acknowledging the
@@ -186,6 +202,8 @@ class CronScheduler(ABC):
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
+        if not scheduled_fire:
+            claim_kwargs["scheduled_fire"] = False
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
@@ -252,6 +270,36 @@ def provider_supports_force_fire(provider: Any) -> bool:
         )
         for parameter in parameters
     )
+
+
+def _accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == keyword
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    )
+
+
+def provider_supports_scheduled_fire(provider: Any) -> bool:
+    """Return whether ``scheduled_fire`` reaches the provider claim safely.
+
+    The base ``fire_due`` virtually dispatches through ``claim_fire``, so a
+    provider with a legacy claim override must not receive the new keyword even
+    though its inherited first phase accepts it.
+    """
+    if not _accepts_keyword(provider.fire_due, "scheduled_fire"):
+        return False
+    if type(provider).fire_due is CronScheduler.fire_due:
+        return _accepts_keyword(provider.claim_fire, "scheduled_fire")
+    return True
 
 
 def provider_supports_split_fire(provider: Any) -> bool:

@@ -1,6 +1,7 @@
 """Regression tests for dashboard cron job profile routing."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import json
 from queue import Empty, SimpleQueue
 import threading
@@ -535,12 +536,21 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
     fired = []
 
     class RecordingProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+        def fire_due(
+            self,
+            job_id,
+            *,
+            adapters=None,
+            loop=None,
+            force=False,
+            scheduled_fire=True,
+        ):
             fired.append(
                 {
                     "job_id": job_id,
                     "jobs_file": cron_jobs._current_cron_store().jobs_file,
                     "force": force,
+                    "scheduled_fire": scheduled_fire,
                 }
             )
             cron_jobs.mark_job_run(job_id, success=True)
@@ -568,6 +578,7 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
             "job_id": selected["id"],
             "jobs_file": isolated_profiles["worker_alpha"] / "cron" / "jobs.json",
             "force": False,
+            "scheduled_fire": False,
         }
     ]
     assert triggered["last_status"] == "ok"
@@ -578,6 +589,60 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
         sibling["id"],
     )
     assert untouched["last_run_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_trigger_cron_job_runs_stale_oneshot_as_manual_fire(
+    isolated_profiles,
+    monkeypatch,
+):
+    from cron import jobs as cron_jobs
+    from cron.scheduler_provider import CronScheduler
+    from hermes_cli import web_server
+
+    now = datetime(2026, 6, 22, 20, 0, 0, tzinfo=timezone.utc)
+    run_at = (now - timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(cron_jobs, "_hermes_now", lambda: now)
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="run stale one-shot intentionally",
+        schedule="1h",
+        name="stale-manual-trigger",
+    )
+    with cron_jobs.use_cron_store(isolated_profiles["worker_alpha"]):
+        records = cron_jobs.load_jobs()
+        records[0]["schedule"] = {"kind": "once", "run_at": run_at}
+        records[0]["next_run_at"] = run_at
+        cron_jobs.save_jobs(records)
+    fired = []
+
+    class ManualProvider(CronScheduler):
+        @property
+        def name(self):
+            return "manual-test"
+
+        def start(self, stop_event, **kwargs):
+            pass
+
+        def fire_claimed(self, claimed_job, **kwargs):
+            fired.append(claimed_job["id"])
+            cron_jobs.mark_job_run(claimed_job["id"], success=True)
+            return True
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: ManualProvider(),
+    )
+
+    triggered = await web_server.trigger_cron_job(
+        job["id"],
+        profile="worker_alpha",
+    )
+
+    assert fired == [job["id"]]
+    assert triggered["last_status"] == "ok"
+    assert triggered.get("missed_at") is None
 
 
 @pytest.mark.asyncio

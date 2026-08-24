@@ -162,6 +162,30 @@ def test_force_fire_capability_detects_legacy_override():
     assert KeywordSink().supports_force_fire is True
 
 
+def test_scheduled_fire_capability_detects_legacy_claim_override():
+    from cron.scheduler_provider import CronScheduler
+
+    class Current(CronScheduler):
+        @property
+        def name(self):
+            return "current"
+
+        def start(self, stop_event, **kw):
+            pass
+
+    class LegacyClaim(Current):
+        def claim_fire(self, job_id, *, force=False):
+            return None
+
+    class KeywordSink(Current):
+        def claim_fire(self, job_id, **kwargs):
+            return None
+
+    assert Current().supports_scheduled_fire is True
+    assert LegacyClaim().supports_scheduled_fire is False
+    assert KeywordSink().supports_scheduled_fire is True
+
+
 def test_inprocess_provider_ticks_and_stops():
     """The built-in provider drives cron.scheduler.tick(sync=False) on a loop
     and exits promptly when stop_event is set — same contract as the raw
@@ -436,8 +460,15 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     )
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
-    assert InProcessCronScheduler().fire_due("j1", force=True) is True
-    assert claims == [("j1", {"force": True, "return_job": True})]
+    assert InProcessCronScheduler().fire_due(
+        "j1", force=True, scheduled_fire=False
+    ) is True
+    assert claims == [
+        (
+            "j1",
+            {"force": True, "scheduled_fire": False, "return_job": True},
+        )
+    ]
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):

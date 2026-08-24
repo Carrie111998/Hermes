@@ -13291,6 +13291,7 @@ def _fire_cron_job_for_profile(
     from cron import jobs as cron_jobs
     from cron.scheduler_provider import (
         provider_supports_force_fire,
+        provider_supports_scheduled_fire,
         resolve_cron_scheduler,
     )
     from hermes_constants import (
@@ -13302,6 +13303,9 @@ def _fire_cron_job_for_profile(
     try:
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
+            fire_kwargs = {"adapters": None, "loop": None}
+            if provider_supports_scheduled_fire(provider):
+                fire_kwargs["scheduled_fire"] = False
             if force:
                 if not provider_supports_force_fire(provider):
                     raise HTTPException(
@@ -13311,10 +13315,8 @@ def _fire_cron_job_for_profile(
                             "does not support atomic forced firing of paused jobs"
                         ),
                     )
-                return bool(
-                    provider.fire_due(job_id, adapters=None, loop=None, force=True)
-                )
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
+                fire_kwargs["force"] = True
+            return bool(provider.fire_due(job_id, **fire_kwargs))
     finally:
         reset_hermes_home_override(token)
 
