@@ -397,16 +397,26 @@ def recover_pending_to_db(
             )
             recovered += 1
             path.unlink(missing_ok=True)
-        except BaseException:
-            # Shutdown cancellation/interrupt must not strand an owned DB.
-            _close_owned_db()
-            raise
         except Exception as exc:
+            # A single bad flush file (corrupt JSON, locked/corrupt DB,
+            # I/O error) must not abort the whole recovery pass: later
+            # files would be silently starved on every subsequent
+            # startup because the loop re-processes in sorted order and
+            # the caller (gateway/run.py) swallows the escape with no
+            # log. Log and leave the file for the next startup retry.
             logger.warning(
                 "Failed to recover pending message from %s: %s",
                 path, exc,
             )
-            # Leave the file for next startup retry.
+            continue
+        except BaseException:
+            # Shutdown cancellation/interrupt must not strand an owned DB.
+            # (Must come after `except Exception` — BaseException is its
+            # superclass, so listing it first made the branch above
+            # unreachable and turned every ordinary error into a hard
+            # abort of the remaining files.)
+            _close_owned_db()
+            raise
 
     _close_owned_db()
 

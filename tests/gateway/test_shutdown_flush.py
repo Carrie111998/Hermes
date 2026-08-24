@@ -168,3 +168,84 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     assert result == tmp_path / "pending_messages"
 
 
+
+
+def test_corrupt_flush_file_does_not_starve_later_files(tmp_path, monkeypatch, caplog):
+    """A single corrupt flush file must not abort the recovery pass.
+
+    Regression: `except BaseException` listed before `except Exception`
+    made every ordinary error (corrupt JSON, DB lock, I/O failure) close
+    the owned DB and re-raise out of the loop — and gateway/run.py
+    swallows that escape silently, so all later flush files were starved
+    on every subsequent startup.
+    """
+    import logging
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    good_a = flush_dir / "a_good.json"
+    bad = flush_dir / "b_corrupt.json"
+    good_c = flush_dir / "c_good.json"
+    good_a.write_text(
+        json.dumps(
+            {
+                "session_key": "k1",
+                "data": {"text": "hello", "session_id": "s1"},
+                "ts": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    bad.write_text("{not valid json", encoding="utf-8")
+    good_c.write_text(
+        json.dumps(
+            {
+                "session_key": "k2",
+                "data": {"text": "world", "session_id": "s2"},
+                "ts": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    db = MagicMock()
+    with caplog.at_level(logging.WARNING):
+        recovered = recover_pending_to_db(session_db=db)
+
+    assert recovered == 2
+    assert db.append_message.call_count == 2
+    # The corrupt file is preserved for a later retry, with a warning.
+    assert bad.exists()
+    assert any("b_corrupt.json" in rec.message for rec in caplog.records)
+
+
+def test_base_exception_still_propagates_and_closes_owned_db(
+    tmp_path, monkeypatch
+):
+    """Ctrl-C-style interrupts still abort recovery without stranding a DB."""
+    from unittest.mock import MagicMock, patch
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    (flush_dir / "a.json").write_text(
+        json.dumps(
+            {
+                "session_key": "k",
+                "data": {"text": "x", "session_id": "s"},
+                "ts": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    db = MagicMock()
+    db.append_message.side_effect = KeyboardInterrupt()
+    fake_sessiondb = MagicMock(return_value=db)
+    with patch("hermes_state.SessionDB", fake_sessiondb):
+        with pytest.raises(KeyboardInterrupt):
+            recover_pending_to_db()
+    db.close.assert_called_once()
