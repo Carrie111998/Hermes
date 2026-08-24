@@ -1191,6 +1191,11 @@ def parse_reasoning_effort(effort) -> dict | None:
         return None
     if isinstance(effort, dict):
         enabled = effort.get("enabled", True)
+        # ``or ""`` deliberately coerces falsy effort values (0, False) to the
+        # missing-effort path rather than stringifying them: a tier named "0"
+        # or "False" would be meaningless on any wire, and passing it through
+        # would turn a YAML typo into a bogus request field. Only non-empty
+        # strings are honored as custom levels.
         inner = str(effort.get("effort") or "").strip()
         if not inner:
             return {"enabled": False} if enabled is False else None
