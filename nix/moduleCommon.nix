@@ -1145,25 +1145,26 @@ let
       }
     ];
 
+  profileReservedNames = [
+    "default"
+    "hermes"
+    "root"
+    "sudo"
+    "test"
+    "tmp"
+  ];
+
   profileNameAssertions =
     { profiles, optionPath }:
     let
-      reserved = [
-        "default"
-        "hermes"
-        "root"
-        "sudo"
-        "test"
-        "tmp"
-      ];
-      valid = name: builtins.match "^[a-z0-9][a-z0-9_-]{0,63}$" name != null && !(lib.elem name reserved);
+      valid = name: builtins.match "^[a-z0-9][a-z0-9_-]{0,63}$" name != null && !(lib.elem name profileReservedNames);
     in
     lib.mapAttrsToList (name: _profile: {
       assertion = valid name;
       message = ''
         ${optionPath}: invalid profile name '${name}'. Names must match
         [a-z0-9][a-z0-9_-]{0,63} and must not be one of:
-        ${lib.concatStringsSep ", " reserved}.
+        ${lib.concatStringsSep ", " profileReservedNames}.
       '';
     }) profiles;
 
@@ -1222,6 +1223,7 @@ in
     mkStateScript
     pluginNameAssertions
     profileNameAssertions
+    profileReservedNames
     processEnvironment
     processPath
     profileOptions

@@ -1019,7 +1019,7 @@ nix build .#checks.x86_64-linux.config-roundtrip    # merge script preserves use
 | `nixos-profiles` | Named profile activation, ownership, services, and container routing metadata |
 | `profile-names-are-safe` | Profile names cannot escape `profiles/` or use reserved identifiers |
 | `bundled-skills` | Skills directory exists, contains SKILL.md files, `HERMES_BUNDLED_SKILLS` is set in wrapper |
-| `config-roundtrip` | 7 merge scenarios: fresh install, Nix override, user key preservation, mixed merge, MCP additive merge, nested deep merge, idempotency |
+| `config-roundtrip` | 8 merge scenarios: fresh install, Nix override, user key preservation, mixed merge, MCP additive merge, nested deep merge, idempotency, and atomic replacement with the requested final mode |
 
 </details>
 

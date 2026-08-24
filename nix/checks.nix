@@ -279,33 +279,23 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
         # ── Declarative named profiles (Home Manager) ────────────────────
         home-manager-profiles =
           let
-            evaluated = inputs.home-manager.lib.homeManagerConfiguration {
-              pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux;
-              modules = [
-                inputs.self.homeManagerModules.default
-                {
-                  home = {
-                    username = "hermes-check";
-                    homeDirectory = "/home/hermes-check";
-                    stateVersion = "24.11";
+            evaluated = evalHomeSplit {
+              programs.enable = true;
+              services = {
+                enable = true;
+                profiles = {
+                  coder = {
+                    gateway.enable = true;
+                    settings.model.default = "test/coder";
+                    environment.PROFILE_KIND = "coder";
+                    hermesHomeFiles."SOUL.md" = "coder soul";
                   };
-                  services.hermes-agent = {
-                    enable = true;
-                    profiles = {
-                      coder = {
-                        gateway.enable = true;
-                        settings.model.default = "test/coder";
-                        environment.PROFILE_KIND = "coder";
-                        hermesHomeFiles."SOUL.md" = "coder soul";
-                      };
-                      research = {
-                        settings.model.default = "test/research";
-                        workingDirectory = "/home/hermes-check/research-workspace";
-                      };
-                    };
+                  research = {
+                    settings.model.default = "test/research";
+                    workingDirectory = "/home/hermes-check/research-workspace";
                   };
-                }
-              ];
+                };
+              };
             };
             darwinCfg = (inputs.home-manager.lib.homeManagerConfiguration {
               pkgs = inputs.nixpkgs.legacyPackages.aarch64-darwin;
@@ -373,8 +363,12 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           );
 
         # ── Named profile paths stay inside profiles/ ────────────────────
+        # Keep the Nix assertion and the Python validator on one canonical-id
+        # contract. The CLI normalizes user input before this validator; Nix
+        # attribute names are already canonical identifiers and stay strict.
         profile-names-are-safe =
           let
+            common = import ./moduleCommon.nix { inherit lib; };
             accepts =
               name:
               let
@@ -386,36 +380,86 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
               in
               probe.success && probe.value;
 
-            cases = [
-              {
-                name = "canonical profile name";
-                ok = accepts "coder_2";
-              }
-              {
-                name = "path traversal is refused";
-                ok = !(accepts "../escape");
-              }
-              {
-                name = "the virtual default profile name is refused";
-                ok = !(accepts "default");
-              }
-              {
-                name = "mixed-case directory names are refused";
-                ok = !(accepts "Coder");
-              }
-              {
-                name = "names longer than 64 characters are refused";
-                ok = !(accepts "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-              }
-            ];
-            failed = lib.filter (c: !c.ok) cases;
+            boundaryCases =
+              [
+                {
+                  label = "canonical profile name";
+                  value = "coder_2";
+                  expected = true;
+                }
+                {
+                  label = "path traversal";
+                  value = "../escape";
+                  expected = false;
+                }
+                {
+                  label = "mixed case";
+                  value = "Coder";
+                  expected = false;
+                }
+                {
+                  label = "64-character name";
+                  value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+                  expected = true;
+                }
+                {
+                  label = "65-character name";
+                  value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+                  expected = false;
+                }
+              ]
+              ++ map (value: {
+                label = "reserved name ${value}";
+                inherit value;
+                expected = false;
+                reserved = true;
+              }) common.profileReservedNames;
+
+            cases = map (case: case // { nixAccepted = accepts case.value; }) boundaryCases;
+            nixFailures = lib.filter (case: case.nixAccepted != case.expected) cases;
+            casesJson = pkgs.writeText "hermes-profile-name-cases.json" (builtins.toJSON cases);
           in
           pkgs.runCommand "hermes-profile-names-are-safe" { } (
-            if failed != [ ] then
-              throw "Profile name rule failed:\n${lib.concatMapStringsSep "\n" (c: "  - ${c.name}") failed}"
+            if nixFailures != [ ] then
+              throw "Nix profile name rule failed:\n${lib.concatMapStringsSep "\n" (case: "  - ${case.label}") nixFailures}"
             else
               ''
-                ${lib.concatMapStringsSep "\n" (c: ''echo "PASS: ${c.name}"'') cases}
+                export HOME=$TMPDIR
+                ${hermesVenv}/bin/python3 -c '
+import json
+import sys
+
+from hermes_cli.profiles import _RESERVED_NAMES, validate_named_profile_name
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    cases = json.load(handle)
+
+mismatches = []
+nix_reserved = {case["value"] for case in cases if case.get("reserved")}
+if nix_reserved != set(_RESERVED_NAMES):
+    mismatches.append({
+        "nixReserved": sorted(nix_reserved),
+        "pythonReserved": sorted(_RESERVED_NAMES),
+    })
+
+for case in cases:
+    try:
+        validate_named_profile_name(case["value"])
+        python_accepted = True
+    except ValueError:
+        python_accepted = False
+
+    if python_accepted != case["expected"] or python_accepted != case["nixAccepted"]:
+        case["pythonAccepted"] = python_accepted
+        mismatches.append(case)
+
+if mismatches:
+    raise SystemExit(
+        "Nix and Python profile name validators disagree:\n"
+        + json.dumps(mismatches, indent=2, sort_keys=True)
+    )
+' ${casesJson}
+                ${lib.concatMapStringsSep "\n" (case: ''echo "PASS: ${case.label}"'') cases}
                 mkdir -p $out
                 echo "ok" > $out/result
               ''
