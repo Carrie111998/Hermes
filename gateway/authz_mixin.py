@@ -28,37 +28,12 @@ from gateway.whatsapp_identity import (
 )
 
 
-def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
-    if not name:
-        return default
-    try:
-        from agent.secret_scope import (
-            current_secret_scope,
-            get_secret,
-            is_multiplex_active,
-        )
-
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-        # A multiplex profile scope is authoritative. The process environment
-        # may contain the active profile's allowlist/allow-all value, so a
-        # scoped miss must not borrow it for a secondary profile.
-        if current_secret_scope() is not None and is_multiplex_active():
-            return default
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
-
-
 def _platform_gate_env(name: str, default: str = "") -> str:
     """Read a platform allow/deny gate env var with per-profile isolation.
 
-    Like ``_auth_env`` but authoritative under multiplex: when a profile
-    secret scope is installed AND multiplexing is active, a key absent from
-    the scope returns ``default`` instead of falling through to
-    ``os.environ``. Under multiplex the process env may hold ANOTHER
+    When a profile secret scope is installed AND multiplexing is active, a
+    key absent from the scope returns ``default`` instead of falling through
+    to ``os.environ``. Under multiplex the process env may hold ANOTHER
     profile's first-writer-bridged value (the YAML→env bridges in the
     Discord/Telegram adapters' ``_apply_yaml_config`` are first-writer-wins),
     so falling through would leak profile A's allowlist into profile B
@@ -79,6 +54,19 @@ def _platform_gate_env(name: str, default: str = "") -> str:
     except Exception:
         pass
     return (os.getenv(name) or default).strip()
+
+
+def _auth_env(name: str, default: str = "") -> str:
+    """Read allowlist/auth env with per-profile isolation under multiplex.
+
+    Same rules as ``_platform_gate_env``: a scoped miss under multiplex
+    returns ``default`` and does not fall through to ``os.environ``. The
+    process env may hold another profile's first-writer-bridged value, so
+    a fallthrough would leak allowlists and allow-all flags across profiles
+    (issue #72348). Single-profile deployments keep the legacy
+    ``os.getenv`` read.
+    """
+    return _platform_gate_env(name, default)
 
 
 def _coerce_allow_set(raw) -> set[str]:
