@@ -206,6 +206,37 @@ def test_custom_endpoint_picker_setup_handles_keyboard_interrupt(monkeypatch):
     assert invalidations == [{"min_interval": 0.0}]
 
 
+def test_custom_endpoint_picker_setup_handles_interrupt_while_reloading(monkeypatch):
+    import cli as cli_mod
+
+    output = []
+    invalidations = []
+    load_count = 0
+
+    def _load_config():
+        nonlocal load_count
+        load_count += 1
+        if load_count == 2:
+            raise KeyboardInterrupt
+        return {"model": {}}
+
+    monkeypatch.setattr("hermes_cli.main._model_flow_custom", lambda _config: None)
+    monkeypatch.setattr("hermes_cli.config.load_config", _load_config)
+    monkeypatch.setattr(cli_mod, "_cprint", output.append)
+
+    self_ = SimpleNamespace(
+        _app=None,
+        _invalidate=lambda **kwargs: invalidations.append(kwargs),
+    )
+
+    _bound(cli_mod.HermesCLI._configure_custom_endpoint_from_picker, self_)(
+        {"slug": "custom"}, []
+    )
+
+    assert output == ["  Custom endpoint setup cancelled."]
+    assert invalidations == [{"min_interval": 0.0}]
+
+
 def test_custom_endpoint_picker_setup_reports_missing_route(monkeypatch):
     import cli as cli_mod
 

@@ -11256,47 +11256,45 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 asyncio.run_coroutine_threadsafe(_run_setup(), app_loop).result()
             else:
                 _setup()
+
+            config = load_config()
+            model_cfg = config.get("model")
+            if not isinstance(model_cfg, dict):
+                _cprint("  No custom endpoint configured.")
+                self._invalidate(min_interval=0.0)
+                return
+            model = str(model_cfg.get("default") or "").strip()
+            base_url = str(model_cfg.get("base_url") or "").strip()
+            if model_cfg.get("provider") != "custom" or not model or not base_url:
+                _cprint("  No custom endpoint configured.")
+                self._invalidate(min_interval=0.0)
+                return
+
+            from hermes_cli.model_switch import switch_model
+
+            fresh_custom_providers = get_compatible_custom_providers(config)
+            result = switch_model(
+                raw_input=model,
+                current_provider=self.provider or "",
+                current_model=self.model or "",
+                current_base_url=base_url,
+                current_api_key=str(model_cfg.get("api_key") or ""),
+                is_global=True,
+                explicit_provider="custom",
+                user_providers=config.get("providers"),
+                custom_providers=fresh_custom_providers or custom_providers,
+            )
+            self._confirm_and_apply_model_switch_result(
+                result,
+                True,
+                custom_providers=fresh_custom_providers or custom_providers,
+            )
         except KeyboardInterrupt:
             _cprint("  Custom endpoint setup cancelled.")
             self._invalidate(min_interval=0.0)
-            return
         except Exception as exc:
             _cprint(f"  ✗ Custom endpoint setup failed: {exc}")
             self._invalidate(min_interval=0.0)
-            return
-
-        config = load_config()
-        model_cfg = config.get("model")
-        if not isinstance(model_cfg, dict):
-            _cprint("  No custom endpoint configured.")
-            self._invalidate(min_interval=0.0)
-            return
-        model = str(model_cfg.get("default") or "").strip()
-        base_url = str(model_cfg.get("base_url") or "").strip()
-        if model_cfg.get("provider") != "custom" or not model or not base_url:
-            _cprint("  No custom endpoint configured.")
-            self._invalidate(min_interval=0.0)
-            return
-
-        from hermes_cli.model_switch import switch_model
-
-        fresh_custom_providers = get_compatible_custom_providers(config)
-        result = switch_model(
-            raw_input=model,
-            current_provider=self.provider or "",
-            current_model=self.model or "",
-            current_base_url=base_url,
-            current_api_key=str(model_cfg.get("api_key") or ""),
-            is_global=True,
-            explicit_provider="custom",
-            user_providers=config.get("providers"),
-            custom_providers=fresh_custom_providers or custom_providers,
-        )
-        self._confirm_and_apply_model_switch_result(
-            result,
-            True,
-            custom_providers=fresh_custom_providers or custom_providers,
-        )
 
     def _handle_model_switch(self, cmd_original: str):
         """Handle /model command — switch model.
