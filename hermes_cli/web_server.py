@@ -7629,6 +7629,13 @@ def _apply_model_assignment_sync(
         provider, model = _normalize_main_model_assignment(provider, model)
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+        current_model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        current_provider = str(current_model_cfg.get("provider") or "").strip().lower()
+        previous_entry = (
+            providers_cfg.get(current_provider)
+            if isinstance(providers_cfg, dict) else None
+        )
+        _sync_custom_endpoint_reasoning_override(cfg, previous_entry, provider_entry)
         if not base_url and isinstance(provider_entry, dict) and provider_entry.get("base_url"):
             base_url = str(provider_entry.get("base_url") or "").strip()
         model_cfg = _apply_main_model_assignment(
@@ -8372,7 +8379,7 @@ def _sync_custom_endpoint_reasoning_override(
         from hermes_constants import parse_reasoning_effort
 
         parsed_effort = parse_reasoning_effort(active_effort)
-        if parsed_effort and parsed_effort.get("enabled"):
+        if parsed_effort is not None:
             if isinstance(active_entry, dict):
                 active_entry["_reasoning_override_state"] = {
                     "model": active_model,
@@ -8747,7 +8754,11 @@ def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
             deleted_entry = providers.pop(provider_key, None)
             cfg["providers"] = providers
             model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-            if str(model_cfg.get("provider") or "").strip().lower() == provider_key:
+            if (
+                str(model_cfg.get("provider") or "").strip().lower() == provider_key
+                or isinstance(deleted_entry, dict)
+                and deleted_entry.get("_reasoning_override_state")
+            ):
                 _sync_custom_endpoint_reasoning_override(cfg, deleted_entry, None)
             _detach_main_model_from_provider(cfg, provider_key)
             remove_env_value(custom_endpoint_key_env(provider_key))

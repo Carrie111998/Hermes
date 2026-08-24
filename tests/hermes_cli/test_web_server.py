@@ -1798,10 +1798,31 @@ class TestWebServerEndpoints:
         }
         assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
         assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "high"
+        switched = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main", "provider": "openrouter",
+                "model": "openai/gpt-5.5", "confirm_expensive_model": True,
+            },
+        )
+        assert switched.status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "low"
         assert self.client.request(
             "DELETE", "/api/providers/custom-endpoints/responses-proxy"
         ).status_code == 200
         assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "low"
+
+    def test_endpoint_reasoning_none_disables_reasoning(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-none",
+            "model_details": [{"id": "gpt-none", "canonical_model": "gpt", "reasoning_effort": "none"}],
+            "make_default": True,
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "none"
 
     def test_custom_endpoint_legacy_edit_preserves_explicit_transport(self):
         """An older Desktop payload must not reset a transport it cannot display."""
