@@ -4,7 +4,17 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_campaigns (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1,
-    config TEXT NOT NULL, estimate TEXT, run_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+    config TEXT NOT NULL, estimate TEXT, run_id TEXT,
+    profile_version_id TEXT REFERENCES company_profile_versions(id),
+    created_by TEXT REFERENCES users(id), updated_by TEXT REFERENCES users(id),
+    created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS company_profile_versions (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    version INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('draft','confirmed','superseded')),
+    profile_json TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
+    confirmed_by TEXT REFERENCES users(id), created_at REAL NOT NULL,
+    confirmed_at REAL, superseded_at REAL, UNIQUE(company_id, version)
 );
 CREATE TABLE IF NOT EXISTS dataset_definitions (
     company_id TEXT NOT NULL REFERENCES companies(id), source_id TEXT NOT NULL, installed INTEGER NOT NULL DEFAULT 0,
@@ -96,6 +106,8 @@ CREATE TABLE IF NOT EXISTS candidate_records (
     FOREIGN KEY(dataset_id, version) REFERENCES candidate_datasets(dataset_id, version)
 );
 CREATE INDEX IF NOT EXISTS ix_research_campaigns_tenant ON research_campaigns(company_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS ix_company_profile_versions_current
+    ON company_profile_versions(company_id, status, version DESC);
 CREATE INDEX IF NOT EXISTS ix_research_sources_tenant ON dataset_definitions(company_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
@@ -111,4 +123,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_candidate_records_domain
     ON candidate_records(dataset_id, version, domain) WHERE domain IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_candidate_records_normalized_name_country
     ON candidate_records(dataset_id, version, normalized_name, country);
+
+-- A new version may supersede an old one, but a confirmed snapshot's inputs
+-- never change in place. Campaigns can therefore keep pointing at an exact
+-- research contract even after the company edits its profile.
+CREATE TRIGGER IF NOT EXISTS protect_confirmed_company_profile_update
+BEFORE UPDATE OF company_id, version, profile_json, created_by, created_at
+ON company_profile_versions
+WHEN OLD.status IN ('confirmed','superseded')
+BEGIN
+    SELECT RAISE(ABORT, 'confirmed company profiles are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS protect_confirmed_company_profile_delete
+BEFORE DELETE ON company_profile_versions
+WHEN OLD.status IN ('confirmed','superseded')
+BEGIN
+    SELECT RAISE(ABORT, 'confirmed company profiles are immutable');
+END;
 """

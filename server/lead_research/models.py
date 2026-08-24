@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -17,6 +18,67 @@ RecordType = Literal[
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class CompanyResearchProfile(ApiModel):
+    """Confirmed inputs that make one campaign's research reproducible."""
+
+    identity: dict[str, str | None]
+    seller_countries: list[str] = Field(min_length=1)
+    products: list[dict[str, Any]] = Field(min_length=1)
+    market_preferences: dict[str, Any]
+    research_exclusions: dict[str, Any] = Field(default_factory=dict)
+    hidden_label_ids: list[str] = Field(default_factory=list)
+    hidden_label_provenance: dict[str, str] = Field(default_factory=dict)
+    source_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    confirmations: dict[str, bool] = Field(default_factory=dict)
+    playbook_versions: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("identity", mode="before")
+    @classmethod
+    def normalize_identity(cls, value):
+        identity = dict(value or {})
+        if not identity.get("name") and not identity.get("legal_name"):
+            raise ValueError("company identity requires a name or legal name")
+        website = identity.get("website")
+        if website:
+            parsed = urlsplit(str(website))
+            if parsed.scheme != "https" or not parsed.hostname:
+                raise ValueError("company website must be an https URL")
+            identity.setdefault("official_domain", parsed.hostname.lower().removeprefix("www."))
+        return identity
+
+    @field_validator("seller_countries")
+    @classmethod
+    def normalize_seller_countries(cls, value: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(str(item).upper() for item in value))
+        if any(len(item) != 2 or not item.isalpha() for item in normalized):
+            raise ValueError("seller countries must use ISO alpha-2 codes")
+        return normalized
+
+    @field_validator("products")
+    @classmethod
+    def products_have_research_scope(cls, value: list[dict[str, Any]]):
+        for product in value:
+            if not product.get("id") or not product.get("name"):
+                raise ValueError("each research product requires id and name")
+            if not (product.get("english_name") or product.get("hs_codes") or product.get("sector_ids")):
+                raise ValueError("each research product requires an English name, HS code, or sector")
+        return value
+
+
+class CompanyProfileVersion(ApiModel):
+    id: str
+    company_id: str
+    version: int = Field(ge=1)
+    status: Literal["draft", "confirmed", "superseded"]
+    profile: CompanyResearchProfile
+    created_by: str
+    confirmed_by: str | None = None
+    created_at: float
+    confirmed_at: float | None = None
+    superseded_at: float | None = None
 
 
 class DatasetDefinition(ApiModel):

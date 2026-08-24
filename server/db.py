@@ -267,6 +267,9 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("documents", "processing_started_at", "REAL"),
     ("documents", "ready_at", "REAL"),
     ("documents", "origin", "TEXT"),
+    ("research_campaigns", "profile_version_id", "TEXT REFERENCES company_profile_versions(id)"),
+    ("research_campaigns", "created_by", "TEXT REFERENCES users(id)"),
+    ("research_campaigns", "updated_by", "TEXT REFERENCES users(id)"),
 )
 
 

@@ -1,5 +1,5 @@
 -- Post-migration verification for a hosted Supabase project.
--- Run after applying migrations/001..005, before pointing traffic at the API,
+-- Run after applying every migration, before pointing traffic at the API,
 -- either through psql or by pasting the whole file into the Supabase SQL Editor:
 --
 --   psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f server/supabase/verify.sql
@@ -14,14 +14,18 @@
 
 begin;
 
--- 1. All five migrations recorded. postgres.py refuses to boot without these,
+-- 1. All required migrations recorded. postgres.py refuses to boot without these,
 --    but failing here names them before the API is even started.
 do $$
 declare missing text;
 begin
   select string_agg(v, ', ') into missing
   from unnest(array['001_initial','002_chat_sessions','003_lead_research',
-                    '004_lead_research_rls','005_auth_table_rls']) v
+                    '004_lead_research_rls','005_auth_table_rls',
+                    '006_message_supersession','007_document_artifacts',
+                    '008_candidate_corpus','009_research_results',
+                    '010_digest_suppression_parity','011_candidate_search_text',
+                    '012_company_profile_versions']) v
   where v not in (select version from schema_migrations);
   if missing is not null then
     raise exception 'unapplied migrations: %', missing;
