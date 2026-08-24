@@ -137,6 +137,43 @@ class TestGoalManager:
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
 
+    def test_continuation_prompt_includes_failed_judge_reason(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="cont-feedback-sid")
+        mgr.set("prove the result")
+        mgr.state.last_verdict = "continue"
+        mgr.state.last_reason = "Show the actual file excerpt, not only a summary."
+
+        prompt = mgr.next_continuation_prompt()
+        assert "Previous completion-check feedback:" in prompt
+        assert "Show the actual file excerpt" in prompt
+        assert "Address this specific feedback" in prompt
+
+    def test_continuation_feedback_is_bounded(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="cont-feedback-bound-sid")
+        mgr.set("prove the result")
+        mgr.state.last_verdict = "continue"
+        mgr.state.last_reason = "x" * 5000
+
+        prompt = mgr.next_continuation_prompt()
+        feedback = prompt.split("Previous completion-check feedback:\n", 1)[1]
+        assert len(feedback) < 1400
+
+    def test_wait_verdict_is_not_replayed_as_failure_feedback(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="cont-wait-sid")
+        mgr.set("wait for peer")
+        mgr.state.last_verdict = "wait"
+        mgr.state.last_reason = "Waiting for a peer reply."
+
+        prompt = mgr.next_continuation_prompt()
+        assert "Previous completion-check feedback:" not in prompt
+        assert "Waiting for a peer reply." not in prompt
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
