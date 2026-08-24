@@ -78,6 +78,29 @@ def test_claim_rejection_attempt_id_deduplicates_retry_only(conn, monkeypatch):
     assert payloads[1]["attempt_id"] != attempt_id
 
 
+@pytest.mark.parametrize("claim_name,status", [("claim_task", "ready"), ("claim_review_task", "review")])
+def test_claim_rejection_audit_failure_preserves_contract_error(
+    conn, monkeypatch, caplog, claim_name, status
+):
+    """A broken secondary audit never masks the routing contract error."""
+    task_id = kb.create_task(conn, title="audit failure", assignee="coder")
+    conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+    monkeypatch.setattr(
+        kb, "_resolve_routing_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RoutingContractError("original route")),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_append_claim_rejected_once",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit unavailable")),
+    )
+
+    with pytest.raises(RoutingContractError, match="original route"):
+        getattr(kb, claim_name)(conn, task_id)
+
+    assert "audit unavailable" in caplog.text
+
+
 def test_review_claim_rejection_rolls_back_and_audits_separately(conn, monkeypatch):
     """Review routing rejection preserves review state and creates no run."""
     task_id = kb.create_task(conn, title="reject review", assignee="coder")

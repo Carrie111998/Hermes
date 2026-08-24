@@ -5531,8 +5531,15 @@ def claim_review_task(
             conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer
         )
     except RoutingContractError as exc:
-        with write_txn(conn):
-            _append_claim_rejected_once(conn, task_id, attempt_id, str(exc))
+        try:
+            with write_txn(conn):
+                _append_claim_rejected_once(conn, task_id, attempt_id, str(exc))
+        except Exception as audit_exc:  # noqa: BLE001 - secondary audit is best effort
+            _log.warning(
+                "failed to audit claim_rejected for task %s: %s",
+                task_id,
+                audit_exc,
+            )
         raise
 
 
@@ -5557,8 +5564,15 @@ def claim_task(
             conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer
         )
     except RoutingContractError as exc:
-        with write_txn(conn):
-            _append_claim_rejected_once(conn, task_id, attempt_id, str(exc))
+        try:
+            with write_txn(conn):
+                _append_claim_rejected_once(conn, task_id, attempt_id, str(exc))
+        except Exception as audit_exc:  # noqa: BLE001 - secondary audit is best effort
+            _log.warning(
+                "failed to audit claim_rejected for task %s: %s",
+                task_id,
+                audit_exc,
+            )
         raise
 
 
