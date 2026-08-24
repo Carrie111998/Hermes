@@ -95,6 +95,14 @@ class SubscriberEntry:
 @dataclass(frozen=True)
 class Roster:
     entries: Tuple[SubscriberEntry, ...]
+    # The file this roster was actually READ from, when it came from one.
+    # Consumers that name a path in an operator-facing message must use this
+    # rather than the module-level ROSTER_PATH: a drift alert that says
+    # "Fix <path>" has to name the file it really loaded, not the default it
+    # assumed. Caught 2026-08-23 by the end-to-end scratch-bus test, which
+    # loaded a drifted roster from a tempdir and got told to fix the shipping
+    # one.
+    source: Optional[Path] = None
 
     @property
     def live(self) -> FrozenSet[str]:
@@ -216,4 +224,5 @@ def load_roster(path: Optional[Path] = None) -> Roster:
         data = json.loads(text)
     except ValueError as exc:
         raise RosterError(f"subscriber roster {p} is not valid JSON: {exc}") from exc
-    return parse_roster(data, origin=str(p))
+    parsed = parse_roster(data, origin=str(p))
+    return Roster(entries=parsed.entries, source=p)

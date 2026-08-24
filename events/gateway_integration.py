@@ -26,7 +26,8 @@ from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
 from events.producers.code_drift_monitor import CodeDriftMonitor, watched_repos
 from events.producers.partial_backlog_monitor import PartialBacklogMonitor
-from events.roster import ROSTER_PATH, RosterError, load_roster
+from events import roster as _roster
+from events.roster import RosterError, load_roster
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
@@ -145,10 +146,13 @@ def _verify_subscriber_roster() -> None:
     if _registry is None:
         return
     registered = {s.subscriber_id for s in _registry.subscribers if s.subscriber_id}
+    # Read the module attribute rather than a name bound at import: this must
+    # report the path actually in effect, and it is only the FALLBACK anyway --
+    # a successful load overwrites it with the file that was really read.
+    roster_path = _roster.ROSTER_PATH
     payload: Dict[str, Any] = {
         "subscriber_id": "roster-check",
         "registered": sorted(registered),
-        "roster_path": str(ROSTER_PATH),
     }
     problems: List[str] = []
 
@@ -159,6 +163,7 @@ def _verify_subscriber_roster() -> None:
         # believe the roster was checked.
         problems.append(f"roster could not be loaded ({exc})")
     else:
+        roster_path = roster.source or roster_path
         retired = roster.retired
         unregistered = sorted(roster.live - registered)
         unlisted = sorted(registered - roster.live)
@@ -189,10 +194,11 @@ def _verify_subscriber_roster() -> None:
     detail = "; ".join(problems)
     payload["error"] = "subscriber roster drift"
     payload["detail"] = detail
+    payload["roster_path"] = str(roster_path)
     logger.error(
         "EventBus: SUBSCRIBER ROSTER DRIFT — %s. Fix %s (and note that "
         "scripts/event_bus_retention.py classifies subscriber_cursors rows from it).",
-        detail, ROSTER_PATH,
+        detail, roster_path,
     )
     if _bus is None:
         return
