@@ -4181,6 +4181,19 @@ class APIServerAdapter(BasePlatformAdapter):
             skip_tool_search_assembly=True,
             update_last_resolved=False,
         )
+        dynamic_definitions, dynamic_toolsets = (
+            APIServerAdapter._dynamic_platform_tool_definitions(config, enabled)
+        )
+        known_names = {
+            (definition.get("function") or {}).get("name")
+            for definition in definitions
+        }
+        for definition in dynamic_definitions:
+            name = (definition.get("function") or {}).get("name")
+            if name in known_names:
+                continue
+            definitions.append(definition)
+            known_names.add(name)
 
         configured = (config.get("platform_toolsets") or {}).get(platform)
         explicit_config_present = isinstance(configured, list)
@@ -4197,7 +4210,7 @@ class APIServerAdapter(BasePlatformAdapter):
             schema = definition.get("function") or {}
             name = schema.get("name")
             entry = registry.get_entry(name) if name else None
-            canonical_toolset = entry.toolset if entry else None
+            canonical_toolset = entry.toolset if entry else dynamic_toolsets.get(name)
             requested_toolsets = requested_by_canonical.get(canonical_toolset, [])
             explicitly_enabled = bool(
                 canonical_toolset in explicit_canonical
@@ -4205,7 +4218,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
             source_server = None
-            if entry is None:
+            if entry is None and canonical_toolset is None:
                 source = "unresolved"
             elif canonical_toolset and canonical_toolset.startswith("mcp-"):
                 source = "mcp"
@@ -4231,6 +4244,75 @@ class APIServerAdapter(BasePlatformAdapter):
 
         data.sort(key=lambda item: str(item.get("name") or ""))
         return data, sorted(enabled), explicit_config_present
+
+    @staticmethod
+    def _dynamic_platform_tool_definitions(
+        config: Dict[str, Any],
+        enabled_toolsets: set[str],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """Return agent-injected provider schemas absent from the tool registry."""
+        from agent.memory_manager import (
+            memory_provider_tools_enabled,
+            normalize_tool_schema,
+        )
+
+        definitions: List[Dict[str, Any]] = []
+        toolsets: Dict[str, str] = {}
+
+        if memory_provider_tools_enabled(sorted(enabled_toolsets)):
+            try:
+                from plugins.memory import load_memory_provider
+                from tools.memory_tool import get_builtin_memory_config
+
+                provider_name = str(
+                    get_builtin_memory_config(config).get("provider") or ""
+                ).strip()
+                provider = (
+                    load_memory_provider(provider_name, register_skills=False)
+                    if provider_name
+                    else None
+                )
+                if provider is not None and provider.is_available():
+                    for raw_schema in provider.get_tool_schemas():
+                        schema = normalize_tool_schema(raw_schema)
+                        if schema is not None:
+                            definitions.append({"type": "function", "function": schema})
+                            toolsets[schema["name"]] = "memory"
+            except Exception:
+                logger.debug(
+                    "Failed to resolve memory-provider schemas for tool catalog",
+                    exc_info=True,
+                )
+
+        if "context_engine" in enabled_toolsets:
+            try:
+                engine_name = str(
+                    (config.get("context") or {}).get("engine") or "compressor"
+                ).strip()
+                engine = None
+                if engine_name != "compressor":
+                    from plugins.context_engine import load_context_engine
+
+                    engine = load_context_engine(engine_name)
+                    if engine is None:
+                        from hermes_cli.plugins import get_plugin_context_engine
+
+                        candidate = get_plugin_context_engine()
+                        if candidate is not None and candidate.name == engine_name:
+                            engine = candidate
+                if engine is not None:
+                    for raw_schema in engine.get_tool_schemas():
+                        schema = normalize_tool_schema(raw_schema)
+                        if schema is not None:
+                            definitions.append({"type": "function", "function": schema})
+                            toolsets[schema["name"]] = "context_engine"
+            except Exception:
+                logger.debug(
+                    "Failed to resolve context-engine schemas for tool catalog",
+                    exc_info=True,
+                )
+
+        return definitions, toolsets
 
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API

@@ -995,6 +995,16 @@ class TestToolsEndpoint:
         ), patch(
             "hermes_cli.tools_config._RECENTLY_SHIPPED_TOOLSETS",
             frozenset({"bfl"}),
+        ), patch.object(
+            APIServerAdapter,
+            "_dynamic_platform_tool_definitions",
+            return_value=(
+                [
+                    {"type": "function", "function": {"name": "memory_search", "parameters": {}}},
+                    {"type": "function", "function": {"name": "lcm_grep", "parameters": {}}},
+                ],
+                {"memory_search": "memory", "lcm_grep": "context_engine"},
+            ),
         ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
@@ -1019,6 +1029,10 @@ class TestToolsEndpoint:
         assert by_name["bfl_flux"]["provenance"]["source"] == "recently_shipped"
         assert by_name["bfl_flux"]["provenance"]["added_below_explicit_config"] is True
         assert by_name["kanban_show"]["provenance"]["source"] == "default_injected"
+        assert by_name["memory_search"]["provenance"]["source"] == "default_injected"
+        assert by_name["memory_search"]["provenance"]["toolset"] == "memory"
+        assert by_name["lcm_grep"]["provenance"]["source"] == "default_injected"
+        assert by_name["lcm_grep"]["provenance"]["toolset"] == "context_engine"
         assert by_name["missing_entry"]["provenance"] == {
             "source": "unresolved",
             "toolset": None,
@@ -1117,6 +1131,49 @@ class TestToolsEndpoint:
         assert enabled == ["file"]
         assert explicit is False
         assert data[0]["provenance"]["added_below_explicit_config"] is False
+
+    def test_dynamic_tool_catalog_loads_available_configured_providers(self):
+        memory_provider = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_tool_schemas=lambda: [
+                {"name": "memory_search", "description": "Search memory", "parameters": {}}
+            ],
+        )
+        context_engine = types.SimpleNamespace(
+            get_tool_schemas=lambda: [
+                {"name": "lcm_grep", "description": "Search context", "parameters": {}}
+            ],
+        )
+        config = {
+            "memory": {"provider": "test-memory"},
+            "context": {"engine": "test-context"},
+        }
+
+        with patch(
+            "tools.memory_tool.get_builtin_memory_config",
+            return_value={"provider": "test-memory"},
+        ), patch(
+            "plugins.memory.load_memory_provider",
+            return_value=memory_provider,
+        ) as load_memory, patch(
+            "plugins.context_engine.load_context_engine",
+            return_value=context_engine,
+        ) as load_context:
+            definitions, toolsets = APIServerAdapter._dynamic_platform_tool_definitions(
+                config,
+                {"memory", "context_engine"},
+            )
+
+        assert {item["function"]["name"] for item in definitions} == {
+            "memory_search",
+            "lcm_grep",
+        }
+        assert toolsets == {
+            "memory_search": "memory",
+            "lcm_grep": "context_engine",
+        }
+        load_memory.assert_called_once_with("test-memory", register_skills=False)
+        load_context.assert_called_once_with("test-context")
 
     @pytest.mark.asyncio
     async def test_tools_requires_api_key_when_configured(self, auth_adapter):
