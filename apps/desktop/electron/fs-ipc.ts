@@ -9,11 +9,13 @@ import { ipcMain, shell } from 'electron'
 
 import { installDesktopPluginFromGit, probePluginRepo } from './desktop-plugin-install'
 import { readDirForIpc } from './fs-read-dir'
+import { allowedFsRoots, assertExistingOrParentPathWithinRoots } from './fs-scope'
 import { gitRootForIpc } from './git-root'
 
 export interface FsIpcDeps {
   hermesHome: string
   readActiveDesktopProfile: () => null | string
+  activeWorkspaceRoot: () => string
   expandUserPath: (value: string) => string
   resolveRequestedPathForIpc: (value: string, options: { purpose: string }) => string
   directoryExists: (value: string) => boolean
@@ -23,14 +25,25 @@ export interface FsIpcDeps {
 export function registerFsIpc({
   hermesHome,
   readActiveDesktopProfile,
+  activeWorkspaceRoot,
   expandUserPath,
   resolveRequestedPathForIpc,
   directoryExists,
   resolveGitBinary
 }: FsIpcDeps) {
-  ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(dirPath))
+  const scopedPath = (value: string, purpose: string) =>
+    assertExistingOrParentPathWithinRoots(
+      value,
+      allowedFsRoots(hermesHome, activeWorkspaceRoot()),
+      purpose
+    )
 
-  ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => gitRootForIpc(startPath))
+  ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(scopedPath(dirPath, 'Directory read')))
+
+  ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => {
+    const root = await gitRootForIpc(scopedPath(startPath, 'Git root'))
+    return root ? scopedPath(root, 'Git root') : null
+  })
 
   // Reveal a path in the OS file manager (Finder / Explorer / Files).
   ipcMain.handle('hermes:fs:reveal', async (_event, targetPath) => {
@@ -41,7 +54,7 @@ export function registerFsIpc({
     }
 
     try {
-      shell.showItemInFolder(target)
+      shell.showItemInFolder(scopedPath(target, 'Reveal'))
 
       return true
     } catch {
@@ -62,8 +75,9 @@ export function registerFsIpc({
     }
 
     try {
-      await fs.promises.mkdir(dir, { recursive: true })
-      const error = await shell.openPath(path.normalize(dir))
+      const scopedDir = scopedPath(dir, 'Open directory')
+      await fs.promises.mkdir(scopedDir, { recursive: true })
+      const error = await shell.openPath(path.normalize(scopedDir))
 
       return error ? { ok: false, error } : { ok: true }
     } catch (error) {
@@ -144,19 +158,21 @@ export function registerFsIpc({
       throw new Error('Invalid rename')
     }
 
+    const scopedSrc = scopedPath(src, 'Rename')
     const dst = path.join(path.dirname(src), name)
+    const scopedDst = scopedPath(dst, 'Rename')
 
-    if (dst === src) {
-      return { path: dst }
+    if (scopedDst === scopedSrc) {
+      return { path: scopedDst }
     }
 
-    if (fs.existsSync(dst)) {
+    if (fs.existsSync(scopedDst)) {
       throw new Error(`"${name}" already exists`)
     }
 
-    await fs.promises.rename(src, dst)
+    await fs.promises.rename(scopedSrc, scopedDst)
 
-    return { path: dst }
+    return { path: scopedDst }
   })
 
   // Write a small UTF-8 text file (e.g. a project's IDEA.md at creation). The path
@@ -176,7 +192,10 @@ export function registerFsIpc({
       throw new Error('Content too large')
     }
 
-    const resolved = resolveRequestedPathForIpc(expandUserPath(raw), { purpose: 'Write text file' })
+    const resolved = scopedPath(
+      resolveRequestedPathForIpc(expandUserPath(raw), { purpose: 'Write text file' }),
+      'Write text file'
+    )
 
     if (!directoryExists(path.dirname(resolved))) {
       throw new Error('Parent directory does not exist')
@@ -196,7 +215,7 @@ export function registerFsIpc({
       throw new Error('Invalid delete')
     }
 
-    await shell.trashItem(target)
+    await shell.trashItem(scopedPath(target, 'Delete'))
 
     return true
   })
