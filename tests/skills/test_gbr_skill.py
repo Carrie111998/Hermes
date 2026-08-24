@@ -117,10 +117,10 @@ def test_attach_only_loopback_or_stdio_and_spectator_role():
     assert "gbr-mcp" in text
     assert "spectator" in text.lower()
     assert "not orchestrator" in text.lower()
-    assert "Linespotting AB" in text
-    assert "not affiliated with xai or spacex" in text.lower()
-    assert "fourth pair" in text.lower()
-    assert "install.sh" in text and "mutable" in text.lower()
+    # Real CLI: hermes mcp add NAME --url|--command|--args (not Claude-style -- remainder).
+    assert "hermes mcp add gbr --url http://127.0.0.1:8788" in text
+    assert "hermes mcp add gbr --command node --args ./bin/gbr-mcp.js" in text
+    assert "hermes mcp add gbr -- " not in text
 
 
 def test_description_index_one_liner():
