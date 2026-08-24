@@ -102,9 +102,11 @@ def _insert_legacy_run(
         (task_id, task_id, task_status, now),
     )
     run_id = conn.execute(
-        "INSERT INTO task_runs (task_id,profile,status,started_at,ended_at) "
-        "VALUES (?,?,?,?,?)",
-        (task_id, "coder", "completed", now - 1, now if ended else None),
+        "INSERT INTO task_runs (task_id,profile,status,outcome,started_at,ended_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (task_id, "coder", "completed",
+         "success" if ended and task_status in ("done", "archived") else None,
+         now - 1, now if ended else None),
     )
     assert run_id.lastrowid is not None
     return int(run_id.lastrowid)
