@@ -402,11 +402,12 @@ class CuaTypedBrowserRoute:
         if missing is not None:
             return missing
         exact_pid = _positive_int(pid)
-        if exact_pid is None:
-            return _refusal(
-                "browser_pid_required", "browser_prepare requires a positive pid."
-            )
         if profile_mode == "existing_profile":
+            if exact_pid is None:
+                return _refusal(
+                    "browser_pid_required",
+                    "browser_prepare requires a positive pid.",
+                )
             exact_window = _positive_int(window_id)
             if exact_window is None:
                 return _refusal(
@@ -458,10 +459,11 @@ class CuaTypedBrowserRoute:
                 )
             profile["name"] = profile_name
         args: Dict[str, Any] = {
-            "pid": exact_pid,
             "allow_launch": True,
             "profile": profile,
         }
+        if exact_pid is not None:
+            args["pid"] = exact_pid
         exact_window = _positive_int(window_id)
         if exact_window is not None:
             args["window_id"] = exact_window

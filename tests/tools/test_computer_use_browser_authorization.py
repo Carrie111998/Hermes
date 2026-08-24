@@ -70,6 +70,20 @@ def test_existing_profile_prepare_delegates_authorization_to_driver():
     ]
 
 
+def test_existing_profile_prepare_requires_positive_pid():
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=None,
+        window_id=202,
+        profile_mode="existing_profile",
+        grant_existing_profile=True,
+    )
+
+    assert result["status"] == "refused"
+    assert result["code"] == "browser_pid_required"
+    assert driver.calls == []
+
+
 def test_existing_profile_prepare_refused_without_config_grant():
     driver = _PrepareDriver()
     result = _route(driver).prepare(
@@ -133,6 +147,44 @@ def test_isolated_prepare_unaffected_by_the_grant():
 
     assert result["status"] == "ok"
     assert [name for name, _ in driver.calls] == ["browser_prepare"]
+    assert driver.calls[0][1]["pid"] == 101
+
+
+@pytest.mark.parametrize(
+    ("profile_mode", "profile_name", "expected_profile"),
+    [
+        ("isolated_new", None, {"mode": "isolated_new"}),
+        (
+            "isolated_named",
+            "research",
+            {"mode": "isolated_named", "name": "research"},
+        ),
+    ],
+)
+def test_driver_owned_isolated_prepare_does_not_require_pid(
+    profile_mode, profile_name, expected_profile
+):
+    """The driver launches isolated profiles, so no existing pid is required."""
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=None,
+        profile_mode=profile_mode,
+        profile_name=profile_name,
+        allow_launch=True,
+        grant_existing_profile=False,
+    )
+
+    assert result["status"] == "ok"
+    assert driver.calls == [
+        (
+            "browser_prepare",
+            {
+                "allow_launch": True,
+                "profile": expected_profile,
+                "session": "hermes-a",
+            },
+        )
+    ]
 
 
 def test_backend_resolves_authorization_and_ignores_model_supplied_values(monkeypatch):
