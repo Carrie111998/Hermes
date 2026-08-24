@@ -26,6 +26,7 @@ Electron main process both use this without loading the full CLI.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,9 +79,13 @@ def _is_python_interpreter(bin_path: Path) -> bool:
 
     Distinguishes the updater's ``python -m hermes_cli.main ...`` drive form
     (where ``argv[0]`` is the interpreter itself) from console-scripts and
-    native launchers, which take ``desktop`` as a plain argument.
+    native launchers, which take ``desktop`` as a plain argument. Matches
+    ``python``, ``python3``, ``python3.11``, ``python2.7`` — and rejects
+    lookalikes like ``python3-config``.
     """
-    return bin_path.name.startswith("python")
+    return bin_path.name == "python" or re.fullmatch(
+        r"python[23](\d+)?(\.\d+)?", bin_path.name
+    ) is not None
 
 
 def resolve_exec_command() -> str:
