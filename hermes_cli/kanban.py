@@ -135,20 +135,12 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
 
 
 def _check_dispatcher_presence() -> tuple[bool, str]:
-    """Return ``(running, message)``.
+    """Report effective dispatcher mode and singleton-lock presence.
 
-    - ``running=True``: a gateway is alive for this HERMES_HOME and its
-      config has ``kanban.dispatch_in_gateway`` on (default). Message
-      is a short status line.
-    - ``running=False``: either no gateway is running, or the gateway
-      is running but the config flag is off. Message is human guidance
-      explaining the next step.
-
-    Used by ``hermes kanban create`` (and callers) to warn when a task
-    will sit in ``ready`` because nothing is there to pick it up.
-    Defensive against import failures and config-read errors — if the
-    probe itself errors, we return ``(True, "")`` so we don't spam
-    false warnings (better to miss a warning than to cry wolf).
+    The gateway PID alone is insufficient once standalone dispatch is a
+    supported topology. Resolve the same config/env contract used at startup,
+    then non-destructively probe the machine-global singleton lock. A lock we
+    can acquire is released immediately and means no dispatcher owns it.
     """
     try:
         from gateway.status import get_running_pid  # type: ignore
@@ -159,23 +151,71 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     except Exception:
         return (True, "")  # probe errored — silent
 
-    # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
         from hermes_cli.config import load_config
-        cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
-    except Exception:
-        dispatch_on = True  # can't tell — assume default
+        from hermes_cli.kanban_dispatcher import (
+            acquire_dispatcher_lock,
+            release_dispatcher_lock,
+            resolve_dispatcher_options,
+        )
 
-    if pid and dispatch_on:
-        return (True, f"gateway pid={pid}, dispatch enabled")
-    if pid and not dispatch_on:
+        options = resolve_dispatcher_options(load_config())
+    except Exception:
         return (
             False,
-            "Gateway is running but kanban.dispatch_in_gateway=false in "
-            "config.yaml — the task will sit in 'ready' until you flip it "
-            "back on and restart the gateway, OR run the legacy "
-            "standalone daemon (`hermes kanban daemon --force`)."
+            "Dispatcher state is indeterminate: effective configuration "
+            "could not be resolved. Check `hermes doctor` and gateway logs.",
+        )
+
+    try:
+        lock_handle, lock_state = acquire_dispatcher_lock()
+    except Exception:
+        lock_handle, lock_state = None, "unavailable"
+    if lock_state == "held":
+        release_dispatcher_lock(lock_handle)
+
+    if lock_state == "unavailable":
+        return (
+            False,
+            "Dispatcher state is indeterminate because the singleton lock "
+            "could not be probed. Duplicate-dispatch protection cannot be "
+            "verified; check filesystem permissions and process supervision.",
+        )
+
+    dispatcher_present = lock_state == "contended"
+    if not options.dispatch_in_gateway:
+        if dispatcher_present:
+            gateway_note = f"; gateway pid={pid} is notifier-only" if pid else ""
+            return (
+                True,
+                "standalone dispatcher is healthy (singleton lock held"
+                f"{gateway_note})",
+            )
+        gateway_note = "Gateway is running, but " if pid else ""
+        return (
+            False,
+            f"{gateway_note}No dispatcher is running and effective "
+            "kanban.dispatch_in_gateway=false. Start the separately supervised "
+            "dispatcher with:\n"
+            "    hermes kanban daemon"
+        )
+
+    if pid and dispatcher_present:
+        return (True, f"embedded dispatcher is healthy (gateway pid={pid})")
+    if dispatcher_present and not pid:
+        return (
+            False,
+            "Dispatcher state is indeterminate: the singleton dispatcher lock "
+            "is held but effective config selects embedded gateway dispatch and "
+            "no gateway PID is healthy. Check for an orphan or forced standalone "
+            "daemon before starting another dispatcher.",
+        )
+    if pid and not dispatcher_present:
+        return (
+            False,
+            f"Dispatcher state is indeterminate: gateway pid={pid} is running "
+            "with embedded dispatch enabled, but no process holds the dispatcher "
+            "lock. The watcher may still be starting or may have failed.",
         )
     return (
         False,
@@ -691,24 +731,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Override config kanban.max_spawn for this pass")
     p_disp.add_argument("--failure-limit", type=int,
-                        default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
+                        default=None,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
-                             f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+                             f"(spawn_failed, timed_out, or crashed; default: config "
+                             f"kanban.failure_limit, then {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
-    # --- daemon (deprecated) ---
+    # --- daemon ---
     p_daemon = sub.add_parser(
         "daemon",
-        help="DEPRECATED — dispatcher now runs in the gateway. Use `hermes gateway start`.",
+        help="Run a standalone dispatcher (requires dispatch_in_gateway=false)",
     )
-    p_daemon.add_argument("--interval", type=float, default=60.0,
-                          help="Seconds between dispatch ticks (default: 60)")
+    p_daemon.add_argument("--interval", type=float, default=None,
+                          help="Override config kanban.dispatch_interval_seconds")
     p_daemon.add_argument("--max", type=int, default=None,
-                          help="Cap number of spawns per tick")
+                          help="Override config kanban.max_spawn")
     p_daemon.add_argument("--failure-limit", type=int,
-                          default=kb.DEFAULT_SPAWN_FAILURE_LIMIT)
+                          default=None,
+                          help="Override config kanban.failure_limit")
     p_daemon.add_argument("--pidfile", default=None,
                           help="Write the daemon's PID to this file on start")
     p_daemon.add_argument("--verbose", "-v", action="store_true",
@@ -2419,45 +2461,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # (#28805). Same semantics as the gateway dispatch path so behavior
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
+    from hermes_cli.config import load_config
+    from hermes_cli.kanban_dispatcher import resolve_dispatcher_options
+
     try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-
-        def _coerce_positive_int(value):
-            if value is None:
-                return None
-            try:
-                ival = int(value)
-            except (TypeError, ValueError):
-                return None
-            return ival if ival >= 1 else None
-
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
-        )
-        max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
-        # CLI --max overrides config kanban.max_spawn when both are present;
-        # CLI is the more explicit signal so it wins.
-        cli_max = getattr(args, "max", None)
-        max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
-            _kanban_cfg.get("max_spawn")
-        )
+        config = load_config()
     except Exception:
-        default_assignee = None
-        max_in_progress_per_profile = None
-        max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+        config = {}
+    options = resolve_dispatcher_options(
+        config,
+        max_spawn_override=getattr(args, "max", None),
+        failure_limit_override=getattr(args, "failure_limit", None),
+    )
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawn=options.max_spawn,
+            max_in_progress=options.max_in_progress,
+            failure_limit=options.failure_limit,
+            stale_timeout_seconds=options.stale_timeout_seconds,
+            default_assignee=options.default_assignee,
+            max_in_progress_per_profile=options.max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2500,7 +2525,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
     if res.auto_assigned_default:
         print(
-            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
+            f"Auto-assigned to kanban.default_assignee={options.default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
         )
     if res.skipped_unassigned:
@@ -2519,46 +2544,55 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
-    """Deprecated — the dispatcher now runs inside the gateway.
+    """Run the independently supervised dispatcher when embedded mode is off."""
+    from hermes_cli.config import load_config
+    from hermes_cli import kanban_dispatcher
 
-    Left in as a stub so users with the old command in scripts/systemd
-    units get a clear migration message instead of a cryptic
-    "no such command" error. A ``--force`` escape hatch keeps the old
-    standalone daemon alive for the rare edge case where someone truly
-    cannot run the gateway (e.g. running on a host that forbids
-    long-lived background services), but the default path exits 2
-    with guidance so nobody accidentally keeps running two dispatchers
-    against the same kanban.db.
-    """
-    # --force lets power users keep the standalone loop for one more
-    # release cycle. Undocumented in `--help` so nobody discovers it
-    # casually — intentional.
-    if not getattr(args, "force", False):
+    try:
+        config = load_config()
+    except Exception as exc:
         print(
-            "hermes kanban daemon: DEPRECATED — the dispatcher now runs\n"
-            "inside the gateway. To use kanban:\n"
-            "\n"
-            "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
-            "\n"
-            "Ready tasks will be picked up on the next dispatcher tick\n"
-            "(default: every 60 seconds). Configure via config.yaml:\n"
-            "\n"
-            "    kanban:\n"
-            "      dispatch_in_gateway: true      # default\n"
-            "      dispatch_interval_seconds: 60\n"
-            "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
-            "\n"
-            "Running both the gateway AND this standalone daemon will\n"
-            "race for claims. If you truly need the old standalone\n"
-            "daemon (no gateway available), rerun with --force.",
+            f"hermes kanban daemon: cannot load effective config: {exc}",
             file=sys.stderr,
         )
         return 2
 
-    # Legacy path — same logic as before, kept behind --force.
-    # Make sure the DB exists before printing "started" so the user sees the
-    # correct DB path and any init error surfaces immediately.
-    kb.init_db()
+    options = kanban_dispatcher.resolve_dispatcher_options(
+        config,
+        interval_override=getattr(args, "interval", None),
+        max_spawn_override=getattr(args, "max", None),
+        failure_limit_override=getattr(args, "failure_limit", None),
+    )
+    force = bool(getattr(args, "force", False))
+    if options.dispatch_in_gateway and not force:
+        print(
+            "hermes kanban daemon refused: duplicate dispatcher risk.\n"
+            "Effective config has kanban.dispatch_in_gateway=true (the default),\n"
+            "so the gateway owns dispatch. Set dispatch_in_gateway=false before\n"
+            "starting a separately supervised daemon. Expert-only override: --force.",
+            file=sys.stderr,
+        )
+        return 2
+
+    lock_handle, lock_state = kanban_dispatcher.acquire_dispatcher_lock()
+    if lock_state != "held" and not force:
+        detail = (
+            "another dispatcher is already running"
+            if lock_state == "contended"
+            else "the singleton dispatcher lock is unavailable"
+        )
+        print(f"hermes kanban daemon refused: {detail}.", file=sys.stderr)
+        return 2
+
+    # Take the process-lifetime singleton before touching the database. A
+    # losing daemon must not run schema/WAL initialization concurrently with
+    # the active dispatcher. Release immediately if initialization itself
+    # fails because the main run-loop cleanup has not been entered yet.
+    try:
+        kb.init_db()
+    except BaseException:
+        kanban_dispatcher.release_dispatcher_lock(lock_handle)
+        raise
 
     pidfile = getattr(args, "pidfile", None)
     if pidfile:
@@ -2570,11 +2604,12 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     verbose = bool(getattr(args, "verbose", False))
     print(
-        f"Kanban dispatcher running STANDALONE via --force "
-        f"(interval={args.interval}s, pid={os.getpid()}). "
-        f"Ctrl-C to stop. NOTE: if a gateway is also running with "
-        f"dispatch_in_gateway=true (default), you have two dispatchers "
-        f"racing for claims.",
+        f"Kanban dispatcher running standalone "
+        f"(interval={options.interval}s, pid={os.getpid()}, "
+        f"max_spawn={options.max_spawn or 'unlimited'}, "
+        f"max_in_progress={options.max_in_progress or 'unlimited'}, "
+        f"per_profile={options.max_in_progress_per_profile or 'unlimited'}). "
+        f"Ctrl-C to stop.",
         file=sys.stderr,
     )
 
@@ -2644,12 +2679,17 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     try:
         kb.run_daemon(
-            interval=args.interval,
-            max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            interval=options.interval,
+            max_spawn=options.max_spawn,
+            max_in_progress=options.max_in_progress,
+            max_in_progress_per_profile=options.max_in_progress_per_profile,
+            default_assignee=options.default_assignee,
+            failure_limit=options.failure_limit,
+            stale_timeout_seconds=options.stale_timeout_seconds,
             on_tick=_on_tick,
         )
     finally:
+        kanban_dispatcher.release_dispatcher_lock(lock_handle)
         if pidfile:
             try:
                 Path(pidfile).unlink()
