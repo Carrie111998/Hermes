@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -14,6 +16,7 @@ import {
   createBackendShutdownCoordinator,
   parseBackendOwnership
 } from './backend-ownership'
+import { compareAndDeleteBackendOwnershipLock, publishBackendOwnershipLock } from './backend-ownership-lock'
 
 const mainSource = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8')
 
@@ -25,16 +28,89 @@ function sourceSlice(startMarker: string, endMarker: string): string {
 }
 
 test('Electron backend lock cleanup uses a rename tombstone CAS, including malformed recovery', () => {
-  const helper = sourceSlice('async function compareAndDeleteBackendOwnershipLock', '\nfunction normalizeBackendOwnershipLockStartMarker')
   const transaction = sourceSlice('async function withBackendOwnershipLock', '\nfunction execText')
 
-  assert.match(helper, /rename\(lockPath, tombstonePath\)/)
-  assert.match(helper, /currentContents !== expectedContents/)
-  assert.match(helper, /link\(tombstonePath, lockPath\)/)
-  assert.match(helper, /unlink\(tombstonePath\)/)
-  assert.doesNotMatch(helper, /unlink\(lockPath\)/)
   assert.match(transaction, /compareAndDeleteBackendOwnershipLock\(lockPath, rawOwner\)/)
   assert.equal(transaction.split('compareAndDeleteBackendOwnershipLock(lockPath, `${contents}\\n`)').length - 1, 2)
+  assert.match(transaction, /publishBackendOwnershipLock\(lockPath, contents\)/)
+})
+
+test('replacement races remove the private tombstone without removing the replacement lock', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-backend-ownership-'))
+  const lockPath = path.join(directory, 'backend.lock')
+
+  try {
+    await writeFile(lockPath, 'old-owner\n')
+    let replacementPublished = false
+    const originalLink = (await import('node:fs/promises')).link
+    const replacementSafeFs = {
+      rename: (await import('node:fs/promises')).rename,
+      readFile,
+      unlink: (await import('node:fs/promises')).unlink,
+      link: async (tombstonePath: string, publicPath: string) => {
+        if (!replacementPublished) {
+          replacementPublished = true
+          await writeFile(publicPath, 'replacement-owner\n')
+        }
+        return originalLink(tombstonePath, publicPath)
+      }
+    }
+
+    assert.equal(await compareAndDeleteBackendOwnershipLock(lockPath, 'different-owner\n', replacementSafeFs as any), false)
+    assert.equal(await readFile(lockPath, 'utf8'), 'replacement-owner\n')
+    assert.deepEqual(
+      (await readdir(directory)).filter(name => name.endsWith('.tombstone')),
+      [],
+      'replacement races must not accumulate private tombstones'
+    )
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('malformed recovery cannot steal a delayed wx creator inode', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-backend-ownership-'))
+  const lockPath = path.join(directory, 'backend.lock')
+  let creatorReady!: () => void
+  let releaseCreator!: () => void
+  const creatorStarted = new Promise<void>(resolve => {
+    creatorReady = resolve
+  })
+  const release = new Promise<void>(resolve => {
+    releaseCreator = resolve
+  })
+
+  try {
+    await writeFile(lockPath, '{"pid":')
+    const fsModule = await import('node:fs/promises')
+    const delayedCreatorFs = {
+      writeFile: async (filePath: string, ...args: any[]) => {
+        const result = await (fsModule.writeFile as any)(filePath, ...args)
+        if (filePath.startsWith(`${lockPath}.`) && filePath.endsWith('.tmp')) {
+          creatorReady()
+          await release
+        }
+        return result
+      },
+      rename: fsModule.rename,
+      link: fsModule.link,
+      rm: fsModule.rm,
+      readFile: fsModule.readFile,
+      unlink: fsModule.unlink
+    }
+    const creator = publishBackendOwnershipLock(lockPath, 'valid-owner', delayedCreatorFs as any)
+
+    await creatorStarted
+    assert.equal(await compareAndDeleteBackendOwnershipLock(lockPath, '{"pid":'), true)
+    releaseCreator()
+    await creator
+
+    assert.equal(await readFile(lockPath, 'utf8'), 'valid-owner\n')
+    assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.tombstone')), [])
+  } finally {
+    releaseCreator?.()
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 function memoryStore(initial = '') {

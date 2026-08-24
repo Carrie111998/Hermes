@@ -807,19 +807,24 @@ finally:
 // The updater's Python _MarkerMutex uses the marker's .mutex sidecar and an
 // advisory flock. Keep that same descriptor locked while the remote shell does
 // the marker check, spawns the backend, and publishes its initial lockfile.
-// The outer shell inherits the descriptor so the critical section survives the
-// Python exec; each detached child closes the descriptor before execing Hermes.
+// Python keeps the descriptor close-on-exec by default and passes it explicitly
+// only to the intended outer shell; each detached child closes it before
+// execing Hermes.
 function withRemoteUpdateMutex(command, mutexPath) {
   const script = `
-import fcntl,os,sys
+import fcntl,os,subprocess,sys
 mutex_path=sys.argv[1]
 payload=sys.argv[2]
 parent=os.path.dirname(mutex_path)
 if parent:os.makedirs(parent,exist_ok=True)
-fd=os.open(mutex_path,os.O_RDWR|os.O_CREAT,0o600)
-os.set_inheritable(fd,True)
+fd=os.open(mutex_path,os.O_RDWR|os.O_CREAT|os.O_CLOEXEC,0o600)
 fcntl.flock(fd,fcntl.LOCK_EX)
-os.execvp("sh",["sh","-c",payload,"hermes-update-mutex",str(fd)])
+result=None
+try:
+ result=subprocess.run(["sh","-c",payload,"hermes-update-mutex",str(fd)],pass_fds=(fd,),check=False)
+finally:
+ os.close(fd)
+sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
   return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`

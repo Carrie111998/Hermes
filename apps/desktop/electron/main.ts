@@ -43,6 +43,7 @@ import {
   waitForHermesReady
 } from './backend-health'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
+import { compareAndDeleteBackendOwnershipLock, publishBackendOwnershipLock } from './backend-ownership-lock'
 import {
   canImportHermesCli,
   execProbeSync,
@@ -3190,61 +3191,6 @@ function writeBackendOwnership(contents) {
 const WINDOWS_FILETIME_EPOCH_TICKS = 621_355_968_000_000_000n
 const UNKNOWN_BACKEND_OWNERSHIP_LOCK_GRACE_MS = 1_000
 
-// A pathname-only unlink is not a compare-and-delete: another interpreter can
-// replace the lock after the read and before the unlink. Rename the exact
-// pathname to a private tombstone first, compare the bytes there, and delete
-// only that tombstone. If the bytes changed, restore the tombstone with a
-// hard-link without ever overwriting a replacement lock at the public path.
-async function compareAndDeleteBackendOwnershipLock(lockPath, expectedContents) {
-  const tombstonePath = `${lockPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tombstone`
-
-  try {
-    await fs.promises.rename(lockPath, tombstonePath)
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return false
-    }
-    throw error
-  }
-
-  const restoreTombstone = async () => {
-    try {
-      // link() is non-destructive when a contender has already published a
-      // replacement at lockPath: EEXIST leaves that replacement untouched.
-      await fs.promises.link(tombstonePath, lockPath)
-      await fs.promises.unlink(tombstonePath)
-    } catch (error) {
-      if (error?.code !== 'EEXIST') {
-        throw error
-      }
-    }
-  }
-
-  let currentContents
-
-  try {
-    currentContents = await fs.promises.readFile(tombstonePath, 'utf8')
-  } catch {
-    await restoreTombstone()
-    return false
-  }
-
-  if (currentContents !== expectedContents) {
-    await restoreTombstone()
-    return false
-  }
-
-  try {
-    await fs.promises.unlink(tombstonePath)
-    return true
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return false
-    }
-    throw error
-  }
-}
-
 function normalizeBackendOwnershipLockStartMarker(marker) {
   if (!IS_WINDOWS || typeof marker !== 'string' || !marker.startsWith('win:')) {
     return marker
@@ -3286,11 +3232,10 @@ async function withBackendOwnershipLock(operation) {
     try {
       const startMarker = normalizeBackendOwnershipLockStartMarker(await processStartMarker(process.pid))
       contents = JSON.stringify({ pid: process.pid, startMarker, createdAt: Date.now() })
-      // wx + write publishes the owner record as one filesystem operation from
-      // the caller's perspective, avoiding the ordinary create-then-publish
-      // window. The malformed-lock recovery below still handles a crash inside
-      // the underlying system call.
-      await fs.promises.writeFile(lockPath, `${contents}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+      // Build the record in a private wx-created inode, then publish it with
+      // a non-overwriting hard link. Malformed recovery can never steal a
+      // public inode while this creator is still writing its record.
+      await publishBackendOwnershipLock(lockPath, contents)
       published = true
       handle = await fs.promises.open(lockPath, 'r')
       break
