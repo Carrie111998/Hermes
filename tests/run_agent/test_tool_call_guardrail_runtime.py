@@ -511,3 +511,108 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_runtime_stop_halts_the_rest_of_the_assistant_batch():
+    """A trusted stop is authoritative for the WHOLE batch, not just the loop.
+
+    The conversation loop only suppresses the next MODEL request. Without a
+    per-call gate, an assistant batch of ``claim-1, claim-2`` could receive
+    ``runtime_stop(max_items)`` from the first result and still dispatch the
+    second — crossing the item boundary the policy just closed.
+    """
+    agent = _make_agent("mcp_fleet_claim", max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                # Distinct arguments: identical calls are deduped upstream.
+                _mock_tool_call("mcp_fleet_claim", '{"item": 1}', "claim-1"),
+                _mock_tool_call("mcp_fleet_claim", '{"item": 2}', "claim-2"),
+            ],
+        ),
+        AssertionError("runtime stop must prevent another model call"),
+    ]
+
+    dispatched = []
+
+    def dispatch(*args, **kwargs):
+        from tools import mcp_tool
+        dispatched.append(kwargs.get("tool_call_id"))
+        mcp_tool._mcp_runtime_stop.set({
+            "reason": "max_items", "status": "success", "policy": "fleet-runtime",
+        })
+        return '{"result": "done"}'
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("claim work")
+
+    assert dispatched == ["claim-1"], "the second dispatcher must never be entered"
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "runtime_stop(max_items)"
+
+    # Every call still needs a paired tool result or the next provider request
+    # violates message-role alternation.
+    tool_rows = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert [row["tool_call_id"] for row in tool_rows] == ["claim-1", "claim-2"]
+    assert "was not executed" in tool_rows[1]["content"]
+
+
+def test_runtime_stop_halts_later_segments_of_a_mixed_batch():
+    """A stop inside one segment must stop every later segment too."""
+    from agent import tool_executor
+
+    agent = _make_agent("mcp_fleet_claim", "web_search", max_iterations=10)
+    dispatched = []
+
+    def dispatch(function_name, *args, **kwargs):
+        from tools import mcp_tool
+        dispatched.append(function_name)
+        if function_name == "mcp_fleet_claim":
+            mcp_tool._mcp_runtime_stop.set({
+                "reason": "max_items", "status": "success",
+                "policy": "fleet-runtime",
+            })
+        return '{"result": "done"}'
+
+    assistant_message = SimpleNamespace(tool_calls=[
+        _mock_tool_call("mcp_fleet_claim", "{}", "claim-1"),
+        _mock_tool_call("web_search", "{}", "search-1"),
+    ])
+    messages: list = []
+
+    with patch("run_agent.handle_function_call", side_effect=dispatch):
+        tool_executor.execute_tool_calls_segmented(
+            agent, assistant_message, messages, "task-1",
+            segments=[
+                ("sequential", [assistant_message.tool_calls[0]]),
+                ("parallel", [assistant_message.tool_calls[1]]),
+            ],
+        )
+
+    assert dispatched == ["mcp_fleet_claim"], "a later segment was still dispatched"
+    assert [m["tool_call_id"] for m in messages] == ["claim-1", "search-1"]
+    assert "was not executed" in messages[1]["content"]
+
+
+def test_authoritative_run_forces_mcp_calls_onto_the_barrier_path():
+    """Parallel siblings cannot be un-executed, so policy runs never fan out."""
+    from agent.tool_dispatch_helpers import _plan_tool_batch_segments
+
+    calls = [
+        _mock_tool_call("mcp__fleet__claim", "{}", "claim-1"),
+        _mock_tool_call("mcp__fleet__claim", "{}", "claim-2"),
+    ]
+    with patch(
+        "agent.tool_dispatch_helpers._is_mcp_tool_parallel_safe", return_value=True,
+    ):
+        assert [kind for kind, _ in _plan_tool_batch_segments(calls)] == ["parallel"]
+        assert [
+            kind for kind, _ in _plan_tool_batch_segments(calls, mcp_barrier=True)
+        ] == ["sequential"]

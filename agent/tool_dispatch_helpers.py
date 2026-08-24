@@ -114,7 +114,12 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+def _plan_tool_batch_segments(
+    tool_calls,
+    *,
+    execution_cwd: Optional[Path] = None,
+    mcp_barrier: bool = False,
+) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
     ``kind`` is ``"parallel"`` (a maximal contiguous run of parallel-safe
@@ -125,6 +130,11 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     identical to fully-sequential execution.  The per-call safety rules
     are the same ones the old all-or-nothing gate applied to the whole
     batch:
+
+    ``mcp_barrier`` forces every MCP call onto the sequential path regardless
+    of its server's ``supports_parallel_tool_calls`` flag. An authoritative
+    scheduled run needs that: a trusted result can end the run, and siblings
+    already in flight in a parallel segment cannot be un-executed.
 
     * ``_NEVER_PARALLEL_TOOLS`` (interactive tools) → barrier.
     * Unparseable / non-dict arguments → barrier.
@@ -216,7 +226,9 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+        if tool_name in _PARALLEL_SAFE_TOOLS or (
+            not mcp_barrier and _is_mcp_tool_parallel_safe(tool_name)
+        ):
             current.append(tool_call)
             continue
 
