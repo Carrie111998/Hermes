@@ -318,6 +318,9 @@ class TestGatewayWsAuthRejectionLogging:
             "ws auth rejected" in record.message and "reason=no_credential" in record.message
             for record in caplog.records
         )
+
+
+class TestWsRequestIsAllowedGated:
     """Bug fix: in gated mode, the WS peer-IP loopback check must be
     bypassed.
 
