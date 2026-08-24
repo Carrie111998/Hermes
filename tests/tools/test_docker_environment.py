@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from io import StringIO
@@ -619,13 +620,35 @@ def test_persistent_bind_mounts_survive_a_session_key_task_id(monkeypatch, tmp_p
     assert len(mounts) == 2, f"expected /root and /workspace binds; got {specs}"
     for spec in mounts:
         source, _, target = spec.rpartition(":")
-        assert ":" not in source, (
+        drive, source_tail = os.path.splitdrive(source)
+        assert ":" not in source_tail, (
             f"bind source still contains a colon, docker run would fail with "
             f"'too many colons': {spec}"
         )
-        # Docker splits on ':' — a sane spec has exactly source:target.
-        assert spec.count(":") == 1, f"spec is not a two-field bind: {spec}"
+        # Native Windows contributes one drive-letter colon; the task-derived
+        # path must not add any more fields to Docker's source:target syntax.
+        assert spec.count(":") == (2 if drive else 1), spec
         assert target in {"/root", "/workspace"}
+
+
+@pytest.mark.linux_only
+def test_existing_unsafe_legacy_dir_is_not_reused(monkeypatch, tmp_path):
+    """A failed pre-fix launch may leave a colon-bearing directory behind."""
+    task_id = "session:legacy"
+    legacy = tmp_path / "docker" / task_id
+    (legacy / "home").mkdir(parents=True)
+    (legacy / "workspace").mkdir()
+
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(task_id=task_id, persistent_filesystem=True)
+    portable = tmp_path / "docker" / docker_env._sandbox_dir_name(task_id)
+
+    assert env._home_dir == str(portable / "home")
+    assert env._workspace_dir == str(portable / "workspace")
+    assert portable != legacy
 
 
 def test_distinct_session_keys_get_distinct_sandbox_dirs(monkeypatch, tmp_path):
@@ -697,6 +720,14 @@ def test_sandbox_dir_name_never_resolves_to_the_sandbox_root():
         assert not (set(name) & set(':/\\')), name
 
 
+@pytest.mark.parametrize("value", ["CON", "con.txt", "LPT1", "aux.json"])
+def test_sandbox_dir_name_rewrites_windows_reserved_devices(value):
+    name = docker_env._sandbox_dir_name(value)
+
+    assert name != value
+    assert name.split(".", 1)[0].upper() not in {"CON", "LPT1", "AUX"}
+
+
 def test_labels_attribute_populated_after_init(monkeypatch):
     """``self._labels`` must be set to the same key/value pairs that went onto
     docker run, so subsequent reuse / reaper paths can match without re-running
@@ -710,6 +741,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
     assert env._labels == {
         "hermes-agent": "1",
         "hermes-task-id": "abc",
+        "hermes-task-key": docker_env._task_identity_fingerprint("abc"),
         "hermes-profile": "default",
         "hermes-egress": "off",
     }
@@ -790,6 +822,130 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_colliding_readable_task_labels_do_not_reuse_container(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    docker_env._cgroup_limits_ok = True
+    containers = []
+    run_calls = []
+
+    def _run(cmd, **kwargs):
+        if not isinstance(cmd, list) or len(cmd) < 2:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "ps":
+            filters = {
+                part.removeprefix("label=")
+                for part in cmd
+                if isinstance(part, str) and part.startswith("label=")
+            }
+            matches = [container for container in containers if filters <= container["labels"]]
+            stdout = "".join(
+                f"{container['id']}\trunning\t<no value>\n" for container in matches
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[1] == "run":
+            run_calls.append(cmd)
+            labels = {
+                cmd[index + 1]
+                for index, value in enumerate(cmd[:-1])
+                if value == "--label"
+            }
+            container_id = f"fresh-{len(containers) + 1}"
+            containers.append({"id": container_id, "labels": labels})
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{container_id}\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    first = _make_dummy_env(task_id="session:a")
+    second = _make_dummy_env(task_id="session?a")
+
+    assert docker_env._sanitize_label_value(
+        "session:a"
+    ) == docker_env._sanitize_label_value("session?a")
+    assert first._container_id == "fresh-1"
+    assert second._container_id == "fresh-2"
+    assert len(run_calls) == 2
+    assert first._labels["hermes-task-key"] != second._labels["hermes-task-key"]
+
+
+@pytest.mark.parametrize(
+    ("mounts_match", "windows_daemon_prefix"),
+    [
+        (True, "mnt"),
+        (True, "host_mnt"),
+        (True, "run/desktop/mnt/host"),
+        (False, "mnt"),
+    ],
+)
+def test_legacy_persistent_container_reuse_requires_matching_bind_sources(
+    monkeypatch, tmp_path, mounts_match, windows_daemon_prefix,
+):
+    from tools.environments import base as base_env
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(base_env, "get_sandbox_dir", lambda: tmp_path)
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    task_id = "session:legacy"
+    sandbox = tmp_path / "docker" / docker_env._sandbox_dir_name(task_id)
+    expected_home = str(sandbox / "home")
+    expected_workspace = str(sandbox / "workspace")
+
+    def _daemon_mount_source(path):
+        if os.name != "nt":
+            return path
+        drive, tail = os.path.splitdrive(path)
+        assert drive
+        tail = tail.lstrip("\\/").replace("\\", "/")
+        return f"/{windows_daemon_prefix}/{drive[0].lower()}/{tail}"
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        if not isinstance(cmd, list) or len(cmd) < 2:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "ps":
+            has_fingerprint = any(
+                str(part).startswith("label=hermes-task-key=") for part in cmd
+            )
+            stdout = "" if has_fingerprint else "legacy-cid\trunning\t<no value>\t<no value>\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            home_source = expected_home if mounts_match else str(tmp_path / "other" / "home")
+            mounts = [
+                {
+                    "Type": "bind",
+                    "Source": _daemon_mount_source(home_source),
+                    "Destination": "/root",
+                },
+                {
+                    "Type": "bind",
+                    "Source": _daemon_mount_source(expected_workspace),
+                    "Destination": "/workspace",
+                },
+            ]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps(mounts), stderr="",
+            )
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id=task_id, persistent_filesystem=True)
+
+    assert env._container_id == ("legacy-cid" if mounts_match else "fresh-cid")
+    run_calls = [cmd for cmd in calls if isinstance(cmd, list) and cmd[1:2] == ["run"]]
+    assert bool(run_calls) is (not mounts_match)
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):

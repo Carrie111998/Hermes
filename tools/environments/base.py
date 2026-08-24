@@ -305,6 +305,11 @@ def get_sandbox_dir() -> Path:
 _SANDBOX_DIR_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 _SANDBOX_DIR_MAX_LEN = 128
 _SANDBOX_DIR_HASH_LEN = 12
+_WINDOWS_RESERVED_PATH_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 def sanitize_task_id_for_path(task_id: str) -> str:
@@ -332,16 +337,20 @@ def sanitize_task_id_for_path(task_id: str) -> str:
         return "default"
 
     cleaned = _SANDBOX_DIR_UNSAFE_RE.sub("_", value)
+    reserved_on_windows = cleaned.split(".", 1)[0].upper() in _WINDOWS_RESERVED_PATH_STEMS
     if (
         cleaned == value
         and len(value) <= _SANDBOX_DIR_MAX_LEN
         and value not in {".", ".."}
+        and not reserved_on_windows
         # Windows silently strips trailing dots/spaces, aliasing two ids onto
         # one directory.
         and not value.endswith((".", " "))
     ):
         return value
 
+    if reserved_on_windows:
+        cleaned = f"task-{cleaned}"
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:_SANDBOX_DIR_HASH_LEN]
     stem = cleaned[: _SANDBOX_DIR_MAX_LEN - _SANDBOX_DIR_HASH_LEN - 1].strip("._")
     return f"{stem or 'task'}-{digest}"
