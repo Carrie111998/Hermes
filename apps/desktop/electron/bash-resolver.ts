@@ -1,4 +1,4 @@
-import { accessSync, constants } from 'node:fs'
+import { accessSync, constants, statSync } from 'node:fs'
 
 // Resolve a bash interpreter for spawning scripts on POSIX systems.
 //
@@ -32,15 +32,21 @@ export function resolveBashExecutable(deps: any = {}) {
 
   // A candidate must be an executable file, not merely present: a
   // non-executable `bash` would fail at spawn time.
-  const fileExists = deps.fileExists ?? ((candidate: string) => {
-    try {
-      accessSync(candidate, constants.X_OK)
+  const fileExists =
+    deps.fileExists ??
+    ((candidate: string) => {
+      try {
+        if (!statSync(candidate).isFile()) {
+          return false
+        }
 
-      return true
-    } catch {
-      return false
-    }
-  })
+        accessSync(candidate, constants.X_OK)
+
+        return true
+      } catch {
+        return false
+      }
+    })
 
   return candidates.find(candidate => fileExists(candidate)) ?? null
 }

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -40,6 +40,16 @@ test('resolveBashExecutable walks PATH in order before known locations', () => {
   })
 
   assert.equal(result, path.join(dirB, 'bash'))
+})
+
+test('resolveBashExecutable rejects an executable directory named bash', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'bash-resolver-directory-'))
+  const directory = path.join(root, 'bash')
+
+  mkdirSync(directory)
+  chmodSync(directory, 0o755)
+
+  assert.equal(resolveBashExecutable({ pathEnv: root, knownLocations: [] }), null)
 })
 
 test('resolveBashExecutable falls back to a well-known location', () => {
