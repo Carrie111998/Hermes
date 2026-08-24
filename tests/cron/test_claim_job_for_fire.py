@@ -9,6 +9,7 @@ E2E-over-mocks discipline for file-touching code.
 """
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -74,6 +75,41 @@ def test_forced_claim_atomically_resumes_paused_job(temp_home):
     assert claimed["paused_at"] is None
     assert claimed["paused_reason"] is None
     assert claimed["fire_claim"] is not None
+
+
+def test_manual_run_claims_stale_oneshot_without_marking_it_missed(
+    temp_home, monkeypatch
+):
+    """Run-now is intentional execution, not a delayed scheduled fire."""
+    import cron.jobs as jobs
+    import tools.cronjob_tools as cronjob_tools
+
+    now = datetime(2026, 6, 22, 20, 0, 0, tzinfo=timezone.utc)
+    run_at = (now - timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(prompt="x", schedule="1h", name="manual stale")
+    records = jobs.load_jobs()
+    records[0]["schedule"] = {"kind": "once", "run_at": run_at}
+    records[0]["next_run_at"] = run_at
+    jobs.save_jobs(records)
+    monkeypatch.setattr(
+        cronjob_tools,
+        "_run_claimed_job",
+        lambda claimed_job, extra_prompt=None: {
+            "claimed": True,
+            "success": True,
+            "error": None,
+        },
+    )
+
+    result = cronjob_tools._execute_job_now(job)
+
+    assert result["claimed"] is True
+    persisted = jobs.get_job(job["id"])
+    assert persisted["enabled"] is True
+    assert persisted["state"] == "scheduled"
+    assert persisted.get("last_status") != "missed"
+    assert persisted.get("missed_at") is None
 
 
 def test_stale_claim_is_reclaimable(temp_home, monkeypatch):

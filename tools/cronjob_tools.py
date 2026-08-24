@@ -741,7 +741,13 @@ def _execute_job_now(
     claimed_job = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        # This is an explicit Run-now request, so a past schedule does not make
+        # the requested execution a stale scheduled fire.
+        claimed_job = claim_job_for_fire(
+            job_id,
+            scheduled_fire=False,
+            return_job=True,
+        )
         if not isinstance(claimed_job, dict):
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
@@ -1081,9 +1087,14 @@ def _try_dispatch_background_run(
         except Exception:
             pass
 
-        # Same snapshot claim as _execute_job_now: carry the owner-bearing
-        # record into the run so terminal writes stay fenced by this owner.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        # Same manual snapshot claim as _execute_job_now: carry the
+        # owner-bearing record into the run so terminal writes stay fenced by
+        # this owner without treating Run-now as a stale scheduled fire.
+        claimed_job = claim_job_for_fire(
+            job_id,
+            scheduled_fire=False,
+            return_job=True,
+        )
         if not isinstance(claimed_job, dict):
             refreshed = get_job(job_id)
             if refreshed is None:

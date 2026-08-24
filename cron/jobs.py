@@ -2957,6 +2957,7 @@ def claim_job_for_fire(
     *,
     claim_ttl_seconds: int = 300,
     force: bool = False,
+    scheduled_fire: bool = True,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
@@ -2966,6 +2967,7 @@ def claim_job_for_fire(
             job_id,
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
+            scheduled_fire=scheduled_fire,
             return_job=return_job,
         )
 
@@ -2975,6 +2977,7 @@ def _claim_job_for_fire_locked(
     *,
     claim_ttl_seconds: int = 300,
     force: bool = False,
+    scheduled_fire: bool = True,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
@@ -2985,9 +2988,11 @@ def _claim_job_for_fire_locked(
     exactly one wins. Single-machine deployments always win.
 
     Under the file lock: reject if the job is missing/disabled/paused. An
-    explicit manual fire may pass ``force=True`` to atomically enable and
-    resume the job as part of the claim; external scheduler callbacks must
-    leave it false so a stale callback cannot resurrect a paused job. If a
+    explicit manual fire passes ``scheduled_fire=False`` so the one-shot grace
+    window does not turn an intentional Run-now request into a missed run. It
+    may also pass ``force=True`` to atomically enable and resume the job as part
+    of the claim; external scheduler callbacks must leave both defaults intact
+    so a stale callback cannot resurrect a paused job. If a
     fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
     Otherwise stamp a ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
@@ -3033,7 +3038,7 @@ def _claim_job_for_fire_locked(
                 job["paused_at"] = None
                 job["paused_reason"] = None
             kind = job.get("schedule", {}).get("kind")
-            if not force and kind == "once":
+            if scheduled_fire and not force and kind == "once":
                 next_run_at = job.get("next_run_at")
                 try:
                     next_run_dt = _ensure_aware(datetime.fromisoformat(next_run_at))
