@@ -244,18 +244,38 @@ async def _commit_session_runtime_options_locked(
 
     # Persist + live assignment are one unit: the worker-thread write cannot
     # be un-done by cancelling the awaiting task, so a cancelled caller must
-    # still see live state follow whatever landed on disk. The unit runs
-    # shielded and, on cancellation, is awaited to completion under the lock
-    # before the cancellation propagates. Known residual: a second
-    # cancellation delivered during that wait still exits the lock with the
-    # unit in flight -- that one case is not covered.
+    # still see live state follow whatever landed on disk. The unit runs as
+    # its own task and is settled here, under the admission lock, before the
+    # caller's cancellation propagates -- across arbitrarily repeated
+    # cancellation, so a second Task.cancel() during settlement cannot
+    # release the lock with the unit still in flight. Nothing else holds a
+    # reference to the unit, so it can only be cancelled by event-loop
+    # teardown, when no admission can run.
     unit = asyncio.ensure_future(_persist_then_assign())
-    try:
-        return await asyncio.shield(unit)
-    except asyncio.CancelledError:
-        if not unit.done():
-            await asyncio.wait({unit})
-        raise
+    cancelled: asyncio.CancelledError | None = None
+    while not unit.done():
+        try:
+            await asyncio.shield(unit)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:  # noqa: BLE001 - unit is terminal; retrieved below
+            break
+    if cancelled is not None:
+        # Retrieve the terminal result so a durable-write failure is never
+        # left as an unobserved task exception behind the cancellation.
+        failure = None if unit.cancelled() else unit.exception()
+        if failure is not None:
+            logger.warning(
+                "Durable runtime-options write for %s failed while the caller "
+                "was cancelled",
+                session_key,
+                exc_info=failure,
+            )
+        # Re-raise the last cancellation we absorbed (keeps its message). The
+        # task's cancelling() count is left alone: this loop did not request
+        # any of those cancellations, so it must not uncancel() them either.
+        raise cancelled
+    return unit.result()
 
 
 # ---------------------------------------------------------------------------
