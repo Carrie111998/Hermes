@@ -2310,8 +2310,7 @@ def _real_native_hermes_root() -> Path:
     import pwd
 
     try:
-        # windows-footgun: ok — guarded by is_windows() above
-        return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes"
+        return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes"  # windows-footgun: ok — guarded by is_windows() above
     except Exception:
         # Sandboxed/container UID with no matching passwd entry (also hit by
         # tests that stub getuid()/Path without stubbing pwd fully). This is
