@@ -18,6 +18,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
+- POST /v1/runs/{run_id}/clarify  — resolve a pending run clarification
 - POST /v1/runs/{run_id}/steer      — inject guidance into a running agent
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
@@ -1564,6 +1565,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Pending clarify state for each run. This is also the
+        # authorization boundary for the response route: one run must never
+        # resolve another run's question, even when both share a session id.
+        self._run_clarify_requests: Dict[str, Dict[str, Any]] = {}
+        self._run_clarify_lock = threading.Lock()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -2268,6 +2274,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
@@ -2819,6 +2826,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        clarify_callback=None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -3132,6 +3140,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "clarify_callback": clarify_callback,
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
@@ -3346,12 +3355,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "run_status": True,
+                "run_session_resume": True,
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,
+                "run_clarify_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "clarify_events": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -3405,6 +3417,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_clarify": {"method": "POST", "path": "/v1/runs/{run_id}/clarify"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
@@ -4506,6 +4519,7 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_limit = request.query.get("limit")
         raw_offset = request.query.get("offset", "0")
         order = request.query.get("order")
+        raw_before = request.query.get("before")
         if order not in (None, "oldest", "latest"):
             return web.json_response(
                 _openai_error(
@@ -4517,13 +4531,26 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             offset = int(raw_offset)
             requested_limit = None if raw_limit is None else int(raw_limit)
+            before_id = None
+            if raw_before is not None:
+                if not re.fullmatch(r"[1-9][0-9]{0,18}", raw_before):
+                    raise ValueError("invalid before cursor")
+                before_id = int(raw_before)
+                if before_id > 9_223_372_036_854_775_807:
+                    raise ValueError("before cursor exceeds SQLite row ID range")
         except (TypeError, ValueError):
             offset = -1
             requested_limit = -1
-        if offset < 0 or (requested_limit is not None and requested_limit < 0):
+            before_id = -1
+        if (
+            offset < 0
+            or (requested_limit is not None and requested_limit < 0)
+            or (before_id is not None and before_id <= 0)
+            or (before_id is not None and (order != "latest" or offset != 0))
+        ):
             return web.json_response(
                 _openai_error(
-                    "limit and offset must be non-negative integers",
+                    "invalid session message pagination",
                     code="invalid_pagination",
                 ),
                 status=400,
@@ -4532,17 +4559,36 @@ class APIServerAdapter(BasePlatformAdapter):
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
-        messages = await asyncio.to_thread(
-            db.get_messages,
-            resolved_id,
-            limit=limit,
-            offset=offset,
-            latest=latest_page,
-        )
+        if latest_page and limit:
+            messages = await asyncio.to_thread(
+                db.get_messages,
+                resolved_id,
+                limit=limit + 1,
+                offset=offset,
+                latest=True,
+                before_id=before_id,
+            )
+            has_more = len(messages) > limit
+            if has_more:
+                messages = messages[-limit:]
+            next_before = str(messages[0]["id"]) if has_more and messages else None
+        else:
+            messages = await asyncio.to_thread(
+                db.get_messages,
+                resolved_id,
+                limit=limit,
+                offset=offset,
+                latest=latest_page,
+            )
+            has_more = False
+            next_before = None
         return web.json_response({
             "object": "list",
+            "requested_session_id": session_id,
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+            "has_more": has_more,
+            "next_before": next_before,
             "pagination": {
                 "limit": limit,
                 "offset": offset,
@@ -7728,11 +7774,140 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return
                 with self._profile_scope(request_profile):
+                    def _clarify_callback(
+                        question: str,
+                        choices,
+                        multi_select: bool = False,
+                        questions=None,
+                    ):
+                        from tools import clarify_gateway
+
+                        request_id = uuid.uuid4().hex
+                        if questions:
+                            wire = [
+                                {
+                                    "qid": str(entry["qid"]),
+                                    "question": str(entry["question"]),
+                                    "choices": list(entry["choices"]) if entry.get("choices") else None,
+                                    "multi_select": bool(entry.get("multi_select")),
+                                }
+                                for entry in questions
+                            ]
+                            done = threading.Event()
+                            state = {
+                                "answers": {},
+                                "done": done,
+                                "kind": "batch",
+                                "question_ids": [entry["qid"] for entry in wire],
+                                "question_modes": {
+                                    entry["qid"]: entry["multi_select"]
+                                    for entry in wire
+                                },
+                                "request_id": request_id,
+                            }
+                            event = {
+                                "event": "clarify.request",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "request_id": request_id,
+                                "questions": wire,
+                            }
+                        else:
+                            clarify_gateway.register(
+                                clarify_id=request_id,
+                                session_key=run_id,
+                                question=question,
+                                choices=list(choices) if choices else None,
+                                multi_select=bool(multi_select),
+                            )
+                            state = {
+                                "kind": "single",
+                                "multi_select": bool(multi_select) and bool(choices),
+                                "request_id": request_id,
+                            }
+                            event = {
+                                "event": "clarify.request",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "request_id": request_id,
+                                "question": question,
+                                "choices": list(choices) if choices else None,
+                                "multi_select": bool(multi_select) and bool(choices),
+                            }
+
+                        with self._run_clarify_lock:
+                            self._run_clarify_requests[run_id] = state
+                        self._set_run_status(
+                            run_id,
+                            "waiting_for_clarify",
+                            last_event="clarify.request",
+                        )
+                        try:
+                            loop.call_soon_threadsafe(_put_event_if_active, event)
+                            timeout = float(clarify_gateway.get_clarify_timeout())
+                            if state["kind"] == "single":
+                                response = clarify_gateway.wait_for_response(
+                                    request_id,
+                                    timeout=timeout,
+                                )
+                                return response or ""
+
+                            deadline = None if timeout <= 0 else time.monotonic() + timeout
+                            try:
+                                from tools.environments.base import touch_activity_if_due
+                            except Exception:
+                                touch_activity_if_due = None
+                            activity_state = {
+                                "last_touch": time.monotonic(),
+                                "start": time.monotonic(),
+                            }
+                            while True:
+                                remaining = None if deadline is None else deadline - time.monotonic()
+                                if remaining is not None and remaining <= 0:
+                                    break
+                                if state["done"].wait(timeout=1.0 if remaining is None else min(1.0, remaining)):
+                                    break
+                                if touch_activity_if_due is not None:
+                                    touch_activity_if_due(
+                                        activity_state,
+                                        "waiting for user clarify responses",
+                                    )
+                            with self._run_clarify_lock:
+                                answers = dict(state["answers"])
+                            result = {"answers": answers}
+                            if len(answers) < len(state["question_ids"]):
+                                result["timed_out"] = True
+                            return result
+                        finally:
+                            owned = False
+                            with self._run_clarify_lock:
+                                if self._run_clarify_requests.get(run_id) is state:
+                                    self._run_clarify_requests.pop(run_id, None)
+                                    owned = True
+                            if owned:
+                                def _mark_responded_if_unblocked() -> None:
+                                    with self._run_clarify_lock:
+                                        pending = self._run_clarify_requests.get(run_id)
+                                    status = self._run_statuses.get(run_id, {}).get("status")
+                                    if (
+                                        pending is None
+                                        and run_id not in self._stopping_run_ids
+                                        and status == "waiting_for_clarify"
+                                    ):
+                                        self._set_run_status(
+                                            run_id,
+                                            "running",
+                                            last_event="clarify.responded",
+                                        )
+
+                                loop.call_soon_threadsafe(_mark_responded_if_unblocked)
+
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
                         tool_progress_callback=event_cb,
+                        clarify_callback=_clarify_callback,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
@@ -7968,6 +8143,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
+                try:
+                    from tools.clarify_gateway import clear_session
+
+                    clear_session(run_id)
+                except Exception:
+                    pass
                 # Sentinel: signal SSE stream to close
                 try:
                     _put_event_if_active(None)
@@ -7976,6 +8157,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                with self._run_clarify_lock:
+                    self._run_clarify_requests.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -8152,6 +8335,153 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_run_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/clarify — answer that run's pending question."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        if run_id not in self._run_statuses:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        request_id = str(body.get("request_id", "")).strip()
+        if not request_id:
+            return web.json_response(
+                _openai_error(
+                    "Missing clarify request_id",
+                    code="invalid_clarify_request",
+                ),
+                status=400,
+            )
+
+        with self._run_clarify_lock:
+            state = self._run_clarify_requests.get(run_id)
+            matches = state is not None and state.get("request_id") == request_id
+        if not matches:
+            return web.json_response(
+                _openai_error(
+                    f"Run has no matching pending clarify request: {run_id}",
+                    code="clarify_not_pending",
+                ),
+                status=409,
+            )
+        assert state is not None
+
+        run_status = self._run_statuses.get(run_id, {}).get("status")
+        if run_id in self._stopping_run_ids or run_status in {
+            "stopping", "completed", "failed", "cancelled",
+        }:
+            return web.json_response(
+                _openai_error(
+                    f"Run is not accepting clarify answers: {run_id}",
+                    code="clarify_not_pending",
+                ),
+                status=409,
+            )
+
+        question_id = None
+        if state["kind"] == "batch":
+            question_id = str(body.get("question_id", "")).strip()
+            if question_id not in state["question_ids"]:
+                return web.json_response(
+                    _openai_error(
+                        "Missing or unknown clarify question_id",
+                        code="invalid_clarify_question",
+                    ),
+                    status=400,
+                )
+            multi_select = bool(state["question_modes"].get(question_id))
+        else:
+            multi_select = bool(state.get("multi_select"))
+
+        answer = body.get("answer", "")
+        if isinstance(answer, list):
+            if not multi_select:
+                return web.json_response(
+                    _openai_error(
+                        "Clarify answer must be a string for this question",
+                        code="invalid_clarify_answer",
+                    ),
+                    status=400,
+                )
+            answer = json.dumps([str(item) for item in answer], ensure_ascii=False)
+        elif not isinstance(answer, str):
+            return web.json_response(
+                _openai_error(
+                    "Clarify answer must be a string or array",
+                    code="invalid_clarify_answer",
+                ),
+                status=400,
+            )
+
+        completed = True
+        if state["kind"] == "batch":
+            with self._run_clarify_lock:
+                if (
+                    self._run_clarify_requests.get(run_id) is not state
+                    or run_id in self._stopping_run_ids
+                    or self._run_statuses.get(run_id, {}).get("status") in {
+                        "stopping", "completed", "failed", "cancelled",
+                    }
+                ):
+                    return web.json_response(
+                        _openai_error(
+                            f"Run has no pending clarify request: {run_id}",
+                            code="clarify_not_pending",
+                        ),
+                        status=409,
+                    )
+                previous = state["answers"].get(question_id)
+                if previous is not None and previous != answer:
+                    return web.json_response(
+                        _openai_error(
+                            "Clarify answer is already locked",
+                            code="clarify_answer_locked",
+                        ),
+                        status=409,
+                    )
+                state["answers"][question_id] = answer
+                completed = len(state["answers"]) == len(state["question_ids"])
+                if completed:
+                    state["done"].set()
+        else:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            if not resolve_gateway_clarify(request_id, answer):
+                return web.json_response(
+                    _openai_error(
+                        f"Run has no pending clarify request: {run_id}",
+                        code="clarify_not_pending",
+                    ),
+                    status=409,
+                )
+
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            q.put_nowait({
+                "event": "clarify.responded",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "request_id": request_id,
+                "question_id": question_id,
+                "completed": completed,
+            })
+        return web.json_response({
+            "object": "hermes.run.clarify",
+            "run_id": run_id,
+            "request_id": request_id,
+            "accepted": True,
+        })
+
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
         auth_err = self._check_auth(request)
@@ -8228,6 +8558,17 @@ class APIServerAdapter(BasePlatformAdapter):
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
 
+        with self._run_clarify_lock:
+            clarify_state = self._run_clarify_requests.get(run_id)
+            if clarify_state is not None and clarify_state.get("kind") == "batch":
+                clarify_state["done"].set()
+        try:
+            from tools.clarify_gateway import clear_session
+
+            clear_session(run_id)
+        except Exception:
+            pass
+
         if agent is not None:
             try:
                 request_hard_interrupt(agent, "Stop requested via API")
@@ -8281,6 +8622,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                with self._run_clarify_lock:
+                    self._run_clarify_requests.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         stale_statuses = [

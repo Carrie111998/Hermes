@@ -11393,6 +11393,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        before_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -11424,11 +11425,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``after_id`` enables keyset pagination (``id > after_id``): O(1)
         page seeks on huge transcripts where OFFSET degrades to O(n) per
         page. Ascending order only (incompatible with ``latest``/``offset``).
+
+        ``before_id`` is the reverse keyset counterpart (``id < before_id``)
+        used for paging backward from the newest messages. It requires
+        ``latest=True`` and is incompatible with ``after_id``/``offset``;
+        results remain in chronological order.
         """
-        if after_id is not None and (latest or offset):
+        if after_id is not None and (latest or offset or before_id is not None):
             raise ValueError("after_id is incompatible with latest/offset paging")
-        if after_id is not None and include_compacted:
-            raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        if before_id is not None and (not latest or offset):
+            raise ValueError("before_id requires latest paging without offset")
+        if (after_id is not None or before_id is not None) and include_compacted:
+            raise ValueError("keyset paging is incompatible with include_compacted (deduped display reads use offset paging)")
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -11439,7 +11447,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND (active = 1 OR compacted = 1)"
         else:
             active_clause = " AND active = 1"
-        keyset_clause = " AND id > ?" if after_id is not None else ""
+        keyset_clause = (
+            " AND id > ?" if after_id is not None
+            else (" AND id < ?" if before_id is not None else "")
+        )
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
             f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
@@ -11447,6 +11458,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params: list = [session_id]
         if after_id is not None:
             params.append(after_id)
+        elif before_id is not None:
+            params.append(before_id)
         if include_compacted:
             # Compaction epochs copy the protected tail into each new
             # generation, so the same logical message can exist as several

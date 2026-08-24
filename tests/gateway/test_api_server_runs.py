@@ -1,15 +1,17 @@
-"""Tests for /v1/runs endpoints: start, status, events, steer, and stop.
+"""Tests for /v1/runs endpoints: start, status, events, prompts, steer, and stop.
 
 Covers:
 - POST /v1/runs — start a run (202)
 - GET /v1/runs/{run_id} — poll run status
 - GET /v1/runs/{run_id}/events — SSE event stream
+- POST /v1/runs/{run_id}/clarify — resolve a pending user question
 - POST /v1/runs/{run_id}/steer — inject guidance into a running agent
 - POST /v1/runs/{run_id}/stop — interrupt a running agent
 - Auth, error handling, and cleanup
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -76,6 +78,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/clarify", adapter._handle_run_clarify)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
@@ -409,6 +412,454 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+
+class TestRunClarify:
+    @pytest.mark.asyncio
+    async def test_clarify_event_blocks_until_run_scoped_answer(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        answer_seen = threading.Event()
+        fake_agent = MagicMock()
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        def _run_conversation(*_args, **_kwargs):
+            answer = fake_agent.clarify_callback(
+                "Which deployment target?",
+                ["staging", "production"],
+            )
+            answer_seen.set()
+            return {"final_response": f"selected:{answer}"}
+
+        fake_agent.run_conversation.side_effect = _run_conversation
+
+        def _create_agent(**kwargs):
+            fake_agent.clarify_callback = kwargs["clarify_callback"]
+            return fake_agent
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent", side_effect=_create_agent):
+                start = await cli.post(
+                    "/v1/runs",
+                    json={"input": "deploy", "session_id": "clarify-session"},
+                    headers=headers,
+                )
+                assert start.status == 202
+                run_id = (await start.json())["run_id"]
+
+                status = {}
+                for _ in range(60):
+                    status = auth_adapter._run_statuses.get(run_id, {})
+                    if status.get("status") == "waiting_for_clarify":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "waiting_for_clarify"
+                event = await asyncio.wait_for(
+                    auth_adapter._run_streams[run_id].get(),
+                    timeout=2.0,
+                )
+                assert event == {
+                    "event": "clarify.request",
+                    "run_id": run_id,
+                    "timestamp": event["timestamp"],
+                    "request_id": event["request_id"],
+                    "question": "Which deployment target?",
+                    "choices": ["staging", "production"],
+                    "multi_select": False,
+                }
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/clarify",
+                    json={
+                        "request_id": event["request_id"],
+                        "answer": "staging",
+                    },
+                    headers=headers,
+                )
+                assert response.status == 200
+                assert (await response.json()) == {
+                    "object": "hermes.run.clarify",
+                    "run_id": run_id,
+                    "request_id": event["request_id"],
+                    "accepted": True,
+                }
+
+                for _ in range(60):
+                    status = auth_adapter._run_statuses.get(run_id, {})
+                    if status.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert answer_seen.is_set()
+        assert status["status"] == "completed"
+        assert status["output"] == "selected:staging"
+
+    @pytest.mark.asyncio
+    async def test_batch_clarify_locks_each_answer_before_resuming(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        fake_agent = MagicMock()
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        def _run_conversation(*_args, **_kwargs):
+            result = fake_agent.clarify_callback(
+                "Deployment details",
+                None,
+                questions=[
+                    {
+                        "qid": "q0",
+                        "question": "Which target?",
+                        "choices": ["staging", "production"],
+                        "multi_select": False,
+                    },
+                    {
+                        "qid": "q1",
+                        "question": "Which checks?",
+                        "choices": ["smoke", "full"],
+                        "multi_select": True,
+                    },
+                ],
+            )
+            return {"final_response": json.dumps(result, sort_keys=True)}
+
+        fake_agent.run_conversation.side_effect = _run_conversation
+
+        def _create_agent(**kwargs):
+            fake_agent.clarify_callback = kwargs["clarify_callback"]
+            return fake_agent
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent", side_effect=_create_agent):
+                start = await cli.post(
+                    "/v1/runs",
+                    json={"input": "deploy", "session_id": "batch-session"},
+                    headers=headers,
+                )
+                run_id = (await start.json())["run_id"]
+
+                status = {}
+                for _ in range(60):
+                    status = auth_adapter._run_statuses.get(run_id, {})
+                    if status.get("status") == "waiting_for_clarify":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "waiting_for_clarify"
+                event = await asyncio.wait_for(
+                    auth_adapter._run_streams[run_id].get(),
+                    timeout=2.0,
+                )
+                assert event["event"] == "clarify.request"
+                assert event["questions"] == [
+                    {
+                        "qid": "q0",
+                        "question": "Which target?",
+                        "choices": ["staging", "production"],
+                        "multi_select": False,
+                    },
+                    {
+                        "qid": "q1",
+                        "question": "Which checks?",
+                        "choices": ["smoke", "full"],
+                        "multi_select": True,
+                    },
+                ]
+
+                first = await cli.post(
+                    f"/v1/runs/{run_id}/clarify",
+                    json={
+                        "request_id": event["request_id"],
+                        "question_id": "q0",
+                        "answer": "staging",
+                    },
+                    headers=headers,
+                )
+                assert first.status == 200
+                assert auth_adapter._run_statuses[run_id]["status"] == "waiting_for_clarify"
+
+                second = await cli.post(
+                    f"/v1/runs/{run_id}/clarify",
+                    json={
+                        "request_id": event["request_id"],
+                        "question_id": "q1",
+                        "answer": ["smoke", "full"],
+                    },
+                    headers=headers,
+                )
+                assert second.status == 200
+
+                for _ in range(60):
+                    status = auth_adapter._run_statuses.get(run_id, {})
+                    if status.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert json.loads(status["output"]) == {
+            "answers": {"q0": "staging", "q1": '["smoke", "full"]'}
+        }
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_batch_clarify_waiter(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        waiter_released = threading.Event()
+        fake_agent = MagicMock()
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+        fake_agent.interrupt.return_value = None
+
+        def _run_conversation(*_args, **_kwargs):
+            fake_agent.clarify_callback(
+                "Stop test",
+                None,
+                questions=[
+                    {
+                        "qid": "q0",
+                        "question": "Continue?",
+                        "choices": ["yes", "no"],
+                        "multi_select": False,
+                    }
+                ],
+            )
+            waiter_released.set()
+            return {"final_response": "released"}
+
+        fake_agent.run_conversation.side_effect = _run_conversation
+
+        def _create_agent(**kwargs):
+            fake_agent.clarify_callback = kwargs["clarify_callback"]
+            return fake_agent
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        with patch("tools.clarify_gateway.get_clarify_timeout", return_value=5):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(auth_adapter, "_create_agent", side_effect=_create_agent):
+                    start = await cli.post(
+                        "/v1/runs",
+                        json={"input": "deploy", "session_id": "stop-batch"},
+                        headers=headers,
+                    )
+                    run_id = (await start.json())["run_id"]
+
+                    for _ in range(60):
+                        if auth_adapter._run_statuses.get(run_id, {}).get("status") == "waiting_for_clarify":
+                            break
+                        await asyncio.sleep(0.05)
+
+                    stop = await cli.post(f"/v1/runs/{run_id}/stop", headers=headers)
+                    assert stop.status == 200
+                    assert waiter_released.wait(timeout=0.5)
+
+    @pytest.mark.asyncio
+    async def test_clarify_answer_cannot_cross_run_boundary(self, auth_adapter):
+        from tools import clarify_gateway
+
+        app = _create_runs_app(auth_adapter)
+        first = clarify_gateway.register("question-a", "run-a", "A?", ["yes", "no"])
+        second = clarify_gateway.register("question-b", "run-b", "B?", ["yes", "no"])
+        auth_adapter._set_run_status("run-a", "waiting_for_clarify")
+        auth_adapter._set_run_status("run-b", "waiting_for_clarify")
+        auth_adapter._run_clarify_requests.update({
+            "run-a": {"kind": "single", "request_id": "question-a"},
+            "run-b": {"kind": "single", "request_id": "question-b"},
+        })
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs/run-a/clarify",
+                    json={"request_id": "question-b", "answer": "yes"},
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+
+            assert response.status == 409
+            assert payload["error"]["code"] == "clarify_not_pending"
+            assert not first.event.is_set()
+            assert not second.event.is_set()
+        finally:
+            clarify_gateway.clear_session("run-a")
+            clarify_gateway.clear_session("run-b")
+
+    @pytest.mark.asyncio
+    async def test_clarify_answer_requires_authentication(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run-any/clarify",
+                json={"request_id": "question", "answer": "yes"},
+            )
+
+        assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_first_answer_cannot_reopen_running_over_next_clarify(self, auth_adapter):
+        from tools import clarify_gateway
+
+        app = _create_runs_app(auth_adapter)
+        fake_agent = MagicMock()
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        def _run_conversation(*_args, **_kwargs):
+            fake_agent.clarify_callback("First?", ["one", "two"])
+            second = fake_agent.clarify_callback("Second?", ["three", "four"])
+            return {"final_response": f"second:{second}"}
+
+        fake_agent.run_conversation.side_effect = _run_conversation
+
+        def _create_agent(**kwargs):
+            fake_agent.clarify_callback = kwargs["clarify_callback"]
+            return fake_agent
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent", side_effect=_create_agent):
+                start = await cli.post(
+                    "/v1/runs",
+                    json={"input": "ask twice", "session_id": "two-clarifies"},
+                    headers=headers,
+                )
+                run_id = (await start.json())["run_id"]
+
+                state = None
+                for _ in range(60):
+                    state = auth_adapter._run_clarify_requests.get(run_id)
+                    if state:
+                        break
+                    await asyncio.sleep(0.05)
+                assert state is not None
+                first_id = state["request_id"]
+
+                real_resolve = clarify_gateway.resolve_gateway_clarify
+
+                def _resolve_first(request_id, answer):
+                    resolved = real_resolve(request_id, answer)
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        current = auth_adapter._run_clarify_requests.get(run_id)
+                        if current and current.get("request_id") != first_id:
+                            break
+                        time.sleep(0.01)
+                    return resolved
+
+                try:
+                    with patch(
+                        "tools.clarify_gateway.resolve_gateway_clarify",
+                        side_effect=_resolve_first,
+                    ):
+                        first_response = await cli.post(
+                            f"/v1/runs/{run_id}/clarify",
+                            json={"request_id": first_id, "answer": "one"},
+                            headers=headers,
+                        )
+                    assert first_response.status == 200
+                    current = auth_adapter._run_clarify_requests[run_id]
+                    assert current["request_id"] != first_id
+                    assert auth_adapter._run_statuses[run_id]["status"] == "waiting_for_clarify"
+                finally:
+                    current = auth_adapter._run_clarify_requests.get(run_id)
+                    if current:
+                        await cli.post(
+                            f"/v1/runs/{run_id}/clarify",
+                            json={"request_id": current["request_id"], "answer": "three"},
+                            headers=headers,
+                        )
+
+    @pytest.mark.asyncio
+    async def test_single_select_rejects_array_answer(self, auth_adapter):
+        from tools import clarify_gateway
+
+        app = _create_runs_app(auth_adapter)
+        entry = clarify_gateway.register("single-array", "run-single", "Target?", ["one", "two"])
+        auth_adapter._set_run_status("run-single", "waiting_for_clarify")
+        auth_adapter._run_clarify_requests["run-single"] = {
+            "kind": "single",
+            "multi_select": False,
+            "request_id": "single-array",
+        }
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs/run-single/clarify",
+                    json={"request_id": "single-array", "answer": ["one"]},
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+            assert response.status == 400
+            assert payload["error"]["code"] == "invalid_clarify_answer"
+            assert not entry.event.is_set()
+        finally:
+            clarify_gateway.clear_session("run-single")
+
+    @pytest.mark.asyncio
+    async def test_batch_single_select_rejects_array_answer(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        done = threading.Event()
+        auth_adapter._set_run_status("run-batch", "waiting_for_clarify")
+        auth_adapter._run_clarify_requests["run-batch"] = {
+            "answers": {},
+            "done": done,
+            "kind": "batch",
+            "question_ids": ["q0"],
+            "question_modes": {"q0": False},
+            "request_id": "batch-array",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run-batch/clarify",
+                json={
+                    "request_id": "batch-array",
+                    "question_id": "q0",
+                    "answer": ["one"],
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            payload = await response.json()
+
+        assert response.status == 400
+        assert payload["error"]["code"] == "invalid_clarify_answer"
+        assert not done.is_set()
+
+    @pytest.mark.asyncio
+    async def test_stopping_run_rejects_late_batch_answer(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        done = threading.Event()
+        state = {
+            "answers": {},
+            "done": done,
+            "kind": "batch",
+            "question_ids": ["q0"],
+            "question_modes": {"q0": False},
+            "request_id": "late-batch",
+        }
+        auth_adapter._set_run_status("run-stopping", "stopping")
+        auth_adapter._stopping_run_ids.add("run-stopping")
+        auth_adapter._run_clarify_requests["run-stopping"] = state
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run-stopping/clarify",
+                json={
+                    "request_id": "late-batch",
+                    "question_id": "q0",
+                    "answer": "one",
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            payload = await response.json()
+
+        assert response.status == 409
+        assert payload["error"]["code"] == "clarify_not_pending"
+        assert state["answers"] == {}
+        assert not done.is_set()
 
 
 # ---------------------------------------------------------------------------
