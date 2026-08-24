@@ -1465,9 +1465,11 @@ export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
  *
  *  It also cannot be dropped by accident: blobatar declares
  *  `sideEffects: ["*.css"]`, so no bundler tree-shakes it out from under a
- *  consumer that only imports `Blobatar`. Do not "optimize" it into a
- *  per-consumer import anyway — the faces would silently stop moving in
- *  whichever surface forgot it, with no error to catch.
+ *  consumer that only imports `Blobatar`. That is first-party — a guarantee
+ *  this project keeps, not one it inherits — so it holds only as long as
+ *  blobatar's package.json keeps saying so. Do not "optimize" this into a
+ *  per-consumer import on either side: the faces would silently stop moving
+ *  in whichever surface forgot it, with no error to catch.
  *
  *  The one real global claim is the namespace: the sheet registers 15
  *  document-wide `@property --mo-*` typed customs plus the `.mo-*` classes.
