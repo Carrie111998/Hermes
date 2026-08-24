@@ -21,6 +21,7 @@ import {
   Loader,
   LogView,
   Tabs,
+  TabsContent,
   TabsList,
   TabsTrigger,
   Textarea,
@@ -70,6 +71,7 @@ import {
   type KanbanText,
   lockedReason,
   ScrollFade,
+  Section,
   shortId,
   StatusMenu,
   useDefaultAssignee,
@@ -178,18 +180,6 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
       <span className="text-(--ui-text-quaternary)">{label}</span>
       <span className="min-w-0 truncate text-(--ui-text-secondary)">{children}</span>
     </>
-  )
-}
-
-function DrawerSection({ action, children, label }: { action?: ReactNode; children: ReactNode; label: string }) {
-  return (
-    <section className="flex flex-col gap-2">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="text-xs font-semibold text-(--ui-text-secondary)">{label}</h3>
-        {action}
-      </div>
-      {children}
-    </section>
   )
 }
 
@@ -376,7 +366,8 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
   const [draft, setDraft] = useState('')
 
   return (
-    <DrawerSection
+    <Section
+      variant="drawer"
       action={
         <Button
           aria-label={editing ? k.cancelEdit : k.editDescription}
@@ -416,7 +407,7 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
       ) : (
         <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
       )}
-    </DrawerSection>
+    </Section>
   )
 }
 
@@ -437,7 +428,8 @@ function AttachmentsSection({
   const fileRef = useRef<HTMLInputElement>(null)
 
   return (
-    <DrawerSection
+    <Section
+      variant="drawer"
       action={
         <>
           <input
@@ -479,7 +471,7 @@ function AttachmentsSection({
       ) : (
         <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noAttachments}</p>
       )}
-    </DrawerSection>
+    </Section>
   )
 }
 
@@ -508,7 +500,7 @@ function EstimateSection({ id }: { id: string }) {
   useEffect(() => setResult(null), [id])
 
   return (
-    <DrawerSection label={k.estimate}>
+    <Section variant="drawer" label={k.estimate}>
       {result?.ok ? (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2 text-[0.8125rem]">
@@ -548,7 +540,7 @@ function EstimateSection({ id }: { id: string }) {
           </Tip>
         </div>
       )}
-    </DrawerSection>
+    </Section>
   )
 }
 
@@ -792,8 +784,12 @@ export function TaskDrawer({
         )}
       </header>
 
-      {task && (
-        <Tabs className="gap-0" onValueChange={value => setActiveTab(value as DrawerTab)} value={activeTab}>
+      {task ? (
+        <Tabs
+          className="min-h-0 flex-1 gap-0"
+          onValueChange={value => setActiveTab(value as DrawerTab)}
+          value={activeTab}
+        >
           <TabsList aria-label={k.details} variant="line">
             <TabsTrigger value="overview" variant="line">
               {k.tabOverview}
@@ -822,226 +818,244 @@ export function TaskDrawer({
               ) : null}
             </TabsTrigger>
           </TabsList>
-        </Tabs>
-      )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4" data-selectable-text="true">
-        {errorMessage ? (
-          <ErrorState title={errorMessage} />
-        ) : !detail || !task ? (
-          <div className="grid h-32 place-items-center">
-            <Loader type="lemniscate-bloom" />
-          </div>
-        ) : activeTab === 'overview' ? (
-          <div className="flex flex-col gap-5 text-sm">
-            {currentState && (
-              <DrawerSection label={k.currentState}>
-                <p className="whitespace-pre-wrap text-[0.8125rem] leading-relaxed text-(--ui-text-secondary)">
-                  {currentState}
-                </p>
-                {task.result && currentSummary && (
-                  <p className="whitespace-pre-wrap text-[0.75rem] leading-relaxed text-(--ui-text-tertiary)">
-                    {currentSummary}
+          <TabsContent
+            className="overflow-y-auto px-4 py-4 data-[state=inactive]:hidden"
+            data-selectable-text="true"
+            forceMount
+            value="overview"
+          >
+            <div className="flex flex-col gap-5 text-sm">
+              {currentState && (
+                <Section variant="drawer" label={k.currentState}>
+                  <p className="whitespace-pre-wrap text-[0.8125rem] leading-relaxed text-(--ui-text-secondary)">
+                    {currentState}
                   </p>
-                )}
-              </DrawerSection>
-            )}
+                  {task.result && currentSummary && (
+                    <p className="whitespace-pre-wrap text-[0.75rem] leading-relaxed text-(--ui-text-tertiary)">
+                      {currentSummary}
+                    </p>
+                  )}
+                </Section>
+              )}
 
-            {task.status === 'ready' && !task.assignee && !defaultAssignee && (
-              <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
-                <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
-              </Callout>
-            )}
+              {task.status === 'ready' && !task.assignee && !defaultAssignee && (
+                <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
+                  <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
+                </Callout>
+              )}
 
-            {task.diagnostics && task.diagnostics.length > 0 && (
-              <DrawerSection label={k.diagnosticsN(task.diagnostics.length)}>
-                <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
-              </DrawerSection>
-            )}
+              {task.diagnostics && task.diagnostics.length > 0 && (
+                <Section variant="drawer" label={k.diagnosticsN(task.diagnostics.length)}>
+                  <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
+                </Section>
+              )}
 
-            <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
+              <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
 
-            <DrawerSection label={k.details}>
-              <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[0.71rem]">
-                <MetaRow label={k.assignee}>
-                  <AssigneeMenu
-                    current={task.assignee}
-                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
-                  />
-                </MetaRow>
-                {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
-                {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
-                {task.workspace_path && (
-                  <MetaRow label={k.workspace}>
-                    {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
-                    {task.workspace_path}
+              <Section variant="drawer" label={k.details}>
+                <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[0.71rem]">
+                  <MetaRow label={k.assignee}>
+                    <AssigneeMenu
+                      current={task.assignee}
+                      onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+                    />
                   </MetaRow>
-                )}
-                <MetaRow label={k.model}>
-                  <ModelOverrideField
-                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
-                    value={{
-                      effort: task.reasoning_effort ?? '',
-                      model: task.model_override ?? '',
-                      provider: task.provider_override ?? ''
-                    }}
-                  />
-                </MetaRow>
-                {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
-                {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
-                {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
-              </div>
-            </DrawerSection>
+                  {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
+                  {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
+                  {task.workspace_path && (
+                    <MetaRow label={k.workspace}>
+                      {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
+                      {task.workspace_path}
+                    </MetaRow>
+                  )}
+                  <MetaRow label={k.model}>
+                    <ModelOverrideField
+                      onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                      value={{
+                        effort: task.reasoning_effort ?? '',
+                        model: task.model_override ?? '',
+                        provider: task.provider_override ?? ''
+                      }}
+                    />
+                  </MetaRow>
+                  {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
+                  {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                  {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+                </div>
+              </Section>
 
-            <EstimateSection id={task.id} />
+              <EstimateSection id={task.id} />
 
-            {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
-              <DrawerSection label={k.dependencies}>
-                {(['parents', 'children'] as const).map(side =>
-                  detail.links[side].length > 0 ? (
-                    <div className="flex flex-wrap items-center gap-1.5" key={side}>
-                      <span className="text-[0.6875rem] text-(--ui-text-quaternary)">
-                        {side === 'parents' ? k.blockedBy : k.blocks}
-                      </span>
-                      {detail.links[side].map(linked => (
-                        <button
-                          className="rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
-                          key={linked}
-                          onClick={() => onOpen(linked)}
-                          type="button"
-                        >
-                          {shortId(linked)}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null
-                )}
-              </DrawerSection>
-            )}
-
-            <AttachmentsSection
-              attachments={detail.attachments}
-              onUpload={file => uploadMut.mutate(file)}
-              pending={uploadMut.isPending}
-            />
-          </div>
-        ) : activeTab === 'timeline' ? (
-          <div className="flex flex-col gap-5 text-sm">
-            {tabStats.timelineCount === 0 && (
-              <p className="py-6 text-center text-xs text-(--ui-text-quaternary)">{k.noTimeline}</p>
-            )}
-
-            {detail.comments.length > 0 && (
-              <DrawerSection
-                action={
-                  <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
-                    <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
-                      <Codicon name="question" size="0.8rem" />
-                    </span>
-                  </Tip>
-                }
-                label={k.comments(detail.comments.length)}
-              >
-                <ul className="flex flex-col gap-3">
-                  {detail.comments.map(comment => (
-                    <li
-                      className="border-b border-(--ui-stroke-tertiary) pb-3 text-[0.75rem] last:border-0 last:pb-0"
-                      key={comment.id}
-                    >
-                      <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
-                      <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">
-                        {ago(comment.created_at)}
-                      </span>
-                      <p className="mt-1 whitespace-pre-wrap leading-relaxed text-(--ui-text-tertiary)">
-                        {comment.body}
-                      </p>
-                    </li>
-                  ))}
-                </ul>
-              </DrawerSection>
-            )}
-
-            {detail.events.length > 0 && (
-              <DrawerSection label={k.activity(detail.events.length)}>
-                <ul className="relative ml-1 flex flex-col gap-3 border-l border-(--ui-stroke-tertiary) pl-4">
-                  {detail.events.map(event => {
-                    const { detail: extra, label } = eventText(event, k)
-
-                    return (
-                      <li
-                        className="relative text-[0.6875rem] before:absolute before:top-1.5 before:-left-[1.1875rem] before:size-1.5 before:rounded-full before:bg-(--ui-text-quaternary) before:ring-4 before:ring-(--ui-bg-elevated)"
-                        key={event.id}
-                      >
-                        <div className="flex items-baseline gap-2">
-                          <span className="text-(--ui-text-secondary)">{label}</span>
-                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
-                        </div>
-                        {extra && <p className="mt-0.5 text-(--ui-text-quaternary)">{extra}</p>}
-                      </li>
-                    )
-                  })}
-                </ul>
-              </DrawerSection>
-            )}
-          </div>
-        ) : (
-          <div className="flex flex-col gap-5 text-sm">
-            {detail.runs.length === 0 && !(log?.exists && log.content) && (
-              <p className="py-6 text-center text-xs text-(--ui-text-quaternary)">{k.noExecution}</p>
-            )}
-
-            {detail.runs.length > 0 && (
-              <DrawerSection label={k.runs(detail.runs.length)}>
-                <ul className="flex flex-col gap-3">
-                  {detail.runs.map(run => {
-                    const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
-
-                    return (
-                      <li
-                        className="flex flex-col gap-1 border-b border-(--ui-stroke-tertiary) pb-3 text-[0.71rem] last:border-0 last:pb-0"
-                        key={run.id}
-                      >
-                        <div className="flex items-center gap-2">
-                          <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
-                            {run.outcome ?? run.status}
-                          </Badge>
-                          {run.profile && <span className="text-(--ui-text-tertiary)">{run.profile}</span>}
-                          {duration(run.started_at, run.ended_at) && (
-                            <span className="text-(--ui-text-quaternary)">
-                              {duration(run.started_at, run.ended_at)}
-                            </span>
-                          )}
-                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
-                            {ago(run.ended_at ?? run.started_at)}
-                          </span>
-                        </div>
-                        {(run.error || run.summary) && (
-                          <p
-                            className={cn(
-                              'line-clamp-3 whitespace-pre-wrap leading-relaxed',
-                              run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
-                            )}
+              {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
+                <Section variant="drawer" label={k.dependencies}>
+                  {(['parents', 'children'] as const).map(side =>
+                    detail.links[side].length > 0 ? (
+                      <div className="flex flex-wrap items-center gap-1.5" key={side}>
+                        <span className="text-[0.6875rem] text-(--ui-text-quaternary)">
+                          {side === 'parents' ? k.blockedBy : k.blocks}
+                        </span>
+                        {detail.links[side].map(linked => (
+                          <button
+                            className="rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
+                            key={linked}
+                            onClick={() => onOpen(linked)}
+                            type="button"
                           >
-                            {run.error ?? run.summary}
-                          </p>
-                        )}
-                      </li>
-                    )
-                  })}
-                </ul>
-              </DrawerSection>
-            )}
+                            {shortId(linked)}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null
+                  )}
+                </Section>
+              )}
 
-            {log?.exists && log.content && (
-              <DrawerSection label={log.truncated ? k.workerLogTail : k.workerLog}>
-                <ScrollFade deps={log.content.length} max="24rem">
-                  <LogView className="border-0 px-0">{log.content}</LogView>
-                </ScrollFade>
-              </DrawerSection>
-            )}
-          </div>
-        )}
-      </div>
+              <AttachmentsSection
+                attachments={detail.attachments}
+                onUpload={file => uploadMut.mutate(file)}
+                pending={uploadMut.isPending}
+              />
+            </div>
+          </TabsContent>
+
+          <TabsContent
+            className="overflow-y-auto px-4 py-4 data-[state=inactive]:hidden"
+            data-selectable-text="true"
+            forceMount
+            value="timeline"
+          >
+            <div className="flex flex-col gap-5 text-sm">
+              {tabStats.timelineCount === 0 && (
+                <p className="py-6 text-center text-xs text-(--ui-text-quaternary)">{k.noTimeline}</p>
+              )}
+
+              {detail.comments.length > 0 && (
+                <Section
+                  variant="drawer"
+                  action={
+                    <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
+                      <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
+                        <Codicon name="question" size="0.8rem" />
+                      </span>
+                    </Tip>
+                  }
+                  label={k.comments(detail.comments.length)}
+                >
+                  <ul className="flex flex-col gap-3">
+                    {detail.comments.map(comment => (
+                      <li
+                        className="border-b border-(--ui-stroke-tertiary) pb-3 text-[0.75rem] last:border-0 last:pb-0"
+                        key={comment.id}
+                      >
+                        <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
+                        <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">
+                          {ago(comment.created_at)}
+                        </span>
+                        <p className="mt-1 whitespace-pre-wrap leading-relaxed text-(--ui-text-tertiary)">
+                          {comment.body}
+                        </p>
+                      </li>
+                    ))}
+                  </ul>
+                </Section>
+              )}
+
+              {detail.events.length > 0 && (
+                <Section variant="drawer" label={k.activity(detail.events.length)}>
+                  <ul className="relative ml-1 flex flex-col gap-3 border-l border-(--ui-stroke-tertiary) pl-4">
+                    {detail.events.map(event => {
+                      const { detail: extra, label } = eventText(event, k)
+
+                      return (
+                        <li
+                          className="relative text-[0.6875rem] before:absolute before:top-1.5 before:-left-[1.1875rem] before:size-1.5 before:rounded-full before:bg-(--ui-text-quaternary) before:ring-4 before:ring-(--ui-bg-elevated)"
+                          key={event.id}
+                        >
+                          <div className="flex items-baseline gap-2">
+                            <span className="text-(--ui-text-secondary)">{label}</span>
+                            <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
+                              {ago(event.created_at)}
+                            </span>
+                          </div>
+                          {extra && <p className="mt-0.5 text-(--ui-text-quaternary)">{extra}</p>}
+                        </li>
+                      )
+                    })}
+                  </ul>
+                </Section>
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent
+            className="overflow-y-auto px-4 py-4 data-[state=inactive]:hidden"
+            data-selectable-text="true"
+            forceMount
+            value="execution"
+          >
+            <div className="flex flex-col gap-5 text-sm">
+              {detail.runs.length === 0 && !(log?.exists && log.content) && (
+                <p className="py-6 text-center text-xs text-(--ui-text-quaternary)">{k.noExecution}</p>
+              )}
+
+              {detail.runs.length > 0 && (
+                <Section variant="drawer" label={k.runs(detail.runs.length)}>
+                  <ul className="flex flex-col gap-3">
+                    {detail.runs.map(run => {
+                      const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
+
+                      return (
+                        <li
+                          className="flex flex-col gap-1 border-b border-(--ui-stroke-tertiary) pb-3 text-[0.71rem] last:border-0 last:pb-0"
+                          key={run.id}
+                        >
+                          <div className="flex items-center gap-2">
+                            <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
+                              {run.outcome ?? run.status}
+                            </Badge>
+                            {run.profile && <span className="text-(--ui-text-tertiary)">{run.profile}</span>}
+                            {duration(run.started_at, run.ended_at) && (
+                              <span className="text-(--ui-text-quaternary)">
+                                {duration(run.started_at, run.ended_at)}
+                              </span>
+                            )}
+                            <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
+                              {ago(run.ended_at ?? run.started_at)}
+                            </span>
+                          </div>
+                          {(run.error || run.summary) && (
+                            <p
+                              className={cn(
+                                'line-clamp-3 whitespace-pre-wrap leading-relaxed',
+                                run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
+                              )}
+                            >
+                              {run.error ?? run.summary}
+                            </p>
+                          )}
+                        </li>
+                      )
+                    })}
+                  </ul>
+                </Section>
+              )}
+
+              {log?.exists && log.content && (
+                <Section variant="drawer" label={log.truncated ? k.workerLogTail : k.workerLog}>
+                  <ScrollFade deps={log.content.length} max="24rem">
+                    <LogView className="border-0 px-0">{log.content}</LogView>
+                  </ScrollFade>
+                </Section>
+              )}
+            </div>
+          </TabsContent>
+        </Tabs>
+      ) : (
+        <div className="grid min-h-0 flex-1 place-items-center px-4 py-4">
+          {errorMessage ? <ErrorState title={errorMessage} /> : <Loader type="lemniscate-bloom" />}
+        </div>
+      )}
 
       {detail && task && (
         <footer className="border-t border-(--ui-stroke-tertiary) px-3 py-2.5">

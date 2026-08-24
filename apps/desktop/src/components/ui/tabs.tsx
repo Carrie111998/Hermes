@@ -42,4 +42,8 @@ function TabsTrigger({ className, variant = 'segmented', ...props }: TabsTrigger
   )
 }
 
-export { Tabs, TabsList, TabsTrigger }
+function TabsContent({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Content>) {
+  return <TabsPrimitive.Content className={cn('min-h-0 flex-1', className)} data-slot="tabs-content" {...props} />
+}
+
+export { Tabs, TabsContent, TabsList, TabsTrigger }
