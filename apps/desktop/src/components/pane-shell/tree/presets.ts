@@ -12,6 +12,7 @@ import { registry } from '@/contrib/registry'
 import { readJson, writeJson, writeKey } from '@/lib/storage'
 
 import { isLayoutNode, type LayoutNode } from './model'
+import { stripPresetLivePanes } from './preset-tree'
 import { $layoutTree, applyTree, markActivePreset } from './store'
 
 export const LAYOUTS_AREA = 'layouts'
@@ -31,11 +32,29 @@ const userDisposers = new Map<string, () => void>()
 function loadUserPresets(): Record<string, StoredPreset> {
   const parsed = readJson<Record<string, StoredPreset>>(USER_KEY) ?? {}
   const out: Record<string, StoredPreset> = {}
+  let healed = false
 
   for (const [id, preset] of Object.entries(parsed)) {
-    if (preset && typeof preset.name === 'string' && isLayoutNode(preset.tree)) {
-      out[id] = preset
+    if (!preset || typeof preset.name !== 'string' || !isLayoutNode(preset.tree)) {
+      continue
     }
+
+    const tree = stripPresetLivePanes(preset.tree)
+
+    if (!tree) {
+      healed = true
+      continue
+    }
+
+    if (tree !== preset.tree) {
+      healed = true
+    }
+
+    out[id] = { name: preset.name, tree }
+  }
+
+  if (healed) {
+    persistUserPresets(out)
   }
 
   return out
@@ -68,6 +87,12 @@ export function saveLayoutPresetTree(name: string, tree: LayoutNode): string | n
     return null
   }
 
+  const geometry = stripPresetLivePanes(tree)
+
+  if (!geometry) {
+    return null
+  }
+
   const id = `user-${
     trimmed
       .toLowerCase()
@@ -75,7 +100,7 @@ export function saveLayoutPresetTree(name: string, tree: LayoutNode): string | n
       .replace(/^-+|-+$/g, '') || Date.now().toString(36)
   }`
 
-  userPresets[id] = { name: trimmed, tree }
+  userPresets[id] = { name: trimmed, tree: geometry }
   persistUserPresets(userPresets)
   registerUserPreset(id, userPresets[id])
   markActivePreset(id)
@@ -107,5 +132,13 @@ export const isUserPreset = (id: string) => id in userPresets
 
 /** Apply a preset's tree (deep-cloned so live edits never mutate the preset). */
 export function applyLayoutPreset(id: string, tree: LayoutNode) {
-  applyTree(structuredClone(tree), id)
+  const geometry = stripPresetLivePanes(structuredClone(tree))
+
+  if (!geometry) {
+    return
+  }
+
+  // applyTree adopts currently-open tiles (session tabs, previews) into the
+  // new geometry — they must not come from the snapshot (#94260).
+  applyTree(geometry, id)
 }
