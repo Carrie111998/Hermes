@@ -16344,6 +16344,24 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
+        # Loopback-spawner escape hatch (#93981): a backend that declares a
+        # non-loopback ``dashboard.public_url`` engages this gated branch even
+        # when it binds loopback — which is exactly how the Desktop spawns its
+        # local chat backends for edge-accessible profiles. The spawned child
+        # probe authenticates with the legacy ``?token=<_SESSION_TOKEN>``, a
+        # process-injected secret that never reaches the SPA and is worthless
+        # to any client that isn't already on loopback. Accept it ONLY when
+        # the peer itself is loopback: remote callers still need a real
+        # ticket, so the public-dashboard posture is unchanged.
+        token_early = ws.query_params.get("token", "")
+        client_host = (ws.client.host if ws.client else "").lower()
+        if (
+            token_early
+            and client_host in _LOOPBACK_HOSTS
+            and hmac.compare_digest(token_early.encode(), _SESSION_TOKEN.encode())
+        ):
+            return None, "token-loopback"
+
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
