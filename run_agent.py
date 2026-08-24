@@ -246,6 +246,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # TBS CEO-readiness continuation guard: a NOT CEO-READY answer without
+    # a hard-stop blocker is an interim candidate plus a synthetic nudge, not
+    # durable transcript content.
+    "_tbs_ceo_ready_guard_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
     # and the "issue the actual tool call now" user nudge exist only to

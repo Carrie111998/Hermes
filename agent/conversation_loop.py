@@ -8388,6 +8388,51 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # ── TBS CEO-readiness continuation guard ───────────────
+                # TBS routing outputs must not stop at NOT CEO-READY when a
+                # safe-envelope next step remains. Treat that not-ready text as
+                # an interim candidate and nudge the model to keep working until
+                # CEO-ready or a true approval/source/access blocker.
+                try:
+                    from agent.tbs_ceo_ready_guard import (
+                        SYNTHETIC_FLAG as _TBS_CEO_READY_GUARD_FLAG,
+                        build_continuation_nudge as _build_tbs_ceo_nudge,
+                    )
+
+                    _tbs_ceo_nudge = _build_tbs_ceo_nudge(
+                        final_response,
+                        user_message=original_user_message,
+                    )
+                except Exception:
+                    logger.debug("TBS CEO-readiness guard check failed", exc_info=True)
+                    _tbs_ceo_nudge = None
+                    _TBS_CEO_READY_GUARD_FLAG = "_tbs_ceo_ready_guard_synthetic"
+
+                if _tbs_ceo_nudge:
+                    final_msg["finish_reason"] = "tbs_ceo_ready_continuation_required"
+                    final_msg[_TBS_CEO_READY_GUARD_FLAG] = True
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _tbs_ceo_nudge,
+                        _TBS_CEO_READY_GUARD_FLAG: True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "TBS CEO-readiness guard issued continuation nudge "
+                        "(session=%s)",
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    agent._emit_status(
+                        "↻ NOT CEO-READY is not a stop — continuing safe next step"
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session
