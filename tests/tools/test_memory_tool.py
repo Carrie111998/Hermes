@@ -412,6 +412,31 @@ class TestMemoryToolDispatcher:
         similarities = [item["similarity"] for item in result["similar_entries"]]
         assert similarities == sorted(similarities, reverse=True)
 
+    def test_review_uses_raw_similarity_at_candidate_cutoff(self, store, monkeypatch):
+        store.memory_char_limit = 10_000
+        entries = [letter * 24 for letter in "abcdefg"]
+        for entry in entries:
+            store.add("memory", entry)
+
+        class FakeMatcher:
+            def __init__(self, _junk, left, right):
+                self.pair = (left, right)
+
+            def ratio(self):
+                if self.pair == (entries[0], entries[1]):
+                    return 0.721
+                if self.pair == (entries[-2], entries[-1]):
+                    return 0.724
+                return 0.9
+
+        monkeypatch.setattr("tools.memory_tool.SequenceMatcher", FakeMatcher)
+
+        result = json.loads(memory_tool(action="review", target="memory", store=store))
+        reported_pairs = [item["entries"] for item in result["similar_entries"]]
+
+        assert [entries[-2], entries[-1]] in reported_pairs
+        assert [entries[0], entries[1]] not in reported_pairs
+
 
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""

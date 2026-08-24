@@ -647,7 +647,7 @@ class MemoryStore:
         if not read_ok:
             return _read_failed_error(path)
 
-        similar_entries = []
+        candidates = []
         for left_index, left in enumerate(entries):
             left_key = _duplicate_key(left)
             for right in entries[left_index + 1:]:
@@ -665,20 +665,20 @@ class MemoryStore:
                     continue
                 similarity = SequenceMatcher(None, left_key, right_key).ratio()
                 if similarity >= _REVIEW_SIMILARITY_THRESHOLD:
-                    similar_entries.append({
-                        "entries": [left, right],
-                        "similarity": round(similarity, 2),
-                    })
+                    candidates.append((similarity, left, right))
 
-        similar_entries.sort(
+        candidates.sort(
             key=lambda candidate: (
-                -candidate["similarity"],
-                _duplicate_key(candidate["entries"][0]),
-                _duplicate_key(candidate["entries"][1]),
+                -candidate[0],
+                _duplicate_key(candidate[1]),
+                _duplicate_key(candidate[2]),
             )
         )
-        omitted_candidate_count = max(0, len(similar_entries) - _REVIEW_MAX_CANDIDATES)
-        similar_entries = similar_entries[:_REVIEW_MAX_CANDIDATES]
+        omitted_candidate_count = max(0, len(candidates) - _REVIEW_MAX_CANDIDATES)
+        similar_entries = [
+            {"entries": [left, right], "similarity": round(similarity, 2)}
+            for similarity, left, right in candidates[:_REVIEW_MAX_CANDIDATES]
+        ]
 
         current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
         limit = self._char_limit(target)
