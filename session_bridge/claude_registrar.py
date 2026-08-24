@@ -1207,8 +1207,12 @@ class ClaudeNativeRegistrar:
                         "Claude provider limit interrupted authentication recovery",
                     )
                 else:
-                    if prompt_response_observed:
-                        output = prompt_response or ""
+                    # Never accept an empty capture as the answer: a response
+                    # seen but not captured is still arriving, so read it out
+                    # rather than scoring the empty string against a prompt
+                    # the model may never have received.
+                    if prompt_response:
+                        output = prompt_response
                     else:
                         if not paste_auto_submitted:
                             process.write("\r")
@@ -1545,8 +1549,12 @@ class ClaudeNativeRegistrar:
                         "Claude provider limit interrupted registration",
                     )
                 else:
-                    if prompt_response_observed:
-                        output = prompt_response or ""
+                    # Never accept an empty capture as the answer: a response
+                    # seen but not captured is still arriving, so read it out
+                    # rather than scoring the empty string against a prompt
+                    # the model may never have received.
+                    if prompt_response:
+                        output = prompt_response
                     else:
                         if not paste_auto_submitted:
                             process.write("\r")

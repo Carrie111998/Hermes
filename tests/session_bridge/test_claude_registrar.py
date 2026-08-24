@@ -33,6 +33,7 @@ from session_bridge.claude_registrar import (
     _PtyResponseTimeout,
     _WinPtyProcess,
     _claude_main_repl_ready,
+    _known_claude_input_modal_visible,
     _has_exact_registered_response,
     _is_provider_limit_failure,
     _normalized_terminal_output,
@@ -4095,3 +4096,36 @@ def _as_cursor_forward_echo(text: str) -> str:
     """Re-encode inter-word spaces the way ConPTY draws them."""
 
     return "\x1b[1C".join(text.split(" "))
+
+
+def test_launch_reads_out_a_response_seen_but_not_yet_captured() -> None:
+    """An observed-but-uncaptured response must be read, not scored as empty.
+
+    _prompt_input_registered_response reports (True, None) while a reply is
+    still arriving.  Accepting ``prompt_response or ""`` there scored the empty
+    string against the prompt and burned the attempt as ambiguous.
+    """
+
+    item = claim()
+    process = FakePty(
+        output="REGISTERED\r\n",
+        prompt_input_output="REGISTERED",  # no line terminator yet
+    )
+    source = FakeSource([None, projection_for(item)])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "visible"
+    # Already auto-submitted, so the CR must NOT be re-sent.
+    assert "\r" not in process.writes
+    assert process.writes[-1] == "/exit\r"
+
+
+def test_cursor_forward_input_modal_signature_still_matches() -> None:
+    """Modal gates match spaced signatures; welded text made them dead."""
+
+    welded = (
+        "\x1b[2mstandard\x1b[1Cpart\x1b[1Cof\x1b[1Cyour\x1b[1Cmax\x1b[1Cplan"
+        "\x1b[1CYes,\x1b[1Ctry\x1b[1Cit\x1b[1CNot\x1b[1Cnow\x1b[0m"
+    )
+    assert _known_claude_input_modal_visible(welded) is True
