@@ -1,27 +1,34 @@
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { I18nProvider } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
-import { $activeSessionId } from '@/store/session'
+import { $activeSessionId, $messages } from '@/store/session'
 
 import { ClarifyTool, readClarifyBatchResult, readClarifyResult } from './clarify-tool'
 
-// The live pending card only renders while its message is running. Force that so
-// keyboard-navigation tests can exercise ClarifyToolPending directly.
+const { messageRunningMock } = vi.hoisted(() => ({
+  messageRunningMock: { current: true }
+}))
+
+// Live pending card reads useAuiState(selectMessageRunning). Tests flip this
+// to cover the dead-turn keep-alive path without remounting the tree.
 vi.mock('@assistant-ui/react', () => ({
-  useAuiState: () => true
+  useAuiState: () => messageRunningMock.current
 }))
 
 afterEach(() => {
   cleanup()
   clearClarifyRequest()
   $activeSessionId.set(null)
+  $messages.set([])
   $gateway.set(null)
+  messageRunningMock.current = true
   vi.clearAllMocks()
 })
 
@@ -629,5 +636,127 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('red')).toBeTruthy()
     expect(screen.getByText('Name?')).toBeTruthy()
     expect(screen.getByText('Skipped')).toBeTruthy()
+  })
+})
+
+const CLARIFY_TEXT_WAIT_MS = 1500
+
+function streamingAssistant(text: string): ChatMessage {
+  return {
+    id: 'asst-live',
+    parts: [{ type: 'text', text }],
+    role: 'assistant'
+  }
+}
+
+function queryPendingChoices() {
+  return screen.queryByRole('button', { name: /staging/ })
+}
+
+function queryFallbackRow() {
+  return document.querySelector('[data-tool-row]')
+}
+
+describe('ClarifyTool visibility gate', () => {
+  beforeEach(() => {
+    messageRunningMock.current = true
+    $messages.set([])
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    messageRunningMock.current = true
+    // Note: $messages is reset by the file-level afterEach AFTER cleanup(),
+    // once the store subscription is gone — resetting it here would re-render
+    // a still-mounted tree outside act().
+  })
+
+  it('R1: keeps the pending panel when the turn is dead but the request is still answerable', () => {
+    messageRunningMock.current = false
+    renderLiveClarify()
+
+    expect(queryPendingChoices()).toBeTruthy()
+    expect(queryFallbackRow()).toBeNull()
+  })
+
+  it('R4: falls back when the turn is dead and no request is parked', () => {
+    messageRunningMock.current = false
+    $activeSessionId.set('session-1')
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    expect(queryPendingChoices()).toBeNull()
+    expect(queryFallbackRow()).toBeTruthy()
+  })
+
+  it('R3a: with a streaming assistant turn, waits the fallback window and never renders ToolFallback', () => {
+    $messages.set([streamingAssistant('Hello')])
+    renderLiveClarify()
+
+    expect(queryPendingChoices()).toBeNull()
+    expect(queryFallbackRow()).toBeNull()
+
+    act(() => {
+      vi.advanceTimersByTime(CLARIFY_TEXT_WAIT_MS - 1)
+    })
+    expect(queryPendingChoices()).toBeNull()
+    expect(queryFallbackRow()).toBeNull()
+
+    act(() => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(queryPendingChoices()).toBeTruthy()
+    expect(queryFallbackRow()).toBeNull()
+  })
+
+  it('R3b: a mid-window text increment releases immediately and does not remount', () => {
+    $messages.set([streamingAssistant('Hello')])
+    renderLiveClarify()
+
+    act(() => {
+      vi.advanceTimersByTime(700)
+    })
+    expect(queryPendingChoices()).toBeNull()
+
+    act(() => {
+      $messages.set([streamingAssistant('Hello world')])
+    })
+    expect(queryPendingChoices()).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+
+    act(() => {
+      vi.advanceTimersByTime(2000)
+    })
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('keeps staged choices across a messageRunning falling edge (same Pending instance)', () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    const props = liveClarifyProps()
+    const view = renderClarify(<ClarifyTool {...props} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+
+    messageRunningMock.current = false
+    view.rerender(
+      <I18nProvider configClient={null} initialLocale="en">
+        <ClarifyTool {...props} />
+      </I18nProvider>
+    )
+
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(queryFallbackRow()).toBeNull()
   })
 })
