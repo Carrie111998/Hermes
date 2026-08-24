@@ -174,7 +174,17 @@ class TestBatchWorkerResumeBehavior:
 
         assert result["discarded_no_reasoning"] == 1
         assert result["completed_prompts"] == [0]
-        assert not batch_file.exists() or batch_file.read_text() == ""
+        # Tombstone row (#93527): the resume content-scan only sees
+        # batch_*.jsonl rows, so a discard must leave one — otherwise every
+        # --resume re-runs the sample at full cost.
+        rows = [
+            json.loads(line)
+            for line in batch_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["discarded"] == "no_reasoning"
+        assert rows[0]["prompt"] == "hi"
 
 
 class TestFinalCheckpointNoDuplicates:
