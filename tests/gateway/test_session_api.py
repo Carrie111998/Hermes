@@ -979,40 +979,97 @@ async def test_session_stream_records_reply_text_for_post_disconnect_recovery(
     assert "the answer worth keeping" in response.text
 
 
-@pytest.mark.asyncio
-async def test_both_run_routes_record_output(adapter):
+def test_both_run_routes_record_output():
     """Structural guard against the asymmetry coming back.
 
     The two routes that mint run ids must both persist the reply text. A future
-    edit that drops `output=` from either one silently removes the recovery
-    path, and no behavioural test of the *other* route would notice.
+    edit dropping `output=` from either silently removes the recovery path, and
+    no behavioural test of the *other* route would notice.
+
+    Parsed with `ast` rather than by scanning source text: an earlier version
+    searched for the string `"completed"` and matched the SSE payload's
+    `"completed": True` key instead of the status write — passing while proving
+    nothing. A later version fixed that with a character-window heuristic,
+    which then depended on kwarg order and comment length. The AST is immune to
+    both, and to reformatting.
     """
-    from pathlib import Path
+    import ast
+    from pathlib import Path as _P
 
-    src = (
-        Path(__file__).resolve().parents[2]
-        / "gateway"
-        / "platforms"
-        / "api_server.py"
-    ).read_text(encoding="utf-8")
+    src_path = _P(__file__).resolve().parents[2] / "gateway" / "platforms" / "api_server.py"
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
 
-    for name, anchor in (
-        ("session stream", "async def _handle_session_chat_stream"),
-        ("/v1/runs", "async def _handle_runs"),
-    ):
-        start = src.index(anchor)
-        # Anchor on the terminal STATUS WRITE, not on the string "completed" —
-        # the SSE payload carries a `"completed": True` key that would match a
-        # naive search and hide a missing output=.
-        cursor = start
-        window = None
-        while True:
-            call_at = src.find("_set_run_status(", cursor)
-            assert call_at != -1, f"{name}: no terminal _set_run_status found"
-            candidate = src[call_at:call_at + 2000]  # generous: the call may carry comments
-            if '"completed",' in candidate[:400]:
-                window = candidate
-                break
-            cursor = call_at + 1
+    def terminal_completion_calls(func_name):
+        """Every `_set_run_status(run_id, "completed", ...)` inside *func_name*."""
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != func_name:
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                fn = inner.func
+                if not (isinstance(fn, ast.Attribute) and fn.attr == "_set_run_status"):
+                    continue
+                if len(inner.args) < 2:
+                    continue
+                second = inner.args[1]
+                if isinstance(second, ast.Constant) and second.value == "completed":
+                    yield inner
+            return  # the named function was found; stop looking
+        raise AssertionError(
+            f"no function named {func_name!r} in api_server.py — it was renamed; "
+            "update this guard and re-verify both routes still record output"
+        )
 
-        assert "output=" in window, f"{name} no longer records the reply text"
+    for name in ("_handle_session_chat_stream", "_handle_runs"):
+        calls = list(terminal_completion_calls(name))
+        assert calls, f"{name}: no terminal _set_run_status(..., \"completed\") call found"
+        for call in calls:
+            kwargs = {kw.arg for kw in call.keywords}
+            assert "output" in kwargs, (
+                f"{name} no longer records the reply text (line {call.lineno}): without "
+                "output=, a client that lost its stream can see the run complete and never "
+                "learn what the agent said"
+            )
+
+
+def test_error_terminations_intentionally_omit_output():
+    """The failure paths deliberately do NOT set output.
+
+    A cancelled or failed run has no reply to hand back, and writing an empty
+    or partial string there would make "" indistinguishable from "the agent
+    answered with nothing". Pinned so the asymmetry reads as intentional rather
+    than as an oversight the next reader should "fix".
+    """
+    import ast
+    from pathlib import Path as _P
+
+    src_path = _P(__file__).resolve().parents[2] / "gateway" / "platforms" / "api_server.py"
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+
+    checked = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "_handle_session_chat_stream"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            fn = inner.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr == "_set_run_status"):
+                continue
+            if len(inner.args) < 2 or not isinstance(inner.args[1], ast.Constant):
+                continue
+            status = inner.args[1].value
+            if status in ("failed", "cancelled"):
+                kwargs = {kw.arg for kw in inner.keywords}
+                assert "output" not in kwargs, (
+                    f"the {status!r} termination now sets output (line {inner.lineno}); if that "
+                    "is deliberate, update this test and say what an empty output means there"
+                )
+                checked += 1
+        break
+
+    assert checked >= 2, f"expected the failed and cancelled paths; found {checked}"
