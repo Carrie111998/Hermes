@@ -8,7 +8,9 @@ description: "Real-time voice conversations with Hermes Agent — CLI, Telegram,
 
 Hermes Agent supports full voice interaction across CLI and messaging platforms. Talk to the agent using your microphone, hear spoken replies, and have live voice conversations in Discord voice channels.
 
-If you want a practical setup walkthrough with recommended configurations and real usage patterns, see [Use Voice Mode with Hermes](/guides/use-voice-mode-with-hermes).
+If you want a practical setup walkthrough with recommended configurations and real usage patterns, see [Use Voice Mode with Hermes](../../guides/use-voice-mode-with-hermes.md).
+
+For hands-free session start — saying "hey hermes" (or any phrase) to open a fresh voice session on the CLI, TUI, or desktop app — see [Wake Word](/user-guide/features/wake-word).
 
 ## Prerequisites
 
@@ -157,13 +159,52 @@ If no speech is detected at all for 15 seconds, recording stops automatically.
 
 Both `silence_threshold` and `silence_duration` are configurable in `config.yaml`. You can also disable the record start/stop beeps with `voice.beep_enabled: false`.
 
+### Ending a voice chat by voice
+
+Say **"stop"** — and nothing else — to end the voice conversation hands-free. The match is deliberately strict: the whole utterance (case-insensitive, surrounding punctuation ignored) must equal a configured phrase, so "stop doing that and try X instead" still reaches the agent normally. Customize the phrase list with `voice.stop_phrases` in `config.yaml` (e.g. `["stop", "goodbye hermes"]`), or set it to `[]` to disable. A voice chat also ends on its own after three consecutive silent cycles (no speech detected).
+
+**Typing** a bare stop phrase while a voice chat is active works the same way on every surface (CLI, TUI, desktop): the message ends the voice chat instead of being sent to the agent. Outside a voice chat, typed "stop" is an ordinary message.
+
 ### Streaming TTS
 
-When TTS is enabled, the agent speaks its reply **sentence-by-sentence** as it generates text — you don't wait for the full response:
+When TTS is enabled, the agent speaks its reply **sentence-by-sentence** as it generates text — you don't wait for the full response. This works with **every TTS provider**:
 
 1. Buffers text deltas into complete sentences (min 20 chars)
-2. Strips markdown formatting and `<think>` blocks
-3. Generates and plays audio per sentence in real-time
+2. Strips markdown formatting, emoji, and `<think>` blocks
+3. Plays audio per sentence in real-time — providers with a chunked PCM API (ElevenLabs, OpenAI) stream raw audio for the lowest time-to-first-word; every other provider (including the default Edge) synthesizes and plays each sentence as it completes
+
+The same pipeline runs in the classic CLI, the TUI, and the desktop app. In a desktop voice conversation the reply text is fed **live** into a per-reply speech WebSocket as the model generates it, so speech overlaps generation — one socket and one audio clock per reply, no per-sentence connection gaps.
+
+### Desktop remote: client-direct voice (lowest-hop path)
+
+When Hermes Desktop is connected to a **remote gateway**, audio does not need to be relayed through the gateway at all. At voice-session start the desktop fetches the active profile's resolved STT/TTS settings (provider, model, language/voice, and credential) from the gateway over the authenticated REST channel (`GET /api/audio/voice-config`) and then calls the providers **directly**:
+
+- **Dictation / voice input:** the mic recording goes straight from your desktop to the profile's STT provider; only the resulting *text* is sent to the gateway as the prompt.
+- **Spoken replies:** the reply text is already streaming to the desktop over the chat socket, so the desktop synthesizes it locally with the profile's TTS provider and plays it — the gateway link never carries audio.
+
+There is nothing to configure on the client: the profile you're talking to is the single source of truth for providers and keys, exactly as if the gateway had done the work itself. Keys are held in the desktop's memory for the session only — never written to disk on the client.
+
+Providers that can only run on the gateway host (local whisper, `edge` TTS, command providers, plugins) automatically fall back to the relay path (`/api/audio/transcribe` and the speech WebSocket), as does any older backend without the endpoint. To force the relay for every provider, set:
+
+```yaml
+voice:
+  client_direct: false
+```
+
+Client-direct wire support: OpenAI (incl. Nous-managed audio), Groq, Mistral, and DeepInfra via the OpenAI-compatible shapes, xAI Grok STT, and ElevenLabs STT + TTS. xAI configured through OAuth stays on the relay (the OAuth bearer refreshes server-side).
+
+### Barge-in
+
+You can interrupt the agent at ANY point in its turn — the microphone stays live from the moment you finish speaking until the reply has fully played (full duplex):
+
+- **Interject while it's thinking** — in continuous voice mode, speaking during LLM generation (before any audio plays) interrupts the in-flight turn and your interjection becomes the next message, the same as typing over a running turn.
+- **Talk over it** — speaking while the agent's reply plays cuts playback the moment you start talking and submits what you said. The detector calibrates its noise floor against the *quiet room* at turn start (never against the playback itself), so speaker bleed can't deafen it and normal speech reliably trips it.
+- **Type or press the record key** — sending a new message or hitting the push-to-talk key stops playback instantly on every surface.
+- **Say "stop"** — the stop phrase works in both phases: mid-generation it interrupts the turn AND ends the voice chat; mid-playback it cuts the speech and ends the chat.
+
+Tuning (config.yaml): `voice.barge_in: false` disables it; `voice.barge_in_threshold_multiplier` (default `3.0`) scales the speech trigger over the quiet-room floor; `voice.barge_in_grace_seconds` (default `0.5`) suppresses trips right after playback starts. Set `HERMES_VOICE_DEBUG=1` to stream per-block VAD diagnostics (calibrated floor, RMS, trip decisions) to stderr for live tuning.
+
+The agent **knows** it was interrupted: the next message carries a short note telling the model its spoken reply was cut off, so it can react naturally ("rude!") or pick up where it left off instead of being oblivious.
 
 ### Hallucination Filter
 
@@ -263,13 +304,13 @@ Go to the [Discord Developer Portal](https://discord.com/developers/applications
 
 | Level | Integer | What's Included |
 |-------|---------|----------------|
-| Text only | `274878286912` | View Channels, Send Messages, Read History, Embeds, Attachments, Threads, Reactions |
-| Text + Voice | `274881432640` | All above + Connect, Speak |
+| Text only | `309237763136` | View Channels, Send Messages, Read History, Embeds, Attachments, Threads, Reactions, Create Public Threads |
+| Text + Voice | `309240908864` | All above + Connect, Speak |
 
 **Re-invite the bot** with the updated permissions URL:
 
 ```
-https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=274881432640
+https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=309240908864
 ```
 
 Replace `YOUR_APP_ID` with your Application ID from the Developer Portal.
@@ -346,29 +387,6 @@ Use these in the Discord text channel where the bot is present:
 You must be in a voice channel before running `/voice join`. The bot joins the same VC you're in.
 :::
 
-### Auto-Join
-
-By default the bot only joins a voice channel when you run `/voice join`. If you'd rather have it join automatically the moment an allowed user enters a voice channel, opt in via `discord.voice` in `config.yaml`:
-
-```yaml
-discord:
-  voice:
-    auto_join_on_user_join: true   # default: false — opt-in only
-    auto_join_users: []            # optional allowlist; empty = any allowed user
-```
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `auto_join_on_user_join` | `false` | When `true`, the bot calls the same join logic as `/voice join` as soon as a qualifying user enters a voice channel it isn't already in. |
-| `auto_join_users` | `[]` | Optional list of Discord user IDs or usernames. Empty means any user who already passes `DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES` can trigger auto-join. Non-empty restricts triggering to just these users (they must still pass the existing allowlist). |
-
-Notes:
-
-- The bot **never** auto-joins in response to another bot joining a voice channel.
-- Auto-join reuses the exact `join_voice_channel()` path (and its per-guild lock) used by `/voice join` — it does not open a second connection or bypass any existing voice permission checks.
-- If the bot is already connected to the channel the user joined, nothing happens (no-op).
-- This is purely additive: `/voice join` and `/voice leave` keep working exactly as before, whether or not auto-join is enabled.
-
 ### How It Works
 
 When the bot joins a voice channel, it:
@@ -415,6 +433,7 @@ voice:
   beep_enabled: true               # Play record start/stop beeps
   silence_threshold: 200           # RMS level (0-32767) below which counts as silence
   silence_duration: 3.0            # Seconds of silence before auto-stop
+  stop_phrases: ["stop"]           # Saying exactly one of these ends the voice chat; [] disables
 
 # Speech-to-Text
 stt:
@@ -426,6 +445,9 @@ stt:
   provider: "local"                  # "local" (free) | "groq" | "openai" | "mistral" | "xai"
   local:
     model: "base"                    # tiny, base, small, medium, large-v3
+    language: ""                     # optional ISO-639-1 hint; blank = use HERMES_LOCAL_STT_LANGUAGE if set, else auto-detect
+  groq:
+    language: ""                     # optional ISO-639-1 hint; blank = use HERMES_LOCAL_STT_LANGUAGE if set, else auto-detect
   # model: "whisper-1"              # Legacy: used when provider is not set
 
 # Text-to-Speech
@@ -440,6 +462,11 @@ tts:
     model: "gpt-4o-mini-tts"
     voice: "alloy"                 # alloy, echo, fable, onyx, nova, shimmer
     base_url: "https://api.openai.com/v1"  # optional: override for self-hosted or OpenAI-compatible endpoints
+    # The `text_to_speech` tool accepts an optional per-call `instructions`
+    # argument (tone, emotion, pacing, accent, whispering) that is forwarded
+    # to `gpt-4o-mini-tts` and to OpenAI-compatible voice-design servers
+    # (e.g. Qwen3-TTS-VoiceDesign via oMLX). See OpenAI's voice-design guide:
+    # https://platform.openai.com/docs/guides/text-to-speech
   neutts:
     ref_audio: ''
     ref_text: ''
@@ -481,6 +508,7 @@ DISCORD_ALLOWED_USERS=...
 | **Groq** | `whisper-large-v3` | Fast (~1s) | Better | Free tier | Yes |
 | **OpenAI** | `whisper-1` | Fast (~1s) | Good | Paid | Yes |
 | **OpenAI** | `gpt-4o-transcribe` | Medium (~2s) | Best | Paid | Yes |
+| **OpenAI** | `gpt-transcribe` | Fast | Best | Paid ($0.0045/min) | Yes |
 | **Mistral** | `voxtral-mini-latest` | Fast | Good | Paid | Yes |
 | **xAI** | `grok-stt` | Fast | Good | Paid | Yes |
 
@@ -496,6 +524,12 @@ Provider priority (automatic fallback): **local** > **groq** > **openai**
 | **NeuTTS** | Good | Free | Depends on CPU/GPU | No |
 
 NeuTTS uses the `tts.neutts` config block above.
+
+For `openai`, the `text_to_speech` tool accepts an optional `instructions`
+argument that unlocks `gpt-4o-mini-tts`'s voice-design capability (tone,
+emotion, pacing, accent, whispering). The same field also routes to
+OpenAI-compatible voice-design servers mounted via `tts.openai.base_url`
+(e.g. Qwen3-TTS-VoiceDesign via oMLX).
 
 ---
 

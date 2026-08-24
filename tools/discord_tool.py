@@ -27,14 +27,14 @@ actionable guidance the model can relay to the user.
 
 import json
 import logging
-import os
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from tools.registry import registry
+from agent.secret_scope import get_secret
+from tools.registry import registry, tool_error
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+_DISCORD_RESPONSE_BODY_MAX_BYTES = 4 * 1024 * 1024
+_DISCORD_ERROR_BODY_MAX_BYTES = 64 * 1024
 
 # Application flag bits (from GET /applications/@me → "flags").
 # Source: https://discord.com/developers/docs/resources/application#application-object-application-flags
@@ -54,9 +56,24 @@ _FLAG_GATEWAY_MESSAGE_CONTENT_LIMITED = 1 << 19
 # Helpers
 # ---------------------------------------------------------------------------
 
+class DiscordAPIError(Exception):
+    """Raised when a Discord API call fails."""
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(f"Discord API error {status}: {body}")
+
+
+def _read_limited_response_body(source: Any, limit: int, *, label: str) -> bytes:
+    body = source.read(limit + 1)
+    if len(body) > limit:
+        raise DiscordAPIError(502, f"Discord API {label} exceeded {limit} bytes.")
+    return body
+
+
 def _get_bot_token() -> Optional[str]:
-    """Resolve the Discord bot token from environment."""
-    return os.getenv("DISCORD_BOT_TOKEN", "").strip() or None
+    """Resolve the Discord bot token under the active profile secret scope."""
+    return (get_secret("DISCORD_BOT_TOKEN", "") or "").strip() or None
 
 
 def _discord_request(
@@ -91,22 +108,26 @@ def _discord_request(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 204:
                 return None
-            return json.loads(resp.read().decode("utf-8"))
+            response_body = _read_limited_response_body(
+                resp,
+                _DISCORD_RESPONSE_BODY_MAX_BYTES,
+                label="response body",
+            )
+            return json.loads(response_body.decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = ""
         try:
-            error_body = e.read().decode("utf-8", errors="replace")
+            raw_error_body = _read_limited_response_body(
+                e,
+                _DISCORD_ERROR_BODY_MAX_BYTES,
+                label="error body",
+            )
+            error_body = raw_error_body.decode("utf-8", errors="replace")
+        except DiscordAPIError as too_large:
+            error_body = too_large.body
         except Exception:
             pass
         raise DiscordAPIError(e.code, error_body) from e
-
-
-class DiscordAPIError(Exception):
-    """Raised when a Discord API call fails."""
-    def __init__(self, status: int, body: str):
-        self.status = status
-        self.body = body
-        super().__init__(f"Discord API error {status}: {body}")
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +172,6 @@ _capability_bg_lock = threading.Lock()
 
 
 def _capability_disk_cache_path() -> "Path":
-    from pathlib import Path
 
     from hermes_constants import get_hermes_home
 
@@ -982,26 +1002,24 @@ def _run_discord_action(
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
     if not token:
-        return json.dumps({"error": "DISCORD_BOT_TOKEN not configured."})
+        return tool_error("DISCORD_BOT_TOKEN not configured.")
 
     action_fn = valid_actions.get(action)
     if not action_fn:
-        return json.dumps({
-            "error": f"Unknown action: {action}",
-            "available_actions": list(valid_actions.keys()),
-        })
+        return tool_error(
+            f"Unknown action: {action}",
+            available_actions=list(valid_actions.keys()),
+        )
 
     # Config-level allowlist gate (defense in depth — schema already filtered,
     # but a stale cached schema from a prior config should not let denied
     # actions through).
     allowlist = _load_allowed_actions_config()
     if allowlist is not None and action not in allowlist:
-        return json.dumps({
-            "error": (
-                f"Action '{action}' is disabled by config (discord.server_actions). "
-                f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}"
-            ),
-        })
+        return tool_error(
+            f"Action '{action}' is disabled by config (discord.server_actions). "
+            f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}"
+        )
 
     local_vars = {
         "guild_id": guild_id,
@@ -1015,9 +1033,9 @@ def _run_discord_action(
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
     if missing:
-        return json.dumps({
-            "error": f"Missing required parameters for '{action}': {', '.join(missing)}",
-        })
+        return tool_error(
+            f"Missing required parameters for '{action}': {', '.join(missing)}"
+        )
 
     try:
         return action_fn(
@@ -1037,11 +1055,11 @@ def _run_discord_action(
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
         if e.status == 403:
-            return json.dumps({"error": _enrich_403(action, e.body)})
-        return json.dumps({"error": str(e)})
+            return tool_error(_enrich_403(action, e.body))
+        return tool_error(str(e))
     except Exception as e:
         logger.exception("Unexpected error in %s action '%s'", tool_label, action)
-        return json.dumps({"error": f"Unexpected error: {e}"})
+        return tool_error(f"Unexpected error: {e}")
 
 
 def discord_core(action: str, **kwargs) -> str:
