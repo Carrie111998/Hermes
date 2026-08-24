@@ -564,6 +564,20 @@ start_ui
 HERMES_BIN="$INSTALL_ROOT/venv/bin/hermes"
 [ -x "$HERMES_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: $HERMES_BIN is missing. The install needs repair (run the Hermes installer or hermes doctor)."; log "$FINAL_MSG"; exit 3; }
 
+# Sanitize inherited Python environment state before ANY $HERMES_BIN call
+# (the --help probe below included). The Desktop app carries whatever shell
+# environment launched it, and macOS sets __PYVENV_LAUNCHER__ when the parent
+# chain went through a non-framework python3 (CommandLineTools, Homebrew).
+# Inside a venv, that variable makes python resolve its home against the
+# WRONG prefix: site-packages is skipped entirely, the editable install's
+# .pth finder never loads, and the update child dies before argparse with
+#   ModuleNotFoundError: No module named 'hermes_cli'
+# -- which reads like a broken install and fails the retry identically, so
+# the Desktop reports an unfixable update. PYTHONHOME poisons the same way;
+# PYTHONPATH can leak host site-packages ahead of the venv's. This is the
+# same trio ~/.local/bin/hermes unsets before exec'ing the venv python.
+unset __PYVENV_LAUNCHER__ PYTHONHOME PYTHONPATH
+
 # Run FROM the install root: `hermes update` resolves the tree it mutates
 # from the working directory, and we inherit the Desktop's cwd (which can be
 # an unrelated repo — updating THAT instead of the install is the failure

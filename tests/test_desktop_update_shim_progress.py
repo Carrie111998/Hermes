@@ -126,6 +126,8 @@ for f in "$TMPDIR"/hermes-update-status.[0-9]*; do
   case "$f" in *.tmp) continue ;; esac
   cp "$f" "$HERMES_TEST_CAPTURE.$n" 2>/dev/null
 done
+# Record whether the poisoned-Python-env trio survived to the update child.
+printf '%s' "${__PYVENV_LAUNCHER__+set}" > "$HERMES_TEST_LAUNCHER.$n" 2>/dev/null
 exit "$(cat "$HERMES_TEST_EXITS.$n" 2>/dev/null || echo 0)"
 """
 
@@ -149,6 +151,11 @@ def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
         "HERMES_TEST_CAPTURE": str(capture),
         "HERMES_TEST_CALLS": str(calls),
         "HERMES_TEST_EXITS": str(tmp_path / "exits"),
+        "HERMES_TEST_LAUNCHER": str(tmp_path / "launcher"),
+        # The real caller (Electron) often carries macOS's __PYVENV_LAUNCHER__
+        # out of a CommandLineTools/Homebrew parent shell; keep the simulation
+        # honest even for tests that don't assert on it.
+        "__PYVENV_LAUNCHER__": "/usr/bin/python3",
     }
     # The hand-off daemonizes and the launcher exits immediately; the result
     # file is the orchestrator's own completion signal.
@@ -197,3 +204,25 @@ def test_retry_gate_publishes_a_distinct_stage(tmp_path):
         "Updating code and dependencies",
         "Retrying update",
     ]
+
+
+@requires_posix_handoff
+def test_handoff_strips_poisoned_python_env_before_update(tmp_path):
+    """The update child must never inherit __PYVENV_LAUNCHER__.
+
+    A Desktop launched from a CommandLineTools/Homebrew python3 parent shell
+    carries __PYVENV_LAUNCHER__; inside the venv that var makes python resolve
+    its prefix against the wrong home, site-packages is skipped, and the very
+    first `hermes update` import dies with ModuleNotFoundError before argparse
+    (observed on macOS 26.5, 2026-08-22..24: every desktop-driven update,
+    both attempts, identical traceback). The hand-off must strip it -- with
+    its two sibling poisons -- before any $HERMES_BIN call.
+    """
+    _run_handoff(tmp_path, {1: 0})
+
+    seen = sorted(tmp_path.glob("launcher.*"), key=lambda p: int(p.suffix[1:]))
+    assert seen, "update child never ran"
+    for capture in seen:
+        assert capture.read_text() == "", (
+            f"{capture.name}: poisoned env survived into the update child"
+        )
