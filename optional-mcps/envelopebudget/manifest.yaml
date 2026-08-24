@@ -4,16 +4,17 @@ manifest_version: 1
 
 name: envelopebudget
 description: >-
-  Read-only access to authorized EnvelopeBudget budgets, transactions,
-  envelope balances, spending, cashflow, and AI categorization reviews.
+  Read-only-by-default access to authorized EnvelopeBudget budgets,
+  transactions, envelope balances, spending, cashflow, and optional
+  explicitly scoped categorization workflows.
 source: https://github.com/envelope-budget/envelopebudget-mcp
 
-# Official vendor-hosted Streamable HTTP server. Version 1 is deliberately
-# read-only and uses a user-created EnvelopeBudget developer key.
+# Official vendor-hosted Streamable HTTP server. API keys are read-only by
+# default; categorization writes require separate user-selected scopes.
 transport:
   type: http
   url: https://envelopebudget.com/mcp
-  version: "1.0.0"
+  version: "1.2.0"
 
 auth:
   type: api_key
@@ -48,8 +49,12 @@ post_install: |
   Create a dedicated, expiring key at
   https://envelopebudget.com/developer/api-keys before installation.
 
-  EnvelopeBudget MCP v1 is read-only. It cannot create or update
-  transactions, move funds, start AI jobs, record consent, or approve
-  suggestions. Delete or rotate the developer key to disconnect Hermes.
+  This catalog enables only the 11 read-only tools by default. The live v1.2
+  server also advertises three write tools, but they require separate API-key
+  scopes and are intentionally not enabled by this catalog entry. Direct
+  categorization cannot create transactions, change amounts, dates, payees,
+  memos, or accounts, or move envelope funds.
+
+  Delete or rotate the developer key to disconnect Hermes.
 
   Start a new Hermes session after installation so the tools load.
