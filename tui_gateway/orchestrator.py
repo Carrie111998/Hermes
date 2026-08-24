@@ -412,7 +412,11 @@ def _make_default_spawn_renderer(active_session_file: str, heartbeat_file: str =
             root = env.get("HERMES_PYTHON_SRC_ROOT") or os.getcwd()
             entry = os.path.join(root, "ui-tui", "dist", "entry.js")
             renderer_argv = [bun, entry]
-        return subprocess.Popen(renderer_argv, env=env)
+        # The renderer is a bun child that must NOT inherit the gateway's
+        # JSON-RPC stdin (fd-inheritance would let it steal protocol bytes).
+        # Detach stdin explicitly; the repo-wide subprocess-stdin guard
+        # (scripts/check_subprocess_stdin.py) enforces this invariant.
+        return subprocess.Popen(renderer_argv, env=env, stdin=subprocess.DEVNULL)
 
     return _spawn
 
