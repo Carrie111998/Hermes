@@ -2062,7 +2062,9 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        _mark_provider_unhealthy(
+            "openrouter", ttl=60, reason=_describe_openrouter_unavailable()
+        )
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
@@ -2094,7 +2096,9 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
                 "Auxiliary: skipping Nous Portal (rate-limited, resets in %.0fs)",
                 _remaining,
             )
-            _mark_provider_unhealthy("nous", ttl=_remaining)
+            _mark_provider_unhealthy(
+                "nous", ttl=_remaining, reason="rate limited by a previous session"
+            )
             return None, None
     except Exception:
         pass
@@ -2106,7 +2110,9 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
             "Auxiliary Nous client unavailable: no Nous authentication found "
             "(run: hermes auth)."
         )
-        _mark_provider_unhealthy("nous", ttl=60)
+        _mark_provider_unhealthy(
+            "nous", ttl=60, reason="no Nous credential configured"
+        )
         return None, None
     if runtime is None and nous:
         logger.debug(
@@ -2154,7 +2160,9 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
                 "Auxiliary Nous client unavailable: no usable inference JWT found "
                 "(run: hermes auth add nous)."
             )
-            _mark_provider_unhealthy("nous", ttl=60)
+            _mark_provider_unhealthy(
+                "nous", ttl=60, reason="no usable Nous inference JWT"
+            )
             return None, None
         base_url = str((nous or {}).get("inference_base_url") or _nous_base_url()).rstrip("/")
     return (
@@ -3091,8 +3099,13 @@ def _get_provider_chain() -> List[tuple]:
 # the user might be running two profiles with different OpenRouter keys.
 
 _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
+# Why each label was quarantined. Most call sites are NOT payment errors --
+# a missing credential and a rate-limit guard both quarantine too -- so the
+# reason travels with the mark instead of being assumed at log time.
+_AUX_UNHEALTHY_DEFAULT_REASON = "payment / credit error"
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
+_aux_unhealthy_reason: Dict[str, str] = {}
 
 # Map provider names that show up in resolved_provider / explicit-config
 # back to the chain labels used by _get_provider_chain(). Keep in sync
@@ -3119,21 +3132,46 @@ def _normalize_chain_label(provider: str) -> str:
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
-def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
-    until the TTL expires. Called from the payment-fallback branches in
-    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+def _mark_provider_unhealthy(
+    provider: str,
+    ttl: Optional[float] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Hide ``provider`` from chain iteration until the TTL expires.
+
+    ``reason`` describes WHY, and defaults to the payment/credit case that
+    the payment-fallback branches in ``call_llm``/``acall_llm`` report. It
+    is not always a payment error: the chain also quarantines a provider
+    whose credential is absent or unrefreshable, and the Nous rate-limit
+    guard quarantines for the remainder of its window. Reporting all of
+    those as "payment / credit error" told the user (and anything reading
+    provider health) to go top up an account that was never billed.
+
+    Re-marking a provider that is ALREADY quarantined for the same reason
+    is the steady state when a credential is simply not configured -- every
+    auxiliary resolution walks the chain, finds nothing, and marks again.
+    That repeat is logged at DEBUG so a permanently-unconfigured provider
+    costs one WARNING per TTL window rather than one per auxiliary call.
     """
     label = _normalize_chain_label(provider)
     if not label:
         return
-    expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
+    reason = reason or _AUX_UNHEALTHY_DEFAULT_REASON
+    ttl_seconds = ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS
+    expires_at = time.time() + ttl_seconds
+    # Read the prior state BEFORE overwriting it.
+    repeat = (
+        _is_provider_unhealthy(label)
+        and _aux_unhealthy_reason.get(label) == reason
+    )
     _aux_unhealthy_until[label] = expires_at
-    logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
+    _aux_unhealthy_reason[label] = reason
+    (logger.debug if repeat else logger.warning)(
+        "Auxiliary: marking %s unhealthy for %ds (%s). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
-        int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        int(ttl_seconds),
+        reason,
         time.strftime("%H:%M:%S", time.localtime(expires_at)),
     )
 
@@ -3150,6 +3188,7 @@ def _is_provider_unhealthy(label: str) -> bool:
     if time.time() >= expires_at:
         _aux_unhealthy_until.pop(label, None)
         _aux_unhealthy_logged_at.pop(label, None)
+        _aux_unhealthy_reason.pop(label, None)
         return False
     return True
 
@@ -3165,8 +3204,11 @@ def _log_skip_unhealthy(label: str, task: Optional[str] = None) -> None:
         _aux_unhealthy_logged_at[label] = now
         expires_at = _aux_unhealthy_until.get(label, now)
         logger.info(
-            "Auxiliary %s: skipping %s (recently returned payment error, retry in %ds)",
-            task or "call", label, max(0, int(expires_at - now)),
+            "Auxiliary %s: skipping %s (%s, retry in %ds)",
+            task or "call",
+            label,
+            _aux_unhealthy_reason.get(label, _AUX_UNHEALTHY_DEFAULT_REASON),
+            max(0, int(expires_at - now)),
         )
 
 
@@ -3175,6 +3217,7 @@ def _reset_aux_unhealthy_cache() -> None:
     user trigger (e.g. ``hermes config aux reset``)."""
     _aux_unhealthy_until.clear()
     _aux_unhealthy_logged_at.clear()
+    _aux_unhealthy_reason.clear()
 
 
 def _is_payment_error(exc: Exception) -> bool:
@@ -4046,7 +4089,10 @@ def _call_fallback_candidate_sync(
         # the token is dead (expired setup token with no refresh token).
         # Quarantine the candidate so subsequent chain walks skip it, and
         # let the caller move on instead of aborting the whole task.
-        _mark_provider_unhealthy(fb_provider or fb_label)
+        _mark_provider_unhealthy(
+            fb_provider or fb_label,
+            reason="stale or unrefreshable credential",
+        )
         logger.warning(
             "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
@@ -4109,7 +4155,10 @@ async def _call_fallback_candidate_async(
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
-        _mark_provider_unhealthy(fb_provider or fb_label)
+        _mark_provider_unhealthy(
+            fb_provider or fb_label,
+            reason="stale or unrefreshable credential",
+        )
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",

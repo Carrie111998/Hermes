@@ -1134,7 +1134,15 @@ class TestExplicitProviderRouting:
         assert client is None
         assert model is None
         mock_openai.assert_not_called()
-        mock_mark.assert_called_once_with("openrouter", ttl=60)
+        # The quarantine reason must name the ACTUAL cause. A missing
+        # credential is not a payment failure, and reporting it as one tells
+        # the user to top up an account that was never billed.
+        mock_mark.assert_called_once_with(
+            "openrouter",
+            ttl=60,
+            reason="OpenRouter credential pool has no usable entries "
+                   "(credentials may be exhausted)",
+        )
 
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
@@ -2264,7 +2272,9 @@ class TestStaleFallbackCandidateSkip:
         assert result.choices[0].message.content == "openrouter-serves"
         assert mock_fb.call_count == 2
         assert mock_fb.call_args_list[1].kwargs.get("reason") == "stale fallback credential"
-        mock_mark.assert_called_once_with("anthropic")
+        mock_mark.assert_called_once_with(
+            "anthropic", reason="stale or unrefreshable credential"
+        )
         assert stale_fb.chat.completions.create.call_count == 1
         assert healthy_fb.chat.completions.create.call_count == 1
 
@@ -5374,6 +5384,90 @@ class TestAuxUnhealthyCache:
         assert _is_provider_unhealthy("openrouter") is False
         _mark_provider_unhealthy("openrouter")
         assert _is_provider_unhealthy("openrouter") is True
+
+    def test_default_reason_is_payment(self, caplog):
+        """A bare mark (the genuine 402 branches) still reports payment."""
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy("openrouter")
+        assert "payment / credit error" in caplog.text
+
+    def test_explicit_reason_replaces_payment_wording(self, caplog):
+        """A missing credential must NOT be reported as a payment failure.
+
+        The quarantine itself is correct -- a provider with no credential
+        should be skipped -- but calling it a payment error tells the user
+        to top up an account that was never billed, and sends the same
+        wrong signal to anything reading provider health.
+        """
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy(
+                "nous", ttl=60, reason="no Nous credential configured"
+            )
+        assert "no Nous credential configured" in caplog.text
+        assert "payment" not in caplog.text
+
+    def test_repeat_mark_same_reason_is_not_re_warned(self, caplog):
+        """A permanently-unconfigured provider costs ONE warning per window.
+
+        Every auxiliary resolution walks the chain, so an absent credential
+        re-marks on each call. Before this, that emitted a fresh WARNING
+        every time -- 12 identical lines per gateway boot.
+        """
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "marking nous" in r.message]
+        assert len(warnings) == 1, f"expected 1 WARNING, got {len(warnings)}"
+
+    def test_reason_change_re_warns(self):
+        """A DIFFERENT reason is new information and must surface."""
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy
+        import agent.auxiliary_client as ac
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        ac.logger.addHandler(handler)
+        ac.logger.setLevel(logging.DEBUG)
+        try:
+            _mark_provider_unhealthy("nous", ttl=60, reason="no credential")
+            _mark_provider_unhealthy("nous", ttl=60, reason="payment / credit error")
+        finally:
+            ac.logger.removeHandler(handler)
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2
+
+    def test_skip_log_reports_recorded_reason(self, caplog):
+        """The skip trail must echo the real reason, not assume payment."""
+        import logging
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy, _log_skip_unhealthy,
+        )
+        _mark_provider_unhealthy("nous", ttl=60, reason="no Nous credential configured")
+        with caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+            _log_skip_unhealthy("nous", task="compression")
+        assert "no Nous credential configured" in caplog.text
+        assert "payment error" not in caplog.text
+
+    def test_reason_is_evicted_with_the_mark(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy, _is_provider_unhealthy,
+            _aux_unhealthy_reason,
+        )
+        import time
+        _mark_provider_unhealthy("openrouter", ttl=0.01, reason="no credential")
+        assert _aux_unhealthy_reason.get("openrouter") == "no credential"
+        time.sleep(0.02)
+        assert _is_provider_unhealthy("openrouter") is False
+        assert "openrouter" not in _aux_unhealthy_reason
 
     def test_ttl_expiry_evicts(self):
         from agent.auxiliary_client import (
