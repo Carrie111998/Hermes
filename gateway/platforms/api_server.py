@@ -4570,6 +4570,39 @@ class APIServerAdapter(BasePlatformAdapter):
         if await asyncio.to_thread(db.get_session, fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
+        from hermes_cli.session_runtime import copy_non_secret_session_runtime
+
+        parent_model_config = self._parse_session_model_config(
+            source.get("model_config")
+        )
+        fork_model_config = {
+            key: parent_model_config[key]
+            for key in (
+                "browser_model_lock",
+                "model_options",
+                "reasoning_config",
+                "service_tier",
+                "max_iterations",
+            )
+            if key in parent_model_config
+        }
+        fork_model_config["_branched_from"] = source_id
+        fork_model_config = copy_non_secret_session_runtime(
+            source,
+            fork_model_config,
+        )
+        fork_model_config["gateway_runtime"] = {
+            key: fork_model_config[key]
+            for key in (
+                "requested_provider",
+                "provider",
+                "base_url",
+                "api_mode",
+                "responses_transport",
+            )
+            if fork_model_config.get(key)
+        }
+
         # Match the CLI /branch semantics: mark the original as branched, then
         # create a child session that carries the transcript forward. This uses
         # SessionDB's native parent_session_id/end_reason visibility model rather
@@ -4578,7 +4611,8 @@ class APIServerAdapter(BasePlatformAdapter):
         await asyncio.to_thread(db.create_session,
             fork_id,
             "api_server",
-            model=source.get("model"),
+            model=fork_model_config.get("model") or source.get("model"),
+            model_config=fork_model_config,
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
         )

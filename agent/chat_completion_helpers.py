@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import inspect
 import json
 import logging
 import math
@@ -70,6 +71,40 @@ def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
     return lambda: context.run(callback)
+
+
+_ALL_CODEX_WEBSOCKET_ABORTS = object()
+
+
+def _has_active_codex_websocket_abort(
+    agent: Any,
+    request_client: Any = _ALL_CODEX_WEBSOCKET_ABORTS,
+) -> bool:
+    """Return whether this request owns an active WebSocket abort hook."""
+    try:
+        inspect.getattr_static(agent, "_active_codex_websocket_aborts")
+    except AttributeError:
+        registry = None
+    else:
+        registry = getattr(agent, "_active_codex_websocket_aborts", None)
+    if isinstance(registry, dict):
+        if request_client is _ALL_CODEX_WEBSOCKET_ABORTS:
+            if registry:
+                return True
+        else:
+            current = registry.get(id(request_client))
+            if (
+                isinstance(current, tuple)
+                and len(current) == 2
+                and current[0] is request_client
+                and callable(current[1])
+            ):
+                return True
+    try:
+        inspect.getattr_static(agent, "_active_codex_websocket_abort")
+    except AttributeError:
+        return False
+    return callable(getattr(agent, "_active_codex_websocket_abort", None))
 
 
 def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
@@ -1654,8 +1689,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
             and _elapsed > _ttfb_timeout
             and getattr(agent, "_codex_stream_last_event_ts", None) is None
         ):
-            _websocket_active = callable(
-                getattr(agent, "_active_codex_websocket_abort", None)
+            _websocket_active = _has_active_codex_websocket_abort(
+                agent,
+                request_client_holder.get("client"),
             )
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -1720,8 +1756,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
             and _last_codex_event_ts is not None
             and (time.time() - _last_codex_event_ts) > _codex_idle_timeout
         ):
-            _websocket_active = callable(
-                getattr(agent, "_active_codex_websocket_abort", None)
+            _websocket_active = _has_active_codex_websocket_abort(
+                agent,
+                request_client_holder.get("client"),
             )
             _event_stale_elapsed = time.time() - _last_codex_event_ts
             logger.warning(
@@ -1761,8 +1798,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
         if _elapsed > _stale_timeout:
-            _websocket_active = callable(
-                getattr(agent, "_active_codex_websocket_abort", None)
+            _websocket_active = _has_active_codex_websocket_abort(
+                agent,
+                request_client_holder.get("client"),
             )
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)

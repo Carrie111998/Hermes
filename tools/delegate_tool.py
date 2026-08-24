@@ -4485,6 +4485,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+    configured_responses_transport = cfg.get("responses_transport")
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
@@ -4534,12 +4535,17 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
             api_mode = configured_api_mode
 
+        from agent.codex_websocket_transport import normalize_codex_responses_transport
+
         return {
             "model": configured_model,
             "provider": provider,
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "responses_transport": normalize_codex_responses_transport(
+                configured_responses_transport
+            ),
         }
 
     if not configured_provider:

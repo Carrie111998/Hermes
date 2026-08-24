@@ -871,6 +871,16 @@ def classify_api_error(
     if getattr(error, "request_replay_safe", True) is False:
         return _result(FailoverReason.unknown, retryable=False)
 
+    # A pre-send WebSocket failure is safe to replay, but only the transport
+    # knows whether the underlying failure is transient. Preserve that signal
+    # before plugin and generic transport classification so terminal lifecycle
+    # errors stay non-retryable while transient connect failures retain retries.
+    if error_type == "WebSocketNotStartedError":
+        return _result(
+            FailoverReason.timeout,
+            retryable=bool(getattr(error, "retryable", False)),
+        )
+
     # ── 0. Plugin classifiers (first valid result wins) ─────────────
     #
     # Consulted BEFORE the built-in pipeline so a provider plugin can both

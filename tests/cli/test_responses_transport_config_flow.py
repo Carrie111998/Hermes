@@ -55,6 +55,9 @@ class _CLISetupHarness(CLIAgentSetupMixin):
     def _ensure_runtime_credentials(self):
         return True
 
+    def finalize_preloaded_skills(self):
+        pass
+
     def _current_reasoning_callback(self):
         return None
 
@@ -92,3 +95,32 @@ def test_classic_cli_passes_resolved_responses_transport_to_agent(monkeypatch):
     assert harness._init_agent()
     assert captured["responses_transport"] == "websocket-cached"
     assert harness._active_agent_route_signature[5] == "websocket-cached"
+
+
+def test_session_transport_override_survives_per_turn_runtime_refresh(monkeypatch):
+    runtime = {
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "responses_transport": "sse",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "token",
+        "source": "test",
+    }
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: dict(runtime),
+    )
+
+    harness = _CLISetupHarness()
+    harness.requested_provider = "openai-codex"
+    harness._explicit_api_key = None
+    harness._explicit_base_url = None
+    harness._session_responses_transport_override = "websocket-cached"
+    harness._normalize_model_for_provider = lambda _provider: False
+
+    assert CLIAgentSetupMixin._ensure_runtime_credentials(harness)
+    assert harness.responses_transport == "websocket-cached"
+
+    # Credential refresh is intentionally repeated for every turn.
+    assert CLIAgentSetupMixin._ensure_runtime_credentials(harness)
+    assert harness.responses_transport == "websocket-cached"

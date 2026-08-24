@@ -95,6 +95,32 @@ def _make_anthropic_agent():
     return agent
 
 
+def test_dynamic_magicmock_attribute_is_not_an_active_websocket_abort():
+    agent = MagicMock()
+
+    assert callable(agent._active_codex_websocket_abort)
+    assert not cch._has_active_codex_websocket_abort(agent)
+
+    agent._active_codex_websocket_abort = lambda: None
+
+    assert cch._has_active_codex_websocket_abort(agent)
+
+
+def test_websocket_abort_registry_is_request_client_scoped():
+    client_a = object()
+    client_b = object()
+    abort_a = lambda: None
+    agent = types.SimpleNamespace(
+        _active_codex_websocket_aborts={id(client_a): (client_a, abort_a)},
+        _active_codex_websocket_abort=None,
+    )
+
+    assert cch._has_active_codex_websocket_abort(agent)
+    assert cch._has_active_codex_websocket_abort(agent, client_a)
+    assert not cch._has_active_codex_websocket_abort(agent, client_b)
+    assert not cch._has_active_codex_websocket_abort(agent, None)
+
+
 def _wait_for_mock_call(mock, timeout=3.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -138,5 +164,3 @@ def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
     )
     # Worker unblocks and closes its own request client from its own thread.
     _wait_for_mock_call(agent._close_request_anthropic_client)
-
-

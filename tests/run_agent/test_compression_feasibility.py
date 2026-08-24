@@ -164,6 +164,7 @@ def test_feasibility_check_passes_live_main_runtime():
             "api_key": "codex-token",
             "api_mode": "codex_responses",
             "auth_mode": "",
+            "responses_transport": "sse",
         },
     )
 
@@ -404,7 +405,6 @@ def test_threshold_suggestion_kept_for_large_context_main(mock_get_client, mock_
 
     assert len(messages) == 1
     assert "threshold: 0.30" in messages[0]
-
 
 
 

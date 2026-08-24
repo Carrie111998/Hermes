@@ -5594,6 +5594,51 @@ class AIAgent:
             return
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _register_codex_websocket_abort(self, client: Any, abort: Any):
+        """Register a WebSocket abort hook for one physical request client."""
+        key = id(client)
+        with self._openai_client_lock():
+            registry = getattr(self, "_active_codex_websocket_aborts", None)
+            if not isinstance(registry, dict):
+                registry = {}
+                self._active_codex_websocket_aborts = registry
+            registry[key] = (client, abort)
+
+        def unregister() -> None:
+            with self._openai_client_lock():
+                registry = getattr(
+                    self,
+                    "_active_codex_websocket_aborts",
+                    None,
+                )
+                if not isinstance(registry, dict):
+                    return
+                current = registry.get(key)
+                if (
+                    isinstance(current, tuple)
+                    and len(current) == 2
+                    and current[0] is client
+                    and current[1] is abort
+                ):
+                    registry.pop(key, None)
+
+        return unregister
+
+    def _codex_websocket_abort_for_client(self, client: Any):
+        """Return the abort hook owned by ``client``, if it is still active."""
+        with self._openai_client_lock():
+            registry = getattr(self, "_active_codex_websocket_aborts", None)
+            if isinstance(registry, dict):
+                current = registry.get(id(client))
+                if (
+                    isinstance(current, tuple)
+                    and len(current) == 2
+                    and current[0] is client
+                    and callable(current[1])
+                ):
+                    return current[1]
+        return None
+
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
@@ -5608,7 +5653,11 @@ class AIAgent:
         ``EPIPE`` so it can unwind and close ``client`` from its own context
         — which is where the FD release belongs.
         """
-        websocket_abort = getattr(self, "_active_codex_websocket_abort", None)
+        websocket_abort = self._codex_websocket_abort_for_client(client)
+        if websocket_abort is None:
+            # Compatibility for extensions and old test doubles that still
+            # register the pre-registry global hook directly.
+            websocket_abort = getattr(self, "_active_codex_websocket_abort", None)
         if callable(websocket_abort):
             try:
                 websocket_abort()

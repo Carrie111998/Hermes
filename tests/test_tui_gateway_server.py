@@ -9614,6 +9614,7 @@ def test_config_set_model_session_switch_clears_pending_once_restore(monkeypatch
         base_url = "https://api.anthropic.com"
         api_key = "sk-temp"
         api_mode = "anthropic_messages"
+        responses_transport = "websocket-cached"
 
         def switch_model(self, **kwargs):
             self.model = kwargs["new_model"]
@@ -9621,6 +9622,7 @@ def test_config_set_model_session_switch_clears_pending_once_restore(monkeypatch
             self.api_key = kwargs["api_key"]
             self.base_url = kwargs["base_url"]
             self.api_mode = kwargs["api_mode"]
+            self.responses_transport = kwargs["responses_transport"]
 
     result = types.SimpleNamespace(
         success=True,
@@ -9664,6 +9666,7 @@ def test_restore_agent_model_runtime_falls_back_to_switch_model():
         base_url = "https://api.anthropic.com"
         api_key = "sk-temp"
         api_mode = "anthropic_messages"
+        responses_transport = "websocket-cached"
 
         def switch_model(self, **kwargs):
             self.model = kwargs["new_model"]
@@ -9671,6 +9674,7 @@ def test_restore_agent_model_runtime_falls_back_to_switch_model():
             self.api_key = kwargs["api_key"]
             self.base_url = kwargs["base_url"]
             self.api_mode = kwargs["api_mode"]
+            self.responses_transport = kwargs["responses_transport"]
 
     agent = Agent()
 
@@ -9682,12 +9686,14 @@ def test_restore_agent_model_runtime_falls_back_to_switch_model():
             "api_key": "sk-old",
             "base_url": "https://openrouter.ai/api/v1",
             "api_mode": "chat_completions",
+            "responses_transport": "auto",
         },
     )
 
     assert agent.model == "old/model"
     assert agent.provider == "openrouter"
     assert agent.base_url == "https://openrouter.ai/api/v1"
+    assert agent.responses_transport == "auto"
 
 
 def test_config_set_personality_rejects_unknown_name(monkeypatch):
@@ -14630,6 +14636,8 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             seen["created"] = new_key
             seen["parent"] = kwargs.get("parent_session_id")
             seen["profile_name"] = kwargs.get("profile_name")
+            seen["model"] = kwargs.get("model")
+            seen["model_config"] = kwargs.get("model_config")
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
@@ -14654,7 +14662,14 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
 
     class FakeAgent:
         def __init__(self):
-            self.model = "test-model"
+            self.model = "gpt-5.4"
+            self.requested_provider = "openai-codex"
+            self.provider = "openai-codex"
+            self.base_url = "https://chatgpt.com/backend-api/codex"
+            self.api_mode = "codex_responses"
+            self.responses_transport = "websocket-cached"
+            self.reasoning_config = {"enabled": True, "effort": "high"}
+            self.service_tier = None
             self.session_id = None
 
     parent = {
@@ -14677,6 +14692,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
 
     def _fake_make_agent(*a, **k):
         seen["agent_session_db"] = k.get("session_db")
+        seen["agent_model_override"] = k.get("model_override")
         return FakeAgent()
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
@@ -14710,6 +14726,21 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         # not just the row. Otherwise its own flushes (and a later compression
         # rotation) land on the launch db, splitting the lineage again.
         assert isinstance(seen.get("agent_session_db"), ProfileDB)
+        runtime = seen["model_config"]
+        assert seen["model"] == "gpt-5.4"
+        assert runtime["_branched_from"] == "parent-key"
+        assert runtime["requested_provider"] == "openai-codex"
+        assert runtime["provider"] == "openai-codex"
+        assert runtime["api_mode"] == "codex_responses"
+        assert runtime["responses_transport"] == "websocket-cached"
+        assert runtime["reasoning_config"] == {"enabled": True, "effort": "high"}
+        assert seen["agent_model_override"] == runtime
+        assert server._sessions[child_sid]["model_override"] == runtime
+        restored = server._stored_session_runtime_overrides(
+            {"model": seen["model"], "model_config": json.dumps(runtime)}
+        )
+        assert restored["model_override"]["requested_provider"] == "openai-codex"
+        assert restored["model_override"]["responses_transport"] == "websocket-cached"
     finally:
         for k in list(server._sessions):
             server._sessions.pop(k, None)

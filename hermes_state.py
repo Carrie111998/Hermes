@@ -8171,8 +8171,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         JSON string) or an already-parsed dict. Prefers the nested
         ``gateway_runtime`` key (written by the gateway's
         ``_sync_session_model_from_agent`` and the CLI ``/model`` persist),
-        falling back to the top-level ``provider``/``base_url``/``api_mode``
-        keys the TUI gateway's ``_runtime_model_config`` writes. As a last
+        falling back to the top-level ``provider``/``base_url``/``api_mode``/
+        ``responses_transport`` keys the TUI gateway's
+        ``_runtime_model_config`` writes. As a last
         resort, falls back to the ``billing_provider`` column (written on
         every session's first accounted API call) so sessions that never ran
         ``/model`` still restore the provider that actually served them.
@@ -8195,7 +8196,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return {k: v for k, v in runtime.items() if v is not None}
         top_level = {
             key: raw.get(key)
-            for key in ("provider", "base_url", "api_mode")
+            for key in (
+                "provider",
+                "base_url",
+                "api_mode",
+                "responses_transport",
+            )
             if raw.get(key)
         }
         if top_level:

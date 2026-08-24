@@ -32,6 +32,7 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.session_runtime import copy_non_secret_session_runtime
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -4730,6 +4731,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # the provider override makes ``session.resume`` fail with "No LLM provider configured".
     # Only restore an explicit provider; otherwise leave it unset so resume falls back to
     # the configured default, matching the working CLI path.
+    requested_provider = str(
+        model_config.get("requested_provider") or ""
+    ).strip()
     explicit_provider = str(model_config.get("provider") or "").strip()
     billing_provider = str(
         model_config.get("billing_provider") or row.get("billing_provider") or ""
@@ -4756,7 +4760,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # regression vector). If none names a real entry,
     # drop the bare provider entirely so resume falls back to the configured
     # default rather than the broken OpenRouter route.
-    if provider.strip().lower() == "custom":
+    if (requested_provider or provider).strip().lower() == "custom":
         healed = None
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
@@ -4769,6 +4773,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
                 "custom provider identity recovery failed", exc_info=True
             )
         provider = healed or ("" if not base_url else provider)
+        requested_provider = provider
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -4776,15 +4781,19 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # initial resume and later rebuilds (/new). Deliberately do not persist
         # or restore raw api_key here; endpoint credentials should continue to
         # come from config/env/provider resolution rather than the session DB.
-        overrides["model_override"] = {
+        model_override = {
             "model": model,
             "provider": provider or None,
             "base_url": base_url or None,
             "api_mode": api_mode or None,
-            "responses_transport": responses_transport or None,
         }
-    if provider:
-        overrides["provider_override"] = provider
+        if requested_provider:
+            model_override["requested_provider"] = requested_provider
+        if responses_transport:
+            model_override["responses_transport"] = responses_transport
+        overrides["model_override"] = model_override
+    if requested_provider or provider:
+        overrides["provider_override"] = requested_provider or provider
     if isinstance(reasoning_config, dict):
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier.lower() == "normal":
@@ -4798,21 +4807,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
 
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
-    config = dict(existing or {})
-    model = str(getattr(agent, "model", "") or "").strip()
-    provider = str(getattr(agent, "provider", "") or "").strip()
-    base_url = str(getattr(agent, "base_url", "") or "").strip()
-    api_mode = str(getattr(agent, "api_mode", "") or "").strip()
-    responses_transport = str(
-        getattr(agent, "responses_transport", "") or ""
-    ).strip()
+    config = copy_non_secret_session_runtime(
+        agent,
+        existing,
+        clear_missing=True,
+    )
+    model = str(config.get("model") or "").strip()
+    requested_provider = str(config.get("requested_provider") or "").strip()
+    provider = str(config.get("provider") or "").strip()
+    base_url = str(config.get("base_url") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
 
-    if model:
-        config["model"] = model
     if provider:
-        if provider.strip().lower() == "custom":
+        if (requested_provider or provider).strip().lower() == "custom":
             # ``agent.provider`` is the RESOLVED provider, and for any named
             # ``providers:`` / ``custom_providers:`` entry that is the literal
             # string "custom" — persisting it loses the entry identity, so a
@@ -4830,29 +4838,21 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
                     canonical_custom_identity,
                 )
 
-                provider = (
+                healed_provider = (
                     canonical_custom_identity(
                         base_url=base_url, model=model or None
                     )
                     or provider
                 )
+                provider = healed_provider
+                requested_provider = healed_provider
             except Exception:
                 logger.debug(
                     "custom provider identity lookup failed", exc_info=True
                 )
         config["provider"] = provider
-    if base_url:
-        config["base_url"] = base_url
-    else:
-        config.pop("base_url", None)
-    if api_mode:
-        config["api_mode"] = api_mode
-    else:
-        config.pop("api_mode", None)
-    if responses_transport:
-        config["responses_transport"] = responses_transport
-    else:
-        config.pop("responses_transport", None)
+    if requested_provider:
+        config["requested_provider"] = requested_provider
     if isinstance(reasoning_config, dict):
         config["reasoning_config"] = reasoning_config
     else:
@@ -5438,6 +5438,10 @@ def _persist_model_switch(result) -> None:
 
     save_config_value("model.default", result.new_model)
     save_config_value("model.provider", result.target_provider)
+    save_config_value(
+        "model.responses_transport",
+        getattr(result, "responses_transport", None) or "sse",
+    )
     if result.base_url:
         save_config_value("model.base_url", result.base_url)
     else:
@@ -5457,6 +5461,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
+        "responses_transport": getattr(agent, "responses_transport", "sse"),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
 
@@ -5482,6 +5487,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
+            responses_transport=snapshot.get("responses_transport", "sse"),
         )
 
 
@@ -5589,6 +5595,12 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
+    from agent.codex_websocket_transport import normalize_codex_responses_transport
+
+    result_responses_transport = normalize_codex_responses_transport(
+        getattr(result, "responses_transport", "sse")
+    )
+
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
     if agent:
@@ -5642,7 +5654,7 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
-                responses_transport=result.responses_transport,
+                responses_transport=result_responses_transport,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -5689,7 +5701,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
-            "responses_transport": result.responses_transport,
+            "responses_transport": result_responses_transport,
         }
     if persist_global:
         _persist_model_switch(result)
@@ -7685,7 +7697,12 @@ def _make_agent(
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
-        requested_provider = model_override.get("provider") or provider_override or None
+        requested_provider = (
+            model_override.get("requested_provider")
+            or model_override.get("provider")
+            or provider_override
+            or None
+        )
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
@@ -7810,6 +7827,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    model_override: dict | str | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -7840,7 +7858,7 @@ def _init_session(
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
-            "model_override": None,
+            "model_override": model_override,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,

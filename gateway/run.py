@@ -8284,13 +8284,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model = getattr(agent, "model", None)
         if not model:
             return
-        runtime = {
-            "provider": getattr(agent, "provider", None),
-            "base_url": getattr(agent, "base_url", None),
-            "api_mode": getattr(agent, "api_mode", None),
-            "fallback_active": bool(getattr(agent, "_fallback_activated", False)),
-        }
-        runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
+        from hermes_cli.session_runtime import copy_non_secret_session_runtime
+
+        runtime = copy_non_secret_session_runtime(agent, include_model=False)
+        runtime["fallback_active"] = bool(
+            getattr(agent, "_fallback_activated", False)
+        )
 
         try:
             db = self._session_db._db
@@ -26492,8 +26491,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``_session_model_overrides`` is in-memory only, so before persistence
         a restart silently reverted every session to the global default model.
-        The non-secret parts (model/provider/base_url/responses_transport) are written through to
-        the session store when /model runs (and cleared on /new); here we read
+        The non-secret parts (model/requested-provider/provider/base-url/
+        api-mode/responses-transport) are written through to the session store
+        when /model runs (and cleared on /new); here we read
         them back on first use and re-resolve credentials via the normal
         runtime provider resolution — api_key is never persisted to disk.
 
@@ -26521,11 +26521,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
+            "requested_provider": persisted.get("requested_provider"),
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
+            "api_mode": persisted.get("api_mode"),
             "responses_transport": persisted.get("responses_transport"),
         }
-        provider = persisted.get("provider")
+        provider = persisted.get("requested_provider") or persisted.get("provider")
         if provider:
             # Re-resolve credentials for the persisted provider. On failure
             # (e.g. credentials were removed since the switch) keep the
@@ -26534,7 +26536,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
                 override["api_key"] = runtime.get("api_key")
-                override["api_mode"] = runtime.get("api_mode")
+                if not override.get("api_mode"):
+                    override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
                 if not override.get("responses_transport"):
                     override["responses_transport"] = runtime.get(
@@ -26571,6 +26574,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return model, runtime_kwargs
         model = override.get("model", model)
         for key in (
+            "requested_provider",
             "provider",
             "api_key",
             "base_url",
@@ -26584,10 +26588,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None
-            and override.get("provider")
+            and (override.get("requested_provider") or override.get("provider"))
         ):
             runtime_kwargs["credential_pool"] = _credential_pool_for_provider(
-                override.get("provider")
+                override.get("requested_provider") or override.get("provider")
             )
         return model, runtime_kwargs
 

@@ -96,6 +96,10 @@ from .whatsapp_identity import (
 )
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
+from hermes_cli.session_runtime import (
+    NON_SECRET_SESSION_RUNTIME_KEYS,
+    copy_non_secret_session_runtime,
+)
 
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
@@ -749,16 +753,10 @@ def build_session_context_prompt(
 
 
 # Keys of a /model session override that are safe to persist to disk.
-# ``api_key`` (and anything else, e.g. ``api_mode`` which is re-derived from
-# provider resolution) is intentionally excluded: credentials must NEVER be
-# written to sessions.json. ``responses_transport`` is a non-secret user
-# preference and must survive the same restart as the selected model.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = (
-    "model",
-    "provider",
-    "base_url",
-    "responses_transport",
-)
+# ``api_key`` and other credentials are intentionally excluded. Provider
+# identities, endpoints, API mode, and transport are non-secret routing state
+# and must survive the same restart as the selected model.
+PERSISTABLE_MODEL_OVERRIDE_KEYS = NON_SECRET_SESSION_RUNTIME_KEYS
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -770,11 +768,7 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     """
     if not isinstance(override, dict):
         return None
-    cleaned = {
-        k: str(v)
-        for k, v in override.items()
-        if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
-    }
+    cleaned = copy_non_secret_session_runtime(override)
     return cleaned or None
 
 
@@ -867,12 +861,13 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
 
-    # Session-scoped /model override (model/provider/base_url/transport — never
-    # credentials).  ``_session_model_overrides`` in the gateway runner is
-    # in-memory, so before this field a gateway restart silently reverted
-    # every session to the global default model.  api_key/api_mode are
-    # re-resolved through the normal runtime provider resolution when the
-    # override is rehydrated after a restart and are never written to disk
+    # Session-scoped /model override (model/requested-provider/provider/base-url/
+    # api-mode/transport; never credentials).  ``_session_model_overrides`` in
+    # the gateway runner is in-memory, so before this field a gateway restart
+    # silently reverted
+    # every session to the global default model.  api_key is re-resolved through
+    # normal runtime provider resolution when the override is rehydrated after a
+    # restart; credentials are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
@@ -3091,10 +3086,10 @@ class SessionStore:
     ) -> None:
         """Persist (or clear) the session-scoped /model override.
 
-        Only non-secret keys (model/provider/base_url/responses_transport — see
-        ``sanitize_model_override``) are written; ``api_key``/``api_mode``
-        are re-resolved at rehydration time via the normal runtime provider
-        resolution.  Pass ``None`` (or a dict with no persistable values)
+        Only non-secret keys (model/requested-provider/provider/base-url/
+        api-mode/responses-transport — see ``sanitize_model_override``) are
+        written; ``api_key`` is re-resolved at rehydration time via the normal
+        runtime provider resolution. Pass ``None`` (or a dict with no persistable values)
         to clear the persisted override, e.g. on /new.
         """
         with self._lock:
@@ -3536,7 +3531,13 @@ class SessionStore:
             self._save()
             return entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+        *,
+        model_override: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
@@ -3572,6 +3573,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                model_override=sanitize_model_override(model_override),
             )
 
             self._entries[session_key] = new_entry

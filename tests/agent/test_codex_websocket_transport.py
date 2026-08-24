@@ -77,13 +77,54 @@ def test_wire_body_excludes_sdk_only_options():
             "stream": True,
             "extra_query": {"api-version": "future"},
             "previous_response_id": "resp_1",
+            "context_management": [
+                {"type": "compaction", "compact_threshold": 200000}
+            ],
         })
     )
 
     assert body["previous_response_id"] == "resp_1"
     assert body["client_metadata"] == {"originator": "hermes"}
     assert body["text"] == {"verbosity": "low"}
+    assert body["context_management"] == [
+        {"type": "compaction", "compact_threshold": 200000}
+    ]
     assert not ({"extra_headers", "extra_query", "extra_body", "timeout", "stream"} & body.keys())
+
+
+def test_sdk_connection_raw_send_bypasses_recursive_request_transform():
+    import json
+
+    from agent.codex_websocket_transport import _prepare_websocket_send
+
+    class RawConnection:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class SDKConnection:
+        def __init__(self):
+            self._connection = RawConnection()
+
+        def send(self, _event):
+            raise AssertionError("public SDK send would run maybe_transform")
+
+    ws = SDKConnection()
+    frame = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": "x" * 1_000_000}],
+        "tools": [{"type": "function", "name": "inspect", "parameters": {}}],
+    }
+
+    send, payload = _prepare_websocket_send(ws, frame)
+    assert isinstance(payload, str)
+    send(payload)
+
+    assert len(ws._connection.sent) == 1
+    assert json.loads(ws._connection.sent[0]) == frame
 
 
 def test_emitted_frame_contains_only_wire_fields(monkeypatch):
@@ -213,10 +254,16 @@ def test_turn_state_metadata_is_recorded_and_added_to_request(monkeypatch):
 
     ws = FakeWS()
     recorded = []
+    handshake = {}
+
+    def fake_connect(_client, headers, timeout=None):
+        handshake.update(headers)
+        return ws
+
     monkeypatch.setattr(
         mod,
         "_connect_websocket",
-        lambda _client, _headers, timeout=None: ws,
+        fake_connect,
     )
 
     run_codex_websocket_stream(
@@ -240,7 +287,131 @@ def test_turn_state_metadata_is_recorded_and_added_to_request(monkeypatch):
         "originator": "hermes",
         "x-codex-turn-state": "prior-state",
     }
+    assert handshake["x-codex-turn-state"] == "prior-state"
     assert recorded == ["sticky-turn"]
+
+
+def test_turn_state_from_handshake_is_recorded_and_added_to_request(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    class FakeWS:
+        closed = False
+
+        def __init__(self):
+            self._connection = SimpleNamespace(
+                response=SimpleNamespace(
+                    headers={"X-Codex-Turn-State": "handshake-state"}
+                )
+            )
+
+        def send(self, payload):
+            self.sent = payload
+
+        def recv(self, timeout=None):
+            return (
+                '{"type":"response.completed","response":'
+                '{"id":"resp_1","status":"completed"}}'
+            )
+
+        def close(self):
+            self.closed = True
+
+    ws = FakeWS()
+    recorded = []
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+
+    run_codex_websocket_stream(
+        api_kwargs=_body(),
+        client=SimpleNamespace(),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        session_id=None,
+        transport="websocket",
+        record_turn_state=recorded.append,
+        collect_events=lambda events, _getter: (
+            list(events),
+            SimpleNamespace(id="resp_1", status="completed", output=[]),
+        )[1],
+    )
+
+    assert ws.sent["client_metadata"]["x-codex-turn-state"] == "handshake-state"
+    assert recorded == ["handshake-state"]
+
+
+def test_reused_socket_does_not_replay_prior_handshake_turn_state(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+
+    class FakeWS:
+        closed = False
+
+        def __init__(self):
+            self._connection = SimpleNamespace(
+                response=SimpleNamespace(
+                    headers={"X-Codex-Turn-State": "prior-turn-state"}
+                )
+            )
+            self.frames = iter(
+                [
+                    '{"type":"response.completed","response":'
+                    '{"id":"resp_1","status":"completed"}}',
+                    '{"type":"response.completed","response":'
+                    '{"id":"resp_2","status":"completed"}}',
+                ]
+            )
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def recv(self, timeout=None):
+            return next(self.frames)
+
+        def close(self):
+            self.closed = True
+
+    ws = FakeWS()
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+    first_recorded = []
+    second_recorded = []
+    finals = iter(
+        [
+            SimpleNamespace(id="resp_1", status="completed", output=[]),
+            SimpleNamespace(id="resp_2", status="completed", output=[]),
+        ]
+    )
+
+    for recorded in (first_recorded, second_recorded):
+        run_codex_websocket_stream(
+            api_kwargs=_body(),
+            client=SimpleNamespace(),
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            session_id="turn-state-reuse",
+            transport="websocket-cached",
+            record_turn_state=recorded.append,
+            collect_events=lambda events, _getter: (
+                list(events),
+                next(finals),
+            )[1],
+        )
+
+    assert first_recorded == ["prior-turn-state"]
+    assert second_recorded == []
+    assert ws.sent[0]["client_metadata"]["x-codex-turn-state"] == (
+        "prior-turn-state"
+    )
+    assert "client_metadata" not in ws.sent[1]
+    cleanup_codex_websocket_sessions()
 
 
 def test_cross_thread_abort_shuts_down_underlying_socket():
@@ -314,6 +485,34 @@ def test_cached_delta_preserves_explicit_conflicting_previous_response_id():
     assert entry.continuation is None
 
 
+def test_cached_delta_preserves_conversation_request_without_previous_response_id():
+    first = _body(input_items=[{"role": "user", "content": "one"}])
+    response_items = [{"role": "assistant", "content": "two"}]
+    continuation = CachedWebSocketContinuationState(
+        last_request_body=first,
+        last_response_id="resp_cached",
+        last_response_items=response_items,
+    )
+    entry = CachedWebSocketConnection(
+        ws=SimpleNamespace(),
+        continuation=continuation,
+    )
+    full_input = first["input"] + response_items + [
+        {"role": "user", "content": "three"}
+    ]
+    request = _body(
+        extra={"conversation": "conv_123"},
+        input_items=full_input,
+    )
+
+    actual = build_cached_websocket_request_body(entry, request)
+
+    assert actual == request
+    assert actual["input"] == full_input
+    assert "previous_response_id" not in actual
+    assert entry.continuation is None
+
+
 def test_continuation_response_items_are_generated_through_adapter():
     from agent.codex_websocket_transport import _response_items_for_continuation
 
@@ -348,6 +547,37 @@ def test_continuation_response_items_are_generated_through_adapter():
         "content": [{"type": "output_text", "text": "answer"}],
         "id": "msg_1",
         "phase": "final_answer",
+    }
+
+
+def test_continuation_conversion_can_preserve_native_compaction_checkpoint():
+    from agent.codex_websocket_transport import _response_items_for_continuation
+
+    response = SimpleNamespace(
+        id="resp_1",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="compaction",
+                encrypted_content="opaque-checkpoint",
+            ),
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="answer")],
+            ),
+        ],
+    )
+
+    items = _response_items_for_continuation(
+        response,
+        native_compaction_eligible=True,
+    )
+
+    assert items[0] == {
+        "type": "compaction",
+        "encrypted_content": "opaque-checkpoint",
     }
 
 
@@ -634,6 +864,130 @@ def test_incomplete_response_does_not_seed_continuation(monkeypatch):
     assert not mod._websocket_session_cache
 
 
+def test_conversation_response_does_not_seed_cached_continuation(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+
+    class FakeWS:
+        closed = False
+
+        def send(self, payload):
+            self.sent = payload
+
+        def recv(self, timeout=None):
+            return (
+                '{"type":"response.completed","response":'
+                '{"id":"resp_conversation","status":"completed"}}'
+            )
+
+        def close(self):
+            self.closed = True
+
+    ws = FakeWS()
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+    final = SimpleNamespace(
+        id="resp_conversation",
+        status="completed",
+        output=[],
+    )
+
+    response = run_codex_websocket_stream(
+        api_kwargs=_body(extra={"conversation": "conv_123"}),
+        client=SimpleNamespace(),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        session_id="conversation-session",
+        transport="websocket-cached",
+        collect_events=lambda events, _getter: (list(events), final)[1],
+    )
+
+    assert response is final
+    entry = next(iter(mod._websocket_session_cache.values()))
+    assert entry.continuation is None
+    assert ws.sent["conversation"] == "conv_123"
+    assert "previous_response_id" not in ws.sent
+    cleanup_codex_websocket_sessions()
+
+
+def test_native_compaction_response_reseeds_from_next_full_request(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+
+    class FakeWS:
+        closed = False
+
+        def send(self, payload):
+            self.sent = payload
+
+        def recv(self, timeout=None):
+            return (
+                '{"type":"response.completed","response":'
+                '{"id":"resp_compacted","status":"completed"}}'
+            )
+
+        def close(self):
+            self.closed = True
+
+    ws = FakeWS()
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+    final = SimpleNamespace(
+        id="resp_compacted",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="compaction",
+                encrypted_content="opaque-checkpoint",
+            ),
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="answer")],
+            ),
+        ],
+    )
+
+    response = run_codex_websocket_stream(
+        api_kwargs=_body(
+            extra={
+                "context_management": [
+                    {"type": "compaction", "compact_threshold": 200000}
+                ]
+            }
+        ),
+        client=SimpleNamespace(),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        session_id="compaction-session",
+        transport="websocket-cached",
+        collect_events=lambda events, _getter: (list(events), final)[1],
+    )
+
+    assert response is final
+    entry = next(iter(mod._websocket_session_cache.values()))
+    assert entry.continuation is None
+    next_request = _body(
+        input_items=[
+            {"type": "compaction", "encrypted_content": "opaque-checkpoint"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"},
+        ]
+    )
+    assert build_cached_websocket_request_body(entry, next_request) == next_request
+    assert "previous_response_id" not in next_request
+    cleanup_codex_websocket_sessions()
+
+
 def test_continuation_conversion_failure_keeps_completed_response(monkeypatch):
     import agent.codex_websocket_transport as mod
 
@@ -656,7 +1010,9 @@ def test_continuation_conversion_failure_keeps_completed_response(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_response_items_for_continuation",
-        lambda _response: (_ for _ in ()).throw(ValueError("bad output item")),
+        lambda _response, **_kwargs: (_ for _ in ()).throw(
+            ValueError("bad output item")
+        ),
     )
     final = SimpleNamespace(id="resp_1", status="completed", output=[])
 
@@ -704,6 +1060,8 @@ def test_native_sdk_connect_receives_handshake_options():
     assert captured["extra_headers"]["thread-id"] == "s"
     assert captured["extra_query"] == {"api-version": "future"}
     assert captured["websocket_connection_options"]["open_timeout"] == 9.0
+    assert captured["websocket_connection_options"]["close_timeout"] == 2.0
+    assert captured["websocket_connection_options"]["max_size"] == 64 * 1024 * 1024
 
 
 def test_native_sdk_connect_caps_handshake_timeout_independently():
@@ -808,6 +1166,20 @@ def test_handshake_headers_preserve_codex_client_custom_headers():
     assert headers["x-custom"] == "yes"
 
 
+def test_handshake_request_id_falls_back_to_body_prompt_cache_key():
+    import agent.codex_websocket_transport as mod
+
+    headers = mod._build_headers_from_client(
+        SimpleNamespace(),
+        {"prompt_cache_key": "stable-body-cache-key"},
+        "physical-session",
+    )
+
+    assert headers["x-client-request-id"] == "stable-body-cache-key"
+    assert headers["session-id"] == "physical-session"
+    assert headers["thread-id"] == "physical-session"
+
+
 def test_handshake_headers_merge_case_insensitively():
     import agent.codex_websocket_transport as mod
 
@@ -826,6 +1198,7 @@ def test_handshake_headers_merge_case_insensitively():
                 "originator": "request-originator",
                 "x-custom": "request",
                 "Session-Id": "caller-session",
+                "X-Client-Request-ID": "stable-prompt-cache-key",
             }
         },
         "managed-session",
@@ -836,6 +1209,7 @@ def test_handshake_headers_merge_case_insensitively():
     assert headers["x-custom"] == "request"
     assert headers["OpenAI-Beta"] == mod.OPENAI_BETA_RESPONSES_WEBSOCKETS
     assert headers["session-id"] == "managed-session"
+    assert headers["x-client-request-id"] == "stable-prompt-cache-key"
     for expected_name in {
         "authorization",
         "originator",
@@ -901,6 +1275,7 @@ def test_cleanup_during_connect_prevents_cache_resurrection(monkeypatch):
     connect_started = threading.Event()
     allow_connect = threading.Event()
     result = []
+    errors = []
 
     class FakeWS:
         closed = False
@@ -916,23 +1291,135 @@ def test_cleanup_during_connect_prevents_cache_resurrection(monkeypatch):
         return ws
 
     monkeypatch.setattr(mod, "_connect_websocket", fake_connect)
-    thread = threading.Thread(
-        target=lambda: result.append(
-            mod._acquire_websocket(SimpleNamespace(), "wss://x", {}, "closing-session")
-        )
-    )
+    def acquire():
+        try:
+            result.append(
+                mod._acquire_websocket(
+                    SimpleNamespace(),
+                    "wss://x",
+                    {},
+                    "closing-session",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=acquire)
     thread.start()
     assert connect_started.wait(timeout=2)
     mod.cleanup_codex_websocket_session("closing-session")
     allow_connect.set()
     thread.join(timeout=2)
 
-    assert len(result) == 1
-    _, entry, _, release = result[0]
-    assert entry is None
+    assert result == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], mod.WebSocketNotStartedError)
+    assert errors[0].retryable is True
     assert not mod._websocket_session_cache
-    release(keep=True)
     assert ws.closed
+
+
+def test_cleanup_cancels_busy_session_temporary_handshake(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+    connect_started = threading.Event()
+    allow_connect = threading.Event()
+    errors = []
+
+    class FakeWS:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    cached_ws = FakeWS()
+    temporary_ws = FakeWS()
+    calls = {"count": 0}
+
+    def fake_connect(_client, _headers, timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return cached_ws
+        connect_started.set()
+        assert allow_connect.wait(timeout=2)
+        return temporary_ws
+
+    monkeypatch.setattr(mod, "_connect_websocket", fake_connect)
+    client = SimpleNamespace()
+    acquired, entry, reused, _release = mod._acquire_websocket(
+        client,
+        "wss://x",
+        {},
+        "busy-cleanup-session",
+    )
+    assert acquired is cached_ws
+    assert entry is not None
+    assert reused is False
+
+    def acquire_temporary():
+        try:
+            mod._acquire_websocket(
+                client,
+                "wss://x",
+                {},
+                "busy-cleanup-session",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=acquire_temporary)
+    thread.start()
+    assert connect_started.wait(timeout=2)
+    mod.cleanup_codex_websocket_session("busy-cleanup-session")
+    allow_connect.set()
+    thread.join(timeout=2)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], mod.WebSocketNotStartedError)
+    assert cached_ws.closed
+    assert temporary_ws.closed
+    assert not mod._websocket_session_cache
+    assert not mod._active_websocket_connection_attempts
+
+
+def test_base_exception_during_connect_releases_pending_waiters(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: (_ for _ in ()).throw(
+            KeyboardInterrupt()
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        mod._acquire_websocket(
+            SimpleNamespace(),
+            "wss://x",
+            {},
+            "interrupt-connect",
+        )
+    assert not mod._pending_websocket_connections
+
+    ws = SimpleNamespace(closed=False, close=lambda: None)
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+    acquired, entry, reused, release = mod._acquire_websocket(
+        SimpleNamespace(),
+        "wss://x",
+        {},
+        "interrupt-connect",
+    )
+    assert acquired is ws
+    assert entry is not None
+    assert reused is False
+    release(keep=False)
 
 
 def test_websocket_rejection_preserves_status_code_body_and_code(monkeypatch):
@@ -1087,6 +1574,160 @@ def test_connection_lifetime_error_is_replay_safe_and_retryable(monkeypatch):
     assert ws.closed
 
 
+def test_explicit_missing_previous_response_is_a_definitive_rejection(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    class FakeWS:
+        closed = False
+
+        def send(self, _payload):
+            pass
+
+        def recv(self, timeout=None):
+            return (
+                '{"type":"error","status":400,"error":{'
+                '"code":"previous_response_not_found",'
+                '"message":"continuation anchor expired"}}'
+            )
+
+        def close(self):
+            self.closed = True
+
+    ws = FakeWS()
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+
+    with pytest.raises(mod.WebSocketRejectedError) as excinfo:
+        run_codex_websocket_stream(
+            api_kwargs=_body(extra={"previous_response_id": "resp_expired"}),
+            client=SimpleNamespace(),
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            session_id="missing-continuation",
+            transport="websocket-cached",
+            collect_events=lambda events, _getter: list(events),
+        )
+
+    assert excinfo.value.request_replay_safe is True
+    assert excinfo.value.retryable is False
+    assert ws.closed
+
+
+def test_cached_missing_previous_response_reconnects_with_full_request(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+
+    class FakeWS:
+        closed = False
+
+        def __init__(self, frames):
+            self.frames = iter(frames)
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def recv(self, timeout=None):
+            return next(self.frames)
+
+        def close(self):
+            self.closed = True
+
+    cached_ws = FakeWS(
+        [
+            '{"type":"response.completed","response":'
+            '{"id":"resp_anchor","status":"completed"}}',
+            '{"type":"error","status":400,"error":{'
+            '"code":"previous_response_not_found",'
+            '"message":"continuation anchor expired",'
+            '"param":"previous_response_id"}}',
+        ]
+    )
+    fresh_ws = FakeWS(
+        [
+            '{"type":"response.completed","response":'
+            '{"id":"resp_fresh","status":"completed"}}'
+        ]
+    )
+    sockets = iter([cached_ws, fresh_ws])
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: next(sockets),
+    )
+    first_body = _body(input_items=[{"role": "user", "content": "one"}])
+    first_final = SimpleNamespace(
+        id="resp_anchor",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="answer")],
+            )
+        ],
+    )
+    run_codex_websocket_stream(
+        api_kwargs=first_body,
+        client=SimpleNamespace(),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        session_id="expired-cache-anchor",
+        transport="websocket-cached",
+        collect_events=lambda events, _getter: (list(events), first_final)[1],
+    )
+
+    continuation = next(
+        iter(mod._websocket_session_cache.values())
+    ).continuation
+    assert continuation is not None
+    second_body = _body(
+        input_items=[
+            {"role": "user", "content": "one"},
+            *continuation.last_response_items,
+            {"role": "user", "content": "two"},
+        ]
+    )
+    with pytest.raises(mod.WebSocketNotStartedError) as excinfo:
+        run_codex_websocket_stream(
+            api_kwargs=second_body,
+            client=SimpleNamespace(),
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            session_id="expired-cache-anchor",
+            transport="websocket-cached",
+            collect_events=lambda events, _getter: list(events),
+        )
+    assert excinfo.value.retryable is True
+    assert cached_ws.sent[1]["previous_response_id"] == "resp_anchor"
+    assert cached_ws.sent[1]["input"] == [
+        {"role": "user", "content": "two"}
+    ]
+
+    fresh_final = SimpleNamespace(
+        id="resp_fresh",
+        status="completed",
+        output=[],
+    )
+    run_codex_websocket_stream(
+        api_kwargs=second_body,
+        client=SimpleNamespace(),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        session_id="expired-cache-anchor",
+        transport="websocket-cached",
+        collect_events=lambda events, _getter: (list(events), fresh_final)[1],
+    )
+    assert "previous_response_id" not in fresh_ws.sent[0]
+    assert fresh_ws.sent[0]["input"] == second_body["input"]
+    cleanup_codex_websocket_sessions()
+
+
 def test_response_done_uses_embedded_failed_status_and_error(monkeypatch):
     import agent.codex_websocket_transport as mod
 
@@ -1133,3 +1774,302 @@ def test_response_done_uses_embedded_failed_status_and_error(monkeypatch):
     assert response.status == "failed"
     assert response.error.code == "overloaded"
     assert ws.closed
+
+
+def test_response_done_canceled_alias_retires_cached_socket(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+
+    class FakeWS:
+        closed = False
+
+        def send(self, _payload):
+            pass
+
+        def recv(self, timeout=None):
+            return (
+                '{"type":"response.done","response":{"id":"resp_cancel",'
+                '"status":"canceled","output":[]}}'
+            )
+
+        def close(self):
+            self.closed = True
+
+    ws = FakeWS()
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, timeout=None: ws,
+    )
+    seen = []
+
+    def collect(events, _getter):
+        seen.extend(events)
+        return seen[-1].response
+
+    response = run_codex_websocket_stream(
+        api_kwargs=_body(),
+        client=SimpleNamespace(),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        session_id="canceled-alias",
+        transport="websocket-cached",
+        collect_events=collect,
+    )
+
+    assert seen[-1].type == "response.cancelled"
+    assert response.status == "canceled"
+    assert ws.closed
+    assert not mod._websocket_session_cache
+
+
+def test_superseded_collector_retires_socket_before_next_request(monkeypatch):
+    import agent.codex_websocket_transport as mod
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    cleanup_codex_websocket_sessions()
+    superseded = threading.Event()
+
+    class RawConnection:
+        def __init__(self, frames, *, supersede_on_recv=None):
+            self.closed = False
+            self.state = "OPEN"
+            self.sent = []
+            self._frames = iter(frames)
+            self._recv_count = 0
+            self._supersede_on_recv = supersede_on_recv
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def recv(self, timeout=None):
+            self._recv_count += 1
+            frame = next(self._frames)
+            if self._recv_count == self._supersede_on_recv:
+                superseded.set()
+            return frame
+
+    class FakeWS:
+        def __init__(self, frames, *, supersede_on_recv=None):
+            self._connection = RawConnection(
+                frames,
+                supersede_on_recv=supersede_on_recv,
+            )
+            self.closed = False
+
+        def parse_event(self, raw):
+            return mod.websocket_event_to_object(raw)
+
+        def close(self):
+            self.closed = True
+            self._connection.closed = True
+
+    stale_ws = FakeWS(
+        [
+            '{"type":"response.output_text.delta","delta":"first"}',
+            '{"type":"response.output_text.delta","delta":"stale-tail"}',
+            '{"type":"response.completed","response":{"id":"old","status":"completed"}}',
+        ],
+        supersede_on_recv=2,
+    )
+    fresh_ws = FakeWS([
+        '{"type":"response.output_text.delta","delta":"fresh"}',
+        '{"type":"response.completed","response":{"id":"new","status":"completed"}}',
+    ])
+    sockets = iter([stale_ws, fresh_ws])
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket",
+        lambda _client, _headers, **_kwargs: next(sockets),
+    )
+
+    def collect(events, _getter=None, *, interrupt_check=None):
+        return _consume_codex_event_stream(
+            events,
+            model="gpt-5",
+            interrupt_check=interrupt_check,
+        )
+
+    common = {
+        "client": SimpleNamespace(),
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "session_id": "superseded-cache",
+        "transport": "websocket-cached",
+    }
+    with pytest.raises(InterruptedError):
+        run_codex_websocket_stream(
+            api_kwargs=_body(),
+            collect_events=lambda events, getter: collect(
+                events,
+                getter,
+                interrupt_check=superseded.is_set,
+            ),
+            interrupted=superseded.is_set,
+            **common,
+        )
+
+    assert stale_ws.closed
+    assert not mod._websocket_session_cache
+
+    response = run_codex_websocket_stream(
+        api_kwargs=_body(),
+        collect_events=lambda events, getter: collect(events, getter),
+        interrupted=lambda: False,
+        **common,
+    )
+
+    assert response.id == "new"
+    assert response.output_text == "fresh"
+    assert len(stale_ws._connection.sent) == 1
+    assert len(fresh_ws._connection.sent) == 1
+    cleanup_codex_websocket_sessions()
+
+
+def test_interrupt_during_handshake_prevents_response_create_send(monkeypatch):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+    connect_started = threading.Event()
+    allow_connect = threading.Event()
+    interrupted = threading.Event()
+    errors = []
+
+    class RawConnection:
+        closed = False
+        state = "OPEN"
+
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class FakeWS:
+        def __init__(self):
+            self._connection = RawConnection()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            self._connection.closed = True
+
+    ws = FakeWS()
+
+    def connect(_client, _headers, **_kwargs):
+        connect_started.set()
+        assert allow_connect.wait(timeout=2)
+        return ws
+
+    monkeypatch.setattr(mod, "_connect_websocket", connect)
+
+    def run():
+        try:
+            run_codex_websocket_stream(
+                api_kwargs=_body(),
+                client=SimpleNamespace(),
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                session_id="interrupt-during-handshake",
+                transport="websocket",
+                collect_events=lambda events, _getter: list(events),
+                interrupted=interrupted.is_set,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert connect_started.wait(timeout=2)
+    interrupted.set()
+    allow_connect.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], InterruptedError)
+    assert ws._connection.sent == []
+    assert ws.closed
+    assert not mod._websocket_session_cache
+
+
+def test_cleanup_cancels_busy_temporary_acquire_before_connect_registration(
+    monkeypatch,
+):
+    import agent.codex_websocket_transport as mod
+
+    cleanup_codex_websocket_sessions()
+
+    class FakeWS:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    cached_ws = FakeWS()
+    temporary_ws = FakeWS()
+    connect_calls = {"count": 0}
+
+    def connect(_client, _headers, **_kwargs):
+        connect_calls["count"] += 1
+        return cached_ws if connect_calls["count"] == 1 else temporary_ws
+
+    monkeypatch.setattr(mod, "_connect_websocket", connect)
+    client = SimpleNamespace()
+    _ws, entry, _reused, release_cached = mod._acquire_websocket(
+        client,
+        "wss://x",
+        {},
+        "busy-pre-registration-cleanup",
+    )
+    assert entry is not None and entry.busy
+
+    entered_connect_wrapper = threading.Event()
+    allow_connect_wrapper = threading.Event()
+    original_connect_for_acquisition = mod._connect_websocket_for_acquisition
+
+    def delayed_connect_for_acquisition(*args, **kwargs):
+        entered_connect_wrapper.set()
+        assert allow_connect_wrapper.wait(timeout=2)
+        return original_connect_for_acquisition(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mod,
+        "_connect_websocket_for_acquisition",
+        delayed_connect_for_acquisition,
+    )
+    results = []
+    errors = []
+
+    def acquire_temporary():
+        try:
+            results.append(
+                mod._acquire_websocket(
+                    client,
+                    "wss://x",
+                    {},
+                    "busy-pre-registration-cleanup",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=acquire_temporary)
+    thread.start()
+    assert entered_connect_wrapper.wait(timeout=2)
+    mod.cleanup_codex_websocket_session("busy-pre-registration-cleanup")
+    allow_connect_wrapper.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], WebSocketNotStartedError)
+    assert errors[0].retryable is True
+    assert cached_ws.closed
+    assert connect_calls["count"] == 1 or temporary_ws.closed
+    assert not mod._websocket_session_cache
+    assert not mod._active_websocket_connection_attempts
+    release_cached(keep=False)

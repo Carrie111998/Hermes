@@ -5261,6 +5261,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.provider = self.requested_provider
         self.api_mode = "chat_completions"
         self.responses_transport = "sse"
+        # A resumed/session-only /model route can intentionally differ from
+        # config.yaml.  _ensure_runtime_credentials() re-resolves config on
+        # every turn, so keep the session transport as an explicit overlay
+        # until /new or a global model switch clears it.
+        self._session_responses_transport_override: Optional[str] = None
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
         self.base_url = (
@@ -8748,6 +8753,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "provider": provider or None,
             "base_url": result.base_url or None,
             "api_mode": result.api_mode or None,
+            "responses_transport": (
+                getattr(result, "responses_transport", None) or None
+            ),
         }
         try:
             db.update_session_model(sid, result.new_model)
@@ -8795,9 +8803,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # gateway's top-level keys).
         from hermes_state import SessionDB as _SessionDB
         _stored_runtime = _SessionDB.session_gateway_runtime(session_meta)
-        stored_provider = _stored_runtime.get("provider") or None
+        stored_provider = (
+            _stored_runtime.get("requested_provider")
+            or _stored_runtime.get("provider")
+            or None
+        )
         stored_base_url = _stored_runtime.get("base_url") or None
         stored_api_mode = _stored_runtime.get("api_mode") or None
+        stored_responses_transport = _stored_runtime.get("responses_transport")
+        if stored_responses_transport is not None:
+            from agent.codex_websocket_transport import (
+                normalize_codex_responses_transport,
+            )
+
+            stored_responses_transport = normalize_codex_responses_transport(
+                stored_responses_transport
+            )
+        # This overlay is intentionally set even when the model/provider
+        # already match: the next per-turn credential refresh must preserve a
+        # session-restored transport instead of replacing it from config.yaml.
+        self._session_responses_transport_override = stored_responses_transport
         # Heal bare "custom" persisted by older builds / gateway turns: it's
         # the resolved billing class, not a routable identity. Recover the
         # durable custom:<name> menu key from the endpoint, else drop the
@@ -8815,9 +8840,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 stored_provider = None
         model_changed = stored_model != self.model
         provider_changed = bool(stored_provider) and stored_provider != self.provider
-        if not model_changed and not provider_changed:
+        transport_changed = (
+            stored_responses_transport is not None
+            and stored_responses_transport
+            != getattr(self, "responses_transport", "sse")
+        )
+        if not model_changed and not provider_changed and not transport_changed:
             return
         self.model = stored_model
+        if stored_responses_transport is not None:
+            self.responses_transport = stored_responses_transport
         if stored_provider:
             self.provider = stored_provider
             self.requested_provider = stored_provider
@@ -8864,6 +8896,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=self.api_key or "",
                     base_url=self.base_url or "",
                     api_mode=self.api_mode or "",
+                    responses_transport=getattr(
+                        self, "responses_transport", "sse"
+                    ),
                 )
             except Exception:
                 logger.debug(
@@ -9899,10 +9934,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # so a session-only switch never leaks into the next session (#48055,
         # #23131).
         self._pending_one_turn_model_restore = None
+        self._session_responses_transport_override = None
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
         _model_config = CLI_CONFIG.get("model", {})
+        from agent.codex_websocket_transport import (
+            normalize_codex_responses_transport,
+            set_agent_codex_responses_transport,
+        )
+
+        _config_responses_transport = normalize_codex_responses_transport(
+            _model_config.get("responses_transport", "sse")
+            if isinstance(_model_config, dict)
+            else "sse"
+        )
+        _transport_reset_by_model_switch = False
         _raw_default2 = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _config_model, _ = _split_model_config_default(_raw_default2)
         if _config_model and _config_model != getattr(self, "model", None):
@@ -9924,6 +9971,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     explicit_provider=_config_provider or "",
                 )
                 if _reset_result.success:
+                    _reset_responses_transport = (
+                        normalize_codex_responses_transport(
+                            getattr(
+                                _reset_result,
+                                "responses_transport",
+                                _config_responses_transport,
+                            )
+                        )
+                    )
                     if self.agent:
                         self.agent.switch_model(
                             new_model=_reset_result.new_model,
@@ -9931,6 +9987,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             api_key=_reset_result.api_key,
                             base_url=_reset_result.base_url,
                             api_mode=_reset_result.api_mode,
+                            responses_transport=_reset_responses_transport,
                         )
                     self.model = _reset_result.new_model
                     self.provider = _reset_result.target_provider
@@ -9943,6 +10000,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self.base_url = _reset_result.base_url
                     if _reset_result.api_mode:
                         self.api_mode = _reset_result.api_mode
+                    self.responses_transport = _reset_responses_transport
+                    _transport_reset_by_model_switch = True
                     if not silent:
                         _cprint(
                             f"  (model reset to config default: "
@@ -9952,6 +10011,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+        if not _transport_reset_by_model_switch:
+            self.responses_transport = _config_responses_transport
+            if self.agent:
+                set_agent_codex_responses_transport(
+                    self.agent, _config_responses_transport
+                )
         _sync_process_session_id(self.session_id)
 
         if self.agent:
@@ -11060,6 +11125,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_transport": getattr(self, "responses_transport", "sse"),
+            "_session_responses_transport_override": getattr(
+                self, "_session_responses_transport_override", None
+            ),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -11078,6 +11147,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key",
             "base_url",
             "api_mode",
+            "responses_transport",
+            "_session_responses_transport_override",
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
@@ -11105,6 +11176,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=snapshot.get("api_key", ""),
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
+                    responses_transport=snapshot.get(
+                        "responses_transport", "sse"
+                    ),
                 )
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
@@ -11211,6 +11285,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 logger.debug("preflight-compression switch warning failed: %s", exc)
 
         old_model = self.model
+        from agent.codex_websocket_transport import (
+            normalize_codex_responses_transport,
+        )
+
+        _result_responses_transport = normalize_codex_responses_transport(
+            getattr(result, "responses_transport", "sse")
+        )
         # Snapshot the CLI-level credential/runtime fields BEFORE mutating them
         # so a failed in-place agent swap can roll the whole CLI back to the old
         # working model.  Otherwise the broken credentials staged below leak into
@@ -11226,6 +11307,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "responses_transport": getattr(self, "responses_transport", "sse"),
+            "_session_responses_transport_override": getattr(
+                self, "_session_responses_transport_override", None
+            ),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11241,7 +11325,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
-        self.responses_transport = result.responses_transport
+        self.responses_transport = _result_responses_transport
+        self._session_responses_transport_override = (
+            None if persist_global else _result_responses_transport
+        )
 
         if self.agent is not None:
             try:
@@ -11251,7 +11338,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
-                    responses_transport=result.responses_transport,
+                    responses_transport=_result_responses_transport,
                 )
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
@@ -11324,6 +11411,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # need (#25106).
             save_config_value("model.base_url", result.base_url or None)
             save_config_value("model.api_mode", result.api_mode or None)
+            save_config_value(
+                "model.responses_transport", _result_responses_transport
+            )
             _cprint("    Saved to config.yaml (--global)")
         else:
             _cprint("    (session only — add --global to persist)")
@@ -11606,6 +11696,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # overwrite the switch on the next turn (it re-resolves from this).
         old_model = self.model
         _one_turn_restore_snapshot = self._snapshot_model_runtime() if one_turn else None
+        from agent.codex_websocket_transport import (
+            normalize_codex_responses_transport,
+        )
+
+        _result_responses_transport = normalize_codex_responses_transport(
+            getattr(result, "responses_transport", "sse")
+        )
         # Snapshot CLI-level fields before mutation so a failed in-place swap
         # rolls the whole CLI back to the old working model (#50163).
         _cli_snapshot = {
@@ -11618,6 +11715,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "responses_transport": getattr(self, "responses_transport", "sse"),
+            "_session_responses_transport_override": getattr(
+                self, "_session_responses_transport_override", None
+            ),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11633,7 +11733,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
-        self.responses_transport = result.responses_transport
+        self.responses_transport = _result_responses_transport
+        self._session_responses_transport_override = (
+            None if persist_global else _result_responses_transport
+        )
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
@@ -11644,7 +11747,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
-                    responses_transport=result.responses_transport,
+                    responses_transport=_result_responses_transport,
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
@@ -11722,6 +11825,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # must be synced on every global switch (#25106).
             save_config_value("model.base_url", result.base_url or None)
             save_config_value("model.api_mode", result.api_mode or None)
+            save_config_value(
+                "model.responses_transport", _result_responses_transport
+            )
             _cprint("    Saved to config.yaml")
         elif one_turn:
             _cprint("    (next turn only — restores after one response)")

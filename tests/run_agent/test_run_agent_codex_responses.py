@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -325,6 +326,64 @@ def test_request_abort_closes_active_codex_websocket(monkeypatch):
     assert calls == ["websocket"]
 
 
+def test_concurrent_request_abort_targets_matching_websocket(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.responses_transport = "websocket"
+    clients = {
+        "A": SimpleNamespace(label="A"),
+        "B": SimpleNamespace(label="B"),
+    }
+    registered = {label: threading.Event() for label in clients}
+    release = {label: threading.Event() for label in clients}
+    aborted = []
+
+    def fake_websocket_stream(*, client, register_connection_abort, **_kwargs):
+        label = client.label
+        unregister = register_connection_abort(lambda: aborted.append(label))
+        registered[label].set()
+        assert release[label].wait(timeout=10)
+        unregister()
+        return _codex_message_response(label)
+
+    monkeypatch.setattr(
+        "agent.codex_websocket_transport.run_codex_websocket_stream",
+        fake_websocket_stream,
+    )
+    monkeypatch.setattr(agent, "_force_close_tcp_sockets", lambda _client: 1)
+    errors = []
+
+    def run(label):
+        try:
+            agent._run_codex_stream(
+                _codex_request_kwargs(),
+                client=clients[label],
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = {
+        label: threading.Thread(target=run, args=(label,))
+        for label in clients
+    }
+    for worker in workers.values():
+        worker.start()
+    for event in registered.values():
+        assert event.wait(timeout=10)
+
+    agent._abort_request_openai_client(clients["A"], reason="watchdog-a")
+    assert aborted == ["A"]
+    release["A"].set()
+    workers["A"].join(timeout=10)
+    assert not workers["A"].is_alive()
+
+    agent._abort_request_openai_client(clients["B"], reason="watchdog-b")
+    assert aborted == ["A", "B"]
+    release["B"].set()
+    workers["B"].join(timeout=10)
+    assert not workers["B"].is_alive()
+    assert errors == []
+
+
 def test_responses_transport_auto_falls_back_to_sse_before_start(monkeypatch):
     agent = _build_agent(monkeypatch)
     agent.responses_transport = "auto"
@@ -432,6 +491,137 @@ def test_websocket_uses_current_raw_event_consumer_and_activity_watchdog(monkeyp
     assert agent._codex_stream_last_event_ts > 0
 
 
+def test_websocket_sanitizes_consumer_wire(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.responses_transport = "websocket"
+    final = _codex_message_response("ok")
+    captured = {}
+
+    def fake_ws(**kwargs):
+        captured.update(kwargs["api_kwargs"])
+        return final
+
+    monkeypatch.setattr(
+        "agent.codex_websocket_transport.run_codex_websocket_stream",
+        fake_ws,
+    )
+
+    request = {
+        **_codex_request_kwargs(),
+        "prompt_cache_retention": "24h",
+        "extra_body": {
+            "prompt_cache_retention": "24h",
+            "client_metadata": {"source": "override"},
+        },
+        "context_management": [
+            {"type": "compaction", "compact_threshold": 200000}
+        ],
+    }
+    result = agent._run_codex_stream(
+        request,
+        client=SimpleNamespace(responses=SimpleNamespace()),
+    )
+
+    assert result is final
+    assert "prompt_cache_retention" not in captured
+    assert captured["extra_body"] == {
+        "client_metadata": {"source": "override"}
+    }
+    assert captured["context_management"] == [
+        {"type": "compaction", "compact_threshold": 200000}
+    ]
+
+
+def test_websocket_auto_uses_sse_during_relay_managed_execution(monkeypatch):
+    from agent import relay_llm
+
+    agent = _build_agent(monkeypatch)
+    agent.responses_transport = "auto"
+    managed = {"enabled": True}
+    websocket_calls = []
+
+    class RelayHost:
+        @staticmethod
+        def managed_execution_enabled():
+            return managed["enabled"]
+
+    monkeypatch.setattr(
+        "agent.relay_runtime.resolve_execution_context",
+        lambda _session_id: (RelayHost(), object(), None),
+    )
+    monkeypatch.setattr(
+        "agent.codex_websocket_transport.run_codex_websocket_stream",
+        lambda **_kwargs: (
+            websocket_calls.append(_kwargs),
+            _codex_message_response("websocket"),
+        )[1],
+    )
+
+    def fake_create(**kwargs):
+        assert kwargs["stream"] is True
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(id="resp_sse", status="completed"),
+            ),
+        ])
+
+    monkeypatch.setattr(
+        relay_llm,
+        "stream",
+        lambda request, factory, **_kwargs: factory(request),
+    )
+    result = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(
+            responses=SimpleNamespace(create=fake_create),
+        ),
+    )
+
+    assert result.status == "completed"
+    assert agent._codex_websocket_auto_disabled_for is None
+    assert websocket_calls == []
+
+    managed["enabled"] = False
+    result = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(responses=SimpleNamespace(create=fake_create)),
+    )
+    assert result.status == "completed"
+    assert len(websocket_calls) == 1
+
+
+def test_forced_websocket_fails_before_send_during_relay_managed_execution(
+    monkeypatch,
+):
+    from agent.codex_websocket_transport import WebSocketNotStartedError
+
+    agent = _build_agent(monkeypatch)
+    agent.responses_transport = "websocket-cached"
+
+    class RelayHost:
+        @staticmethod
+        def managed_execution_enabled():
+            return True
+
+    monkeypatch.setattr(
+        "agent.relay_runtime.resolve_execution_context",
+        lambda _session_id: (RelayHost(), object(), None),
+    )
+    monkeypatch.setattr(
+        "agent.codex_websocket_transport.run_codex_websocket_stream",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("WebSocket request must not start under Relay")
+        ),
+    )
+
+    with pytest.raises(WebSocketNotStartedError, match="Relay managed stream"):
+        agent._run_codex_stream(
+            _codex_request_kwargs(),
+            client=SimpleNamespace(responses=SimpleNamespace()),
+        )
+
+
 def test_websocket_stream_stops_when_a_newer_writer_supersedes_it(monkeypatch):
     agent = _build_agent(monkeypatch)
     agent.responses_transport = "websocket"
@@ -502,6 +692,40 @@ def test_websocket_turn_state_flows_only_within_current_turn(monkeypatch):
     agent._codex_turn_state = None
     agent._run_codex_stream(_codex_request_kwargs(), client=SimpleNamespace())
     assert seen[-1] is None
+
+
+def test_websocket_retry_replays_turn_state_recorded_by_first_connection(
+    monkeypatch,
+):
+    from agent.codex_websocket_transport import WebSocketNotStartedError
+
+    agent = _build_agent(monkeypatch)
+    agent.responses_transport = "websocket-cached"
+    agent._current_turn_id = "turn-1"
+    agent._codex_turn_state_turn_id = "turn-1"
+    agent._codex_turn_state = None
+    final = _codex_message_response("ok")
+    seen = []
+
+    def fake_ws(**kwargs):
+        seen.append(kwargs["turn_state"])
+        if len(seen) == 1:
+            kwargs["record_turn_state"]("sticky-reconnect-state")
+            raise WebSocketNotStartedError("reconnect", retryable=True)
+        return final
+
+    monkeypatch.setattr(
+        "agent.codex_websocket_transport.run_codex_websocket_stream",
+        fake_ws,
+    )
+
+    result = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(),
+    )
+
+    assert result is final
+    assert seen == [None, "sticky-reconnect-state"]
 
 
 def test_api_mode_respects_explicit_openrouter_provider_over_codex_url(monkeypatch):

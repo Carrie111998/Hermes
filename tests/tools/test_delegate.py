@@ -818,6 +818,22 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "foundry-key")
         self.assertEqual(creds["api_mode"], "anthropic_messages")
 
+    def test_direct_codex_endpoint_preserves_configured_responses_transport(self):
+        parent = _make_mock_parent(depth=0)
+        parent.responses_transport = "sse"
+        cfg = {
+            "model": "gpt-5.6-sol",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "responses_transport": "websocket_cached",
+        }
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["provider"], "openai-codex")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        self.assertEqual(creds["responses_transport"], "websocket-cached")
+
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):

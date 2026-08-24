@@ -159,6 +159,8 @@ class TestHandleReasoningCommand(unittest.TestCase):
             api_key="k",
             base_url="",
             api_mode="",
+            responses_transport="websocket-cached",
+            _session_responses_transport_override="websocket-cached",
         )
 
         fake_result = SimpleNamespace(
@@ -168,13 +170,18 @@ class TestHandleReasoningCommand(unittest.TestCase):
             api_key="k2",
             base_url="https://openrouter.ai/api/v1",
             api_mode="chat_completions",
+            responses_transport="sse",
         )
         with patch.dict(
             CLI_CONFIG.setdefault("agent", {}),
             {"reasoning_effort": "medium", "service_tier": "normal"},
         ), patch.dict(
             CLI_CONFIG,
-            {"model": {"default": "config-default-model", "provider": "openrouter"}},
+            {"model": {
+                "default": "config-default-model",
+                "provider": "openrouter",
+                "responses_transport": "sse",
+            }},
         ), patch(
             "hermes_cli.model_switch.switch_model", return_value=fake_result
         ):
@@ -187,6 +194,57 @@ class TestHandleReasoningCommand(unittest.TestCase):
         # Model reset to the config default via the live agent swap.
         self.assertEqual(stub.model, "config-default-model")
         agent.switch_model.assert_called_once()
+        self.assertEqual(
+            agent.switch_model.call_args.kwargs["responses_transport"], "sse"
+        )
+        self.assertEqual(stub.responses_transport, "sse")
+        self.assertIsNone(stub._session_responses_transport_override)
+
+    def test_new_session_clears_transport_override_when_model_matches_config(self):
+        from cli import CLI_CONFIG, HermesCLI
+
+        agent = SimpleNamespace(
+            reasoning_config=None,
+            responses_transport="websocket-cached",
+            reset_session_state=MagicMock(),
+        )
+        stub = SimpleNamespace(
+            agent=agent,
+            conversation_history=[],
+            session_id="old-session",
+            _session_db=None,
+            _pending_title=None,
+            _resumed=False,
+            reasoning_config=None,
+            _notify_session_boundary=MagicMock(),
+            service_tier=None,
+            _pending_one_turn_model_restore=None,
+            _session_responses_transport_override="websocket-cached",
+            model="config-default-model",
+            provider="openai-codex",
+            requested_provider="openai-codex",
+            api_key="token",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+            responses_transport="websocket-cached",
+        )
+
+        with patch.dict(
+            CLI_CONFIG.setdefault("agent", {}),
+            {"reasoning_effort": "medium", "service_tier": "normal"},
+        ), patch.dict(
+            CLI_CONFIG,
+            {"model": {
+                "default": "config-default-model",
+                "provider": "openai-codex",
+                "responses_transport": "sse",
+            }},
+        ):
+            HermesCLI.new_session(stub, silent=True)
+
+        self.assertEqual(stub.responses_transport, "sse")
+        self.assertEqual(agent.responses_transport, "sse")
+        self.assertIsNone(stub._session_responses_transport_override)
 
 
 # ---------------------------------------------------------------------------

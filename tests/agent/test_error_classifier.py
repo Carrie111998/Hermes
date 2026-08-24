@@ -783,6 +783,51 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is False
 
+    @pytest.mark.parametrize("retryable", [False, True])
+    def test_websocket_pre_send_failure_preserves_retryability(self, retryable):
+        from agent.codex_websocket_transport import WebSocketNotStartedError
+
+        result = classify_api_error(
+            WebSocketNotStartedError(
+                "connection failed before response.create",
+                retryable=retryable,
+            ),
+            provider="openai-codex",
+            model="gpt-5-codex",
+        )
+
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is retryable
+        assert result.should_fallback is False
+
+    def test_plugin_cannot_override_websocket_replay_safety(self, monkeypatch):
+        from agent.codex_websocket_transport import WebSocketStartedError
+        from hermes_cli import plugins
+
+        called = []
+
+        def plugin_classifier(**_kwargs):
+            called.append(True)
+            return {
+                "reason": FailoverReason.timeout,
+                "retryable": True,
+            }
+
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_error_classification",
+            plugin_classifier,
+        )
+        result = classify_api_error(
+            WebSocketStartedError("ambiguous post-send failure", retryable=True),
+            provider="openai-codex",
+            model="gpt-5-codex",
+        )
+
+        assert called == []
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is False
+
     def test_connect_error(self):
         e = ConnectError("Connection refused")
         result = classify_api_error(e)
@@ -1594,4 +1639,3 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-

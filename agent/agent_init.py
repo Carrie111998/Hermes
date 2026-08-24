@@ -683,6 +683,10 @@ def init_agent(
     from agent.codex_websocket_transport import normalize_codex_responses_transport
 
     agent.responses_transport = normalize_codex_responses_transport(responses_transport)
+    agent._active_codex_websocket_aborts = {}
+    # Legacy single-hook slot retained for compatibility with older callers
+    # and lightweight test doubles. Production registrations use the
+    # request-client keyed registry above.
     agent._active_codex_websocket_abort = None
     agent._codex_websocket_auto_disabled_for = None
     agent._codex_turn_state = None
@@ -1410,8 +1414,49 @@ def init_agent(
                             )
                             continue
                         if _fb_client is not None:
-                            agent.provider = _fb["provider"]
+                            _fb_provider = str(_fb["provider"]).strip().lower()
+                            _fb_base_url = str(_fb_client.base_url)
+                            _fb_api_mode = str(_fb.get("api_mode") or "").strip()
+                            if not _fb_api_mode:
+                                from hermes_cli.providers import determine_api_mode
+
+                                _fb_api_mode = determine_api_mode(
+                                    _fb_provider,
+                                    _fb_base_url,
+                                    _fb_model or _fb["model"],
+                                )
+                            _fb_responses_transport = _fb.get(
+                                "responses_transport"
+                            )
+                            if (
+                                _fb_responses_transport is None
+                                and _fb_provider == "openai-codex"
+                            ):
+                                try:
+                                    from hermes_cli.config import load_config
+
+                                    _fb_model_cfg = load_config().get("model") or {}
+                                    if isinstance(_fb_model_cfg, dict):
+                                        _fb_responses_transport = _fb_model_cfg.get(
+                                            "responses_transport",
+                                            "sse",
+                                        )
+                                except Exception:
+                                    _fb_responses_transport = "sse"
+
+                            agent.provider = _fb_provider
+                            agent.requested_provider = _fb_provider
                             agent.model = _fb_model or _fb["model"]
+                            agent.base_url = _fb_base_url
+                            agent.api_mode = _fb_api_mode
+                            from agent.codex_websocket_transport import (
+                                set_agent_codex_responses_transport,
+                            )
+
+                            set_agent_codex_responses_transport(
+                                agent,
+                                _fb_responses_transport or "sse",
+                            )
                             agent._fallback_activated = True
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,

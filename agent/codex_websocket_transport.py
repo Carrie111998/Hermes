@@ -40,7 +40,10 @@ CODEX_RESPONSES_SDK_ONLY_FIELDS = frozenset({
 SESSION_WEBSOCKET_CACHE_TTL_SECONDS = 5 * 60
 WEBSOCKET_RECV_POLL_TIMEOUT_SECONDS = 1.0
 WEBSOCKET_CONNECT_TIMEOUT_SECONDS = 15.0
+WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 2.0
+WEBSOCKET_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
+PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found"
 _TERMINAL_EVENTS = {
     "response.completed",
     "response.incomplete",
@@ -170,6 +173,18 @@ class CachedWebSocketConnection:
     last_used_at: float = 0.0
 
 
+@dataclass
+class _PendingWebSocketConnection:
+    event: threading.Event
+    cancelled: bool = False
+
+
+@dataclass
+class _WebSocketConnectionAttempt:
+    session_id: str | None
+    cancelled: bool = False
+
+
 class _WebSocketTransportError(RuntimeError):
     def __init__(self, message: str, *, cause: BaseException | None = None, retryable: bool = False):
         super().__init__(message)
@@ -228,7 +243,11 @@ class CodexWebSocketEventError(RuntimeError):
 
 
 _websocket_session_cache: Dict[tuple[str, str], CachedWebSocketConnection] = {}
-_pending_websocket_connections: Dict[tuple[str, str], threading.Event] = {}
+_pending_websocket_connections: Dict[
+    tuple[str, str], _PendingWebSocketConnection
+] = {}
+_active_websocket_connection_attempts: Dict[int, _WebSocketConnectionAttempt] = {}
+_next_websocket_connection_attempt_id = 0
 _cache_generation = 0
 
 # A process-wide lock is enough: entries are held briefly only while acquiring or
@@ -244,8 +263,12 @@ def cleanup_codex_websocket_sessions() -> None:
         _websocket_session_cache.clear()
         pending = list(_pending_websocket_connections.values())
         _pending_websocket_connections.clear()
-    for event in pending:
-        event.set()
+        active_attempts = list(_active_websocket_connection_attempts.values())
+        for attempt in active_attempts:
+            attempt.cancelled = True
+    for connection in pending:
+        connection.cancelled = True
+        connection.event.set()
     for _, entry in entries:
         _close_websocket_silently(entry.ws)
 
@@ -254,10 +277,8 @@ def cleanup_codex_websocket_session(session_id: str | None) -> None:
     """Close cached Codex WebSockets for one Hermes session."""
     if not session_id:
         return
-    global _cache_generation
     stale: list[CachedWebSocketConnection] = []
     with _cache_lock:
-        _cache_generation += 1
         for key, entry in list(_websocket_session_cache.items()):
             if key[0] == session_id:
                 stale.append(entry)
@@ -265,12 +286,16 @@ def cleanup_codex_websocket_session(session_id: str | None) -> None:
                 entry.busy = False
                 entry.continuation = None
         pending = []
-        for key, event in list(_pending_websocket_connections.items()):
+        for key, connection in list(_pending_websocket_connections.items()):
             if key[0] == session_id:
-                pending.append(event)
+                connection.cancelled = True
+                pending.append(connection)
                 _pending_websocket_connections.pop(key, None)
-    for event in pending:
-        event.set()
+        for attempt in _active_websocket_connection_attempts.values():
+            if attempt.session_id == session_id:
+                attempt.cancelled = True
+    for connection in pending:
+        connection.event.set()
     for entry in stale:
         _close_websocket_silently(entry.ws)
 
@@ -335,7 +360,14 @@ def _websocket_cache_key(
     ``session_id``. Including a stable fingerprint prevents reusing a socket
     authenticated for an older token or a different backend URL.
     """
-    normalized_headers = sorted((str(k).lower(), str(v)) for k, v in headers)
+    # Turn state changes during a user turn. It must be replayed on a fresh
+    # handshake, but it must not change the identity of an already-open
+    # session socket (the response.create frame carries the same state).
+    normalized_headers = sorted(
+        (str(k).lower(), str(v))
+        for k, v in headers
+        if str(k).lower() != "x-codex-turn-state"
+    )
     try:
         auth_headers = getattr(client, "auth_headers", None)
     except Exception:
@@ -374,7 +406,15 @@ def _connect_websocket(
     open_timeout = WEBSOCKET_CONNECT_TIMEOUT_SECONDS
     if isinstance(timeout, (int, float)) and timeout > 0:
         open_timeout = min(open_timeout, float(timeout))
-    options: Dict[str, Any] = {"open_timeout": open_timeout}
+    options: Dict[str, Any] = {
+        "open_timeout": open_timeout,
+        "close_timeout": WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
+        # response.output_item.done repeats the complete item, and encrypted
+        # reasoning/native-compaction checkpoints can legitimately exceed the
+        # websockets library's 1 MiB default. Keep a bounded ceiling aligned
+        # with mature Codex clients so a valid response cannot self-close 1009.
+        "max_size": WEBSOCKET_MAX_MESSAGE_BYTES,
+    }
 
     # Proxy/SSL note: websockets.sync.client.connect uses environment proxy
     # support in modern websockets releases, but it cannot inherit custom httpx
@@ -416,6 +456,61 @@ def _connect_websocket(
     return enter()
 
 
+def _register_websocket_connection_attempt_locked(
+    session_id: str | None,
+) -> tuple[int, _WebSocketConnectionAttempt]:
+    """Register an acquisition attempt while ``_cache_lock`` is held."""
+    global _next_websocket_connection_attempt_id
+    _next_websocket_connection_attempt_id += 1
+    attempt_id = _next_websocket_connection_attempt_id
+    attempt = _WebSocketConnectionAttempt(session_id=session_id)
+    _active_websocket_connection_attempts[attempt_id] = attempt
+    return attempt_id, attempt
+
+
+def _connect_websocket_for_acquisition(
+    client: Any,
+    headers: Mapping[str, str],
+    session_id: str | None,
+    *,
+    registered_attempt: tuple[int, _WebSocketConnectionAttempt] | None = None,
+    **connect_options: Any,
+) -> Any:
+    """Connect while allowing session/global cleanup to cancel the handshake."""
+    if registered_attempt is None:
+        with _cache_lock:
+            attempt_id, attempt = _register_websocket_connection_attempt_locked(
+                session_id
+            )
+    else:
+        attempt_id, attempt = registered_attempt
+    with _cache_lock:
+        cancelled_before_connect = attempt.cancelled
+        if cancelled_before_connect:
+            _active_websocket_connection_attempts.pop(attempt_id, None)
+    if cancelled_before_connect:
+        raise WebSocketNotStartedError(
+            "Codex WebSocket session was reset during connection acquisition",
+            retryable=True,
+        )
+    try:
+        ws = _connect_websocket(client, headers, **connect_options)
+    except BaseException:
+        with _cache_lock:
+            _active_websocket_connection_attempts.pop(attempt_id, None)
+        raise
+    with _cache_lock:
+        _active_websocket_connection_attempts.pop(attempt_id, None)
+        cancelled = attempt.cancelled
+    if cancelled:
+        _close_websocket_silently(ws)
+        raise WebSocketNotStartedError(
+            "Codex WebSocket session was reset during connection acquisition",
+            retryable=True,
+        )
+    return ws
+
+
 def _acquire_websocket(
     client: Any,
     url: str,
@@ -430,7 +525,12 @@ def _acquire_websocket(
     if extra_query:
         connect_options["extra_query"] = extra_query
     if not session_id:
-        ws = _connect_websocket(client, headers, **connect_options)
+        ws = _connect_websocket_for_acquisition(
+            client,
+            headers,
+            session_id,
+            **connect_options,
+        )
         return ws, None, False, lambda keep=True: _close_websocket_silently(ws)
 
     cache_key = _websocket_cache_key(
@@ -442,11 +542,14 @@ def _acquire_websocket(
     while True:
         stale_ws = None
         create_temporary = False
+        temporary_attempt = None
         creator = False
         with _cache_lock:
             if acquisition_generation != _cache_generation:
-                create_temporary = True
-                pending = None
+                raise WebSocketNotStartedError(
+                    "Codex WebSocket session was reset during connection acquisition",
+                    retryable=True,
+                )
             else:
                 cached = _websocket_session_cache.get(cache_key)
                 if cached and not cached.busy and _is_websocket_reusable(cached.ws):
@@ -456,13 +559,19 @@ def _acquire_websocket(
                     # Parallel turns on one session use an uncached temporary
                     # connection and keep the cached continuation chain isolated.
                     create_temporary = True
+                    # Register before releasing _cache_lock. Session/global
+                    # cleanup can now cancel this acquisition even if it lands
+                    # before the connect wrapper starts running.
+                    temporary_attempt = _register_websocket_connection_attempt_locked(
+                        session_id
+                    )
                 elif cached:
                     _websocket_session_cache.pop(cache_key, None)
                     stale_ws = cached.ws
 
                 pending = _pending_websocket_connections.get(cache_key)
                 if not create_temporary and pending is None:
-                    pending = threading.Event()
+                    pending = _PendingWebSocketConnection(threading.Event())
                     _pending_websocket_connections[cache_key] = pending
                     creator = True
 
@@ -470,35 +579,56 @@ def _acquire_websocket(
             _close_websocket_silently(stale_ws)
 
         if create_temporary:
-            ws = _connect_websocket(client, headers, **connect_options)
+            ws = _connect_websocket_for_acquisition(
+                client,
+                headers,
+                session_id,
+                registered_attempt=temporary_attempt,
+                **connect_options,
+            )
             return ws, None, False, lambda keep=True: _close_websocket_silently(ws)
 
         if not creator:
-            pending.wait()
+            pending.event.wait()
+            if pending.cancelled:
+                raise WebSocketNotStartedError(
+                    "Codex WebSocket session was reset during connection acquisition",
+                    retryable=True,
+                )
             continue
 
         try:
-            ws = _connect_websocket(client, headers, **connect_options)
-        except Exception:
+            ws = _connect_websocket_for_acquisition(
+                client,
+                headers,
+                session_id,
+                **connect_options,
+            )
+        except BaseException:
             with _cache_lock:
                 if _pending_websocket_connections.get(cache_key) is pending:
                     _pending_websocket_connections.pop(cache_key, None)
-                pending.set()
+                pending.event.set()
             raise
 
         entry = CachedWebSocketConnection(ws=ws, cache_key=cache_key, busy=True)
         with _cache_lock:
             published = (
-                acquisition_generation == _cache_generation
+                not pending.cancelled
+                and acquisition_generation == _cache_generation
                 and _pending_websocket_connections.get(cache_key) is pending
             )
             if published:
                 _websocket_session_cache[cache_key] = entry
                 _pending_websocket_connections.pop(cache_key, None)
-            pending.set()
+            pending.event.set()
         if published:
             return ws, entry, False, _make_release(cache_key, entry)
-        return ws, None, False, lambda keep=True: _close_websocket_silently(ws)
+        _close_websocket_silently(ws)
+        raise WebSocketNotStartedError(
+            "Codex WebSocket session was reset during connection acquisition",
+            retryable=True,
+        )
 
 
 def _make_release(cache_key: tuple[str, str], entry: CachedWebSocketConnection):
@@ -537,6 +667,35 @@ def _recv_websocket_event(ws: Any) -> Any:
     return websocket_event_to_object(raw)
 
 
+def _prepare_websocket_send(ws: Any, event: Dict[str, Any]) -> tuple[Callable[[Any], None], Any]:
+    """Prepare a request frame without the SDK's recursive typed transform.
+
+    OpenAI 2.24's public ``ResponsesConnection.send()`` walks the full event
+    through ``maybe_transform`` before serializing it. Hermes has already
+    validated and normalized Codex requests into plain JSON, and repeating
+    that typed walk can hold the GIL for very large conversations (#93650).
+    Serialize before crossing the replay-safety boundary, then write through
+    the SDK connection's underlying websocket. Non-JSON values and the
+    existing debug escape hatch retain the public typed path.
+    """
+    use_sdk_transform = os.environ.get(
+        "HERMES_CODEX_SDK_TRANSFORM", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    raw_connection = getattr(ws, "_connection", None)
+    raw_send = getattr(raw_connection, "send", None)
+    if not use_sdk_transform and callable(raw_send):
+        from agent.codex_runtime import _is_plain_json_data
+
+        if _is_plain_json_data(event):
+            payload = json.dumps(
+                event,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return raw_send, payload
+    return ws.send, event
+
+
 def get_cached_websocket_input_delta(
     body: Dict[str, Any],
     continuation: CachedWebSocketContinuationState,
@@ -554,6 +713,13 @@ def get_cached_websocket_input_delta(
 
 
 def build_cached_websocket_request_body(entry: CachedWebSocketConnection, body: Dict[str, Any]) -> Dict[str, Any]:
+    # OpenAI Responses treats ``conversation`` and ``previous_response_id``
+    # as mutually exclusive continuation mechanisms. A caller-selected
+    # conversation owns its own history, so cached transport state must not
+    # inject a second continuation anchor or trim the request to a delta.
+    if body.get("conversation") is not None:
+        entry.continuation = None
+        return dict(body)
     continuation = entry.continuation
     if continuation is None:
         return dict(body)
@@ -677,7 +843,12 @@ def _with_codex_turn_state(body: Dict[str, Any], turn_state: str | None) -> Dict
     return request_body
 
 
-def _build_headers_from_client(client: Any, api_kwargs: Dict[str, Any], session_id: str | None) -> Dict[str, str]:
+def _build_headers_from_client(
+    client: Any,
+    api_kwargs: Dict[str, Any],
+    session_id: str | None,
+    turn_state: str | None = None,
+) -> Dict[str, str]:
     headers: Dict[str, str] = {}
 
     canonical_names = {
@@ -687,6 +858,7 @@ def _build_headers_from_client(client: Any, api_kwargs: Dict[str, Any], session_
         "session-id": "session-id",
         "thread-id": "thread-id",
         "x-client-request-id": "x-client-request-id",
+        "x-codex-turn-state": "x-codex-turn-state",
     }
 
     def put_header(name: Any, value: Any) -> None:
@@ -714,12 +886,38 @@ def _build_headers_from_client(client: Any, api_kwargs: Dict[str, Any], session_
                 put_header(key, value)
     request_id = str(session_id or uuid.uuid4())
     put_header("OpenAI-Beta", OPENAI_BETA_RESPONSES_WEBSOCKETS)
-    put_header("x-client-request-id", request_id)
+    # CodexTransport binds this header to the request body's prompt_cache_key.
+    # Preserve the caller-provided value; the physical session id is only a
+    # fallback for direct callers that did not construct one.
+    if not any(name.lower() == "x-client-request-id" for name in headers):
+        prompt_cache_key = api_kwargs.get("prompt_cache_key")
+        put_header(
+            "x-client-request-id",
+            prompt_cache_key
+            if isinstance(prompt_cache_key, str) and prompt_cache_key
+            else request_id,
+        )
     put_header("session-id", request_id)
     put_header("thread-id", request_id)
+    if turn_state:
+        put_header("x-codex-turn-state", turn_state)
     if not any(name.lower() == "originator" for name in headers):
         put_header("originator", "hermes-agent")
     return headers
+
+
+def _turn_state_from_handshake(ws: Any) -> str | None:
+    """Read Codex sticky-routing state from an SDK WebSocket 101 response."""
+    connection = getattr(ws, "_connection", None)
+    response = getattr(connection, "response", None)
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return None
+    for name, value in headers.items():
+        if str(name).lower() == "x-codex-turn-state" and value is not None:
+            state = str(value).strip()
+            return state or None
+    return None
 
 
 def _is_retryable_transport_error(exc: BaseException) -> bool:
@@ -748,7 +946,11 @@ def _is_retryable_transport_error(exc: BaseException) -> bool:
     return False
 
 
-def _response_items_for_continuation(final_response: Any) -> List[Dict[str, Any]]:
+def _response_items_for_continuation(
+    final_response: Any,
+    *,
+    native_compaction_eligible: bool = False,
+) -> List[Dict[str, Any]]:
     """Generate continuation items through Hermes' adapter conversion path."""
     from agent.codex_responses_adapter import _chat_messages_to_responses_input, _normalize_codex_response
 
@@ -771,7 +973,14 @@ def _response_items_for_continuation(final_response: Any) -> List[Dict[str, Any]
                 "function": {"name": getattr(fn, "name", ""), "arguments": getattr(fn, "arguments", "{}")},
             })
         msg_dict["tool_calls"] = converted
-    return [item for item in _chat_messages_to_responses_input([msg_dict]) if item.get("type") != "function_call_output"]
+    return [
+        item
+        for item in _chat_messages_to_responses_input(
+            [msg_dict],
+            native_compaction_eligible=native_compaction_eligible,
+        )
+        if item.get("type") != "function_call_output"
+    ]
 
 
 def run_codex_websocket_stream(
@@ -804,7 +1013,12 @@ def run_codex_websocket_stream(
         )
 
     url = resolve_codex_websocket_url(base_url)
-    headers = _build_headers_from_client(client, api_kwargs, session_id)
+    headers = _build_headers_from_client(
+        client,
+        api_kwargs,
+        session_id,
+        turn_state,
+    )
     extra_query = api_kwargs.get("extra_query")
     if extra_query is not None and not isinstance(extra_query, Mapping):
         raise WebSocketNotStartedError(
@@ -817,8 +1031,15 @@ def run_codex_websocket_stream(
     unregister_abort = None
     started = False
     keep_connection = True
+    cached_previous_response_injected = False
+
+    def raise_if_interrupted() -> None:
+        if interrupted is not None and interrupted():
+            raise InterruptedError("Agent interrupted during Codex WebSocket stream")
+
     try:
-        ws, entry, _reused, release = _acquire_websocket(
+        raise_if_interrupted()
+        ws, entry, reused, release = _acquire_websocket(
             client,
             url,
             headers,
@@ -826,6 +1047,19 @@ def run_codex_websocket_stream(
             extra_query=extra_query,
             timeout=timeout,
         )
+        # The handshake can outlive the caller's cancellation because no
+        # connection-specific abort hook exists until acquisition completes.
+        # Recheck before constructing or sending response.create so a cancelled
+        # turn cannot start inference after the handshake finally returns.
+        raise_if_interrupted()
+        handshake_turn_state = (
+            None if reused else _turn_state_from_handshake(ws)
+        )
+        if handshake_turn_state:
+            if record_turn_state is not None:
+                record_turn_state(handshake_turn_state)
+            if not turn_state:
+                turn_state = handshake_turn_state
         if register_connection_abort is not None:
             unregister_abort = register_connection_abort(
                 lambda: _abort_websocket_silently(ws)
@@ -834,14 +1068,26 @@ def run_codex_websocket_stream(
         body = dict(wire_body)
         if transport == "websocket-cached" and entry is not None:
             body = build_cached_websocket_request_body(entry, body)
+            cached_previous_response_injected = (
+                "previous_response_id" not in wire_body
+                and bool(body.get("previous_response_id"))
+            )
         body = _with_codex_turn_state(body, turn_state)
-        # Once send() starts, the frame may have reached the kernel or backend
-        # even if the call raises before returning. Treat that boundary as an
-        # ambiguous started request so no outer retry can duplicate execution.
+        frame = {"type": "response.create", **body}
+        send, payload = _prepare_websocket_send(ws, frame)
+        # Serialization can be substantial for long conversations. Close the
+        # final pre-send cancellation window after it completes.
+        raise_if_interrupted()
+        # JSON serialization above is replay-safe. Once the socket send starts,
+        # the frame may have reached the kernel or backend even if the call
+        # raises before returning, so outer recovery must not replay it.
         started = True
-        ws.send({"type": "response.create", **body})
+        send(payload)
+
+        saw_terminal_event = False
 
         def iter_events() -> Iterable[Any]:
+            nonlocal saw_terminal_event
             last_event_at = time.monotonic()
             while True:
                 if interrupted and interrupted():
@@ -864,26 +1110,61 @@ def run_codex_websocket_stream(
                     record_turn_state(response_turn_state)
                 if event_type == "error":
                     raise CodexWebSocketEventError(event)
+                if event_type in _TERMINAL_EVENTS:
+                    saw_terminal_event = True
                 yield event
                 if event_type in _TERMINAL_EVENTS:
                     break
 
         final_response = collect_events(iter_events(), None)
         status = str(getattr(final_response, "status", "") or "").lower()
-        if status in {"failed", "cancelled", "incomplete"}:
+        if status in {"failed", "cancelled", "canceled", "incomplete"}:
             keep_connection = False
             if entry is not None:
                 entry.continuation = None
+        elif not saw_terminal_event:
+            # A collector can stop early when its stream-writer token is
+            # superseded. The socket still contains frames for the old
+            # response, so returning it to the session cache would let the next
+            # request consume the previous response's terminal frame.
+            keep_connection = False
+            if entry is not None:
+                entry.continuation = None
+            if interrupted is not None and interrupted():
+                raise InterruptedError(
+                    "Agent interrupted during Codex WebSocket stream"
+                )
+            raise RuntimeError(
+                "Codex WebSocket collector returned before a terminal response"
+            )
         elif transport == "websocket-cached" and entry is not None:
             response_id = getattr(final_response, "id", None)
-            if isinstance(response_id, str) and response_id:
+            if wire_body.get("conversation") is not None:
+                entry.continuation = None
+            elif isinstance(response_id, str) and response_id:
                 try:
-                    response_items = _response_items_for_continuation(final_response)
-                    entry.continuation = CachedWebSocketContinuationState(
-                        last_request_body=wire_body,
-                        last_response_id=response_id,
-                        last_response_items=response_items,
+                    response_items = _response_items_for_continuation(
+                        final_response,
+                        native_compaction_eligible=bool(
+                            wire_body.get("context_management")
+                        ),
                     )
+                    if any(
+                        item.get("type") == "compaction"
+                        for item in response_items
+                    ):
+                        # The production adapter prunes pre-checkpoint input on
+                        # the next request. That reshapes the local prefix, so
+                        # seed the next cached baseline from its full request
+                        # instead of guessing which history the server folded
+                        # into the opaque checkpoint.
+                        entry.continuation = None
+                    else:
+                        entry.continuation = CachedWebSocketContinuationState(
+                            last_request_body=wire_body,
+                            last_response_id=response_id,
+                            last_response_items=response_items,
+                        )
                 except Exception:
                     # Continuation compaction is a cache optimization. A
                     # conversion failure after a completed response must keep
@@ -904,14 +1185,21 @@ def run_codex_websocket_stream(
             entry.continuation = None
         keep_connection = False
         retryable = _is_retryable_transport_error(exc)
-        if (
+        replay_safe_server_reset = (
             isinstance(exc, CodexWebSocketEventError)
-            and exc.code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
-        ):
-            # Codex explicitly reports this frame when the 60-minute socket
-            # lifetime expires and guarantees that the caller should reconnect
-            # and continue. This is the one post-send response that establishes
-            # a replay-safe outcome.
+            and (
+                exc.code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                or (
+                    exc.code == PREVIOUS_RESPONSE_NOT_FOUND_CODE
+                    and cached_previous_response_injected
+                )
+            )
+        )
+        if replay_safe_server_reset:
+            # Codex explicitly rejects these frames before starting a response.
+            # A fresh connection with a full request is therefore replay-safe:
+            # either the socket expired or its connection-local continuation
+            # anchor no longer exists.
             raise WebSocketNotStartedError(
                 str(exc),
                 cause=exc,

@@ -1642,28 +1642,59 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         str(getattr(agent, "base_url", "") or "").rstrip("/").lower(),
         str(getattr(agent, "model", "") or ""),
     )
+    relay_managed_execution = False
+    if transport != "sse":
+        try:
+            from agent import relay_runtime
+
+            relay_host, relay_session, _relay_parent = (
+                relay_runtime.resolve_execution_context(
+                    str(getattr(agent, "session_id", "") or "")
+                )
+            )
+            relay_managed_execution = bool(
+                relay_host is not None
+                and relay_session is not None
+                and relay_host.managed_execution_enabled()
+            )
+        except Exception:
+            logger.debug(
+                "Could not inspect Relay execution state for Codex WebSocket",
+                exc_info=True,
+            )
     auto_websocket_disabled = (
         transport == "auto"
-        and getattr(agent, "_codex_websocket_auto_disabled_for", None)
-        == websocket_runtime_identity
+        and (
+            getattr(agent, "_codex_websocket_auto_disabled_for", None)
+            == websocket_runtime_identity
+            or relay_managed_execution
+        )
     )
+    if transport == "auto" and relay_managed_execution:
+        # Relay's stream pipeline owns chunk interception, policy transforms,
+        # and pre-delivery redaction. The synchronous Responses WebSocket
+        # adapter currently consumes events inside its callback, so auto mode
+        # must keep SSE while managed execution is active.
+        logger.debug(
+            "Codex WebSocket auto mode selected SSE because Relay managed "
+            "stream execution is active"
+        )
     if transport != "sse" and not auto_websocket_disabled:
         from agent.codex_websocket_transport import (
             WebSocketNotStartedError,
             run_codex_websocket_stream,
         )
 
-        timeout = api_kwargs.get("timeout")
-        timeout = float(timeout) if isinstance(timeout, (int, float)) and timeout > 0 else None
+        if relay_managed_execution:
+            raise WebSocketNotStartedError(
+                "Codex WebSocket transport cannot preserve Relay managed "
+                "stream interception yet. Use responses_transport=auto or sse "
+                "while Relay plugins are active.",
+                retryable=False,
+            )
 
         def _register_connection_abort(abort):
-            agent._active_codex_websocket_abort = abort
-
-            def unregister():
-                if getattr(agent, "_active_codex_websocket_abort", None) is abort:
-                    agent._active_codex_websocket_abort = None
-
-            return unregister
+            return agent._register_codex_websocket_abort(active_client, abort)
 
         codex_turn_id = getattr(agent, "_current_turn_id", None)
         turn_state = (
@@ -1685,33 +1716,50 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         for websocket_attempt in range(2):
             interrupt_check = _claim_stream_interrupt_check()
 
-            def _consume_websocket_events(
-                events,
-                _get_final_response=None,
-                _interrupt_check=interrupt_check,
-            ):
-                return _consume_codex_event_stream(
-                    events,
-                    model=api_kwargs.get("model"),
-                    on_text_delta=_on_text_delta,
-                    on_reasoning_delta=_on_reasoning_delta,
-                    on_commentary_message=(
-                        _on_commentary_message
-                        if (
-                            getattr(agent, "interim_assistant_callback", None)
-                            is not None
-                            and getattr(agent, "show_commentary", True)
-                        )
-                        else None
-                    ),
-                    on_first_delta=on_first_delta,
-                    on_event=_on_event,
-                    interrupt_check=_interrupt_check,
+            attempt_turn_state = (
+                getattr(agent, "_codex_turn_state", None)
+                if getattr(agent, "_codex_turn_state_turn_id", None)
+                == codex_turn_id
+                else turn_state
+            )
+
+            def _execute_websocket(next_api_kwargs: dict[str, Any]):
+                # Relay middleware may rewrite the request, so consumer-Codex
+                # wire sanitization belongs inside the physical callback just
+                # like the SSE path below.
+                websocket_api_kwargs = _sanitize_consumer_codex_request(
+                    agent,
+                    next_api_kwargs,
+                )
+                timeout = websocket_api_kwargs.get("timeout")
+                timeout = (
+                    float(timeout)
+                    if isinstance(timeout, (int, float)) and timeout > 0
+                    else None
                 )
 
-            try:
+                def _consume_websocket_events(events, _get_final_response=None):
+                    return _consume_codex_event_stream(
+                        events,
+                        model=websocket_api_kwargs.get("model"),
+                        on_text_delta=_on_text_delta,
+                        on_reasoning_delta=_on_reasoning_delta,
+                        on_commentary_message=(
+                            _on_commentary_message
+                            if (
+                                getattr(agent, "interim_assistant_callback", None)
+                                is not None
+                                and getattr(agent, "show_commentary", True)
+                            )
+                            else None
+                        ),
+                        on_first_delta=on_first_delta,
+                        on_event=_on_event,
+                        interrupt_check=interrupt_check,
+                    )
+
                 return run_codex_websocket_stream(
-                    api_kwargs=api_kwargs,
+                    api_kwargs=websocket_api_kwargs,
                     client=active_client,
                     provider=agent.provider,
                     base_url=agent.base_url,
@@ -1721,9 +1769,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupted=interrupt_check,
                     timeout=timeout,
                     register_connection_abort=_register_connection_abort,
-                    turn_state=turn_state,
+                    turn_state=attempt_turn_state,
                     record_turn_state=_record_turn_state,
                 )
+
+            try:
+                return _execute_websocket(dict(api_kwargs))
             except WebSocketNotStartedError as exc:
                 if websocket_attempt == 0 and getattr(exc, "retryable", False):
                     logger.debug(

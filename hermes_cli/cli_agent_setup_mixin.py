@@ -90,6 +90,14 @@ class CLIAgentSetupMixin:
         resolved_provider = runtime.get("provider", "openrouter")
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
         resolved_responses_transport = runtime.get("responses_transport", "sse")
+        session_responses_transport = getattr(
+            self, "_session_responses_transport_override", None
+        )
+        if session_responses_transport is not None:
+            # Session resume and session-only /model switches own this field
+            # until their conversation boundary.  The rest of the runtime
+            # (credentials, endpoint, token pool) remains freshly resolved.
+            resolved_responses_transport = session_responses_transport
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
@@ -309,7 +317,7 @@ class CLIAgentSetupMixin:
                 self, "requested_provider", self.provider
             ),
             "api_mode": self.api_mode,
-            "responses_transport": self.responses_transport,
+            "responses_transport": getattr(self, "responses_transport", "sse"),
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
