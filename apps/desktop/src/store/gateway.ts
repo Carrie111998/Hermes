@@ -48,6 +48,8 @@ interface Secondary {
   connection: HermesConnection | null
   gateway: HermesGateway
   activeRequests: number
+  /** Long-lived background consumers that explicitly own this socket. */
+  retainers: number
   connectPromise: Promise<void> | null
   offEvent: () => void
   offState: () => void
@@ -479,6 +481,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     connection: null,
     gateway,
     activeRequests: 0,
+    retainers: 0,
     connectPromise: null,
     offEvent: () => {},
     offState: () => {},
@@ -637,6 +640,67 @@ export async function requestGatewayForProfile<T>(
 }
 
 /**
+ * Keep one registry-scoped socket alive for a background consumer without
+ * foregrounding it. The returned disposer releases exactly one ownership
+ * lease; the socket closes once no request, foreground owner, or retainer
+ * still needs it.
+ */
+export async function retainGatewayForAgent(connectionId: string, profile: string): Promise<() => void> {
+  const key = normKey(profile)
+  const id = String(connectionId || '').trim()
+
+  if (!id || !window.hermesDesktop?.getConnectionFor) {
+    throw new Error('A registry connection is required to retain an agent gateway')
+  }
+
+  const scope = registryBackendScopeKey(id, key)
+  const entry = g.secondaries.get(scope) ?? createSecondary(key, id)
+
+  if (!Number.isFinite(entry.retainers)) {
+    entry.retainers = 0
+  }
+
+  entry.retainers += 1
+  entry.wantOpen = true
+  let released = false
+
+  const release = () => {
+    if (released) {
+      return
+    }
+
+    released = true
+    // A material connection edit replaces the pool entry in-place. Ownership
+    // follows that replacement so the original disposer still releases the
+    // re-dialed socket instead of leaking it.
+    const ownedEntry = g.secondaries.get(scope) ?? entry
+    ownedEntry.retainers = Math.max(0, Number(ownedEntry.retainers) - 1)
+
+    if (
+      ownedEntry.retainers === 0 &&
+      ownedEntry.activeRequests === 0 &&
+      !ownedEntry.retained &&
+      g.activeKey !== ownedEntry.scope &&
+      g.secondaries.get(ownedEntry.scope) === ownedEntry
+    ) {
+      disposeSecondary(ownedEntry)
+      g.secondaries.delete(ownedEntry.scope)
+    }
+  }
+
+  try {
+    if (!isOpen(entry.gateway)) {
+      await openSecondary(entry)
+    }
+  } catch (error) {
+    release()
+    throw error
+  }
+
+  return release
+}
+
+/**
  * Send a gateway RPC through one registry source without activating it. The
  * composite (connectionId, profile) pool key prevents same-named agents on two
  * sources from sharing a socket. Only null/empty ids retain the v1 profile
@@ -686,7 +750,12 @@ export async function requestGatewayForAgent<T>(
   } finally {
     entry.activeRequests = Math.max(0, entry.activeRequests - 1)
 
-    if (entry.activeRequests === 0 && !entry.retained && g.activeKey !== entry.scope) {
+    if (
+      entry.activeRequests === 0 &&
+      !(Number.isFinite(entry.retainers) && entry.retainers > 0) &&
+      !entry.retained &&
+      g.activeKey !== entry.scope
+    ) {
       disposeSecondary(entry)
 
       if (g.secondaries.get(entry.scope) === entry) {
@@ -959,6 +1028,7 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
       keep.has(key) ||
       (!entry.connectionId && keep.has(entry.profile)) ||
       entry.activeRequests > 0 ||
+      (Number.isFinite(entry.retainers) && entry.retainers > 0) ||
       // Mid-dial activation target: the profile being switched TO is not yet
       // active and has no live work, so without this lease any recompute
       // during its cold spawn disposed the entry and the click died silently
@@ -1042,6 +1112,8 @@ export function disposeSecondariesForConnection(connectionId: string, opts: { re
     }
 
     const wasActive = key === g.activeKey
+    const retainers = Number.isFinite(entry.retainers) ? entry.retainers : 0
+    const retained = entry.retained
     activeInvalidated ||= wasActive
 
     disposeSecondary(entry)
@@ -1051,6 +1123,13 @@ export function disposeSecondariesForConnection(connectionId: string, opts: { re
       const reopen = wasActive
         ? ensureGatewayForAgent(entry.connectionId, entry.profile)
         : openGatewayForAgent(entry.connectionId, entry.profile)
+
+      const replacement = g.secondaries.get(key)
+
+      if (replacement) {
+        replacement.retainers = retainers
+        replacement.retained = retained
+      }
 
       void reopen.catch(() => undefined)
     }

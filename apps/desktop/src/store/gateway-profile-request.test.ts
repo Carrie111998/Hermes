@@ -55,6 +55,7 @@ const {
   disposeSecondariesForConnection,
   openGatewayForAgent,
   pruneSecondaryGateways,
+  retainGatewayForAgent,
   requestGatewayForAgent,
   requestGatewayForProfile,
   setPrimaryGateway
@@ -190,6 +191,49 @@ describe('requestGatewayForProfile', () => {
 })
 
 describe('requestGatewayForAgent', () => {
+  it('reuses a retained registry socket until the final owner releases it', async () => {
+    const primary = makePrimary()
+    const getConnectionFor = vi.fn(async ({ connectionId, profile }) => ({ connectionId, port: 5151, profile }))
+
+    setPrimaryGateway(primary as never, 'default')
+    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+      getConnection: vi.fn(),
+      getConnectionFor,
+      getGatewayWsUrlFor: vi.fn(async ({ connectionId, profile }) => ({
+        ok: true as const,
+        wsUrl: `ws://${connectionId}/${profile}`
+      })),
+      touchBackend: vi.fn(async () => undefined)
+    }
+
+    const releaseFirst = await retainGatewayForAgent('source-a', 'research')
+    const releaseSecond = await retainGatewayForAgent('source-a', 'research')
+
+    await requestGatewayForAgent('source-a', 'research', 'bot_relay.outbox.drain')
+    await requestGatewayForAgent('source-a', 'research', 'bot_relay.outbox.drain')
+    pruneSecondaryGateways(new Set())
+
+    expect(secondaryGateways).toHaveLength(1)
+    expect(secondaryGateways[0].connect).toHaveBeenCalledOnce()
+    expect(secondaryGateways[0].request).toHaveBeenCalledTimes(2)
+    expect(secondaryGateways[0].close).not.toHaveBeenCalled()
+
+    disposeSecondariesForConnection('source-a', { redial: true })
+    await vi.waitFor(() => expect(secondaryGateways[1]?.connect).toHaveBeenCalledOnce())
+    await requestGatewayForAgent('source-a', 'research', 'bot_relay.outbox.drain')
+    pruneSecondaryGateways(new Set())
+
+    expect(secondaryGateways).toHaveLength(2)
+    expect(secondaryGateways[0].close).toHaveBeenCalledOnce()
+    expect(secondaryGateways[1].request).toHaveBeenCalledOnce()
+    expect(secondaryGateways[1].close).not.toHaveBeenCalled()
+
+    releaseFirst()
+    expect(secondaryGateways[1].close).not.toHaveBeenCalled()
+    releaseSecond()
+    expect(secondaryGateways[1].close).toHaveBeenCalledOnce()
+  })
+
   it('leases separate registry sockets for duplicate profile names without changing the active gateway', async () => {
     const primary = makePrimary()
     const getConnection = vi.fn(async (profile: null | string) => ({ port: 4242, profile, token: 'legacy-token' }))

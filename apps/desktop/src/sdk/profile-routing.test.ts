@@ -86,6 +86,7 @@ vi.mock('@/store/gateway', async () => {
     ensureGatewayForAgent: vi.fn(),
     openGatewayForAgent: vi.fn(),
     openGatewayForProfile: vi.fn(),
+    retainGatewayForAgent: vi.fn(async () => vi.fn()),
     requestGatewayForAgent: vi.fn(
       async (connectionId: string, profile: string, method: string, params: Record<string, unknown>) => ({
         connectionId,
@@ -110,6 +111,7 @@ const { deleteProfile } = await import('@/hermes')
 const {
   openGatewayForAgent,
   openGatewayForProfile,
+  retainGatewayForAgent,
   requestGatewayForAgent,
   requestGatewayForProfile,
   retireLocalProfileGateways
@@ -253,6 +255,21 @@ describe('connection-aware plugin host APIs', () => {
       include_sessions: true
     })
     expect(requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('retains a targeted route and returns the transport disposer', async () => {
+    const release = vi.fn()
+    vi.mocked(retainGatewayForAgent).mockResolvedValueOnce(release)
+
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'remote-worker',
+      targetProfile: 'backend-worker'
+    }
+
+    await expect(host.retainProfile(route)).resolves.toBe(release)
+    expect(retainGatewayForAgent).toHaveBeenCalledWith('source-a', 'remote-worker')
   })
 
   it('fails closed when a descriptor omits connection or target profile identity', async () => {

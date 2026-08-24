@@ -49,6 +49,7 @@ import {
   openGatewayForProfile,
   requestGatewayForAgent,
   requestGatewayForProfile,
+  retainGatewayForAgent,
   retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
@@ -256,6 +257,14 @@ async function requestPluginProfile<T>(
   throw new Error(
     `Profile "${profile}" requires a route descriptor from host.profileRoutes(); profile-only routing is limited to legacy/local profiles.`
   )
+}
+
+async function retainPluginProfile(route: PluginProfileRoute): Promise<() => void> {
+  if (!route.connectionId.trim() || !route.profile.trim() || !route.targetProfile.trim()) {
+    throw new Error('Profile route must include connectionId, profile, and targetProfile')
+  }
+
+  return retainGatewayForAgent(route.connectionId, route.profile)
 }
 
 /** Re-read Electron's current registry before retrying an exact-owner wake.
@@ -1131,6 +1140,10 @@ export const host = {
     method: string,
     params: Record<string, unknown> = {}
   ): Promise<T> => requestPluginProfile<T>(route, method, params),
+
+  /** Hold a route's pooled socket across repeated background RPCs. The
+   *  disposer releases this owner without disturbing foreground/live work. */
+  retainProfile: async (route: PluginProfileRoute): Promise<() => void> => retainPluginProfile(route),
 
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
    *  the app itself uses. Lazy: resolves the LIVE socket per call. */

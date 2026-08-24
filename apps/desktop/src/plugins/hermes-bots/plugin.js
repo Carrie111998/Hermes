@@ -1394,10 +1394,74 @@ let relayRosterBusy = false
 let relayDrainBusy = false
 let relayPushUnsub = null
 let relayPushDebounceTimer = null
+const relayConnectionLeases = new Map()
+let relayLeaseSync = Promise.resolve()
 // A push landing while a drain is ALREADY running would be lost forever —
 // the gateway signature is monotone (one event per new envelope, never
 // re-broadcast) — so remember it and re-schedule after the drain finishes.
 let relayDrainRerun = false
+
+const relayRouteIdentity = route =>
+  [route?.connectionId, route?.profile, route?.targetProfile].map(String).join('\u0000')
+
+function releaseRelayConnectionLease(entry) {
+  try {
+    entry?.release?.()
+  } catch {
+    // A lease disposer must never break relay teardown.
+  }
+}
+
+async function reconcileRelayConnectionLeases(connections) {
+  if (relayDisposed || typeof host.retainProfile !== 'function') {
+    return
+  }
+
+  const desired = new Map(connections.map(connection => [String(connection.id), connection]))
+
+  for (const [id, entry] of relayConnectionLeases) {
+    const connection = desired.get(id)
+
+    if (!connection || relayRouteIdentity(connection.route) !== entry.routeIdentity) {
+      relayConnectionLeases.delete(id)
+      releaseRelayConnectionLease(entry)
+    }
+  }
+
+  await Promise.all(
+    [...desired].map(async ([id, connection]) => {
+      if (relayConnectionLeases.has(id)) {
+        return
+      }
+
+      const entry = { release: null, routeIdentity: relayRouteIdentity(connection.route) }
+      relayConnectionLeases.set(id, entry)
+
+      try {
+        const release = await host.retainProfile(connection.route)
+
+        if (relayDisposed || relayConnectionLeases.get(id) !== entry) {
+          releaseRelayConnectionLease({ release })
+        } else {
+          entry.release = release
+        }
+      } catch {
+        if (relayConnectionLeases.get(id) === entry) {
+          relayConnectionLeases.delete(id)
+        }
+      }
+    })
+  )
+}
+
+function syncRelayConnectionLeases(connections) {
+  relayLeaseSync = relayLeaseSync.then(
+    () => reconcileRelayConnectionLeases(connections),
+    () => reconcileRelayConnectionLeases(connections)
+  )
+
+  return relayLeaseSync
+}
 
 /** One representative route per reachable connection id. */
 async function relayConnections() {
@@ -1417,7 +1481,10 @@ async function relayConnections() {
       }
     }
 
-    return [...byConnection.entries()].map(([id, route]) => ({ id, route }))
+    const connections = [...byConnection.entries()].map(([id, route]) => ({ id, route }))
+    await syncRelayConnectionLeases(connections.length >= 2 ? connections : [])
+
+    return connections
   } catch {
     return []
   }
@@ -1669,6 +1736,11 @@ function stopBotRelay() {
   // A rerun remembered mid-drain must not leak into the next start —
   // it would fire one stale drain after restart.
   relayDrainRerun = false
+
+  for (const entry of relayConnectionLeases.values()) {
+    releaseRelayConnectionLease(entry)
+  }
+  relayConnectionLeases.clear()
 
   if (relayRosterTimer !== null) {
     clearInterval(relayRosterTimer)
