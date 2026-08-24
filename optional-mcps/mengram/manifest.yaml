@@ -27,10 +27,13 @@ auth:
 # surface lives at /mcp for callers that want it.
 
 # Composer-suggestion triggers (desktop brand pills).
+# Brand term only, matching the approved entries: `memory` would fire the pill
+# whenever anyone talks about memory at all, which reads as an upsell wearing
+# an endorsement's clothes rather than a brand match. The host below already
+# covers people who name the site.
 suggest:
   keywords:
     - mengram
-    - memory
   hosts:
     - mengram.io
 
