@@ -493,6 +493,113 @@ class TestPauseResumeJob:
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
 
+    def test_pause_normalizes_a_blank_reason_to_none(self, tmp_cron_dir):
+        """Whitespace is not a WHY. Store None so readers can trust the field."""
+        job = create_job(prompt="Pause me", schedule="every 1h")
+        paused = pause_job(job["id"], reason="   ")
+        assert paused["paused_reason"] is None
+
+    def test_resume_archives_the_pause_reason_into_history(self, tmp_cron_dir):
+        """The WHY survives the resume.
+
+        Resuming clears paused_reason (a running job must not advertise one),
+        but the reason is the only thing distinguishing a routine pause from
+        "this job is broken", so it moves to paused_history rather than being
+        destroyed.
+        """
+        job = create_job(prompt="Resume me", schedule="every 1h")
+        pause_job(job["id"], reason="host was CPU-saturated")
+        resumed = resume_job(job["id"])
+
+        assert resumed["paused_reason"] is None
+        assert resumed["paused_at"] is None
+
+        history = resumed["paused_history"]
+        assert len(history) == 1
+        assert history[0]["paused_reason"] == "host was CPU-saturated"
+        assert history[0]["paused_at"]
+        assert history[0]["resumed_at"]
+
+        # Durable, not just in the returned dict.
+        assert get_job(job["id"])["paused_history"] == history
+
+    def test_resume_clears_a_stale_paused_flag(self, tmp_cron_dir):
+        """`paused: True` must not outlive the resume.
+
+        The scheduler's bulk pause (pause_jobs_cas) writes a legacy `paused`
+        flag that every dispatch gate ignores — they read enabled/state. Left
+        set, it reads as "still paused" to anyone auditing the record, which is
+        exactly the ambiguity paused_reason exists to remove.
+        """
+        job = create_job(prompt="Resume me", schedule="every 1h")
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused": True,
+                "paused_at": "2026-08-23T10:00:00-04:00",
+                "paused_reason": "scheduler bulk pause",
+            },
+        )
+
+        resumed = resume_job(job["id"])
+
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["paused"] is False
+
+    def test_resume_leaves_records_that_never_had_paused_flag_alone(self, tmp_cron_dir):
+        """Don't grow every record a key it never carried."""
+        job = create_job(prompt="Resume me", schedule="every 1h")
+        pause_job(job["id"], reason="routine")
+        resumed = resume_job(job["id"])
+        assert "paused" not in resumed
+
+    def test_resume_without_a_recorded_pause_writes_no_history(self, tmp_cron_dir):
+        """A job disabled directly (no paused_at/reason) has nothing to archive."""
+        job = create_job(prompt="Resume me", schedule="every 1h")
+        update_job(job["id"], {"enabled": False, "state": "paused"})
+        resumed = resume_job(job["id"])
+        assert "paused_history" not in resumed
+
+    def test_paused_history_is_bounded(self, tmp_cron_dir):
+        """A job paused and resumed daily must not grow jobs.json forever."""
+        from cron.jobs import PAUSED_HISTORY_LIMIT
+
+        job = create_job(prompt="Churn me", schedule="every 1h")
+        for i in range(PAUSED_HISTORY_LIMIT + 3):
+            pause_job(job["id"], reason=f"cycle {i}")
+            resume_job(job["id"])
+
+        history = get_job(job["id"])["paused_history"]
+        assert len(history) == PAUSED_HISTORY_LIMIT
+        # Oldest dropped first: the newest cycle is last.
+        assert history[-1]["paused_reason"] == f"cycle {PAUSED_HISTORY_LIMIT + 2}"
+        assert history[0]["paused_reason"] == "cycle 3"
+
+    def test_trigger_job_archives_the_pause_reason_too(self, tmp_cron_dir, monkeypatch):
+        """trigger_job is the other path that revives a paused job.
+
+        It cleared paused_reason with no archive, so `cron run` on a paused job
+        silently destroyed the WHY that `cron pause --reason` recorded. Pinned
+        so the two revive paths can't drift apart again.
+        """
+        from cron.jobs import trigger_job
+        from events.bus import EventBus
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="Trigger me", schedule="every 1h")
+        pause_job(job["id"], reason="quarantined pending review")
+        triggered = trigger_job(job["id"], caller="test")
+
+        assert triggered["paused_reason"] is None
+        assert triggered["paused_history"][-1]["paused_reason"] == (
+            "quarantined pending review"
+        )
+
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
         ValueError — the revived job would silently never fire."""

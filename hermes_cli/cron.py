@@ -149,6 +149,11 @@ def cron_list(show_all: bool = False):
 
         print(f"  {color(job_id, Colors.YELLOW)} {status}")
         print(f"    Name:      {name}")
+        if state == "paused":
+            paused_reason = job.get("paused_reason") or "(no reason recorded)"
+            paused_at = job.get("paused_at")
+            suffix = f" (since {paused_at})" if paused_at else ""
+            print(f"    Paused:    {paused_reason}{suffix}")
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
@@ -439,6 +444,12 @@ def _job_action(
         return 1
     job = result.get("job") or result.get("removed_job") or {}
     print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
+    if action == "pause":
+        paused_reason = job.get("paused_reason")
+        if paused_reason:
+            print(f"  Reason: {paused_reason}")
+        else:
+            print(color("  Reason: (none recorded - pass --reason next time)", Colors.DIM))
     if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
@@ -481,7 +492,9 @@ def cron_command(args):
         return cron_edit(args)
 
     if subcmd == "pause":
-        return _job_action("pause", args.job_id, "Paused")
+        raw_reason = getattr(args, "reason", None)
+        reason = (raw_reason or "").strip() or None
+        return _job_action("pause", args.job_id, "Paused", reason=reason)
 
     if subcmd == "resume":
         return _job_action("resume", args.job_id, "Resumed")

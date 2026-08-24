@@ -87,3 +87,13 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_pause_accepts_an_optional_reason():
+    parser = _build()
+    ns = parser.parse_args(["cron", "pause", "jid", "--reason", "host CPU-saturated"])
+    assert ns.cron_command == "pause"
+    assert ns.job_id == "jid"
+    assert ns.reason == "host CPU-saturated"
+    # Optional: bare `cron pause <id>` must keep working.
+    assert parser.parse_args(["cron", "pause", "jid"]).reason is None

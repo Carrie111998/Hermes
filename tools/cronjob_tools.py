@@ -591,6 +591,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    if job.get("paused_history"):
+        # Pause reasons survive a resume here (cron.jobs.resume_job), so an
+        # auditor can tell a routine pause from one that meant "this is broken".
+        result["paused_history"] = job["paused_history"]
     if job.get("script"):
         result["script"] = job["script"]
     if job.get("no_agent"):

@@ -56,6 +56,75 @@ class TestCronCommandLifecycle:
         assert "Resumed job" in out
         assert "Triggered job" in out
 
+    def test_pause_reason_is_persisted_and_echoed(self, tmp_cron_dir, capsys):
+        """`hermes cron pause <id> --reason ...` records the WHY.
+
+        Without it a paused job is indistinguishable from one paused because it
+        is broken, and the next session has to guess whether resuming is safe.
+        """
+        job = create_job(prompt="Check server status", schedule="every 1h")
+
+        rc = cron_command(
+            Namespace(
+                cron_command="pause",
+                job_id=job["id"],
+                reason="host CPU-saturated 2026-08-23",
+            )
+        )
+
+        assert rc == 0
+        paused = get_job(job["id"])
+        assert paused["state"] == "paused"
+        assert paused["paused_reason"] == "host CPU-saturated 2026-08-23"
+        assert "Reason: host CPU-saturated 2026-08-23" in capsys.readouterr().out
+
+    def test_pause_blank_reason_is_stored_as_none(self, tmp_cron_dir, capsys):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+
+        cron_command(
+            Namespace(cron_command="pause", job_id=job["id"], reason="   ")
+        )
+
+        assert get_job(job["id"])["paused_reason"] is None
+        assert "(none recorded" in capsys.readouterr().out
+
+    def test_pause_without_a_reason_attribute_still_works(self, tmp_cron_dir, capsys):
+        """Back-compat: callers that build the Namespace by hand omit `reason`."""
+        job = create_job(prompt="Check server status", schedule="every 1h")
+
+        rc = cron_command(Namespace(cron_command="pause", job_id=job["id"]))
+
+        assert rc == 0
+        assert get_job(job["id"])["paused_reason"] is None
+        assert "(none recorded" in capsys.readouterr().out
+
+    def test_list_surfaces_the_pause_reason(self, tmp_cron_dir, capsys):
+        """Storing the reason is only useful if an audit can see it."""
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(
+            Namespace(
+                cron_command="pause",
+                job_id=job["id"],
+                reason="host CPU-saturated 2026-08-23",
+            )
+        )
+        capsys.readouterr()
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        out = capsys.readouterr().out
+        assert "[paused]" in out
+        assert "Paused:    host CPU-saturated 2026-08-23 (since " in out
+
+    def test_list_flags_a_pause_with_no_reason(self, tmp_cron_dir, capsys):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(Namespace(cron_command="pause", job_id=job["id"]))
+        capsys.readouterr()
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        assert "Paused:    (no reason recorded)" in capsys.readouterr().out
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",
