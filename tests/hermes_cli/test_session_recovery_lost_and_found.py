@@ -8,6 +8,7 @@ b-tree/schema header bytes), not mocked cursor exceptions.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -568,6 +569,71 @@ def test_mapper_preserves_attributed_cold_archive_tombstones(
         assert recovered.get_session("cold-purged") is None
     finally:
         recovered.close()
+
+
+def test_mapper_reconciles_prompts_and_routes_for_tombstoned_ids(
+    tmp_path: Path,
+) -> None:
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    lf_conn.execute(
+        "CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO system_prompts VALUES (?, ?)",
+        ("prompt-hash", "recovered secret prompt"),
+    )
+    lf_conn.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL, "
+        "system_prompt_hash TEXT)"
+    )
+    lf_conn.executemany(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+        [
+            ("cold-purged", "cli", 123.0, "prompt-hash"),
+            ("survivor", "cli", 124.0, None),
+        ],
+    )
+    lf_conn.execute(
+        "CREATE TABLE cold_archive_tombstones ("
+        "session_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, "
+        "source_fingerprint TEXT NOT NULL, deleted_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO cold_archive_tombstones VALUES (?, ?, ?, ?)",
+        ("cold-purged", "cold-purged", "d" * 64, 789.0),
+    )
+    lf_conn.execute(
+        "CREATE TABLE gateway_routing ("
+        "scope TEXT NOT NULL, session_key TEXT NOT NULL, "
+        "entry_json TEXT NOT NULL, updated_at REAL NOT NULL, "
+        "PRIMARY KEY (scope, session_key))"
+    )
+    lf_conn.executemany(
+        "INSERT INTO gateway_routing VALUES (?, ?, ?, ?)",
+        [
+            ("test", "cold-key", json.dumps({"session_id": "cold-purged"}), 1.0),
+            ("test", "survivor-key", json.dumps({"session_id": "survivor"}), 2.0),
+        ],
+    )
+
+    output = tmp_path / "mapped-prompt-route.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        reconciliation = mapping["tombstone_reconciliation"]
+        assert reconciliation["system_prompts_removed"] == 1
+        assert reconciliation["gateway_routes_removed"] == 1
+        assert dest.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0] == 0
+        routes = dest.execute(
+            "SELECT session_key FROM gateway_routing ORDER BY session_key"
+        ).fetchall()
+        assert routes == [("survivor-key",)]
+        assert stub_missing_parent_sessions(dest)["sessions_stubbed"] == 0
+    finally:
+        lf_conn.close()
+        dest.close()
 
 
 def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(

@@ -23,6 +23,7 @@ data, and derived FTS indexes are rebuilt from scratch.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sqlite3
@@ -382,6 +383,9 @@ def reconcile_cold_archive_tombstones(
     result = {
         "sessions_removed": 0,
         "sessions_parent_cleared": 0,
+        "system_prompts_removed": 0,
+        "gateway_routes_removed": 0,
+        "gateway_routes_unverifiable": 0,
         "messages_removed": 0,
         "session_model_usage_removed": 0,
         "compression_locks_removed": 0,
@@ -392,12 +396,48 @@ def reconcile_cold_archive_tombstones(
 
     destination.execute("SAVEPOINT reconcile_cold_archive_tombstones")
     try:
+        tombstoned_ids = {
+            str(row[0])
+            for row in destination.execute(
+                "SELECT session_id FROM cold_archive_tombstones"
+            ).fetchall()
+        }
+        prompt_hashes = {
+            str(row[0])
+            for row in destination.execute(
+                "SELECT DISTINCT system_prompt_hash FROM sessions "
+                "WHERE id IN (SELECT session_id FROM cold_archive_tombstones) "
+                "AND system_prompt_hash IS NOT NULL"
+            ).fetchall()
+        }
         parent_cursor = destination.execute(
             "UPDATE sessions SET parent_session_id = NULL "
             "WHERE parent_session_id IN ("
             "SELECT session_id FROM cold_archive_tombstones)"
         )
         result["sessions_parent_cleared"] = parent_cursor.rowcount
+
+        if _table_columns(destination, "gateway_routing"):
+            route_rows = destination.execute(
+                "SELECT scope, session_key, entry_json FROM gateway_routing"
+            ).fetchall()
+            for scope, session_key, entry_json in route_rows:
+                try:
+                    entry = json.loads(entry_json)
+                except (TypeError, json.JSONDecodeError):
+                    result["gateway_routes_unverifiable"] += 1
+                    continue
+                session_id = entry.get("session_id") if isinstance(entry, dict) else None
+                if not isinstance(session_id, str):
+                    result["gateway_routes_unverifiable"] += 1
+                    continue
+                if session_id not in tombstoned_ids:
+                    continue
+                cursor = destination.execute(
+                    "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
+                    (scope, session_key),
+                )
+                result["gateway_routes_removed"] += cursor.rowcount
 
         for table, report_key in (
             ("messages", "messages_removed"),
@@ -421,6 +461,13 @@ def reconcile_cold_archive_tombstones(
             "SELECT session_id FROM cold_archive_tombstones)"
         )
         result["sessions_removed"] = sessions_cursor.rowcount
+        for prompt_hash in prompt_hashes:
+            prompt_cursor = destination.execute(
+                "DELETE FROM system_prompts WHERE hash = ? AND NOT EXISTS ("
+                "SELECT 1 FROM sessions WHERE system_prompt_hash = ?)",
+                (prompt_hash, prompt_hash),
+            )
+            result["system_prompts_removed"] += prompt_cursor.rowcount
         destination.execute("RELEASE SAVEPOINT reconcile_cold_archive_tombstones")
     except BaseException:
         destination.execute("ROLLBACK TO SAVEPOINT reconcile_cold_archive_tombstones")
