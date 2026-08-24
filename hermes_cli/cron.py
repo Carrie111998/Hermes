@@ -184,6 +184,8 @@ def cron_list(show_all: bool = False):
                 print(f"    Changed:   {mon_state['last_changed_at']}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+        if job.get("max_turns") is not None:
+            print(f"    Max turns: {job['max_turns']}")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
