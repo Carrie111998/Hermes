@@ -41,6 +41,30 @@ const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
 
+async function resolveHostPython(): Promise<string> {
+  try {
+    const direct = (await exec('command -v python3 || command -v python')).stdout.trim()
+
+    if (direct) {
+      return direct
+    }
+  } catch {
+    // Try the uv-managed interpreter below.
+  }
+
+  try {
+    const discovered = (await exec('uv python find')).stdout.trim()
+
+    if (discovered) {
+      return discovered
+    }
+  } catch {
+    // Report the missing interpreter with a stable error below.
+  }
+
+  throw new Error('no python3, python, or uv-managed interpreter available on PATH')
+}
+
 function ownedLock(over: any = {}) {
   return {
     schemaVersion: LOCKFILE_SCHEMA_VERSION,
@@ -339,13 +363,19 @@ test.skipIf(process.platform === 'win32')(
     const pythonLink = path.join(venvBin, 'python')
     const entrypoint = path.join(installDir, 'hermes')
     const launcher = path.join(temp, 'hermes launcher')
-    const python = (await exec('command -v python3')).stdout.trim()
+    const python = await resolveHostPython()
+    const bash = resolveBashExecutable()
+
+    if (!bash) {
+      throw new Error('no executable bash available on PATH')
+    }
+
     const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
 
     await mkdir(venvBin, { recursive: true })
     await symlink(python, pythonLink)
     await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
-    await writeFile(launcher, `#!/bin/bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
+    await writeFile(launcher, `#!${bash}\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)
 
     const backendFlags = [

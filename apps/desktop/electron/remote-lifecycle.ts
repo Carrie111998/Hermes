@@ -461,7 +461,13 @@ async function pidIsOurDashboard(
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 
-    const out = await ssh.exec(`python3 -c ${shq(script)}`)
+    const out = await ssh.exec(
+      `if command -v python3 >/dev/null 2>&1; then python3 -c ${shq(script)}; ` +
+        `elif command -v python >/dev/null 2>&1; then python -c ${shq(script)}; ` +
+        `elif command -v uv >/dev/null 2>&1; then ` +
+        `PYTHON_BIN="$(uv python find 2>/dev/null || true)"; ` +
+        `[ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c ${shq(script)}; fi`
+    )
 
     return String(out || '').trim() === 'OWNED'
   } catch (cause) {
