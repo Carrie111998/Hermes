@@ -33,6 +33,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,16 @@ def _default_claim_timeout_seconds() -> float:
 # persisted claim older than this timestamp was made by a previous process
 # that died between claiming a tick and confirming/abandoning it, so the
 # claim can never be resolved and must be treated as a missed delivery.
+# Best-effort: wall clock only, so a backwards NTP step after import makes
+# this process's own later claims (recorded on the stepped-back clock) look
+# older than the start marker. Only claims older than start minus the skew
+# tolerance below are treated as orphans; steps larger than the tolerance
+# are out of scope for this proxy.
 _PROCESS_START_TS = time.time()
+# Wall-clock skew tolerance (seconds) for the previous-process orphan test
+# above: a claim recorded up to this far before _PROCESS_START_TS still
+# reads as a live-process claim, absorbing backwards NTP steps.
+_PROCESS_START_SKEW_TOLERANCE_SECONDS = 120.0
 
 HEARTBEAT_PROMPT_TEMPLATE = (
     "[Heartbeat — recurring instruction, fires every {interval}]\n"
@@ -255,6 +265,66 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
 
+# Sentinel for HeartbeatManager(..., state=...): "not provided, load from
+# disk" must stay distinguishable from None ("no heartbeat persisted").
+_UNSET_STATE = object()
+
+
+class HeartbeatLoadCache:
+    """mtime-checked cache of heartbeat states for poll-loop reuse.
+
+    The gateway poll constructs a HeartbeatManager per watched session
+    every ``POLL_SECONDS``; each construction otherwise re-reads the state
+    from SessionDB on the event-loop thread. This cache keeps repeated
+    polls O(1) in disk I/O: states are reloaded only when the SessionDB
+    files (``state.db`` / ``state.db-wal``) changed since the last load,
+    so a stable poll across N watches does zero DB reads, and a poll that
+    follows a DB change re-reads each state at most once.
+
+    Cached HeartbeatState objects are handed to managers by reference;
+    mutations are persisted through save_heartbeat, which bumps the DB
+    mtime and thereby invalidates the cache on the next load.
+    """
+
+    def __init__(self) -> None:
+        self._fingerprint: Optional[tuple] = None
+        self._states: Dict[str, Optional[HeartbeatState]] = {}
+
+    def _db_fingerprint(self) -> Optional[tuple]:
+        db = _get_session_db()
+        if db is None:
+            return None
+        try:
+            main = Path(str(db.db_path))
+            wal = Path(str(db.db_path) + "-wal")
+            parts: list = [main.stat().st_mtime_ns, main.stat().st_size]
+            try:
+                parts.append(wal.stat().st_mtime_ns)
+                parts.append(wal.stat().st_size)
+            except OSError:
+                # No WAL file (yet): nothing to add.
+                parts.append(0)
+                parts.append(0)
+            return tuple(parts)
+        except (AttributeError, OSError, TypeError):  # pragma: no cover - defensive
+            return None
+
+    def load(self, session_id: str) -> Optional[HeartbeatState]:
+        fingerprint = self._db_fingerprint()
+        if fingerprint is None:
+            # No SessionDB handle to fingerprint: the cache cannot stay
+            # fresh, fall through to the uncached load.
+            return load_heartbeat(session_id)
+        if fingerprint != self._fingerprint:
+            self._fingerprint = fingerprint
+            self._states = {}
+        if session_id in self._states:
+            return self._states[session_id]
+        state = load_heartbeat(session_id)
+        self._states[session_id] = state
+        return state
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Manager — the surface CLI + gateway talk to
 # ──────────────────────────────────────────────────────────────────────
@@ -282,6 +352,7 @@ class HeartbeatManager:
         self,
         session_id: str,
         claim_timeout_seconds: Optional[float] = None,
+        state: Optional[HeartbeatState] = _UNSET_STATE,
     ):
         self.session_id = session_id
         # How long a claimed tick may wait for a turn before it is
@@ -292,7 +363,11 @@ class HeartbeatManager:
             if claim_timeout_seconds is not None
             else _default_claim_timeout_seconds()
         )
-        self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        # state=... lets hot loops (gateway poll) inject a HeartbeatLoadCache
+        # hit and skip the synchronous disk read; anything else loads fresh.
+        if state is _UNSET_STATE:
+            state = load_heartbeat(session_id)
+        self._state: Optional[HeartbeatState] = state
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -397,11 +472,18 @@ class HeartbeatManager:
             return None
         now = now if now is not None else time.time()
         if s.claimed_at is not None:
-            if s.claimed_at < _PROCESS_START_TS:
+            if (
+                s.claimed_at
+                < _PROCESS_START_TS - _PROCESS_START_SKEW_TOLERANCE_SECONDS
+            ):
                 # The claiming process died before confirming/abandoning.
                 # The tick never became a turn — count it missed, surface
                 # the loss, and let the next poll re-claim the still-due
-                # tick instead of silently stalling.
+                # tick instead of silently stalling. (Claims inside the
+                # skew tolerance stay live-process claims: wall-clock
+                # claims recorded after a backwards NTP step can read
+                # slightly older than _PROCESS_START_TS without being
+                # orphans.)
                 logger.warning(
                     "HeartbeatManager: session %s heartbeat tick was claimed at %.0f "
                     "but never confirmed delivered (previous process died mid-handoff); "
@@ -437,11 +519,14 @@ class HeartbeatManager:
         """Record the fire for the in-flight claim after real delivery.
 
         The ONLY place ``fire_count`` and ``last_fired_at`` advance. Call
-        this after the claimed prompt was handed to a live input path (CLI
-        input queue) or consumed by a turn (gateway pending-slot drain).
-        Returns True when a claim was pending; False when there was nothing
-        to confirm (e.g. the claim was already abandoned, or the heartbeat
-        was paused in between — in which case the delivery is ignored).
+        this after the claimed prompt was accepted into a live input path
+        (CLI input queue) or accepted into the live pipeline (gateway, at
+        the turn's acceptance boundary in ``_handle_message`` — turn
+        START, not completion; do NOT move this call post-turn or
+        unconfirmed claims would stall again). Returns True when a claim
+        was pending; False when there was nothing to confirm (e.g. the
+        claim was already abandoned, or the heartbeat was paused in
+        between — in which case the delivery is ignored).
         """
         s = self._state
         if s is None or s.claimed_at is None:

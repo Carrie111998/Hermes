@@ -21565,7 +21565,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # process so the next poll re-claims the tick instead of the
             # heartbeat stalling forever (#92837 orphan-claim recovery).
             try:
-                from hermes_cli.heartbeat import HeartbeatManager, _PROCESS_START_TS
+                from hermes_cli.heartbeat import (
+                    HeartbeatManager,
+                    _PROCESS_START_SKEW_TOLERANCE_SECONDS,
+                    _PROCESS_START_TS,
+                )
 
                 inflight = getattr(self, "_heartbeat_inflight", None)
                 if inflight:
@@ -21575,7 +21579,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if (
                     st is not None
                     and st.claimed_at is not None
-                    and st.claimed_at >= _PROCESS_START_TS
+                    and st.claimed_at
+                    >= _PROCESS_START_TS - _PROCESS_START_SKEW_TOLERANCE_SECONDS
                 ):
                     mgr.abandon_claim(
                         "heartbeat watch (re)registered; prior in-flight "
@@ -21706,7 +21711,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             inflight = {}
             self._heartbeat_inflight = inflight
 
-        from hermes_cli.heartbeat import HeartbeatManager
+        from hermes_cli.heartbeat import HeartbeatLoadCache, HeartbeatManager
+
+        # mtime-checked state cache: each watched session would otherwise
+        # re-read its heartbeat state from SessionDB on every poll (5s) on
+        # the event-loop thread. With the cache, an unchanged poll does
+        # zero reads and a changed DB re-reads each state at most once —
+        # never once per watch per poll.
+        cache = getattr(self, "_heartbeat_load_cache", None)
+        if cache is None:
+            cache = HeartbeatLoadCache()
+            self._heartbeat_load_cache = cache
 
         for quick_key, (source, session_id) in list(watch.items()):
             try:
@@ -21720,7 +21735,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # delivery path, so the persisted state stays truthful.
                     continue
 
-                mgr = HeartbeatManager(session_id=session_id)
+                mgr = HeartbeatManager(session_id=session_id, state=cache.load(session_id))
                 if not mgr.has_heartbeat():
                     watch.pop(quick_key, None)
                     inflight.pop(quick_key, None)

@@ -294,3 +294,63 @@ async def test_busy_session_leaves_staged_tick_in_flight(monkeypatch):
     assert mgr.state.fire_count == 0
     assert mgr.state.claimed_at is not None
     assert key in runner._heartbeat_inflight
+
+
+@pytest.mark.asyncio
+async def test_poll_reuses_cached_state_instead_of_rereading_disk(monkeypatch):
+    """The 5s poll must not re-read heartbeat state from disk per watch.
+
+    Without the mtime-checked cache, each watched session is reloaded from
+    SessionDB on every poll inside the event loop (N reads per poll, every
+    poll). With the cache: the cold poll loads each watch once, a poll that
+    follows a real DB change re-reads each watch exactly once (the state
+    genuinely changed), and a poll where nothing changed does ZERO disk
+    reads regardless of watch count — the O(1) steady state.
+    """
+    import hermes_cli.heartbeat as hb
+
+    runner, adapter, key, _source = _make_runner(monkeypatch)
+    # Three watches sharing the same adapter.
+    runner._heartbeat_watch = {}
+    for chat, sid in (("42", "session-1"), ("43", "session-2"), ("44", "session-3")):
+        src = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat,
+            chat_type="dm",
+            user_id=chat,
+        )
+        runner._heartbeat_watch[build_session_key(src)] = (src, sid)
+        _due_heartbeat(sid, 700)
+
+    real_load = hb.load_heartbeat
+    reads = {"count": 0}
+
+    def counting_load(session_id: str):
+        reads["count"] += 1
+        return real_load(session_id)
+
+    monkeypatch.setattr(hb, "load_heartbeat", counting_load)
+
+    await runner._poll_heartbeat_delivery_accounting_once()
+    # Cold cache: each watched session loaded exactly once.
+    assert reads["count"] == 3
+
+    await runner._poll_heartbeat_delivery_accounting_once()
+    # The previous poll's claims really changed the DB, so each watch is
+    # re-read exactly once — never once per watch per poll.
+    assert reads["count"] == 6
+
+    await runner._poll_heartbeat_delivery_accounting_once()
+    # Stable poll: nothing changed on disk -> ZERO reads for 3 watches
+    # (uncached this would be 3 more reads, every 5s, forever).
+    assert reads["count"] == 6
+
+    # A real state change written through the same SessionDB (this fresh
+    # manager's own load counts as one read).
+    HeartbeatManager(session_id="session-1").pause()
+    assert reads["count"] == 7
+
+    await runner._poll_heartbeat_delivery_accounting_once()
+    # The changed DB fingerprint is detected: exactly one re-read per
+    # watch, then the cache is warm again.
+    assert reads["count"] == 10

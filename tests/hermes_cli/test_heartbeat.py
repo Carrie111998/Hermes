@@ -214,7 +214,11 @@ def test_stale_claim_from_previous_process_warns_and_counts_missed(caplog):
     mgr.state.created_at = time.time() - 700
     # Simulate a claim made by a previous process that died before
     # confirming or abandoning it (crash between claim and handoff).
-    mgr.state.claimed_at = hb._PROCESS_START_TS - 60
+    # The claim must sit OUTSIDE the NTP skew tolerance band to read as
+    # an orphan rather than a live-process claim.
+    mgr.state.claimed_at = (
+        hb._PROCESS_START_TS - hb._PROCESS_START_SKEW_TOLERANCE_SECONDS - 60
+    )
     save_heartbeat("hb-stale-sid", mgr.state)
     with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
         assert mgr.due_prompt() is None
@@ -224,6 +228,35 @@ def test_stale_claim_from_previous_process_warns_and_counts_missed(caplog):
     assert mgr.state.fire_count == 0
     # Next poll re-claims the still-due tick.
     assert mgr.due_prompt() is not None
+
+
+def test_ntp_step_back_within_tolerance_keeps_claim_in_flight(caplog, monkeypatch):
+    """A backwards NTP step must not misread live claims as orphans.
+
+    Wall-clock ``_PROCESS_START_TS`` is captured at import. If NTP steps
+    the clock backwards afterwards, a claim recorded by THIS process on
+    the corrected clock can read slightly OLDER than the start marker.
+    Inside the skew tolerance that must stay a live in-flight claim (no
+    spurious "previous process died" warning, no missed_count bump);
+    outside it, the orphan handling still applies (covered above).
+    """
+    import hermes_cli.heartbeat as hb
+
+    # The process "started" 30s in the future of the claim: the import
+    # happened on the old, ahead clock before the backwards step.
+    monkeypatch.setattr(hb, "_PROCESS_START_TS", time.time() + 30)
+    mgr = HeartbeatManager(session_id="hb-ntp-sid", claim_timeout_seconds=60)
+    mgr.set("tick", 600)
+    mgr.state.created_at = time.time() - 700
+    mgr.state.claimed_at = time.time() - 10  # 40s < tolerance 120s
+    save_heartbeat("hb-ntp-sid", mgr.state)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.heartbeat"):
+        assert mgr.due_prompt() is None
+    assert "never confirmed" not in caplog.text
+    assert mgr.state.missed_count == 0
+    assert mgr.state.fire_count == 0
+    # The claim stays in flight for the live process to resolve.
+    assert mgr.state.claimed_at is not None
 
 
 def test_resume_reanchors_instead_of_instant_fire():
@@ -381,4 +414,15 @@ def test_cli_confirm_delivery_failure_abandons_claim_instead_of_wedging():
     assert mgr.state.fire_count == 0
     assert mgr.state.missed_count == 1
     assert mgr.state.claimed_at is None
+
+
+def test_confirm_delivery_docstring_states_acceptance_boundary():
+    """Review guard (#92837): confirm_delivery fires at the ACCEPTANCE
+    boundary (turn START for the gateway), not at turn completion. Wording
+    that says "consumed by a turn" invites someone to move the call
+    post-turn and reintroduce stuck claims."""
+    doc = HeartbeatManager.confirm_delivery.__doc__
+    assert doc is not None
+    assert "accepted into the live pipeline" in doc
+    assert "consumed by a turn" not in doc
 
