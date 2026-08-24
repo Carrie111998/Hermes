@@ -30,7 +30,7 @@ import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
-import { type ErrorSurface, formatErrorDiagnostics } from '@/lib/error-surface'
+import { type ErrorSurface, formatErrorDiagnostics, formatUserFacingError } from '@/lib/error-surface'
 import { triggerHaptic } from '@/lib/haptics'
 import {
   AudioLines,
@@ -244,7 +244,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
                 <div className="flex items-start gap-1.5">
                   <div className="min-w-0 flex-1">
                     <ErrorLayerLabel />
-                    <ErrorPrimitive.Message className="min-w-0" />
+                    <VisibleErrorMessage />
                   </div>
                   {onDismissError && (
                     <TooltipIconButton
@@ -470,6 +470,18 @@ const ErrorLayerLabel: FC = () => {
   const label = (surface && labels[surface.layer]) || labels.generic
 
   return <div className="font-medium">{label}</div>
+}
+
+const VisibleErrorMessage: FC = () => {
+  const surface = useAuiState(s => s.message.metadata?.custom?.errorSurface as ErrorSurface | undefined)
+
+  const errorText = useAuiState(s => {
+    const status = s.message.status as { error?: unknown; type?: string } | undefined
+
+    return status?.type === 'incomplete' && typeof status.error === 'string' ? status.error : ''
+  })
+
+  return <div className="min-w-0">{formatUserFacingError(errorText, surface)}</div>
 }
 
 // Isolated because useNavigate() THROWS outside a <Router> (bare test

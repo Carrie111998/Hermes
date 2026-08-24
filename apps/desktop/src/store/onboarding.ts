@@ -185,10 +185,28 @@ async function checkRuntime(ctx: OnboardingContext, requestedProvider?: string):
   })
 }
 
-function shouldPreserveConfiguredOnFallback(runtime: RuntimeReadinessResult, state: DesktopOnboardingState): boolean {
-  // Non-authoritative transport fallback only — keep a previously verified
-  // configured state instead of forcing the blocking onboarding overlay.
-  return runtime.source === 'fallback' && state.configured === true && !state.requested
+function shouldPreserveConfiguredOnRuntimeFailure(
+  runtime: RuntimeReadinessResult,
+  state: DesktopOnboardingState
+): boolean {
+  if (state.configured !== true || state.requested) {
+    return false
+  }
+
+  // A transport-level probe failure is not evidence that a returning install
+  // lost its credentials. Likewise, setup.status=true + runtime_check=false
+  // means Hermes found configured auth but could not resolve the selected
+  // runtime (for example while a named custom provider is being reloaded).
+  // Neither condition can be repaired by sending the user through first-run
+  // API-key setup again. Keep the shell usable and surface runtime recovery as
+  // a non-blocking error instead.
+  //
+  // A concrete missing-credential verdict is different: setup.status may be
+  // true only because some OTHER provider is configured, so the selected
+  // provider still needs the setup flow.
+  const missingSelectedCredential = /No usable credentials found for\b/i.test(runtime.reason ?? '')
+
+  return runtime.source === 'fallback' || (runtime.checksDisagree && !missingSelectedCredential)
 }
 
 function notifyReady(provider: string) {
@@ -551,17 +569,18 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
 
   const state = $desktopOnboarding.get()
 
-  if (shouldPreserveConfiguredOnFallback(runtime, state)) {
-    // Gateway probes timed out but the user was already configured — don't
-    // downgrade to the blocking onboarding overlay. Surface a non-blocking
-    // notification with a stable id so repeated calls during an outage dedup
-    // instead of stacking toasts.
+  if (shouldPreserveConfiguredOnRuntimeFailure(runtime, state)) {
+    // The user was already configured — don't downgrade to the blocking
+    // first-run overlay for a transient gateway failure or a runtime resolver
+    // mismatch. Surface a non-blocking notification with a stable id so
+    // repeated checks during an outage dedup instead of stacking toasts.
     notify({
       id: 'runtime-not-ready',
       kind: 'error',
       title: 'Runtime not ready',
-      message:
-        'Hermes Desktop could not verify the running backend on startup. Some features may be unavailable until the gateway is reachable.'
+      message: runtime.reason
+        ? `Hermes Desktop kept your existing setup, but the selected runtime is unavailable: ${runtime.reason}`
+        : 'Hermes Desktop could not verify the running backend on startup. Some features may be unavailable until the gateway is reachable.'
     })
 
     return false

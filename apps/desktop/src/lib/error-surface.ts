@@ -54,6 +54,51 @@ export function parseErrorSurface(value: unknown): ErrorSurface | null {
   }
 }
 
+/**
+ * Concise copy for the visible error card.
+ *
+ * Provider payloads are intentionally retained verbatim by
+ * formatErrorDiagnostics(), but the transcript should not expose router
+ * internals such as deployment hashes, pre-call flags, or cooldown arrays.
+ * Prefer the structured surface taxonomy and keep the raw string behind
+ * "Copy error details" for diagnosis.
+ */
+export function formatUserFacingError(errorText: string, surface?: ErrorSurface | null): string {
+  const raw = errorText.trim()
+  const retryAfter = raw.match(/try again in\s+(\d+)\s+seconds?/i)?.[1]
+  const wait = retryAfter ? ` Retry is available in ${retryAfter} seconds.` : ''
+
+  if (surface?.layer === 'billing') {
+    return 'This provider has insufficient credits for the request. Hermes can continue on a configured fallback provider.'
+  }
+
+  if (surface?.layer === 'auth') {
+    return 'This provider rejected its credential. Reconnect it in Settings or continue on a configured fallback provider.'
+  }
+
+  if (surface?.code === 'rate_limit' || surface?.code === 'upstream_rate_limit') {
+    return `The selected model is temporarily unavailable.${wait} Hermes can continue on a configured fallback model.`
+  }
+
+  if (surface?.layer === 'streaming') {
+    return `The provider connection ended before the reply completed.${wait}`
+  }
+
+  if (surface?.layer === 'endpoint') {
+    return 'Hermes could not reach the configured model endpoint. Check the endpoint or continue on a configured fallback provider.'
+  }
+
+  // Older backends may not send a structured descriptor. Keep their useful
+  // provider prose while stripping only known router implementation details.
+  const cleaned = raw
+    .replace(/^Error:\s*/i, '')
+    .replace(/^HTTP\s+\d{3}:\s*/i, '')
+    .split(/\s+Passed model=/i, 1)[0]
+    .trim()
+
+  return cleaned || 'The model request failed. Open the error details for diagnostics.'
+}
+
 /** Plain-text error-details blob for the error card's "Copy error details". */
 export function formatErrorDiagnostics(input: {
   appVersion?: string

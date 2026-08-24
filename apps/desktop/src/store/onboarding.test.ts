@@ -64,6 +64,23 @@ function keylessCustomGateway(): OnboardingContext['requestGateway'] {
   }
 }
 
+function unresolvedNamedCustomGateway(): OnboardingContext['requestGateway'] {
+  return async method => {
+    if (method === 'setup.status') {
+      return { provider_configured: true } as never
+    }
+
+    if (method === 'setup.runtime_check') {
+      return {
+        error: "Unknown provider 'custom:litellm-gateway'. Check 'hermes model' for available providers.",
+        ok: false
+      } as never
+    }
+
+    throw new Error(`unexpected gateway method: ${method}`)
+  }
+}
+
 function onboardingContext(requestGateway: OnboardingContext['requestGateway']): OnboardingContext {
   return { requestGateway }
 }
@@ -184,6 +201,37 @@ describe('refreshOnboarding', () => {
       })
     )
     expect($desktopOnboarding.get().configured).toBe(true)
+  })
+
+  it('keeps a returning install out of first-run setup during a named-provider resolver mismatch', async () => {
+    const notifySpy = vi.spyOn(notifications, 'notify')
+    const api = vi.fn()
+
+    installApiMock(api)
+    window.localStorage.setItem('hermes-desktop-onboarded-v1', '1')
+    $desktopOnboarding.set(
+      baseState({
+        configured: true,
+        providers: [makeOAuthProvider('cached')],
+        reason: null,
+        requested: false
+      })
+    )
+
+    const ready = await refreshOnboarding(onboardingContext(unresolvedNamedCustomGateway()))
+
+    expect(ready).toBe(false)
+    expect(api).not.toHaveBeenCalled()
+    expect($desktopOnboarding.get().configured).toBe(true)
+    expect($desktopOnboarding.get().reason).toBeNull()
+    expect(window.localStorage.getItem('hermes-desktop-onboarded-v1')).toBe('1')
+    expect(notifySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'runtime-not-ready',
+        kind: 'error',
+        message: expect.stringContaining("Unknown provider 'custom:litellm-gateway'")
+      })
+    )
   })
 
   it('enters setup when the selected OpenRouter credential is genuinely empty', async () => {

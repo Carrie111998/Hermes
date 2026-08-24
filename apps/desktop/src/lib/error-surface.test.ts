@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { formatErrorDiagnostics, parseErrorSurface } from './error-surface'
+import { formatErrorDiagnostics, formatUserFacingError, parseErrorSurface } from './error-surface'
 
 describe('parseErrorSurface', () => {
   it('accepts a valid descriptor', () => {
@@ -82,5 +82,41 @@ describe('formatErrorDiagnostics', () => {
     expect(text).not.toContain('layer:')
     expect(text).not.toContain('model:')
     expect(text.split('\n').every(line => line.trim().length > 0)).toBe(true)
+  })
+})
+
+describe('formatUserFacingError', () => {
+  it('replaces deployment cooldown internals with actionable rate-limit copy', () => {
+    const raw =
+      "HTTP 429: No deployments available for selected model, Try again in 45 seconds. Passed model=glm-5.3. pre-call-checks=True, cooldown_list=['deployment-hash']"
+
+    const text = formatUserFacingError(raw, {
+      layer: 'provider',
+      code: 'rate_limit',
+      retryable: true
+    })
+
+    expect(text).toContain('temporarily unavailable')
+    expect(text).toContain('45 seconds')
+    expect(text).toContain('configured fallback model')
+    expect(text).not.toContain('deployment-hash')
+    expect(text).not.toContain('pre-call-checks')
+    expect(text).not.toContain('cooldown_list')
+  })
+
+  it('keeps raw provider text in diagnostics while simplifying the visible billing card', () => {
+    const raw = 'HTTP 402: requested 8192 tokens but can only afford 93'
+    const surface = { layer: 'billing', code: 'billing', retryable: false } as const
+
+    expect(formatUserFacingError(raw, surface)).toContain('insufficient credits')
+    expect(formatErrorDiagnostics({ errorText: raw, surface })).toContain(raw)
+  })
+
+  it('strips legacy router internals even without structured metadata', () => {
+    const text = formatUserFacingError(
+      "Error: HTTP 429: No deployments available. Passed model=glm-5.3. pre-call-checks=True, cooldown_list=['secret-ish-id']"
+    )
+
+    expect(text).toBe('No deployments available.')
   })
 })
