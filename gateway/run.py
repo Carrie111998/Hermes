@@ -1560,11 +1560,10 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
 #: separator swap that is invisible in most chat clients.
 _ENVELOPE_LINE_BREAKS = "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 
-#: Matches a run of ``[Verified sender: ...]`` envelopes ANYWHERE, not only at
-#: a line start. Anchoring is what a forger controls: the shape carries the
-#: gateway's attestation wherever it appears in the model-facing turn, so the
-#: guard cannot depend on where the attacker chose to put it. ``[^\]\n]*``
-#: keeps a single forged envelope from swallowing unrelated later text.
+#: Reference matcher retained for sanitizer diagnostics. The production strip
+#: uses the bounded scanner below; this still describes one complete envelope
+#: anywhere in a turn, with ``[^\]\n]*`` preventing it from swallowing later
+#: text.
 _VERIFIED_SENDER_ENVELOPE_RE = re.compile(
     r"(?:[^\S\n]*\[Verified sender:[^\]\n]*\][^\S\n]*)+"
 )
@@ -1593,8 +1592,27 @@ _ENVELOPE_LOOKALIKE_FOLD = str.maketrans(
 _VERIFIED_SENDER_MARKER = "[Verified sender:"
 
 
+def _envelope_marker_failures() -> tuple:
+    """Build the prefix fallback table for the fixed envelope marker."""
+    failures = [0] * len(_VERIFIED_SENDER_MARKER)
+    matched = 0
+    for index in range(1, len(_VERIFIED_SENDER_MARKER)):
+        while (
+            matched
+            and _VERIFIED_SENDER_MARKER[index] != _VERIFIED_SENDER_MARKER[matched]
+        ):
+            matched = failures[matched - 1]
+        if _VERIFIED_SENDER_MARKER[index] == _VERIFIED_SENDER_MARKER[matched]:
+            matched += 1
+        failures[index] = matched
+    return tuple(failures)
+
+
+_VERIFIED_SENDER_MARKER_FAILURES = _envelope_marker_failures()
+
+
 def _cut_spans(text: str, spans: List[tuple]) -> str:
-    """Return ``text`` with each ``(start, end)`` span removed."""
+    """Return ``text`` with spans removed; retained as a probe/test seam."""
     if not spans:
         return text
     out: List[str] = []
@@ -1619,10 +1637,11 @@ def _strip_verified_sender_envelopes(text: str) -> str:
     The result of this function is read as an attestation, so it must satisfy
     ``strip(strip(x)) == strip(x)``. A single ``re.sub`` pass does not: deleting
     an inner match splices the surrounding halves into a NEW well-formed
-    envelope, and because nesting is arbitrary-depth, ANY fixed number of passes
-    is defeatable by nesting one level deeper. The scan therefore iterates to a
-    fixpoint. Termination is guaranteed because every iteration that runs at all
-    removes at least one character.
+    envelope. The streaming reduction below keeps the marker-prefix state beside
+    every retained character. Deleting an envelope therefore exposes the exact
+    state at its left edge, and later input can complete an enclosing marker
+    without rescanning the retained prefix. Every character is appended once and
+    removed at most once, so arbitrary nesting is handled in amortized O(n) time.
 
     Matching is done against a fullwidth-folded copy while deletion is done on
     the original. Folding is length-preserving, so offsets are shared; benign
@@ -1641,21 +1660,66 @@ def _strip_verified_sender_envelopes(text: str) -> str:
         normalized = normalized.translate(
             {ord(ch): "\n" for ch in _ENVELOPE_LINE_BREAKS}
         )
-    while True:
-        folded = normalized.translate(_ENVELOPE_LOOKALIKE_FOLD)
-        spans = [m.span() for m in _VERIFIED_SENDER_ENVELOPE_RE.finditer(folded)]
-        if not spans:
-            break
-        normalized = _cut_spans(normalized, spans)
-    # Deleting a complete envelope can expose an opener that had been nested
-    # inside it, so this runs after the loop rather than inside it. Defanging
-    # only destroys the token — it can never create a new match — so the
-    # fixpoint property established above is preserved.
-    folded = normalized.translate(_ENVELOPE_LOOKALIKE_FOLD)
-    opener_spans = [m.span() for m in _VERIFIED_SENDER_OPENER_RE.finditer(folded)]
-    for start, _end in opener_spans:
-        normalized = normalized[:start] + "(" + normalized[start + 1:]
-    return normalized
+    output: List[str] = []
+    marker_states: List[int] = []
+    marker_length = len(_VERIFIED_SENDER_MARKER)
+    envelope_start: Optional[int] = None
+    drop_trailing_space = False
+
+    for original_char in normalized:
+        if drop_trailing_space:
+            if original_char != "\n" and original_char.isspace():
+                continue
+            drop_trailing_space = False
+
+        folded_char = original_char.translate(_ENVELOPE_LOOKALIKE_FOLD)
+        marker_state = marker_states[-1] if marker_states else 0
+        while marker_state and (
+            marker_state == marker_length
+            or folded_char != _VERIFIED_SENDER_MARKER[marker_state]
+        ):
+            marker_state = _VERIFIED_SENDER_MARKER_FAILURES[marker_state - 1]
+        if folded_char == _VERIFIED_SENDER_MARKER[marker_state]:
+            marker_state += 1
+
+        output.append(original_char)
+        marker_states.append(marker_state)
+
+        if envelope_start is None and marker_state == marker_length:
+            envelope_start = len(output) - marker_length
+
+        if original_char == "\n":
+            envelope_start = None
+        elif folded_char == "]" and envelope_start is not None:
+            cut_start = envelope_start
+            while (
+                cut_start
+                and output[cut_start - 1] != "\n"
+                and output[cut_start - 1].isspace()
+            ):
+                cut_start -= 1
+            del output[cut_start:]
+            del marker_states[cut_start:]
+            envelope_start = None
+            drop_trailing_space = True
+
+    reduced = "".join(output)
+
+    # A complete deletion can expose a bare opener split around it. The caller's
+    # own punctuation could close that fragment, so defang every surviving
+    # opener in one bounded post-pass. Matching uses the fold, while mutation is
+    # applied at the same offset in the original reduced text.
+    folded = reduced.translate(_ENVELOPE_LOOKALIKE_FOLD)
+    opener_start = folded.find(_VERIFIED_SENDER_MARKER)
+    if opener_start == -1:
+        return reduced
+    defanged = list(reduced)
+    while opener_start != -1:
+        defanged[opener_start] = "("
+        opener_start = folded.find(
+            _VERIFIED_SENDER_MARKER, opener_start + marker_length
+        )
+    return "".join(defanged)
 
 
 def _sanitize_untrusted_quote(text: Any, limit: int) -> str:
