@@ -119,9 +119,9 @@ hermes doctor       # Diagnose any issues
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
 
-To admit tool calls before they run, hook the tool dispatcher once with npm [`barycenters`](https://www.npmjs.com/package/barycenters) (`bary.govern` / `admit`, shadow default).
-MCP is a side door: Streamable HTTP at `https://barycenters-admit.fly.dev/mcp/` (tools `admit`, `check_readiness`).
-Lifecycle (pack → instantiate → charter → bind): [barycenters.ai](https://barycenters.ai)
+Wrap the tool executor once with npm [`barycenters`](https://www.npmjs.com/package/barycenters) (`bary.govern`) — zero-dep JS SDK; shadow records `wouldBlock`, enforce throws `RefusedError`.
+MCP at `https://barycenters-admit.fly.dev/mcp/` is a side door (`admit`, `check_readiness`), not a wrap of every Hermes tool.
+See [https://barycenters.ai/adapters](https://barycenters.ai/adapters).
 
 ---
 
