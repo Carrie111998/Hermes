@@ -10,9 +10,51 @@ only after a successful install, so healthy installs stay a cheap no-op).
 
 from __future__ import annotations
 
+import subprocess
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_cli import update_cmd
+
+
+def _current_checkout_git(cmd, **_kwargs):
+    joined = " ".join(str(part) for part in cmd)
+    if "rev-parse --abbrev-ref" in joined:
+        stdout = "main\n"
+    elif "rev-list" in joined:
+        stdout = "0\n"
+    elif "rev-parse --is-shallow-repository" in joined:
+        stdout = "false\n"
+    else:
+        stdout = ""
+    return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+
+def test_current_checkout_branch_wires_config_repair():
+    args = SimpleNamespace(
+        yes=True,
+        branch=None,
+        force=False,
+        force_venv=False,
+        no_backup=True,
+        backup=False,
+    )
+    with (
+        patch.object(update_cmd.subprocess, "run", side_effect=_current_checkout_git),
+        patch.object(update_cmd, "_run_pre_update_backup"),
+        patch.object(update_cmd, "_pause_windows_gateways_for_update", return_value=None),
+        patch.object(update_cmd, "_resume_windows_gateways_after_update"),
+        patch.object(update_cmd, "_detect_venv_python_processes", return_value=[]),
+        patch.object(update_cmd, "_venv_core_imports_healthy", return_value=(True, "")),
+        patch.object(update_cmd, "_repair_node_deps_on_current_checkout") as repair_node,
+        patch.object(update_cmd, "_repair_config_on_current_checkout") as repair_config,
+        patch("hermes_cli.managed_uv.update_managed_uv"),
+        patch("hermes_cli.managed_uv.ensure_uv"),
+    ):
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+    repair_node.assert_called_once()
+    repair_config.assert_called_once_with()
 
 
 def test_current_checkout_repairs_failed_node_deps(capsys):
@@ -42,3 +84,41 @@ def test_current_checkout_healthy_node_deps_reports_up_to_date():
     # The refresh pairs with the web build like every other call site.
     m.return_value._build_web_ui.assert_called_once()
     completion.assert_called_once_with("✓ Already up to date!")
+
+
+def test_current_checkout_migrates_config_from_already_pulled_code(capsys):
+    """An interrupted-install retry must not leave old config unbootable."""
+    with (
+        patch.object(update_cmd, "_run_config_check_fresh", return_value=(37, 38)),
+        patch.object(
+            update_cmd,
+            "_run_migrate_config_fresh",
+            return_value={"config_added": [], "warnings": []},
+        ) as migrate,
+    ):
+        update_cmd._repair_config_on_current_checkout()
+
+    migrate.assert_called_once_with(interactive=False, quiet=True)
+    assert "Updating config format (v37 → v38)" in capsys.readouterr().out
+
+
+def test_current_checkout_skips_config_migration_when_current(capsys):
+    with (
+        patch.object(update_cmd, "_run_config_check_fresh", return_value=(38, 38)),
+        patch.object(update_cmd, "_run_migrate_config_fresh") as migrate,
+    ):
+        update_cmd._repair_config_on_current_checkout()
+
+    migrate.assert_not_called()
+    assert "Configuration is up to date" in capsys.readouterr().out
+
+
+def test_current_checkout_config_migration_failure_is_actionable(capsys):
+    with patch.object(
+        update_cmd, "_run_config_check_fresh", side_effect=RuntimeError("broken")
+    ):
+        update_cmd._repair_config_on_current_checkout()
+
+    out = capsys.readouterr().out
+    assert "Config format update failed: broken" in out
+    assert "hermes config migrate" in out
