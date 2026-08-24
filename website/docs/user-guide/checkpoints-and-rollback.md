@@ -251,10 +251,37 @@ Restore just one file from a checkpoint without affecting the rest of the direct
   │   ├── projects/<hash>.json  # workdir + created_at + last_touch
   │   └── info/exclude
   ├── .last_prune            # auto-prune idempotency marker
+  ├── store.current          # OPTIONAL: pointer to the active generation
+  ├── store.<UTC ts>/        # OPTIONAL: verified recovery generations
   └── legacy-<ts>/           # archived pre-v2 per-project shadow repos
 ```
 
 Each `<hash>` is derived from the absolute path of the working directory. You normally never need to touch these manually — use `hermes checkpoints status` / `prune` / `clear` instead.
+
+### Atomic store activation (advanced)
+
+If the shared store ever becomes structurally damaged, an offline repair tool
+can produce a verified candidate copy — but replacing the live multi-gigabyte
+`store/` directory in place fails on some filesystems (e.g. FUSE overlays) and
+leaves a window where the canonical path does not exist. Instead, activate the
+repaired copy as a *generation* with one atomic metadata write:
+
+```bash
+# Copy the verified candidate into store.<UTC ts>/ and point store.current at it.
+hermes checkpoints activate /path/to/repaired-store-copy
+
+# Inspect what is active and what generations exist:
+hermes checkpoints status
+
+# Roll back to the original store/ at any time (generations are kept):
+hermes checkpoints deactivate
+```
+
+Without a `store.current` file, behaviour is exactly the classic layout —
+nothing changes for existing installations. A malformed `store.current` never
+silently falls back to `store/`: checkpointing refuses to run until the
+pointer is fixed or removed, so a damaged generation can't be swapped for a
+suspect legacy one by accident.
 
 ### Migration from v1
 

@@ -23,6 +23,10 @@ Storage layout (single shared store, git objects deduplicated across projects)
         .last_prune                     — auto-prune idempotency marker
         legacy-<timestamp>/             — archived pre-v2 per-project shadow
                                           repos (auto-migrated on first init)
+        store.current                   — OPTIONAL one-line pointer naming the
+                                          active generation (atomic activation)
+        store.YYYYMMDDTHHMMSSZ/         — OPTIONAL verified store generations;
+                                          the pointer decides which is live
 
 Why a single store?
 -------------------
@@ -78,6 +82,38 @@ _INDEXES_DIRNAME = "indexes"
 _PROJECTS_DIRNAME = "projects"
 _LEDGERS_DIRNAME = "ledgers"
 _LEGACY_PREFIX = "legacy-"
+
+# Atomic store activation (#93314): an optional pointer file naming the
+# active store *generation* — a verified sibling copy of the shared store.
+# Absent pointer = legacy behaviour (``store/`` is canonical).  The pointer
+# lets a repaired store be activated without moving/renaming the live
+# multi-gigabyte directory, which is exactly the operation that fails on
+# exotic filesystems (e.g. FUSE overlays).
+_STORE_SELECTOR_NAME = "store.current"
+# ``store.<UTC timestamp>`` — strict pattern, so the resolved target can never
+# escape the checkpoint base and legacy/migration sweeps can recognise our
+# generations by name alone.
+_GENERATION_NAME_RE = re.compile(r"^store\.\d{8}T\d{6}Z$")
+# Refuse further activations once this many generations exist: recovery
+# copies are operator-managed state, so growth must be an explicit decision
+# (dispose of old ones first), never silent disk creep.
+_MAX_STORE_GENERATIONS = 8
+
+
+class CheckpointStoreSelectorError(Exception):
+    """The ``store.current`` selector is present but not safely resolvable.
+
+    Raised instead of silently falling back to the legacy ``store/`` path:
+    a broken selector most likely means an interrupted or corrupted
+    activation of a repaired generation, and quietly re-pointing Hermes at
+    the (possibly damaged) legacy store would defeat the whole recovery.
+    Callers degrade to "checkpoints unavailable" rather than guess.
+    """
+
+
+def _is_generation_name(name: str) -> bool:
+    return bool(_GENERATION_NAME_RE.match(name))
+
 
 # Agent-write ledger cap: newest entries retained per project.
 _LEDGER_MAX_ENTRIES = 2000
@@ -208,9 +244,84 @@ def _project_hash(working_dir: str) -> str:
     return hashlib.sha256(abs_path.encode()).hexdigest()[:16]
 
 
+def _read_store_selector(base: Path) -> Optional[str]:
+    """Read the ``store.current`` pointer and return the generation name.
+
+    Returns ``None`` when the pointer is absent (legacy layout).  Raises
+    :class:`CheckpointStoreSelectorError` when the pointer exists but cannot
+    be trusted: wrong type (symlink/dir/unreadable), not exactly one strict
+    ``store.YYYYMMDDTHHMMSSZ`` token, or naming a missing/symlinked target.
+    """
+    selector = base / _STORE_SELECTOR_NAME
+    try:
+        # Symlink first: ``exists()``/``is_file()`` follow links, and a
+        # pointer must never be an alias into operator-chosen territory.
+        if selector.is_symlink():
+            raise CheckpointStoreSelectorError(
+                f"{selector} must be a regular file, not a symlink"
+            )
+        if not selector.exists():
+            return None
+        if not selector.is_file():
+            raise CheckpointStoreSelectorError(
+                f"{selector} must be a regular file"
+            )
+        raw = selector.read_text(encoding="utf-8")
+    except CheckpointStoreSelectorError:
+        raise
+    except OSError as exc:
+        raise CheckpointStoreSelectorError(
+            f"Cannot read store selector {selector}: {exc}"
+        ) from exc
+    name = raw.strip()
+    if not name or "\n" in name or "\r" in name:
+        raise CheckpointStoreSelectorError(
+            f"Store selector {selector} must contain exactly one generation name"
+        )
+    if not _is_generation_name(name):
+        raise CheckpointStoreSelectorError(
+            f"Store selector {selector} names {name!r}; expected a direct "
+            "generation directory named store.YYYYMMDDTHHMMSSZ"
+        )
+    target = base / name
+    # The strict pattern already pins ``name`` to ``store.<digits>`` shape,
+    # so ``target`` is always an immediate child of ``base``; re-verify the
+    # on-disk reality anyway — a generation is only selectable once it fully
+    # exists as a real directory (never mid-copy, never a symlink).
+    if target.is_symlink() or not target.is_dir():
+        raise CheckpointStoreSelectorError(
+            f"Store selector {selector} points to {target}, which is not an "
+            "existing direct generation directory"
+        )
+    return name
+
+
+def active_generation_name(base: Optional[Path] = None) -> Optional[str]:
+    """Return the active store generation, or None on the legacy layout.
+
+    Raises :class:`CheckpointStoreSelectorError` for an untrustworthy
+    selector — callers that merely want information may catch it.
+    """
+    b = base or CHECKPOINT_BASE
+    return _read_store_selector(b)
+
+
 def _store_path(base: Optional[Path] = None) -> Path:
-    """Return the single shared shadow store path."""
-    return (base or CHECKPOINT_BASE) / _STORE_DIRNAME
+    """Return the shared shadow store path for checkpoint operations.
+
+    With no ``store.current`` pointer this is the legacy fixed path
+    ``(base)/store`` — byte-for-byte the pre-#93314 behaviour.  When a
+    valid pointer exists, the named generation directory is returned so
+    every reader/writer/pruner transparently operates on the activated
+    generation.  An untrustworthy pointer raises
+    :class:`CheckpointStoreSelectorError` (fail closed): silently falling
+    back to the legacy store could resurrect a damaged generation.
+    """
+    b = base or CHECKPOINT_BASE
+    generation = _read_store_selector(b)
+    if generation is None:
+        return b / _STORE_DIRNAME
+    return b / generation
 
 
 def _shadow_repo_path(working_dir: str) -> Path:  # pragma: no cover — kept for BC
@@ -438,13 +549,16 @@ def _migrate_legacy_store(base: Path) -> Optional[Path]:
     """
     if not base.exists():
         return None
-    store = _store_path(base)
     legacy_root: Optional[Path] = None
-    # Reserved top-level entries managed by v2.
-    reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME}
+    # Reserved top-level entries managed by v2.  ``store.current`` and
+    # generation dirs (``store.<ts>``) belong to the atomic-activation
+    # layout (#93314) — archiving either would orphan the activated store.
+    reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME, _STORE_SELECTOR_NAME}
     for child in list(base.iterdir()):
         name = child.name
         if name in reserved or name.startswith(_LEGACY_PREFIX):
+            continue
+        if _is_generation_name(name):
             continue
         # Candidate: pre-v2 shadow repo (has HEAD) OR stray dir.  Either way
         # we archive it so v2 starts clean.
@@ -462,7 +576,6 @@ def _migrate_legacy_store(base: Path) -> Optional[Path]:
         except OSError as exc:
             logger.warning("Could not archive legacy checkpoint %s: %s", child, exc)
     # If the store still hasn't been created, create it here.
-    _ = store
     if legacy_root is not None:
         logger.info(
             "Migrated pre-v2 checkpoint repos to %s. "
@@ -670,6 +783,11 @@ def _pre_v2_shadow_repos(base: Path) -> List[Dict]:
             continue
         if child.name == _STORE_DIRNAME or child.name.startswith(_LEGACY_PREFIX):
             continue
+        # Activated store generations (#93314) are v2 shared stores, never
+        # pre-v2 per-project shadow repos — exclude them from the orphan
+        # scan so a generation is never offered for deletion.
+        if _is_generation_name(child.name):
+            continue
         if not (child / "HEAD").exists():
             continue
         workdir: Optional[str] = None
@@ -840,7 +958,10 @@ class CheckpointManager:
             return {"success": False, "error": hash_err}
 
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        try:
+            store = _store_path(CHECKPOINT_BASE)
+        except CheckpointStoreSelectorError as exc:
+            return {"success": False, "error": f"Checkpoint store unavailable: {exc}"}
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
 
@@ -930,7 +1051,11 @@ class CheckpointManager:
     def list_checkpoints(self, working_dir: str) -> List[Dict]:
         """List available checkpoints for a directory (most recent first)."""
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        try:
+            store = _store_path(CHECKPOINT_BASE)
+        except CheckpointStoreSelectorError as exc:
+            logger.warning("Checkpoint list unavailable: %s", exc)
+            return []
 
         if not (store / "HEAD").exists():
             return []
@@ -977,7 +1102,11 @@ class CheckpointManager:
         entry carries the extra ``workdir`` key so callers can label which
         project a checkpoint belongs to.
         """
-        store = _store_path(CHECKPOINT_BASE)
+        try:
+            store = _store_path(CHECKPOINT_BASE)
+        except CheckpointStoreSelectorError as exc:
+            logger.warning("Checkpoint list unavailable: %s", exc)
+            return []
         if not (store / "HEAD").exists():
             return []
         results: List[Dict] = []
@@ -1011,7 +1140,10 @@ class CheckpointManager:
             return {"success": False, "error": hash_err}
 
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        try:
+            store = _store_path(CHECKPOINT_BASE)
+        except CheckpointStoreSelectorError as exc:
+            return {"success": False, "error": f"Checkpoint store unavailable: {exc}"}
 
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -1111,7 +1243,10 @@ class CheckpointManager:
             if path_err:
                 return {"success": False, "error": path_err}
 
-        store = _store_path(CHECKPOINT_BASE)
+        try:
+            store = _store_path(CHECKPOINT_BASE)
+        except CheckpointStoreSelectorError as exc:
+            return {"success": False, "error": f"Checkpoint store unavailable: {exc}"}
 
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -1231,7 +1366,11 @@ class CheckpointManager:
 
     def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
-        store = _store_path(CHECKPOINT_BASE)
+        try:
+            store = _store_path(CHECKPOINT_BASE)
+        except CheckpointStoreSelectorError as exc:
+            logger.warning("Checkpoint store unavailable: %s", exc)
+            return False
 
         err = _init_store(store, working_dir)
         if err:
@@ -1787,6 +1926,12 @@ def prune_checkpoints(
             continue
         if child.name == _STORE_DIRNAME:
             continue
+        # Activated store generations (#93314): never swept by name-based
+        # retention.  The ACTIVE generation holds live checkpoint data and
+        # even inactive ones are operator-managed recovery state — deleting
+        # a verified repaired copy on an mtime rule would defeat the point.
+        if _is_generation_name(child.name):
+            continue
         if child.name.startswith(_LEGACY_PREFIX):
             # Legacy archive: prune by dir mtime using same retention rule.
             if retention_days <= 0:
@@ -1856,7 +2001,15 @@ def prune_checkpoints(
             logger.warning("Failed to prune checkpoint repo %s: %s", child.name, exc)
 
     # --- v2 shared store: per-project ref pruning via metadata ---
-    store = _store_path(base)
+    try:
+        store = _store_path(base)
+    except CheckpointStoreSelectorError as exc:
+        # Broken pointer: skip v2 ref pruning entirely rather than prune
+        # against a guessed store.  Retention of legacy dirs above already
+        # ran; the error is surfaced via the returned counter and log.
+        logger.warning("checkpoint prune skipped: %s", exc)
+        result["errors"] += 1
+        return result
     if (store / "HEAD").exists():
         for meta in _list_projects(store):
             dir_hash = meta.get("_hash") or ""
@@ -2095,34 +2248,44 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
         "projects": [],
         "pre_v2_projects": [],
         "legacy_archives": [],
+        # Atomic activation (#93314): which generation the pointer selects
+        # (None = legacy ``store/``) and every generation present.
+        "active_generation": None,
+        "generations": [],
     }
     if not base.exists():
         return out
 
-    store = _store_path(base)
-    if store.exists():
-        out["store_size_bytes"] = _dir_size_bytes(store)
-        if (store / "HEAD").exists():
-            for meta in _list_projects(store):
-                dir_hash = meta.get("_hash") or ""
-                workdir = meta.get("workdir") or ""
-                ref = _ref_name(dir_hash)
-                ok, count_out, _ = _run_git(
-                    ["rev-list", "--count", ref], store, str(base),
-                    allowed_returncodes={128},
-                )
-                try:
-                    commits = int(count_out) if ok else 0
-                except ValueError:
-                    commits = 0
-                out["projects"].append({
-                    "hash": dir_hash,
-                    "workdir": workdir,
-                    "exists": bool(workdir) and Path(workdir).exists(),
-                    "created_at": meta.get("created_at"),
-                    "last_touch": meta.get("last_touch"),
-                    "commits": commits,
-                })
+    try:
+        out["active_generation"] = _read_store_selector(base)
+        store = _store_path(base)
+    except CheckpointStoreSelectorError as exc:
+        out["selector_error"] = str(exc)
+        # Informational surface: still report sizes, anchored on the legacy
+        # layout, so operators can see enough to repair the pointer.
+        store = base / _STORE_DIRNAME
+    out["store_size_bytes"] = _dir_size_bytes(store)
+    if (store / "HEAD").exists():
+        for meta in _list_projects(store):
+            dir_hash = meta.get("_hash") or ""
+            workdir = meta.get("workdir") or ""
+            ref = _ref_name(dir_hash)
+            ok, count_out, _ = _run_git(
+                ["rev-list", "--count", ref], store, str(base),
+                allowed_returncodes={128},
+            )
+            try:
+                commits = int(count_out) if ok else 0
+            except ValueError:
+                commits = 0
+            out["projects"].append({
+                "hash": dir_hash,
+                "workdir": workdir,
+                "exists": bool(workdir) and Path(workdir).exists(),
+                "created_at": meta.get("created_at"),
+                "last_touch": meta.get("last_touch"),
+                "commits": commits,
+            })
     out["project_count"] = len(out["projects"])
 
     out["pre_v2_projects"] = [
@@ -2150,6 +2313,22 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
                 "size_bytes": size,
                 "mtime": mt,
             })
+
+    # Generations present under base (active one first).  These are the
+    # operator-managed recovery copies from atomic activation (#93314);
+    # surfacing them here is what lets an operator (or recovery wrapper)
+    # see what can be activated or disposed of — Hermes itself never
+    # deletes them.
+    generations: List[Dict] = []
+    for child in base.iterdir():
+        if child.is_dir() and _is_generation_name(child.name):
+            generations.append({
+                "name": child.name,
+                "size_bytes": _dir_size_bytes(child),
+                "is_active": bool(out["active_generation"])
+                and child.name == out["active_generation"],
+            })
+    out["generations"] = sorted(generations, key=lambda g: g["name"], reverse=True)
 
     out["total_size_bytes"] = _dir_size_bytes(base)
     return out
@@ -2193,4 +2372,296 @@ def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
             out["deleted"] += 1
         except OSError as exc:
             logger.warning("Could not delete legacy archive %s: %s", child, exc)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Atomic store activation (#93314)
+#
+# Recovery gap: a repaired candidate store could only be activated by
+# renaming/replacing the live ``store/`` directory — a non-atomic,
+# often-failing operation on FUSE/network filesystems, with a window where
+# the canonical path simply does not exist.  Instead, a fully verified
+# sibling *generation* (``store.<UTC ts>``) is activated by flipping one
+# small pointer file (``store.current``) with tmp-write + fsync +
+# ``os.replace`` + parent-dir fsync.  Neither the live store nor any
+# generation is ever moved, overwritten, or deleted by activation, and a
+# failed flip leaves either the old or the new state valid and resolvable.
+# ---------------------------------------------------------------------------
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync of a directory entry (POSIX; no-op failure elsewhere).
+
+    Makes the just-replaced pointer durable across power loss.  Windows
+    cannot open directory fds here — atomicity still comes from
+    ``os.replace``; this only narrows the durability window.
+    """
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_store_selector(base: Path, generation: Optional[str]) -> None:
+    """Atomically point ``store.current`` at ``generation`` (or clear it).
+
+    ``generation=None`` removes the pointer, restoring the legacy layout.
+    Single-syscall ``os.replace``/unlink flip: readers see either the
+    previous or the next selection, never absence-of-file semantics they
+    did not choose.
+    """
+    pointer = base / _STORE_SELECTOR_NAME
+    if generation is None:
+        try:
+            pointer.unlink()
+        except FileNotFoundError:
+            return
+        _fsync_directory(base)
+        return
+    tmp = base / f".{_STORE_SELECTOR_NAME}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(generation)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.replace(tmp, pointer)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    _fsync_directory(base)
+
+
+def _verify_store_generation(store: Path, working_dir: str) -> Optional[str]:
+    """Sanity-check a generation directory. Returns error string or None."""
+    if store.is_symlink() or not store.is_dir():
+        return f"{store} is not a real directory"
+    if not (store / "HEAD").exists():
+        return f"{store} has no HEAD file — not an initialised git store"
+
+    # Isolated-config env (same isolation as every other bare git call):
+    # user global/system config must not influence verification, and fsck
+    # must never be able to prompt.
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+    env["GIT_DIR"] = str(store)
+    for var in ("GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        env.pop(var, None)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    try:
+        result = subprocess.run(
+            ["git", "fsck", "--full"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, timeout=_GIT_TIMEOUT * 4,
+            cwd=working_dir,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"git fsck timed out on {store}"
+    except FileNotFoundError:
+        return "git executable not found"
+    except Exception as exc:  # pragma: no cover — defensive
+        return f"git fsck failed unexpectedly: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return f"git fsck rejected {store}: {detail[:500]}"
+    # Strict pass: dangling-object chatter is normal for a live store, but
+    # the operator's recovery flow demands a *strictly* clean structure
+    # before a candidate becomes canonical (#93314 acceptance criteria).
+    try:
+        strict = subprocess.run(
+            ["git", "fsck", "--full", "--strict", "--no-progress"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, timeout=_GIT_TIMEOUT * 4,
+            cwd=working_dir,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"git fsck --strict timed out on {store}"
+    except Exception as exc:  # pragma: no cover — defensive
+        return f"git fsck --strict failed unexpectedly: {exc}"
+    if strict.returncode != 0:
+        detail = (strict.stderr or strict.stdout or "").strip()
+        return f"git fsck --strict rejected {store}: {detail[:500]}"
+    return None
+
+
+def activate_store_generation(
+    generation_source: Path,
+    checkpoint_base: Optional[Path] = None,
+    verify: bool = True,
+) -> Dict[str, object]:
+    """Activate a verified store copy as the canonical checkpoint store.
+
+    Copies ``generation_source`` (an offline-repaired store candidate) into
+    a new sibling generation ``store.<UTC ts>``, verifies the copy, then
+    flips ``store.current`` to select it — one atomic metadata write, no
+    rename of the live store, deterministic rollback (re-run activation on
+    another candidate, or :func:`deactivate_store_generation`).  Neither
+    the live store nor any generation is moved or deleted.
+
+    Fails closed *before* touching the pointer when anything is off:
+    unreadable/broken current selector, source identical to the live
+    store, copy failure, or verification failure.  In those cases the
+    previous selection stays authoritative and any partial copy is removed.
+
+    Note: file contents, permissions and timestamps are copied verbatim;
+    file *ownership* follows the invoking user (Python cannot chown
+    without privileges) — run the recovery tool as the store owner when
+    that matters (containers: same uid as Hermes).
+
+    Returns ``{"success": bool, ...}``; on success ``generation`` names the
+    activated copy and ``previous`` the prior selection (None = legacy).
+    """
+    base = checkpoint_base or CHECKPOINT_BASE
+    src = Path(generation_source)
+    out: Dict[str, object] = {
+        "success": False,
+        "generation": None,
+        "previous": None,
+        "store": None,
+    }
+
+    # Anchor the rollback state FIRST: a present-but-untrustworthy selector
+    # must block activation rather than be silently replaced.
+    try:
+        previous = _read_store_selector(base)
+    except CheckpointStoreSelectorError:
+        # Current selection exists but cannot be trusted — record it as
+        # unknown; the guard below refuses to overwrite it.
+        previous = None
+    out["previous"] = previous
+    if base.exists() and (base / _STORE_SELECTOR_NAME).exists() \
+            and previous is None:
+        out["error"] = (
+            f"Refusing activation: {base / _STORE_SELECTOR_NAME} exists but "
+            "cannot be trusted — fix or remove it manually first."
+        )
+        return out
+
+    if src.is_symlink() or not src.is_dir():
+        out["error"] = f"Generation source {src} is not a real directory"
+        return out
+
+    # Never re-activate the store that is currently serving traffic.
+    try:
+        current = _store_path(base)
+        if src.resolve() == current.resolve():
+            out["error"] = (
+                f"Refusing activation: {src} is the currently active store"
+            )
+            return out
+    except CheckpointStoreSelectorError as exc:
+        out["error"] = f"Cannot determine the active store: {exc}"
+        return out
+
+    if not base.exists():
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            out["error"] = f"Could not create checkpoint base {base}: {exc}"
+            return out
+
+    # Bounded retention: refuse to grow past the generation cap instead of
+    # silently accumulating multi-gigabyte recovery copies. The operator
+    # disposes of old generations first, then retries.
+    existing = [p.name for p in base.iterdir() if _is_generation_name(p.name)]
+    if len(existing) >= _MAX_STORE_GENERATIONS:
+        out["error"] = (
+            f"Refusing activation: {_MAX_STORE_GENERATIONS} store "
+            "generations already exist — dispose of old ones first "
+            f"(present: {', '.join(sorted(existing))})."
+        )
+        return out
+
+    # Pick a free generation stamp (bump seconds on collisions instead of
+    # suffixing — names must stay inside the strict store.<ts> pattern).
+    gen_name = ""
+    for attempt in range(60):
+        candidate = "store." + time.strftime(
+            "%Y%m%dT%H%M%SZ", time.gmtime(time.time() + attempt),
+        )
+        if not (base / candidate).exists():
+            gen_name = candidate
+            break
+    if not gen_name:
+        out["error"] = "No free generation name under " + str(base)
+        return out
+    target = base / gen_name
+
+    # Copy WITHOUT touching the source; a failed/incomplete copy is never
+    # referenced by the pointer, so it can never be selected.
+    try:
+        shutil.copytree(src, target, symlinks=True)
+    except OSError as exc:
+        out["error"] = f"Copy {src} -> {target} failed: {exc}"
+        shutil.rmtree(target, ignore_errors=True)
+        return out
+
+    if verify:
+        err = _verify_store_generation(target, str(base))
+        if err:
+            out["error"] = err
+            shutil.rmtree(target, ignore_errors=True)
+            return out
+
+    try:
+        _write_store_selector(base, gen_name)
+    except OSError as exc:
+        out["error"] = f"Pointer update failed ({exc}); previous state kept"
+        shutil.rmtree(target, ignore_errors=True)
+        return out
+
+    logger.warning(
+        "Checkpoint store generation %s activated (previous selection: %s)",
+        gen_name, previous or "legacy store/",
+    )
+    out.update({
+        "success": True,
+        "generation": gen_name,
+        "store": str(target),
+    })
+    return out
+
+
+def deactivate_store_generation(
+    checkpoint_base: Optional[Path] = None,
+) -> Dict[str, object]:
+    """Atomically restore the legacy ``store/`` as the canonical store.
+
+    Removes the ``store.current`` pointer after confirming the legacy store
+    actually exists and is initialised — deactivating onto a missing or
+    half-built legacy store would trade a known state for a worse one.
+    Generations are left untouched for later disposal by the operator.
+    """
+    base = checkpoint_base or CHECKPOINT_BASE
+    out: Dict[str, object] = {"success": False}
+    legacy = base / _STORE_DIRNAME
+    if not (legacy / "HEAD").exists():
+        out["error"] = (
+            f"Refusing deactivation: legacy store {legacy} has no HEAD — "
+            "there is no healthy store to fall back to."
+        )
+        return out
+    try:
+        _write_store_selector(base, None)
+    except OSError as exc:
+        out["error"] = f"Could not remove store selector: {exc}"
+        return out
+    out["success"] = True
     return out
