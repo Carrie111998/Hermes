@@ -44,4 +44,4 @@ def test_frozen_benchmark_thresholds_and_reversed_order_determinism():
     assert forward["recall"] == 1.0
     assert forward["average_depth"] <= 6.0
     assert 1 <= len(forward["rows"][-2][0]) <= 3
-    assert len(forward["rows"][-1][0]) == 8
+    assert forward["rows"][-1][0] == []

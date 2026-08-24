@@ -75,7 +75,7 @@ def test_public_shapes_and_privacy_are_unchanged(tmp_path, monkeypatch):
     private_body = "private-body-token"
     credential_value = "credential-value-token"
     environment_value = "environment-value-token"
-    raw_query = "raw-query-token"
+    raw_query = "alpha raw-query-token"
     monkeypatch.setenv("ROUTING_SECRET", environment_value)
     _write_skill(tmp_path, "alpha", body=private_body)
 

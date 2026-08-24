@@ -227,10 +227,7 @@ def test_query_applies_category_filter_before_ranking(tmp_path):
         skills_tool.skills_list(category="devops", query="needle", limit=8)
     )
 
-    assert {skill["name"] for skill in result["skills"]} == {
-        "devops-match",
-        "devops-other",
-    }
+    assert {skill["name"] for skill in result["skills"]} == {"devops-match"}
     assert result["total_candidates"] == 2
 
 
@@ -266,7 +263,7 @@ def test_query_honors_default_and_explicit_limit(tmp_path):
     default = json.loads(skills_tool.skills_list(query="unmatched"))
     explicit = json.loads(skills_tool.skills_list(query="unmatched", limit=3))
 
-    assert default["count"] == 8
+    assert default["count"] == 0
     assert explicit["count"] == 3
     assert default["total_candidates"] == explicit["total_candidates"] == 10
 

@@ -177,15 +177,18 @@ def rank_skills(
         )
         for skill, document in zip(skill_list, canonical_documents)
     }
-    depth = min(max(0, limit), total)
-    if limit == _DEFAULT_LIMIT and scored:
-        if scored[0][1] > 0.0:
-            runner_up = scored[1][1] if len(scored) > 1 else 0.0
-            if runner_up <= 0.0 or scored[0][1] >= runner_up * _STRONG_SCORE_RATIO:
-                exact_name_count = sum(exact_name for exact_name, _, _ in scored)
-                depth = min(depth, max(_STRONG_DEPTH, exact_name_count))
+    rankable = scored
+    if limit == _DEFAULT_LIMIT:
+        rankable = [item for item in scored if item[1] > 0.0]
 
-    for rank, (_, score, document) in enumerate(scored[:depth], start=1):
+    depth = min(max(0, limit), len(rankable))
+    if limit == _DEFAULT_LIMIT and rankable:
+        runner_up = rankable[1][1] if len(rankable) > 1 else 0.0
+        if runner_up <= 0.0 or rankable[0][1] >= runner_up * _STRONG_SCORE_RATIO:
+            exact_name_count = sum(exact_name for exact_name, _, _ in rankable)
+            depth = min(depth, max(_STRONG_DEPTH, exact_name_count))
+
+    for rank, (_, score, document) in enumerate(rankable[:depth], start=1):
         ranked.append({
             "rank": rank,
             "name": document["name"],
