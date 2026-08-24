@@ -12,7 +12,7 @@ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
-import { migrateSessionDraft } from '@/store/composer'
+import { migrateSessionDraft, setComposerDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { openGatewayForAgent, openGatewayForProfile, requestGatewayForAgent } from '@/store/gateway'
 import { $gatewaySwitching } from '@/store/gateway-switch'
@@ -1195,6 +1195,11 @@ export function useSessionActions({
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
         const prefetchPromise = watchWindow ? null : getLatestSessionMessages(storedSessionId, sessionRestScope)
 
+        // The runtime resume is the boundary authority. A sealed-compression
+        // response may return before the REST prefetch, so consume a late
+        // prefetch rejection even when that transcript is intentionally ignored.
+        prefetchPromise?.catch(() => undefined)
+
         let resumeRuntimeBaselineMessages: ChatMessage[] = []
 
         const resumePromise = singleFlightSessionResume(storedSessionId, () =>
@@ -1224,9 +1229,25 @@ export function useSessionActions({
         // keeps it from surfacing as unhandled while the prefetch settles.
         resumePromise.catch(() => undefined)
 
+        const resumed = await resumePromise
+
+        if (!isCurrentResume()) {
+          return
+        }
+
+        if (resumed.compression_boundary) {
+          const resumePrompt = resumed.compression_boundary.resume_prompt?.trim()
+          startFreshSessionDraft()
+          if (resumePrompt) {
+            setComposerDraft(resumePrompt)
+          }
+
+          return
+        }
+
         // Keep both requests concurrent, but do not paint the REST result until
-        // the runtime resume has also settled. An eager prefetch paint followed
-        // by the runtime projection rebuilds large transcripts during resume.
+        // the runtime resume has also settled. The boundary branch above must
+        // win before a poisoned transcript prefetch is awaited or reconciled.
         let prefetchedResult: { messages: SessionMessage[]; session_id?: string } | null = null
 
         try {
@@ -1235,12 +1256,6 @@ export function useSessionActions({
           }
         } catch {
           // Non-fatal: gateway resume below can still hydrate the session.
-        }
-
-        const resumed = await resumePromise
-
-        if (!isCurrentResume()) {
-          return
         }
 
         if (prefetchedResult) {
@@ -1569,6 +1584,7 @@ export function useSessionActions({
       sessionStateByRuntimeIdRef,
       startFreshSessionDraft,
       syncSessionStateToView,
+      setComposerDraft,
       updateSessionState
     ]
   )
