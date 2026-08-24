@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { TRANSLATIONS } from '@/i18n/catalog'
 import { en } from '@/i18n/en'
 
 import { defaultBindings, KEYBIND_ACTIONS, keybindAction } from './actions'
@@ -42,6 +43,19 @@ describe('view.toggleProjects keybind action', () => {
 
   it('has an English label so it renders in the shortcuts panel', () => {
     expect(en.keybinds.actions['view.toggleProjects']).toBe('Collapse / expand all projects')
+  })
+
+  // Locales built with defineLocale inherit missing keys from `en`, but a
+  // locale written as a full literal object does not. Without a label the
+  // shortcuts panel falls back to the raw action id (`view.toggleProjects`),
+  // so assert every shipped locale resolves to real text.
+  it('has a label in every shipped locale', () => {
+    for (const [locale, translations] of Object.entries(TRANSLATIONS)) {
+      const label = translations.keybinds.actions['view.toggleProjects']
+
+      expect(label, `${locale} is missing a view.toggleProjects label`).toBeTruthy()
+      expect(label, `${locale} renders the raw action id`).not.toBe('view.toggleProjects')
+    }
   })
 
   // A duplicate default reads as a permanent conflict in the keybinds panel and

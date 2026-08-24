@@ -305,6 +305,7 @@ export const zh: Translations = {
       'view.toggleStatusbar': '切换状态栏',
       'view.toggleTabStrip': '切换标签',
       'view.showFiles': '显示文件浏览器',
+      'view.toggleProjects': '收起 / 展开全部项目',
       'view.showBrowser': '打开浏览器',
       'view.showTerminal': '显示终端',
       'view.selectionToComposer': '将选区发送到输入框',
