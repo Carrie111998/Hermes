@@ -24,7 +24,7 @@ class _StubAdapter(BasePlatformAdapter):
         cfg = PlatformConfig()
         super().__init__(cfg, Platform.TELEGRAM)
         self._send_results = []   # queue of SendResult to return per call
-        self._send_calls = []     # record of (chat_id, content) sent
+        self._send_calls = []     # record of (chat_id, content, reply_to, metadata) sent
 
     def _next_result(self) -> SendResult:
         if self._send_results:
@@ -32,7 +32,7 @@ class _StubAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id="ok")
 
     async def send(self, chat_id, content, reply_to=None, metadata=None, **kwargs) -> SendResult:
-        self._send_calls.append((chat_id, content))
+        self._send_calls.append((chat_id, content, reply_to, metadata))
         return self._next_result()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -166,6 +166,32 @@ class TestSendWithRetryFallback:
         assert len(adapter._send_calls) == 2
         # Fallback content should be plain-text notice
         assert "plain text" in adapter._send_calls[1][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_private_dm_topic_retries_without_stale_routing(self):
+        """A deleted Telegram DM topic must fall back to the parent DM.
+
+        Retaining the reply anchor or private-topic metadata sends the fallback
+        to the same deleted topic and drops an otherwise completed response.
+        """
+        adapter = _StubAdapter()
+        metadata = {
+            "thread_id": "10802",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "10802",
+        }
+        adapter._send_results = [
+            SendResult(success=False, error="Message thread not found"),
+            SendResult(success=True, message_id="parent_dm_ok"),
+        ]
+
+        result = await adapter._send_with_retry(
+            "chat1", "completed response", reply_to="10782", metadata=metadata,
+        )
+
+        assert result.success
+        assert len(adapter._send_calls) == 2
+        assert adapter._send_calls[1] == ("chat1", "completed response", None, None)
 
 
 # ---------------------------------------------------------------------------

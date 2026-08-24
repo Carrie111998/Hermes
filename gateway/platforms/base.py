@@ -5609,6 +5609,26 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
+        # A private Telegram DM topic can disappear while an agent turn is
+        # running. The normal plain-text fallback below would preserve both
+        # its reply anchor and topic metadata, sending the retry to the same
+        # deleted topic. Route this one recovery attempt to the parent DM.
+        if (
+            "thread not found" in error_str.lower()
+            and isinstance(metadata, dict)
+            and metadata.get("telegram_dm_topic_reply_fallback")
+        ):
+            logger.warning(
+                "[%s] Telegram DM topic vanished; retrying without reply/topic routing",
+                self.name,
+            )
+            return await self.send(
+                chat_id=chat_id,
+                content=content,
+                reply_to=None,
+                metadata=None,
+            )
+
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
