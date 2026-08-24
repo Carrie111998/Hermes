@@ -1707,9 +1707,10 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
 # failed and retrying every call would be wasted work.  The one-shot is
-# scoped to the Hermes home: under profile multiplexing (gateway.
-# multiplex_profiles) each profile has its own config.yaml, so the first
-# profile's bridge must not pin TERMINAL_* for the others (#94200).
+# keyed to the context-local Hermes home override: under profile
+# multiplexing (gateway.multiplex_profiles) each profile runs under its own
+# override, so the first profile's bridge must not pin TERMINAL_* for the
+# others (#94200).
 _terminal_config_bridge_attempted = False
 _terminal_config_bridge_scope: "str | None" = None
 # TERMINAL_* keys the last bridge introduced (not present in os.environ
@@ -1738,19 +1739,22 @@ def _ensure_terminal_env_bridged() -> None:
     keys are preserved. When no terminal section exists, exported/.env values
     keep working unchanged.
 
-    The bridge runs once per Hermes home. Under multiplexed profiles the
-    first terminal call used to pin the first profile's TERMINAL_* into the
-    shared process env — a docker profile bridging first made every later
-    local profile inherit Docker ("sandbox flapping", #94200). On a scope
-    change the keys the previous bridge introduced are unset before
-    re-bridging, so each profile resolves from its own config.
+    The bridge runs once per context-local home override. Under multiplexed
+    profiles the override is the profile boundary (each profile's agents run
+    under its own ``set_hermes_home_override``), and the first terminal call
+    used to pin the first profile's TERMINAL_* into the shared process env —
+    a docker profile bridging first made every later local profile inherit
+    Docker ("sandbox flapping", #94200). When the override changes, the keys
+    the previous bridge introduced are unset before re-bridging, so each
+    profile resolves from its own config. Without an override (single-home
+    CLI/processes) the flag keeps its pure one-shot optimization semantics.
     """
     global _terminal_config_bridge_attempted
     global _terminal_config_bridge_scope, _terminal_config_bridge_keys
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_hermes_home_override
 
-        current_scope = str(get_hermes_home())
+        current_scope = get_hermes_home_override()
     except Exception:
         current_scope = None
     if _terminal_config_bridge_attempted and _terminal_config_bridge_scope == current_scope:

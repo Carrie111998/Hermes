@@ -129,13 +129,21 @@ def test_scope_change_rebridges_instead_of_inheriting_previous_profile(
     (home_a / "config.yaml").write_text("terminal:\n  backend: docker\n")
     (home_b / "config.yaml").write_text("terminal:\n  backend: local\n")
 
-    monkeypatch.setenv("HERMES_HOME", str(home_a))
-    config_a = terminal_tool._get_env_config()
-    assert config_a["env_type"] == "docker"
-    assert os.environ["TERMINAL_ENV"] == "docker"
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    monkeypatch.setenv("HERMES_HOME", str(home_b))
-    config_b = terminal_tool._get_env_config()
+    token_a = set_hermes_home_override(str(home_a))
+    try:
+        config_a = terminal_tool._get_env_config()
+        assert config_a["env_type"] == "docker"
+        assert os.environ["TERMINAL_ENV"] == "docker"
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(str(home_b))
+    try:
+        config_b = terminal_tool._get_env_config()
+    finally:
+        reset_hermes_home_override(token_b)
 
     assert config_b["env_type"] == "local"
     assert os.environ["TERMINAL_ENV"] == "local"
@@ -155,12 +163,20 @@ def test_scope_change_without_terminal_section_drops_bridged_env(
     (home_a / "config.yaml").write_text("terminal:\n  backend: docker\n")
     (home_b / "config.yaml").write_text("agent:\n  max_turns: 5\n")
 
-    monkeypatch.setenv("HERMES_HOME", str(home_a))
-    terminal_tool._get_env_config()
-    assert os.environ["TERMINAL_ENV"] == "docker"
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    monkeypatch.setenv("HERMES_HOME", str(home_b))
-    config_b = terminal_tool._get_env_config()
+    token_a = set_hermes_home_override(str(home_a))
+    try:
+        terminal_tool._get_env_config()
+        assert os.environ["TERMINAL_ENV"] == "docker"
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(str(home_b))
+    try:
+        config_b = terminal_tool._get_env_config()
+    finally:
+        reset_hermes_home_override(token_b)
 
     assert config_b["env_type"] == "local"
 
@@ -171,7 +187,9 @@ def test_same_scope_keeps_one_shot_semantics(monkeypatch, tmp_path):
     home = tmp_path / "single-profile"
     home.mkdir()
     (home / "config.yaml").write_text("terminal:\n  backend: docker\n")
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
 
     import hermes_cli.config as cli_config
 
@@ -183,12 +201,15 @@ def test_same_scope_keeps_one_shot_semantics(monkeypatch, tmp_path):
         return real_apply(env=env, override=override)
 
     monkeypatch.setattr(cli_config, "apply_terminal_config_to_env", _counting_apply)
-    terminal_tool._get_env_config()
-    terminal_tool._get_env_config()
-    terminal_tool._get_env_config()
+    try:
+        terminal_tool._get_env_config()
+        terminal_tool._get_env_config()
+        terminal_tool._get_env_config()
 
-    assert calls["n"] == 1
-    assert os.environ["TERMINAL_ENV"] == "docker"
+        assert calls["n"] == 1
+        assert os.environ["TERMINAL_ENV"] == "docker"
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_handoff_never_unsets_shell_exported_terminal_vars(
@@ -204,10 +225,18 @@ def test_handoff_never_unsets_shell_exported_terminal_vars(
     (home_b / "config.yaml").write_text("agent:\n  max_turns: 5\n")
     monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "shell/image:9")
 
-    monkeypatch.setenv("HERMES_HOME", str(home_a))
-    terminal_tool._get_env_config()
-    monkeypatch.setenv("HERMES_HOME", str(home_b))
-    terminal_tool._get_env_config()
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token_a = set_hermes_home_override(str(home_a))
+    try:
+        terminal_tool._get_env_config()
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(str(home_b))
+    try:
+        terminal_tool._get_env_config()
+    finally:
+        reset_hermes_home_override(token_b)
 
     assert os.environ["TERMINAL_DOCKER_IMAGE"] == "shell/image:9"
 
