@@ -16461,6 +16461,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             plain = {
                 "status": self._handle_status_command,
                 "context": self._handle_context_command,
+                "thread": self._handle_thread_command,
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
@@ -17603,6 +17604,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "thread":
+            return await self._handle_thread_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -18176,6 +18180,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return self._telegram_topic_root_lobby_message()
             return None
 
+        return await self._dispatch_event_to_agent(
+            event,
+            source,
+            _quick_key,
+            is_internal=is_internal,
+        )
+
+    async def _dispatch_event_to_agent(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        *,
+        is_internal: bool = False,
+    ) -> Any:
+        """Run one resolved event through the normal agent-turn pipeline."""
         # ── External-drain new-turn gate (Phase 2) ────────────────────
         # When NAS has engaged an external drain (.drain_request.json present,
         # observed by _drain_control_watcher), refuse to START a new turn so
@@ -18189,7 +18209,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._external_drain_active and not is_internal:
             logger.info(
                 "Refusing new turn for session %s — external drain active.",
-                _quick_key,
+                session_key,
             )
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
@@ -18205,27 +18225,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
         _active_session_lease, _limit_message = self._claim_active_session_slot(
-            _quick_key,
+            session_key,
             source,
         )
         if _limit_message is not None:
             logger.info(
                 "Rejecting new active session %s: max_concurrent_sessions reached",
-                _quick_key,
+                session_key,
             )
             return _limit_message
-        _claim_state = self._session_state(_quick_key)
+        _claim_state = self._session_state(session_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+        _run_generation = self._begin_session_run_generation(session_key)
 
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
-                    event, source, _quick_key, _run_generation
+                    event, source, session_key, _run_generation
                 )
             except TurnLeaseTimeoutError as exc:
                 # This is a rejected message, not a completed agent turn. Return
@@ -18235,7 +18255,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Rejecting turn for routing key %s on session %s after "
                     "turn-lease timeout; transcript load was not started and "
                     "the user must resend",
-                    _quick_key,
+                    session_key,
                     exc.session_id,
                 )
                 return (
@@ -18262,8 +18282,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # permanently (every later message silently fans out through MoA).
             # Putting it in finally guarantees the revert on success, exception,
             # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
+            self._restore_moa_one_shot(event, session_key)
+            self._restore_pending_one_turn_model_override(session_key)
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
             # the next unclean startup's recovery pass.
@@ -18275,11 +18295,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            self._release_running_agent_state(session_key)
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            self._release_turn_lease(session_key, _run_generation)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -21211,6 +21231,129 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+
+    async def _handle_thread_command(self, event: MessageEvent) -> Any:
+        """Start a Feishu thread-scoped turn or reset the current thread.
+
+        A command typed in a parent chat creates a native Feishu topic rooted
+        at that command and retargets the agent turn to the new deterministic
+        session key. Inside an existing topic, it resets only that topic's
+        Hermes session before running the supplied prompt.
+        """
+        source = event.source
+        if source.platform != Platform.FEISHU:
+            return "/thread is currently supported only on Feishu."
+
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return "Usage: /thread <prompt>"
+
+        adapter = self._adapter_for_source(source)
+        original_session_key = self._session_key_for_source(source)
+        original_message_id = getattr(event, "message_id", None)
+        thread_source = source
+        seed_message_id: Optional[str] = None
+
+        if source.thread_id:
+            thread_key = self._session_key_for_source(source)
+            if self._is_session_running(thread_key):
+                await self._interrupt_and_clear_session(
+                    thread_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="thread_command",
+                )
+            # Reset only this topic. The /new notice is intentionally hidden;
+            # the next visible final should answer the supplied prompt.
+            await self._handle_reset_command(dataclasses.replace(event, text="/new"))
+        else:
+            create_thread = getattr(adapter, "create_thread", None) if adapter else None
+            if create_thread is None:
+                return (
+                    "Feishu /thread is unavailable: adapter does not support "
+                    "thread creation."
+                )
+            if not original_message_id:
+                return "Feishu /thread requires a message id to create a thread."
+
+            result = await create_thread(
+                source.chat_id,
+                "⏳",
+                reply_to=str(original_message_id),
+            )
+            if not getattr(result, "success", False):
+                return (
+                    "Failed to create Feishu thread: "
+                    f"{getattr(result, 'error', 'unknown error')}"
+                )
+            thread_id = getattr(result, "thread_id", None) or getattr(
+                result, "message_id", None
+            )
+            if not thread_id:
+                return (
+                    "Failed to create Feishu thread: response did not include "
+                    "a thread id."
+                )
+
+            created_message_id = getattr(result, "message_id", None)
+            seed_message_id = (
+                str(created_message_id) if created_message_id is not None else None
+            )
+            thread_source = dataclasses.replace(
+                source,
+                thread_id=str(thread_id),
+                parent_chat_id=source.chat_id,
+                # Preserve the user command as the durable reply anchor. The
+                # temporary bot seed is deleted after the turn.
+                message_id=str(original_message_id),
+            )
+            release_retargeted = getattr(
+                adapter, "release_retargeted_session_guard", None
+            )
+            if release_retargeted is not None:
+                release_retargeted(original_session_key)
+
+        event.text = prompt
+        event.message_type = MessageType.TEXT
+        event.source = thread_source
+        # Keep routing anchored to the user command without injecting the
+        # prompt a second time as synthetic reply context for the model.
+        event.reply_to_message_id = (
+            str(original_message_id) if original_message_id else None
+        )
+        event.reply_to_text = None
+        event.reply_to_author_id = None
+        event.reply_to_author_name = None
+        event.reply_to_is_own_message = False
+
+        thread_key = self._session_key_for_source(thread_source)
+        try:
+            return await self._dispatch_event_to_agent(
+                event,
+                thread_source,
+                thread_key,
+            )
+        finally:
+            # The seed exists only to ask Feishu for a native topic id. Cleanup
+            # is best-effort and must never suppress or replace final delivery.
+            if seed_message_id and adapter is not None:
+                delete_message = getattr(adapter, "delete_message", None)
+                if delete_message is not None:
+                    try:
+                        deleted = await delete_message(source.chat_id, seed_message_id)
+                    except Exception as exc:
+                        deleted = False
+                        logger.warning(
+                            "Feishu /thread seed delete failed for %s: %s",
+                            seed_message_id,
+                            exc,
+                            exc_info=True,
+                        )
+                    if not deleted:
+                        logger.warning(
+                            "Feishu /thread seed delete failed for %s",
+                            seed_message_id,
+                        )
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str

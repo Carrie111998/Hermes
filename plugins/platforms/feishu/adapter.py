@@ -95,6 +95,7 @@ CreateImageRequest = None  # type: ignore[assignment]
 CreateImageRequestBody = None  # type: ignore[assignment]
 CreateMessageRequest = None  # type: ignore[assignment]
 CreateMessageRequestBody = None  # type: ignore[assignment]
+DeleteMessageRequest = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
@@ -1400,6 +1401,7 @@ def _load_lark_oapi() -> bool:
                 CreateFileRequest, CreateFileRequestBody,
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
+                DeleteMessageRequest,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
@@ -1425,6 +1427,7 @@ def _load_lark_oapi() -> bool:
             "CreateImageRequestBody": CreateImageRequestBody,
             "CreateMessageRequest": CreateMessageRequest,
             "CreateMessageRequestBody": CreateMessageRequestBody,
+            "DeleteMessageRequest": DeleteMessageRequest,
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
@@ -1487,6 +1490,14 @@ class FeishuAdapter(BasePlatformAdapter):
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Keep completed Feishu replies below their progress messages."""
+        return True
+
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
@@ -1538,6 +1549,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_drain_scheduled = False
         self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
         self._chat_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
+        # Thread creation gets a dedicated per-chat lock because handle_message()
+        # releases _chat_locks after scheduling ordinary work. Without this
+        # narrower lock, two fast /thread launches can overlap at the API seam.
+        self._thread_creation_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
@@ -2012,6 +2027,48 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def create_thread(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Create a Feishu topic by replying with ``reply_in_thread``."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not reply_to:
+            return SendResult(
+                success=False,
+                error="Feishu /thread requires a source message id",
+            )
+
+        # Keep the platform call linear per visible parent conversation. Each
+        # result remains paired with its own command message even when users
+        # launch multiple isolated threads in quick succession.
+        creation_lock = self._get_thread_creation_lock(chat_id)
+        async with creation_lock:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            seed_chunk = chunks[0] if chunks else formatted
+            msg_type, payload = self._build_outbound_payload(seed_chunk)
+            try:
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type=msg_type,
+                    payload=payload,
+                    reply_to=reply_to,
+                    metadata={**(metadata or {}), "thread_id": "__create__"},
+                )
+                result = self._finalize_send_result(response, "create_thread failed")
+                if result.success and not result.thread_id:
+                    result.thread_id = result.message_id
+                return result
+            except Exception as exc:
+                logger.error("[Feishu] create_thread error: %s", exc, exc_info=True)
+                return SendResult(success=False, error=str(exc))
+
     async def edit_message(
         self,
         chat_id: str,
@@ -2046,6 +2103,32 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a temporary seed or stale streaming preview."""
+        if not self._client or not message_id:
+            return False
+        try:
+            request = self._build_delete_message_request(message_id)
+            response = await self._run_blocking(
+                self._client.im.v1.message.delete,
+                request,
+            )
+            if self._response_succeeded(response):
+                return True
+            logger.warning(
+                "[Feishu] Failed to delete message %s: %s",
+                message_id,
+                getattr(response, "msg", None) or "delete failed",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] Failed to delete message %s: %s",
+                message_id,
+                exc,
+                exc_info=True,
+            )
+        return False
 
     # Template attrs for the shared _format_exec_approval core. The card
     # header carries the title, so the text core starts at the code fence.
@@ -3114,6 +3197,21 @@ class FeishuAdapter(BasePlatformAdapter):
     # Per-chat serialization and typing indicator
     # =========================================================================
 
+    def _get_thread_creation_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return the bounded per-chat lock for Feishu topic creation."""
+        lock = self._thread_creation_locks.get(chat_id)
+        if lock is not None:
+            self._thread_creation_locks.move_to_end(chat_id)
+            return lock
+        if len(self._thread_creation_locks) >= self.CHAT_LOCK_MAX_SIZE:
+            for key in list(self._thread_creation_locks):
+                if not self._thread_creation_locks[key].locked():
+                    self._thread_creation_locks.pop(key)
+                    break
+        lock = asyncio.Lock()
+        self._thread_creation_locks[chat_id] = lock
+        return lock
+
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Return (creating if needed) the per-chat asyncio.Lock for serial message processing.
 
@@ -3385,6 +3483,7 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+            message_id=message_id,
         )
         normalized = MessageEvent(
             text=text,
@@ -4895,6 +4994,10 @@ class FeishuAdapter(BasePlatformAdapter):
         return SendResult(
             success=True,
             message_id=self._extract_response_field(response, "message_id"),
+            thread_id=(
+                self._extract_response_field(response, "thread_id")
+                or self._extract_response_field(response, "root_id")
+            ),
             raw_response=response,
         )
 
@@ -5155,6 +5258,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
         return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_delete_message_request(message_id: str) -> Any:
+        if DeleteMessageRequest is not None:
+            return DeleteMessageRequest.builder().message_id(message_id).build()
+        return SimpleNamespace(message_id=message_id)
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:

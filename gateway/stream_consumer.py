@@ -2436,14 +2436,36 @@ class GatewayStreamConsumer:
         try:
             if self._message_id is not None:
                 if self._edit_supported:
+                    _needs_fresh_final = False
+                    if finalize:
+                        # Resolve adapter preference before the identical-text
+                        # fast path. Fresh-final adapters must still replace a
+                        # fully flushed preview with a new bottom message.
+                        _has_prefers_hook = (
+                            hasattr(
+                                type(self.adapter),
+                                "prefers_fresh_final_streaming",
+                            )
+                            or "prefers_fresh_final_streaming"
+                            in getattr(self.adapter, "__dict__", {})
+                        )
+                        _prefers_fresh = self._adapter_prefers_fresh_final(text)
+                        _needs_fresh_final = (
+                            _prefers_fresh
+                            or (
+                                not _has_prefers_hook
+                                and self._should_send_fresh_final()
+                            )
+                        )
                     # Skip if text is identical to what we last sent.
-                    # Exception: adapters that require an explicit finalize
-                    # call (REQUIRES_EDIT_FINALIZE) must still receive the
-                    # finalize=True edit even when content is unchanged, so
-                    # their streaming UI can transition out of the in-
-                    # progress state.  Everyone else short-circuits.
+                    # Explicit-finalize and fresh-final adapters still need the
+                    # final tick even when the complete preview is on screen.
                     if text == self._last_sent_text and not (
-                        finalize and self._adapter_requires_finalize
+                        finalize
+                        and (
+                            self._adapter_requires_finalize
+                            or _needs_fresh_final
+                        )
                     ):
                         return True
                     # Fresh-final for long-lived previews: when finalizing
@@ -2479,22 +2501,9 @@ class GatewayStreamConsumer:
                     # __dict__ for test doubles that explicitly assign the
                     # attribute (e.g. adapter.prefers_fresh_final_streaming
                     # = MagicMock(return_value=False)).
-                    _has_prefers_hook = (
-                        hasattr(type(self.adapter),
-                                "prefers_fresh_final_streaming")
-                        or "prefers_fresh_final_streaming"
-                            in getattr(self.adapter, "__dict__", {})
-                    )
-                    _prefers_fresh = self._adapter_prefers_fresh_final(text)
                     if (
                         finalize
-                        and (
-                            _prefers_fresh
-                            or (
-                                not _has_prefers_hook
-                                and self._should_send_fresh_final()
-                            )
-                        )
+                        and _needs_fresh_final
                         and await self._try_fresh_final(
                             text, is_turn_final=is_turn_final,
                         )
