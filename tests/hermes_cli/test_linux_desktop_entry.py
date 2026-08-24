@@ -334,6 +334,65 @@ def test_exec_uses_known_wrapper_when_path_lookup_misses(
     assert exec_line == f"{known_wrapper} desktop"
 
 
+@pytest.mark.parametrize(
+    ("layout", "env_overrides", "expected"),
+    [
+        pytest.param(
+            "user",
+            {},
+            "HOME-SET-BY-TEST/.local/bin/hermes",
+            id="user-layout",
+        ),
+        pytest.param(
+            "termux",
+            {"PREFIX": "PREFIX-SET-BY-TEST"},
+            "PREFIX-SET-BY-TEST/bin/hermes",
+            id="termux-prefix-first",
+        ),
+        pytest.param(
+            "root-fhs",
+            {"__EUID0__": "1"},
+            "/usr/local/bin/hermes",
+            id="root-fhs",
+        ),
+    ],
+)
+def test_known_wrapper_candidates_cover_installer_layouts(
+    layout, env_overrides, expected, monkeypatch
+):
+    """_known_wrapper_candidates mirrors get_command_link_dir() layouts.
+
+    Termux ($PREFIX/bin) outranks everything; root FHS (/usr/local/bin)
+    applies only to euid 0; the user layout (~/.local/bin) is always a
+    candidate. Locking these in protects against silent regressions in
+    the stripped-PATH probe path.
+    """
+    import os
+
+    sentinel_home = tmp_path_mark = "/home/__sentinel_home__"
+    monkeypatch.setenv("HOME", sentinel_home)
+    for key, value in env_overrides.items():
+        if key == "__EUID0__":
+            monkeypatch.setattr(lde.os, "geteuid", lambda: 0 if value == "1" else 1000)
+        else:
+            monkeypatch.setenv(key, value)
+
+    candidates = [str(c) for c in lde._known_wrapper_candidates()]
+
+    expected_resolved = expected.replace("HOME-SET-BY-TEST", sentinel_home)
+    assert expected_resolved in candidates
+    if layout == "termux":
+        # PREFIX outranks the user layout.
+        assert candidates[0] == expected_resolved
+    if layout == "root-fhs":
+        # Root FHS outranks the user layout.
+        assert candidates.index("/usr/local/bin/hermes") < candidates.index(
+            f"{sentinel_home}/.local/bin/hermes"
+        )
+    else:
+        assert "/usr/local/bin/hermes" not in candidates or (os.geteuid() == 0)
+
+
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr(
