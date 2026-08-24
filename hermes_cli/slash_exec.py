@@ -323,7 +323,8 @@ def _exec_cron(ctx: CommandContext) -> CommandReply:
     except ValueError:
         return CommandReply(
             "Usage: /cron list [--all]\n"
-            "Gateway /cron is read-only; use the CLI for create/edit/pause/run/remove.",
+            "Gateway /cron is read-only; use the CLI for "
+            "add/create/edit/pause/resume/run/remove.",
             format="markdown",
         )
 
@@ -338,7 +339,8 @@ def _exec_cron(ctx: CommandContext) -> CommandReply:
     else:
         return CommandReply(
             "Gateway /cron is read-only.\n"
-            "Use /cron list [--all] here, or use the CLI for create/edit/pause/run/remove.",
+            "Use /cron list [--all] here, or use the CLI for "
+            "add/create/edit/pause/resume/run/remove.",
             data={"blocked_subcommand": subcommand},
             format="markdown",
         )

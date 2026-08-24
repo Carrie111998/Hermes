@@ -1752,15 +1752,24 @@ class GatewaySlashCommandsMixin:
         """Handle gateway /cron — read-only cron job listing."""
         from hermes_cli.slash_exec import CommandContext, execute_command
 
-        reply = execute_command(
-            "cron",
-            CommandContext(
-                surface="gateway",
-                args=event.get_command_args(),
-                options={"max_chars": 3800},
-            ),
-        )
-        return reply.text
+        def _execute() -> str:
+            return execute_command(
+                "cron",
+                CommandContext(
+                    surface="gateway",
+                    args=event.get_command_args(),
+                    options={"max_chars": 3800},
+                ),
+            ).text
+
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return _execute()
+
+        from gateway.run import _profile_runtime_scope
+
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        with _profile_runtime_scope(profile_home):
+            return _execute()
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.

@@ -16475,6 +16475,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "footer": self._handle_footer_command,
                 "help": self._handle_help_command,
                 "commands": self._handle_commands_command,
+                "cron": self._handle_cron_command,
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
