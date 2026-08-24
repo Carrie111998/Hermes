@@ -9,6 +9,7 @@ import type {
   PetOverlayStatePayload
 } from './store/pet-overlay'
 import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } from './store/quick-entry'
+import type { StartupServiceRecord } from '../electron/startup-service-gate'
 
 export {}
 
@@ -1002,6 +1003,8 @@ export interface DesktopBootProgress {
    */
   retryable?: boolean
   running: boolean
+  /** Main's authoritative startup-service probe ledger; absent on older runtimes. */
+  startupServices?: StartupServiceRecord[]
   timestamp: number
 }
 
