@@ -5879,6 +5879,12 @@ async function openRosterBot(bot) {
 }
 
 function displayName(bot, meta) {
+  // Defensive: callers have historically passed {name: <object>} here (e.g.
+  // wrapping a roster owner object instead of its .name); a non-string name
+  // must degrade to '' rather than TypeError mid-render.
+  if (bot && typeof bot.name !== 'string') {
+    bot = { ...bot, name: typeof bot.name === 'object' && bot.name !== null ? String(bot.name?.name ?? '') : '' }
+  }
   // A configured alias route claiming this row overrides source-derived
   // identity: the friendly alias name must survive hosted-session
   // activation and Cloud-only rosters (#89131).
@@ -11207,7 +11213,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               'Send results to',
               pickerSelect(target, setTarget, [
                 { id: 'history', label: 'Run history only' },
-                { id: 'bot-chat', label: `${displayName({ name: bot }, $botMeta.get()[bot])}\u2019s chat (bot responds)` }
+                { id: 'bot-chat', label: `${displayName(typeof bot === 'string' ? { name: bot } : bot, botRosterMeta(bot, $botMeta.get()))}\u2019s chat (bot responds)` }
               ])
             ),
             jsxs('label', {
