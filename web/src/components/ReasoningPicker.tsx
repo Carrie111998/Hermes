@@ -20,13 +20,14 @@
  */
 
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
-import { Brain } from "lucide-react";
+import { Brain, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import {
   EFFORT_OPTIONS,
   normalizeEffort,
+  normalizeSkillEffort,
   VALID_EFFORTS,
 } from "@/lib/reasoning-effort";
 
@@ -50,6 +51,7 @@ export function ReasoningPicker({
   onChanged,
 }: ReasoningPickerProps) {
   const [effort, setEffort] = useState("medium");
+  const [skillMap, setSkillMap] = useState<Record<string, string>>({});
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const lastFetchKeyRef = useRef("");
@@ -63,6 +65,12 @@ export function ReasoningPicker({
       .then((cfg) => {
         const agent = (cfg?.agent as Record<string, unknown> | undefined) ?? {};
         setEffort(normalizeEffort(agent.reasoning_effort));
+        const map = agent.reasoning_by_skill;
+        setSkillMap(
+          map && typeof map === "object"
+            ? (map as Record<string, string>)
+            : {},
+        );
         setLoaded(true);
       })
       .catch(() => {
@@ -71,15 +79,34 @@ export function ReasoningPicker({
       });
   }, [currentModel, profile, refreshKey]);
 
+  const persistSkillMap = useCallback(
+    (nextMap: Record<string, string>) => {
+      setSaving(true);
+      void api
+        .getConfig(profile)
+        .then((cfg) => {
+          const base = (cfg ?? {}) as Record<string, unknown>;
+          const agent =
+            base.agent && typeof base.agent === "object"
+              ? { ...(base.agent as Record<string, unknown>) }
+              : {};
+          agent.reasoning_by_skill = nextMap;
+          return api.saveConfig({ ...base, agent }, profile);
+        })
+        .catch(() => {
+          // Revert on failure is best-effort; keep current state.
+        })
+        .finally(() => setSaving(false));
+    },
+    [profile],
+  );
+
   const onSelect = useCallback(
     (next: string) => {
       if (!VALID_EFFORTS.has(next) || next === effort) return;
       const prev = effort;
       setEffort(next); // optimistic
       setSaving(true);
-      // Read-modify-write the whole config — the dashboard's single-key save
-      // pattern — so we never clobber sibling keys. `saveConfig` PUTs the full
-      // object the agent boots from.
       void api
         .getConfig(profile)
         .then((cfg) => {
@@ -102,24 +129,122 @@ export function ReasoningPicker({
     [effort, onChanged, profile],
   );
 
+  const skillRows = () =>
+    Object.entries(skillMap).map(([skill, eff], i) => ({
+      key: `${skill}::${i}`,
+      skill,
+      effort: eff,
+    }));
+
+  const setRowSkill = (key: string, skill: string) => {
+    const rows = skillRows();
+    const row = rows.find((r) => r.key === key);
+    if (!row) return;
+    const next = { ...skillMap };
+    if (next[row.skill] !== undefined) delete next[row.skill];
+    if (skill.trim()) next[skill.trim()] = row.effort;
+    setSkillMap(next);
+    persistSkillMap(next);
+  };
+
+  const setRowEffort = (key: string, eff: string) => {
+    const rows = skillRows();
+    const row = rows.find((r) => r.key === key);
+    if (!row) return;
+    const next = { ...skillMap };
+    const normalized = normalizeSkillEffort(eff);
+    if (normalized === "off") {
+      delete next[row.skill];
+    } else {
+      next[row.skill] = normalized;
+    }
+    setSkillMap(next);
+    persistSkillMap(next);
+  };
+
+  const addRow = () => {
+    const next = { ...skillMap, "": "xhigh" };
+    setSkillMap(next);
+    persistSkillMap(next);
+  };
+
+  const removeRow = (key: string) => {
+    const rows = skillRows();
+    const row = rows.find((r) => r.key === key);
+    if (!row) return;
+    const next = { ...skillMap };
+    if (next[row.skill] !== undefined) delete next[row.skill];
+    setSkillMap(next);
+    persistSkillMap(next);
+  };
+
   return (
-    <div className="flex items-center gap-2 px-3 py-2 text-xs">
-      <div className="flex items-center gap-1.5 text-text-tertiary">
-        <Brain className="h-3.5 w-3.5" />
-        <span className="text-display tracking-wider">reasoning</span>
+    <div className="px-3 py-2 text-xs">
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 text-text-tertiary">
+          <Brain className="h-3.5 w-3.5" />
+          <span className="text-display tracking-wider">reasoning</span>
+        </div>
+        <Select
+          className="ml-auto min-w-0"
+          disabled={!loaded || saving}
+          onValueChange={onSelect}
+          value={effort}
+        >
+          {EFFORT_OPTIONS.map((opt) => (
+            <SelectOption key={opt.value} value={opt.value}>
+              {opt.label}
+            </SelectOption>
+          ))}
+        </Select>
       </div>
-      <Select
-        className="ml-auto min-w-0"
-        disabled={!loaded || saving}
-        onValueChange={onSelect}
-        value={effort}
-      >
-        {EFFORT_OPTIONS.map((opt) => (
-          <SelectOption key={opt.value} value={opt.value}>
-            {opt.label}
-          </SelectOption>
+
+      <div className="mt-2 flex flex-col gap-1.5 border-t border-line pt-2">
+        <span className="text-display tracking-wider text-text-tertiary">
+          per-skill
+        </span>
+        {skillRows().map((row) => (
+          <div key={row.key} className="flex items-center gap-1.5">
+            <input
+              className="min-w-0 flex-1 rounded border border-line bg-transparent px-1.5 py-1"
+              value={row.skill}
+              disabled={saving}
+              placeholder="skill name (e.g. plan)"
+              onChange={(e) => setRowSkill(row.key, e.target.value)}
+            />
+            <Select
+              className="min-w-0"
+              disabled={saving}
+              onValueChange={(v) => setRowEffort(row.key, v)}
+              value={normalizeSkillEffort(row.effort)}
+            >
+              <SelectOption value="off">Off</SelectOption>
+              {EFFORT_OPTIONS.map((opt) => (
+                <SelectOption key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectOption>
+              ))}
+            </Select>
+            <button
+              className="shrink-0 text-text-tertiary hover:text-danger"
+              disabled={saving}
+              aria-label={`Remove ${row.skill || "skill"} override`}
+              onClick={() => removeRow(row.key)}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
         ))}
-      </Select>
+        <button
+          className="flex items-center gap-1 self-start text-text-tertiary hover:text-text-secondary"
+          disabled={saving}
+          onClick={addRow}
+        >
+          <Plus className="h-3 w-3" />
+          Add skill override
+        </button>
+      </div>
     </div>
   );
 }
+

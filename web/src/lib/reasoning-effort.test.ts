@@ -3,6 +3,8 @@ import {
   EFFORT_OPTIONS,
   VALID_EFFORTS,
   normalizeEffort,
+  normalizeSkillEffort,
+  SKILL_OFF_VALUES,
 } from "./reasoning-effort";
 
 describe("normalizeEffort", () => {
@@ -43,5 +45,31 @@ describe("EFFORT_OPTIONS", () => {
     for (const level of ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
       expect(values.has(level)).toBe(true);
     }
+  });
+});
+
+describe("normalizeSkillEffort (per-skill reasoning map)", () => {
+  it("passes through a valid effort level", () => {
+    expect(normalizeSkillEffort("xhigh")).toBe("xhigh");
+    expect(normalizeSkillEffort("high")).toBe("high");
+  });
+
+  it("maps off/false/no/none/disabled to the sentinel", () => {
+    for (const off of SKILL_OFF_VALUES) {
+      expect(normalizeSkillEffort(off)).toBe("off");
+    }
+    expect(normalizeSkillEffort(false)).toBe("off");
+    expect(normalizeSkillEffort("")).toBe("off");
+  });
+
+  it("is case- and whitespace-insensitive", () => {
+    expect(normalizeSkillEffort("OFF")).toBe("off");
+    expect(normalizeSkillEffort("  XHigh  ")).toBe("xhigh");
+  });
+
+  it("treats unknown values as off (disabled) rather than guessing a level", () => {
+    expect(normalizeSkillEffort("turbo")).toBe("off");
+    expect(normalizeSkillEffort(42)).toBe("off");
+    expect(normalizeSkillEffort(undefined)).toBe("off");
   });
 });
