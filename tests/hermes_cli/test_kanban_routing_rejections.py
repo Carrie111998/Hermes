@@ -124,6 +124,51 @@ def test_review_claim_rejection_rolls_back_and_audits_separately(conn, monkeypat
     assert payload["attempt_id"]
 
 
+def test_corrupted_claimed_run_rejects_spawn_and_accounts_retry(conn, monkeypatch, tmp_path):
+    """A malformed frozen run traverses the complete rejection lifecycle."""
+    task_id = kb.create_task(conn, title="corrupt after claim", assignee="coder")
+    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+    monkeypatch.setattr(
+        kb,
+        "_resolve_routing_snapshot",
+        lambda *args, **kwargs: {
+            "routing_role": "executor", "routing_model": "model",
+            "routing_provider": "provider", "routing_contract": 1,
+            "routing_reason": "test", "roster_digest": "digest",
+            "routing_policy": "{}", "ac_revision": "revision",
+            "routing_source": "task_role",
+        },
+    )
+    monkeypatch.setattr(kb, "resolve_workspace", lambda *args, **kwargs: tmp_path)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+
+    def corrupt_then_spawn(task, workspace, **kwargs):
+        conn.execute(
+            "UPDATE task_runs SET routing_model=NULL WHERE id=?",
+            (task.current_run_id,),
+        )
+        return kb._default_spawn(task, workspace, **kwargs)
+
+    result = kb.dispatch_once(conn, spawn_fn=corrupt_then_spawn, failure_limit=3)
+
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT status,outcome,ended_at FROM task_runs WHERE id=?",
+        (task.current_run_id or 1,),
+    ).fetchone()
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='spawn_rejected'",
+        (task_id,),
+    ).fetchone()
+    assert result.spawned == []
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert task.consecutive_failures == 1
+    assert tuple(run)[:2] == ("failed", "spawn_failed")
+    assert run["ended_at"] is not None
+    assert "incomplete frozen routing snapshot" in json.loads(event["payload"])["reason"]
+
+
 @pytest.mark.parametrize("failure_limit, expected_status", [(3, "ready"), (1, "blocked")])
 def test_spawn_rejection_closes_run_and_deduplicates_event(
     conn, monkeypatch, failure_limit, expected_status
