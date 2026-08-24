@@ -420,6 +420,14 @@ async function gatewayRequestForContext<T>(
   method: string,
   params: Record<string, unknown> = {}
 ): Promise<T> {
+  if (context.connectionId === null) {
+    if (context.gateway.connectionState !== 'open') {
+      throw new Error('Captured primary Hermes gateway is closed; cannot safely reconnect its original source')
+    }
+
+    return gatewayRequestOn<T>(context.gateway, method, params)
+  }
+
   return requestGatewayForAgent<T>(context.connectionId, context.profile, method, params)
 }
 

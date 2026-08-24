@@ -370,7 +370,7 @@ describe('transactional Project renaming', () => {
     expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
   })
 
-  it('keeps compensation and reconciliation on gateway A after switching to B', async () => {
+  it('uses still-open captured primary A for compensation and reconciliation after switching to B', async () => {
     const renamed = { ...alpha, name: 'Group · Alpha' }
     const renameResponse = deferred<{ projects: (typeof alpha)[] }>()
     const providerFailure = new Error('provider unavailable')
@@ -403,9 +403,6 @@ describe('transactional Project renaming', () => {
     let current = gatewayA
 
     activeGateway.mockImplementation(() => current as never)
-    requestGatewayForAgent.mockImplementation(
-      async (_connectionId, _profile, method, params) => gatewayA.request(method, params) as never
-    )
 
     const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
       deleteProjectGroup({
@@ -438,6 +435,92 @@ describe('transactional Project renaming', () => {
       'projects.tree'
     ])
     expect(gatewayA.request.mock.calls.every(([, params]) => params?.profile === 'default')).toBe(true)
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(gatewayB.request).not.toHaveBeenCalled()
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
+    expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
+  })
+
+  it('fails compensation instead of retargeting a closed captured primary route to B', async () => {
+    const providerFailure = new Error('provider unavailable')
+    let projectNameOnA = alpha.name
+    let projectNameOnB = 'Source B'
+
+    const gatewayA = {
+      connectionState: 'open',
+      request: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (gatewayA.connectionState !== 'open') {
+          throw new Error('gateway A is disconnected')
+        }
+
+        if (method !== 'projects.rename_many') {
+          throw new Error(`unexpected ${method}`)
+        }
+
+        const [rename] = params?.renames as Array<{ expectedName: string; newName: string }>
+        expect(rename.expectedName).toBe(projectNameOnA)
+        projectNameOnA = rename.newName
+
+        return { projects: [{ ...alpha, name: projectNameOnA }] }
+      })
+    }
+
+    const gatewayB = {
+      connectionState: 'open',
+      request: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'projects.rename_many') {
+          const [rename] = params?.renames as Array<{ newName: string }>
+          projectNameOnB = rename.newName
+
+          return { projects: [{ ...alpha, name: projectNameOnB }] }
+        }
+
+        return method === 'projects.tree'
+          ? { active_id: null, projects: [], scoped_session_ids: [] }
+          : { active_id: null, projects: [{ ...alpha, name: projectNameOnB }] }
+      })
+    }
+
+    let current = gatewayA
+
+    activeGateway.mockImplementation(() => current as never)
+
+    const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
+      deleteProjectGroup({
+        contribution: {
+          deleteGroup: vi.fn(async () => {
+            gatewayA.connectionState = 'closed'
+            current = gatewayB
+            $activeGatewayProfile.set('profile-b')
+            $projects.set([{ ...alpha, id: 'source-b', name: projectNameOnB }])
+            $projectTree.set([
+              { id: 'source-b', label: projectNameOnB, path: '/b', repos: [], sessionCount: 0 }
+            ])
+            throw providerFailure
+          }),
+          getSnapshot: () => ({ groups: [{ id: 'group', label: 'Group', projectIds: [alpha.id] }] }),
+          subscribe: () => () => undefined
+        },
+        group: { id: 'group', label: 'Group', projectIds: [alpha.id] },
+        operationId: 'operation-a',
+        prependGroupName: true,
+        projects: [alpha],
+        reconcile,
+        renameMany
+      })
+    )
+
+    const error = await pending.catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(ProjectGroupDeleteCompensationError)
+    expect((error as ProjectGroupDeleteCompensationError).providerError).toBe(providerFailure)
+    expect((error as ProjectGroupDeleteCompensationError).rollbackError).toEqual(
+      expect.objectContaining({ message: expect.stringMatching(/captured primary.*(closed|disconnected)/i) })
+    )
+    expect(projectNameOnA).toBe('Group · Alpha')
+    expect(projectNameOnB).toBe('Source B')
+    expect(gatewayA.request).toHaveBeenCalledOnce()
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
     expect(gatewayB.request).not.toHaveBeenCalled()
     expect($projects.get().map(project => project.id)).toEqual(['source-b'])
     expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
