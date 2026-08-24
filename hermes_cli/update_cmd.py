@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -3252,6 +3253,69 @@ def _print_fetch_failure(stderr: str) -> None:
 UPDATE_CHECK_FETCH_TIMEOUT_SECONDS = 30
 
 
+def _update_check_fetch_popen_kwargs() -> dict:
+    """Isolate a fetch so timeout handling can stop all of its children."""
+    if sys.platform == "win32":
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        return {
+            "creationflags": windows_hide_flags()
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        }
+    return {"start_new_session": True}
+
+
+def _terminate_update_check_fetch(proc: subprocess.Popen) -> bool:
+    """Stop and reap a timed-out fetch process tree before cleanup begins."""
+    if sys.platform == "win32":
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        try:
+            killed = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
+            proc.wait(timeout=5)
+            return False
+        if killed.returncode != 0:
+            proc.kill()
+        proc.wait(timeout=5)
+        return killed.returncode == 0
+
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=5)
+    deadline = _time.monotonic() + 5
+    while _time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        _time.sleep(0.05)
+    return False
+
+
 def _run_update_check_fetch(
     git_cmd: list[str],
     depth_args: list[str],
@@ -3261,17 +3325,24 @@ def _run_update_check_fetch(
 ) -> subprocess.CompletedProcess:
     """Run one bounded update-check fetch and clean abandoned temp packs."""
     cmd = git_cmd + ["fetch"] + depth_args + [remote, branch]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_update_check_fetch_popen_kwargs(),
+    )
+    safe_to_sweep = True
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=UPDATE_CHECK_FETCH_TIMEOUT_SECONDS,
+        stdout, stderr = proc.communicate(timeout=UPDATE_CHECK_FETCH_TIMEOUT_SECONDS)
+        result = subprocess.CompletedProcess(
+            cmd, proc.returncode, stdout=stdout, stderr=stderr
         )
     except subprocess.TimeoutExpired:
+        safe_to_sweep = _terminate_update_check_fetch(proc)
         result = subprocess.CompletedProcess(
             cmd,
             124,
@@ -3282,7 +3353,7 @@ def _run_update_check_fetch(
             ),
         )
 
-    if result.returncode != 0:
+    if result.returncode != 0 and safe_to_sweep:
         from hermes_cli.gitlock import clear_stale_git_artifacts
 
         clear_stale_git_artifacts(repo_root, temp_pack_min_age_seconds=0)

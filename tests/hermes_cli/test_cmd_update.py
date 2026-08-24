@@ -777,13 +777,17 @@ class TestCmdUpdateCheckBranchFlag:
         return side_effect
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.update_cmd._run_update_check_fetch")
     @patch("subprocess.run")
     def test_check_branch_compares_against_named_origin_branch(
-        self, mock_run, _mock_method, capsys
+        self, mock_run, mock_fetch, _mock_method, capsys
     ):
         """--check --branch bb/gui compares against origin/bb/gui, never origin/main."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="bb/gui", verify_ok=True, commit_count="2"
+        )
+        mock_fetch.return_value = subprocess.CompletedProcess(
+            ["git", "fetch"], 0, stdout="", stderr=""
         )
         args = SimpleNamespace(check=True, branch="bb/gui")
 
@@ -791,7 +795,7 @@ class TestCmdUpdateCheckBranchFlag:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         # Non-main branch skips upstream probe entirely.
-        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        assert [call.args[2] for call in mock_fetch.call_args_list] == ["origin"]
         # Verify and rev-list both target origin/bb/gui.
         verify_cmds = [c for c in commands if "rev-parse" in c and "--verify" in c]
         assert any("origin/bb/gui" in c for c in verify_cmds), verify_cmds
@@ -800,9 +804,10 @@ class TestCmdUpdateCheckBranchFlag:
         assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.update_cmd._run_update_check_fetch")
     @patch("subprocess.run")
     def test_check_branch_missing_on_origin_exits_cleanly(
-        self, mock_run, _mock_method, capsys
+        self, mock_run, mock_fetch, _mock_method, capsys
     ):
         """If origin/<branch> doesn't exist, surface a friendly error and exit 1.
 
@@ -811,6 +816,9 @@ class TestCmdUpdateCheckBranchFlag:
         """
         mock_run.side_effect = self._check_side_effect(
             target_branch="ghost", verify_ok=False
+        )
+        mock_fetch.return_value = subprocess.CompletedProcess(
+            ["git", "fetch"], 0, stdout="", stderr=""
         )
         args = SimpleNamespace(check=True, branch="ghost")
 
@@ -831,21 +839,25 @@ class TestCmdUpdateCheckBranchFlag:
         assert not any("rev-list" in c for c in commands), commands
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.update_cmd._run_update_check_fetch")
     @patch("subprocess.run")
     def test_check_default_main_still_prefers_upstream(
-        self, mock_run, _mock_method, capsys
+        self, mock_run, mock_fetch, _mock_method, capsys
     ):
         """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
+        mock_fetch.return_value = subprocess.CompletedProcess(
+            ["git", "fetch"], 0, stdout="", stderr=""
+        )
         args = SimpleNamespace(check=True, branch=None)
 
         cmd_update(args)
 
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
+        assert [call.args[2] for call in mock_fetch.call_args_list] == ["upstream"]
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         # Compare ref is upstream/main (upstream fetch succeeded).
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
