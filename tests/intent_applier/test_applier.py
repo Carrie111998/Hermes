@@ -564,19 +564,47 @@ def _stage_payload(stage: str, key_suffix: str = "") -> dict:
 class TestPreflightSatisfied:
     """Fix A — suppress redundant no-op intents whose job is already at/past target."""
 
-    def test_past_target_skips_dual_write(self, tmp_path, mailbox, pipeline_path):
-        # Job sits at materials_ready, which is PAST the requested 'approved'.
+    def test_downstream_state_is_a_real_transition_not_a_noop(
+        self, tmp_path, mailbox, pipeline_path
+    ):
+        """REGRESSION (2026-08-23): materials_ready must NOT satisfy 'approved'.
+
+        The operator release review -> approved moves a job BACKWARD along
+        BUSINESS_STATE_ORDER (approved_for_tailor 2 < materials_ready 3). Reading
+        that as "already past, therefore redundant" discarded five real operator
+        approvals -- silently, with the idempotency key burned so no retry could
+        ever land. It must flow through the normal dual-write path.
+        """
         a = _make_applier(tmp_path, mailbox, pipeline_path,
                           job_state_reader=lambda jid: "materials_ready")
         f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+        assert len(_pipeline_updates(mailbox["inbox"])) == 1
+
+    def test_satisfied_still_emits_the_canonical_mirror(
+        self, tmp_path, mailbox, pipeline_path
+    ):
+        """THE DURABILITY INVARIANT: no intent is consumed without a canonical write.
+
+        Postgres agreeing with the request says nothing about whether the TRACKER
+        knows. Canonical is the source of truth and the bridge projects it ONTO
+        Postgres every 15 minutes, so consuming an intent without emitting left
+        canonical unaware and the next postgres-sync erased the Postgres side too.
+        The :4100 POST is the only thing this pre-flight may skip.
+        """
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "approved_for_tailor")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
         assert a.apply_one(f) == "satisfied"
-        # No :4100 POST, no mirror, no legacy-projection regression.
-        a._jobops_mock.post_legacy_stage.assert_not_called()
-        assert _pipeline_updates(mailbox["inbox"]) == []
-        data = json.loads(pipeline_path.read_text())
-        job = next(j for j in data["jobs"] if j["job_id"] == "linkedin-1")
-        assert job["stage"] == "review"  # unchanged — step 3 skipped
-        # Moved to processed + key burned so the redundant intent can't recur.
+        a._jobops_mock.post_legacy_stage.assert_not_called()   # POST skipped
+        mirrors = _pipeline_updates(mailbox["inbox"])          # mirror NOT skipped
+        assert len(mirrors) == 1
+        body = json.loads(mirrors[0].read_text(encoding="utf-8"))
+        assert body["payload"]["to_stage"] == "approved"
+        assert body["payload"]["metadata"]["emitted_by"] == "tracker-intent-applier"
+        assert body["correlation_id"] == VALID_INTENT_PAYLOAD["message_id"]
+        # Still consumed + key burned, exactly as before.
         assert (mailbox["processed"] / "intent.json").exists()
         assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
 
@@ -638,9 +666,11 @@ class TestReapConvergedPartials:
 
     def _capped_kwargs(self, **extra):
         # give_up=5 so a .rd5 partial is "capped"; both readers wired.
+        # "Converged" for a requested 'approved' now means exactly
+        # approved_for_tailor -- see _STAGE_SATISFIED_BY.
         base = dict(redrive_give_up_attempts=5,
-                    job_state_reader=lambda jid: "materials_ready",
-                    canonical_state_reader=lambda: {"linkedin-1": "materials_ready"})
+                    job_state_reader=lambda jid: "approved_for_tailor",
+                    canonical_state_reader=lambda: {"linkedin-1": "approved_for_tailor"})
         base.update(extra)
         return base
 
@@ -657,7 +687,7 @@ class TestReapConvergedPartials:
         assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
 
     def test_gate_b_disagrees_is_not_reaped(self, tmp_path, mailbox, pipeline_path):
-        # PG says materials_ready (gate A pass) but canonical still shows scored.
+        # PG says approved_for_tailor (gate A pass) but canonical still shows scored.
         a = _make_applier(tmp_path, mailbox, pipeline_path,
                           **self._capped_kwargs(
                               canonical_state_reader=lambda: {"linkedin-1": "scored"}))
@@ -681,8 +711,8 @@ class TestReapConvergedPartials:
 
     def test_canonical_parsed_once_per_sweep(self, tmp_path, mailbox, pipeline_path):
         from unittest.mock import MagicMock
-        canonical = MagicMock(return_value={"linkedin-1": "materials_ready",
-                                            "linkedin-2": "materials_ready"})
+        canonical = MagicMock(return_value={"linkedin-1": "approved_for_tailor",
+                                            "linkedin-2": "approved_for_tailor"})
         a = _make_applier(tmp_path, mailbox, pipeline_path,
                           **self._capped_kwargs(canonical_state_reader=canonical))
         p2 = json.loads(json.dumps(VALID_INTENT_PAYLOAD))

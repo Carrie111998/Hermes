@@ -110,3 +110,99 @@ def test_connect_bounds_both_phases(monkeypatch):
     assert seen["connect_timeout"] == 2.0
     assert seen["options"] == f"-c statement_timeout={mod._STATEMENT_TIMEOUT_MS}"
     assert seen["autocommit"] is True
+
+
+# --------------------------------------------------------------------------
+# Identity resolution (2026-08-23 incident).
+#
+# An intent's job_id is jobs.id -- the value the applier POSTs to :4100 as
+# /jobs/<id>. The reader used to match jobs.external_job_key instead. Those two
+# columns disagree on every live row, so the lookup either found nothing or
+# found a DIFFERENT job. Five operator approvals were discarded because a
+# stranger's business state answered for them.
+# --------------------------------------------------------------------------
+
+
+class _RecordingCursor(_FakeCursor):
+    def __init__(self, row, sink):
+        super().__init__(row)
+        self._sink = sink
+
+    def execute(self, sql, params=None):
+        self._sink.append((sql, params))
+        return None
+
+
+class _RecordingConn(_FakeConn):
+    def __init__(self, row, sink):
+        super().__init__(row)
+        self._sink = sink
+
+    def cursor(self):
+        return _RecordingCursor(self._row, self._sink)
+
+
+def test_query_matches_on_id_and_binds_job_id_to_every_placeholder():
+    sink = []
+    r = NativePgJobStateReader(dsn="x")
+    r._connect = lambda: _RecordingConn(("scored", True), sink)
+    r("job-uuid")
+    sql, params = sink[0]
+    assert "id::text = %s" in sql, "must resolve the way the write path resolves"
+    assert params == ("job-uuid", "job-uuid", "job-uuid")
+
+
+def test_an_id_match_outranks_an_external_key_match():
+    """The tie-break is the whole fix: a twin must never answer for the target.
+
+    53 live rows carry an external_job_key equal to ANOTHER row's id. Without the
+    ORDER BY, Postgres may return either; with it the id row always wins.
+    """
+    from intent_applier.job_state_reader import _QUERY
+
+    normalized = " ".join(_QUERY.split()).lower()
+    assert "order by matched_by_id desc" in normalized
+    assert normalized.index("id::text = %s") < normalized.index("external_job_key = %s")
+
+
+def test_reader_returns_first_column_even_though_two_are_selected():
+    r = NativePgJobStateReader(dsn="x")
+    r._connect = lambda: _FakeConn(("approved_for_tailor", True))
+    assert r("job-uuid") == "approved_for_tailor"
+
+
+def test_query_runs_and_prefers_the_id_row_against_live_postgres():
+    """READ-ONLY: proves the SQL parses and orders correctly in real Postgres.
+
+    Every offline test above stubs the cursor, so none of them would catch a
+    syntax error, a bad cast, or an ORDER BY that Postgres refuses. Skips when
+    Postgres is unreachable or when no twinned row exists to discriminate on.
+    """
+    import os
+    import pytest
+
+    psycopg = pytest.importorskip("psycopg")
+    dsn = os.environ.get(
+        "HERMES_JOBFLOW_PG_DSN", "postgres://jobflow:jobflow@127.0.0.1:5432/jobflow"
+    )
+    try:
+        conn = psycopg.connect(dsn, connect_timeout=2.0, autocommit=True)
+    except Exception:
+        pytest.skip("jobflow Postgres unreachable")
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select t.id::text, t.current_business_state
+                from jobs t
+                where exists (select 1 from jobs u where u.external_job_key = t.id::text)
+                limit 1
+                """
+            )
+            row = cur.fetchone()
+    if row is None:
+        pytest.skip("no twinned row available to discriminate on")
+    job_id, own_state = row
+
+    r = NativePgJobStateReader(dsn=dsn)
+    assert r(job_id) == own_state, "reader must report the target job, not its twin"

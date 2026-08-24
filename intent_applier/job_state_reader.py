@@ -28,8 +28,28 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_DSN = "postgres://jobflow:jobflow@127.0.0.1:5432/jobflow"
 
-# job_id in intents is the jobs.external_job_key (full UUID form).
-_QUERY = "select current_business_state from jobs where external_job_key = %s limit 1"
+# An intent's job_id is the value the applier POSTs to :4100 as /jobs/<id> --
+# that is jobs.id. It is NOT jobs.external_job_key: those two columns disagree on
+# every one of the 5389 live rows (measured 2026-08-24). Matching external_job_key
+# alone therefore either matched nothing, leaving the pre-flight inert, or -- for
+# the 53 rows whose external_job_key equals some OTHER row's id -- matched a
+# DIFFERENT job and let that stranger's business state decide a real intent's
+# fate. Every one of the 15 times this pre-flight has ever fired in production it
+# was reading the wrong row, and five operator approvals were silently discarded
+# on 2026-08-23 as a result.
+#
+# Resolve the way the WRITE path resolves, or the pre-flight is not answering the
+# question the caller is asking. jobs.id wins. external_job_key remains a
+# fallback because some producers really do address a job by its external key
+# (observed: State Street 9a668393), but it can never outrank an id match --
+# ORDER BY matched_by_id DESC puts the id row first whenever both exist.
+_QUERY = """
+    select current_business_state, (id::text = %s) as matched_by_id
+    from jobs
+    where id::text = %s or external_job_key = %s
+    order by matched_by_id desc
+    limit 1
+"""
 
 # Bound the STATEMENT phase, not just connect.
 #
@@ -105,7 +125,7 @@ class NativePgJobStateReader:
             if self._conn is None or getattr(self._conn, "closed", False):
                 self._conn = self._connect()
             with self._conn.cursor() as cur:
-                cur.execute(_QUERY, (job_id,))
+                cur.execute(_QUERY, (job_id, job_id, job_id))
                 row = cur.fetchone()
             return row[0] if row else None
         except Exception:

@@ -4,7 +4,8 @@ For each intent file in the inbox:
   1. Parse (corrupt JSON -> dead-letter immediately)
   2. Idempotency check (already applied -> skip + move to processed)
   2b. Pre-flight state check (Fix A): if a native-Postgres reader is wired and
-      the job is ALREADY at or past the requested stage, the intent is a
+      the job is ALREADY IN the state the requested stage maps to, the intent
+      is a
       redundant no-op — skip steps 3/3b/4 entirely (no legacy-projection write,
       no mirror, no congesting :4100 POST) and move to processed ("satisfied").
       Fails OPEN: any reader error / unknown stage falls through to the normal
@@ -63,30 +64,37 @@ logger = logging.getLogger(__name__)
 PROTECTED_STAGES = {"approved", "final_submission", "applied"}
 
 
-# Fix A — "already at or past" business-state sets per requested legacy stage.
-# Mirrors jobflow-api's OWN progression semantics (repository.ts ~2054-2064,
-# the pipeline stage-count query): a job whose current_business_state is in the
-# set for a requested legacy stage has already reached (or moved beyond) it, so
-# re-applying that stage is a redundant no-op. Forward stages include every
-# downstream state; terminal states (archived/withdrawn/rejected) match only
-# themselves (nothing is "past" a terminal). Stages NOT listed here (e.g.
-# 'scored', 'applied', 'final_submission') are deliberately omitted — the
-# pre-flight will NOT short-circuit them and they flow through the normal gated
-# dual-write path. Keep in sync with jobflow-api if the state machine changes.
+# Fix A — the business state that makes a requested legacy stage a redundant
+# no-op. EXACT TARGET MATCH ONLY: an intent is redundant when the job is already
+# IN the state the stage maps to, and in no other case.
+#
+# This used to be an "at or past" set per stage, on the theory that a job
+# downstream of the request had already satisfied it. That theory assumes intents
+# only ever move a job FORWARD. They do not. The operator release review ->
+# approved runs BACKWARD along BUSINESS_STATE_ORDER (approved_for_tailor ranks 2,
+# materials_ready ranks 3) and is the single highest-volume operator action there
+# is -- it is how a tailored job is sent back to be re-tailored. Listing
+# materials_ready as satisfying 'approved' classified that deliberate action as a
+# redundant replay and threw it away. This is the same direction error that
+# 5cf02a1a6 fixed one layer down in hermes-postgres-bridge.py; the ordered list
+# is a pipeline order, not a legality order, and "past" is not a safe proxy for
+# "already done".
+#
+# There is no cost to the narrowing. Suppressing less can only ever cost one POST
+# to :4100 -- which is all this pre-flight was ever protecting -- while
+# suppressing wrongly destroys an operator decision with no event, no error, and
+# no way to retry (the idempotency key is burned on the way out). In production
+# the pre-flight has fired 15 times in total and every one was a false positive.
+#
+# Stages NOT listed here (e.g. 'scored', 'applied', 'final_submission') are
+# deliberately omitted — the pre-flight will NOT short-circuit them and they flow
+# through the normal gated dual-write path.
 _STAGE_SATISFIED_BY: dict[str, frozenset[str]] = {
-    "approved": frozenset({
-        "approved_for_tailor", "materials_ready", "approved_for_submission",
-        "submitted", "responded", "interviewing", "offer",
-    }),
-    "materials_ready": frozenset({
-        "materials_ready", "approved_for_submission",
-        "submitted", "responded", "interviewing", "offer",
-    }),
-    "submission_ready": frozenset({
-        "approved_for_submission", "submitted", "responded", "interviewing", "offer",
-    }),
-    "submitted": frozenset({"submitted", "responded", "interviewing", "offer"}),
-    "interviewing": frozenset({"interviewing", "offer"}),
+    "approved": frozenset({"approved_for_tailor"}),
+    "materials_ready": frozenset({"materials_ready"}),
+    "submission_ready": frozenset({"approved_for_submission"}),
+    "submitted": frozenset({"submitted"}),
+    "interviewing": frozenset({"interviewing"}),
     "offer": frozenset({"offer"}),
     "archived": frozenset({"archived"}),
     "withdrawn": frozenset({"withdrawn"}),
@@ -205,16 +213,31 @@ class IntentApplier:
             return "skipped_idempotent"
 
         # Step 2b: pre-flight (Fix A) — suppress redundant no-op intents.
-        # If native Postgres already shows the job at or past the requested
-        # stage, the intent's goal is already met. Skip the whole dual-write
-        # (no legacy-projection regression, no redundant mirror, no congesting
-        # :4100 POST) and burn the key so the redundant intent can't recur.
+        # If native Postgres already shows the job IN the state the requested
+        # stage maps to, the intent's goal is already met. Skip the congesting
+        # :4100 POST and burn the key so the redundant intent can't recur -- but
+        # still emit the canonical mirror (see below).
         if self._already_satisfied(msg):
             logger.info(
                 "intent-applier: pre-flight satisfied job=%s stage=%s "
-                "(Postgres already at/past target); skipping dual-write",
+                "(Postgres already at target); skipping the :4100 POST",
                 msg.job_id, msg.requested_stage,
             )
+            # Skip the POST, never the canonical mirror. Postgres agreeing with
+            # the request says nothing about whether the TRACKER knows: the two
+            # are different stores and the bridge projects canonical ONTO
+            # Postgres every 15 minutes, so a Postgres-only agreement is
+            # transient. Consuming the intent here without emitting left the
+            # canonical store unaware of a decision it is the source of truth
+            # for, and the very next postgres-sync erased the Postgres side too
+            # -- the failure this module's own _emit_canonical_pipeline_update
+            # docstring predicts, reached by the one path that skipped it.
+            #
+            # The invariant this restores: NO INTENT IS EVER CONSUMED WITHOUT A
+            # CANONICAL WRITE. The mirror is a file write, not a network call,
+            # so it costs nothing the pre-flight was trying to save, and when the
+            # intent really is redundant the tracker's set_stage no-ops on it.
+            self._emit_canonical_pipeline_update(msg)
             self.idempotency.mark_applied(msg.idempotency_key, message_id=msg.message_id)
             self._move_to(intent_path, self.processed_dir)
             return "satisfied"
@@ -327,7 +350,7 @@ class IntentApplier:
         return "applied"
 
     def _already_satisfied(self, msg: IntentMessage) -> bool:
-        """True iff Postgres already shows the job at or past the requested stage.
+        """True iff Postgres already shows the job IN the requested stage's state.
 
         Fix A pre-flight. Fails OPEN in every ambiguous case so it can only ever
         SKIP redundant work, never block a real transition:
@@ -335,7 +358,9 @@ class IntentApplier:
           * reader raises / returns None   -> False (Postgres unknown -> apply)
           * requested stage not in the known progression map -> False
         Only when the reader returns a concrete business_state that lives in the
-        requested stage's "at or past" set do we short-circuit.
+        requested stage's target set do we short-circuit. "Already in the target
+        state" is the ONLY safe reading -- see _STAGE_SATISFIED_BY for why "past"
+        is not, and for the operator action it used to destroy.
         """
         reader = self.job_state_reader
         if reader is None:
@@ -530,7 +555,7 @@ class IntentApplier:
         return self._parse_redrive_attempt(path) >= self.redrive_give_up_attempts
 
     def reap_converged_partials(self) -> dict[str, str]:
-        """Auto-clear CAPPED partials already converged at/past their target stage.
+        """Auto-clear CAPPED partials already converged ON their target stage.
 
         A capped partial is one redrive_partials() has given up on
         (redrive_give_up_attempts > 0 and attempt N >= it): it is never re-driven
@@ -539,7 +564,7 @@ class IntentApplier:
         that gap with a two-gate, FAIL-CLOSED convergence check:
 
           * Gate A (native Postgres): _already_satisfied(msg) -- current_business_state
-            in _STAGE_SATISFIED_BY[requested_stage].
+            in _STAGE_SATISFIED_BY[requested_stage] (an exact target match).
           * Gate B (tracker canonical pipeline.json): currentBusinessState for the
             job is ALSO in that same set.
 
