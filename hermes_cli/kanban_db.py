@@ -3137,9 +3137,9 @@ def backfill_routing_metadata(
     home = Path(hermes_home or os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
     candidates = conn.execute(
         "SELECT r.id,r.profile,r.metadata FROM task_runs r "
-        "JOIN tasks t ON t.id=r.task_id "
         "WHERE r.id<=? AND r.routing_source IS NULL "
-        "AND r.ended_at IS NOT NULL AND t.status IN ('done','archived') "
+        "AND r.ended_at IS NOT NULL "
+        "AND r.outcome IS NOT NULL AND r.status != 'running' "
         "ORDER BY r.id",
         (cutoff,),
     ).fetchall()
