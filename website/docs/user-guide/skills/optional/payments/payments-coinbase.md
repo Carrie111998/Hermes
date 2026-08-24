@@ -61,8 +61,10 @@ Call the exposed `coinbase_*` MCP tools directly. Use the tools' schemas and res
 
 ## Quick Reference
 
-- Read: balance, products, fees, portfolios, open orders, and order history.
-- Write: order preview/create/edit/cancel, conversion quote/execute, transfer, and x402 pay/fetch.
+- Market data: `coinbase_products_list`, `coinbase_products_get`, `coinbase_products_ticker`, `coinbase_products_book`, and `coinbase_products_candles`.
+- Account data: `coinbase_balance`, `coinbase_fees`, `coinbase_portfolios_list`, and `coinbase_portfolios_get`.
+- Orders: `coinbase_orders_preview`, `coinbase_orders_create`, `coinbase_orders_edit`, and `coinbase_orders_cancel`.
+- Convert: `coinbase_convert_quote` → `coinbase_convert_execute` → `coinbase_convert_get`.
 - For x402 resources, discover with `coinbase_x402_resources` before calling `coinbase_x402_fetch` or `coinbase_x402_pay`.
 
 ## Procedure
@@ -70,16 +72,16 @@ Call the exposed `coinbase_*` MCP tools directly. Use the tools' schemas and res
 1. Select the correct portfolio and inspect balances or market data. Completion: the user confirms the intended asset and funding source.
 2. Before any order, conversion, transfer, x402 fetch, or x402 pay, state and get confirmation of the complete action: asset/product, side, amount, price or limit, fees when available, source portfolio, and maximum spend.
 3. Preview large, limit, stop, or futures orders. Completion: user approves the preview terms, including liquidation risk for futures when returned.
-4. Submit the confirmed tool call. Completion: report its response; do not automatically fetch the order afterward.
+4. Submit the confirmed tool call. Use a stable `client_order_id` or idempotency key for retries when the tool accepts one. Completion: report its response; do not automatically fetch the order afterward.
 5. For a conversion, quote first, show the rate and fees, then confirm before execution.
 6. For x402, select a catalog resource, use only its advertised input schema, and confirm the maximum spend. On retries, reuse the same idempotency key if the tool supports one.
 
 ## Pitfalls
 
-- OAuth scopes limit visible tools and portfolios. Ask the user to reconnect with the required Coinbase consent instead of retrying an authorization failure.
+- OAuth scopes and runtime gates limit visible tools and portfolios. Ask the user to reconnect with the required Coinbase consent instead of retrying an authorization failure.
 - Use the quote currency the user specifies. If omitted, inspect balances; if both USD and USDC are available, prefer USDC. Do not silently change products.
 - Native limit and stop orders are durable; do not emulate them with a polling loop.
-- The MCP tool is the payment boundary. Never request or expose credentials, raw API keys, or payment details.
+- x402 accepts only catalog resources; set `max_amount` as a spend ceiling. Never request or expose credentials, raw API keys, or payment details.
 
 ## Verification
 
