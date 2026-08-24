@@ -1792,6 +1792,19 @@ updates:
   #             installs where local source edits should not persist
   non_interactive_local_changes: "stash"
 
+  # What happens when the source checkout is parked on a feature branch with
+  # a DIRTY working tree (uncommitted or untracked changes).
+  #
+  #   skip   - touch nothing; the code update is SKIPPED with a loud warning
+  #            naming the branch and how far behind it is (default)
+  #   commit - commit the working tree onto the parked branch first
+  #            ("wip: pre-update auto-commit"), then continue normally.
+  #            Nothing is discarded and nothing is stashed across a checkout;
+  #            the commit stays on the branch. Use this when unattended
+  #            updates (desktop button, gateway /update, cron) matter more
+  #            than a tidy branch history — they cannot resolve a skip.
+  parked_branch_dirty_strategy: "skip"
+
 
 # =============================================================================
 # Web Dashboard
