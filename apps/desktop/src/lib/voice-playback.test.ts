@@ -20,12 +20,17 @@ const gateway = vi.hoisted(() => {
   }
 })
 
-vi.mock('@hermes/shared', () => ({
-  resolveGatewayWsUrl: async () => gateway.currentUrl()
-}))
+vi.mock('@hermes/shared', async importOriginal => {
+  const actual = await importOriginal<typeof import('@hermes/shared')>()
+  return {
+    ...actual,
+    resolveGatewayWsUrl: async () => gateway.currentUrl()
+  }
+})
 
 vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => null,
+  getApiRequestConnection: () => null,
   speakText: vi.fn(async () => ({
     data_url: 'data:audio/mpeg;base64,AAAA',
     mime_type: 'audio/mpeg',
