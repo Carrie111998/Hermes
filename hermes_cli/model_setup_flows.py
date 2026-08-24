@@ -397,7 +397,7 @@ def _model_flow_moa(config, current_model=""):
 
 
 def _model_flow_nous(config, current_model="", args=None):
-    """Nous Portal provider: ensure logged in, then pick model."""
+    """Set up Nous, returning False when login fails and may be retried elsewhere."""
     from hermes_cli.auth import (
         get_provider_auth_state,
         _prompt_model_selection,
@@ -439,12 +439,14 @@ def _model_flow_nous(config, current_model="", args=None):
                 prompt_enable_tool_gateway(_refreshed)
             except Exception:
                 pass
-        except SystemExit:
+        except SystemExit as exc:
             print("Login cancelled or failed.")
-            return
+            if exc.code == 130:
+                return
+            return False
         except Exception as exc:
             print(f"Login failed: {exc}")
-            return
+            return False
         # login_nous already handles model selection + config update
         return
 
