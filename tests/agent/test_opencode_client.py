@@ -265,21 +265,28 @@ def test_server_singleton_spawn_readiness_and_release(tmp_path, monkeypatch):
     try:
         handle = oc.acquire_opencode_server(working_directory=str(tmp_path))
         assert handle.base_url.startswith("http://127.0.0.1:")
-        key = str(tmp_path)
-        # Second acquire for the same directory reuses the same process.
-        again = oc.acquire_opencode_server(working_directory=str(tmp_path))
+        # Acquires for DIFFERENT directories reuse the same single server.
+        other = tmp_path / "other"
+        other.mkdir()
+        again = oc.acquire_opencode_server(working_directory=str(other))
         assert again is handle
         import urllib.request
 
         with urllib.request.urlopen(f"{handle.base_url}/session", timeout=5) as resp:
             assert resp.status == 200
+        # Release does NOT terminate the shared server — it stays warm.
         oc.release_opencode_server(handle)
         oc.release_opencode_server(handle)
+        time.sleep(0.3)
+        assert handle.proc.poll() is None
+        assert oc._server_state()
+        # Explicit shutdown terminates it.
+        oc.shutdown_opencode_server()
         deadline = time.time() + 10
         while handle.proc.poll() is None and time.time() < deadline:
             time.sleep(0.05)
         assert handle.proc.poll() is not None
-        assert key not in oc._server_state()
+        assert not oc._server_state()
     finally:
         oc._reset_server_singleton()
 

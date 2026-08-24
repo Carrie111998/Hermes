@@ -7,13 +7,15 @@ interactive questions (``GET /question`` -> auto-answer -> ``POST
 /question/{id}/reply`` with ``{answers:[[label], ...]}``).
 
 The HTTP transport is injectable for hermetic tests; by default a small
-``urllib`` transport talks to a lazily-spawned, reference-counted shared server
-process (one per Hermes process, any cwd — the per-session directory is a query
-parameter on each call).
+``urllib`` transport talks to a single lazily-spawned, process-wide shared
+server that stays running for the life of the Hermes process — every delegate
+session creates a new session inside that one server, scoped per-request via
+the ``?directory=`` query parameter.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -60,15 +62,19 @@ class _UrllibTransport:
 
 
 # ---------------------------------------------------------------------------
-# Shared server lifecycle (one opencode serve per Hermes process)
+# Shared server lifecycle (ONE opencode serve per Hermes process)
 # ---------------------------------------------------------------------------
 
 _server_lock = threading.Lock()
-# One shared server per working directory: OpenCode pins sessions (and,
-# critically, native question registration over ``GET /question``) to the
-# server's *instance* directory — its startup cwd — so a server spawned in an
-# unrelated cwd would silently hide every interactive question.
+# A single shared server hosts every delegate session: sessions (and their
+# pending native questions, via ``GET /question``) are addressable in any
+# existing directory through the ``?directory=`` query scope, so per-session
+# working directories do NOT need their own server process. The server is
+# spawned once, kept running for the life of the Hermes process, and each
+# delegate_session client creates its own session inside it.
 _servers: Dict[str, "_ServerHandle"] = {}
+
+_SINGLETON_KEY = "__opencode_singleton__"
 
 
 class _ServerHandle:
@@ -125,16 +131,20 @@ def acquire_opencode_server(
     working_directory: str = "",
     ready_timeout: float = _DEFAULT_READY_TIMEOUT,
 ) -> _ServerHandle:
-    """Return the shared server handle for ``working_directory``, spawning one if needed."""
-    key = os.path.abspath(working_directory or os.getcwd())
+    """Return the ONE shared server handle, spawning it on first use.
+
+    ``working_directory`` is accepted for API compatibility but ignored: every
+    call is scoped per-request via the ``?directory=`` query parameter, so a
+    single long-lived server hosts delegate sessions in any directory.
+    """
     with _server_lock:
-        handle = _servers.get(key)
+        handle = _servers.get(_SINGLETON_KEY)
         if handle is not None:
             proc = handle.proc
             if proc is None or proc.poll() is None:
                 handle.refcount += 1
                 return handle
-            _servers.pop(key, None)  # dead process: respawn below
+            _servers.pop(_SINGLETON_KEY, None)  # dead process: respawn below
 
         external = os.environ.get("HERMES_OPENCODE_SERVER_URL", "").strip()
         if external:
@@ -145,13 +155,13 @@ def acquire_opencode_server(
             cmd = _opencode_command() + [
                 "serve", "--port", str(port), "--hostname", "127.0.0.1",
             ]
-            # Spawn with cwd = the session's working directory: OpenCode's
-            # instance directory (startup cwd) controls which sessions (and
-            # their pending native questions) are addressable, and user
-            # plugins load normally.
+            # Spawn from a stable home directory: the per-session directory is
+            # a query parameter on each call, so the startup cwd only needs to
+            # exist for the process lifetime; user plugins load normally.
+            spawn_cwd = Path_home()
             proc = subprocess.Popen(
                 cmd,
-                cwd=key if os.path.isdir(key) else None,
+                cwd=spawn_cwd if os.path.isdir(spawn_cwd) else None,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -169,25 +179,49 @@ def acquire_opencode_server(
                 handle.proc.terminate()
             raise
         handle.refcount = 1
-        _servers[key] = handle
+        _servers[_SINGLETON_KEY] = handle
+        _ensure_shutdown_hook()
         return handle
 
 
 def release_opencode_server(handle: _ServerHandle) -> None:
+    """Release a client's reference.
+
+    The shared server deliberately STAYS RUNNING: other delegate sessions (or
+    future ones) reuse it, and a warm server avoids the multi-second plugin
+    load on every delegation. It is terminated only by
+    ``shutdown_opencode_server`` (process exit).
+    """
     with _server_lock:
         handle.refcount -= 1
-        if handle.refcount > 0:
-            return
-        for key, current in list(_servers.items()):
-            if current is handle:
-                del _servers[key]
-    proc = handle.proc
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if handle.refcount < 0:
+            handle.refcount = 0
+
+
+def shutdown_opencode_server() -> None:
+    """Terminate the shared server (called at Hermes process exit)."""
+    global _shutdown_registered
+    with _server_lock:
+        handles = list(_servers.values())
+        _servers.clear()
+    for handle in handles:
+        proc = handle.proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+_shutdown_registered = False
+
+
+def _ensure_shutdown_hook() -> None:
+    global _shutdown_registered
+    if not _shutdown_registered:
+        atexit.register(shutdown_opencode_server)
+        _shutdown_registered = True
 
 
 # ---------------------------------------------------------------------------
