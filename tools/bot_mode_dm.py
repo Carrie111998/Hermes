@@ -569,11 +569,14 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
                     return subprocess.run(argv, stdin=stream, check=False).returncode
+            env = os.environ.copy()
+            env["HERMES_BOT_MODE_QUERY_FILE"] = "1"
             proc = subprocess.run(
                 [*argv, "--query-file", dm_file],
                 check=False,
                 capture_output=True,
                 text=True,
+                env=env,
             )
             if proc.returncode != 0:
                 from tools.bot_failure_reasons import (
@@ -589,6 +592,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                         check=False,
                         capture_output=True,
                         text=True,
+                        env=env,
                     )
             # Re-emit the transport's streams: stdout is the reply text the
             # completion notification carries back to the sending agent.
