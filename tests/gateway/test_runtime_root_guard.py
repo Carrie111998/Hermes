@@ -55,11 +55,48 @@ def test_preloaded_foreign_agent_init_fails_closed(tmp_path, monkeypatch):
         gateway_run._load_runtime_ai_agent_class()
 
 
-def test_api_server_create_agent_uses_runtime_root_loader():
-    """API server must not bypass the runtime-root pin with a bare import."""
-    import inspect
-    from gateway.platforms import api_server as api_mod
+def test_api_server_create_agent_uses_runtime_root_loader(monkeypatch):
+    """The API server constructs the class returned by the guarded loader."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
 
-    src = inspect.getsource(api_mod.APIServerAdapter._create_agent)
-    assert "_load_runtime_ai_agent_class" in src
-    assert "from run_agent import AIAgent" not in src
+    created = {}
+
+    class GuardedAgent:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.model = kwargs["model"]
+            self.provider = kwargs.get("provider")
+
+    monkeypatch.setattr(
+        gateway_run, "_load_runtime_ai_agent_class", lambda: GuardedAgent
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"provider": "test-provider"},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "test/model")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 1)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_load_fallback_model",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_load_reasoning_config",
+        staticmethod(lambda model="": None),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools", lambda *_: set()
+    )
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    agent = adapter._create_agent(session_id="guard-test")
+
+    assert isinstance(agent, GuardedAgent)
+    assert created["model"] == "test/model"
