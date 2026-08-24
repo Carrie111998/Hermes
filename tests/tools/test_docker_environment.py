@@ -620,15 +620,18 @@ def test_persistent_bind_mounts_survive_a_session_key_task_id(monkeypatch, tmp_p
     assert len(mounts) == 2, f"expected /root and /workspace binds; got {specs}"
     for spec in mounts:
         source, _, target = spec.rpartition(":")
-        assert ":" not in source, (
+        drive, source_tail = os.path.splitdrive(source)
+        assert ":" not in source_tail, (
             f"bind source still contains a colon, docker run would fail with "
             f"'too many colons': {spec}"
         )
-        # Docker splits on ':' — a sane spec has exactly source:target.
-        assert spec.count(":") == 1, f"spec is not a two-field bind: {spec}"
+        # Native Windows contributes one drive-letter colon; the task-derived
+        # path must not add any more fields to Docker's source:target syntax.
+        assert spec.count(":") == (2 if drive else 1), spec
         assert target in {"/root", "/workspace"}
 
 
+@pytest.mark.linux_only
 def test_existing_unsafe_legacy_dir_is_not_reused(monkeypatch, tmp_path):
     """A failed pre-fix launch may leave a colon-bearing directory behind."""
     task_id = "session:legacy"
@@ -891,9 +894,7 @@ def test_legacy_persistent_container_reuse_requires_matching_bind_sources(
     calls = []
 
     task_id = "session:legacy"
-    sandbox = docker_env._sandbox_task_dir(
-        tmp_path / "docker", task_id, allow_legacy=False,
-    )
+    sandbox = tmp_path / "docker" / docker_env._sandbox_dir_name(task_id)
     expected_home = str(sandbox / "home")
     expected_workspace = str(sandbox / "workspace")
 
