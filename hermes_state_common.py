@@ -372,6 +372,11 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
 -- bucket); a long-lived session spanning many hours would otherwise have its
 -- entire volume attributed to the final hour.  Written from the same
 -- chokepoint (_record_model_usage) in the same transaction as the aggregate.
+--
+-- Growth note: one row per LLM call is unbounded.  A busy gateway profile
+-- can generate millions of rows/year (plus 3 index entries per insert).
+-- Operators should pair this with a retention rule (prune rows older than
+-- N days during startup/VACUUM maintenance) or monitor state.db size.
 CREATE TABLE IF NOT EXISTS api_call_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -381,6 +386,9 @@ CREATE TABLE IF NOT EXISTS api_call_usage (
     billing_base_url TEXT NOT NULL DEFAULT '',
     billing_mode TEXT NOT NULL DEFAULT '',
     task TEXT NOT NULL DEFAULT '',
+    -- Normally 1 (one row = one LLM call).  Values > 1 indicate a batched
+    -- delta where multiple identical calls were collapsed into one insert;
+    -- analytics summing tokens should multiply by api_call_count.
     api_call_count INTEGER NOT NULL DEFAULT 1,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,

@@ -7771,7 +7771,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
         except Exception:
-            pass  # best-effort — never let the detail write fail accounting
+            logger.debug("api_call_usage insert failed for session %s", session_id, exc_info=True)
 
     def ensure_session(
         self,
