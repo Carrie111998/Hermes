@@ -81,3 +81,34 @@ repos:
         language: system
         pass_filenames: false
         files: ^events/.*\.py$
+      # 2026-08-23: .superpowers/ is SDD agent scratch and must never reach a
+      # commit. Ported from ~/.hermes (45c2d4a4a) after root-causing how it got
+      # committed there on 2026-08-22 -- two independent causes, which is why
+      # this is a HOOK and not a wording rule:
+      #   - one implementer was ORDERED to commit its report by a dispatch that
+      #     said "Commit all scoped product/test changes plus report"; the report
+      #     lives at an ignored path, so `git add -f` was the only way to obey.
+      #   - another was correctly told "Commit product changes only" and force-
+      #     added anyway, after a plain add was refused and git's own "hint: Use
+      #     -f if you really want to add them" supplied the override.
+      # An ignore rule cannot stop an explicit -f. THIS REPO HAS ALREADY LOST
+      # THIS RACE ONCE: the 2026-08-10 untrack here was undone by a `git add`
+      # five minutes later (a4f9b110b), because agent-src relied on a per-dir
+      # .gitignore that was missing in some worktrees. The rule is sound now
+      # (.git/info/exclude:45), but soundness was never the failing part.
+      #
+      # DELETIONS ARE DELIBERATELY STILL ALLOWED -- pre-commit passes only
+      # added/copied/modified paths, so `git rm --cached` untracking commits
+      # pass. That is load-bearing: it is how a re-tracked file gets removed.
+      # Escape hatch is the NAMED skip, never --no-verify:
+      #   SKIP=no-sdd-scratch git commit ...
+      - id: no-sdd-scratch
+        name: block .superpowers scratch from being committed
+        language: fail
+        entry: >-
+          .superpowers/ is SDD agent scratch and must never be committed.
+          Report files are handed back as a PATH, not committed. If a brief
+          told you to commit one, the brief is wrong. To untrack an existing
+          one use `git rm --cached` (deletions are allowed). Deliberate
+          override: SKIP=no-sdd-scratch — never --no-verify.
+        files: ^\.superpowers/
