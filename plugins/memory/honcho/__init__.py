@@ -488,7 +488,7 @@ class HonchoMemoryProvider(MemoryProvider):
             if cfg.reasoning_level_cap in self._LEVEL_ORDER:
                 self._reasoning_level_cap = cfg.reasoning_level_cap
 
-            raw = cfg.raw or {}
+            raw = getattr(cfg, "raw", None) or {}
             self._injection_log_path = self._resolve_injection_log_path(raw)
             self._session_start_components = self._resolve_session_start(raw)
             self._explicit_observations = self._resolve_explicit_observations(raw)
