@@ -3473,7 +3473,14 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
 
     def _status_thread_lock(self, key: Tuple[str, str, str]) -> asyncio.Lock:
-        """Return the lock that orders Assistant API writes for one thread."""
+        """Return the lock that orders Assistant API writes for one thread.
+
+        This only orders when each write is *initiated* against Slack, not
+        the order Slack applies them in; an internal retry on the earlier
+        request could still in principle land it after the later one. If a
+        "status still stuck" report ever recurs with this lock in place,
+        that residual reordering is where to look next.
+        """
         lock = self._status_thread_locks.get(key)
         if lock is None:
             if len(self._status_thread_locks) > self._ACTIVE_STATUS_THREADS_MAX:
