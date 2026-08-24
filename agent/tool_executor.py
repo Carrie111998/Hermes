@@ -623,7 +623,9 @@ def _run_agent_tool_execution_middleware(
                         state["args"] = modified_args
                     return block_msg
                 except Exception:
-                    return None
+                    # The managed executor must fail closed before passing a
+                    # skip flag to the downstream model-tools dispatcher.
+                    return "Tool blocked: pre-tool policy check failed"
 
             block_message = (
                 _resolve_pre_tool_block()

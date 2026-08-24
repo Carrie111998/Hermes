@@ -1,6 +1,7 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+from pathlib import Path
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -293,7 +294,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     assert observed["start"] == expected
     assert observed["dispatch"] == expected
     assert observed["checkpoint"] == [
-        ("/approved/path", "before write_file")
+        (str(Path("/approved/path")), "before write_file")
     ]
 
 
@@ -342,6 +343,47 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_concurrent_executor_blocks_when_pre_tool_hook_dispatch_raises():
+    """The managed/concurrent executor cannot turn hook errors into execution."""
+    agent = _make_agent("web_search")
+    tc = _mock_tool_call("web_search", json.dumps({"query": "test"}), "c-hook-error")
+    messages = []
+
+    with (
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            side_effect=RuntimeError("sensitive internal error"),
+        ),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as dispatch,
+    ):
+        agent._execute_tool_calls_concurrent(SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert "Tool blocked: pre-tool policy check failed" in messages[0]["content"]
+    assert "sensitive internal error" not in messages[0]["content"]
+
+
+def test_terminal_pre_tool_hook_fires_exactly_once_before_sequential_dispatch():
+    agent = _make_agent("terminal")
+    args = {"command": "git status"}
+    tc = _mock_tool_call("terminal", json.dumps(args), "c-terminal")
+    hook_calls = []
+
+    def observe_hook(name, payload, **kwargs):
+        del kwargs
+        hook_calls.append((name, dict(payload)))
+        return (None, None)
+
+    with (
+        patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=observe_hook),
+        patch("run_agent.handle_function_call", return_value='{"ok":true}') as dispatch,
+    ):
+        agent._execute_tool_calls_sequential(SimpleNamespace(content="", tool_calls=[tc]), [], "task-1")
+
+    assert hook_calls == [("terminal", args)]
+    assert dispatch.call_args.kwargs["skip_pre_tool_call_hook"] is True
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():

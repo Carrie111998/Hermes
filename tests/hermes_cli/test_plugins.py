@@ -1277,6 +1277,19 @@ class TestPreToolCallModify:
         assert modified == {"path": "/real"}
 
 
+def test_pre_tool_hook_callback_error_propagates_to_fail_closed_dispatch():
+    """Only the enforcement hook must surface callback failure to its caller."""
+    manager = PluginManager()
+
+    def broken_hook(**kwargs):
+        del kwargs
+        raise RuntimeError("sensitive internal error")
+
+    manager._hooks["pre_tool_call"] = [broken_hook]
+    with pytest.raises(RuntimeError, match="sensitive internal error"):
+        manager.invoke_hook("pre_tool_call", tool_name="write_file", args={})
+
+
 class TestGetPreVerifyContinueMessage:
     """`pre_verify` directive aggregation — mirrors the pre_tool_call block path."""
 

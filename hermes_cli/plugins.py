@@ -5138,6 +5138,11 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                # ``pre_tool_call`` is an enforcement boundary. Its callers
+                # convert failure to a generic block; swallowing it here would
+                # turn a broken policy hook into silent execution.
+                if hook_name == "pre_tool_call":
+                    raise
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,

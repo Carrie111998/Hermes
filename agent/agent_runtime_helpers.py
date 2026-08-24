@@ -3092,7 +3092,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             if modified_args is not None:
                 function_args = modified_args
         except Exception:
-            block_message = None
+            # Pre-tool policy is an enforcement boundary: never execute after a
+            # dispatch failure and never expose its exception details.
+            block_message = "Tool blocked: pre-tool policy check failed"
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
