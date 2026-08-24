@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 from ..db import json_dump, json_load, new_id, now
 from ..quality import normalize_name
+from .models import ResolvedIdentity
 
 
 def _nonblank(value) -> bool:
@@ -23,6 +24,18 @@ class IdentityResolver:
     def __init__(self, db, company_id: str):
         self.db = db
         self.company_id = company_id
+
+    def _result(self, organization_id: str, *, created: bool, matched_by: str) -> dict:
+        row = self.db.one(
+            "SELECT shared_organization_id FROM organizations WHERE id=? AND company_id=?",
+            (organization_id, self.company_id),
+        )
+        return ResolvedIdentity(
+            organization_id=organization_id,
+            shared_organization_id=row["shared_organization_id"] if row else None,
+            created=created,
+            matched_by=matched_by,
+        ).model_dump(mode="json")
 
     @staticmethod
     def _identifiers(payload: dict, fallback_country: str | None = None) -> list[tuple[str, str]]:
@@ -103,7 +116,7 @@ class IdentityResolver:
             source_id,
             stamp,
         )
-        return {"organization_id": organization_id, "created": False, "matched_by": matched_by}
+        return self._result(organization_id, created=False, matched_by=matched_by)
 
     def _match_by_verified_name(self, payload: dict, hint_country: str | None = None) -> str | None:
         """Locate an existing identity by verified name and country.
@@ -201,7 +214,9 @@ class IdentityResolver:
             or "Unknown organization"
         )
         self.db.execute(
-            "INSERT INTO organizations VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO organizations("
+            "id,company_id,display_name,normalized_name,domain,country,data,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 organization_id, self.company_id, display, normalize_name(display),
                 verified_payload.get("domain"), verified_payload.get("country"),
@@ -209,7 +224,7 @@ class IdentityResolver:
             ),
         )
         self._upsert_verified_links(organization_id, identifiers, source_id, stamp)
-        return {"organization_id": organization_id, "created": True, "matched_by": "new"}
+        return self._result(organization_id, created=True, matched_by="new")
 
 
     def detach_source(self, source_id: str) -> int:

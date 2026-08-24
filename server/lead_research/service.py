@@ -412,7 +412,9 @@ class LeadResearchService:
             observed_at=observed_at,
         )
         self.db.execute(
-            "INSERT INTO feature_claims VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO feature_claims("
+            "id,company_id,campaign_id,organization_id,field,status,value,confidence,"
+            "method,evidence_ids,data,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 new_id("claim"),
                 company_id,

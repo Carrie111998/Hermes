@@ -48,7 +48,9 @@ def _organization(db, company_id: str, name: str, country: str) -> str:
 
 def _claim(db, company_id, organization_id, field, value, *, age_days=0.0, campaign_id=None):
     db.execute(
-        "INSERT INTO feature_claims VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO feature_claims("
+        "id,company_id,campaign_id,organization_id,field,status,value,confidence,"
+        "method,evidence_ids,data,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (new_id("claim"), company_id, campaign_id, organization_id, field, "observed",
          json_dump(value), 0.9, "observed", "[]", "{}", now() - age_days * 86400),
     )

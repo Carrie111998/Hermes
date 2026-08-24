@@ -88,6 +88,96 @@ CREATE TABLE IF NOT EXISTS research_translations (
     updated_at REAL NOT NULL,
     UNIQUE(company_id, fact_key, content_hash, source_language, display_locale)
 );
+CREATE TABLE IF NOT EXISTS shared_organizations (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    country TEXT,
+    domain TEXT,
+    registry_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_evidence_records (
+    id TEXT PRIMARY KEY,
+    source_id TEXT,
+    provenance_url TEXT,
+    raw_hash TEXT,
+    source_class TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    source_language TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    span_start INTEGER NOT NULL,
+    span_end INTEGER NOT NULL,
+    content_hash TEXT NOT NULL UNIQUE,
+    retrieved_at REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_facts (
+    id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES shared_organizations(id),
+    field TEXT NOT NULL,
+    value_en TEXT NOT NULL,
+    value_hash TEXT NOT NULL,
+    primary_evidence_id TEXT NOT NULL REFERENCES shared_evidence_records(id),
+    derivation_kind TEXT NOT NULL,
+    period TEXT,
+    unit TEXT,
+    currency TEXT,
+    status TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    validation_basis TEXT NOT NULL,
+    source_class TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    mechanically_validated INTEGER NOT NULL,
+    observed_at REAL,
+    retrieved_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_fact_evidence (
+    fact_id TEXT NOT NULL REFERENCES shared_facts(id),
+    evidence_id TEXT NOT NULL REFERENCES shared_evidence_records(id),
+    PRIMARY KEY(fact_id, evidence_id)
+);
+CREATE TABLE IF NOT EXISTS tenant_facts (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    campaign_id TEXT REFERENCES research_campaigns(id),
+    organization_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value_en TEXT NOT NULL,
+    value_hash TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    source_language TEXT NOT NULL,
+    derivation_kind TEXT NOT NULL,
+    period TEXT,
+    unit TEXT,
+    currency TEXT,
+    status TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    validation_basis TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    span_start INTEGER NOT NULL,
+    span_end INTEGER NOT NULL,
+    source_class TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    mechanically_validated INTEGER NOT NULL,
+    observed_at REAL,
+    retrieved_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(company_id, organization_id, field, value_hash, evidence_id)
+);
+CREATE TABLE IF NOT EXISTS research_fact_consumers (
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    shared_fact_id TEXT NOT NULL REFERENCES shared_facts(id),
+    first_used_at REAL NOT NULL,
+    last_used_at REAL NOT NULL,
+    PRIMARY KEY(company_id, shared_fact_id)
+);
 -- Candidate corpora are service-only shared inputs.  They deliberately have
 -- no company_id: a later campaign may evaluate them, but importing a corpus
 -- cannot create a tenant lead, organization, research row, or evidence.
@@ -132,6 +222,16 @@ CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(
 CREATE INDEX IF NOT EXISTS ix_research_results_tenant ON research_results(company_id, campaign_id, verdict);
 CREATE INDEX IF NOT EXISTS ix_research_translations_tenant
     ON research_translations(company_id, fact_key, display_locale);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_shared_organizations_domain
+    ON shared_organizations(domain) WHERE domain IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_shared_organizations_registry
+    ON shared_organizations(country, registry_id) WHERE registry_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_shared_fact_identity
+    ON shared_facts(organization_id, field, value_hash, primary_evidence_id);
+CREATE INDEX IF NOT EXISTS ix_shared_facts_reusable
+    ON shared_facts(organization_id, field, status, expires_at);
+CREATE INDEX IF NOT EXISTS ix_tenant_facts_reusable
+    ON tenant_facts(company_id, organization_id, field, status, expires_at);
 -- Evidence reuse reads by tenant, source and age; the tenant index above leads
 -- with campaign_id, which this lookup deliberately does not filter on, so
 -- without this it scanned every evidence row the tenant owns once per run.
@@ -167,4 +267,6 @@ END;
 POST_COLUMN_SCHEMA = """
 CREATE INDEX IF NOT EXISTS ix_candidate_datasets_visibility_owner
     ON candidate_datasets(visibility, owner_company_id, dataset_id, version);
+CREATE INDEX IF NOT EXISTS ix_organizations_shared_identity
+    ON organizations(company_id, shared_organization_id);
 """

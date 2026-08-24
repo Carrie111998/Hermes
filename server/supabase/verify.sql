@@ -26,7 +26,7 @@ begin
                     '008_candidate_corpus','009_research_results',
                     '010_digest_suppression_parity','011_candidate_search_text',
                     '012_company_profile_versions','013_candidate_visibility',
-                    '014_research_translations']) v
+                    '014_research_translations','015_shared_research_facts']) v
   where v not in (select version from schema_migrations);
   if missing is not null then
     raise exception 'unapplied migrations: %', missing;

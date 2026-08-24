@@ -275,6 +275,62 @@ class Organization(ApiModel):
     buyer_types: list[str] = Field(default_factory=list)
 
 
+class ResolvedIdentity(ApiModel):
+    organization_id: str
+    shared_organization_id: str | None = None
+    created: bool
+    matched_by: str
+
+
+class EvidenceSpan(ApiModel):
+    original: str = Field(min_length=1)
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def ordered_offsets(self):
+        if self.end <= self.start:
+            raise ValueError("evidence span end must be after its start")
+        return self
+
+
+class ResearchFact(ApiModel):
+    organization_id: str
+    campaign_id: str | None = None
+    field: str
+    value_en: Any
+    original_text: str
+    source_language: str
+    derivation_kind: Literal["observed", "translated", "calculated"]
+    period: str | None = None
+    unit: str | None = None
+    currency: str | None = None
+    status: Literal["observed", "unknown", "conflicted", "withdrawn"] = "observed"
+    confidence: float = Field(ge=0, le=1)
+    validation_basis: str
+    evidence_id: str
+    span: EvidenceSpan
+    source_class: Literal["official", "registry", "public", "licensed", "customer"]
+    visibility: Literal["public", "licensed", "private"]
+    mechanically_validated: bool
+    observed_at: float | None
+    retrieved_at: float
+    expires_at: float
+
+    @model_validator(mode="after")
+    def span_text_is_original(self):
+        if self.span.original != self.original_text:
+            raise ValueError("fact original text must equal its evidence span")
+        return self
+
+
+class StoredFact(ResearchFact):
+    id: str
+    pool: Literal["shared", "tenant"]
+    company_id: str | None = None
+    shared_organization_id: str | None = None
+
+
 class MarketSignal(ApiModel):
     metric: str
     value: float
