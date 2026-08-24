@@ -5415,6 +5415,7 @@ class TurnRunner:
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            task_id=ctx.session_id,
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -9461,7 +9462,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return getattr(self, "_ephemeral_system_prompt", None) or ""
 
     @staticmethod
-    def _load_reasoning_config(model: str = "") -> dict | None:
+    def _load_reasoning_config(
+        model: str = "", task_id: Optional[str] = None
+    ) -> dict | None:
         """Load reasoning effort from config.yaml, respecting per-model overrides.
 
         Thin wrapper over the shared chokepoint
@@ -9469,13 +9472,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         global ``agent.reasoning_effort``; YAML boolean False = disabled).
         Closes #21256.
 
+        When ``task_id`` is supplied (== session id) and that session has a
+        currently active skill declaring a reasoning suggestion, the skill's
+        suggestion (and any user ``agent.reasoning_by_skill`` override) are
+        honored per the chokepoint's priority.
+
         Args:
             model: The effective model for the calling session. When empty,
                    the config's ``model.default`` is used.
+            task_id: The session's task id (== session id). When set, the
+                     active-skill suggestion is looked up and passed through.
         """
         from hermes_constants import resolve_reasoning_config
         cfg = _load_gateway_runtime_config()
-        return resolve_reasoning_config(cfg, model)
+        active_skill = None
+        if task_id:
+            try:
+                from tools.skills_tool import active_skill_reasoning
+                active_skill = active_skill_reasoning(str(task_id))
+            except Exception:
+                active_skill = None
+        return resolve_reasoning_config(cfg, model, active_skill=active_skill)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -9509,15 +9526,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         model: str = "",
+        task_id: Optional[str] = None,
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
         Priority: session-scoped ``/reasoning --session`` override >
-        per-model override (``agent.reasoning_overrides``) > global
-        ``agent.reasoning_effort``. ``model`` should be the session's
-        *effective* model (session ``/model`` override included) so
-        per-model overrides track what the session actually runs — when
-        empty, the config's ``model.default`` is used.
+        per-skill override/suggestion (``agent.reasoning_by_skill`` + active
+        skill's ``metadata.hermes.reasoning``) > per-model override
+        (``agent.reasoning_overrides``) > global ``agent.reasoning_effort``.
+        ``model`` should be the session's *effective* model (session ``/model``
+        override included) so per-model overrides track what the session
+        actually runs — when empty, the config's ``model.default`` is used.
+        ``task_id`` (== session id) is passed through to look up the active
+        skill's suggestion.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -9530,7 +9551,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
-        return self._load_reasoning_config(model)
+        return self._load_reasoning_config(model, task_id=task_id)
 
     def _set_session_reasoning_override(
         self,
@@ -23022,7 +23043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(
-                source=source, model=model
+                source=source, model=model, task_id=task_id
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
