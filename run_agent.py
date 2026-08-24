@@ -7713,6 +7713,25 @@ class AIAgent:
         # has it; gemma3 / qwen3-coder don't. Cached per (model, base_url).
         if base_url_host_matches(self._base_url_lower, "ollama.com"):
             return self._ollama_supports_thinking_cached()
+        # For any endpoint that serves an OpenRouter-compatible /v1/models
+        # catalog (e.g. the claudecode-as-openai shim on localhost), consult
+        # the endpoint's own advertised supported_parameters before giving up.
+        # fetch_endpoint_model_metadata() is cached per base URL with a 5-minute
+        # TTL, so this is a dict lookup on every turn after the first call.
+        try:
+            from agent.model_metadata import endpoint_model_supports_reasoning
+
+            catalog_result = endpoint_model_supports_reasoning(
+                self.model,
+                self._base_url or "",
+                api_key=self._api_key or "",
+            )
+            if catalog_result is True:
+                return True
+            # catalog_result is False (model listed but no reasoning) or None
+            # (catalog unreachable / model unlisted) -- fall through.
+        except Exception:
+            pass
         if not self._is_openrouter_url():
             return False
         if base_url_host_matches(self._base_url_lower, "api.mistral.ai"):
