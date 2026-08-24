@@ -10,6 +10,7 @@ interface PendingClarifyIdentity {
   question?: string
   questions?: string[]
   requestId: string
+  toolCallId?: string
 }
 
 function toolId(payload: GatewayEventPayload | undefined): string {
@@ -54,80 +55,39 @@ function parseMaybeJsonObject(value: unknown): Record<string, unknown> {
   }
 }
 
-function stringChoices(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((choice): choice is string => typeof choice === 'string') : []
-}
-
-function choicesEqual(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((choice, index) => choice === right[index])
-}
-
-function clarifyArgsMatch(row: Record<string, unknown>, pending: PendingClarifyIdentity): boolean {
-  if (pending.questions) {
-    if (!Array.isArray(row.questions)) {
-      return false
-    }
-
-    const questions = row.questions.map(value => {
-      const entry = recordFromUnknown(value)
-
-      return typeof entry?.question === 'string' ? entry.question : ''
-    })
-
-    return choicesEqual(questions, pending.questions)
-  }
-
-  return (
-    row.question === pending.question &&
-    choicesEqual(stringChoices(row.choices), pending.choices ?? []) &&
-    (row.multi_select === true) === Boolean(pending.multiSelect)
-  )
-}
-
 export function bindPendingClarifyIdentity(
   messages: ChatMessage[],
   pending: PendingClarifyIdentity
 ): ChatMessage[] {
+  if (!pending.toolCallId) {
+    return messages
+  }
+
   for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
     const message = messages[messageIndex]
 
-    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
-      const part = message.parts[partIndex]
+    const partIndex = message.parts.findIndex(
+      part =>
+        part.type === 'tool-call' &&
+        part.toolName === 'clarify' &&
+        part.toolCallId === pending.toolCallId &&
+        part.result === undefined
+    )
 
-      if (part.type !== 'tool-call' || part.toolName !== 'clarify' || part.result !== undefined) {
-        continue
-      }
-
-      const row = parseMaybeJsonObject(part.args)
-
-      if (row.request_id === pending.requestId) {
-        return messages
-      }
-
-      if (typeof row.request_id === 'string' && row.request_id) {
-        if (clarifyArgsMatch(row, pending)) {
-          return messages
-        }
-
-        continue
-      }
-
-      if (!clarifyArgsMatch(row, pending)) {
-        continue
-      }
-
-      const boundPart: ChatMessagePart = {
-        ...part,
-        args: { ...row, request_id: pending.requestId }
-      }
-
-      const boundMessage: ChatMessage = {
-        ...message,
-        parts: message.parts.map((candidate, index) => (index === partIndex ? boundPart : candidate))
-      }
-
-      return messages.map((candidate, index) => (index === messageIndex ? boundMessage : candidate))
+    if (partIndex < 0) {
+      continue
     }
+
+    const part = message.parts[partIndex]
+    const row = parseMaybeJsonObject(part.type === 'tool-call' ? part.args : undefined)
+    const boundPart = { ...part, args: { ...row, request_id: pending.requestId } } as ChatMessagePart
+
+    const boundMessage = {
+      ...message,
+      parts: message.parts.map((candidate, index) => (index === partIndex ? boundPart : candidate))
+    }
+
+    return messages.map((candidate, index) => (index === messageIndex ? boundMessage : candidate))
   }
 
   return messages
@@ -292,10 +252,15 @@ function findToolPartIndex(
 
       const pendingRequestId = toolPartRequestId(part)
 
+      if (name === 'clarify' && !requestId && phase === 'running' && pendingRequestId) {
+        return false
+      }
+
       // A clarify.request carries the authoritative request identity. Never
       // correlate it by question text with a card already owned by another
-      // request: identical prompts can legitimately recur. A tool.start has
-      // no request_id, so it can still merge with the synthetic request row.
+      // request: identical prompts can legitimately recur. Request-less
+      // clarify starts may only merge with an unbound row; the event handler
+      // adds the active request id when clarify.request arrived first.
       return !requestId || !pendingRequestId || requestId === pendingRequestId
     })
     .map(({ index }) => index)
@@ -305,7 +270,8 @@ function findToolPartIndex(
   }
 
   if (matchValues.length) {
-    const contextualIndex = pendingIndices.find(overlaps)
+    const contextualIndex =
+      name === 'clarify' && phase === 'complete' ? pendingIndices.findLast(overlaps) : pendingIndices.find(overlaps)
 
     if (contextualIndex !== undefined) {
       return contextualIndex
@@ -421,9 +387,14 @@ export function upsertToolPart(
   const prevResult = prev && 'result' in prev ? prev.result : undefined
   const args = toolArgs(payload, prevArgs)
 
+  const prevId = prev && 'toolCallId' in prev && typeof prev.toolCallId === 'string' ? prev.toolCallId : ''
+  const prevRequestId = prev ? toolPartRequestId(prev) : ''
+  const incomingRequestId = toolPayloadRequestId(payload)
+  const syntheticClarifyRequest = name === 'clarify' && Boolean(stableId) && stableId === incomingRequestId
+
   const id =
-    stableId ||
-    (prev && 'toolCallId' in prev && typeof prev.toolCallId === 'string' ? prev.toolCallId : '') ||
+    (syntheticClarifyRequest && prevId && !prevRequestId ? prevId : stableId) ||
+    prevId ||
     nextLiveToolId(name)
 
   const base = {

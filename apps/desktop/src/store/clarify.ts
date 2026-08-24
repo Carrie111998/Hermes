@@ -19,6 +19,8 @@ export interface ClarifyRequest {
   /** Local receipt time (Unix seconds), used to reject stale resume cleanup. */
   receivedAt?: number
   sessionId: string | null
+  /** Provider tool-call identity used to correlate tool.start/tool.complete. */
+  toolCallId?: string
   /** Batch (multi-question) clarify: present instead of question/choices. */
   questions?: ClarifyQuestion[]
   /** Answers already locked server-side (reconnect replay): qid → answer. */

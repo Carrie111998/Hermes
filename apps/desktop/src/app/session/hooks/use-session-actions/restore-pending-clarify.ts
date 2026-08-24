@@ -77,6 +77,7 @@ export function restorePendingClarifyFromSnapshot(
     receivedAt: Date.now() / 1000,
     requestId: pending.request_id,
     sessionId,
+    toolCallId: typeof pending.tool_id === 'string' && pending.tool_id ? pending.tool_id : undefined,
     ...(questions.length > 0 ? { questions } : {})
   }
 
@@ -100,6 +101,6 @@ export function pendingClarifyToolPayload(request: ClarifyRequest): GatewayEvent
           ...(request.multiSelect ? { multi_select: true } : {}),
           question: request.question
         },
-    tool_id: request.requestId
+    tool_id: request.toolCallId ?? request.requestId
   }
 }

@@ -1,4 +1,6 @@
+import type { GatewayEventPayload } from '@/lib/chat-messages'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
+import { $clarifyRequests, type ClarifyRequest } from '@/store/clarify'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
 import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
@@ -11,6 +13,45 @@ import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/s
 import { SUBAGENT_EVENT_TYPES, toTodoPayload } from '../utils'
 
 import type { GatewayEventContext } from './types'
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
+}
+
+function clarifyToolMatchesRequest(args: Record<string, unknown>, request: ClarifyRequest): boolean {
+  if (request.questions) {
+    if (!Array.isArray(args.questions) || args.questions.length !== request.questions.length) {
+      return false
+    }
+
+    return args.questions.every((entry, index) => {
+      const row = entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : null
+
+      return row?.question === request.questions?.[index]?.question
+    })
+  }
+
+  return (
+    args.question === request.question &&
+    JSON.stringify(stringArray(args.choices)) === JSON.stringify(request.choices ?? []) &&
+    (args.multi_select === true) === request.multiSelect
+  )
+}
+
+function identifyActiveClarify(payload: GatewayEventPayload | undefined, sessionId: string): GatewayEventPayload | undefined {
+  if (payload?.name !== 'clarify' || !payload.args || typeof payload.args !== 'object' || Array.isArray(payload.args)) {
+    return payload
+  }
+
+  const request = $clarifyRequests.get()[sessionId]
+  const args = payload.args as Record<string, unknown>
+
+  if (!request || !clarifyToolMatchesRequest(args, request)) {
+    return payload
+  }
+
+  return { ...payload, args: { ...args, request_id: request.requestId } }
+}
 
 /** tool.generating / tool.start / tool.progress / tool.complete / subagent.*. */
 export function handleToolEvent(ctx: GatewayEventContext): boolean {
@@ -46,7 +87,8 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
     }
 
     flushQueuedDeltas(sessionId)
-    upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type, occurredAt)
+    const toolPayload = toTodoPayload(payload) ?? payload
+    upsertToolCall(sessionId, identifyActiveClarify(toolPayload, sessionId), 'running', event.type, occurredAt)
 
     if (isActiveEvent) {
       setPetActivity({ reasoning: false, toolRunning: true })

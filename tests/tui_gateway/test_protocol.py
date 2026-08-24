@@ -521,6 +521,11 @@ def test_clarify_block_helper_builds_batch_payload(capture):
     multi_select) — the tool-side normalized entries carry extra keys the
     renderer must not see."""
     server, buf = capture
+    server._sessions["s1"] = {"history": []}
+    server._on_tool_start("s1", "call-batch", "clarify", {})
+    assert server._sessions["s1"]["clarify_tool_id"] == "call-batch"
+    buf.seek(0)
+    buf.truncate(0)
     normalized = [
         {
             "qid": "q0", "id": "approach", "question": "Which?",
@@ -553,9 +558,13 @@ def test_clarify_block_helper_builds_batch_payload(capture):
     messages = [json.loads(line) for line in buf.getvalue().splitlines()]
     request = messages[0]["params"]
     assert request["type"] == "clarify.request"
+    assert request["payload"]["tool_id"] == "call-batch"
     sent = request["payload"]["questions"][0]
     assert set(sent) == {"qid", "question", "choices", "multi_select"}
     assert "id" not in sent and "choices_offered" not in sent
+
+    server._on_tool_complete("s1", "call-batch", "clarify", {}, "{}")
+    assert "clarify_tool_id" not in server._sessions["s1"]
 
 
 def test_approval_pending_replays_unresolved_requests(server, monkeypatch):

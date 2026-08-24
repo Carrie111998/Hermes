@@ -290,6 +290,26 @@ describe('clarify.request stream hydration', () => {
     ])
   })
 
+  it('keeps a repeated single clarify on its own identity when tool.start arrives first', () => {
+    mountStream()
+
+    const args = { choices: ['a'], question: 'Pick' }
+    clarifyRequest({ ...args, request_id: 'req-old' })
+    clearClarifyRequest('req-old', SID)
+
+    toolStart({ args, name: 'clarify', tool_id: 'call-new' })
+    clarifyRequest({ ...args, request_id: 'req-new', tool_id: 'call-new' })
+    clearClarifyRequest('req-new', SID)
+    toolComplete({ args, name: 'clarify', result: { answer: 'a', question: 'Pick' }, tool_id: 'call-new' })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(2)
+    expect(parts[0]).toMatchObject({ args: { request_id: 'req-old' }, toolCallId: 'req-old' })
+    expect(parts[0].type === 'tool-call' && parts[0].result).toBeUndefined()
+    expect(parts[1]).toMatchObject({ args: { request_id: 'req-new' }, toolCallId: 'call-new' })
+    expect(parts[1].type === 'tool-call' && parts[1].result).toBeDefined()
+  })
+
   it('merges a BATCH tool.start row with its clarify.request (no top-level question)', () => {
     mountStream()
 
@@ -350,5 +370,31 @@ describe('clarify.request stream hydration', () => {
       'req-batch-old',
       'req-batch-new'
     ])
+  })
+
+  it('keeps a repeated batch clarify on its own identity when clarify.request arrives first', () => {
+    mountStream()
+
+    const requestQuestions = [
+      { qid: 'q0', question: 'Drink?' },
+      { qid: 'q1', question: 'Productive when?' }
+    ]
+
+    const args = { questions: requestQuestions.map(({ question }) => ({ question })) }
+
+    clarifyRequest({ questions: requestQuestions, request_id: 'req-batch-old' })
+    clearClarifyRequest('req-batch-old', SID)
+
+    clarifyRequest({ questions: requestQuestions, request_id: 'req-batch-new', tool_id: 'call-batch-new' })
+    toolStart({ args, name: 'clarify', tool_id: 'call-batch-new' })
+    clearClarifyRequest('req-batch-new', SID)
+    toolComplete({ args, name: 'clarify', result: { responses: [] }, tool_id: 'call-batch-new' })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(2)
+    expect(parts[0]).toMatchObject({ args: { request_id: 'req-batch-old' }, toolCallId: 'req-batch-old' })
+    expect(parts[0].type === 'tool-call' && parts[0].result).toBeUndefined()
+    expect(parts[1]).toMatchObject({ args: { request_id: 'req-batch-new' }, toolCallId: 'call-batch-new' })
+    expect(parts[1].type === 'tool-call' && parts[1].result).toBeDefined()
   })
 })

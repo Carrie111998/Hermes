@@ -34,7 +34,8 @@ describe('bindPendingClarifyIdentity', () => {
 
     const bound = bindPendingClarifyIdentity(messages, {
       questions: ['Color?', 'Name?'],
-      requestId: 'request-batch'
+      requestId: 'request-batch',
+      toolCallId: 'call-batch'
     })
 
     expect(bound[0]?.parts[0]).toMatchObject({
@@ -48,7 +49,8 @@ describe('bindPendingClarifyIdentity', () => {
     const bound = bindPendingClarifyIdentity(messages, {
       choices: ['staging', 'production'],
       question: 'Which deployment target?',
-      requestId: 'request-newer'
+      requestId: 'request-newer',
+      toolCallId: 'call-newer'
     })
 
     expect(bound[0].parts[0].type === 'tool-call' && bound[0].parts[0].args).not.toMatchObject({
@@ -59,7 +61,7 @@ describe('bindPendingClarifyIdentity', () => {
     })
   })
 
-  it('never falls back to an older card when the newest match has another request identity', () => {
+  it('never falls back to an older card when the exact tool identity is absent', () => {
     const older = clarifyMessage('older')
     const newer = clarifyMessage('newer', 'request-older')
     const messages = [older, newer]
@@ -67,7 +69,8 @@ describe('bindPendingClarifyIdentity', () => {
     const bound = bindPendingClarifyIdentity(messages, {
       choices: ['staging', 'production'],
       question: 'Which deployment target?',
-      requestId: 'request-newer'
+      requestId: 'request-newer',
+      toolCallId: 'call-missing'
     })
 
     expect(bound).toBe(messages)
@@ -77,5 +80,32 @@ describe('bindPendingClarifyIdentity', () => {
     expect(bound[1].parts[0].type === 'tool-call' && bound[1].parts[0].args).toMatchObject({
       request_id: 'request-older'
     })
+  })
+
+  it('binds cold resume by the exact tool call id instead of identical question text', () => {
+    const messages = [clarifyMessage('old'), clarifyMessage('current')]
+
+    const bound = bindPendingClarifyIdentity(messages, {
+      choices: ['staging', 'production'],
+      question: 'Which deployment target?',
+      requestId: 'request-current',
+      toolCallId: 'call-current'
+    })
+
+    expect(bound[0]?.parts[0]).not.toMatchObject({ args: { request_id: 'request-current' } })
+    expect(bound[1]?.parts[0]).toMatchObject({ args: { request_id: 'request-current' } })
+  })
+
+  it('does not revive an identical stale card when the exact resumed tool call is absent', () => {
+    const messages = [clarifyMessage('stale')]
+
+    const bound = bindPendingClarifyIdentity(messages, {
+      choices: ['staging', 'production'],
+      question: 'Which deployment target?',
+      requestId: 'request-current',
+      toolCallId: 'call-current'
+    })
+
+    expect(bound).toBe(messages)
   })
 })

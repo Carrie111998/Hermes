@@ -672,6 +672,7 @@ export interface SessionResumeResponse {
     question?: string
     questions?: unknown
     request_id?: string
+    tool_id?: string
   }
   info?: SessionRuntimeInfo
   message_count: number

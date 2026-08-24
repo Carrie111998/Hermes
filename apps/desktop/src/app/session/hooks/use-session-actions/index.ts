@@ -273,7 +273,6 @@ function restorePendingApproval(response: SessionResumeResponse, sessionId: stri
   return true
 }
 
-
 function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
   return typeof target === 'string' ? target.trim() || null : target
 }

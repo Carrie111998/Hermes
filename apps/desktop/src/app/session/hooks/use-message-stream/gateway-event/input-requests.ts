@@ -67,7 +67,8 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         questions,
         receivedAt: Date.now() / 1000,
         requestId,
-        sessionId: sessionId ?? null
+        sessionId: sessionId ?? null,
+        toolCallId: typeof payload?.tool_id === 'string' && payload.tool_id ? payload.tool_id : undefined
       }
 
       setClarifyRequest(request)
@@ -94,6 +95,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         })
 
 
+
         if (sessionId === activeSessionIdRef.current) {
           requestScrollToBottom()
         }
@@ -116,7 +118,8 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         choices: choices.length > 0 ? choices : null,
         multiSelect,
         receivedAt: Date.now() / 1000,
-        sessionId: sessionId ?? null
+        sessionId: sessionId ?? null,
+        toolCallId: typeof payload?.tool_id === 'string' && payload.tool_id ? payload.tool_id : undefined
       }
 
       setClarifyRequest(request)
@@ -131,6 +134,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
             pendingClarifyToolPayload(request),
             occurredAt
           )
+
 
 
           return {

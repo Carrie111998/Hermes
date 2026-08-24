@@ -4133,6 +4133,9 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
     result-assembly keys (id, choices_offered) the renderer must not see.
     The tool decodes the JSON reply via its batch answer parser.
     """
+    session = _sessions.get(sid)
+    tool_id = str(session.get("clarify_tool_id") or "") if session else ""
+
     if questions:
         wire = [
             {
@@ -4146,7 +4149,7 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
         return _block(
             "clarify.request",
             sid,
-            {"questions": wire},
+            {"questions": wire, **({"tool_id": tool_id} if tool_id else {})},
             timeout=_clarify_timeout_seconds(),
             batch_qids=[entry["qid"] for entry in questions],
         )
@@ -4159,9 +4162,9 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
         "clarify.request",
         sid,
         (
-            {"question": q, "choices": c, "multi_select": True}
+            {"question": q, "choices": c, "multi_select": True, **({"tool_id": tool_id} if tool_id else {})}
             if multi_select
-            else {"question": q, "choices": c}
+            else {"question": q, "choices": c, **({"tool_id": tool_id} if tool_id else {})}
         ),
         timeout=_clarify_timeout_seconds(),
     )
@@ -6592,6 +6595,8 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         except Exception:
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
+        if name == "clarify":
+            session["clarify_tool_id"] = tool_call_id
     if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
         payload: dict[str, object] = {
             "tool_id": tool_call_id,
@@ -6622,6 +6627,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     if session is not None:
         snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None)
         started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None)
+        if name == "clarify" and session.get("clarify_tool_id") == tool_call_id:
+            session.pop("clarify_tool_id", None)
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
