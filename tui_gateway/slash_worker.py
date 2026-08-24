@@ -23,8 +23,10 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import cli as cli_mod
 from cli import HermesCLI
@@ -57,6 +59,9 @@ def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
     return getppid() != original_ppid
 
 
+_SLASH_WORKER_MARKER = os.path.join(tempfile.gettempdir(), "hermes-slash-worker-marker")
+
+
 def _prepare_slash_worker_runtime() -> None:
     """Start bounded MCP discovery before HermesCLI snapshots tools.
 
@@ -76,6 +81,14 @@ def _prepare_slash_worker_runtime() -> None:
         thread_name="slash-worker-mcp-discovery",
     )
     wait_for_mcp_discovery()
+    # Marker read by cli.show_tools(): this process is a slash worker with
+    # no late-refresh, so a slow MCP handshake would silently omit a server
+    # from /tools output (#92330). HERMES_INTERACTIVE=1 means the opposite
+    # (interactive session) so it is not usable as this signal.
+    try:
+        Path(_SLASH_WORKER_MARKER).touch()
+    except OSError:
+        pass
 
 
 def _start_parent_death_watchdog(original_ppid) -> None:
