@@ -233,11 +233,16 @@ class TestSchemas:
         assert "content" in RETAIN_SCHEMA["parameters"]["required"]
 
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_get_tool_schemas_returns_four(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
+        assert len(schemas) == 4
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert names == {
+            "hindsight_retain",
+            "hindsight_recall",
+            "hindsight_reflect",
+            "hindsight_update_memory",
+        }
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")

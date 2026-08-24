@@ -262,6 +262,56 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     return str(version) if version else None
 
 
+async def _patch_memory_via_client(
+    client, bank_id: str, memory_id: str, fields: dict, timeout: float
+) -> dict:
+    """PATCH a single memory's fields through the SDK's request pipeline.
+
+    hindsight-client 0.6.1's generated ``MemoryApi`` has no per-memory PATCH
+    method, so this drives ``ApiClient.param_serialize``/``call_api`` with a
+    constant resource path — the exact channel the generated methods use.
+    The target host, auth, and timeout all come from the client's own
+    ``Configuration`` (same source as every aretain/arecall call), so no
+    request can reach anything but the configured Hindsight server. Both
+    client shapes work: the cloud facade exposes ``_api_client`` directly,
+    and ``HindsightEmbedded`` forwards attribute access to its inner
+    facade via ``__getattr__``.
+    """
+    api_client = getattr(client, "_api_client", None)
+    if api_client is None:
+        raise RuntimeError("Hindsight client does not expose an ApiClient")
+    _param = api_client.param_serialize(
+        method="PATCH",
+        resource_path="/v1/default/banks/{bank_id}/memories/{memory_id}",
+        path_params={"bank_id": bank_id, "memory_id": memory_id},
+        query_params=[],
+        header_params={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        body=fields,
+        post_params=[],
+        auth_settings=[],
+    )
+    response = await api_client.call_api(*_param, _request_timeout=timeout)
+    await response.read()
+    if response.status not in (200, 204):
+        detail = ""
+        try:
+            detail = response.data.decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        # Surface the server's own rejection body — for observation facts
+        # it names the actual reason ("only world/experience facts can be
+        # curated. Observations are derived…").
+        raise RuntimeError(f"HTTP {response.status}: {detail or response.reason}")
+    try:
+        data = json.loads(response.data.decode("utf-8", errors="replace")) if response.data else {}
+    except ValueError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
 def _check_api_supports_update_mode_append(api_url: str,
                                            api_key: str | None = None) -> bool:
     """Cached capability check for ``update_mode='append'`` on *api_url*.
@@ -398,6 +448,40 @@ REFLECT_SCHEMA = {
             "query": {"type": "string", "description": "The question to reflect on."},
         },
         "required": ["query"],
+    },
+}
+
+UPDATE_SCHEMA = {
+    "name": "hindsight_update_memory",
+    "description": (
+        "Update a stored memory — most importantly its event-time anchors "
+        "occurred_start/occurred_end, which Hindsight timelines and "
+        "time-filtered recall are built on and which retained memories land "
+        "with as null. Only world/experience facts can be updated; the "
+        "server rejects derived observation facts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of the stored memory to update."},
+            "occurred_start": {
+                "type": "string",
+                "description": (
+                    "ISO-8601 start of the event (Z / +00:00 / naive UTC all accepted). "
+                    'Empty string clears the field; omitting it leaves it unchanged.'
+                ),
+            },
+            "occurred_end": {
+                "type": "string",
+                "description": (
+                    "ISO-8601 end of the event. Empty string clears the field; "
+                    "omitting it leaves it unchanged."
+                ),
+            },
+            "text": {"type": "string", "description": "Replacement memory text."},
+            "context": {"type": "string", "description": "Replacement context label."},
+        },
+        "required": ["memory_id"],
     },
 }
 
@@ -2170,7 +2254,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, UPDATE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -2242,6 +2326,43 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
+
+        elif tool_name == "hindsight_update_memory":
+            memory_id = str(args.get("memory_id") or "").strip()
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            # Only keys the caller provided go on the patch body — an empty
+            # string is meaningful (it clears the field server-side).
+            fields: Dict[str, str] = {}
+            for key in ("occurred_start", "occurred_end", "text", "context"):
+                value = args.get(key)
+                if value is not None:
+                    fields[key] = str(value)
+            if not fields:
+                return tool_error(
+                    "Provide at least one field to update: occurred_start, "
+                    "occurred_end, text, or context"
+                )
+            try:
+                logger.debug("Tool hindsight_update_memory: bank=%s, memory=%s, fields=%s",
+                             self._bank_id, memory_id, sorted(fields))
+                self._run_hindsight_operation(
+                    lambda client: _patch_memory_via_client(
+                        client,
+                        bank_id=self._bank_id,
+                        memory_id=memory_id,
+                        fields=fields,
+                        timeout=float(self._timeout or _DEFAULT_TIMEOUT),
+                    )
+                )
+                return json.dumps({
+                    "result": "Memory updated successfully.",
+                    "memory_id": memory_id,
+                    "updated_fields": sorted(fields),
+                })
+            except Exception as e:
+                logger.warning("hindsight_update_memory failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to update memory: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 
