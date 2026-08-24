@@ -367,7 +367,6 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
 
   return (
     <Section
-      variant="drawer"
       action={
         <Button
           aria-label={editing ? k.cancelEdit : k.editDescription}
@@ -382,6 +381,7 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
         </Button>
       }
       label={k.description}
+      variant="drawer"
     >
       {editing ? (
         <div className="flex flex-col gap-1.5">
@@ -429,7 +429,6 @@ function AttachmentsSection({
 
   return (
     <Section
-      variant="drawer"
       action={
         <>
           <input
@@ -458,6 +457,7 @@ function AttachmentsSection({
         </>
       }
       label={k.attachments(attachments.length)}
+      variant="drawer"
     >
       {attachments.length > 0 ? (
         <ul className="flex flex-col gap-1">
@@ -500,7 +500,7 @@ function EstimateSection({ id }: { id: string }) {
   useEffect(() => setResult(null), [id])
 
   return (
-    <Section variant="drawer" label={k.estimate}>
+    <Section label={k.estimate} variant="drawer">
       {result?.ok ? (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2 text-[0.8125rem]">
@@ -827,7 +827,7 @@ export function TaskDrawer({
           >
             <div className="flex flex-col gap-5 text-sm">
               {currentState && (
-                <Section variant="drawer" label={k.currentState}>
+                <Section label={k.currentState} variant="drawer">
                   <p className="whitespace-pre-wrap text-[0.8125rem] leading-relaxed text-(--ui-text-secondary)">
                     {currentState}
                   </p>
@@ -846,14 +846,14 @@ export function TaskDrawer({
               )}
 
               {task.diagnostics && task.diagnostics.length > 0 && (
-                <Section variant="drawer" label={k.diagnosticsN(task.diagnostics.length)}>
+                <Section label={k.diagnosticsN(task.diagnostics.length)} variant="drawer">
                   <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
                 </Section>
               )}
 
               <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
 
-              <Section variant="drawer" label={k.details}>
+              <Section label={k.details} variant="drawer">
                 <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[0.71rem]">
                   <MetaRow label={k.assignee}>
                     <AssigneeMenu
@@ -888,7 +888,7 @@ export function TaskDrawer({
               <EstimateSection id={task.id} />
 
               {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
-                <Section variant="drawer" label={k.dependencies}>
+                <Section label={k.dependencies} variant="drawer">
                   {(['parents', 'children'] as const).map(side =>
                     detail.links[side].length > 0 ? (
                       <div className="flex flex-wrap items-center gap-1.5" key={side}>
@@ -932,7 +932,6 @@ export function TaskDrawer({
 
               {detail.comments.length > 0 && (
                 <Section
-                  variant="drawer"
                   action={
                     <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
                       <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
@@ -941,6 +940,7 @@ export function TaskDrawer({
                     </Tip>
                   }
                   label={k.comments(detail.comments.length)}
+                  variant="drawer"
                 >
                   <ul className="flex flex-col gap-3">
                     {detail.comments.map(comment => (
@@ -962,7 +962,7 @@ export function TaskDrawer({
               )}
 
               {detail.events.length > 0 && (
-                <Section variant="drawer" label={k.activity(detail.events.length)}>
+                <Section label={k.activity(detail.events.length)} variant="drawer">
                   <ul className="relative ml-1 flex flex-col gap-3 border-l border-(--ui-stroke-tertiary) pl-4">
                     {detail.events.map(event => {
                       const { detail: extra, label } = eventText(event, k)
@@ -1000,7 +1000,7 @@ export function TaskDrawer({
               )}
 
               {detail.runs.length > 0 && (
-                <Section variant="drawer" label={k.runs(detail.runs.length)}>
+                <Section label={k.runs(detail.runs.length)} variant="drawer">
                   <ul className="flex flex-col gap-3">
                     {detail.runs.map(run => {
                       const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
@@ -1042,7 +1042,7 @@ export function TaskDrawer({
               )}
 
               {log?.exists && log.content && (
-                <Section variant="drawer" label={log.truncated ? k.workerLogTail : k.workerLog}>
+                <Section label={log.truncated ? k.workerLogTail : k.workerLog} variant="drawer">
                   <ScrollFade deps={log.content.length} max="24rem">
                     <LogView className="border-0 px-0">{log.content}</LogView>
                   </ScrollFade>
