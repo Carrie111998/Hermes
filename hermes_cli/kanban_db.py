@@ -3004,6 +3004,102 @@ def _migrate_routing_metadata(conn: sqlite3.Connection) -> None:
     )
 
 
+@dataclass(frozen=True)
+class RoutingBackfillResult:
+    """Summary counters for one routing metadata backfill pass."""
+
+    processed: int = 0
+    inferred: int = 0
+    unknown: int = 0
+    skipped: int = 0
+    errors: int = 0
+
+
+def _routing_usage_evidence(
+    state_db: Path, worker_session_id: str
+) -> Optional[tuple[str, str]]:
+    """Return an unambiguous dominant main-loop model/provider pair."""
+    if not state_db.is_file():
+        return None
+    try:
+        with sqlite3.connect(state_db) as usage_conn:
+            rows = usage_conn.execute(
+                "SELECT model, billing_provider, api_call_count "
+                "FROM session_model_usage WHERE session_id=? AND task='' "
+                "ORDER BY api_call_count DESC",
+                (worker_session_id,),
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return None
+    if not rows:
+        return None
+    top_count = rows[0][2]
+    if len(rows) > 1 and rows[1][2] == top_count:
+        return None
+    model, provider = rows[0][0], rows[0][1]
+    if not isinstance(model, str) or not model.strip():
+        return None
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    return model.strip(), provider.strip()
+
+
+def backfill_routing_metadata(
+    conn: sqlite3.Connection,
+    *,
+    hermes_home: Optional[Path] = None,
+) -> RoutingBackfillResult:
+    """Backfill terminal pre-migration runs from execution evidence only."""
+    metadata = conn.execute(
+        "SELECT value FROM kanban_metadata WHERE key='migration_cutoff_id'"
+    ).fetchone()
+    if metadata is None:
+        raise ValueError("routing migration cutoff is missing")
+    cutoff = int(metadata["value"])
+    if cutoff < 0:
+        raise ValueError("routing migration cutoff must be non-negative")
+    home = Path(hermes_home or os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    candidates = conn.execute(
+        "SELECT r.id,r.profile,r.metadata FROM task_runs r "
+        "JOIN tasks t ON t.id=r.task_id "
+        "WHERE r.id<=? AND r.routing_source IS NULL "
+        "AND r.ended_at IS NOT NULL AND t.status IN ('done','archived') "
+        "ORDER BY r.id",
+        (cutoff,),
+    ).fetchall()
+    inferred = unknown = 0
+    with write_txn(conn):
+        for row in candidates:
+            try:
+                run_metadata = json.loads(row["metadata"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                run_metadata = {}
+            session_id = run_metadata.get("worker_session_id") if isinstance(run_metadata, dict) else None
+            profile = row["profile"]
+            evidence = None
+            if isinstance(session_id, str) and session_id and isinstance(profile, str) and profile:
+                evidence = _routing_usage_evidence(
+                    home / "profiles" / profile / "state.db", session_id
+                )
+            if evidence is None:
+                conn.execute(
+                    "UPDATE task_runs SET routing_source='legacy_unknown', "
+                    "routing_model=NULL, routing_provider=NULL WHERE id=? AND routing_source IS NULL",
+                    (row["id"],),
+                )
+                unknown += 1
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET routing_source='inferred_evidence', "
+                    "routing_model=?, routing_provider=? WHERE id=? AND routing_source IS NULL",
+                    (evidence[0], evidence[1], row["id"]),
+                )
+                inferred += 1
+    return RoutingBackfillResult(
+        processed=len(candidates), inferred=inferred, unknown=unknown
+    )
+
+
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
 # ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current
 # schema uses ``INTEGER PRIMARY KEY AUTOINCREMENT`` / ``INTEGER NOT NULL
