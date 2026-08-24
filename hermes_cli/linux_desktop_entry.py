@@ -57,16 +57,31 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
-def resolve_exec_command() -> str:
+def resolve_exec_command(project_root: Optional[Path] = None) -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
     Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
     runs as a module with no launcher installed, use the current
     interpreter, also absolute.
+
+    The persisted entry must be launch-context independent: whatever
+    process writes it, the next launch must read and rewrite the same
+    bytes. ``resolve_hermes_bin()`` prefers ``sys.argv[0]``, which differs
+    per launch path (wrapper, repo script, ``python -m``), so for this
+    one caller an argv[0] that points inside the checkout is not a
+    durable installed launcher — skip it and resolve from PATH instead.
+    Otherwise a broken entry keeps regenerating itself (the repo-script
+    form pins a mutable uv interpreter path; the ``python -m`` form
+    persists a bare ``<python> desktop`` that no DE can run).
+
+    ``project_root`` pins which checkout counts as "internal"; defaults to
+    the running checkout.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
-    bin_path = resolve_hermes_bin()
+    bin_path = _resolve_hermes_bin_for_desktop_entry(
+        resolve_hermes_bin, checkout_root=project_root
+    )
     if bin_path:
         resolved = Path(bin_path).resolve()
         if _needs_interpreter(resolved):
@@ -84,6 +99,80 @@ def resolve_exec_command() -> str:
     else:
         argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _resolve_hermes_bin_for_desktop_entry(
+    resolve_fn=None,
+    checkout_root: Optional[Path] = None,
+) -> Optional[str]:
+    """Resolve the launcher binary for the persisted ``.desktop`` entry.
+
+    Wraps :func:`hermes_cli.relaunch.resolve_hermes_bin` with one
+    desktop-entry-specific rule: an ``argv[0]`` that points inside this
+    checkout is a launch-context artifact (the repo ``hermes`` script, or
+    ``python -m hermes_cli.main``'s interpreter), not a durable installed
+    launcher. Persisting it makes the entry a function of however the
+    previous launch happened — the bootstrap loop behind #90292's
+    incomplete fix. Skip argv[0]/relative candidates in that case and
+    fall through to PATH, where the shell installer's wrapper lives.
+
+    ``resolve_fn`` is injectable for tests.
+    """
+    if resolve_fn is None:
+        from hermes_cli.relaunch import resolve_hermes_bin as resolve_fn
+
+    if checkout_root is None:
+        checkout_root = _project_root()
+    checkout_root = Path(checkout_root).resolve()
+    original_argv0 = sys.argv[0]
+
+    def _inside_checkout(candidate: str) -> bool:
+        try:
+            path = Path(candidate).resolve()
+        except OSError:
+            return False
+        # The repo `hermes` script and anything else shipped in the tree is
+        # checkout-internal.
+        if path == checkout_root or checkout_root in path.parents:
+            return True
+        # The `python -m hermes_cli.main` relaunch context surfaces the
+        # interpreter itself as argv[0]; an interpreter is never a durable,
+        # launchable entry target (it would persist a bare `<python> desktop`).
+        # Compare against the *invoking* interpreter (argv[0]'s own file),
+        # not sys.executable — under test harnesses they differ.
+        try:
+            if path.samefile(original_argv0) and _is_interpreter(path):
+                return True
+        except OSError:
+            pass
+        return False
+
+    def _is_interpreter(candidate: Path) -> bool:
+        """A python interpreter binary (``bin/python*``), not a launcher."""
+        name = candidate.name.lower()
+        return candidate.parent.name in {"bin", "scripts"} and (
+            name == "python" or name.startswith("python")
+        )
+
+    # Only reroute when argv[0] actually drove the resolution: re-run the
+    # resolver with argv[0] hidden and compare. If PATH yields nothing,
+    # keep the resolver's original answer (its fallback chain stays
+    # authoritative; #90492 semantics preserved).
+    sys.argv[0] = ""
+    try:
+        rerouted = resolve_fn()
+    finally:
+        sys.argv[0] = original_argv0
+
+    primary = resolve_fn()
+    if primary and _inside_checkout(primary) and rerouted:
+        return rerouted
+    return primary
+
+
+def _project_root() -> Path:
+    """This file lives at ``<checkout>/hermes_cli/linux_desktop_entry.py``."""
+    return Path(__file__).resolve().parent.parent
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -116,7 +205,7 @@ def _quote_exec_arg(arg: str) -> str:
     Reserved characters require double quotes. Inside the quotes, escape
     a backslash and a double quote with a backslash.
     """
-    if not any(c in arg for c in ' \t\n"\'\\><~|&;$*?#()`'):
+    if not any(c in arg for c in " \t\n\"'\\><~|&;$*?#()`"):
         return arg
     escaped = arg.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
@@ -190,7 +279,7 @@ def install_desktop_entry(project_root: Path) -> Optional[Path]:
     # Use the themed name when the checkout has no icon (a lite or
     # packaged install). A broken absolute path renders as no icon.
     icon_value = str(icon) if icon.is_file() else "hermes"
-    contents = render_desktop_entry(resolve_exec_command(), icon_value)
+    contents = render_desktop_entry(resolve_exec_command(project_root), icon_value)
 
     try:
         entry_path.parent.mkdir(parents=True, exist_ok=True)
