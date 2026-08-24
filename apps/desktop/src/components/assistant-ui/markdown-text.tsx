@@ -543,6 +543,9 @@ function MarkdownTextSurface({
   // punctuation delimiter rules reject `**…**는`-style closings (Korean
   // particles, CJK quote-adjacent spans), so bold markers leak as literal
   // `**`. The official @streamdown/cjk plugin fixes delimiter acceptance.
+  // Deps note: `streamdownCjk` is a stable module-level import (~2KB chain),
+  // so [code] remains exhaustive — unlike the async code plugin it never
+  // changes identity between renders.
   const plugins = useMemo(
     () => (code ? { math: mathPlugin, code, cjk: streamdownCjk } : { math: mathPlugin, cjk: streamdownCjk }),
     [code]
