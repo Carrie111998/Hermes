@@ -3578,7 +3578,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // ── Pre-flight state.db integrity guard (#68474) ─────────────────
     // Emergency backup and header verification before the update touches
     // anything.  Runs while the backend is still alive.
-    preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
+    await preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
 
     // Stop our own backend(s) and wait for the venv shim to unlock BEFORE we
     // spawn the updater. Without this the updater races a still-locked
@@ -3918,7 +3918,7 @@ function runningAppBundle() {
 // desktop Electron process itself, before the backend is killed and
 // before the updater is spawned — a separate safety net from the
 // Python-level pre-update snapshot inside `hermes update`.
-function preflightStateDb(hermesHome, rememberLog, updateRoot) {
+async function preflightStateDb(hermesHome, rememberLog, updateRoot) {
   const stateDbPath = path.join(hermesHome, 'state.db')
 
   if (!fileExists(stateDbPath)) {
@@ -3952,53 +3952,53 @@ function preflightStateDb(hermesHome, rememberLog, updateRoot) {
       // returns in <1s (measured 0.4s on Apple Silicon), so the cost of
       // catching corruption before mutation is negligible. Run it through
       // the repo's Python (stdlib sqlite3; venv may not ship a sqlite3
-      // binary), never blocking the update if the probe itself fails.
+      // binary) via scripts/db_integrity_probe.py, never blocking the
+      // update if the probe itself fails. Awaited (not execFileSync) so a
+      // slow probe — SQLite lock contention, a big corrupt file — can't
+      // freeze the whole Electron main process for up to the 30s cap.
       // Three states, deliberately: "could not check" must never look like
       // "checked, and found damaged".  Both are non-ok, but only a probe that
       // actually RAN and returned non-ok earns the .CORRUPT tag below.  A
       // missing interpreter would otherwise brand a perfectly healthy backup
       // as damaged — and that filename outlives the log line explaining it.
+      // The probe never opens a read-write fallback: this runs while the
+      // backend may still hold state.db open, so a second RW connection here
+      // would recreate the exact hazard — two writers on a live database —
+      // behind the 2026-08-21 incident. A failed read-only open is reported
+      // as "unverified", not risked away with a write-capable retry.
+      const MAX_INTEGRITY_PROBLEM_CHARS = 2000
       let integrityVerdict: 'ok' | 'corrupt' | 'unverified' = 'unverified'
       let integrityProblem = 'not-run'
+
       try {
         const pythonBin = findPythonForRoot(updateRoot)
-        if (pythonBin) {
-          const code = [
-            'import sqlite3, sys, pathlib',
-            'p = pathlib.Path(sys.argv[1])',
-            'try:',
-            // Read-only open: this runs while the backend is still alive, so
-            // adding a second READ-WRITE connection to a database another
-            // process is writing is exactly the shape behind the 2026-08-21
-            // corruption.  as_uri() escapes spaces and unicode in the path.
-            '    c = sqlite3.connect(p.as_uri() + "?mode=ro", uri=True, timeout=5)',
-            'except sqlite3.OperationalError:',
-            // A read-only WAL open needs an existing -shm, which disappears
-            // once no process holds the database.  Fall back rather than
-            // report a healthy database as unverified.
-            '    c = sqlite3.connect(str(p), timeout=5)',
-            'print("\\n".join(r[0] for r in c.execute("PRAGMA integrity_check")))',
-          ].join('\n')
-          const probe = execFileSync(pythonBin, ['-c', code, stateDbPath], {
-            encoding: 'utf8',
-            timeout: 30_000, // 30s cap; 65MB DB takes ~0.4s
-          })
-          const lines = (probe || '').trim().split('\n').filter(Boolean)
+        const probeScript = path.join(updateRoot, 'scripts', 'db_integrity_probe.py')
+
+        if (pythonBin && fileExists(probeScript)) {
+          const probe = await execText(pythonBin, [probeScript, stateDbPath], { timeout: 30_000 })
+          const lines = probe.trim().split('\n').filter(Boolean)
+
           if (lines.length === 1 && lines[0] === 'ok') {
             integrityVerdict = 'ok'
             integrityProblem = ''
+          } else if (lines.length === 1 && lines[0].startsWith('UNVERIFIED:')) {
+            integrityProblem = lines[0].slice('UNVERIFIED:'.length).trim()
           } else {
             integrityVerdict = 'corrupt'
-            integrityProblem = (lines[0] || 'non-ok').slice(0, 300)
+            // Keep every row (not just the first) for forensics; cap the
+            // total so one badly-corrupt database can't evict the rest of
+            // the 300-line log ring buffer (see rememberLog).
+            integrityProblem = lines.join(' | ').slice(0, MAX_INTEGRITY_PROBLEM_CHARS)
           }
         } else {
-          integrityProblem = 'no-python-found'
+          integrityProblem = pythonBin ? 'no-probe-script-found' : 'no-python-found'
         }
       } catch (integrityErr) {
         // A probe malfunction (spawn failure, timeout, unreadable path) says
         // nothing about the database — the verdict stays 'unverified'.
         integrityProblem = String(integrityErr && integrityErr.message ? integrityErr.message : integrityErr)
       }
+
       rememberLog(
         `[updates] state.db pre-flight integrity: verdict=${integrityVerdict}` +
           (integrityProblem ? `, problem=${integrityProblem}` : '')
@@ -4032,6 +4032,7 @@ function preflightStateDb(hermesHome, rememberLog, updateRoot) {
           : integrityVerdict === 'corrupt'
             ? '.CORRUPT'
             : '.UNVERIFIED'
+
       const emergencyPath = path.join(
         hermesHome,
         `state.db.pre-update-emergency-${ts}${integritySuffix}.bak`
@@ -4106,7 +4107,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
   }
 
   // ── Pre-flight state.db integrity guard (#68474) ──
-  preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
+  await preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
 
   // Branch-pin so a non-main checkout doesn't get switched to main (and
   // self-heal to main when the pinned branch no longer exists on origin).
