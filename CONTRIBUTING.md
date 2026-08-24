@@ -680,8 +680,8 @@ that touches the OS, assume *any* platform can hit your code path.
 
 > **Before you PR:** run `scripts/check-windows-footguns.py` to catch the
 > common Windows-unsafe patterns in your diff. It's grep-based and cheap;
-> CI runs it on every PR too. The same goes for
-> `scripts/check-bash-shebangs.py` (hardcoded `/bin/bash`, see rule 16).
+> CI runs it on every PR too. The portable-bash checker below is also run for
+> every checker-relevant diff, including Markdown-only changes.
 
 ### Critical rules
 
@@ -832,19 +832,17 @@ that touches the OS, assume *any* platform can hit your code path.
     _quote_cmd_script_arg` and `_quote_schtasks_arg` for the reference
     pair.
 
-16. **Portable bash shebangs.** Every shell script uses
-    `#!/usr/bin/env bash`; hardcoded `/bin/bash` paths break on NixOS,
-    musl distros, and minimal containers where nothing exists there. The
-    `env` form resolves bash through `PATH`. This applies to markdown code
-    blocks too - users copy-paste them. Exceptions need a REASON, never a
-    bare waiver: put `# shebang: ok <why>` on the line immediately ABOVE
-    (above-line only: trailing shebang text is passed to bash as an
-    interpreter argument and breaks execution), or list a repo-relative glob
-    in the path-based allowlist passed via `--allowlist` for whole-file
-    platform exceptions such as Termux shims. A bare `ok` without text does
-    not suppress anything. CI runs `scripts/check-bash-shebangs.py --all`
-    (blocking in `lint.yml`); the checker fails closed (exit 2) when its git
-    scope lookup breaks, so it can never silently scan nothing.
+16. **Portable bash shebangs.** Use `#!/usr/bin/env bash`, never a shebang
+    that hardcodes `/bin/bash`. This applies to shell scripts, generated script strings,
+    Markdown code blocks, and executable extensionless tracked files. An
+    intentional inline exception must be written as `# shebang: ok <reason>`
+    on the line immediately above the match; a bare `ok` is rejected. A
+    whole-file exception must be a repo-relative POSIX glob with a required
+    trailing `# reason` in an allowlist passed with `--allowlist`. Absolute,
+    parent-traversing, and reasonless entries are rejected. The checker exits
+    2 (not clean) for missing paths, traversal/read failures, or unverifiable
+    git scope. Pull requests run it on the changed-file diff; pushes to main
+    run the full-repository scan. See `scripts/check-bash-shebangs.py`.
 
 ### Testing cross-platform
 

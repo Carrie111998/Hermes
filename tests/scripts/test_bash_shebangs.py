@@ -21,6 +21,74 @@ def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_missing_explicit_path_fails_closed_and_reports_path(tmp_path):
+    missing = tmp_path / "missing.sh"
+    result = run_checker(str(missing))
+    assert result.returncode == 2
+    assert str(missing) in result.stderr
+    assert "does not exist" in result.stderr
+
+
+def test_markdown_only_fixture_is_checked(tmp_path):
+    markdown = tmp_path / "guide.md"
+    bad_shebang = "#!" + "/bin/bash\n"
+    markdown.write_text(f"```bash\n{bad_shebang}```\n", encoding="utf-8")
+    result = run_checker(str(markdown))
+    assert result.returncode == 1
+    assert "guide.md:2" in result.stdout
+
+
+def test_bare_inline_allowance_is_rejected(tmp_path):
+    script = tmp_path / "bare-ok.sh"
+    script.write_text(
+        "# shebang: ok\n" + "#!" + "/bin/bash\n", encoding="utf-8"
+    )
+    result = run_checker(str(script))
+    assert result.returncode == 1
+    assert "bare-ok.sh:2" in result.stdout
+
+
+def test_allowlist_entries_require_a_reason(tmp_path):
+    script = tmp_path / "shim.sh"
+    script.write_text("#!" + "/bin/bash\n", encoding="utf-8")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("shim.sh\n", encoding="utf-8")
+    result = run_checker("--allowlist", str(allowlist), str(script))
+    assert result.returncode == 2
+    assert "trailing # reason" in result.stderr
+
+
+def test_reasoned_repo_relative_allowlist_can_skip_a_specific_file():
+    fixture = REPO_ROOT / "tests/scripts/_temporary-shebang-allowlist-fixture.sh"
+    allowlist = REPO_ROOT / "tests/scripts/_temporary-shebang-allowlist.txt"
+    fixture.write_text("#!" + "/bin/bash\n", encoding="utf-8")
+    allowlist.write_text(
+        "tests/scripts/_temporary-shebang-allowlist-fixture.sh # platform shim\n",
+        encoding="utf-8",
+    )
+    try:
+        result = run_checker("--allowlist", str(allowlist), str(fixture))
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    finally:
+        fixture.unlink(missing_ok=True)
+        allowlist.unlink(missing_ok=True)
+
+
+def test_extensionless_executable_is_checked(tmp_path):
+    script = tmp_path / "run-helper"
+    script.write_text("#!" + "/bin/bash\n", encoding="utf-8")
+    script.chmod(0o755)
+    result = run_checker(str(script))
+    assert result.returncode == 1
+    assert "run-helper:1" in result.stdout
+
+
+def test_git_scope_lookup_failure_exits_two():
+    result = run_checker("--diff", "not-a-real-ref-for-shebang-policy")
+    assert result.returncode == 2
+    assert "git diff" in result.stderr
+
+
 def test_scan_catches_markdown_and_honors_above_line_suppression(tmp_path):
     old_shebang = "#!" + "/bin/bash\n"
     markdown = tmp_path / "optional-skills" / "example.md"
@@ -31,9 +99,6 @@ def test_scan_catches_markdown_and_honors_above_line_suppression(tmp_path):
     assert result.returncode == 1
     assert "example.md:2" in result.stdout
 
-    # The suppression marker lives on the line ABOVE the shebang. A marker on
-    # the shebang line itself would be passed to bash as an interpreter
-    # argument and break execution of the very script it is meant to excuse.
     suppressed = tmp_path / "suppressed.sh"
     suppressed.write_text(
         "# shebang: ok fixture-only example\n#!" + "/bin/bash\n",
@@ -61,26 +126,20 @@ def test_scan_flags_embedded_shebang_strings_and_honors_suppression(tmp_path):
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
 
-def test_bare_ok_without_reason_does_not_suppress(tmp_path):
-    # helix4u review point: the checker must enforce that a suppression
-    # carries a reason. `ok` alone, or `ok` with only whitespace/punctuation,
-    # is treated as a violation so every waiver stays auditable.
+def test_bare_ok_variants_do_not_suppress(tmp_path):
     for bad_marker in (
         "# shebang: ok",
         "# shebang: OK:",
         "# shebang: ok   ",
     ):
-        f = tmp_path / "bare-ok.sh"
-        f.write_text(bad_marker + "\n#!" + "/bin/bash\n", encoding="utf-8")
-        result = run_checker(str(f))
+        fixture = tmp_path / "bare-ok.sh"
+        fixture.write_text(bad_marker + "\n#!" + "/bin/bash\n", encoding="utf-8")
+        result = run_checker(str(fixture))
         assert result.returncode == 1, f"{bad_marker!r}: {result.stdout}"
-        assert "shebang string" in result.stdout
+        assert "shebang" in result.stdout
 
 
 def test_allowlist_skips_matched_paths_but_not_others(tmp_path):
-    # helix4u review point: platform exceptions are represented OUTSIDE the
-    # shebang via a path-based allowlist (e.g. a Termux shim), not by editing
-    # the shebang line itself.
     allowed_file = tmp_path / "termux-shim.sh"
     allowed_file.write_text("#!" + "/bin/bash\n", encoding="utf-8")
     other_file = tmp_path / "normal.sh"
@@ -88,7 +147,8 @@ def test_allowlist_skips_matched_paths_but_not_others(tmp_path):
 
     allowlist = tmp_path / "allowlist.txt"
     allowlist.write_text(
-        "# termux launcher shim: no usable env at kernel exec time\ntermux-shim.sh\n",
+        "# termux launcher shim: no usable env at kernel exec time\n"
+        "termux-shim.sh # platform shim\n",
         encoding="utf-8",
     )
 
@@ -101,16 +161,8 @@ def test_allowlist_skips_matched_paths_but_not_others(tmp_path):
 
 
 def test_missing_allowlist_file_fails_closed(tmp_path):
-    f = tmp_path / "clean.sh"
-    f.write_text("#!" + "/usr/bin/env bash\n", encoding="utf-8")
-    result = run_checker("--allowlist", str(tmp_path / "nope.txt"), str(f))
+    fixture = tmp_path / "clean.sh"
+    fixture.write_text("#!" + "/usr/bin/env bash\n", encoding="utf-8")
+    result = run_checker("--allowlist", str(tmp_path / "nope.txt"), str(fixture))
     assert result.returncode == 2
     assert "cannot read allowlist" in result.stderr
-
-
-def test_git_lookup_failure_in_diff_mode_exits_2(tmp_path):
-    # helix4u review point: git lookup errors collapsed to an empty
-    # successful scan. A broken scope query must exit 2, never 0.
-    result = run_checker("--diff", "definitely-not-a-real-ref-92368")
-    assert result.returncode == 2
-    assert "refusing to guess" in result.stderr
