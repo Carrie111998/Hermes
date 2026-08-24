@@ -2399,17 +2399,26 @@ class PhotonAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_permanent_sidecar_failure(result: SendResult) -> bool:
-        """True when the sidecar classified the failure as permanent.
+        """True when the sidecar failure must not be retried or re-sent.
 
         ``auth_or_config`` and ``target_not_allowed`` cannot be fixed by
         retrying or by the plain-text fallback resend — attempting either
         just double-sends a doomed request (issue #50971).
+
+        ``sidecar_internal`` is included fail-closed: the sidecar hit an
+        internal error *after* handing the send to the upstream, so the
+        message may already have been delivered. Spectrum's "Unknown server
+        error occurred" surfaces this class on sends that completed, and
+        the plain-text resend then duplicated the reply (issue #94117).
+        For a personal channel one silent failure beats one duplicate per
+        message, so the ambiguous class suppresses the resend too.
         """
         raw = result.raw_response
         return (
             isinstance(raw, dict)
             and raw.get("retryable") is False
-            and raw.get("error_class") in ("auth_or_config", "target_not_allowed")
+            and raw.get("error_class")
+            in ("auth_or_config", "target_not_allowed", "sidecar_internal")
         )
 
     async def _send_with_retry(
@@ -2440,7 +2449,9 @@ class PhotonAdapter(BasePlatformAdapter):
         if self._is_permanent_sidecar_failure(result):
             # Permanent failure classes: retrying cannot succeed and the
             # unconditional plain-text fallback below would double-send the
-            # same doomed request. Return the structured failure as-is
+            # same doomed request. For ``sidecar_internal`` the send may
+            # already have delivered, so the resend is suppressed too
+            # (fail-closed, #94117). Return the structured failure as-is
             # (with the user-facing explanation already attached for
             # target_not_allowed in _sidecar_send).
             return result
