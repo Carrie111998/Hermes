@@ -327,7 +327,7 @@ def ensure_windows_bin_launchers(
     return restored
 
 
-def reconcile_venv_layout(root) -> Path | None:
+def reconcile_venv_layout(root, *, windows: bool | None = None) -> Path | None:
     """Retire a stale sibling venv when both ``venv`` and ``.venv`` exist.
 
     Two layouts are in the wild (installers historically created ``venv``;
@@ -340,10 +340,15 @@ def reconcile_venv_layout(root) -> Path | None:
     ``<name>.legacy-<timestamp>``): atomic, recoverable, and it makes every
     resolver agree immediately. stdlib-only on purpose (boot path); never
     raises. Returns the parked path, or None when there is nothing to retire.
+
+    *windows* is injectable for tests (host-independent probing), same
+    pattern as ``ensure_windows_bin_launchers``.
     """
     from hermes_constants import project_venv_dir, venv_python_path
 
     root = Path(root)
+    if windows is None:
+        windows = _is_windows()
     present = [name for name in (".venv", "venv") if (root / name).is_dir()]
     if len(present) < 2:
         return None
@@ -351,7 +356,7 @@ def reconcile_venv_layout(root) -> Path | None:
     if active is None:
         return None
     legacy = (root / "venv") if active == root / ".venv" else root / ".venv"
-    if not venv_python_path(active, windows=_is_windows()).exists():
+    if not venv_python_path(active, windows=windows).exists():
         return None  # resolved venv unusable: leave the mix alone
     parked = root / f"{legacy.name}.legacy-{time.strftime('%Y%m%d-%H%M%S')}"
     if parked.exists():

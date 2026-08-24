@@ -27,7 +27,7 @@ def test_parks_legacy_venv_when_both_exist(tmp_path):
     _make(root, "venv")
     _make(root, ".venv")
 
-    parked = reconcile_venv_layout(root)
+    parked = reconcile_venv_layout(root, windows=True)
 
     assert parked is not None
     assert parked.name.startswith("venv.legacy-")
@@ -44,7 +44,7 @@ def test_parks_other_sibling_when_running_from_legacy(tmp_path, monkeypatch):
     _make(root, ".venv")
     monkeypatch.setattr(sys, "prefix", str(root / "venv"))
 
-    parked = reconcile_venv_layout(root)
+    parked = reconcile_venv_layout(root, windows=True)
 
     assert parked is not None
     assert parked.name.startswith(".venv.legacy-")
@@ -56,7 +56,7 @@ def test_single_layout_is_a_noop(tmp_path):
     root = tmp_path / "checkout"
     _make(root, ".venv")
 
-    assert reconcile_venv_layout(root) is None
+    assert reconcile_venv_layout(root, windows=True) is None
     assert (root / ".venv" / "Scripts" / "python.exe").exists()
 
 
@@ -68,7 +68,7 @@ def test_broken_resolved_venv_never_prompts_parking(tmp_path):
     _make(root, ".venv")
     (root / ".venv" / "Scripts" / "python.exe").unlink()  # canonical broken
 
-    assert reconcile_venv_layout(root) is None
+    assert reconcile_venv_layout(root, windows=True) is None
     assert (root / "venv").exists()
 
 
@@ -80,4 +80,4 @@ def test_never_raises(tmp_path):
     _make(root, ".venv")
     (root / ".venv" / "Scripts" / "python.exe").unlink()
 
-    assert reconcile_venv_layout(root) is None
+    assert reconcile_venv_layout(root, windows=True) is None
