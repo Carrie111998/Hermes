@@ -107,7 +107,7 @@ export function installUserTheme(theme: DesktopTheme): DesktopTheme {
 export function removeUserTheme(name: string): void {
   const current = $userThemes.get()
 
-  if (!current[name]) {
+  if (!Object.hasOwn(current, name)) {
     return
   }
 

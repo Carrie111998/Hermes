@@ -89,6 +89,56 @@ describe('user theme registry', () => {
     ])
   })
 
+  it.each(['__proto__', 'constructor', 'toString'])('is a true no-op for inherited prototype name %s', name => {
+    const retained = makeTheme('Retained')
+    const current = { [retained.name]: retained }
+    const rawUserThemes = JSON.stringify(current)
+    const rawProfiles = JSON.stringify({ default: name, custom: retained.name })
+    $userThemes.set(current)
+    window.localStorage.setItem(USER_THEMES_KEY, rawUserThemes)
+    window.localStorage.setItem(PROFILE_SKINS_KEY, rawProfiles)
+    window.localStorage.setItem(SKIN_KEY, name)
+    const persistenceEvents: PersistenceEvent[] = []
+    const unsubscribe = onPersistenceEvent(event => persistenceEvents.push(event))
+
+    try {
+      removeUserTheme(name)
+    } finally {
+      unsubscribe()
+    }
+
+    expect($userThemes.get()).toBe(current)
+    expect($userThemes.get()).toEqual({ [retained.name]: retained })
+    expect(window.localStorage.getItem(USER_THEMES_KEY)).toBe(rawUserThemes)
+    expect(window.localStorage.getItem(PROFILE_SKINS_KEY)).toBe(rawProfiles)
+    expect(window.localStorage.getItem(SKIN_KEY)).toBe(name)
+    expect(persistenceEvents).toEqual([])
+  })
+
+  it('removes an own prototype-named theme from a null-prototype registry', () => {
+    const theme = makeTheme('Prototype collision')
+    theme.name = '__proto__'
+    const current = Object.create(null) as Record<string, typeof theme>
+    current[theme.name] = theme
+    $userThemes.set(current)
+    window.localStorage.setItem(USER_THEMES_KEY, JSON.stringify(current))
+    const persistenceEvents: PersistenceEvent[] = []
+    const unsubscribe = onPersistenceEvent(event => persistenceEvents.push(event))
+
+    try {
+      removeUserTheme(theme.name)
+    } finally {
+      unsubscribe()
+    }
+
+    expect(Object.hasOwn($userThemes.get(), theme.name)).toBe(false)
+    expect(persistenceEvents).toEqual([
+      { key: USER_THEMES_KEY, op: 'remove', value: null },
+      { key: PROFILE_SKINS_KEY, op: 'read', value: null },
+      { key: SKIN_KEY, op: 'read', value: null }
+    ])
+  })
+
   it('still scrubs the global skin assignment when profile storage contains corrupted JSON', () => {
     const theme = installUserTheme(makeTheme('Corrupted profiles'))
     const rawProfiles = '{not-json'
