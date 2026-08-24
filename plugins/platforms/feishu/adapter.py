@@ -2169,6 +2169,9 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive update prompt with Yes/No buttons."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -2182,7 +2185,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 ensure_ascii=False,
             )
             response = await self._feishu_send_with_retry(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 msg_type="interactive",
                 payload=payload,
                 reply_to=None,
@@ -2197,7 +2200,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "correlation_id": str(correlation_id),
                     "control_home": str((context or {}).get("control_home") or ""),
                     "message_id": result.message_id or "",
-                    "chat_id": chat_id,
+                    "chat_id": normalized_chat_id,
                 }
             return result
         except Exception as exc:
@@ -2800,9 +2803,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if not callback_chat_id or (expected_chat_id and callback_chat_id != expected_chat_id):
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "").strip()
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        if not expected_chat_id or not callback_chat_id or callback_chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] Approval callback chat mismatch for %s (expected=%s, got=%s)",
                 approval_id,
@@ -2860,9 +2863,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if not callback_chat_id or (expected_chat_id and callback_chat_id != expected_chat_id):
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "").strip()
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        if not expected_chat_id or not callback_chat_id or callback_chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] Update prompt callback chat mismatch for %s (expected=%s, got=%s)",
                 prompt_id,
@@ -2911,11 +2914,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._is_interactive_operator_authorized(open_id):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if not chat_id or (expected_chat_id and expected_chat_id != chat_id):
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        callback_chat_id = str(chat_id or "").strip()
+        if not expected_chat_id or not callback_chat_id or expected_chat_id != callback_chat_id:
             logger.warning(
                 "[Feishu] Approval %s chat mismatch (expected=%s, got=%s)",
-                approval_id, expected_chat_id, chat_id,
+                approval_id, expected_chat_id, callback_chat_id,
             )
             return
         state = self._approval_state.pop(approval_id, None)
@@ -2935,7 +2939,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # already timed out (fail-closed deny) or was resolved via
                 # /approve. Correct the record so the user doesn't believe
                 # the command ran.
-                _chat = str(state.get("chat_id", "") or chat_id or "")
+                _chat = expected_chat_id or callback_chat_id
                 if _chat:
                     try:
                         await self.send(
@@ -2962,13 +2966,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if not chat_id or (expected_chat_id and expected_chat_id != chat_id):
+        expected_chat_id = str(state.get("chat_id", "") or "").strip()
+        callback_chat_id = str(chat_id or "").strip()
+        if not expected_chat_id or not callback_chat_id or expected_chat_id != callback_chat_id:
             logger.warning(
                 "[Feishu] Update prompt %s chat mismatch (expected=%s, got=%s)",
-                prompt_id,
-                expected_chat_id,
-                chat_id,
+                prompt_id, expected_chat_id, callback_chat_id,
             )
             return
         try:

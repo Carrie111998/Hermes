@@ -202,6 +202,45 @@ class TestFeishuUpdatePrompt:
         assert state["prompt_id"] == "prompt-up-1"
         assert state["correlation_id"] == "corr-up-1"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", ["", " \t\n"])
+    async def test_rejects_empty_or_whitespace_chat_id_before_sending(self, chat_id):
+        adapter = _make_adapter()
+
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+        ) as mock_send:
+            result = await adapter.send_update_prompt(
+                chat_id=chat_id,
+                prompt="Restore stashed changes after update?",
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        assert adapter._update_prompt_state == {}
+
+    @pytest.mark.asyncio
+    async def test_normalizes_chat_id_before_sending_and_storing(self):
+        adapter = _make_adapter()
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_up_trimmed"),
+        )
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_send:
+            result = await adapter.send_update_prompt(
+                chat_id="  oc_trimmed  ",
+                prompt="Continue?",
+            )
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+        state = next(iter(adapter._update_prompt_state.values()))
+        assert state["chat_id"] == "oc_trimmed"
+
 
 # ===========================================================================
 # _resolve_approval — approval state pop + gateway resolution
@@ -430,6 +469,65 @@ class TestCardActionCallbackResponse:
         assert response is not None
         assert response.card is None
         assert 8 in adapter._update_prompt_state
+        mock_submit.assert_not_called()
+
+    def test_update_prompt_empty_stored_chat_id_rejects_nonempty_callback(
+        self, _patch_callback_card_types
+    ):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
+        adapter._update_prompt_state[9] = {
+            "session_key": "sess-up-9",
+            "message_id": "msg_up_009",
+            "chat_id": "",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 9},
+            chat_id="oc_callback",
+            open_id="ou_bob",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 9 in adapter._update_prompt_state
+        mock_submit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("stored_chat_id", "callback_chat_id"),
+        [("   ", "oc_expected"), ("oc_expected", " \t\n")],
+    )
+    def test_update_prompt_rejects_whitespace_chat_ids(
+        self,
+        stored_chat_id,
+        callback_chat_id,
+        _patch_callback_card_types,
+    ):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
+        adapter._update_prompt_state[10] = {
+            "session_key": "sess-up-10",
+            "message_id": "msg_up_010",
+            "chat_id": stored_chat_id,
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 10},
+            chat_id=callback_chat_id,
+            open_id="ou_bob",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 10 in adapter._update_prompt_state
         mock_submit.assert_not_called()
 
     def test_update_prompt_missing_callback_chat_id_returns_no_card(self, _patch_callback_card_types):
