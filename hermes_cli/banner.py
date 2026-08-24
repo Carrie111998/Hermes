@@ -786,7 +786,7 @@ def _display_toolset_name(toolset_name: str) -> str:
 # refresh re-verifies it right after the banner renders (see
 # cli.show_banner), so a stale panel self-heals within one launch.
 
-_BANNER_SNAPSHOT_VERSION = 1
+_BANNER_SNAPSHOT_VERSION = 2
 
 
 def _banner_snapshot_path() -> Path:
@@ -826,7 +826,8 @@ def load_banner_snapshot(enabled_toolsets: List[str] = None) -> Optional[Dict[st
     fp = banner_snapshot_fingerprint()
     if not fp or blob.get("fingerprint") != fp:
         return None
-    if blob.get("enabled_toolsets") != sorted(enabled_toolsets or []):
+    snapshot_toolsets = None if enabled_toolsets is None else sorted(enabled_toolsets)
+    if blob.get("enabled_toolsets") != snapshot_toolsets:
         return None
     tools = blob.get("tools")
     toolset_map = blob.get("toolset_map")
@@ -841,7 +842,7 @@ def load_banner_snapshot(enabled_toolsets: List[str] = None) -> Optional[Dict[st
 
 def save_banner_snapshot(
     tools: List[dict],
-    enabled_toolsets: List[str],
+    enabled_toolsets: Optional[List[str]],
     availability: Dict[str, Any],
     toolset_map: Dict[str, str],
 ) -> None:
@@ -851,7 +852,9 @@ def save_banner_snapshot(
         return
     payload = {
         "fingerprint": fp,
-        "enabled_toolsets": sorted(enabled_toolsets or []),
+        "enabled_toolsets": (
+            None if enabled_toolsets is None else sorted(enabled_toolsets)
+        ),
         "tools": [
             {"function": {"name": t["function"]["name"]}}
             for t in tools
@@ -889,6 +892,7 @@ def compute_toolset_availability(enabled_toolsets: List[str] = None) -> Dict[str
     """
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
 
+    restrict_to_enabled = enabled_toolsets is not None
     enabled_toolsets = enabled_toolsets or []
     _, unavailable_toolsets = check_tool_availability(quiet=True)
     # The availability check walks the GLOBAL toolset registry, so it includes
@@ -898,7 +902,7 @@ def compute_toolset_availability(enabled_toolsets: List[str] = None) -> Dict[str
     # toolsets actually enabled for this agent; a toolset that's enabled but
     # currently has unmet deps legitimately shows as disabled/lazy below.
     _enabled_ts = {str(t) for t in enabled_toolsets}
-    if _enabled_ts:
+    if restrict_to_enabled:
         unavailable_toolsets = [
             item for item in unavailable_toolsets
             if str(item.get("id", item.get("name", ""))) in _enabled_ts
@@ -957,6 +961,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         from model_tools import get_toolset_for_tool
 
     tools = tools or []
+    unrestricted_toolsets = enabled_toolsets is None
     enabled_toolsets = enabled_toolsets or []
 
     if availability is None:
@@ -1153,7 +1158,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     # (it exposes skill_view / skill_manage). When it's disabled — e.g. a Blank
     # Slate install — the agent literally cannot load any skill, so advertising
     # the on-disk catalog here is misleading. Reflect the real state instead.
-    _skills_enabled = (not _enabled_ts) or ("skills" in _enabled_ts)
+    _skills_enabled = unrestricted_toolsets or ("skills" in _enabled_ts)
     if _skills_enabled:
         if skills_by_category is None:
             skills_by_category = get_available_skills()
