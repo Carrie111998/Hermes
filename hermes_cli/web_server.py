@@ -379,6 +379,24 @@ def _eager_reconcile_own_session_db() -> None:
         )
 
 
+async def _wisdom_checker_loop(interval: int = 300) -> None:
+    """Reconcile the typed Wisdom feed without spending an agent/model turn."""
+    while True:
+        try:
+            from hermes_cli.config import load_config
+
+            wisdom = (load_config() or {}).get("wisdom") or {}
+            if isinstance(wisdom, dict) and wisdom.get("enabled"):
+                from hermes_wisdom.service import WisdomService
+
+                await asyncio.to_thread(WisdomService().check, apply_automatic=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.debug("Collective Wisdom background reconciliation failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -464,6 +482,7 @@ async def _lifespan(app: "FastAPI"):
     # Live auto-archive timer — keeps a backend that stays up for days
     # sweeping stale sessions on schedule, independent of list requests.
     auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
+    wisdom_checker_task = asyncio.create_task(_wisdom_checker_loop())
 
     try:
         yield
@@ -473,6 +492,7 @@ async def _lifespan(app: "FastAPI"):
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
+        wisdom_checker_task.cancel()
         await PTY_REGISTRY.close_all()
         if os.getenv("HERMES_DESKTOP") == "1":
             _terminate_desktop_managed_gateway()
@@ -1661,8 +1681,15 @@ from hermes_cli.web_models import (  # noqa: F401
     WisdomSuggestRequest,
     WisdomReviewRequest,
     WisdomDecisionRequest,
+    WisdomSetupRequest,
+    WisdomScanRequest,
     WisdomInstallPlanRequest,
     WisdomInstallApplyRequest,
+    WisdomCheckRequest,
+    WisdomUpdatePlanRequest,
+    WisdomUpdateApplyRequest,
+    WisdomUninstallRequest,
+    WisdomNotificationRequest,
     DebugShareRequest,
     TTSSpeakRequest,
     OAuthSubmitBody,
@@ -15317,6 +15344,57 @@ async def get_wisdom_status(profile: Optional[str] = None):
     return await _run_wisdom(profile, lambda service: service.status())
 
 
+def _wisdom_action_name(verb: str, profile: Optional[str]) -> str:
+    scope = (profile or "current").strip().lower() or "current"
+    slug = re.sub(r"[^a-z0-9]+", "-", scope).strip("-")[:32] or "current"
+    digest = hashlib.sha1(scope.encode()).hexdigest()[:8]
+    name = f"wisdom-{verb}-{slug}-{digest}"
+    _ACTION_LOG_FILES.setdefault(name, f"action-{name}.log")
+    return name
+
+
+def _spawn_wisdom_action(
+    verb: str, profile: Optional[str], command: List[str]
+) -> dict[str, Any]:
+    name = _wisdom_action_name(verb, profile)
+    existing = _ACTION_PROCS.get(name)
+    if existing is not None and existing.poll() is None:
+        return {"ok": True, "pid": existing.pid, "name": name, "reused": True}
+    args = [*_profile_cli_args(profile), "wisdom", *command, "--json"]
+    proc = _spawn_hermes_action(args, name)
+    return {"ok": True, "pid": proc.pid, "name": name, "reused": False}
+
+
+@app.post("/api/wisdom/setup")
+async def post_wisdom_setup(body: WisdomSetupRequest):
+    if not body.accept_disclosure:
+        raise HTTPException(
+            status_code=422,
+            detail="Collective Wisdom setup requires explicit disclosure acceptance",
+        )
+    try:
+        return _spawn_wisdom_action(
+            "setup", body.profile, ["setup", "--accept-disclosure"]
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("Failed to start Collective Wisdom setup")
+        raise HTTPException(status_code=500, detail=f"Failed to start setup: {exc}")
+
+
+@app.post("/api/wisdom/scan")
+async def post_wisdom_scan(body: WisdomScanRequest):
+    command = ["scan", *([body.skill] if body.skill else [])]
+    try:
+        return _spawn_wisdom_action("scan", body.profile, command)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("Failed to start Collective Wisdom scan")
+        raise HTTPException(status_code=500, detail=f"Failed to start scan: {exc}")
+
+
 @app.get("/api/wisdom/candidates")
 async def get_wisdom_candidates(profile: Optional[str] = None):
     return await _run_wisdom(
@@ -15360,6 +15438,15 @@ async def get_wisdom_discovery(profile: Optional[str] = None):
 @app.get("/api/wisdom/skills/{skill_id}")
 async def get_wisdom_skill(skill_id: str, profile: Optional[str] = None):
     return await _run_wisdom(profile, lambda service: service.show(skill_id))
+
+
+@app.get("/api/wisdom/skills/{skill_id}/versions/{version}/content")
+async def get_wisdom_version_content(
+    skill_id: str, version: int, profile: Optional[str] = None
+):
+    return await _run_wisdom(
+        profile, lambda service: service.version_content(skill_id, version)
+    )
 
 
 @app.post("/api/wisdom/suggest")
@@ -15416,6 +15503,60 @@ async def post_wisdom_install_apply(body: WisdomInstallApplyRequest):
         lambda service: service.install_apply(
             body.receipt, accept_partial=body.accept_partial
         ),
+    )
+
+
+@app.get("/api/wisdom/installations")
+async def get_wisdom_installations(profile: Optional[str] = None):
+    def read(service):
+        return {
+            "installations": service.store.installations(),
+            "notifications": service.notifications(mark_seen=False)["events"],
+        }
+
+    return await _run_wisdom(profile, read)
+
+
+@app.post("/api/wisdom/check")
+async def post_wisdom_check(body: WisdomCheckRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.check(apply_automatic=body.apply_automatic),
+    )
+
+
+@app.post("/api/wisdom/update/plan")
+async def post_wisdom_update_plan(body: WisdomUpdatePlanRequest):
+    return await _run_wisdom(
+        body.profile, lambda service: service.update_plan(body.skill_id)
+    )
+
+
+@app.post("/api/wisdom/update/apply")
+async def post_wisdom_update_apply(body: WisdomUpdateApplyRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.update_apply(
+            body.receipt,
+            accept_sensitive=body.accept_sensitive,
+            accept_partial=body.accept_partial,
+            preserve_modified=body.preserve_modified,
+        ),
+    )
+
+
+@app.post("/api/wisdom/uninstall")
+async def post_wisdom_uninstall(body: WisdomUninstallRequest):
+    return await _run_wisdom(
+        body.profile, lambda service: service.uninstall(body.skill_id)
+    )
+
+
+@app.post("/api/wisdom/notifications")
+async def post_wisdom_notifications(body: WisdomNotificationRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.notifications(mark_seen=body.mark_seen),
     )
 
 

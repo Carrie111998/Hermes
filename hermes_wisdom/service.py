@@ -21,8 +21,9 @@ from tools.skill_usage import _find_skill_dir, is_bundled, is_hub_installed
 from tools.skills_guard import scan_skill, should_allow_install
 from tools.skillevaluator_scan import run_tier1_scan, tier1_advisory_enabled
 
-from .client import WisdomClient, WisdomValidationError
+from .client import WisdomClient, WisdomConflict, WisdomValidationError
 from .compatibility import CompatibilityResult, detect_local_capabilities, evaluate
+from .consumption import WisdomConsumption
 from .contract import (
     CONTRACT_PIN,
     PackageManifest,
@@ -37,10 +38,14 @@ from .package import (
     prepare_package,
     verify_content_files,
 )
-from .store import WisdomStore
+from .store import WisdomStore, utc_now
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+WISDOM_DISCLOSURE = (
+    "Candidate signals stay on this profile. Only owner-approved private draft bytes, "
+    "author copy, manifest metadata, and managed-install state reach the Gateway."
+)
 
 
 def _config() -> dict[str, Any]:
@@ -79,6 +84,19 @@ def _source_fingerprint(source: Path) -> str:
                 f"{path.relative_to(source).as_posix()} {sha256_address(path.read_bytes())}\n"
             )
     return sha256_address("".join(rows).encode("utf-8"))
+
+
+def _verified_tree(root: Path) -> tuple[dict[str, str], str]:
+    if not root.is_dir() or root.is_symlink():
+        raise WisdomValidationError("managed package tree is missing or unsafe")
+    files: list[tuple[str, str, bytes]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise WisdomValidationError("managed package tree contains a symbolic link")
+        if path.is_file():
+            files.append((path.relative_to(root).as_posix(), "file", path.read_bytes()))
+    records, content_hash = verify_content_files(files)
+    return {record.path: record.hash for record in records}, content_hash
 
 
 def _scan_summary(path: Path) -> dict[str, Any]:
@@ -184,7 +202,20 @@ class WisdomService:
             )
         return self._client
 
-    def setup(self) -> dict[str, Any]:
+    @property
+    def consumption(self) -> WisdomConsumption:
+        return WisdomConsumption(
+            store=self.store,
+            client=self.client,
+            scan=_scan_summary,
+            config=_config(),
+        )
+
+    def setup(self, *, disclosure_accepted: bool = False) -> dict[str, Any]:
+        if not disclosure_accepted:
+            raise PackagePolicyError(
+                "setup requires explicit acceptance of the local telemetry and private-draft disclosure"
+            )
         installation_id = self.store.installation_identity()
         capability = self.client.capability()
         registered = self.client.register_identity(installation_id)
@@ -203,7 +234,18 @@ class WisdomService:
         except OSError:
             pass
         recovered = self.reconcile_pending_install_records()
+        recovered.extend(self.consumption.recover())
         candidates = self.scan_candidates()
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        wisdom = config.get("wisdom")
+        wisdom = dict(wisdom) if isinstance(wisdom, dict) else {}
+        acknowledged_at = str(wisdom.get("disclosure_acknowledged_at") or utc_now())
+        wisdom["enabled"] = True
+        wisdom["disclosure_acknowledged_at"] = acknowledged_at
+        config["wisdom"] = wisdom
+        save_config(config)
         return {
             "ok": True,
             "installation_id": installation_id,
@@ -215,35 +257,94 @@ class WisdomService:
             "managed_directory": str(managed / org_id),
             "candidate_count": len(candidates),
             "recovered_gateway_records": recovered,
-            "disclosure": (
-                "Candidate signals stay on this profile. Only owner-approved private draft bytes, "
-                "author copy, manifest metadata, and managed-install state reach the Gateway."
-            ),
+            "disclosure": WISDOM_DISCLOSURE,
+            "disclosure_acknowledged_at": acknowledged_at,
         }
 
     def reconcile_pending_install_records(self) -> list[str]:
-        """Retry final Gateway install records after a local commit succeeded."""
+        """Resume interrupted installs from their last durable journal phase."""
         recovered: list[str] = []
         installation_id = self.store.installation_identity()
         for operation in self.store.pending_operations():
-            if (
-                operation["kind"] != "install"
-                or operation["phase"] != "local_ledger_committed"
-            ):
+            if operation["kind"] != "install":
+                continue
+            plan = json.loads(operation["payload_json"])
+            skill_id = str(plan.get("skill_id") or operation["entity_id"])
+            lock = self.store.acquire_operation_lock(skill_id)
+            if not lock:
                 continue
             try:
-                plan = json.loads(operation["payload_json"])
-                self.client.record_install(
+                plan_org = str(plan.get("org_id") or "")
+                if plan_org and plan_org != self.store.active_org_id():
+                    raw_staging = plan.get("staging_path")
+                    staging = (
+                        Path(raw_staging)
+                        if isinstance(raw_staging, str) and raw_staging
+                        else None
+                    )
+                    if staging is not None and staging.is_dir():
+                        abandoned = (
+                            self.store.root
+                            / "recovery"
+                            / str(operation["id"])
+                            / "stale-org-staging"
+                        )
+                        abandoned.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        if not abandoned.exists():
+                            os.replace(staging, abandoned)
+                    self.store.deactivate_install(skill_id)
+                    self.store.advance(str(operation["id"]), "stale_org", done=True)
+                    continue
+                if operation["phase"] in {"staged", "files_committed"}:
+                    receipt = str(plan.get("receipt") or "")
+                    if not receipt:
+                        continue
+                    self._resume_install(
+                        str(operation["id"]),
+                        plan,
+                        plan_path=self.store.root / "plans" / f"{receipt}.json",
+                    )
+                    recovered.append(skill_id)
+                    continue
+                if operation["phase"] != "local_ledger_committed":
+                    continue
+                server = self.client.record_install(
                     skill_id=plan["skill_id"],
                     installation_id=installation_id,
                     version=int(plan["version"]),
                     takedown_generation=int(plan["takedown_generation"]),
                     update_mode=plan.get("update_mode"),
                 )
+            except WisdomConflict:
+                local = self.store.installation(str(plan.get("skill_id", "")))
+                if local:
+                    target = Path(str(local["target_path"]))
+                    quarantine = (
+                        self.store.root
+                        / "recovery"
+                        / str(operation["id"])
+                        / "gateway-rejected"
+                    )
+                    quarantine.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    if target.exists() and not quarantine.exists():
+                        os.replace(target, quarantine)
+                    self.store.deactivate_install(str(plan["skill_id"]))
+                self.store.advance(operation["id"], "gateway_rejected", done=True)
+                continue
             except Exception:
                 continue
-            self.store.advance(operation["id"], "gateway_recorded", done=True)
-            recovered.append(str(operation["entity_id"]))
+            else:
+                local = self.store.installation(str(plan["skill_id"]))
+                if local:
+                    self.store.record_install({
+                        **local,
+                        "baseline": local["baseline"],
+                        "update_mode": server.effective_update_mode,
+                    })
+                self.store.advance(operation["id"], "gateway_recorded", done=True)
+                recovered.append(str(operation["entity_id"]))
+            finally:
+                self.store.release_operation_lock(skill_id, lock)
         return recovered
 
     def status(self) -> dict[str, Any]:
@@ -599,10 +700,45 @@ class WisdomService:
         return response.model_dump(mode="json")
 
     def show(self, skill_id: str) -> dict[str, Any]:
-        return self.client.skill(skill_id).model_dump(mode="json")
+        detail = self.client.skill(skill_id)
+        result = detail.model_dump(mode="json")
+        versions = [
+            int(item["version"])
+            for item in detail.versions
+            if isinstance(item.get("version"), int) and int(item["version"]) > 0
+        ]
+        if versions:
+            latest = self.client.version(skill_id, max(versions))
+            result["latest_version_detail"] = latest.model_dump(mode="json")
+            specification = latest.version.get("system_spec")
+            if isinstance(specification, dict):
+                parsed_specification = SystemSpecification.model_validate(specification)
+                result["local_compatibility"] = asdict(
+                    evaluate(
+                        parsed_specification,
+                        detect_local_capabilities(parsed_specification),
+                    )
+                )
+        return result
 
     def versions(self, skill_id: str) -> list[dict[str, Any]]:
         return self.client.skill(skill_id).versions
+
+    def version_content(self, skill_id: str, version: int) -> dict[str, Any]:
+        response, files = self.client.content(skill_id, version)
+        return {
+            "commit": response.commit,
+            "content_hash": response.content_hash,
+            "files": [
+                {
+                    "path": path,
+                    "mode": mode,
+                    "hash": sha256_address(body),
+                    "content_utf8": body.decode("utf-8", errors="replace"),
+                }
+                for path, mode, body in files
+            ],
+        }
 
     def _resolve_install_ref(self, reference: str) -> tuple[str, int | None]:
         parsed = urlparse(reference)
@@ -622,6 +758,11 @@ class WisdomService:
         self, reference: str, *, update_mode: str | None = None
     ) -> dict[str, Any]:
         skill_id, selected_version = self._resolve_install_ref(reference)
+        existing = self.store.installation(skill_id)
+        if existing and existing["state"] == "active":
+            raise PackagePolicyError(
+                "skill is already managed; use `hermes wisdom update`"
+            )
         detail = self.client.skill(skill_id)
         if detail.skill.get("state") != "active":
             raise PackagePolicyError("only active Wisdom skills can be installed")
@@ -637,7 +778,7 @@ class WisdomService:
             "name": str(detail.skill.get("slug") or skill_id),
             "requirements": version_detail.version.get("system_spec"),
         }).requirements
-        compatibility = evaluate(spec, detect_local_capabilities())
+        compatibility = evaluate(spec, detect_local_capabilities(spec))
         if compatibility.outcome == "blocked_pending_action":
             allowed = False
         else:
@@ -666,10 +807,30 @@ class WisdomService:
         plan_path = self.store.root / "plans" / f"{receipt}.json"
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            skill_id = str(plan["skill_id"])
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
             raise PackagePolicyError(
                 "install plan receipt is missing or invalid"
             ) from exc
+        lock = self.store.acquire_operation_lock(skill_id)
+        if not lock:
+            raise PackagePolicyError(
+                "another managed operation is already active for this skill"
+            )
+        try:
+            return self._install_apply_unlocked(
+                plan, plan_path=plan_path, accept_partial=accept_partial
+            )
+        finally:
+            self.store.release_operation_lock(skill_id, lock)
+
+    def _install_apply_unlocked(
+        self,
+        plan: dict[str, Any],
+        *,
+        plan_path: Path,
+        accept_partial: bool,
+    ) -> dict[str, Any]:
         outcome = plan["compatibility"]["outcome"]
         if not plan.get("allowed") or outcome == "blocked_pending_action":
             raise PackagePolicyError(
@@ -678,6 +839,20 @@ class WisdomService:
         if outcome in {"partial", "compatible_after_setup"} and not accept_partial:
             raise PackagePolicyError(
                 "compatibility action is required; explicitly accept the plan"
+            )
+        pending = next(
+            (
+                item
+                for item in self.store.pending_operations()
+                if item["kind"] == "install" and item["entity_id"] == plan["skill_id"]
+            ),
+            None,
+        )
+        if pending:
+            return self._resume_install(
+                str(pending["id"]),
+                json.loads(pending["payload_json"]),
+                plan_path=plan_path,
             )
         response, files = self.client.content(plan["skill_id"], int(plan["version"]))
         exact_records, exact_hash = verify_content_files(files)
@@ -695,7 +870,10 @@ class WisdomService:
             raise PackagePolicyError(
                 "managed install target escaped the Wisdom root"
             ) from exc
-        operation = self.store.journal("install", plan["skill_id"], "downloaded", plan)
+        if target.exists():
+            raise PackagePolicyError(
+                "managed target already exists without an active ledger entry"
+            )
         staging = Path(tempfile.mkdtemp(prefix=f".{plan['slug']}-", dir=managed_root))
         try:
             for raw_path, mode, body in files:
@@ -708,48 +886,157 @@ class WisdomService:
                 raise PackagePolicyError(
                     f"built-in guard blocked installation: {local_scan['guard']['reason']}"
                 )
-            self.store.advance(operation, "staged")
-            backup = managed_root / f".{plan['slug']}.previous"
-            if backup.exists():
-                shutil.rmtree(backup)
-            if target.exists():
-                os.replace(target, backup)
-            os.replace(staging, target)
-            self.store.advance(operation, "files_committed")
             baseline = {record.path: record.hash for record in exact_records}
-            self.store.record_install({
-                "skill_id": plan["skill_id"],
+            plan.update({
                 "org_id": org_id,
-                "slug": plan["slug"],
-                "version": plan["version"],
+                "staging_path": str(staging),
+                "target_path": str(target),
                 "content_hash": exact_hash,
                 "baseline": baseline,
+                "local_scan": local_scan,
+            })
+            operation = self.store.journal("install", plan["skill_id"], "staged", plan)
+            return self._resume_install(operation, plan, plan_path=plan_path)
+        except BaseException:
+            if staging.exists() and not any(
+                item["kind"] == "install" and item["entity_id"] == plan["skill_id"]
+                for item in self.store.pending_operations()
+            ):
+                shutil.rmtree(staging)
+            raise
+
+    def _resume_install(
+        self, operation_id: str, plan: dict[str, Any], *, plan_path: Path
+    ) -> dict[str, Any]:
+        operation = self.store.operation(operation_id)
+        if not operation:
+            raise PackagePolicyError("install recovery journal is missing")
+        phase = str(operation["phase"])
+        staging = Path(str(plan["staging_path"]))
+        target = Path(str(plan["target_path"]))
+        if phase == "staged":
+            if staging.exists():
+                staged_baseline, staged_hash = _verified_tree(staging)
+                if (
+                    staged_hash != plan["content_hash"]
+                    or staged_baseline != plan["baseline"]
+                ):
+                    raise WisdomValidationError(
+                        "staged install bytes changed after validation"
+                    )
+                os.replace(staging, target)
+            elif not target.exists():
+                raise PackagePolicyError("staged install bytes are unavailable")
+            else:
+                target_baseline, target_hash = _verified_tree(target)
+                if (
+                    target_hash != plan["content_hash"]
+                    or target_baseline != plan["baseline"]
+                ):
+                    raise WisdomValidationError(
+                        "committed install bytes do not match the recovery journal"
+                    )
+            self.store.advance(operation_id, "files_committed")
+            phase = "files_committed"
+        if phase == "files_committed":
+            self.store.record_install({
+                "skill_id": plan["skill_id"],
+                "org_id": plan["org_id"],
+                "slug": plan["slug"],
+                "version": plan["version"],
+                "content_hash": plan["content_hash"],
+                "baseline": plan["baseline"],
                 "target_path": str(target),
                 "update_mode": plan.get("update_mode") or "MANUAL",
             })
-            self.store.advance(operation, "local_ledger_committed")
-            installation_id = self.store.installation_identity()
-            server = self.client.record_install(
-                skill_id=plan["skill_id"],
-                installation_id=installation_id,
-                version=int(plan["version"]),
-                takedown_generation=int(plan["takedown_generation"]),
-                update_mode=plan.get("update_mode"),
-            )
-            self.store.advance(operation, "gateway_recorded", done=True)
+            self.store.advance(operation_id, "local_ledger_committed")
+            phase = "local_ledger_committed"
+        if phase == "local_ledger_committed":
+            try:
+                server = self.client.record_install(
+                    skill_id=plan["skill_id"],
+                    installation_id=self.store.installation_identity(),
+                    version=int(plan["version"]),
+                    takedown_generation=int(plan["takedown_generation"]),
+                    update_mode=plan.get("update_mode"),
+                )
+            except WisdomConflict:
+                quarantine = (
+                    self.store.root / "recovery" / operation_id / "gateway-rejected"
+                )
+                quarantine.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if target.exists() and not quarantine.exists():
+                    os.replace(target, quarantine)
+                self.store.deactivate_install(str(plan["skill_id"]))
+                self.store.advance(operation_id, "gateway_rejected", done=True)
+                raise
+            self.store.record_install({
+                "skill_id": plan["skill_id"],
+                "org_id": plan["org_id"],
+                "slug": plan["slug"],
+                "version": plan["version"],
+                "content_hash": plan["content_hash"],
+                "baseline": plan["baseline"],
+                "target_path": str(target),
+                "update_mode": server.effective_update_mode,
+            })
+            self.store.advance(operation_id, "gateway_recorded", done=True)
             plan_path.unlink(missing_ok=True)
-            if backup.exists():
-                shutil.rmtree(backup)
             return {
                 "installed": True,
                 "skill_id": plan["skill_id"],
                 "version": plan["version"],
                 "path": str(target),
-                "content_hash": exact_hash,
+                "content_hash": plan["content_hash"],
                 "effective_update_mode": server.effective_update_mode,
                 "compatibility": plan["compatibility"],
-                "local_scan": local_scan,
+                "local_scan": plan["local_scan"],
             }
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
+        raise PackagePolicyError(f"unsupported install recovery phase: {phase}")
+
+    def check(self, *, apply_automatic: bool = True) -> dict[str, Any]:
+        return self.consumption.check(apply_automatic=apply_automatic)
+
+    def update_plan(self, skill_id: str) -> dict[str, Any]:
+        return self.consumption.update_plan(skill_id)
+
+    def update_apply(
+        self,
+        receipt: str,
+        *,
+        accept_sensitive: bool = False,
+        accept_partial: bool = False,
+        preserve_modified: bool = False,
+    ) -> dict[str, Any]:
+        return self.consumption.update_apply(
+            receipt,
+            accept_sensitive=accept_sensitive,
+            accept_partial=accept_partial,
+            preserve_modified=preserve_modified,
+        )
+
+    def update_all(self, *, apply: bool = False) -> dict[str, Any]:
+        checked = self.consumption.check(apply_automatic=False)
+        if not apply:
+            return checked
+        applied: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        for item in checked["installations"]:
+            plan = item.get("plan")
+            if item.get("state") != "update_available" or not isinstance(plan, dict):
+                continue
+            try:
+                applied.append(
+                    self.consumption.update_apply(str(plan["receipt"]), automatic=False)
+                )
+            except PackagePolicyError as exc:
+                pending.append({"skill_id": item["skill_id"], "reason": str(exc)})
+        checked["applied"] = applied
+        checked["pending_action"] = pending
+        return checked
+
+    def uninstall(self, skill_id: str) -> dict[str, Any]:
+        return self.consumption.uninstall(skill_id)
+
+    def notifications(self, *, mark_seen: bool = False) -> dict[str, Any]:
+        return self.consumption.notifications(mark_seen=mark_seen)

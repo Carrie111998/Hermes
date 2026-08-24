@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from hermes_wisdom.client import WisdomClient, WisdomNotFound, WisdomValidationError
+from hermes_wisdom.client import (
+    WisdomClient,
+    WisdomError,
+    WisdomNotFound,
+    WisdomValidationError,
+)
 
 
 class Response:
@@ -90,3 +95,73 @@ def test_approve_exact_three_hash_body():
         "author_description_hash": "d",
         "package_manifest_hash": "m",
     }
+
+
+def test_installation_reconciliation_uses_identity_path_and_owned_delete():
+    value = client(Response(200, {"installations": []}))
+    assert value.installations("hwi_1234567890123456") == []
+    method, url, request = value.session.calls[0]
+    assert (method, url) == (
+        "GET",
+        "https://gateway.example/v1/sync/wisdom/installations/hwi_1234567890123456",
+    )
+    assert request["params"] is None
+
+    value.session.response = Response(
+        200,
+        {
+            "skill_id": "skill-1",
+            "installation_id": "hwi_1234567890123456",
+            "state": "inactive",
+        },
+    )
+    result = value.deactivate_install("hwi_1234567890123456", "skill-1")
+    assert result.state == "inactive"
+    assert value.session.calls[1][0:2] == (
+        "DELETE",
+        "https://gateway.example/v1/sync/wisdom/installations/hwi_1234567890123456/skills/skill-1",
+    )
+
+
+def test_installation_and_feed_responses_are_typed_fail_closed():
+    value = client(
+        Response(
+            200,
+            {
+                "installations": [
+                    {
+                        "skill_id": "skill-1",
+                        "installed_version": 1,
+                        "latest_version": 2,
+                        "update_mode": "UNKNOWN",
+                        "skill_state": "active",
+                        "takedown_generation": 0,
+                    }
+                ]
+            },
+        )
+    )
+    with pytest.raises(WisdomError, match="schema validation"):
+        value.installations("hwi_1234567890123456")
+
+    value.session.response = Response(
+        200,
+        {
+            "events": [
+                {
+                    "event_id": "event-1",
+                    "kind": "invented",
+                    "skill_id": "skill-1",
+                    "version": 2,
+                    "takedown_generation": 0,
+                    "installation_id": "hwi_1234567890123456",
+                    "update_mode": "MANUAL",
+                    "occurred_at": "2026-08-24T00:00:00Z",
+                }
+            ],
+            "next_cursor": "cursor-1",
+            "has_more": False,
+        },
+    )
+    with pytest.raises(WisdomError, match="schema validation"):
+        value.feed(installation_id="hwi_1234567890123456")

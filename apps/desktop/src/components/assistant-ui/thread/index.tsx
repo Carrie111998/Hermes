@@ -9,6 +9,7 @@ import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/type
 import { UserEditComposer } from '@/components/assistant-ui/thread/user-edit-composer'
 import { UserMessage } from '@/components/assistant-ui/thread/user-message'
 import { WisdomCandidateCard } from '@/components/assistant-ui/wisdom-candidate-card'
+import { WisdomNoticeCard } from '@/components/assistant-ui/wisdom-notice-card'
 import { Intro, type IntroProps } from '@/components/chat/intro'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { HermesGateway, ProfileScope } from '@/hermes'
@@ -163,8 +164,13 @@ export const Thread = memo(function Thread({
   // always correct.
   const loadingIndicator = useMemo(() => <BackgroundResumeNotice />, [])
 
-  const wisdomCandidate = useMemo(
-    () => (sessionId ? <WisdomCandidateCard profile={wisdomProfile} sessionId={sessionId} /> : undefined),
+  const wisdomContent = useMemo(
+    () => (sessionId ? (
+      <>
+        <WisdomNoticeCard profile={wisdomProfile} />
+        <WisdomCandidateCard profile={wisdomProfile} sessionId={sessionId} />
+      </>
+    ) : undefined),
     [sessionId, wisdomProfile]
   )
 
@@ -172,7 +178,7 @@ export const Thread = memo(function Thread({
     <ThreadEditContext.Provider value={editContext}>
       <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
         <ThreadMessageList
-          afterContent={wisdomCandidate}
+          afterContent={wisdomContent}
           clampToComposer={clampToComposer}
           components={messageComponents}
           emptyPlaceholder={emptyPlaceholder}

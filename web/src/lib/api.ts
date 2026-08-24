@@ -751,6 +751,24 @@ export const api = {
     fetchJSON<SkillInfo[]>(`/api/skills${profileQuery(profile)}`),
   getWisdomStatus: (profile?: string) =>
     fetchJSON<WisdomStatus>(`/api/wisdom/status${profileQuery(profile)}`),
+  setupWisdom: (profile?: string) =>
+    fetchJSON<ActionResponse>("/api/wisdom/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        accept_disclosure: true,
+        profile: profile || undefined,
+      }),
+    }),
+  scanWisdom: (skill?: string, profile?: string) =>
+    fetchJSON<ActionResponse>("/api/wisdom/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        skill: skill || undefined,
+        profile: profile || undefined,
+      }),
+    }),
   getWisdomCandidates: (profile?: string) =>
     fetchJSON<{ candidates: WisdomCandidate[] }>(
       `/api/wisdom/candidates${profileQuery(profile)}`,
@@ -774,13 +792,98 @@ export const api = {
     fetchJSON<WisdomSkillDetail>(
       `/api/wisdom/skills/${encodeURIComponent(skillId)}${profileQuery(profile)}`,
     ),
+  getWisdomVersionContent: (
+    skillId: string,
+    version: number,
+    profile?: string,
+  ) =>
+    fetchJSON<WisdomVersionContent>(
+      `/api/wisdom/skills/${encodeURIComponent(skillId)}/versions/${version}/content${profileQuery(profile)}`,
+    ),
+  getWisdomInstallations: (profile?: string) =>
+    fetchJSON<WisdomInstallations>(
+      `/api/wisdom/installations${profileQuery(profile)}`,
+    ),
+  checkWisdom: (profile?: string) =>
+    fetchJSON<Record<string, unknown>>("/api/wisdom/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        profile: profile || undefined,
+        apply_automatic: true,
+      }),
+    }),
+  planWisdomInstall: (reference: string, profile?: string) =>
+    fetchJSON<WisdomActionPlan>("/api/wisdom/install/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reference, profile: profile || undefined }),
+    }),
+  applyWisdomInstall: (
+    receipt: string,
+    acceptPartial: boolean,
+    profile?: string,
+  ) =>
+    fetchJSON<Record<string, unknown>>("/api/wisdom/install/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        receipt,
+        accept_partial: acceptPartial,
+        profile: profile || undefined,
+      }),
+    }),
+  planWisdomUpdate: (skillId: string, profile?: string) =>
+    fetchJSON<WisdomActionPlan>("/api/wisdom/update/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skill_id: skillId, profile: profile || undefined }),
+    }),
+  applyWisdomUpdate: (
+    receipt: string,
+    confirmations: {
+      acceptSensitive: boolean;
+      acceptPartial: boolean;
+      preserveModified: boolean;
+    },
+    profile?: string,
+  ) =>
+    fetchJSON<Record<string, unknown>>("/api/wisdom/update/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        receipt,
+        accept_sensitive: confirmations.acceptSensitive,
+        accept_partial: confirmations.acceptPartial,
+        preserve_modified: confirmations.preserveModified,
+        profile: profile || undefined,
+      }),
+    }),
+  uninstallWisdomSkill: (skillId: string, profile?: string) =>
+    fetchJSON<Record<string, unknown>>("/api/wisdom/uninstall", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skill_id: skillId, profile: profile || undefined }),
+    }),
+  acknowledgeWisdomNotifications: (profile?: string) =>
+    fetchJSON<{ events: Array<Record<string, unknown>> }>(
+      "/api/wisdom/notifications",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mark_seen: true,
+          profile: profile || undefined,
+        }),
+      },
+    ),
   suggestWisdomSkill: (
     skill: string,
     profile?: string,
     description?: string,
     systemSpecification?: Record<string, unknown>,
   ) =>
-    fetchJSON<WisdomPreparedDraft | { draft: WisdomDraft }>("/api/wisdom/suggest", {
+    fetchJSON<WisdomPreparedDraft | WisdomSubmittedDraft>("/api/wisdom/suggest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2424,6 +2527,17 @@ export interface WisdomPreparedDraft {
   next_step: string;
 }
 
+export interface WisdomLocalScan {
+  guard: Record<string, unknown>;
+  skill_evaluator: Record<string, unknown>;
+}
+
+export interface WisdomSubmittedDraft {
+  draft: WisdomDraft;
+  local_scan: WisdomLocalScan;
+  notice: string;
+}
+
 export interface WisdomSkillSummary {
   id: string;
   slug: string;
@@ -2445,11 +2559,16 @@ export interface WisdomDraft {
   slug: string;
   state: string;
   authorDescription: string | null;
+  explanation?: string | null;
+  scan?: Record<string, unknown> | null;
   scanVerdict: string | null;
+  systemSpec?: Record<string, unknown> | null;
   updatedAt: string;
 }
 
 export interface WisdomSkillDetail {
+  latest_version_detail?: Record<string, unknown>;
+  local_compatibility?: Record<string, unknown>;
   skill: Record<string, unknown>;
   versions: Array<Record<string, unknown>>;
 }
@@ -2468,6 +2587,43 @@ export interface WisdomDraftReview {
     package_manifest: string;
   };
   receipt: string | null;
+}
+
+export interface WisdomVersionContent {
+  commit: string;
+  content_hash: string;
+  files: Array<{
+    path: string;
+    mode: "file" | "exec";
+    hash: string;
+    content_utf8: string;
+  }>;
+}
+
+export interface WisdomManagedInstall {
+  skill_id: string;
+  slug: string;
+  version: number;
+  update_mode: "AUTO_WITH_NOTICE" | "MANUAL" | "REQUIRED";
+  state: string;
+  target_path: string;
+}
+
+export interface WisdomInstallations {
+  installations: WisdomManagedInstall[];
+  notifications: Array<Record<string, unknown>>;
+}
+
+export interface WisdomActionPlan {
+  receipt?: string;
+  state?: string;
+  skill_id: string;
+  version?: number;
+  compatibility?: { outcome: string; reasons?: string[] };
+  sensitive_expansion?: string[];
+  modified?: boolean;
+  update_mode?: string;
+  allowed?: boolean;
 }
 
 export interface SkillContent {

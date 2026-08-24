@@ -4,7 +4,12 @@ export const wisdomCopy = {
   title: 'Collective Wisdom',
   loading: 'Loading Collective Wisdom',
   unavailable: 'Collective Wisdom is unavailable.',
-  setup: 'Run hermes wisdom setup to verify this profile.',
+  setup: 'Collective Wisdom is not set up for this profile.',
+  setupDisclosure:
+    'Candidate qualification stays on this profile. Only owner-approved private draft bytes, author copy, declarative manifest metadata, and managed-install state reach the Gateway.',
+  setupAction: 'I understand — set up this profile',
+  settingUp: 'Setting up…',
+  scanLocal: 'Scan local skills',
   search: 'Search shared skills…',
   potential: 'Potential contributions',
   ownerReview: 'Owner review',
@@ -27,7 +32,20 @@ export const wisdomCopy = {
   submit: 'Submit for owner-only server review',
   submitting: 'Submitting…',
   publishing: 'Publishing…',
-  approve: 'Approve exact content & publish'
+  approve: 'Approve exact content & publish',
+  decline: 'Decline',
+  checkUpdates: (count: number) => `Check updates${count ? ` (${count})` : ''}`,
+  checking: 'Checking…',
+  updatesReady: (count: number) => `${count} Collective Wisdom updates are ready.`,
+  markSeen: 'Mark seen',
+  install: 'Install…',
+  uninstall: 'Uninstall…',
+  checkSkill: 'Check this skill',
+  installed: (version: number, mode: string) => `Installed v${version} · ${mode}`,
+  confirmAction: (action: string) => `Confirm ${action}`,
+  acceptCompatibility: 'I reviewed and accept the compatibility actions.',
+  acceptSensitive: 'I explicitly accept the new sensitive requirements.',
+  preserveModified: 'Preserve my modified copy as an unmanaged fork first.'
 } as const
 
 export type WisdomCopy = typeof wisdomCopy

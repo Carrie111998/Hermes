@@ -28,15 +28,38 @@ def cmd_wisdom(args: argparse.Namespace) -> int:
     command = getattr(args, "wisdom_command", None)
     try:
         if command == "setup":
-            result = service.setup()
+            accepted = bool(args.accept_disclosure)
+            if not accepted:
+                if not sys.stdin.isatty():
+                    raise PackagePolicyError(
+                        "noninteractive setup requires --accept-disclosure"
+                    )
+                from hermes_wisdom.service import WISDOM_DISCLOSURE
+
+                print(WISDOM_DISCLOSURE)
+                answer = input("Enable Collective Wisdom for this profile? [y/N] ")
+                if answer.strip().lower() not in {"y", "yes"}:
+                    return 7
+                accepted = True
+            result = service.setup(disclosure_accepted=accepted)
         elif command == "status":
             result = service.status()
         elif command == "scan":
             result = service.scan(getattr(args, "skill", None))
         elif command == "suggest":
+            raw_specification = getattr(args, "system_specification", None)
+            system_specification = None
+            if raw_specification:
+                try:
+                    system_specification = json.loads(raw_specification)
+                except json.JSONDecodeError as exc:
+                    raise PackagePolicyError(
+                        "--system-specification-json must be valid JSON"
+                    ) from exc
             result = service.suggest(
                 getattr(args, "skill", None),
                 description=getattr(args, "description", None),
+                system_specification=system_specification,
                 allow_private_secret_review=getattr(
                     args, "private_secret_override", False
                 ),
@@ -94,6 +117,51 @@ def cmd_wisdom(args: argparse.Namespace) -> int:
                     result = service.install_apply(
                         plan["receipt"], accept_partial=args.accept_partial
                     )
+        elif command == "check":
+            result = service.check(apply_automatic=True)
+        elif command == "update":
+            if args.all:
+                result = service.update_all(apply=True)
+            elif args.apply_receipt:
+                result = service.update_apply(
+                    args.apply_receipt,
+                    accept_sensitive=args.accept_sensitive,
+                    accept_partial=args.accept_partial,
+                    preserve_modified=args.preserve_modified,
+                )
+            elif args.skill_id:
+                plan = service.update_plan(args.skill_id)
+                if plan.get("state") == "current" or args.plan or args.json:
+                    result = plan
+                else:
+                    _emit(plan, as_json=False)
+                    if not sys.stdin.isatty():
+                        raise PackagePolicyError(
+                            "noninteractive update requires --plan then --apply-receipt"
+                        )
+                    answer = input("Apply this verified managed update plan? [y/N] ")
+                    if answer.strip().lower() not in {"y", "yes"}:
+                        return 7
+                    result = service.update_apply(
+                        plan["receipt"],
+                        accept_sensitive=args.accept_sensitive,
+                        accept_partial=args.accept_partial,
+                        preserve_modified=args.preserve_modified,
+                    )
+            else:
+                raise PackagePolicyError("update requires a skill id or --all")
+        elif command == "uninstall":
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    raise PackagePolicyError("noninteractive uninstall requires --yes")
+                answer = input(
+                    "Move this managed skill to recoverable Wisdom trash? [y/N] "
+                )
+                if answer.strip().lower() not in {"y", "yes"}:
+                    return 7
+            result = service.uninstall(args.skill_id)
+        elif command == "notifications":
+            result = service.notifications(mark_seen=args.mark_seen)
         else:
             args._wisdom_parser.print_help()
             return 2
@@ -134,13 +202,23 @@ def build_wisdom_parser(subparsers) -> None:
         )
         return command
 
-    add("setup", "Validate entitlement and initialize this profile")
+    setup = add("setup", "Validate entitlement and initialize this profile")
+    setup.add_argument(
+        "--accept-disclosure",
+        action="store_true",
+        help="Accept the local telemetry and owner-private draft disclosure",
+    )
     add("status", "Show local and Gateway Wisdom status")
     scan = add("scan", "Run local policy and advisory scans")
     scan.add_argument("skill", nargs="?")
     suggest = add("suggest", "Browse candidates or submit an owner-private draft")
     suggest.add_argument("skill", nargs="?")
     suggest.add_argument("--description", help="Owner-edited outcome description")
+    suggest.add_argument(
+        "--system-specification-json",
+        dest="system_specification",
+        help="Owner-reviewed declarative System Specification JSON",
+    )
     suggest.add_argument(
         "--send-for-owner-only-server-review",
         dest="private_secret_override",
@@ -183,3 +261,35 @@ def build_wisdom_parser(subparsers) -> None:
     install.add_argument(
         "--update-mode", choices=["MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"]
     )
+    add("check", "Reconcile the feed and check managed installations")
+    update = add("update", "Plan or apply verified managed updates")
+    update.add_argument("skill_id", nargs="?")
+    update.add_argument(
+        "--all", action="store_true", help="Process every managed install"
+    )
+    update.add_argument(
+        "--plan", action="store_true", help="Create a plan without applying"
+    )
+    update.add_argument(
+        "--apply-receipt", help="Apply a previously reviewed update plan"
+    )
+    update.add_argument(
+        "--accept-sensitive",
+        action="store_true",
+        help="Explicitly accept newly declared sensitive requirements",
+    )
+    update.add_argument(
+        "--accept-partial",
+        action="store_true",
+        help="Accept partial/setup-required compatibility",
+    )
+    update.add_argument(
+        "--preserve-modified",
+        action="store_true",
+        help="Preserve locally modified managed bytes as an unmanaged fork",
+    )
+    uninstall = add("uninstall", "Move a managed skill to recoverable trash")
+    uninstall.add_argument("skill_id")
+    uninstall.add_argument("--yes", action="store_true", help="Confirm uninstall")
+    notifications = add("notifications", "Show durable local Wisdom notices")
+    notifications.add_argument("--mark-seen", action="store_true")

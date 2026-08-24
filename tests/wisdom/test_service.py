@@ -1,7 +1,17 @@
 import json
+import copy
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from hermes_wisdom.client import Draft
+from hermes_wisdom.contract import (
+    PackageManifest,
+    SystemSpecification,
+    canonical_json_bytes,
+)
+from hermes_wisdom.package import PackagePolicyError, verify_content_files
 from hermes_wisdom.service import WisdomService
 from hermes_wisdom.store import WisdomStore
 
@@ -36,6 +46,77 @@ class FakeClient:
             explanation=None,
             updatedAt="revision-1",
         )
+
+
+class InstallClient:
+    def __init__(self, *, fail_record: bool = False):
+        manifest = PackageManifest(
+            name="managed-skill",
+            requirements=SystemSpecification.model_validate({
+                "hermes": {"minimum_version": "0.1.0"}
+            }),
+        )
+        self.files = [
+            ("SKILL.md", "file", b"# Managed\n"),
+            (
+                "skill.manifest.json",
+                "file",
+                canonical_json_bytes(manifest.model_dump(mode="json")),
+            ),
+        ]
+        self.fail_record = fail_record
+
+    def skill(self, _skill_id):
+        return SimpleNamespace(
+            skill={
+                "state": "active",
+                "slug": "managed-skill",
+                "takedown_generation": 0,
+            },
+            versions=[{"version": 1}],
+        )
+
+    def version(self, _skill_id, _version):
+        manifest = json.loads(self.files[1][2])
+        return SimpleNamespace(version={"system_spec": manifest["requirements"]})
+
+    def content(self, _skill_id, _version):
+        _records, content_hash = verify_content_files(self.files)
+        return SimpleNamespace(content_hash=content_hash), self.files
+
+    def record_install(self, **_kwargs):
+        if self.fail_record:
+            self.fail_record = False
+            raise RuntimeError("network down")
+        return SimpleNamespace(effective_update_mode="MANUAL")
+
+
+class SetupClient:
+    display_org_id = "org-1"
+    display_scopes = ("wisdom:read", "wisdom:install")
+    identity = {"claims": {"tool_gateway_admin": True}}
+
+    def capability(self):
+        return {"capabilities": ["wisdom"]}
+
+    def register_identity(self, installation_id):
+        return {"installation_id": installation_id, "state": "active"}
+
+
+def _install_service(monkeypatch, tmp_path: Path, *, client: InstallClient):
+    skills = tmp_path / "skills"
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    return WisdomService(store=store, client=client)
 
 
 def test_prepare_requires_local_owner_edit_before_any_network(
@@ -80,3 +161,104 @@ def test_prepare_requires_local_owner_edit_before_any_network(
     serialized = json.dumps(fake.submissions[0])
     for forbidden in ("usage", "refinement", "candidate", "ranking", "stability"):
         assert forbidden not in serialized
+
+
+def test_setup_persists_explicit_disclosure_and_enables_the_profile(
+    monkeypatch, tmp_path: Path
+):
+    skills = tmp_path / "skills"
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    config = {"wisdom": {"enabled": False}}
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(config))
+
+    def save_config(value):
+        config.clear()
+        config.update(copy.deepcopy(value))
+
+    monkeypatch.setattr("hermes_cli.config.save_config", save_config)
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=SetupClient())
+
+    with pytest.raises(PackagePolicyError, match="explicit acceptance"):
+        service.setup()
+    first = service.setup(disclosure_accepted=True)
+    second = service.setup(disclosure_accepted=True)
+
+    assert config["wisdom"]["enabled"] is True
+    assert (
+        config["wisdom"]["disclosure_acknowledged_at"]
+        == first["disclosure_acknowledged_at"]
+    )
+    assert second["disclosure_acknowledged_at"] == first["disclosure_acknowledged_at"]
+
+
+def test_install_retries_from_staged_bytes_after_directory_swap_failure(
+    monkeypatch, tmp_path: Path
+):
+    client = InstallClient()
+    service = _install_service(monkeypatch, tmp_path, client=client)
+    plan = service.install_plan("skill-1")
+    real_replace = __import__("os").replace
+    failed = False
+
+    def replace_once(source, destination):
+        nonlocal failed
+        if not failed and Path(destination).name == "managed-skill":
+            failed = True
+            raise OSError("injected swap failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("hermes_wisdom.service.os.replace", replace_once)
+    with pytest.raises(OSError, match="injected"):
+        service.install_apply(plan["receipt"])
+    assert service.store.pending_operations()[0]["phase"] == "staged"
+
+    monkeypatch.setattr("hermes_wisdom.service.os.replace", real_replace)
+    assert service.reconcile_pending_install_records() == ["skill-1"]
+    installation = service.store.installation("skill-1")
+    assert installation["state"] == "active"
+    assert Path(installation["target_path"], "SKILL.md").read_text() == "# Managed\n"
+
+
+def test_install_recovery_verifies_target_when_swap_won_before_journal_advance(
+    monkeypatch, tmp_path: Path
+):
+    client = InstallClient()
+    service = _install_service(monkeypatch, tmp_path, client=client)
+    plan = service.install_plan("skill-1")
+    real_advance = service.store.advance
+    failed = False
+
+    def advance_once(operation_id, phase, *, done=False):
+        nonlocal failed
+        if not failed and phase == "files_committed":
+            failed = True
+            raise OSError("injected journal failure")
+        return real_advance(operation_id, phase, done=done)
+
+    monkeypatch.setattr(service.store, "advance", advance_once)
+    with pytest.raises(OSError, match="journal"):
+        service.install_apply(plan["receipt"])
+    pending = service.store.pending_operations()[0]
+    payload = json.loads(pending["payload_json"])
+    assert pending["phase"] == "staged"
+    assert not Path(payload["staging_path"]).exists()
+    assert Path(payload["target_path"]).is_dir()
+
+    monkeypatch.setattr(service.store, "advance", real_advance)
+    result = service.install_apply(plan["receipt"])
+    assert result["installed"] is True
+
+
+def test_install_retries_only_gateway_record_after_local_commit(
+    monkeypatch, tmp_path: Path
+):
+    client = InstallClient(fail_record=True)
+    service = _install_service(monkeypatch, tmp_path, client=client)
+    plan = service.install_plan("skill-1")
+    with pytest.raises(RuntimeError, match="network down"):
+        service.install_apply(plan["receipt"])
+    assert service.store.pending_operations()[0]["phase"] == "local_ledger_committed"
+    result = service.install_apply(plan["receipt"])
+    assert result["installed"] is True
+    assert service.store.pending_operations() == []

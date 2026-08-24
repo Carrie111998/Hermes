@@ -2,7 +2,12 @@ export const wisdomCopy = {
   title: 'Collective Wisdom',
   loading: 'Loading Collective Wisdom…',
   unavailable: 'Collective Wisdom is unavailable.',
-  setup: 'Run hermes wisdom setup for this profile.',
+  setup: 'Collective Wisdom is not set up for this profile.',
+  setupDisclosure:
+    'Candidate qualification stays on this profile. Only owner-approved private draft bytes, author copy, declarative manifest metadata, and managed-install state reach the Gateway.',
+  setupAction: 'I understand — set up this profile',
+  settingUp: 'Setting up…',
+  scanLocal: 'Scan local skills',
   orgWide: 'organization-wide collective',
   sharedSkills: (count: number) => `${count} shared skills`,
   localCandidates: (count: number) => `${count} local candidates`,
@@ -37,7 +42,22 @@ export const wisdomCopy = {
   localAdvisory: 'local advisory: separate pre-submit scan',
   serverReviewNotice: 'Read every raw file below. Approval is bound to these exact server-authoritative hashes.',
   decline: 'Decline',
-  approvePublish: 'Approve & publish'
+  approvePublish: 'Approve & publish',
+  checkUpdates: (count: number) => `Check${count ? ` (${count})` : ''}`,
+  checking: 'Checking…',
+  install: 'Install…',
+  uninstall: 'Uninstall…',
+  checkSkill: 'Check this skill',
+  installed: (version: number, mode: string) => `Installed v${version} · ${mode}`,
+  confirmAction: (action: string) => `Confirm ${action}`,
+  acceptCompatibility: 'I reviewed and accept the compatibility actions.',
+  acceptSensitive: 'I explicitly accept the new sensitive requirements.',
+  preserveModified: 'Preserve my modified copy as an unmanaged fork first.',
+  alreadyCurrent: 'This managed skill is already current.',
+  ownerCopyLabel: 'Owner-authored description (not platform verified)',
+  serverFactsLabel: 'Server-enforced scan and server-derived facts',
+  notifications: 'Collective Wisdom updates',
+  markSeen: 'Mark seen'
 } as const
 
 export type WisdomCopy = typeof wisdomCopy

@@ -6,7 +6,8 @@ import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 from urllib.parse import quote
 
 import requests
@@ -130,12 +131,51 @@ class VersionContent(WireModel):
 
 
 class InstallationRecord(WireModel):
-    installed_version: int
-    effective_update_mode: str
+    installed_version: int = Field(gt=0)
+    effective_update_mode: Literal["MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"]
+
+
+class InstallationItem(WireModel):
+    skill_id: str
+    installed_version: int = Field(gt=0)
+    latest_version: int | None = Field(default=None, gt=0)
+    update_mode: Literal["MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"]
+    skill_state: str
+    takedown_generation: int | None = Field(default=None, ge=0)
+
+
+class InstallationList(WireModel):
+    installations: list[InstallationItem]
+
+
+class InstallationDeactivation(WireModel):
+    skill_id: str
+    installation_id: str
+    state: Literal["inactive"]
+
+
+class FeedEvent(WireModel):
+    event_id: str
+    kind: Literal[
+        "new",
+        "updated",
+        "archived",
+        "taken_down",
+        "restored",
+        "installed",
+        "installation_updated",
+        "uninstalled",
+    ]
+    skill_id: str
+    version: int | None = Field(default=None, gt=0)
+    takedown_generation: int | None = Field(default=None, ge=0)
+    installation_id: str | None
+    update_mode: Literal["MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"] | None
+    occurred_at: datetime
 
 
 class Feed(WireModel):
-    events: list[dict[str, Any]]
+    events: list[FeedEvent]
     next_cursor: str
     has_more: bool
 
@@ -491,11 +531,27 @@ class WisdomClient:
 
     def installations(self, installation_id: str) -> list[dict[str, Any]]:
         result = self._request(
-            "GET", "installations", params={"installation_id": installation_id}
+            "GET",
+            f"installations/{quote(installation_id, safe='')}",
+            model=InstallationList,
         )
-        return list((result or {}).get("installations") or [])
+        return [item.model_dump(mode="json") for item in result.installations]
 
-    def feed(self, cursor: str | None = None) -> Feed:
+    def deactivate_install(
+        self, installation_id: str, skill_id: str
+    ) -> InstallationDeactivation:
         return self._request(
-            "GET", "feed", model=Feed, params={"cursor": cursor} if cursor else None
+            "DELETE",
+            f"installations/{quote(installation_id, safe='')}/skills/{quote(skill_id, safe='')}",
+            model=InstallationDeactivation,
         )
+
+    def feed(
+        self, cursor: str | None = None, *, installation_id: str | None = None
+    ) -> Feed:
+        params: dict[str, str] = {}
+        if cursor:
+            params["cursor"] = cursor
+        if installation_id:
+            params["installation_id"] = installation_id
+        return self._request("GET", "feed", model=Feed, params=params or None)

@@ -8,14 +8,14 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -177,6 +177,30 @@ class WisdomStore:
                   UNIQUE(kind, skill_id, content_hash, qualification),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS feed_state (
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  cursor TEXT,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS feed_event (
+                  event_id TEXT PRIMARY KEY,
+                  kind TEXT NOT NULL,
+                  skill_id TEXT NOT NULL,
+                  version INTEGER,
+                  installation_id TEXT,
+                  update_mode TEXT,
+                  payload_json TEXT NOT NULL,
+                  cadence TEXT NOT NULL,
+                  due_at TEXT NOT NULL,
+                  local_seen_at TEXT,
+                  telegram_delivered_at TEXT,
+                  created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operation_lock (
+                  entity_id TEXT PRIMARY KEY,
+                  owner TEXT NOT NULL,
+                  expires_at TEXT NOT NULL
+                );
                 """
             )
             columns = {
@@ -245,6 +269,33 @@ class WisdomStore:
                     DROP TABLE local_event_v2;
                     """
                 )
+            journal_sql = str(
+                db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='operation_journal'"
+                ).fetchone()[0]
+            ).replace("\n", " ")
+            if "UNIQUE(kind, entity_id, state)" in journal_sql:
+                db.executescript(
+                    """
+                    ALTER TABLE operation_journal RENAME TO operation_journal_v2;
+                    CREATE TABLE operation_journal (
+                      id TEXT PRIMARY KEY,
+                      kind TEXT NOT NULL,
+                      entity_id TEXT NOT NULL,
+                      phase TEXT NOT NULL,
+                      payload_json TEXT NOT NULL,
+                      state TEXT NOT NULL,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO operation_journal SELECT * FROM operation_journal_v2;
+                    DROP TABLE operation_journal_v2;
+                    """
+                )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS operation_journal_one_pending "
+                "ON operation_journal(kind,entity_id) WHERE state='pending'"
+            )
             db.execute(
                 "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -536,6 +587,11 @@ class WisdomStore:
     def verify_installation_identity(self, org_id: str) -> None:
         with self.transaction() as db:
             db.execute(
+                "UPDATE managed_install SET state='inactive',updated_at=? "
+                "WHERE org_id<>? AND state='active'",
+                (utc_now(), org_id),
+            )
+            db.execute(
                 "UPDATE installation_identity SET verified_org_id=?,verified_at=? WHERE singleton=1",
                 (org_id, utc_now()),
             )
@@ -646,6 +702,12 @@ class WisdomStore:
     ) -> str:
         operation_id = str(uuid.uuid4())
         with self.transaction() as db:
+            existing = db.execute(
+                "SELECT id FROM operation_journal WHERE kind=? AND entity_id=? AND state='pending'",
+                (kind, entity_id),
+            ).fetchone()
+            if existing:
+                return str(existing["id"])
             db.execute(
                 "INSERT INTO operation_journal VALUES(?,?,?,?,?,'pending',?,?)",
                 (
@@ -659,6 +721,26 @@ class WisdomStore:
                 ),
             )
         return operation_id
+
+    def operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM operation_journal WHERE id=?", (operation_id,)
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        value["payload"] = json.loads(value["payload_json"])
+        return value
+
+    def replace_operation_payload(
+        self, operation_id: str, payload: dict[str, Any]
+    ) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE operation_journal SET payload_json=?,updated_at=? WHERE id=?",
+                (json.dumps(payload, sort_keys=True), utc_now(), operation_id),
+            )
 
     def advance(self, operation_id: str, phase: str, *, done: bool = False) -> None:
         with self.transaction() as db:
@@ -675,6 +757,29 @@ class WisdomStore:
                     "SELECT * FROM operation_journal WHERE state='pending' ORDER BY created_at"
                 ).fetchall()
             ]
+
+    def acquire_operation_lock(
+        self, entity_id: str, *, ttl_seconds: int = 900
+    ) -> str | None:
+        owner = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM operation_lock WHERE expires_at<=?", (now.isoformat(),)
+            )
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO operation_lock VALUES(?,?,?)",
+                (entity_id, owner, expires.isoformat()),
+            )
+            return owner if cursor.rowcount else None
+
+    def release_operation_lock(self, entity_id: str, owner: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM operation_lock WHERE entity_id=? AND owner=?",
+                (entity_id, owner),
+            )
 
     def record_install(self, values: dict[str, Any]) -> None:
         now = utc_now()
@@ -702,9 +807,178 @@ class WisdomStore:
 
     def installations(self) -> list[dict[str, Any]]:
         with self.transaction() as db:
-            return [
+            rows = [
                 dict(row)
                 for row in db.execute(
                     "SELECT * FROM managed_install ORDER BY slug"
                 ).fetchall()
             ]
+        for row in rows:
+            row["baseline"] = json.loads(row.pop("baseline_json"))
+        return rows
+
+    def installation(self, skill_id: str) -> dict[str, Any] | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM managed_install WHERE skill_id=?", (skill_id,)
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        value["baseline"] = json.loads(value.pop("baseline_json"))
+        return value
+
+    def deactivate_install(self, skill_id: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE managed_install SET state='inactive',updated_at=? WHERE skill_id=?",
+                (utc_now(), skill_id),
+            )
+
+    def feed_cursor(self) -> str | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT cursor FROM feed_state WHERE singleton=1"
+            ).fetchone()
+            return str(row[0]) if row and row[0] else None
+
+    def persist_feed_page(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        next_cursor: str,
+        cadences: dict[str, str],
+        now: str,
+    ) -> int:
+        current = datetime.fromisoformat(now).astimezone(timezone.utc)
+
+        def due_at(cadence: str) -> str:
+            if cadence == "daily":
+                due = (current + timedelta(days=1)).replace(
+                    hour=9, minute=0, second=0, microsecond=0
+                )
+            elif cadence == "weekly":
+                days = 7 - current.weekday()
+                due = (current + timedelta(days=days)).replace(
+                    hour=9, minute=0, second=0, microsecond=0
+                )
+            else:
+                due = current
+            return due.isoformat()
+
+        inserted = 0
+        with self.transaction() as db:
+            for event in events:
+                kind = str(event["kind"])
+                cadence = cadences.get(
+                    str(event["event_id"]), cadences.get(kind, "immediate")
+                )
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO feed_event VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(event["event_id"]),
+                        kind,
+                        str(event["skill_id"]),
+                        event.get("version"),
+                        event.get("installation_id"),
+                        event.get("update_mode"),
+                        json.dumps(event, sort_keys=True),
+                        cadence,
+                        due_at(cadence),
+                        None,
+                        None,
+                        str(event.get("occurred_at") or now),
+                    ),
+                )
+                inserted += max(cursor.rowcount, 0)
+            db.execute(
+                "INSERT INTO feed_state VALUES(1,?,?) ON CONFLICT(singleton) "
+                "DO UPDATE SET cursor=excluded.cursor,updated_at=excluded.updated_at",
+                (next_cursor, now),
+            )
+        return inserted
+
+    def feed_events(
+        self, *, unseen_only: bool = False, telegram_due_at: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM feed_event WHERE 1=1"
+        params: list[str] = []
+        if unseen_only:
+            query += " AND local_seen_at IS NULL AND cadence!='off' AND due_at<=?"
+            params.append(utc_now())
+        if telegram_due_at is not None:
+            query += (
+                " AND telegram_delivered_at IS NULL AND cadence!='off' AND due_at<=?"
+            )
+            params.append(telegram_due_at)
+        query += " ORDER BY created_at,event_id"
+        with self.transaction() as db:
+            rows = [dict(row) for row in db.execute(query, params).fetchall()]
+        for row in rows:
+            row["payload"] = json.loads(row.pop("payload_json"))
+        return rows
+
+    def persist_local_notice(
+        self,
+        *,
+        event_id: str,
+        kind: str,
+        skill_id: str,
+        payload: dict[str, Any],
+        cadence: str = "immediate",
+    ) -> bool:
+        now = utc_now()
+        current = datetime.fromisoformat(now)
+        if cadence == "daily":
+            due = (
+                (current + timedelta(days=1))
+                .replace(hour=9, minute=0, second=0, microsecond=0)
+                .isoformat()
+            )
+        elif cadence == "weekly":
+            due = (
+                (current + timedelta(days=7 - current.weekday()))
+                .replace(hour=9, minute=0, second=0, microsecond=0)
+                .isoformat()
+            )
+        else:
+            due = now
+        with self.transaction() as db:
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO feed_event VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    kind,
+                    skill_id,
+                    payload.get("version"),
+                    None,
+                    None,
+                    json.dumps(payload, sort_keys=True),
+                    cadence,
+                    due,
+                    None,
+                    None,
+                    now,
+                ),
+            )
+            return bool(cursor.rowcount)
+
+    def mark_feed_local_seen(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        with self.transaction() as db:
+            db.execute(
+                f"UPDATE feed_event SET local_seen_at=? WHERE event_id IN ({placeholders})",
+                [utc_now(), *event_ids],
+            )
+
+    def mark_feed_telegram_delivered(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        with self.transaction() as db:
+            db.execute(
+                f"UPDATE feed_event SET telegram_delivered_at=? WHERE event_id IN ({placeholders})",
+                [utc_now(), *event_ids],
+            )

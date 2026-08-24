@@ -63,10 +63,25 @@ describe('WisdomCandidateCard', () => {
         system_specification: { hermes: { minimum_version: '0.17.0' } },
         next_step: 'review'
       })
-      .mockResolvedValueOnce({ draft: { id: 'draft-1' } })
+      .mockResolvedValueOnce({
+        draft: { id: 'draft-1' },
+        local_scan: {
+          guard: { allowed: true, findings: [] },
+          skill_evaluator: { status: 'available', findings: [] }
+        },
+        notice: 'owner private'
+      })
     reviewWisdomDraft
       .mockResolvedValueOnce({
-        draft: { id: 'draft-1', slug: 'safe-skill', scanVerdict: 'pass' },
+        draft: {
+          id: 'draft-1',
+          slug: 'safe-skill',
+          authorDescription: 'Owner-authored claim',
+          scanVerdict: 'pass',
+          scan: { verdict: 'pass' },
+          explanation: 'Server facts only',
+          systemSpec: { runtime: { sandbox: true } }
+        },
         effective_policy: {},
         files: [
           { path: 'SKILL.md', mode: 'file', hash: 'sha256:file', content_utf8: '# Safe' },
@@ -83,6 +98,11 @@ describe('WisdomCandidateCard', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Send for owner-only server review' }))
     expect(await screen.findByText(/sha256:content/)).toBeTruthy()
     expect(screen.getByText(/server enforced: pass/)).toBeTruthy()
+    expect(screen.getByText('Owner-authored claim')).toBeTruthy()
+    expect(screen.getByText(/"status": "available"/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    expect(screen.getByText('Safe')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
     fireEvent.click(screen.getByRole('button', { name: 'Approve & publish' }))
 
     await waitFor(() => expect(decideWisdomDraft).toHaveBeenCalledWith('draft-1', 'approve', 'research'))

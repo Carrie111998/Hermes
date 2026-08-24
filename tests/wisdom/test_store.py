@@ -82,3 +82,24 @@ def test_operation_journal_survives_restart(tmp_path: Path):
     resumed = WisdomStore(root).pending_operations()
     assert resumed[0]["id"] == operation
     assert resumed[0]["phase"] == "files_committed"
+
+
+def test_verified_org_change_deactivates_stale_managed_installs(tmp_path: Path):
+    store = WisdomStore(tmp_path / "wisdom")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    store.record_install({
+        "skill_id": "skill-1",
+        "org_id": "org-1",
+        "slug": "managed",
+        "version": 1,
+        "content_hash": "sha256:content",
+        "baseline": {"SKILL.md": "sha256:file"},
+        "target_path": str(tmp_path / "skills" / "_wisdom" / "org-1" / "managed"),
+        "update_mode": "MANUAL",
+    })
+
+    store.verify_installation_identity("org-2")
+
+    assert store.active_org_id() == "org-2"
+    assert store.installation("skill-1")["state"] == "inactive"

@@ -9,12 +9,33 @@ import {
   suggestWisdomSkill,
   type WisdomCandidateEvent,
   type WisdomDraftReview,
+  type WisdomLocalScan,
   type WisdomPreparedDraft
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
 
 const MAX_INLINE_REVIEW_BYTES = 256 * 1024
+
+function SafeSkillPreview({ text }: { text: string }) {
+  return (
+    <div className="space-y-2 whitespace-pre-wrap text-xs text-muted-foreground">
+      {text.split('\n').map((line, index) => {
+        const heading = /^(#{1,4})\s+(.+)$/.exec(line)
+
+        if (heading) {
+          return <h3 className="font-medium text-foreground" key={index}>{heading[2]}</h3>
+        }
+
+        if (/^[-*+]\s+/.test(line)) {
+          return <div className="pl-3" key={index}>• {line.replace(/^[-*+]\s+/, '')}</div>
+        }
+
+        return <div key={index}>{line || '\u00a0'}</div>
+      })}
+    </div>
+  )
+}
 
 export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileScope; sessionId: string }) {
   const { t } = useI18n()
@@ -24,6 +45,8 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
   const [description, setDescription] = useState('')
   const [specification, setSpecification] = useState('')
   const [review, setReview] = useState<null | WisdomDraftReview>(null)
+  const [localScan, setLocalScan] = useState<null | WisdomLocalScan>(null)
+  const [reviewMode, setReviewMode] = useState<'raw' | 'rendered'>('raw')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -92,6 +115,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
       })
 
       if (!('draft' in result)) {throw new Error('Gateway did not return an owner-private draft')}
+      setLocalScan(result.local_scan)
       const exact = await reviewWisdomDraft(result.draft.id, false, profile)
       const size = exact.files.reduce((total, file) => total + new Blob([file.content_utf8]).size, 0)
 
@@ -102,6 +126,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
       }
 
       setReview(exact)
+      setReviewMode('raw')
       setPrepared(null)
     } catch (error) {
       notifyError(error, 'Owner-private submission failed')
@@ -123,6 +148,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
 
       await decideWisdomDraft(review.draft.id, decision, profile)
       setReview(null)
+      setEvent(null)
     } catch (error) {
       notifyError(error, `Collective Wisdom ${decision} failed`)
     } finally {
@@ -200,22 +226,65 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
             <span className="rounded-full bg-emerald-600/10 px-2 py-1 text-emerald-700">
               {copy.serverEnforced}: {review.draft.scanVerdict || 'reviewed'}
             </span>
-            <span className="rounded-full bg-(--ui-bg-quinary) px-2 py-1">{copy.localAdvisory}</span>
+            <span className="rounded-full bg-(--ui-bg-quinary) px-2 py-1">
+              {copy.localAdvisory}: {localScan ? 'available' : 'unavailable'}
+            </span>
           </div>
           <p className="mt-3 text-xs text-muted-foreground">{copy.serverReviewNotice}</p>
+          <div className="mt-3 grid gap-3 border-y border-(--ui-stroke-tertiary) py-3 text-[0.68rem]">
+            <div>
+              <strong>{copy.ownerCopyLabel}</strong>
+              <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                {review.draft.authorDescription || copy.noDescription}
+              </p>
+            </div>
+            <div>
+              <strong>{copy.serverFactsLabel}</strong>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-muted-foreground">
+                {JSON.stringify({
+                  verdict: review.draft.scanVerdict,
+                  scan: review.draft.scan,
+                  explanation: review.draft.explanation
+                }, null, 2)}
+              </pre>
+            </div>
+            <div>
+              <strong>{copy.localAdvisory}</strong>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-muted-foreground">
+                {localScan ? JSON.stringify(localScan, null, 2) : 'Advisory scan unavailable.'}
+              </pre>
+            </div>
+            <div>
+              <strong>{copy.systemSpecification}</strong>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-muted-foreground">
+                {JSON.stringify(review.draft.systemSpec, null, 2)}
+              </pre>
+            </div>
+          </div>
           <div className="my-3 grid gap-1 break-all font-mono text-[0.6rem]">
             <span>content {review.hashes.content}</span>
             <span>author description {review.hashes.author_description}</span>
             <span>package manifest {review.hashes.package_manifest}</span>
           </div>
-          {review.files.map(file => (
-            <details className="border-t border-(--ui-stroke-tertiary) py-2" key={file.path} open>
-              <summary className="cursor-pointer font-mono text-[0.68rem]">
-                {file.path} · {file.hash}
-              </summary>
-              <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-[0.65rem]">{file.content_utf8}</pre>
-            </details>
-          ))}
+          <div className="mb-2 flex justify-end gap-1">
+            <Button onClick={() => setReviewMode('raw')} size="sm" variant={reviewMode === 'raw' ? 'default' : 'outline'}>Raw</Button>
+            <Button onClick={() => setReviewMode('rendered')} size="sm" variant={reviewMode === 'rendered' ? 'default' : 'outline'}>Rendered</Button>
+          </div>
+          {reviewMode === 'rendered' && (
+            <div className="border-t border-(--ui-stroke-tertiary) py-3">
+              <SafeSkillPreview text={review.files.find(file => file.path === 'SKILL.md')?.content_utf8 || ''} />
+            </div>
+          )}
+          {review.files
+            .filter(file => reviewMode === 'raw' || file.path !== 'SKILL.md')
+            .map(file => (
+              <details className="border-t border-(--ui-stroke-tertiary) py-2" key={file.path} open>
+                <summary className="cursor-pointer font-mono text-[0.68rem]">
+                  {file.path} · {file.hash}
+                </summary>
+                <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-[0.65rem]">{file.content_utf8}</pre>
+              </details>
+            ))}
           <footer className="mt-3 flex justify-end gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
             <Button disabled={busy} onClick={() => void decide('decline')} size="sm" variant="outline">
               {copy.decline}

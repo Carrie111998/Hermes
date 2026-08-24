@@ -1,3 +1,5 @@
+import type { ActionResponse } from '@/types/hermes'
+
 import { capabilityScoped, type ProfileScope } from './client'
 
 export interface WisdomStatus {
@@ -55,7 +57,10 @@ export interface WisdomDraft {
   slug: string
   state: string
   authorDescription: null | string
+  explanation?: null | string
+  scan?: null | Record<string, unknown>
   scanVerdict: null | string
+  systemSpec?: null | Record<string, unknown>
   updatedAt: string
 }
 
@@ -68,6 +73,17 @@ export interface WisdomPreparedDraft {
   next_step: string
 }
 
+export interface WisdomLocalScan {
+  guard: Record<string, unknown>
+  skill_evaluator: Record<string, unknown>
+}
+
+export interface WisdomSubmittedDraft {
+  draft: WisdomDraft
+  local_scan: WisdomLocalScan
+  notice: string
+}
+
 export interface WisdomDraftReview {
   draft: WisdomDraft & Record<string, unknown>
   effective_policy: Record<string, unknown>
@@ -77,8 +93,42 @@ export interface WisdomDraftReview {
 }
 
 export interface WisdomSkillDetail {
+  latest_version_detail?: Record<string, unknown>
+  local_compatibility?: Record<string, unknown>
   skill: Record<string, unknown>
   versions: Array<Record<string, unknown>>
+}
+
+export interface WisdomVersionContent {
+  commit: string
+  content_hash: string
+  files: Array<{ content_utf8: string; hash: string; mode: 'exec' | 'file'; path: string }>
+}
+
+export interface WisdomManagedInstall {
+  skill_id: string
+  slug: string
+  version: number
+  update_mode: 'AUTO_WITH_NOTICE' | 'MANUAL' | 'REQUIRED'
+  state: string
+  target_path: string
+}
+
+export interface WisdomInstallations {
+  installations: WisdomManagedInstall[]
+  notifications: Array<Record<string, unknown>>
+}
+
+export interface WisdomActionPlan {
+  receipt?: string
+  state?: string
+  skill_id: string
+  version?: number
+  compatibility?: { outcome: string; reasons?: string[] }
+  sensitive_expansion?: string[]
+  modified?: boolean
+  update_mode?: string
+  allowed?: boolean
 }
 
 const request = <T>(path: string, profile?: ProfileScope, init?: { body?: unknown; method?: string }): Promise<T> =>
@@ -90,6 +140,12 @@ const request = <T>(path: string, profile?: ProfileScope, init?: { body?: unknow
   })
 
 export const getWisdomStatus = (profile?: ProfileScope): Promise<WisdomStatus> => request('/api/wisdom/status', profile)
+
+export const setupWisdom = (profile?: ProfileScope): Promise<ActionResponse> =>
+  request('/api/wisdom/setup', profile, { method: 'POST', body: { accept_disclosure: true } })
+
+export const scanWisdom = (skill?: string, profile?: ProfileScope): Promise<ActionResponse> =>
+  request('/api/wisdom/scan', profile, { method: 'POST', body: { skill } })
 
 export const getWisdomCandidates = (profile?: ProfileScope): Promise<{ candidates: WisdomCandidate[] }> =>
   request('/api/wisdom/candidates', profile)
@@ -109,11 +165,63 @@ export const getWisdomDrafts = (profile?: ProfileScope): Promise<{ drafts: Wisdo
 export const getWisdomSkill = (skillId: string, profile?: ProfileScope): Promise<WisdomSkillDetail> =>
   request(`/api/wisdom/skills/${encodeURIComponent(skillId)}`, profile)
 
+export const getWisdomVersionContent = (
+  skillId: string,
+  version: number,
+  profile?: ProfileScope
+): Promise<WisdomVersionContent> =>
+  request(`/api/wisdom/skills/${encodeURIComponent(skillId)}/versions/${version}/content`, profile)
+
+export const getWisdomInstallations = (profile?: ProfileScope): Promise<WisdomInstallations> =>
+  request('/api/wisdom/installations', profile)
+
+export const checkWisdom = (profile?: ProfileScope): Promise<Record<string, unknown>> =>
+  request('/api/wisdom/check', profile, { method: 'POST', body: { apply_automatic: true } })
+
+export const planWisdomInstall = (reference: string, profile?: ProfileScope): Promise<WisdomActionPlan> =>
+  request('/api/wisdom/install/plan', profile, { method: 'POST', body: { reference } })
+
+export const applyWisdomInstall = (
+  receipt: string,
+  acceptPartial: boolean,
+  profile?: ProfileScope
+): Promise<Record<string, unknown>> =>
+  request('/api/wisdom/install/apply', profile, {
+    method: 'POST',
+    body: { accept_partial: acceptPartial, receipt }
+  })
+
+export const planWisdomUpdate = (skillId: string, profile?: ProfileScope): Promise<WisdomActionPlan> =>
+  request('/api/wisdom/update/plan', profile, { method: 'POST', body: { skill_id: skillId } })
+
+export const applyWisdomUpdate = (
+  receipt: string,
+  confirmations: { acceptPartial: boolean; acceptSensitive: boolean; preserveModified: boolean },
+  profile?: ProfileScope
+): Promise<Record<string, unknown>> =>
+  request('/api/wisdom/update/apply', profile, {
+    method: 'POST',
+    body: {
+      accept_partial: confirmations.acceptPartial,
+      accept_sensitive: confirmations.acceptSensitive,
+      preserve_modified: confirmations.preserveModified,
+      receipt
+    }
+  })
+
+export const uninstallWisdomSkill = (skillId: string, profile?: ProfileScope): Promise<Record<string, unknown>> =>
+  request('/api/wisdom/uninstall', profile, { method: 'POST', body: { skill_id: skillId } })
+
+export const acknowledgeWisdomNotifications = (
+  profile?: ProfileScope
+): Promise<{ events: Array<Record<string, unknown>> }> =>
+  request('/api/wisdom/notifications', profile, { method: 'POST', body: { mark_seen: true } })
+
 export const suggestWisdomSkill = (
   skill: string,
   profile?: ProfileScope,
   approval?: { description: string; systemSpecification: Record<string, unknown> }
-): Promise<WisdomPreparedDraft | { draft: WisdomDraft }> =>
+): Promise<WisdomPreparedDraft | WisdomSubmittedDraft> =>
   request('/api/wisdom/suggest', profile, {
     method: 'POST',
     body: {

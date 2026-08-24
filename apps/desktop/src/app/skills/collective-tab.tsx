@@ -3,16 +3,29 @@ import { useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import {
+  acknowledgeWisdomNotifications,
+  applyWisdomInstall,
+  applyWisdomUpdate,
+  checkWisdom,
   decideWisdomDraft,
+  getActionStatus,
   getWisdomCandidates,
   getWisdomDiscovery,
   getWisdomDrafts,
+  getWisdomInstallations,
   getWisdomSkill,
   getWisdomStatus,
+  getWisdomVersionContent,
+  planWisdomInstall,
+  planWisdomUpdate,
   type ProfileScope,
   profileScopeKey,
   reviewWisdomDraft,
+  scanWisdom,
+  setupWisdom,
   suggestWisdomSkill,
+  uninstallWisdomSkill,
+  type WisdomActionPlan,
   type WisdomDraftReview,
   type WisdomPreparedDraft
 } from '@/hermes'
@@ -21,6 +34,24 @@ import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 
 import { DetailColumn, ListColumn, ListStrip, MasterDetail } from '../master-detail'
+
+async function waitForWisdomAction(name: string, profile: ProfileScope): Promise<void> {
+  for (let attempt = 0; attempt < 1200; attempt += 1) {
+    const status = await getActionStatus(name, 80, profile)
+
+    if (!status.running) {
+      if (status.exit_code !== 0) {
+        throw new Error(status.lines.at(-1) || `Collective Wisdom action failed (${status.exit_code ?? 'unknown'})`)
+      }
+
+      return
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+
+  throw new Error('Collective Wisdom action timed out')
+}
 
 export function CollectiveTab({ profile, query }: { profile: ProfileScope; query: string }) {
   const { t } = useI18n()
@@ -33,6 +64,14 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   const [review, setReview] = useState<null | WisdomDraftReview>(null)
   const [busy, setBusy] = useState<null | string>(null)
 
+  const [actionPlan, setActionPlan] = useState<
+    null | (WisdomActionPlan & { action: 'install' | 'uninstall' | 'update' })
+  >(null)
+
+  const [acceptSensitive, setAcceptSensitive] = useState(false)
+  const [acceptPartial, setAcceptPartial] = useState(false)
+  const [preserveModified, setPreserveModified] = useState(false)
+
   const status = useQuery({
     queryKey: ['wisdom-status', scope],
     queryFn: () => getWisdomStatus(profile),
@@ -42,26 +81,48 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   const discovery = useQuery({
     queryKey: ['wisdom-discovery', scope],
     queryFn: () => getWisdomDiscovery(profile),
-    staleTime: 30_000
+    staleTime: 30_000,
+    enabled: status.data?.configured === true
   })
 
   const candidates = useQuery({
     queryKey: ['wisdom-candidates', scope],
     queryFn: () => getWisdomCandidates(profile),
-    staleTime: 15_000
+    staleTime: 15_000,
+    enabled: status.data?.configured === true
   })
 
   const drafts = useQuery({
     queryKey: ['wisdom-drafts', scope],
     queryFn: () => getWisdomDrafts(profile),
-    staleTime: 15_000
+    staleTime: 15_000,
+    enabled: status.data?.configured === true
   })
 
   const detail = useQuery({
     queryKey: ['wisdom-detail', scope, selectedId],
     queryFn: () => getWisdomSkill(selectedId || '', profile),
-    enabled: Boolean(selectedId),
+    enabled: status.data?.configured === true && Boolean(selectedId),
     staleTime: 30_000
+  })
+
+  const installations = useQuery({
+    queryKey: ['wisdom-installations', scope],
+    queryFn: () => getWisdomInstallations(profile),
+    staleTime: 10_000,
+    enabled: status.data?.configured === true
+  })
+
+  const latestSelectedVersion = useMemo(
+    () => Math.max(0, ...(detail.data?.versions ?? []).map(version => Number(version.version) || 0)),
+    [detail.data?.versions]
+  )
+
+  const content = useQuery({
+    queryKey: ['wisdom-content', scope, selectedId, latestSelectedVersion],
+    queryFn: () => getWisdomVersionContent(selectedId || '', latestSelectedVersion, profile),
+    enabled: Boolean(selectedId && latestSelectedVersion),
+    staleTime: 60_000
   })
 
   const rows = useMemo(() => {
@@ -94,7 +155,10 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   }
 
   const submit = async () => {
-    if (!prepared) {return}
+    if (!prepared) {
+      return
+    }
+
     setBusy(prepared.local_draft_id)
 
     try {
@@ -122,13 +186,19 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   }
 
   const approve = async () => {
-    if (!review) {return}
+    if (!review) {
+      return
+    }
+
     setBusy(review.draft.id)
 
     try {
       const acknowledged = await reviewWisdomDraft(review.draft.id, true, profile)
 
-      if (!acknowledged.receipt) {throw new Error('Gateway review receipt was not created')}
+      if (!acknowledged.receipt) {
+        throw new Error('Gateway review receipt was not created')
+      }
+
       await decideWisdomDraft(review.draft.id, 'approve', profile)
       setReview(null)
       await Promise.all([drafts.refetch(), discovery.refetch()])
@@ -139,12 +209,123 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
     }
   }
 
-  if (status.isPending || discovery.isPending || candidates.isPending || drafts.isPending) {
+  const installed = installations.data?.installations.find(
+    item => item.skill_id === selectedId && item.state === 'active'
+  )
+
+  const planManagedAction = async (action: 'install' | 'uninstall' | 'update') => {
+    if (!selectedId) {
+      return
+    }
+
+    setBusy(selectedId)
+
+    try {
+      const plan =
+        action === 'install'
+          ? await planWisdomInstall(selectedId, profile)
+          : action === 'update'
+            ? await planWisdomUpdate(selectedId, profile)
+            : { skill_id: selectedId, state: 'confirm_uninstall' }
+
+      setActionPlan({ ...plan, action })
+      setAcceptSensitive(false)
+      setAcceptPartial(false)
+      setPreserveModified(false)
+    } catch (error) {
+      notifyError(error, `Wisdom ${action} planning failed`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const applyManagedAction = async () => {
+    if (!actionPlan) {
+      return
+    }
+
+    setBusy(actionPlan.skill_id)
+
+    try {
+      if (actionPlan.action === 'uninstall') {
+        await uninstallWisdomSkill(actionPlan.skill_id, profile)
+      } else if (!actionPlan.receipt) {
+        throw new Error('Verified action receipt is missing')
+      } else if (actionPlan.action === 'install') {
+        await applyWisdomInstall(actionPlan.receipt, acceptPartial, profile)
+      } else {
+        await applyWisdomUpdate(actionPlan.receipt, { acceptPartial, acceptSensitive, preserveModified }, profile)
+      }
+
+      setActionPlan(null)
+      await Promise.all([installations.refetch(), detail.refetch()])
+    } catch (error) {
+      notifyError(error, `Wisdom ${actionPlan.action} failed`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const setupProfile = async () => {
+    setBusy('setup')
+
+    try {
+      const action = await setupWisdom(profile)
+      await waitForWisdomAction(action.name, profile)
+      await status.refetch()
+      await Promise.all([discovery.refetch(), candidates.refetch(), drafts.refetch(), installations.refetch()])
+    } catch (error) {
+      notifyError(error, 'Collective Wisdom setup failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (status.isPending) {
     return <div className="grid h-full place-items-center text-xs text-muted-foreground">{copy.loading}</div>
   }
 
-  if (status.isError || discovery.isError || candidates.isError || drafts.isError) {
-    const error = status.error || discovery.error || candidates.error || drafts.error
+  if (status.isError) {
+    const error = status.error
+
+    return (
+      <div className="grid h-full place-items-center px-8 text-center text-xs text-muted-foreground">
+        {copy.unavailable} {error instanceof Error ? error.message : ''}
+      </div>
+    )
+  }
+
+  if (!status.data.configured) {
+    return (
+      <div className="grid h-full place-items-center p-8">
+        <section
+          aria-label={copy.title}
+          className="max-w-xl space-y-4 border border-(--ui-stroke-tertiary) p-5 text-sm"
+        >
+          <div>
+            <h2 className="font-medium">{copy.title}</h2>
+            <p className="mt-1 text-xs text-muted-foreground">{copy.setup}</p>
+          </div>
+          <p className="text-xs leading-5 text-muted-foreground">{copy.setupDisclosure}</p>
+          {status.data.error && (
+            <div className="text-xs text-destructive" role="alert">
+              {status.data.error}
+            </div>
+          )}
+          <Button disabled={busy === 'setup'} onClick={setupProfile} size="sm">
+            {busy === 'setup' ? copy.settingUp : copy.setupAction}
+          </Button>
+        </section>
+      </div>
+    )
+  }
+
+  if (discovery.isPending || candidates.isPending || drafts.isPending || installations.isPending) {
+    return <div className="grid h-full place-items-center text-xs text-muted-foreground">{copy.loading}</div>
+  }
+
+  if (discovery.isError || candidates.isError || drafts.isError || installations.isError) {
+    const error = discovery.error || candidates.error || drafts.error || installations.error
 
     return (
       <div className="grid h-full place-items-center px-8 text-center text-xs text-muted-foreground">
@@ -158,8 +339,77 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="shrink-0 border-b border-(--ui-stroke-tertiary) px-3 py-2">
-        <div className="text-xs font-medium">{copy.title}</div>
-        <div className="text-[0.65rem] text-muted-foreground">{statusCopy}</div>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs font-medium">{copy.title}</div>
+            <div className="text-[0.65rem] text-muted-foreground">{statusCopy}</div>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              onClick={async () => {
+                setBusy('scan')
+
+                try {
+                  const action = await scanWisdom(undefined, profile)
+                  await waitForWisdomAction(action.name, profile)
+                  await candidates.refetch()
+                } catch (error) {
+                  notifyError(error, 'Wisdom local scan failed')
+                } finally {
+                  setBusy(null)
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
+              {busy === 'scan' ? copy.checking : copy.scanLocal}
+            </Button>
+            <Button
+              onClick={async () => {
+                setBusy('check')
+
+                try {
+                  await checkWisdom(profile)
+                  await installations.refetch()
+                } catch (error) {
+                  notifyError(error, 'Wisdom update check failed')
+                } finally {
+                  setBusy(null)
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
+              {busy === 'check' ? copy.checking : copy.checkUpdates(installations.data.notifications.length)}
+            </Button>
+          </div>
+        </div>
+        {installations.data.notifications.length > 0 && (
+          <div className="mt-2 flex items-start justify-between gap-3 border-t border-(--ui-stroke-tertiary) pt-2 text-[0.65rem]">
+            <ul className="min-w-0 space-y-1 text-muted-foreground">
+              {installations.data.notifications.slice(0, 4).map((event, index) => (
+                <li className="truncate" key={String(event.event_id ?? index)}>
+                  {String(event.kind ?? 'update')} · {String(event.skill_id ?? 'skill')}
+                  {event.version ? ` · v${String(event.version)}` : ''}
+                </li>
+              ))}
+            </ul>
+            <Button
+              onClick={async () => {
+                try {
+                  await acknowledgeWisdomNotifications(profile)
+                  await installations.refetch()
+                } catch (error) {
+                  notifyError(error, 'Could not acknowledge Wisdom notifications')
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
+              {copy.markSeen}
+            </Button>
+          </div>
+        )}
       </div>
       <MasterDetail resizeId="collective-capabilities-split" split="wide">
         <ListColumn
@@ -244,8 +494,50 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                 </p>
                 <h3 className="mt-5 text-xs font-medium">{copy.versionHistory}</h3>
                 <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap text-[0.67rem] text-muted-foreground">
-                  {JSON.stringify(detail.data.versions, null, 2)}
+                  {JSON.stringify(
+                    {
+                      latest_version: detail.data.latest_version_detail,
+                      version_history: detail.data.versions,
+                      local_compatibility: detail.data.local_compatibility
+                    },
+                    null,
+                    2
+                  )}
                 </pre>
+                {content.data && (
+                  <div className="mt-4">
+                    <div className="break-all font-mono text-[0.62rem]">content {content.data.content_hash}</div>
+                    {content.data.files.map(file => (
+                      <details className="border-t border-(--ui-stroke-tertiary) py-2" key={file.path} open>
+                        <summary className="cursor-pointer font-mono text-[0.68rem]">
+                          {file.path} · {file.hash}
+                        </summary>
+                        <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap text-[0.65rem]">
+                          {file.content_utf8}
+                        </pre>
+                      </details>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                  {installed ? (
+                    <>
+                      <span className="text-[0.62rem] text-muted-foreground">
+                        {copy.installed(installed.version, installed.update_mode)}
+                      </span>
+                      <Button onClick={() => void planManagedAction('uninstall')} size="sm" variant="outline">
+                        {copy.uninstall}
+                      </Button>
+                      <Button onClick={() => void planManagedAction('update')} size="sm">
+                        {copy.checkSkill}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button onClick={() => void planManagedAction('install')} size="sm">
+                      {copy.install}
+                    </Button>
+                  )}
+                </div>
               </section>
             )}
           </div>
@@ -291,6 +583,34 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
         <div className="absolute inset-6 z-20 overflow-auto border border-emerald-600/50 bg-background p-5 shadow-xl">
           <h2 className="font-mono text-sm">{review.draft.slug}</h2>
           <p className="mt-1 text-xs text-muted-foreground">{copy.readEvery}</p>
+          <div className="mt-3 grid gap-3 border-y border-(--ui-stroke-tertiary) py-3 text-xs">
+            <div>
+              <strong>{copy.ownerCopyLabel}</strong>
+              <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                {review.draft.authorDescription || copy.noDescription}
+              </p>
+            </div>
+            <div>
+              <strong>{copy.serverFactsLabel}</strong>
+              <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-muted-foreground">
+                {JSON.stringify(
+                  {
+                    verdict: review.draft.scanVerdict,
+                    scan: review.draft.scan,
+                    explanation: review.draft.explanation
+                  },
+                  null,
+                  2
+                )}
+              </pre>
+            </div>
+            <div>
+              <strong>{copy.systemSpecification}</strong>
+              <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-muted-foreground">
+                {JSON.stringify(review.draft.systemSpec, null, 2)}
+              </pre>
+            </div>
+          </div>
           <div className="my-3 grid gap-1 break-all font-mono text-[0.62rem]">
             <span>content {review.hashes.content}</span>
             <span>author description {review.hashes.author_description}</span>
@@ -308,9 +628,83 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
             <Button onClick={() => setReview(null)} size="sm" variant="outline">
               {copy.close}
             </Button>
+            <Button
+              disabled={busy === review.draft.id}
+              onClick={async () => {
+                setBusy(review.draft.id)
+
+                try {
+                  await decideWisdomDraft(review.draft.id, 'decline', profile)
+                  setReview(null)
+                  await drafts.refetch()
+                } catch (error) {
+                  notifyError(error, 'Wisdom decline failed')
+                } finally {
+                  setBusy(null)
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
+              {copy.decline}
+            </Button>
             <Button disabled={busy === review.draft.id} onClick={() => void approve()} size="sm">
               {copy.approve}
             </Button>
+          </div>
+        </div>
+      )}
+
+      {actionPlan && (
+        <div
+          aria-label="Verified managed action plan"
+          className="absolute inset-6 z-30 overflow-auto border border-amber-600/50 bg-background p-5 shadow-xl"
+          role="dialog"
+        >
+          <h2 className="font-mono text-sm">{copy.confirmAction(actionPlan.action)}</h2>
+          <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap text-[0.65rem]">
+            {JSON.stringify(actionPlan, null, 2)}
+          </pre>
+          {actionPlan.state === 'current' && <p className="mt-3 text-xs">{copy.alreadyCurrent}</p>}
+          {actionPlan.compatibility && actionPlan.compatibility.outcome !== 'compatible' && (
+            <label className="mt-3 flex gap-2 text-xs">
+              <input
+                checked={acceptPartial}
+                onChange={event => setAcceptPartial(event.target.checked)}
+                type="checkbox"
+              />
+              {copy.acceptCompatibility}
+            </label>
+          )}
+          {(actionPlan.sensitive_expansion?.length ?? 0) > 0 && (
+            <label className="mt-2 flex gap-2 text-xs">
+              <input
+                checked={acceptSensitive}
+                onChange={event => setAcceptSensitive(event.target.checked)}
+                type="checkbox"
+              />
+              {copy.acceptSensitive}
+            </label>
+          )}
+          {actionPlan.modified && actionPlan.update_mode !== 'REQUIRED' && (
+            <label className="mt-2 flex gap-2 text-xs">
+              <input
+                checked={preserveModified}
+                onChange={event => setPreserveModified(event.target.checked)}
+                type="checkbox"
+              />
+              {copy.preserveModified}
+            </label>
+          )}
+          <div className="mt-4 flex justify-end gap-2">
+            <Button onClick={() => setActionPlan(null)} size="sm" variant="outline">
+              Cancel
+            </Button>
+            {actionPlan.state !== 'current' && (
+              <Button onClick={() => void applyManagedAction()} size="sm">
+                {copy.confirmAction(actionPlan.action)}
+              </Button>
+            )}
           </div>
         </div>
       )}

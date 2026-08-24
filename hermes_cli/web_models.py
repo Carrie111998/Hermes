@@ -297,6 +297,16 @@ class WisdomSuggestRequest(BaseModel):
     profile: Optional[str] = None
 
 
+class WisdomSetupRequest(BaseModel):
+    accept_disclosure: bool = False
+    profile: Optional[str] = None
+
+
+class WisdomScanRequest(BaseModel):
+    skill: Optional[str] = None
+    profile: Optional[str] = None
+
+
 class WisdomReviewRequest(BaseModel):
     draft_id: str
     acknowledge: bool = False
@@ -317,6 +327,34 @@ class WisdomInstallPlanRequest(BaseModel):
 class WisdomInstallApplyRequest(BaseModel):
     receipt: str
     accept_partial: bool = False
+    profile: Optional[str] = None
+
+
+class WisdomCheckRequest(BaseModel):
+    apply_automatic: bool = True
+    profile: Optional[str] = None
+
+
+class WisdomUpdatePlanRequest(BaseModel):
+    skill_id: str
+    profile: Optional[str] = None
+
+
+class WisdomUpdateApplyRequest(BaseModel):
+    receipt: str
+    accept_sensitive: bool = False
+    accept_partial: bool = False
+    preserve_modified: bool = False
+    profile: Optional[str] = None
+
+
+class WisdomUninstallRequest(BaseModel):
+    skill_id: str
+    profile: Optional[str] = None
+
+
+class WisdomNotificationRequest(BaseModel):
+    mark_seen: bool = False
     profile: Optional[str] = None
 
 
