@@ -5656,10 +5656,29 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     )
 
 
-_VISION_AUTO_PROVIDER_ORDER = (
+# Providers that have a dedicated strict vision backend. Membership here
+# decides ROUTING for an EXPLICIT ``auxiliary.vision.provider`` -- drop a
+# name and that provider silently stops using its strict backend and falls
+# through to the generic router, so this tuple must stay complete.
+_VISION_STRICT_BACKENDS = (
     "openrouter",
     "nous",
     "deepinfra",
+)
+
+# The subset walked when vision is set to AUTO. ``nous`` is deliberately
+# excluded (2026-08-23): no Nous credential exists in either auth store, so
+# auto-probing it only ever logged "no Nous authentication found" and
+# quarantined the label. Because ``get_available_vision_backends()`` runs on
+# every vision AVAILABILITY check -- not just on a real vision call -- a dead
+# entry here is noisier than a dead entry in the text chain.
+#
+# This is SEPARATE from _VISION_STRICT_BACKENDS on purpose: an explicit
+# ``auxiliary.vision.provider: nous`` must still route to the strict backend
+# and warn loudly that it cannot be served. Collapsing the two back into one
+# tuple silently changes explicit-override routing.
+_VISION_AUTO_PROVIDER_ORDER = tuple(
+    p for p in _VISION_STRICT_BACKENDS if p != "nous"
 )
 
 
@@ -5751,7 +5770,7 @@ def get_available_vision_backends() -> List[str]:
     # 1. Active provider — if the user configured a provider, try it first.
     main_provider = _read_main_provider()
     if main_provider and main_provider not in {"auto", ""}:
-        if main_provider in _VISION_AUTO_PROVIDER_ORDER:
+        if main_provider in _VISION_STRICT_BACKENDS:
             if _strict_vision_backend_available(main_provider):
                 available.append(main_provider)
         else:
@@ -5939,7 +5958,7 @@ def resolve_vision_provider_client(
         logger.debug("Auxiliary vision client: none available")
         return None, None, None
 
-    if requested in _VISION_AUTO_PROVIDER_ORDER:
+    if requested in _VISION_STRICT_BACKENDS:
         sync_client, default_model = _resolve_strict_vision_backend(
             requested, resolved_model
         )
