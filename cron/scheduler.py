@@ -6109,6 +6109,7 @@ def run_job(
         agent.cron_job_id = job_id
         agent.cron_job_name = job_name
         agent.cron_max_turns = job.get("max_turns")
+        agent.runtime_task_id = _cron_session_id
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
