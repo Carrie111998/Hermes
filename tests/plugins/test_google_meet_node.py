@@ -1,9 +1,8 @@
 """Tests for the google_meet node primitive.
 
 Covers protocol helpers, the file-backed registry, the server's
-token-and-dispatch machinery, a mocked client, and the CLI plumbing.
-We never open a real socket — websockets.serve / websockets.sync.client
-are fully mocked.
+token-and-dispatch machinery, a mocked client, a real localhost WebSocket
+round trip, and the CLI plumbing.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ import argparse
 import asyncio
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -355,6 +355,41 @@ def test_client_rpc_sends_correct_envelope_and_parses_response(monkeypatch):
     assert sent["payload"] == {"hello": 1}
     assert sent["id"]  # non-empty
     assert holder["url"] == "ws://remote:1"
+
+
+def test_client_server_ping_roundtrip_over_localhost(tmp_path):
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet.node.client import NodeClient
+    from plugins.google_meet.node.server import NodeServer
+    from websockets.sync.server import serve
+
+    node = NodeServer(
+        token_path=tmp_path / "token.json",
+        display_name="local-node",
+    )
+    token = node.ensure_token()
+
+    def handler(connection):
+        request = protocol.decode(connection.recv())
+        response = asyncio.run(node._handle_request(request))
+        connection.send(protocol.encode(response))
+
+    with serve(handler, "127.0.0.1", 0) as server:
+        port = server.socket.getsockname()[1]
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            result = NodeClient(
+                f"ws://127.0.0.1:{port}",
+                token,
+                timeout=2.0,
+            ).ping()
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+    assert result["display_name"] == "local-node"
+    assert isinstance(result["ts"], float)
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import threading
 import time
 from difflib import SequenceMatcher
@@ -55,6 +56,7 @@ MEET_URL_RE = re.compile(
 SAY_QUEUE_FILENAME = "say_queue.jsonl"
 SAY_PCM_FILENAME = "speaker.pcm"
 CALL_ERROR_STRIKE_LIMIT = 3
+CAPTION_REVISION_WINDOW_SECONDS = 2.0
 MAX_TRANSCRIPT_TEXT_LEN = 500
 MEET_MEDIA_PROXY_BYPASS = "74.125.250.0/24,74.125.247.128,142.250.82.0/24"
 MEET_WEBRTC_PROXY_POLICY = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
@@ -97,10 +99,31 @@ def _meeting_id_from_url(url: str) -> str:
 # Status + transcript file writers
 # ---------------------------------------------------------------------------
 
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically replace a text file without exposing partial contents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(text)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
 class _BotState:
     """Single-process mutable state, flushed to ``status.json`` on each change."""
 
     def __init__(self, out_dir: Path, meeting_id: str, url: str):
+        self._lock = threading.RLock()
         self.out_dir = out_dir
         self.meeting_id = meeting_id
         self.url = url
@@ -210,9 +233,11 @@ class _BotState:
             for chunk in self._split_caption_text(text):
                 rendered.append((ts, speaker, chunk, group_id))
         self._transcript_entries = rendered
-        with self.transcript_path.open("w", encoding="utf-8") as f:
-            for ts, speaker, text, _group_id in rendered:
-                f.write(f"[{ts}] {speaker}: {text}\n")
+        transcript = "".join(
+            f"[{ts}] {speaker}: {text}\n"
+            for ts, speaker, text, _group_id in rendered
+        )
+        _atomic_write_text(self.transcript_path, transcript)
         self.transcript_lines = len(rendered)
 
     @staticmethod
@@ -336,6 +361,7 @@ class _BotState:
             "speaker": speaker,
             "text": text,
             "ts": ts,
+            "updated_monotonic": time.monotonic(),
             "caption_keys": {caption_key},
         }
         self._caption_groups.append(group)
@@ -357,8 +383,14 @@ class _BotState:
         exclude_caption_key: str,
     ) -> Optional[dict]:
         candidates: list[tuple[int, dict]] = []
+        now = time.monotonic()
         for group in reversed(self._caption_groups[-24:]):
             if group.get("speaker") != speaker:
+                continue
+            updated_monotonic = group.get("updated_monotonic")
+            if not isinstance(updated_monotonic, (int, float)):
+                continue
+            if now - updated_monotonic > CAPTION_REVISION_WINDOW_SECONDS:
                 continue
             caption_keys = group.get("caption_keys")
             if isinstance(caption_keys, set) and exclude_caption_key in caption_keys:
@@ -410,10 +442,29 @@ class _BotState:
         group["text"] = text
         group["speaker"] = speaker
         group["ts"] = ts
+        group["updated_monotonic"] = time.monotonic()
         self._rewrite_transcript()
         return True
 
     def record_caption(
+        self,
+        speaker: str,
+        text: str,
+        *,
+        speaker_source: Optional[str] = None,
+        speaker_debug: Optional[dict] = None,
+        caption_id: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            self._record_caption_locked(
+                speaker,
+                text,
+                speaker_source=speaker_source,
+                speaker_debug=speaker_debug,
+                caption_id=caption_id,
+            )
+
+    def _record_caption_locked(
         self,
         speaker: str,
         text: str,
@@ -476,6 +527,10 @@ class _BotState:
     # -------- status file ----------------------------------------------
 
     def _flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
         debug_enabled = _debug_status_enabled()
         data = {
             "meetingId": self.meeting_id,
@@ -521,16 +576,15 @@ class _BotState:
             "captionUiNoiseDrops": self.caption_ui_noise_drops,
             "lastUnresolvedCaptionAt": self.last_unresolved_caption_at,
         }
-        tmp = self.status_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(self.status_path)
+        _atomic_write_text(self.status_path, json.dumps(data, indent=2))
 
     def set(self, **kwargs) -> None:
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-        if any(k in kwargs for k in ("join_attempted_at", "joined_at", "last_caption_at")):
-            self.last_progress_at = time.time()
-        self._flush()
+        with self._lock:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+            if any(k in kwargs for k in ("join_attempted_at", "joined_at", "last_caption_at")):
+                self.last_progress_at = time.time()
+            self._flush_locked()
 
     def heartbeat(
         self,
@@ -540,19 +594,20 @@ class _BotState:
         last_ui_text: Optional[str] = None,
         last_url: Optional[str] = None,
     ) -> None:
-        if phase:
-            self.phase = phase
-        self.stalled_reason = stalled_reason
-        if last_ui_text is not None:
-            if _debug_status_enabled():
-                text = " ".join(str(last_ui_text).split())
-                self.last_ui_text = text[:1000]
-            else:
-                self.last_ui_text = None
-        if last_url is not None:
-            self.last_url = str(last_url)
-        self.last_heartbeat_at = time.time()
-        self._flush()
+        with self._lock:
+            if phase:
+                self.phase = phase
+            self.stalled_reason = stalled_reason
+            if last_ui_text is not None:
+                if _debug_status_enabled():
+                    text = " ".join(str(last_ui_text).split())
+                    self.last_ui_text = text[:1000]
+                else:
+                    self.last_ui_text = None
+            if last_url is not None:
+                self.last_url = str(last_url)
+            self.last_heartbeat_at = time.time()
+            self._flush_locked()
 
 
 # ---------------------------------------------------------------------------

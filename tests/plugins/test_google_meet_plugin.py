@@ -15,6 +15,7 @@ Does NOT spawn a real Chromium — we mock ``subprocess.Popen`` where needed.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -65,6 +66,44 @@ def test_meeting_id_extraction():
 # _BotState — transcript + status file round-trip
 # ---------------------------------------------------------------------------
 
+def test_caption_observer_real_chromium_round_trip():
+    from plugins.google_meet.meet_bot import _CAPTION_OBSERVER_JS
+
+    playwright = pytest.importorskip("playwright.sync_api")
+
+    with playwright.sync_playwright() as pw:
+        executable = Path(pw.chromium.executable_path)
+        if not executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = pw.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <div role="region" aria-label="Captions">
+                  <div jsname="dsyhDe">
+                    <span class="NWpY1d">Alex Rivera</span>
+                    <span jsname="tgaKEf">Initial caption</span>
+                  </div>
+                </div>
+                """
+            )
+            page.evaluate(_CAPTION_OBSERVER_JS)
+            page.locator('[jsname="tgaKEf"]').evaluate(
+                "element => { element.textContent = 'Updated caption text'; }"
+            )
+            page.wait_for_timeout(50)
+            entries = page.evaluate("window.__hermesMeetDrain()")
+        finally:
+            browser.close()
+
+    assert any(
+        entry.get("speaker") == "Alex Rivera"
+        and entry.get("text") == "Updated caption text"
+        for entry in entries
+    )
+
+
 def test_bot_state_dedupes_captions_and_flushes_status(tmp_path):
     from plugins.google_meet.meet_bot import _BotState
 
@@ -86,6 +125,58 @@ def test_bot_state_dedupes_captions_and_flushes_status(tmp_path):
     assert status["meetingId"] == "abc-defg-hij"
     assert status["transcriptLines"] == 2
     assert status["transcriptPath"].endswith("transcript.txt")
+
+
+def test_bot_state_replaces_transcript_atomically(tmp_path, monkeypatch):
+    from plugins.google_meet import meet_bot
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "session"
+    state = _BotState(
+        out_dir=out,
+        meeting_id="abc-defg-hij",
+        url="https://meet.google.com/abc-defg-hij",
+    )
+    state.record_caption("Alex Rivera", "First caption", caption_id="row-a")
+
+    transcript_path = out / "transcript.txt"
+    original_transcript = transcript_path.read_text()
+    observed_before_replace = []
+    real_replace = meet_bot.os.replace
+
+    def observe_replace(src, dst):
+        if Path(dst) == transcript_path:
+            observed_before_replace.append(transcript_path.read_text())
+        real_replace(src, dst)
+
+    monkeypatch.setattr(meet_bot.os, "replace", observe_replace)
+    state.record_caption("Jordan Lee", "Second caption", caption_id="row-b")
+
+    assert observed_before_replace == [original_transcript]
+    assert "First caption" in transcript_path.read_text()
+    assert "Second caption" in transcript_path.read_text()
+
+
+def test_bot_state_status_writes_are_thread_safe(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "session"
+    state = _BotState(
+        out_dir=out,
+        meeting_id="abc-defg-hij",
+        url="https://meet.google.com/abc-defg-hij",
+    )
+
+    def write_status(worker: int) -> None:
+        for offset in range(100):
+            state.set(audio_bytes_out=(worker * 100) + offset)
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(write_status, range(12)))
+
+    status = json.loads((out / "status.json").read_text())
+    assert status["meetingId"] == "abc-defg-hij"
+    assert isinstance(status["audioBytesOut"], int)
 
 
 def test_bot_state_rewrites_growing_same_speaker_caption_row(tmp_path):
@@ -353,6 +444,41 @@ def test_bot_state_keeps_separate_same_speaker_restarts(tmp_path):
     assert [line.split("] ", 1)[1] for line in transcript] == [
         "Alex Rivera: Okay we should start with the project timeline.",
         "Alex Rivera: Okay we should start with the budget instead.",
+    ]
+
+
+def test_bot_state_keeps_separate_same_speaker_restarts_after_revision_window(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins.google_meet import meet_bot
+    from plugins.google_meet.meet_bot import _BotState
+
+    now = [100.0]
+    monkeypatch.setattr(meet_bot.time, "monotonic", lambda: now[0])
+    out = tmp_path / "session"
+    state = _BotState(
+        out_dir=out,
+        meeting_id="abc-defg-hij",
+        url="https://meet.google.com/abc-defg-hij",
+    )
+
+    state.record_caption(
+        "Alex Rivera",
+        "Okay we should start with the project timeline today.",
+        caption_id="row-a",
+    )
+    now[0] += 3.0
+    state.record_caption(
+        "Alex Rivera",
+        "Okay we should start with the project timeline tomorrow.",
+        caption_id="row-b",
+    )
+
+    transcript = (out / "transcript.txt").read_text().splitlines()
+    assert [line.split("] ", 1)[1] for line in transcript] == [
+        "Alex Rivera: Okay we should start with the project timeline today.",
+        "Alex Rivera: Okay we should start with the project timeline tomorrow.",
     ]
 
 
@@ -1253,6 +1379,7 @@ def test_start_preserves_profile_proxy_bypass_tristate(
         assert captured["env"]["HERMES_MEET_PROXY_BYPASS"] == expected
 
 
+@pytest.mark.linux_only
 def test_start_headed_uses_xvfb_when_display_is_missing(monkeypatch):
     """A service-mode headed launch must be wrapped with xvfb-run."""
     from plugins.google_meet import process_manager as pm
@@ -1268,7 +1395,6 @@ def test_start_headed_uses_xvfb_when_display_is_missing(monkeypatch):
         captured_env.update(kwargs.get("env") or {})
         return _FakeProc()
 
-    monkeypatch.setattr(pm.sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setenv("HERMES_MEET_XVFB", "disabled")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
@@ -1292,6 +1418,7 @@ def test_start_headed_uses_xvfb_when_display_is_missing(monkeypatch):
     assert active["xvfb"] is True
 
 
+@pytest.mark.linux_only
 def test_start_headed_rejects_without_display_or_xvfb(monkeypatch):
     """Without DISPLAY or xvfb-run, fail before spawning Chromium."""
     from plugins.google_meet import process_manager as pm
@@ -1305,7 +1432,6 @@ def test_start_headed_rejects_without_display_or_xvfb(monkeypatch):
             pid = 99997
         return _FakeProc()
 
-    monkeypatch.setattr(pm.sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setenv("HERMES_MEET_XVFB", "force")
     monkeypatch.setenv("PATH", "/definitely-no-xvfb-here")
@@ -1321,6 +1447,7 @@ def test_start_headed_rejects_without_display_or_xvfb(monkeypatch):
     assert pm._read_active() is None
 
 
+@pytest.mark.macos_only
 def test_start_headed_uses_native_browser_on_darwin(monkeypatch):
     from plugins.google_meet import process_manager as pm
 
@@ -1333,7 +1460,6 @@ def test_start_headed_uses_native_browser_on_darwin(monkeypatch):
         captured_argv.extend(argv)
         return _FakeProc()
 
-    monkeypatch.setattr(pm.sys, "platform", "darwin")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setenv("HERMES_MEET_XVFB", "force")
 
