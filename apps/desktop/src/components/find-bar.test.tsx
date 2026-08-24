@@ -698,6 +698,28 @@ describe('FindBar', () => {
     await waitFor(() => expect(document.activeElement).toBe(input))
   })
 
+  it('selects existing text on re-focus (⌘F while bar is already open)', async () => {
+    const surface = plantSurface()
+    surface.textContent = 'needle haystack'
+    openFindBar()
+    renderFindBar()
+
+    const input = await screen.findByRole('searchbox', { name: /find in page/i }) as HTMLInputElement
+    await waitFor(() => expect(document.activeElement).toBe(input))
+
+    // Type a query so there's text to select.
+    fireEvent.change(input, { target: { value: 'needle' } })
+    // Click away — simulate losing focus.
+    input.blur()
+    expect(document.activeElement).not.toBe(input)
+
+    // Press ⌘F again — should re-focus and select all text.
+    openFindBar()
+    await waitFor(() => expect(document.activeElement).toBe(input))
+    expect(input.selectionStart).toBe(0)
+    expect(input.selectionEnd).toBe('needle'.length)
+  })
+
   it('debounces typing into a single scoped find', async () => {
     vi.useFakeTimers()
     const surface = plantSurface()
