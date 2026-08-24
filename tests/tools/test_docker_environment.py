@@ -1488,3 +1488,35 @@ def test_extra_args_set_shm_size_helper():
     assert docker_env._extra_args_set_shm_size(None) is False
     # non-string entries must not crash (config.yaml can be malformed)
     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
+
+
+def test_persistent_mount_sanitizes_session_task_id_with_colon(monkeypatch, tmp_path):
+    """Interactive chat sessions use task_id='session:<key>'. The persistent
+    volume mount path must sanitize colons to underscores so Docker does not
+    parse the source path as a volume separator (exit 125 'invalid mode: /root').
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr("tools.environments.base.get_sandbox_dir", lambda: tmp_path / "sandboxes")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        task_id="session:20260823_140621_59dd51",
+        persistent_filesystem=True,
+    )
+
+    assert ":" not in env._home_dir
+    assert "session_20260823_140621_59dd51" in env._home_dir
+
+    run_args = _run_args_from_calls(calls)
+    mount_sources = []
+    for i, arg in enumerate(run_args):
+        if arg == "-v" and i + 1 < len(run_args):
+            mount_sources.append(run_args[i + 1])
+
+    home_mounts = [m for m in mount_sources if m.endswith(":/root")]
+    assert len(home_mounts) == 1
+    home_mount = home_mounts[0]
+    host_src, target = home_mount.split(":/root")[0], "/root"
+    assert ":" not in host_src
+    assert "session_20260823_140621_59dd51/home" in host_src
+

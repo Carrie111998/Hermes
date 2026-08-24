@@ -130,6 +130,27 @@ def _sanitize_label_value(value: str) -> str:
     return cleaned
 
 
+def _sanitize_path_component(value: str) -> str:
+    """Sanitize a task/session ID for use as a single filesystem path segment.
+
+    NOT interchangeable with _sanitize_label_value(): a label collision is
+    harmless, but a collision here would merge two sessions' sandbox home
+    directories. So this never drops information:
+      - every character outside [A-Za-z0-9._-] becomes '_'
+        (fixes the ':' that breaks docker -v host:container parsing)
+      - if the result exceeds 64 chars, keep a stable prefix plus a 12-char
+        sha256 of the ORIGINAL value, so distinct inputs always map to
+        distinct components (hash the overflow, never just drop it).
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", value or "")
+    if not safe:
+        return "default"
+    if len(safe) > 64:
+        digest = hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:12]
+        safe = safe[: 64 - 13] + "_" + digest
+    return safe
+
+
 def _get_active_profile_name() -> str:
     """Return the active Hermes profile name, or ``"default"`` on any error.
 
@@ -980,7 +1001,7 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
+            sandbox = get_sandbox_dir() / "docker" / _sanitize_path_component(task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args.extend([
