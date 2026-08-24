@@ -16660,25 +16660,133 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
-        # /goal is safe mid-run for status/pause/clear/wait (inspection
-        # and control-plane only — doesn't interrupt the running turn).
-        # Setting a new goal text mid-run is rejected with the same
-        # "wait or /stop" message as /model so we don't race a second
-        # continuation prompt against the current turn.
-        _goal_arg = (event.get_command_args() or "").strip().lower()
-        _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
+        # Control verbs keep their existing mid-run behavior. A new goal is
+        # durably queued on Native Kanban without interrupting the active turn.
+        # The message-scoped idempotency key makes redelivery return the same
+        # card instead of creating a duplicate.
+        goal_arg = (event.get_command_args() or "").strip()
+        goal_lower = goal_arg.lower()
+        goal_verb = goal_lower.split(None, 1)[0] if goal_lower else ""
         # Exact-match control verbs (unchanged semantics), plus the
         # wait/unwait barrier verbs which take a pid argument and the
         # gate management verb (inspection/mutation of the gate list only —
         # gates run at turn boundary, so editing them mid-run is safe).
-        _is_control = (
-            not _goal_arg
-            or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
-            or _goal_verb in {"wait", "gate"}
+        is_control = (
+            not goal_lower
+            or goal_lower in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
+            or goal_verb in {"wait", "gate"}
         )
-        if _is_control:
+        if is_control:
             return await self._handle_goal_command(event)
-        return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
+
+        import hashlib
+
+        def _enqueue_goal():
+            from hermes_cli import kanban_db as kb
+
+            message_id = str(getattr(event, "message_id", "") or "")
+            update_id = getattr(event, "platform_update_id", None)
+            if message_id:
+                delivery_identity = f"message:{message_id}"
+            elif update_id is not None:
+                delivery_identity = f"update:{update_id}"
+            else:
+                delivery_identity = f"event:{event.timestamp.isoformat()}"
+            source_identity = "|".join(
+                str(getattr(source, field, "") or "")
+                for field in ("platform", "chat_id", "thread_id", "user_id", "profile")
+            )
+            fingerprint = hashlib.sha256(
+                f"{quick_key}|{source_identity}|{delivery_identity}".encode("utf-8")
+            ).hexdigest()
+            assignee = (
+                str(getattr(source, "profile", "") or "").strip()
+                or self._active_profile_name()
+            )
+            title = " ".join(goal_arg.split())[:120]
+            conn = kb.connect()
+            try:
+                platform = getattr(
+                    getattr(source, "platform", ""),
+                    "value",
+                    getattr(source, "platform", ""),
+                )
+                thread_id = str(getattr(source, "thread_id", "") or "")
+                chat_type = str(getattr(source, "chat_type", "") or "dm")
+                delivery_metadata = {"chat_type": chat_type}
+                if thread_id:
+                    delivery_metadata["thread_id"] = thread_id
+                if (
+                    str(platform).lower() == "telegram"
+                    and thread_id
+                    and chat_type.lower() in {"dm", "direct", "private"}
+                ):
+                    delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+                    if thread_id != "1":
+                        delivery_metadata["direct_messages_topic_id"] = thread_id
+                    if message_id:
+                        delivery_metadata["telegram_reply_to_message_id"] = message_id
+
+                # The card and its origin subscription are one durable intake.
+                # An outer BEGIN IMMEDIATE also serializes concurrent redelivery;
+                # create_task's nested idempotency check returns the same card.
+                with kb.write_txn(conn):
+                    idempotency_key = f"gateway-goal:{fingerprint}"
+                    existing = conn.execute(
+                        "SELECT id, status FROM tasks WHERE idempotency_key = ? "
+                        "ORDER BY (status = 'archived') ASC, created_at DESC, "
+                        "rowid DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        task_id = existing["id"]
+                        archived = existing["status"] == "archived"
+                    else:
+                        task_id = kb.create_task(
+                            conn,
+                            title=title,
+                            body=goal_arg,
+                            assignee=assignee,
+                            created_by="gateway:/goal",
+                            idempotency_key=idempotency_key,
+                            goal_mode=True,
+                        )
+                        archived = False
+                    if not archived:
+                        kb.add_notify_sub(
+                            conn,
+                            task_id=task_id,
+                            platform=str(platform).lower(),
+                            chat_id=str(getattr(source, "chat_id", "") or ""),
+                            thread_id=thread_id or None,
+                            user_id=str(getattr(source, "user_id", "") or "") or None,
+                            user_id_alt=(
+                                str(getattr(source, "user_id_alt", "") or "") or None
+                            ),
+                            chat_type=chat_type,
+                            notifier_profile=assignee,
+                            # One visible event path. notify+wake would send the
+                            # passive notice and then inject the same event into
+                            # the Telegram session, allowing a duplicate reply.
+                            delivery_mode="notify",
+                            delivery_metadata=delivery_metadata,
+                        )
+                task = kb.get_task(conn, task_id)
+                return task_id, (getattr(task, "status", None) or "ready")
+            finally:
+                conn.close()
+
+        try:
+            task_id, status = await asyncio.to_thread(_enqueue_goal)
+        except Exception as exc:
+            logger.warning("busy /goal kanban enqueue failed: %s", exc)
+            return t("gateway.goal.busy_enqueue_failed", error=str(exc))
+
+        return t(
+            "gateway.goal.busy_enqueued",
+            task_id=task_id,
+            status=t(f"gateway.kanban.status.{status}"),
+        )
 
     async def _busy_loop_command(self, event: MessageEvent, quick_key: str, source):
         # /loop mirrors /goal: control verbs are safe mid-run (state

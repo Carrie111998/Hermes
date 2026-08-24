@@ -62,6 +62,32 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_retry_event_preserves_iteration_budget_payload(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="budgeted", assignee="worker")
+        assert kb.claim_task(conn, task_id, claimer="test") is not None
+
+        tripped = kb._record_task_failure(
+            conn,
+            task_id,
+            "Iteration budget exhausted (7/7)",
+            outcome="timed_out",
+            failure_limit=3,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"budget_used": 7, "budget_max": 7},
+        )
+
+        assert tripped is False
+        event = next(e for e in kb.list_events(conn, task_id) if e.kind == "timed_out")
+        assert event.payload["budget_used"] == 7
+        assert event.payload["budget_max"] == 7
+        assert event.payload["retry_status"] == "ready"
+    finally:
+        conn.close()
+
+
 
 
 

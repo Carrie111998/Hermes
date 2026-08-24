@@ -146,6 +146,9 @@ gateway:
     invalid:               "無效目標：{error}"
     set:                   "⊙ 目標已設定（{budget} 輪預算）：{goal}\n我會持續工作直到目標完成、你暫停／清除目標，或預算耗盡。\n控制指令：/goal status · /goal pause · /goal resume · /goal clear"
 
+    busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
+    busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+
   help:
     header:                "📖 **Hermes 指令**\n"
     skill_header:          "\n⚡ **技能指令**（{count} 個作用中）："
@@ -160,6 +163,32 @@ gateway:
     subscribed_suffix:     "（已訂閱 — 當 {task_id} 完成或被封鎖時將通知您）"
     truncated_suffix:      "…（已截斷；如需完整輸出請在終端機執行 `hermes kanban …`）"
     no_output:             "（無輸出）"
+    status:
+      triage:              "triage"
+      todo:                "waiting for dependencies"
+      scheduled:           "scheduled"
+      ready:               "ready"
+      running:             "running"
+      blocked:             "blocked"
+      review:              "in review"
+      done:                "done"
+      archived:            "archived"
+    notice:
+      retry:               "; dispatcher will retry"
+      completed:           "✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+      blocked:             "⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+      gave_up:             "✖ {board_tag}{tag}Kanban {task_id} gave up{error}"
+      gave_up_spawn:       "✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{error}"
+      gave_up_budget:      "✖ {board_tag}{tag}Kanban {task_id} gave up after exhausting the iteration budget ({used}/{max}){error}"
+      gave_up_timeout:     "✖ {board_tag}{tag}Kanban {task_id} gave up after runtime timeout (max_runtime={limit}s, elapsed={elapsed}s){error}"
+      gave_up_worker:      "✖ {board_tag}{tag}Kanban {task_id} gave up after the worker exited{error}"
+      worker_exited:       "✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone){retry}"
+      budget_exhausted:    "⏱ {board_tag}{tag}Kanban {task_id} iteration budget exhausted ({used}/{max}){retry}"
+      runtime_timeout:     "⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s, elapsed={elapsed}s){retry}"
+      status:              "🔄 {board_tag}{tag}Kanban {task_id} → {status}"
+      review:              "👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+      block_loop_count:    " (blocked {count}x for the same cause)"
+      block_loop:          "🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — needs a human decision{count}{reason}"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

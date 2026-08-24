@@ -146,6 +146,9 @@ gateway:
     invalid:               "Objetivo inválido: {error}"
     set:                   "⊙ Objetivo definido (orçamento de {budget} turnos): {goal}\nVou continuar a trabalhar até o objetivo estar concluído, pausares/limpares ou o orçamento esgotar.\nControlos: /goal status · /goal pause · /goal resume · /goal clear"
 
+    busy_enqueued:         "The current work is still in progress. The new request was added to the board. Task ID: {task_id}, status: {status}."
+    busy_enqueue_failed:   "The current work is still in progress. The new request could not be added to the board. Error: {error}"
+
   help:
     header:                "📖 **Comandos do Hermes**\n"
     skill_header:          "\n⚡ **Comandos de skill** ({count} ativos):"
@@ -160,6 +163,32 @@ gateway:
     subscribed_suffix:     "(subscrito — receberás uma notificação quando {task_id} terminar ou bloquear)"
     truncated_suffix:      "… (truncado; usa `hermes kanban …` no teu terminal para a saída completa)"
     no_output:             "(sem saída)"
+    status:
+      triage:              "triage"
+      todo:                "waiting for dependencies"
+      scheduled:           "scheduled"
+      ready:               "ready"
+      running:             "running"
+      blocked:             "blocked"
+      review:              "in review"
+      done:                "done"
+      archived:            "archived"
+    notice:
+      retry:               "; dispatcher will retry"
+      completed:           "✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+      blocked:             "⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+      gave_up:             "✖ {board_tag}{tag}Kanban {task_id} gave up{error}"
+      gave_up_spawn:       "✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{error}"
+      gave_up_budget:      "✖ {board_tag}{tag}Kanban {task_id} gave up after exhausting the iteration budget ({used}/{max}){error}"
+      gave_up_timeout:     "✖ {board_tag}{tag}Kanban {task_id} gave up after runtime timeout (max_runtime={limit}s, elapsed={elapsed}s){error}"
+      gave_up_worker:      "✖ {board_tag}{tag}Kanban {task_id} gave up after the worker exited{error}"
+      worker_exited:       "✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone){retry}"
+      budget_exhausted:    "⏱ {board_tag}{tag}Kanban {task_id} iteration budget exhausted ({used}/{max}){retry}"
+      runtime_timeout:     "⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s, elapsed={elapsed}s){retry}"
+      status:              "🔄 {board_tag}{tag}Kanban {task_id} → {status}"
+      review:              "👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+      block_loop_count:    " (blocked {count}x for the same cause)"
+      block_loop:          "🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — needs a human decision{count}{reason}"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"
