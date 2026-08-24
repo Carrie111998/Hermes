@@ -70,7 +70,7 @@
       "author": "TTomas78",
       "tags": ["rbac", "multi-user", "permissions", "security", "gateway"],
       "repo": "TTomas78/hermes-rbac",
-      "ref": "5e86465076df8b681f2871a05c1b76e0fbc729e3",
+      "ref": "c1d6b33ef5d08be17e7b2c8cec00f19c9f232d94",
       "homepage": "https://github.com/TTomas78/hermes-rbac",
       "capabilities": ["commands", "hooks"],
       "api_version": 1,
