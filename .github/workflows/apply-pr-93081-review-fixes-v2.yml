@@ -1,0 +1,40 @@
+name: Apply PR 93081 review fixes v2
+
+on:
+  push:
+    branches: [fix/git-free-desktop-bootstrap]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Recover and run patch script
+        shell: bash
+        run: |
+          git show HEAD^:.github/workflows/apply-pr-93081-review-fixes.yml > /tmp/old.yml
+          python -c 'from pathlib import Path; s=Path("/tmp/old.yml").read_text(); a=s.index("          python - <<\x27PY_PATCH_93081\x27")+len("          python - <<\x27PY_PATCH_93081\x27\n"); b=s.index("          PY_PATCH_93081", a); body=s[a:b]; Path("/tmp/patch.py").write_text("\n".join(line[10:] if line.startswith("          ") else line for line in body.splitlines())+"\n")'
+          python /tmp/patch.py
+
+      - name: Verify targeted regression suite
+        shell: bash
+        run: |
+          bash -n scripts/install.sh
+          uv run --with pytest pytest -q tests/test_install_git_free_release_runtime.py tests/test_install_no_initial_commit.py tests/test_install_sh_bootstrap_marker.py tests/test_install_sh_install_method_stamp.py
+
+      - name: Commit verified fixes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-pr-93081-review-fixes.yml .github/workflows/apply-pr-93081-review-fixes-v2.yml
+          git add apps/bootstrap-installer/src-tauri/src/bootstrap.rs scripts/install.sh tests/test_install_git_free_release_runtime.py tests/test_install_sh_install_method_stamp.py
+          git commit -m "fix(installer): harden git-free release provenance"
+          git push
