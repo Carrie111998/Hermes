@@ -2787,6 +2787,9 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        # Optional argv for the Lisptc local runner. An empty list discovers
+        # `lisptc` on PATH. Example: ["node", "path/to/repl/src/cli.ts"].
+        "lisptc_command": [],
     },
 
     # Tool Search (progressive disclosure for large tool surfaces).

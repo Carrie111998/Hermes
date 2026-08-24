@@ -36,6 +36,7 @@ import platform
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -132,6 +133,54 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
         stdout_bytes[-tail_bytes:],
         total_bytes=len(stdout_bytes),
     )
+
+
+def _drain_bounded_head(pipe, chunks: list, max_bytes: int) -> None:
+    """Drain a pipe to EOF while retaining at most ``max_bytes`` from its head."""
+    captured = 0
+    try:
+        while True:
+            data = pipe.read(4096)
+            if not data:
+                break
+            if captured < max_bytes:
+                kept = data[:max_bytes - captured]
+                chunks.append(kept)
+                captured += len(kept)
+    except (ValueError, OSError) as exc:
+        logger.debug("Error reading process output: %s", exc, exc_info=True)
+
+
+def _drain_bounded_head_tail(
+    pipe,
+    head_chunks: list,
+    tail_chunks: list,
+    head_bytes: int,
+    tail_bytes: int,
+    total_ref: list,
+) -> None:
+    """Drain a pipe to EOF, retaining a bounded head and rolling byte tail."""
+    head_collected = 0
+    tail = bytearray()
+    try:
+        while True:
+            data = pipe.read(4096)
+            if not data:
+                break
+            total_ref[0] += len(data)
+            if head_collected < head_bytes:
+                kept = data[:head_bytes - head_collected]
+                head_chunks.append(kept)
+                head_collected += len(kept)
+                data = data[len(kept):]
+            if data and tail_bytes:
+                tail.extend(data)
+                if len(tail) > tail_bytes:
+                    del tail[:-tail_bytes]
+    except (ValueError, OSError) as exc:
+        logger.debug("Error reading process output: %s", exc, exc_info=True)
+    if tail:
+        tail_chunks.append(bytes(tail))
 
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
@@ -1073,6 +1122,293 @@ def _format_interrupted_output(stdout_text: str) -> str:
     return f"{stdout_text}\n{marker}" if stdout_text else marker
 
 
+def _local_file_rpc_loop(
+    rpc_dir: str,
+    task_id: str,
+    tool_call_log: list,
+    tool_call_counter: list,
+    max_tool_calls: int,
+    allowed_tools: frozenset,
+    stop_event: threading.Event,
+    rpc_token: str,
+):
+    """Dispatch Lisptc's synchronous file RPC on a local backend."""
+    from model_tools import handle_function_call
+
+    while not stop_event.is_set():
+        try:
+            request_files = sorted(
+                path for path in os.listdir(rpc_dir)
+                if path.startswith("req_") and not path.endswith(".tmp")
+            )
+        except FileNotFoundError:
+            return
+        if not request_files:
+            stop_event.wait(0.01)
+            continue
+
+        for name in request_files:
+            request_path = os.path.join(rpc_dir, name)
+            try:
+                with open(request_path, encoding="utf-8") as stream:
+                    request = json.load(stream)
+            except (OSError, ValueError):
+                try:
+                    os.unlink(request_path)
+                except OSError:
+                    pass
+                continue
+
+            # Response names are derived from model-controlled data.  Accept
+            # only the exact six-digit protocol name and its matching bounded
+            # integer sequence before constructing a response path.
+            match = re.fullmatch(r"req_(\d{6})", name)
+            seq = request.get("seq") if isinstance(request, dict) else None
+            tool_args = request.get("args") if isinstance(request, dict) else None
+            tool_name = request.get("tool") if isinstance(request, dict) else None
+            if (
+                match is None
+                or isinstance(seq, bool)
+                or not isinstance(seq, int)
+                or not 1 <= seq <= 999_999
+                or seq != int(match.group(1))
+                or not isinstance(tool_name, str)
+                or not isinstance(tool_args, dict)
+            ):
+                try:
+                    os.unlink(request_path)
+                except OSError:
+                    pass
+                continue
+
+            if not rpc_token or not secrets.compare_digest(
+                str(request.get("token") or "").encode(), rpc_token.encode()
+            ):
+                tool_result = tool_error("Unauthorized RPC request")
+            elif tool_name not in allowed_tools:
+                tool_result = tool_error(
+                    f"Tool '{tool_name}' is not available in execute_code. "
+                    f"Available: {', '.join(sorted(allowed_tools))}"
+                )
+            elif tool_call_counter[0] >= max_tool_calls:
+                tool_result = tool_error(
+                    f"Tool call limit reached ({max_tool_calls}). "
+                    "No more tool calls allowed in this execution."
+                )
+            else:
+                if tool_name == "terminal" and isinstance(tool_args, dict):
+                    for param in _TERMINAL_BLOCKED_PARAMS:
+                        tool_args.pop(param, None)
+                started = time.monotonic()
+                try:
+                    with thread_scoped_silence():
+                        tool_result = handle_function_call(
+                            tool_name, tool_args, task_id=task_id
+                        )
+                except Exception as exc:
+                    logger.error("Tool call failed in Lisptc sandbox: %s", exc, exc_info=True)
+                    tool_result = tool_error(str(exc))
+                tool_call_counter[0] += 1
+                tool_call_log.append({
+                    "tool": tool_name,
+                    "args_preview": str(tool_args)[:80],
+                    "duration": round(time.monotonic() - started, 2),
+                })
+
+            response_path = os.path.join(rpc_dir, f"res_{seq:06d}")
+            temp_response = response_path + ".tmp"
+            with open(temp_response, "w", encoding="utf-8") as stream:
+                json.dump(tool_result, stream, ensure_ascii=False)
+            os.replace(temp_response, response_path)
+            try:
+                os.unlink(request_path)
+            except OSError:
+                pass
+
+
+def _resolve_lisptc_command() -> Optional[List[str]]:
+    """Resolve Lisptc from config.yaml or PATH (never from a user env var)."""
+    configured = _load_config().get("lisptc_command")
+    if isinstance(configured, str) and configured.strip():
+        return shlex.split(configured)
+    if isinstance(configured, list) and configured and all(isinstance(x, str) for x in configured):
+        return configured
+    executable = shutil.which("lisptc")
+    return [executable] if executable else None
+
+
+def _execute_lisptc_local(
+    code: str,
+    task_id: Optional[str],
+    enabled_tools: Optional[List[str]],
+) -> str:
+    """Run one Lisptc program with the standard Hermes RPC authority chain."""
+    command = _resolve_lisptc_command()
+    if not command:
+        return json.dumps({
+            "status": "error",
+            "error": (
+                "Lisptc executable not found. Install `lisptc` on PATH or set "
+                "code_execution.lisptc_command in config.yaml."
+            ),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        })
+
+    cfg = _load_config()
+    timeout = cfg.get("timeout", DEFAULT_TIMEOUT)
+    max_tool_calls = cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    sandbox_tools = (
+        SANDBOX_ALLOWED_TOOLS
+        if enabled_tools is None
+        else frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    )
+    effective_task_id = task_id or "default"
+    tmpdir = tempfile.mkdtemp(prefix="hermes_lisptc_")
+    rpc_dir = os.path.join(tmpdir, "rpc")
+    os.mkdir(rpc_dir, 0o700)
+    program_path = os.path.join(tmpdir, "program.ptc")
+    with open(program_path, "w", encoding="utf-8") as stream:
+        stream.write(code)
+
+    rpc_token = secrets.token_urlsafe(32)
+    tool_call_log: list = []
+    tool_call_counter = [0]
+    stop_event = threading.Event()
+    started = time.monotonic()
+    rpc_thread = threading.Thread(
+        target=propagate_context_to_thread(_local_file_rpc_loop),
+        args=(rpc_dir, effective_task_id, tool_call_log, tool_call_counter,
+              max_tool_calls, sandbox_tools, stop_event, rpc_token),
+        daemon=True,
+    )
+    rpc_thread.start()
+
+    child_env = _scrub_child_env(os.environ)
+    child_env.update({
+        "HERMES_RPC_DIR": rpc_dir,
+        "HERMES_RPC_TOKEN": rpc_token,
+        "HERMES_RPC_TOOLS": json.dumps(sorted(sandbox_tools)),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    from hermes_constants import apply_subprocess_home_env
+    apply_subprocess_home_env(child_env)
+
+    status = "success"
+    error = None
+    exit_code = -1
+    stdout_text = ""
+    stderr_text = ""
+    stdout_metadata: Dict[str, Any] = {}
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [*command, "--hermes-rpc", program_path],
+            cwd=_resolve_child_cwd(_get_execution_mode(), tmpdir, task_id=effective_task_id),
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        from tools.interrupt import is_interrupted as _is_interrupted
+        try:
+            from tools.environments.base import touch_activity_if_due
+        except Exception:
+            touch_activity_if_due = None
+        deadline = started + timeout
+        activity_state = {"last_touch": started, "start": started}
+        poll_interval = 0.01
+        stdout_head_chunks: list = []
+        stdout_tail_chunks: list = []
+        stdout_total_bytes = [0]
+        stderr_chunks: list = []
+        stdout_head_bytes = int(MAX_STDOUT_BYTES * 0.4)
+        stdout_tail_bytes = MAX_STDOUT_BYTES - stdout_head_bytes
+        stdout_reader = threading.Thread(
+            target=_drain_bounded_head_tail,
+            args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
+                  stdout_head_bytes, stdout_tail_bytes, stdout_total_bytes),
+            daemon=True,
+        )
+        stderr_reader = threading.Thread(
+            target=_drain_bounded_head,
+            args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES),
+            daemon=True,
+        )
+        stdout_reader.start()
+        stderr_reader.start()
+        while proc.poll() is None:
+            if _is_interrupted():
+                _kill_process_group(proc)
+                status = "interrupted"
+                error = "Lisptc program was interrupted and killed."
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                _kill_process_group(proc, escalate=True)
+                status = "timeout"
+                error = f"Lisptc program timed out after {timeout}s and was killed."
+                break
+            if touch_activity_if_due is not None:
+                try:
+                    touch_activity_if_due(activity_state, "execute_code running")
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=min(poll_interval, max(0.0, deadline - now)))
+            except subprocess.TimeoutExpired:
+                pass
+            poll_interval = min(0.2, poll_interval * 1.5)
+
+        stdout_reader.join(timeout=3)
+        stderr_reader.join(timeout=3)
+        if stdout_reader.is_alive() or stderr_reader.is_alive():
+            _kill_process_group(proc, escalate=True)
+            stdout_reader.join()
+            stderr_reader.join()
+        exit_code = proc.returncode if proc.returncode is not None else -1
+        stdout_text, stdout_metadata = _assemble_stdout_result(
+            b"".join(stdout_head_chunks),
+            b"".join(stdout_tail_chunks),
+            total_bytes=stdout_total_bytes[0],
+        )
+        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        if status == "success" and exit_code != 0:
+            status = "error"
+            error = f"Lisptc exited with code {exit_code}"
+    except Exception as exc:
+        status = "error"
+        error = str(exc)
+        if proc is not None and proc.poll() is None:
+            _kill_process_group(proc, escalate=True)
+    finally:
+        stop_event.set()
+        rpc_thread.join(timeout=3)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    from tools.ansi_strip import strip_ansi
+    from agent.redact import redact_sensitive_text
+    stdout_text = strip_ansi(stdout_text)
+    if not stdout_metadata:
+        stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
+    stderr_text = redact_sensitive_text(strip_ansi(stderr_text), code_file=True)
+    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+    result: Dict[str, Any] = {
+        "status": status,
+        "output": stdout_text,
+        "exit_code": exit_code,
+        "tool_calls_made": tool_call_counter[0],
+        "duration_seconds": round(time.monotonic() - started, 2),
+    }
+    result.update(stdout_metadata)
+    if error:
+        result["error"] = error
+    if stderr_text:
+        result["stderr"] = stderr_text
+    return json.dumps(result, ensure_ascii=False)
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1267,6 +1603,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    language: str = "python",
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1276,7 +1613,7 @@ def execute_code(
     depending on the configured terminal backend.
 
     Args:
-        code:          Python source code to execute.
+        code:          Python or Lisptc source code to execute.
         task_id:       Session task ID for tool isolation (terminal env, etc.).
         enabled_tools: Tool names enabled in the current session. The sandbox
                        gets the intersection with SANDBOX_ALLOWED_TOOLS.
@@ -1290,10 +1627,17 @@ def execute_code(
             "Use normal tool calls (terminal, read_file, write_file, ...) instead."
         )
 
+    language = (language or "python").strip().lower()
+    if language not in {"python", "lisptc"}:
+        return tool_error(
+            f"Unsupported execute_code language '{language}'. Available: python, lisptc."
+        )
+
     if not code or not code.strip():
         return tool_error(
             "No code provided. execute_code requires a non-empty 'code' "
-            "parameter containing Python source. To run shell commands, use "
+            "parameter containing Python source (or Lisptc source when "
+            "language='lisptc'). To run shell commands, use "
             "terminal(command=...) instead."
         )
 
@@ -1348,6 +1692,18 @@ def execute_code(
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
 
+    if language == "lisptc" and env_type != "local":
+        return json.dumps({
+            "status": "error",
+            "error": (
+                f"Lisptc execute_code is not supported on the {env_type} backend yet; "
+                "select the local terminal backend or use Python."
+            ),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+    if language == "lisptc":
+        return _execute_lisptc_local(code, task_id, enabled_tools)
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
 
@@ -1561,66 +1917,20 @@ def execute_code(
         _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
         _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
 
-        def _drain(pipe, chunks, max_bytes):
-            """Simple head-only drain (used for stderr)."""
-            total = 0
-            try:
-                while True:
-                    data = pipe.read(4096)
-                    if not data:
-                        break
-                    if total < max_bytes:
-                        keep = max_bytes - total
-                        chunks.append(data[:keep])
-                    total += len(data)
-            except (ValueError, OSError) as e:
-                logger.debug("Error reading process output: %s", e, exc_info=True)
-
         stdout_total_bytes = [0]  # mutable ref for total bytes seen
-
-        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
-            """Drain stdout keeping both head and tail data."""
-            head_collected = 0
-            from collections import deque
-            tail_buf = deque()
-            tail_collected = 0
-            try:
-                while True:
-                    data = pipe.read(4096)
-                    if not data:
-                        break
-                    total_ref[0] += len(data)
-                    # Fill head buffer first
-                    if head_collected < head_bytes:
-                        keep = min(len(data), head_bytes - head_collected)
-                        head_chunks.append(data[:keep])
-                        head_collected += keep
-                        data = data[keep:]  # remaining goes to tail
-                        if not data:
-                            continue
-                    # Everything past head goes into rolling tail buffer
-                    tail_buf.append(data)
-                    tail_collected += len(data)
-                    # Evict old tail data to stay within tail_bytes budget
-                    while tail_collected > tail_bytes and tail_buf:
-                        oldest = tail_buf.popleft()
-                        tail_collected -= len(oldest)
-            except (ValueError, OSError):
-                pass
-            # Transfer final tail to output list
-            tail_chunks.extend(tail_buf)
 
         stdout_head_chunks: list = []
         stdout_tail_chunks: list = []
 
         stdout_reader = threading.Thread(
-            target=_drain_head_tail,
+            target=_drain_bounded_head_tail,
             args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
                   _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes),
             daemon=True
         )
         stderr_reader = threading.Thread(
-            target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
+            target=_drain_bounded_head,
+            args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
         )
         stdout_reader.start()
         stderr_reader.start()
@@ -2149,7 +2459,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         )
 
     description = (
-        "Run a Python script that calls Hermes tools programmatically. "
+        "Run a Python (default) or Lisptc program that calls Hermes tools programmatically. "
         "Use when you need 3+ tool calls with logic between them: "
         "filtering/reducing large outputs before they enter context, "
         "conditional branching, or loops (N pages/files, retry on failure). "
@@ -2164,7 +2474,11 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "is available for processing.\n\n"
         "Built-in helpers (no import): json_parse(text) — tolerant json.loads for "
         "terminal() output; shell_quote(s) — shlex.quote for dynamic shell args; "
-        "retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures."
+        "retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures.\n\n"
+        "For Lisptc, select language='lisptc' and call the enabled tools with "
+        "hyphenated names and positional arguments, for example "
+        "(read-file \"path\") or (search-files \"pattern\" \"content\" \".\"). "
+        "The same seven-tool allowlist and per-session intersection apply."
     )
 
     return {
@@ -2176,9 +2490,18 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                 "code": {
                     "type": "string",
                     "description": (
-                        "Python code to execute. Import tools with "
+                        "Python (default) or Lisptc source. In Python, import tools with "
                         f"`from hermes_tools import {import_str}` "
-                        "and print your final result to stdout."
+                        "and print your final result to stdout. Lisptc prints its final value."
+                    ),
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["python", "lisptc"],
+                    "default": "python",
+                    "description": (
+                        "Program language. Defaults to Python for compatibility. "
+                        "Lisptc is currently supported only with the local terminal backend."
                     ),
                 },
             },
@@ -2215,6 +2538,7 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
         )
 
     code = args.get("code", "")
+    language = args.get("language", "python")
     if code is not None and not isinstance(code, str):
         # A non-string payload (int, dict, list) would otherwise surface as
         # a generic AttributeError from code.strip() — redirect instead.
@@ -2223,11 +2547,17 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
             "requires Python source as a string. Retry as "
             "execute_code(code=\"...\")."
         )
+    if language is not None and not isinstance(language, str):
+        return tool_error(
+            f"execute_code received a {type(language).__name__} in 'language', "
+            "but it requires a string: 'python' or 'lisptc'."
+        )
 
     return execute_code(
         code=code or "",
         task_id=kwargs.get("task_id"),
         enabled_tools=kwargs.get("enabled_tools"),
+        language=language,
     )
 
 

@@ -17,7 +17,9 @@ import pytest
 
 import json
 import os
+from pathlib import Path
 import socket
+import tempfile
 import time
 
 os.environ["TERMINAL_ENV"] = "local"
@@ -47,6 +49,9 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
     _format_interrupted_output,
+    _execute_code_handler,
+    _execute_lisptc_local,
+    _local_file_rpc_loop,
 )
 from tools.registry import registry
 
@@ -80,6 +85,24 @@ class TestSandboxRequirements(unittest.TestCase):
         self.assertEqual(EXECUTE_CODE_SCHEMA["name"], "execute_code")
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["properties"])
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["required"])
+
+    def test_language_selector_is_optional_and_defaults_to_python(self):
+        language = EXECUTE_CODE_SCHEMA["parameters"]["properties"]["language"]
+        self.assertEqual(language["enum"], ["python", "lisptc"])
+        self.assertEqual(language["default"], "python")
+        self.assertNotIn("language", EXECUTE_CODE_SCHEMA["parameters"]["required"])
+
+    def test_non_string_language_returns_actionable_error(self):
+        result = json.loads(_execute_code_handler(
+            {"code": "print('x')", "language": ["lisptc"]},
+        ))
+        self.assertIn("language", result["error"])
+        self.assertIn("string", result["error"])
+
+    def test_lisptc_command_has_a_non_persisted_empty_default(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        self.assertEqual(DEFAULT_CONFIG["code_execution"]["lisptc_command"], [])
 
 
 class TestInterruptedOutput(unittest.TestCase):
@@ -146,6 +169,17 @@ class TestHermesToolsGeneration(unittest.TestCase):
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
+    def test_lisptc_remote_backend_returns_explicit_unsupported_error(self):
+        with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "ssh"}), \
+             patch("tools.terminal_tool._docker_has_host_access", return_value=False), \
+             patch("tools.approval.check_execute_code_guard", return_value={"approved": True}), \
+             patch("tools.code_execution_tool._execute_remote") as remote:
+            result = json.loads(execute_code("(+ 1 2)", language="lisptc"))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("not supported", result["error"])
+        remote.assert_not_called()
+
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
             def __init__(self):
@@ -250,6 +284,14 @@ class TestExecuteCode(unittest.TestCase):
         self.assertIn("hello world", result["output"])
         self.assertEqual(result["tool_calls_made"], 0)
 
+    def test_lisptc_missing_executable_is_actionable(self):
+        with patch("tools.code_execution_tool._resolve_lisptc_command", return_value=None):
+            result = json.loads(execute_code(
+                "(+ 1 2)", language="lisptc", enabled_tools=["read_file"],
+            ))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("code_execution.lisptc_command", result["error"])
+
     def test_no_tool_call_script_does_not_wait_for_rpc_accept_timeout(self):
         """A no-tool script should not wait seconds for the idle RPC accept thread."""
         start = time.monotonic()
@@ -277,6 +319,168 @@ print(result.get("output", ""))
         self.assertEqual(result["status"], "success")
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_lisptc_composes_two_hermes_tools_and_returns_reduced_result(self):
+        """A fake client proves Hermes' generated file-RPC contract in isolation."""
+        with tempfile.TemporaryDirectory() as fake_dir:
+            fake_cli = Path(fake_dir) / "fake_lisptc.py"
+            fake_cli.write_text(r'''
+import json, os, sys, time
+from pathlib import Path
+
+rpc = Path(os.environ["HERMES_RPC_DIR"])
+token = os.environ["HERMES_RPC_TOKEN"]
+tools = json.loads(os.environ["HERMES_RPC_TOOLS"])
+assert tools == ["read_file", "search_files"]
+
+def call(seq, tool, args):
+    req = rpc / f"req_{seq:06d}"
+    tmp = Path(str(req) + ".tmp")
+    tmp.write_text(json.dumps({"tool": tool, "args": args, "seq": seq, "token": token}))
+    tmp.replace(req)
+    res = rpc / f"res_{seq:06d}"
+    deadline = time.monotonic() + 5
+    while not res.exists():
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    value = json.loads(res.read_text())
+    res.unlink()
+    return json.loads(value)
+
+file = call(1, "read_file", {"path": "notes.txt"})
+hits = call(2, "search_files", {"pattern": "needle", "search_content": True, "path": "."})
+print(json.dumps([file["content"], len(hits["matches"])]))
+''', encoding="utf-8")
+            with patch(
+                "tools.code_execution_tool._resolve_lisptc_command",
+                return_value=[sys.executable, str(fake_cli)],
+            ), patch(
+                "model_tools.handle_function_call",
+                side_effect=_mock_handle_function_call,
+            ):
+                result = json.loads(execute_code(
+                    code="(fake composition program)",
+                    language="lisptc",
+                    task_id="lisptc-test-task",
+                    enabled_tools=["read_file", "search_files"],
+                ))
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            json.loads(result["output"]),
+            ["line 1\nline 2\nline 3\n", 1],
+        )
+        self.assertEqual(result["tool_calls_made"], 2)
+
+    def test_lisptc_large_output_is_bounded_with_head_tail_metadata(self):
+        with tempfile.TemporaryDirectory() as fake_dir:
+            child = Path(fake_dir) / "large_output.py"
+            child.write_text(
+                "import os\n"
+                "os.write(1, b'HEAD\\n' + b'x' * 120000 + b'\\nFINAL-VALUE\\n')\n"
+                "os.write(2, b'ERR-HEAD\\n' + b'e' * 30000 + b'\\nERR-TAIL\\n')\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "tools.code_execution_tool._resolve_lisptc_command",
+                return_value=[sys.executable, str(child)],
+            ):
+                result = json.loads(_execute_lisptc_local("x", "task", []))
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["stdout_truncated"])
+        self.assertEqual(result["stdout_bytes_captured"], 50_000)
+        self.assertEqual(result["stdout_bytes_total"], 120_018)
+        self.assertEqual(result["stdout_bytes_omitted"], 70_018)
+        self.assertIn("HEAD", result["output"])
+        self.assertTrue(result["output"].endswith("FINAL-VALUE\n"))
+        self.assertLessEqual(len(result["stderr"].encode()), 10_000)
+        self.assertTrue(result["stderr"].startswith("ERR-HEAD"))
+
+    def test_lisptc_interruption_kills_process_group(self):
+        with tempfile.TemporaryDirectory() as fake_dir:
+            child = Path(fake_dir) / "wait.py"
+            grandchild_pid = Path(fake_dir) / "grandchild.pid"
+            child.write_text(
+                "import pathlib, subprocess, sys, time\n"
+                f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(grandchild_pid)!r}).write_text(str(p.pid))\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            with patch("tools.code_execution_tool._resolve_lisptc_command",
+                       return_value=[sys.executable, str(child)]), \
+                 patch("tools.interrupt.is_interrupted",
+                       side_effect=lambda: grandchild_pid.exists()), \
+                 patch("tools.code_execution_tool._kill_process_group", wraps=__import__(
+                     "tools.code_execution_tool", fromlist=["_kill_process_group"]
+                 )._kill_process_group) as kill:
+                result = json.loads(_execute_lisptc_local("x", "task", []))
+                spawned_pid = int(grandchild_pid.read_text())
+        self.assertEqual(result["status"], "interrupted")
+        kill.assert_called_once()
+        self.assertFalse(__import__("psutil").pid_exists(spawned_pid))
+
+    def test_lisptc_timeout_escalates_process_group_cleanup(self):
+        with tempfile.TemporaryDirectory() as fake_dir:
+            child = Path(fake_dir) / "wait.py"
+            grandchild_pid = Path(fake_dir) / "grandchild.pid"
+            child.write_text(
+                "import pathlib, subprocess, sys, time\n"
+                f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(grandchild_pid)!r}).write_text(str(p.pid))\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            with patch("tools.code_execution_tool._resolve_lisptc_command",
+                       return_value=[sys.executable, str(child)]), \
+                 patch("tools.code_execution_tool._load_config",
+                       return_value={"timeout": 0.2, "max_tool_calls": 1}), \
+                 patch("tools.code_execution_tool._kill_process_group", wraps=__import__(
+                     "tools.code_execution_tool", fromlist=["_kill_process_group"]
+                 )._kill_process_group) as kill:
+                result = json.loads(_execute_lisptc_local("x", "task", []))
+                spawned_pid = int(grandchild_pid.read_text())
+        self.assertEqual(result["status"], "timeout")
+        kill.assert_called_once()
+        self.assertTrue(kill.call_args.kwargs["escalate"])
+        self.assertFalse(__import__("psutil").pid_exists(spawned_pid))
+
+
+    def test_malformed_requests_are_discarded_and_worker_keeps_serving(self):
+        with tempfile.TemporaryDirectory() as rpc_dir:
+            token = "test-token"
+            malformed = [
+                [],
+                {"seq": "nope", "tool": "read_file", "args": {}, "token": token},
+                {"seq": -1, "tool": "read_file", "args": {}, "token": token},
+                {"seq": 1_000_000, "tool": "read_file", "args": {}, "token": token},
+                {"seq": 2, "tool": "read_file", "args": [], "token": token},
+            ]
+            for index, request in enumerate(malformed):
+                Path(rpc_dir, f"req_bad_{index}").write_text(json.dumps(request))
+            Path(rpc_dir, "req_000003").write_text(json.dumps({
+                "seq": 3, "tool": "read_file", "args": {"path": "ok"}, "token": token,
+            }))
+            stop = threading.Event()
+            counter = [0]
+            thread = threading.Thread(target=_local_file_rpc_loop, args=(
+                rpc_dir, "task", [], counter, 5, frozenset({"read_file"}), stop, token,
+            ), daemon=True)
+            with patch("model_tools.handle_function_call",
+                       side_effect=_mock_handle_function_call):
+                thread.start()
+                deadline = time.monotonic() + 2
+                response = Path(rpc_dir, "res_000003")
+                while not response.exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                stop.set()
+                thread.join(1)
+
+            self.assertTrue(response.exists(), "worker died before valid request")
+            self.assertEqual(counter[0], 1)
+            self.assertFalse(any(Path(rpc_dir).glob("req_*")))
+            self.assertEqual({p.name for p in Path(rpc_dir).glob("res_*")}, {"res_000003"})
 
 
     def test_concurrent_tool_calls_match_responses(self):
