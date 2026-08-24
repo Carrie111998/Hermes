@@ -900,3 +900,236 @@ def test_fail_inflight_calls_quarantines_only_retiring_generation():
     assert gen1 not in server._inflight_by_gen
     assert server._inflight_by_gen == {}
 
+
+# ---------------------------------------------------------------------------
+# #48069 final: mark_suspect / ensure_healthy (SuspectableBackend SHAPE)
+# ---------------------------------------------------------------------------
+
+
+def test_mark_suspect_sets_reason_and_is_idempotent_shape():
+    """``mark_suspect`` records the reason cheaply and lock-free; a fresh
+    server starts NOT suspect. Matches the SuspectableBackend shape (method is
+    present, non-blocking, sets exactly the flag)."""
+    server = _make_lifecycle_server("suspect-set")
+    # Fresh server is not suspect.
+    assert server._suspect_reason is None
+    # Marking records the reason.
+    server.mark_suspect("tools/call foo timeout")
+    assert server._suspect_reason == "tools/call foo timeout"
+    # Re-marking overwrites with the latest reason (still "set", not appended).
+    server.mark_suspect("second reason")
+    assert server._suspect_reason == "second reason"
+
+
+def test_ensure_healthy_noop_when_not_suspect():
+    """When the connection was never marked suspect, ``ensure_healthy`` is a
+    no-op that returns True and does NOT signal a reconnect."""
+    server = _make_lifecycle_server("healthy-noop")
+    server.session = object()
+    server._reconnect_event.clear()
+    assert server.ensure_healthy() is True
+    # No recycle was requested.
+    assert not server._reconnect_event.is_set()
+    assert server._suspect_reason is None
+
+
+def test_ensure_healthy_recycles_suspect_and_clears_flag():
+    """A suspect connection is recycled on the next ``ensure_healthy``: the
+    reconnect signal fires (transport rebuild) and the suspect flag is cleared
+    so a follow-up call does not re-signal."""
+    server = _make_lifecycle_server("suspect-recycle")
+    server.session = object()
+    server._reconnect_event.clear()
+
+    server.mark_suspect("tools/call bar timeout")
+    assert server._suspect_reason is not None
+
+    recovered = server.ensure_healthy()
+    # A recycle was signalled (no live MCP loop in the test → direct .set()).
+    assert recovered is True
+    assert server._reconnect_event.is_set()
+    # Flag cleared → exactly-once recycle.
+    assert server._suspect_reason is None
+
+    # A second ensure_healthy is now a no-op (does not re-arm anything).
+    server._reconnect_event.clear()
+    assert server.ensure_healthy() is True
+    assert not server._reconnect_event.is_set()
+
+
+def test_ensure_healthy_recycles_even_when_session_object_present():
+    """The whole point of the suspect flag: a bounded RPC tripped its deadline,
+    so the transport may be silently wedged even though ``self.session`` still
+    points at a live-looking object. ``ensure_healthy`` recycles it anyway."""
+    server = _make_lifecycle_server("suspect-live-looking")
+    # Session object present, generation live, admission open, still recycled.
+    server.session = object()
+    server._publish_session(server.session)  # generation 1, admitting
+    assert server._rpc_generation not in server._retired_generations
+    assert server._admitting_generation is not None
+    server._reconnect_event.clear()
+
+    server.mark_suspect("deadline trip on a live-looking session")
+    assert server.ensure_healthy() is True
+    assert server._reconnect_event.is_set()
+    assert server._suspect_reason is None
+
+
+def test_mark_suspect_then_recycle_before_reuse_signals_once():
+    """End-to-end reuse gate: ``_recycle_before_reuse`` (the helper wired into
+    every user-RPC entry point) recycles a suspect connection exactly once and
+    leaves a non-suspect connection untouched."""
+    from tools.mcp_tool import _recycle_before_reuse
+
+    server = _make_lifecycle_server("reuse-gate")
+    server.session = object()
+    server._reconnect_event.clear()
+
+    # Not suspect → gate is a no-op.
+    _recycle_before_reuse(server, server.name, tool_timeout=1.0)
+    assert not server._reconnect_event.is_set()
+
+    # Suspect → gate recycles and clears.
+    server.mark_suspect("tools/call baz timeout")
+    _recycle_before_reuse(server, server.name, tool_timeout=1.0)
+    assert server._reconnect_event.is_set()
+    assert server._suspect_reason is None
+
+
+# ---------------------------------------------------------------------------
+# #48069 final: resource/prompt handler cancellation on teardown (teknium1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "op,rpc",
+    [
+        ("resources/read", "read_resource"),
+        ("resources/list", "list_resources"),
+        ("prompts/get", "get_prompt"),
+        ("prompts/list", "list_prompts"),
+    ],
+)
+def test_resource_and_prompt_handlers_cancelled_on_teardown(op, rpc):
+    """teknium1's original review finding: resource/prompt handlers use the
+    same background-loop + RPC-lock pattern as ``call_tool`` but were not
+    cancelled during reconnect/shutdown teardown. Every user-visible request
+    coroutine must now be tracked and cancelled by ``_fail_inflight_calls``.
+
+    This drives a blocking resource/prompt RPC through ``_track_inflight_rpc``
+    and asserts the teardown sweep cancels it and converts the cancel into the
+    clean retryable error (self-healing), not a raw ``CancelledError``.
+    """
+    from tools.mcp_tool import _track_inflight_rpc
+
+    server = _make_lifecycle_server(f"teardown-{rpc}")
+
+    class _Blocking:
+        async def _block(self, *a, started, **k):
+            started.set()
+            await asyncio.sleep(3600)
+
+    session = _Blocking()
+    # Bind the specific RPC name so the handler-shaped call resolves it.
+    setattr(session, rpc, session._block)
+    server._publish_session(session)
+    gen = server._rpc_generation
+    outcome = {}
+
+    async def drive():
+        started = asyncio.Event()
+
+        async def _run():
+            try:
+                async with _track_inflight_rpc(server, server.name, op):
+                    async with server._rpc_lock:
+                        return await getattr(server.session, rpc)(
+                            started=started,
+                        )
+            except RuntimeError as exc:
+                outcome["err"] = str(exc)
+                raise
+
+        task = asyncio.create_task(_run())
+        await started.wait()
+        # The user-visible request registered in BOTH the flat set and the
+        # per-generation map (this is what the teardown sweep cancels).
+        assert task in server._inflight_tasks
+        assert gen in server._inflight_by_gen
+        assert task in server._inflight_by_gen[gen]
+
+        # Teardown: close admission then run the cancellation sweep.
+        server._close_rpc_admission()
+        server._fail_inflight_calls("reconnect")
+        assert gen in server._retired_generations
+        # The blocked resource/prompt RPC is cancelled and surfaces the clean
+        # retryable error, NOT a raw CancelledError.
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert "reconnected during" in outcome["err"]
+        # The lock was released as the task unwound.
+        assert not server._rpc_lock.locked()
+
+    asyncio.run(drive())
+
+
+def test_teardown_sweep_cancels_mixed_families_together():
+    """A shutdown/reconnect teardown must cancel EVERY in-flight user-visible
+    family at once (call_tool AND resource AND prompt), not just call_tool."""
+    from tools.mcp_tool import _track_inflight_rpc
+
+    server = _make_lifecycle_server("teardown-mixed")
+
+    class _Blocking:
+        async def _block(self, *a, started, **k):
+            started.set()
+            await asyncio.sleep(3600)
+
+    session = _Blocking()
+    for rpc in ("call_tool", "read_resource", "get_prompt"):
+        setattr(session, rpc, session._block)
+    server._publish_session(session)
+    gen = server._rpc_generation
+
+    async def drive():
+        ops = [
+            ("tools/call", "call_tool"),
+            ("resources/read", "read_resource"),
+            ("prompts/get", "get_prompt"),
+        ]
+        started_events = []
+        tasks = []
+        errs = []
+
+        for op, rpc in ops:
+            started = asyncio.Event()
+            started_events.append(started)
+
+            async def _run(op=op, rpc=rpc, started=started):
+                try:
+                    async with _track_inflight_rpc(server, server.name, op):
+                        return await getattr(server.session, rpc)(
+                            started=started,
+                        )
+                except RuntimeError as exc:
+                    errs.append(str(exc))
+                    raise
+
+            tasks.append(asyncio.create_task(_run()))
+
+        for ev in started_events:
+            await ev.wait()
+        # All three families registered.
+        assert len(server._inflight_tasks) == 3
+        assert len(server._inflight_by_gen[gen]) == 3
+
+        # One teardown sweep cancels all three.
+        server._close_rpc_admission()
+        server._fail_inflight_calls("shutdown")
+        for task in tasks:
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(task, timeout=2.0)
+        assert len(errs) == 3
+        assert all("reconnected during" in e for e in errs)
+
+    asyncio.run(drive())

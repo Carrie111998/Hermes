@@ -2392,7 +2392,7 @@ class MCPServerTask:
         "_pending_call_context",
         "_inflight_tasks", "_reconnecting",
         "_inflight_by_gen", "_retired_generations",
-        "_rpc_generation", "_admitting_generation",
+        "_rpc_generation", "_admitting_generation", "_suspect_reason",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported", "_list_cache_meta",
@@ -2530,6 +2530,23 @@ class MCPServerTask:
         # a real session has been published (generation >= 1).
         self._rpc_generation: int = 0
         self._admitting_generation: Optional[int] = 0
+        # Suspect flag (#48069 final; SuspectableBackend SHAPE, no import).
+        #
+        # PR #93796 introduces a shared ``SuspectableBackend`` protocol that
+        # the ``run_bounded_*`` deadline layer calls ``mark_suspect()`` on
+        # whenever a bounded RPC trips its deadline, so the NEXT use of the
+        # connection health-checks and recycles it instead of handing back a
+        # wedged transport. That protocol is not on main yet (it lives only in
+        # unmerged #93796), so this class implements the same SHAPE locally
+        # without importing it: ``mark_suspect`` records a reason cheaply and
+        # ``ensure_healthy`` acts on it at the next reuse gate. When #93796
+        # lands, ``MCPServerTask`` already satisfies the protocol structurally
+        # and the deadline layer can drive it with no further change here.
+        #
+        # ``None`` means "not suspect"; a non-empty string is the reason the
+        # connection was marked (e.g. a tool-call deadline). Set lock-free from
+        # any thread, read/cleared on the MCP loop by ``ensure_healthy``.
+        self._suspect_reason: Optional[str] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -2663,6 +2680,74 @@ class MCPServerTask:
     def mark_tool_call(self) -> None:
         """Record that a user-visible MCP operation is starting."""
         self._last_tool_call_at = time.monotonic()
+
+    def mark_suspect(self, reason: str) -> None:
+        """Flag this connection as possibly wedged (SuspectableBackend SHAPE).
+
+        Cheap, non-blocking, lock-free: record the reason and log at debug.
+        The next reuse of the connection consults the flag in
+        :meth:`ensure_healthy`, which health-checks and recycles the transport
+        before handing it back, so a timed-out / poisoned session is recycled
+        rather than returned wedged.
+
+        This matches the ``SuspectableBackend`` protocol shape from PR #93796
+        WITHOUT importing it (that protocol is not on main yet). When #93796
+        lands, the shared ``run_bounded_*`` deadline layer calls this method
+        automatically on a deadline trip; today the wiring is local (see the
+        mark-on-timeout comment at the tool-call site).
+
+        Safe to call from any thread: a single attribute write is atomic under
+        CPython, and :meth:`ensure_healthy` only ever reads/clears it on the
+        MCP loop, so there is no lock and no ordering hazard.
+        """
+        self._suspect_reason = reason
+        logger.debug(
+            "MCP server '%s': marked suspect (%s)", self.name, reason,
+        )
+
+    def ensure_healthy(self) -> bool:
+        """Recycle a suspect connection before reuse (SuspectableBackend SHAPE).
+
+        If the connection was flagged by :meth:`mark_suspect`, health-check it
+        and recycle/reconnect before the next use so a wedged transport is not
+        handed back. Returns ``True`` when the connection is healthy or has
+        been recycled toward recovery, ``False`` only when there is no
+        reconnect machinery to revive it (nothing we can do).
+
+        Health check (cheap, no RPC): a live session is one that is published
+        (``self.session is not None``), whose generation is NOT already retired
+        (``_rpc_generation not in _retired_generations``), and whose admission
+        gate is open. A suspect connection that still looks live is recycled
+        anyway, the whole point of the suspect flag is that a bounded RPC tore
+        through its deadline, so the transport may be silently wedged even
+        though the object still exists. We ask the server task to rebuild the
+        transport (thread-safe reconnect signal) and clear the flag; the fresh
+        session initializes on the MCP loop and the caller's own
+        ``_wait_for_server_session_ready`` / retry path picks it up.
+
+        Not suspect → no-op, returns ``True``. Idempotent and lock-free; the
+        flag is cleared before signalling so a concurrent second caller does
+        not double-signal.
+        """
+        if self._suspect_reason is None:
+            return True
+        reason = self._suspect_reason
+        # Clear first so a racing second caller sees "not suspect" and does
+        # not re-signal; the reconnect is idempotent regardless.
+        self._suspect_reason = None
+        session_live = (
+            self.session is not None
+            and self._rpc_generation not in self._retired_generations
+            and self._admitting_generation is not None
+        )
+        logger.info(
+            "MCP server '%s': ensure_healthy recycling suspect connection "
+            "(%s; session_live=%s)",
+            self.name, reason, session_live,
+        )
+        # Recycle-before-reuse: ask the server task to rebuild the transport.
+        # Returns False only when the server has no reconnect machinery.
+        return _signal_reconnect(self)
 
     def _mark_lifecycle_started(self) -> None:
         now = time.monotonic()
@@ -6026,6 +6111,47 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+def _recycle_before_reuse(
+    server: Any, server_name: str, tool_timeout: float,
+) -> None:
+    """Recycle a suspect connection before a user RPC reuses it (#48069).
+
+    Called at every user-RPC reuse gate (tool call, resource read/list, prompt
+    get/list) right after the session-present check. If the connection was
+    flagged by ``mark_suspect`` (e.g. a prior bounded RPC tripped its
+    deadline), ``ensure_healthy`` health-checks it and asks the server task to
+    rebuild the transport before the next use, so a wedged/poisoned session is
+    recycled instead of handed back. We then wait briefly for the fresh
+    session so this call runs on the recycled transport rather than the
+    retiring one.
+
+    A no-op when the connection is not suspect (``ensure_healthy`` returns
+    True without signalling) or when the server has no ``ensure_healthy``
+    method (synthetic doubles); best-effort, never raises into the caller.
+    """
+    ensure_healthy = getattr(server, "ensure_healthy", None)
+    if not callable(ensure_healthy):
+        return
+    was_suspect = getattr(server, "_suspect_reason", None) is not None
+    try:
+        ensure_healthy()
+    except Exception:
+        logger.debug(
+            "MCP server '%s': ensure_healthy raised (ignored)",
+            server_name, exc_info=True,
+        )
+        return
+    if was_suspect:
+        # A recycle was just signalled; give the server task a brief window to
+        # publish the fresh session so this RPC reuses the recycled transport.
+        old_session = getattr(server, "session", None)
+        _wait_for_server_session_ready(
+            server,
+            old_session=old_session,
+            timeout=min(5.0, float(tool_timeout or 5.0)),
+        )
+
+
 def _generation_retired(server, gen) -> bool:
     """Return True if generation ``gen`` has been drained (its teardown cause).
 
@@ -6257,6 +6383,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        # Recycle-before-reuse gate (#48069): a prior bounded RPC that tripped
+        # its deadline marks the connection suspect; ensure_healthy recycles it
+        # here so this call runs on a fresh transport, not a wedged one.
+        _recycle_before_reuse(server, server_name, tool_timeout)
+
         async def _call():
             _mark_server_call_started(server)
             async with _track_inflight_rpc(server, server_name, "tools/call"):
@@ -6415,6 +6546,27 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
             return result
+        except TimeoutError:
+            # The tool call tore through its bounded ``tool_timeout`` on the
+            # MCP loop. The transport may be silently wedged even though the
+            # session object still exists, so mark the connection suspect: the
+            # NEXT reuse gate (_recycle_before_reuse) recycles it instead of
+            # handing back the wedged session.
+            #
+            # When PR #93796 lands: pass backend=self to run_bounded_* so the shared deadline layer calls mark_suspect() automatically.
+            mark_suspect = getattr(server, "mark_suspect", None)
+            if callable(mark_suspect):
+                mark_suspect(f"tools/call {tool_name} timeout")
+            _bump_server_error(server_name)
+            logger.error(
+                "MCP tool %s/%s call timed out (marked suspect)",
+                server_name, tool_name,
+            )
+            return tool_error(
+                f"MCP server '{server_name}' timed out on {tool_name}; "
+                f"the connection was recycled. Do NOT retry immediately, "
+                f"give it a few seconds to reconnect."
+            )
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
@@ -6457,6 +6609,8 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
+
+        _recycle_before_reuse(server, server_name, tool_timeout)
 
         async def _call():
             _mark_server_call_started(server)
@@ -6522,6 +6676,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         if not uri:
             return tool_error("Missing required parameter 'uri'")
 
+        _recycle_before_reuse(server, server_name, tool_timeout)
+
         async def _call():
             _mark_server_call_started(server)
             async with _track_inflight_rpc(server, server_name, "resources/read"):
@@ -6579,6 +6735,8 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
+
+        _recycle_before_reuse(server, server_name, tool_timeout)
 
         async def _call():
             _mark_server_call_started(server)
@@ -6646,6 +6804,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
         if not name:
             return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
+
+        _recycle_before_reuse(server, server_name, tool_timeout)
 
         async def _call():
             _mark_server_call_started(server)
