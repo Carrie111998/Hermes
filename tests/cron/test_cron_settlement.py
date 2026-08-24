@@ -84,17 +84,27 @@ def test_real_sessiondb_verification_reads_only_the_persisted_tail(tmp_path):
         db.close()
 
 
-def test_run_one_job_consumes_incomplete_settlement_before_delivery(monkeypatch):
+@pytest.mark.parametrize(
+    "tail",
+    [
+        {"role": "assistant", "content": "partial", "finish_reason": "length"},
+        {"role": "assistant", "content": "partial", "finish_reason": "provider_new"},
+        {"role": "assistant", "content": "partial"},
+    ],
+)
+def test_run_one_job_consumes_incomplete_settlement_before_delivery(monkeypatch, tail):
     import cron.scheduler as scheduler
 
     events: list[tuple[str, object]] = []
 
     def fake_run_job(job, *, settlement=None, **_kwargs):
         assert settlement is not None
+        status = scheduler._classify_persisted_cron_final_message(tail)
+        assert status == "incomplete"
         settlement.update(
             {
                 "session_id": "cron-exact-fire",
-                "status": "incomplete",
+                "status": status,
                 "end_reason": "cron_incomplete_no_output",
                 "error": "Cron run ended without a persisted final assistant message.",
             }
