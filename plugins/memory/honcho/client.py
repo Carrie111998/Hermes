@@ -873,9 +873,9 @@ class HonchoClientConfig:
         self,
         cwd: str | None = None,
         session_title: str | None = None,
-        session_title_source: str | None = None,
         session_id: str | None = None,
         gateway_session_key: str | None = None,
+        session_title_source: str | None = None,
     ) -> str | None:
         """Resolve Honcho session name.
 

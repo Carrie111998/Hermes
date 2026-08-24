@@ -7450,6 +7450,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    cwd_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -7617,6 +7618,7 @@ def _make_agent(
         provider_data_collection=_pr.get("data_collection"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
+        cwd=cwd_override,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
