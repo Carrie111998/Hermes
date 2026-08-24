@@ -3249,6 +3249,46 @@ def _print_fetch_failure(stderr: str) -> None:
         print(f"  {stderr.splitlines()[0]}")
 
 
+UPDATE_CHECK_FETCH_TIMEOUT_SECONDS = 30
+
+
+def _run_update_check_fetch(
+    git_cmd: list[str],
+    depth_args: list[str],
+    remote: str,
+    branch: str,
+    repo_root: Path,
+) -> subprocess.CompletedProcess:
+    """Run one bounded update-check fetch and clean abandoned temp packs."""
+    cmd = git_cmd + ["fetch"] + depth_args + [remote, branch]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=UPDATE_CHECK_FETCH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        result = subprocess.CompletedProcess(
+            cmd,
+            124,
+            stdout="",
+            stderr=(
+                "git fetch timed out after "
+                f"{UPDATE_CHECK_FETCH_TIMEOUT_SECONDS} seconds"
+            ),
+        )
+
+    if result.returncode != 0:
+        from hermes_cli.gitlock import clear_stale_git_artifacts
+
+        clear_stale_git_artifacts(repo_root, temp_pack_min_age_seconds=0)
+    return result
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -3292,11 +3332,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # lock file) behind; every later fetch then fails with "File exists" and
     # the check reports a hard failure (or, in the banner path, silently
     # compares stale refs). Self-heal abandoned locks before fetching.
-    from hermes_cli.gitlock import clear_stale_git_locks
+    from hermes_cli.gitlock import clear_stale_git_artifacts
 
-    cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
-    for lock_path in cleared:
-        print(f"  (removed stale git lock: {lock_path})")
+    cleared = clear_stale_git_artifacts(_m().PROJECT_ROOT)
+    for artifact_path in cleared:
+        print(f"  (removed stale git artifact: {artifact_path})")
 
     # Fetch only the branch we compare against; prefer upstream as the canonical
     # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
@@ -3337,11 +3377,12 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         fetch_result = None
         if has_upstream_remote:
             print("→ Fetching from upstream...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["upstream", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+            fetch_result = _run_update_check_fetch(
+                git_cmd,
+                depth_args,
+                "upstream",
+                branch,
+                _m().PROJECT_ROOT,
             )
         if fetch_result is not None and fetch_result.returncode == 0:
             upstream_exists = True
@@ -3349,22 +3390,24 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         else:
             # No upstream remote, or the upstream fetch failed — use origin.
             print("→ Fetching from origin...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["origin", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+            fetch_result = _run_update_check_fetch(
+                git_cmd,
+                depth_args,
+                "origin",
+                branch,
+                _m().PROJECT_ROOT,
             )
             upstream_exists = False
             compare_branch = f"origin/{branch}"
     else:
         # Non-default branch: compare against origin/<branch> directly.
         print("→ Fetching from origin...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+        fetch_result = _run_update_check_fetch(
+            git_cmd,
+            depth_args,
+            "origin",
+            branch,
+            _m().PROJECT_ROOT,
         )
         upstream_exists = False
         compare_branch = f"origin/{branch}"
@@ -6076,15 +6119,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # against.
         branch = _m()._resolve_update_branch(args)
 
-        # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
-        # crashed fetch) before the fetch — otherwise the update fails with
-        # "Unable to create .../shallow.lock: File exists" and never reaches
-        # the network.
-        from hermes_cli.gitlock import clear_stale_git_locks
+        # Self-heal abandoned git artifacts before fetching: stale lock files
+        # wedge later operations, while interrupted index-pack temp files can
+        # otherwise accumulate without bound.
+        from hermes_cli.gitlock import clear_stale_git_artifacts
 
-        cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
+        cleared = clear_stale_git_artifacts(_m().PROJECT_ROOT)
         if cleared:
-            print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
+            print("  (removed stale git artifact(s): %s)" % ", ".join(cleared))
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(

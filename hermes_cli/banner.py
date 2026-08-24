@@ -319,14 +319,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        # Self-heal abandoned git lock files before fetching. A stale
-        # .git/shallow.lock from a crashed fetch makes the fetch fail, the
-        # exception below is swallowed, and stale refs get compared against
-        # HEAD — silently degrading the passive check until a human removes
-        # the lock (git never self-heals these).
-        from hermes_cli.gitlock import clear_stale_git_locks
+        # Self-heal abandoned git artifacts before fetching. Stale locks wedge
+        # later operations, while interrupted index-pack temp files otherwise
+        # accumulate across passive checks.
+        from hermes_cli.gitlock import clear_stale_git_artifacts
 
-        clear_stale_git_locks(repo_dir)
+        clear_stale_git_artifacts(repo_dir)
 
         # Scope the fetch to the one branch the behind-count compares against.
         # An unscoped ``git fetch origin`` transfers every remote head (~1,400
@@ -340,13 +338,19 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
-        subprocess.run(
+        fetch_result = subprocess.run(
             fetch_args,
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
+        if fetch_result.returncode != 0:
+            clear_stale_git_artifacts(repo_dir, temp_pack_min_age_seconds=0)
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        try:
+            clear_stale_git_artifacts(repo_dir, temp_pack_min_age_seconds=0)
+        except Exception:
+            pass
+        # Offline or timeout — use stale refs, that's fine.
 
     if is_shallow:
         # No history to count across the shallow boundary. `origin/main` may not
