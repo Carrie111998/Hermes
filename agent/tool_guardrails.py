@@ -181,6 +181,10 @@ class ToolCallGuardrailConfig:
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
 
+# Keys of LoopCapConfig that carry special meaning in from_mapping; anything
+# else under ``loop_caps`` is a typo and gets a warning instead of silence.
+_KNOWN_LOOP_CAP_KEYS = frozenset({"max_web_searches", "max_subagents", "per_tool"})
+
 
 @dataclass(frozen=True)
 class LoopCapConfig:
@@ -198,10 +202,16 @@ class LoopCapConfig:
     repeated identical/failing calls): these caps are a hard ceiling on the
     total count of a tool within the turn and fire regardless of
     ``hard_stop_enabled``. A value of ``0`` disables the cap (unlimited).
+
+    ``per_tool`` extends the same hard-ceiling semantics to ANY tool by name
+    (#92476): ``{"todo": 10, "text_to_speech": 3}`` caps those tools per turn.
+    The two legacy named fields keep working unchanged; if a tool appears in
+    both, its legacy field wins.
     """
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    per_tool: Mapping[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -209,6 +219,23 @@ class LoopCapConfig:
         if not isinstance(data, Mapping):
             return cls()
         defaults = cls()
+        unknown = sorted(
+            str(k) for k in data.keys() if str(k) not in _KNOWN_LOOP_CAP_KEYS
+        )
+        if unknown:
+            # A silently-dropped cap looks identical to "no cap configured" —
+            # tell the user their key did nothing (#92476).
+            print(
+                "⚠ tool_loop_guardrails.loop_caps: unrecognized key(s) "
+                f"{', '.join(unknown)} — expected max_web_searches, "
+                "max_subagents, or per_tool."
+            )
+        raw_per_tool = data.get("per_tool")
+        per_tool: dict[str, int] = {}
+        if isinstance(raw_per_tool, Mapping):
+            for tool_name, raw_cap in raw_per_tool.items():
+                cap = _non_negative_int(raw_cap, 0)
+                per_tool[str(tool_name)] = cap
         return cls(
             max_web_searches=_non_negative_int(
                 data.get("max_web_searches"), defaults.max_web_searches
@@ -216,6 +243,7 @@ class LoopCapConfig:
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
             ),
+            per_tool=per_tool,
         )
 
 
@@ -368,6 +396,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_per_tool_counts: dict[str, int] = {}
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -720,6 +749,32 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
             self._turn_subagent_count += spawn_count
+            return None
+
+        # Generic per-tool ceiling (#92476): the hard-cap semantics above,
+        # extended by name to any tool via loop_caps.per_tool.
+        per_tool_cap = caps.per_tool.get(tool_name)
+        if per_tool_cap is not None:
+            count = self._turn_per_tool_counts.get(tool_name, 0)
+            if per_tool_cap and count >= per_tool_cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_tool_cap",
+                    message=(
+                        f"Blocked {tool_name}: this turn has already made "
+                        f"{count} calls (per-turn limit {per_tool_cap} from "
+                        "tool_loop_guardrails.loop_caps.per_tool). This looks "
+                        "like a runaway loop — work with what you have and "
+                        "answer the user."
+                    ),
+                    tool_name=tool_name,
+                    count=count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            if per_tool_cap:
+                self._turn_per_tool_counts[tool_name] = count + 1
             return None
 
         return None
