@@ -4235,6 +4235,51 @@ def _tour_request(sid: str, payload: dict) -> str:
     return answer or _TOUR_BRIDGE_UNAVAILABLE
 
 
+_PREVIEW_ACTION_TIMEOUT_S = 45
+_PREVIEW_ACTION_PROBE_TIMEOUT_S = 10
+
+_PREVIEW_ACTION_BRIDGE_UNAVAILABLE = json.dumps(
+    {
+        "success": False,
+        "error": (
+            "No Hermes Desktop window answered the preview action request. "
+            "The Desktop renderer bridge is unavailable for this session. "
+            "Update Hermes Desktop and start a new session. Do not retry "
+            "drive_preview or annotate_preview in this session."
+        ),
+    }
+)
+
+
+def _preview_action_request(sid: str, payload: dict) -> str:
+    """Bridge preview actions without repeatedly waiting on an absent renderer."""
+    session = _sessions.get(sid)
+    if session is None:
+        session = {}
+    state = session.get("preview_action_bridge")
+
+    if state == "unanswered":
+        return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+
+    answer = _block(
+        "preview.act.request",
+        sid,
+        dict(payload),
+        timeout=(
+            _PREVIEW_ACTION_TIMEOUT_S
+            if state == "answered"
+            else _PREVIEW_ACTION_PROBE_TIMEOUT_S
+        ),
+    )
+
+    if answer:
+        session["preview_action_bridge"] = "answered"
+    elif state != "answered":
+        session["preview_action_bridge"] = "unanswered"
+
+    return answer or _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+
+
 def _clear_pending(sid: str | None = None) -> None:
     """Release pending prompts with an empty answer.
 
@@ -6964,12 +7009,7 @@ def _agent_cbs(sid: str) -> dict:
         # annotate_preview rides this same callback: it resolves a target
         # through the same engine and differs only in the verb it sends, so it
         # needs a tool of its own but not a channel of its own.
-        "drive_preview_callback": lambda payload: _block(
-            "preview.act.request",
-            sid,
-            dict(payload),
-            timeout=45,
-        ),
+        "drive_preview_callback": lambda payload: _preview_action_request(sid, payload),
         # read_window_below tool (desktop GUI): the renderer asks its main
         # process (which owns native window enumeration) which OS window sits
         # directly underneath the Hermes window, and answers
