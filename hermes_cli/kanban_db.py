@@ -5501,27 +5501,38 @@ def _claim_review_task_once(
         return get_task(conn, task_id)
 
 
+def _append_claim_rejected_once(
+    conn: sqlite3.Connection, task_id: str, attempt_id: str, reason: str
+) -> None:
+    """Audit a routing rejection once for a stable logical attempt."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='claim_rejected'",
+        (task_id,),
+    ).fetchall()
+    if any(json.loads(row["payload"]).get("attempt_id") == attempt_id for row in rows):
+        return
+    _append_event(
+        conn, task_id, "claim_rejected", {"attempt_id": attempt_id, "reason": reason}
+    )
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    attempt_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Claim review work or durably audit a rejected review route."""
-    attempt_id = str(uuid.uuid4())
+    attempt_id = attempt_id or str(uuid.uuid4())
     try:
         return _claim_review_task_once(
             conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer
         )
     except RoutingContractError as exc:
         with write_txn(conn):
-            _append_event(
-                conn,
-                task_id,
-                "claim_rejected",
-                {"attempt_id": attempt_id, "reason": str(exc)},
-            )
+            _append_claim_rejected_once(conn, task_id, attempt_id, str(exc))
         raise
 
 
@@ -5531,26 +5542,23 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    attempt_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Claim implementation work or durably audit a rejected route.
 
     Routing rejection must escape the main claim transaction so that its
     rollback completes before the audit event is written in a separate
-    transaction. The exception is then returned to the caller unchanged.
+    transaction. Callers may reuse ``attempt_id`` when retrying the same API
+    attempt; omitted IDs are fresh UUIDs so legitimate re-attempts are kept.
     """
-    attempt_id = str(uuid.uuid4())
+    attempt_id = attempt_id or str(uuid.uuid4())
     try:
         return _claim_task_once(
             conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer
         )
     except RoutingContractError as exc:
         with write_txn(conn):
-            _append_event(
-                conn,
-                task_id,
-                "claim_rejected",
-                {"attempt_id": attempt_id, "reason": str(exc)},
-            )
+            _append_claim_rejected_once(conn, task_id, attempt_id, str(exc))
         raise
 
 

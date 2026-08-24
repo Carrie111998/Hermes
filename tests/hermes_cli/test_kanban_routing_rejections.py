@@ -56,6 +56,28 @@ def test_claim_rejection_rolls_back_and_audits_separately(conn, monkeypatch):
     assert payload["attempt_id"]
 
 
+def test_claim_rejection_attempt_id_deduplicates_retry_only(conn, monkeypatch):
+    """One logical attempt audits once while fresh calls remain distinct."""
+    task_id = kb.create_task(conn, title="deduplicate reject", assignee="coder")
+    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+    monkeypatch.setattr(
+        kb, "_resolve_routing_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RoutingContractError("bad route")),
+    )
+    attempt_id = "93722498-a216-4ea7-9f14-cdb46fbc69b9"
+
+    for _ in range(2):
+        with pytest.raises(RoutingContractError, match="bad route"):
+            kb.claim_task(conn, task_id, attempt_id=attempt_id)
+    with pytest.raises(RoutingContractError, match="bad route"):
+        kb.claim_task(conn, task_id)
+
+    payloads = _event_payloads(conn, task_id, "claim_rejected")
+    assert [payload["attempt_id"] for payload in payloads].count(attempt_id) == 1
+    assert len(payloads) == 2
+    assert payloads[1]["attempt_id"] != attempt_id
+
+
 def test_review_claim_rejection_rolls_back_and_audits_separately(conn, monkeypatch):
     """Review routing rejection preserves review state and creates no run."""
     task_id = kb.create_task(conn, title="reject review", assignee="coder")
