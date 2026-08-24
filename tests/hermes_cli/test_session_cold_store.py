@@ -578,6 +578,53 @@ def test_store_reports_the_same_canonical_path_it_writes(tmp_path: Path) -> None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are required")
+def test_store_rejects_rename_unsafe_archive_parent_before_creating_root(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    shared_parent = tmp_path / "shared"
+    archive_root = shared_parent / "archive"
+    shared_parent.mkdir(mode=0o770)
+    shared_parent.chmod(0o770)
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        with pytest.raises(ValueError, match="unsafe archive parent path"):
+            store_archived_lineage(db, "terminal", archive_root)
+
+        assert not archive_root.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership is required")
+def test_directory_authority_rejects_foreign_owned_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "foreign-owned"
+    directory.mkdir(mode=0o700)
+    descriptor = os.open(directory, cold_store._directory_open_flags())
+    real_fstat = os.fstat
+
+    def foreign_owner_fstat(fd: int) -> os.stat_result:
+        opened = real_fstat(fd)
+        if fd != descriptor:
+            return opened
+        values = list(opened)
+        values[4] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(os, "fstat", foreign_owner_fstat)
+    try:
+        with pytest.raises(ValueError, match="unsafe archive parent path"):
+            cold_store._validate_directory_authority(descriptor, directory)
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are required")
 @pytest.mark.parametrize(
     ("member", "insecure_mode"),
     [

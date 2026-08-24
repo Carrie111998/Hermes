@@ -300,6 +300,19 @@ def _unsafe_archive_parent(path: Path, exc: OSError | None = None) -> ValueError
     return error
 
 
+def _validate_directory_authority(descriptor: int, path: Path) -> None:
+    opened = os.fstat(descriptor)
+    owner_is_trusted = opened.st_uid in {0, os.geteuid()}
+    writable_by_others = stat.S_IMODE(opened.st_mode) & 0o022
+    sticky = opened.st_mode & stat.S_ISVTX
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not owner_is_trusted
+        or (writable_by_others and not sticky)
+    ):
+        raise _unsafe_archive_parent(path)
+
+
 def _open_or_create_directory(parent_fd: int, name: str, path: Path) -> int:
     flags = _directory_open_flags()
     try:
@@ -337,6 +350,7 @@ def _open_snapshot_parent(
             descriptor = _open_or_create_directory(descriptors[-1], name, current_path)
             edges.append((descriptors[-1], name, descriptor, current_path))
             descriptors.append(descriptor)
+            _validate_directory_authority(descriptor, current_path)
     except BaseException:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
@@ -359,6 +373,7 @@ def _directory_entry_matches(parent_fd: int, name: str, descriptor: int) -> bool
 
 def _validate_directory_chain(edges: list[tuple[int, str, int, Path]]) -> None:
     for parent_fd, name, descriptor, path in edges:
+        _validate_directory_authority(descriptor, path)
         if not _directory_entry_matches(parent_fd, name, descriptor):
             raise _unsafe_archive_parent(path)
 
@@ -683,6 +698,7 @@ def _open_existing_snapshot_parent(
                 raise _unsafe_archive_parent(current_path, exc)
             edges.append((descriptors[-1], name, descriptor, current_path))
             descriptors.append(descriptor)
+            _validate_directory_authority(descriptor, current_path)
     except BaseException:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
