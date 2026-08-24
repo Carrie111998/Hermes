@@ -44,29 +44,57 @@ const $activeConnectionProfile = computed(
     connectionId,
     descriptorProfile: normalizeProfileKey(connection?.profile),
     profile: normalizeProfileKey(profile),
-    registryScoped: connection?.registryScoped === true
+    registryScoped: connection?.registryScoped === true,
+    mode: connection?.mode,
+    // Distinguish "primary backend has no profile field" (undefined → record
+    // the live gateway profile directly) from a pooled secondary or a stale
+    // startup descriptor that DOES carry a profile but must still match.
+    hasDescriptorProfile: connection?.profile != null
   })
 )
 
 // Remember one profile per source, so switching machines is a re-home rather
 // than a reset to `default`. The map is local UI preference only; Electron
 // remains the authority for the connection registry and all secrets.
-$activeConnectionProfile.subscribe(({ connectionId, descriptorProfile, profile, registryScoped }) => {
-  // A migrated v1 per-profile remote may expose a client-side alias such as
-  // "work" while the registered source's actual profile is "default". Only
-  // remember a source/profile pair after Electron confirms that exact v2
-  // descriptor. This also rejects the brief startup window where the profile
-  // atom still carries the previous app run's alias.
-  if (
-    !connectionId ||
-    !registryScoped ||
-    descriptorProfile !== profile ||
-    $lastProfileByConnection.get()[connectionId] === profile
-  ) {
+$activeConnectionProfile.subscribe(({ connectionId, descriptorProfile, profile, registryScoped, mode, hasDescriptorProfile }) => {
+  // A local-pool switch carries no connectionId (legacy route), but it is
+  // still "This device" — key it under `local` so switching back from a
+  // remote source re-homes to the last-used local profile instead of
+  // resetting to `default`.
+  const key = connectionId ?? (mode === 'local' ? 'local' : null)
+
+  if (!key) {
     return
   }
 
-  $lastProfileByConnection.set({ ...$lastProfileByConnection.get(), [connectionId]: profile })
+  // A connection switch in flight leaves $activeGatewayProfile briefly naming
+  // the TARGET (via onActiveRouteChanged) while $connection still describes the
+  // previous source — recording then would write the wrong profile under the
+  // old key (e.g. `local` ← the remote's profile). Skip until the switch
+  // settles. Profile switches (selectProfile) never set this, so they still
+  // record immediately.
+  if ($pendingConnectionId.get()) {
+    return
+  }
+
+  if (key !== 'local') {
+    // Remote source: keep the full guard (registryScoped + descriptor match),
+    // which also rejects a migrated v1 routing alias.
+    if (!registryScoped || descriptorProfile !== profile) {
+      return
+    }
+  } else if (hasDescriptorProfile && descriptorProfile !== profile) {
+    // A pooled secondary (or a stale startup descriptor) carries a profile and
+    // must still match. Only a profile-less PRIMARY backend records the live
+    // gateway profile directly — its `profile` field is absent by design.
+    return
+  }
+
+  if ($lastProfileByConnection.get()[key] === profile) {
+    return
+  }
+
+  $lastProfileByConnection.set({ ...$lastProfileByConnection.get(), [key]: profile })
 })
 
 /** @internal Reset module-owned preferences and switch coordination for tests. */
