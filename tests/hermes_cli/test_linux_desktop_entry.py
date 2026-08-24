@@ -93,6 +93,12 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # interpreter when the DE spawns the .desktop entry → ModuleNotFoundError,
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
 # resolved bin that is a python script escaping the running venv.
+#
+# The prefix must be sys.executable AS-IS, never resolved: a venv created
+# with symlinks (or by uv, which shares one managed CPython across every venv
+# it creates) has venv/bin/python as a symlink, and CPython's venv detection
+# keys off the invoked path — resolving it away loses site-packages
+# resolution and reproduces the exact bug this prefix exists to fix.
 def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
     import sys
 
@@ -107,8 +113,7 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    assert exec_line.split(" ")[0].strip('"') == sys.executable
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
 
@@ -147,6 +152,36 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     # Console-script with the venv's own interpreter in the shebang: correct
     # as-is, prefixing would only add noise.
     assert exec_line == f"{hermes_bin} desktop"
+
+
+# Regression test: a venv whose ``bin/python`` is a SYMLINK to a shared
+# managed CPython (e.g. `uv`-created venvs, or `python -m venv --symlinks`)
+# must keep the symlink path in Exec=, never the dereferenced target. Writing
+# the resolved target loses venv/site-packages resolution and the launched
+# process dies with ModuleNotFoundError on the first third-party import,
+# invisible to the user because Terminal=false. This asserts the module-level
+# fallback branch (no resolvable hermes bin) uses sys.executable verbatim.
+def test_exec_module_fallback_keeps_symlinked_venv_python_unresolved(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+
+    real_interpreter = tmp_path / "real-cpython" / "bin" / "python3.11"
+    real_interpreter.parent.mkdir(parents=True)
+    real_interpreter.write_text("", encoding="utf-8")
+
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(real_interpreter)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # Must be the venv symlink path, NOT real_interpreter (the resolved target).
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(real_interpreter) not in exec_line
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):

@@ -66,6 +66,21 @@ def resolve_exec_command() -> str:
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
+    # ``sys.executable`` is already an absolute path (CPython guarantees this)
+    # and MUST be used as-is, never through ``Path(...).resolve()``. A venv
+    # created with ``python -m venv --symlinks`` (or by ``uv``, which shares
+    # one managed CPython across every venv it creates) has ``venv/bin/python``
+    # as a symlink to that shared interpreter. CPython's venv/site-packages
+    # detection keys off the *invoked* executable path — it walks up from
+    # ``sys.executable``'s own directory looking for ``pyvenv.cfg`` — and only
+    # finds it when the venv path itself is what's exec'd. ``.resolve()``
+    # dereferences the symlink to the shared interpreter's real path outside
+    # the venv, silently losing venv/site-packages resolution: the process
+    # boots with the venv's own dependencies invisible (e.g.
+    # ``ModuleNotFoundError: No module named 'yaml'``), invisible to the user
+    # because desktop entries run with ``Terminal=false`` (#90292).
+    venv_python = sys.executable
+
     bin_path = resolve_hermes_bin()
     if bin_path:
         resolved = Path(bin_path).resolve()
@@ -78,11 +93,11 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            argv = [venv_python, str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [venv_python, "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
