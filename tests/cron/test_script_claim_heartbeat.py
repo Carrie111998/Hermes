@@ -369,7 +369,14 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
         lost_seen.set()
         return False
 
-    def _run_job(job, *, defer_agent_teardown=None, extra_prompt=None, cancel_event=None):
+    def _run_job(
+        job,
+        *,
+        defer_agent_teardown=None,
+        extra_prompt=None,
+        cancel_event=None,
+        settlement=None,
+    ):
         assert lost_seen.wait(timeout=2)
         return True, "stale output", "stale response", None
 
@@ -533,7 +540,9 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    # Leave a generous wall-clock margin on Windows CI: the heartbeat thread
+    # must observe multiple failed renewals, not just one scheduler tick.
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.1)
 
     assert scheduler.run_one_job(job) is True
     assert calls >= 3

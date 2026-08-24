@@ -47,6 +47,9 @@ def _job(**overrides):
 def _tick(job, tmp_path, current_provider, deliveries):
     """Run one run_one_job tick with the provider resolution pinned."""
     fake_db = MagicMock()
+    fake_db.get_messages.return_value = [
+        {"role": "assistant", "content": "ok", "finish_reason": "stop"}
+    ]
 
     def fake_deliver(job, content, adapters=None, loop=None):
         deliveries.append(content)

@@ -543,6 +543,9 @@ class TestRunJobSessionPersistence:
             "prompt": "hello",
         }
         fake_db = MagicMock()
+        fake_db.get_messages.return_value = [
+            {"role": "assistant", "content": "ok", "finish_reason": "stop"}
+        ]
         fake_db.get_compression_tip.side_effect = lambda session_id: session_id
 
         with patch("cron.scheduler._hermes_home", tmp_path), \

@@ -166,7 +166,8 @@ def _failure_streak_nudge(job: dict) -> str:
     Threshold config: ``cron.failure_nudge_threshold`` (default 3, ``0``
     disables the nudge). One-shot jobs never nudge — they don't recur.
     """
-    schedule_kind = (job.get("schedule") or {}).get("kind")
+    schedule = job.get("schedule")
+    schedule_kind = schedule.get("kind") if isinstance(schedule, dict) else None
     if schedule_kind not in {"cron", "interval"}:
         return ""
     try:
@@ -580,6 +581,85 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+_CRON_SETTLEMENT_COMPLETE = "complete"
+_CRON_SETTLEMENT_SILENT = "silent"
+_CRON_SETTLEMENT_INCOMPLETE = "incomplete"
+_CRON_SETTLEMENT_UNVERIFIED = "unverified"
+_CRON_NON_TERMINAL_FINISH_REASONS = frozenset({
+    "error",
+    "agent_error",
+    "content_filter",
+    "incomplete",
+    "tool_calls",
+    "verification_required",
+    "verify_hook_continue",
+})
+
+
+def _classify_persisted_cron_final_message(message: Optional[dict]) -> str:
+    """Classify the exact persisted tail of an agent-backed cron turn.
+
+    This is deliberately stricter than ``session_lifecycle_statuses``. That
+    picker helper is allowed to fail open for unknown message shapes; cron
+    booking needs positive evidence that the user-visible result was durable.
+    """
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return _CRON_SETTLEMENT_INCOMPLETE
+    if message.get("tool_calls"):
+        return _CRON_SETTLEMENT_INCOMPLETE
+    if str(message.get("finish_reason") or "").strip().lower() in _CRON_NON_TERMINAL_FINISH_REASONS:
+        return _CRON_SETTLEMENT_INCOMPLETE
+
+    content = message.get("content")
+    try:
+        from agent.message_content import flatten_message_text
+
+        text = flatten_message_text(content).strip()
+    except Exception:
+        text = content.strip() if isinstance(content, str) else ""
+    if not text:
+        return _CRON_SETTLEMENT_INCOMPLETE
+    if text == SILENT_MARKER:
+        return _CRON_SETTLEMENT_SILENT
+    return _CRON_SETTLEMENT_COMPLETE
+
+
+def _verify_persisted_cron_final_message(session_db, session_id: str) -> str:
+    """Return a settlement status from one exact session's persisted tail.
+
+    ``get_messages(... latest=True, limit=1)`` performs a bounded tail read;
+    it does not scan or infer from the in-memory agent result. Any malformed
+    result is a verification failure and is raised so the caller can record
+    ``unverified`` rather than booking a false success.
+    """
+    messages = session_db.get_messages(session_id, latest=True, limit=1)
+    if not isinstance(messages, list):
+        raise TypeError("SessionDB.get_messages returned a non-list result")
+    return _classify_persisted_cron_final_message(messages[0] if messages else None)
+
+
+def _publish_cron_settlement(
+    settlement: Optional[dict],
+    *,
+    session_id: str,
+    status: str,
+    end_reason: str,
+    error: Optional[str] = None,
+) -> None:
+    """Publish the one-fire settlement to the caller before delivery."""
+    if not isinstance(settlement, dict):
+        return
+    settlement.clear()
+    settlement.update(
+        session_id=session_id,
+        status=status,
+        end_reason=end_reason,
+    )
+    if error:
+        settlement["error"] = error
+
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -5066,6 +5146,7 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    settlement: Optional[dict] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5083,6 +5164,10 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
+
+    ``settlement``: optional per-fire holder populated after the exact cron
+    session tail has been verified. ``run_one_job`` consumes it before saving
+    delivery state, so lifecycle completion cannot outrun durable output.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5311,6 +5396,8 @@ def run_job(
     # the whole gateway process is restarted, silently skipping every
     # scheduled fire in between with "already running — skipping".
     _session_db = None
+    _cron_session_id: Optional[str] = None
+    _cron_run_failed = False
     try:
         from hermes_state import SessionDB
 
@@ -5428,6 +5515,17 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if _session_db is None:
+        _publish_cron_settlement(
+            settlement,
+            session_id=_cron_session_id,
+            status=_CRON_SETTLEMENT_UNVERIFIED,
+            end_reason="cron_unverified",
+            error=(
+                f"Cron job '{job_id}' has no available session store; its "
+                "final assistant result cannot be verified as persisted."
+            ),
+        )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -6356,6 +6454,7 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
+        _cron_run_failed = True
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Best-effort audit write on failure path. _audit_fire_id
@@ -6423,7 +6522,12 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
-        if _session_db:
+        if _session_db and not _cron_session_id:
+            try:
+                _session_db.close()
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Job '%s': failed to close unused SQLite session store: %s", job_id, e)
+        if _session_db and _cron_session_id:
             # The agent turn has already returned. Bound every subsequent DB
             # operation so storage failure cannot hold the dispatch guard.
             _session_db = _BoundedCronSessionDB(_session_db, job_id)
@@ -6486,12 +6590,68 @@ def run_job(
                             break
                     except (Exception, KeyboardInterrupt):
                         continue
-            try:
-                _session_db.end_session(
-                    _final_cron_session_id, "cron_complete"
+            if _cron_run_failed:
+                _settlement_status = "failed"
+                _end_reason = "cron_failed"
+                _settlement_error = (
+                    f"Cron job '{job_id}' failed before terminal completion."
                 )
+            else:
+                try:
+                    _settlement_status = _verify_persisted_cron_final_message(
+                        _session_db, _final_cron_session_id
+                    )
+                    _end_reason = (
+                        "cron_complete"
+                        if _settlement_status
+                        in {_CRON_SETTLEMENT_COMPLETE, _CRON_SETTLEMENT_SILENT}
+                        else "cron_incomplete_no_output"
+                    )
+                    _settlement_error = (
+                        None
+                        if _end_reason == "cron_complete"
+                        else (
+                            f"Cron job '{job_id}' ended without a persisted final "
+                            "assistant message."
+                        )
+                    )
+                except (Exception, KeyboardInterrupt) as e:
+                    _settlement_status = _CRON_SETTLEMENT_UNVERIFIED
+                    _end_reason = "cron_unverified"
+                    _settlement_error = (
+                        f"Cron job '{job_id}' could not verify its persisted final "
+                        "assistant message."
+                    )
+                    logger.warning(
+                        "Job '%s': cron terminal settlement could not be verified: %s",
+                        job_id,
+                        e,
+                    )
+
+            _publish_cron_settlement(
+                settlement,
+                session_id=_final_cron_session_id,
+                status=_settlement_status,
+                end_reason=_end_reason,
+                error=_settlement_error,
+            )
+            try:
+                _session_db.end_session(_final_cron_session_id, _end_reason)
             except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to end session: %s", job_id, e)
+                # The proof itself is not durable if the terminal session write
+                # cannot be committed. Reclassify the fire so run history does
+                # not report a green result while the session remains open.
+                _publish_cron_settlement(
+                    settlement,
+                    session_id=_final_cron_session_id,
+                    status=_CRON_SETTLEMENT_UNVERIFIED,
+                    end_reason="cron_unverified",
+                    error=(
+                        f"Cron job '{job_id}' could not persist its terminal "
+                        "session state."
+                    ),
+                )
+                logger.warning("Job '%s': failed to end session: %s", job_id, e)
             try:
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
@@ -6803,12 +6963,14 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        settlement: dict = {}
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
+                    settlement=settlement,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -6816,6 +6978,7 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
+                    settlement=settlement,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -6859,6 +7022,23 @@ def _run_one_job_body(
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
             return True
+
+        # A run is not successful until the exact session fired above has a
+        # durable assistant tail (or the deliberate [SILENT] sentinel). This
+        # verdict is produced by run_job's finalization boundary and must be
+        # consumed before delivery/last_status/execution bookkeeping.
+        _settlement_status = settlement.get("status")
+        if success and _settlement_status not in {
+            None,
+            _CRON_SETTLEMENT_COMPLETE,
+            _CRON_SETTLEMENT_SILENT,
+        }:
+            success = False
+            final_response = ""
+            error = settlement.get("error") or (
+                f"Cron job '{job['id']}' did not produce a verified terminal "
+                "session result."
+            )
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
