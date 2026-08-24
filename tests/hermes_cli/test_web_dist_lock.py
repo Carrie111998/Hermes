@@ -59,18 +59,29 @@ def test_waiter_refuses_lock_path_replaced_during_contention(
 ):
     import hermes_cli.web_dist_lock as lock_module
 
-    opened = threading.Event()
+    contended = threading.Event()
     result: list[BaseException | str] = []
-    original_open = lock_module._open_no_follow
+    original_try_acquire = lock_module.WebDistLock._try_acquire
 
     with web_dist_lock(tmp_path, timeout_seconds=0.0):
 
-        def observed_open(path: Path) -> int:
-            fd = original_open(path)
-            opened.set()
-            return fd
+        def observed_try_acquire(lock) -> None:
+            try:
+                original_try_acquire(lock)
+            except OSError:
+                # Synchronize only after the contender has opened and
+                # identity-checked the original inode, then observed the
+                # owner's OS lock. Signalling from _open_no_follow left a
+                # scheduling window where replacement could happen before
+                # the initial identity check and made this assertion flaky.
+                contended.set()
+                raise
 
-        monkeypatch.setattr(lock_module, "_open_no_follow", observed_open)
+        monkeypatch.setattr(
+            lock_module.WebDistLock,
+            "_try_acquire",
+            observed_try_acquire,
+        )
 
         def wait_for_lock() -> None:
             try:
@@ -81,7 +92,7 @@ def test_waiter_refuses_lock_path_replaced_during_contention(
 
         waiter = threading.Thread(target=wait_for_lock)
         waiter.start()
-        assert opened.wait(timeout=1.0)
+        assert contended.wait(timeout=1.0)
         lock_path = tmp_path / ".web_ui_build.lock"
         lock_path.unlink()
         lock_path.write_bytes(b"replacement")
