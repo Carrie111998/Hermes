@@ -218,6 +218,23 @@ fn no_follow_open_options(options: &mut OpenOptions) -> &mut OpenOptions {
     }
 }
 
+/// Perform the final stat-only no-follow fence before a Windows path move.
+///
+/// `MoveFileExW` only accepts paths, so keep all handles closed and validate the
+/// destination, its parent, and the staged source immediately before the move.
+/// `validate_no_reparse_topology` uses `symlink_metadata` (lstat semantics) and
+/// rejects Windows reparse-point attributes without opening anything.
+#[cfg(windows)]
+fn validate_move_no_follow(source: &Path, destination: &Path) -> Result<(), String> {
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| format!("update marker has no parent: {destination:?}"))?;
+    validate_no_reparse_topology(destination)?;
+    validate_no_reparse_topology(destination_parent)?;
+    validate_no_reparse_topology(source)?;
+    Ok(())
+}
+
 /// Open an existing marker through a no-follow handle and reject a reparse
 /// handle before its contents are consumed. On Windows OPEN_REPARSE_POINT
 /// opens the reparse point itself rather than its target; on POSIX O_NOFOLLOW
@@ -583,12 +600,9 @@ fn atomic_write_marker(path: &Path, pid: u32, lease_at: u64) -> Result<(), Strin
                 MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
             };
 
-            let _source_handle = open_marker_no_follow(&temp, false)?;
-            {
-                let _destination_handle = open_marker_no_follow(path, true)?;
-            }
             let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
             let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            validate_move_no_follow(&temp, path)?;
             let ok = unsafe {
                 MoveFileExW(
                     from.as_ptr(),
