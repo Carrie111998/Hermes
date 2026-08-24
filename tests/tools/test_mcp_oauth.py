@@ -1125,13 +1125,11 @@ class TestRefreshOn401:
     @pytest.mark.asyncio
     async def test_refresh_on_401_with_valid_refresh_token(self, tmp_path, monkeypatch):
         """When a 401 is received and a refresh token is available, try refresh first."""
-        import httpx
-        
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _set_interactive_stdin(monkeypatch)
         provider = build_oauth_auth("test-refresh", "https://example.com/mcp")
         assert provider is not None
-        
+
         # Set up initial tokens with a refresh token
         mock_token = MagicMock()
         mock_token.access_token = "initial-access"
@@ -1144,34 +1142,51 @@ class TestRefreshOn401:
         }
         provider.context.current_tokens = mock_token
         provider.context.update_token_expiry(mock_token)
-        
+
         # Create a mock request
         mock_request = MagicMock()
         mock_request.headers = {}
-        
-        # Mock the async generator to simulate httpx behavior
-        async def mock_flow():
-            # First yield is the initial request
-            yield mock_request
-            # Then we get back the response (simulated by httpx)
-            # The test will simulate what happens next
-        
-        # Test that _refresh_token is called when 401 is received
-        with patch.object(provider, '_refresh_token') as mock_refresh, \
-             patch.object(provider, '_handle_refresh_response') as mock_handle_refresh, \
-             patch.object(provider, '_add_auth_header'):
-            
-            mock_refresh_response = MagicMock()
-            mock_refresh.return_value = mock_refresh_response
-            mock_handle_refresh.return_value = True
-            
-            # Simulate the flow
-            response = MagicMock()
-            response.status_code = 401
-            
-            # The actual flow happens in the SDK, but we can test our override
-            # by manually calling the method and checking behavior
-            assert provider.context.current_tokens.refresh_token == "refresh-token-123"
+
+        # Drive the async_auth_flow generator directly
+        gen = provider.async_auth_flow(mock_request)
+
+        # First yield: the initial request
+        initial = await gen.asend(None)
+        assert initial is mock_request
+
+        # Simulate httpx returning a 401
+        response_401 = MagicMock()
+        response_401.status_code = 401
+
+        with patch.object(provider, "_refresh_token") as mock_refresh, \
+             patch.object(provider, "_handle_refresh_response") as mock_handle, \
+             patch.object(provider, "_add_auth_header") as mock_add_auth:
+
+            mock_refresh_request = MagicMock()
+            mock_refresh.return_value = mock_refresh_request
+            mock_handle.return_value = True
+
+            # Send 401 — should trigger refresh attempt
+            refresh_req = await gen.asend(response_401)
+            assert mock_refresh.await_count == 1
+            assert refresh_req is mock_refresh_request
+
+            # Simulate successful refresh response
+            refresh_response = MagicMock()
+            refresh_response.status_code = 200
+
+            # Send refresh response — should retry original request
+            retried = await gen.asend(refresh_response)
+            assert mock_add_auth.await_count == 1
+            assert retried is mock_request
+
+            # Simulate successful retry response
+            ok_response = MagicMock()
+            ok_response.status_code = 200
+            try:
+                await gen.asend(ok_response)
+            except StopAsyncIteration:
+                pass
 
     @pytest.mark.asyncio
     async def test_no_refresh_falls_through_to_browser_auth(self, tmp_path, monkeypatch):
@@ -1180,11 +1195,11 @@ class TestRefreshOn401:
         _set_interactive_stdin(monkeypatch)
         provider = build_oauth_auth("test-no-refresh", "https://example.com/mcp")
         assert provider is not None
-        
+
         # Set up tokens WITHOUT a refresh token
         mock_token = MagicMock()
         mock_token.access_token = "initial-access"
-        mock_token.refresh_token = None  # No refresh token
+        mock_token.refresh_token = None
         mock_token.expires_in = 3600
         mock_token.model_dump.return_value = {
             "access_token": "initial-access",
@@ -1192,29 +1207,40 @@ class TestRefreshOn401:
         }
         provider.context.current_tokens = mock_token
         provider.context.update_token_expiry(mock_token)
-        
-        # Verify no refresh token
-        assert provider.context.current_tokens.refresh_token is None
+
+        mock_request = MagicMock()
+        mock_request.headers = {}
+
+        gen = provider.async_auth_flow(mock_request)
+        initial = await gen.asend(None)
+        assert initial is mock_request
+
+        response_401 = MagicMock()
+        response_401.status_code = 401
+
+        # With no refresh token, should fall through to super().async_auth_flow
+        # which raises StopAsyncIteration (no browser in test env)
+        with pytest.raises(StopAsyncIteration):
+            await gen.asend(response_401)
 
     def test_token_expiry_safety_margin(self, tmp_path, monkeypatch):
-        """Tokens should be considered invalid 60 seconds before actual expiry."""
+        """Tokens expired within 60 seconds should be reported as already expired."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("safety-margin-test")
-        
+
         # Create a token that expires in 30 seconds
         mock_token = MagicMock()
         mock_token.model_dump.return_value = {
             "access_token": "token-abc",
             "token_type": "Bearer",
-            "expires_in": 30,  # expires in 30 seconds
+            "expires_in": 30,
         }
         asyncio.run(storage.set_tokens(mock_token))
-        
-        # Get the token back
+
         loaded = asyncio.run(storage.get_tokens())
-        
-        # With 60-second safety margin, a token that expires in 30 seconds
-        # should be reported as expired (expires_in should be 0)
+
+        # With 60-second safety margin, a token with 30s remaining
+        # should be clamped to 0 — i.e. reported as expired
         assert loaded is not None
-        # The expires_in should be clamped to 0 due to the 60-second margin
+        assert loaded.expires_in == 0
         # since 30 seconds < 60 seconds margin

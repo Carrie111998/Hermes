@@ -1383,7 +1383,7 @@ def _get_hermes_oauth_provider_class() -> type | None:
                 self.context.clear_tokens()
                 return False
 
-    
+
         async def async_auth_flow(self, request: Any) -> Any:
             """Override to try refresh_token before browser auth on 401.
 
