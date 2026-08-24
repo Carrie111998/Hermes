@@ -87,6 +87,8 @@ def test_how_to_run_uses_terminal_tool():
     assert "`terminal`" in how
     assert "gbr-agent pair" in how
     assert "gbr-agent run" in how
+    assert "hermes mcp add gbr --command node --args" in how
+    assert "hermes mcp add gbr --url" not in how
 
 
 def test_verification_is_one_gbr_agent_command():
@@ -117,10 +119,11 @@ def test_attach_only_loopback_or_stdio_and_spectator_role():
     assert "gbr-mcp" in text
     assert "spectator" in text.lower()
     assert "not orchestrator" in text.lower()
-    # Real CLI: hermes mcp add NAME --url|--command|--args (not Claude-style -- remainder).
-    assert "hermes mcp add gbr --url http://127.0.0.1:8788" in text
-    assert "hermes mcp add gbr --command node --args ./bin/gbr-mcp.js" in text
+    # Real CLI: hermes mcp add NAME --command/--args. :8788 is Bot API REST, not MCP HTTP.
+    assert "hermes mcp add gbr --command node --args mcp/gbr-mcp/bin/gbr-mcp.js" in text
+    assert "hermes mcp add gbr --url http://127.0.0.1:8788" not in text
     assert "hermes mcp add gbr -- " not in text
+    assert "Bot API REST" in text
 
 
 def test_description_index_one_liner():
