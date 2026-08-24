@@ -353,3 +353,79 @@ def test_playback_play_proceeds_when_active_device_exists(
     )
     assert response.get("success") is True
     assert started and started[0]["uris"] == ["spotify:track:abc"]
+
+
+# ── Queue add must infer the item type instead of forcing "track" ────────────
+# Spotify's POST /v1/me/player/queue accepts tracks *and* episodes, so a typed
+# episode URI must survive the handler while unqueueable types still error and
+# bare search-result IDs still default to a track.
+
+
+@pytest.mark.parametrize(
+    ("raw_uri", "expected_uri"),
+    [
+        ("spotify:track:7ouMYWpwJ422jRcDASZB7P", "spotify:track:7ouMYWpwJ422jRcDASZB7P"),
+        ("spotify:episode:512ojhOuo1ktJprKbVcKyQ", "spotify:episode:512ojhOuo1ktJprKbVcKyQ"),
+        (
+            "https://open.spotify.com/episode/512ojhOuo1ktJprKbVcKyQ?si=abc",
+            "spotify:episode:512ojhOuo1ktJprKbVcKyQ",
+        ),
+        ("7ouMYWpwJ422jRcDASZB7P", "spotify:track:7ouMYWpwJ422jRcDASZB7P"),
+    ],
+)
+def test_handle_spotify_queue_add_infers_type_per_input(
+    monkeypatch: pytest.MonkeyPatch, raw_uri: str, expected_uri: str
+) -> None:
+    seen_uris: list[str] = []
+
+    class _QueueStub:
+        def add_to_queue(self, *, uri, device_id=None):
+            seen_uris.append(uri)
+            return {"snapshot_id": "snap-1"}
+
+    monkeypatch.setattr(spotify_tool, "_spotify_client", lambda: _QueueStub())
+    response = json.loads(
+        spotify_tool._handle_spotify_queue(
+            {"action": "add", "uri": raw_uri, "device_id": "dev-1"}
+        )
+    )
+    assert response["success"] is True
+    assert response["uri"] == expected_uri
+    # A raw open.spotify.com URL is never handed to Spotify as-is (Bad URI).
+    assert seen_uris == [expected_uri]
+
+
+@pytest.mark.parametrize(
+    "raw_uri",
+    [
+        "spotify:album:0sNOF9WDwhWunNAHPD3Baj",
+        "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+    ],
+)
+def test_handle_spotify_queue_add_rejects_unqueueable_type(
+    monkeypatch: pytest.MonkeyPatch, raw_uri: str
+) -> None:
+    """Types Spotify cannot queue must fail before the API call."""
+    seen_uris: list[str] = []
+
+    class _QueueStub:
+        def add_to_queue(self, *, uri, device_id=None):
+            seen_uris.append(uri)
+            return {"snapshot_id": "snap-1"}
+
+    monkeypatch.setattr(spotify_tool, "_spotify_client", lambda: _QueueStub())
+    response = json.loads(
+        spotify_tool._handle_spotify_queue(
+            {"action": "add", "uri": raw_uri, "device_id": "dev-1"}
+        )
+    )
+    assert "error" in response
+    assert "only queue a track or an episode" in response["error"]
+    assert seen_uris == []
+
+
+def test_spotify_uri_type_reads_type_from_uri_and_url() -> None:
+    assert spotify_mod.spotify_uri_type("spotify:episode:abc") == "episode"
+    assert spotify_mod.spotify_uri_type("https://open.spotify.com/track/abc?si=x") == "track"
+    # A bare id carries no type information.
+    assert spotify_mod.spotify_uri_type("7ouMYWpwJ422jRcDASZB7P") is None

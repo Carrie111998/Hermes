@@ -13,6 +13,7 @@ from plugins.spotify.client import (
     normalize_spotify_id,
     normalize_spotify_uri,
     normalize_spotify_uris,
+    spotify_uri_type,
 )
 from tools.registry import tool_error, tool_result
 
@@ -73,6 +74,26 @@ def _coerce_spotify_uri(value: str, expected_type: Optional[str] = None) -> str:
     required by the queue handler for search-result IDs).
     """
     return normalize_spotify_uri(str(value or ""), expected_type)
+
+
+# Item types Spotify's queue endpoint accepts.
+_QUEUEABLE_TYPES = {"track", "episode"}
+
+
+def _coerce_queueable_spotify_uri(value: str) -> str:
+    """Normalize a queue target into ``spotify:track:<id>`` or ``spotify:episode:<id>``.
+
+    Spotify's ``POST /v1/me/player/queue`` accepts tracks *and* episodes, so the
+    type is inferred per input rather than forced to "track": typed URIs and
+    ``open.spotify.com/<type>/<id>`` urls keep their own type (and are still
+    canonicalized, never forwarded as a raw url), while a bare id — the
+    search-result case — defaults to a track. Types Spotify cannot queue are
+    rejected here instead of coming back as a "Bad URI" from the API.
+    """
+    item_type = spotify_uri_type(value) or "track"
+    if item_type.lower() not in _QUEUEABLE_TYPES:
+        raise SpotifyError(f"Spotify can only queue a track or an episode, got {item_type}.")
+    return _coerce_spotify_uri(value, item_type)
 
 
 def _describe_empty_playback(payload: Any, *, action: str) -> dict | None:
@@ -228,7 +249,7 @@ def _handle_spotify_queue(args: dict, **kw) -> str:
                     "No active Spotify playback device is available. Use `spotify_devices` to list devices, "
                     "then transfer playback before retrying."
                 )
-            uri = _coerce_spotify_uri(str(args.get("uri") or ""), expected_type="track")
+            uri = _coerce_queueable_spotify_uri(str(args.get("uri") or ""))
             result = client.add_to_queue(uri=uri, device_id=args.get("device_id"))
             return tool_result({"success": True, "action": action, "uri": uri, "result": result})
         return tool_error(f"Unknown spotify_queue action: {action}")
