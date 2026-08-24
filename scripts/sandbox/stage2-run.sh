@@ -48,9 +48,6 @@ fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
 node_env=()
-if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
-fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
   electron_env+=(
@@ -109,6 +106,29 @@ else
   # The git-upload-pack shim standing in for github.com is the only file that
   # must beat the host's copy; sh/ls/env are already there for real.
   shim_mounts+=(--bind "$DEV_SANDBOX_ROOT/root/usr/bin/ssh" /usr/bin/ssh)
+fi
+
+# npm_config_nodedir points node-gyp at a Node install's bundled headers
+# (include/node/common.gypi). NODE_DIR was resolved on the HOST, and most host
+# paths do not survive the mount plan above: /usr/local is always shadowed by
+# the sandbox's own near-empty copy, and anything outside the mounted runtime
+# prefixes (/nix, or /usr /bin /sbin /lib /lib64) does not exist inside at
+# all. A nodedir that is empty inside the sandbox breaks every node-gyp build
+# ("gyp: <nodedir>/common.gypi not found" while compiling node-pty), whereas
+# with no nodedir node-gyp fetches version-matched headers through the proxy
+# -- exactly what a real install does. So pass the nodedir through only when
+# the directory is visible inside the sandbox and really contains the headers.
+nodedir_visible=false
+case "${DEV_SANDBOX_NODE_DIR:-}" in
+  '') ;;
+  /usr/local|/usr/local/*) ;;
+  /nix|/nix/*) [ "$USE_HOST_RUNTIME" = false ] && nodedir_visible=true ;;
+  /usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*)
+    [ "$USE_HOST_RUNTIME" = true ] && nodedir_visible=true ;;
+esac
+if [ "$nodedir_visible" = true ] \
+  && [ -f "$DEV_SANDBOX_NODE_DIR/include/node/common.gypi" ]; then
+  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
 fi
 
 # /etc: start from a copy of the host's and overwrite only the files we fake.
