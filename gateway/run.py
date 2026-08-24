@@ -5531,6 +5531,7 @@ class TurnRunner:
             "base_url": turn_route["runtime"].get("base_url"),
         }
         _configured_default_route = turn_route.get("configured_default_route")
+        _effective_configured_default_route = _configured_default_route
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -5737,13 +5738,14 @@ class TurnRunner:
         # must reach the next turn (#60955).  Per-session turn
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
-            refreshed_chain = self._runner._refresh_fallback_model(
+            (
+                refreshed_chain,
+                _effective_configured_default_route,
+            ) = self._runner._refresh_fallback_state(
                 primary_route=_fallback_primary_route,
                 configured_default_route=_configured_default_route,
             )
-            agent._configured_default_route = getattr(
-                self._runner, "_configured_default_route", _configured_default_route
-            )
+            agent._configured_default_route = _effective_configured_default_route
             self._runner._apply_fallback_chain_to_agent(
                 agent,
                 refreshed_chain,
@@ -5771,6 +5773,13 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
+            (
+                refreshed_chain,
+                _effective_configured_default_route,
+            ) = self._runner._refresh_fallback_state(
+                primary_route=_fallback_primary_route,
+                configured_default_route=_configured_default_route,
+            )
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -5803,10 +5812,7 @@ class TurnRunner:
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(
-                    primary_route=_fallback_primary_route,
-                    configured_default_route=_configured_default_route,
-                ),
+                fallback_model=refreshed_chain,
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
@@ -5825,9 +5831,7 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
-        agent._configured_default_route = getattr(
-            self._runner, "_configured_default_route", _configured_default_route
-        )
+        agent._configured_default_route = _effective_configured_default_route
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -6917,7 +6921,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
-        self._configured_default_route = None
+        self._fallback_state_by_home = {
+            str(_gateway_config_home().resolve()): (self._fallback_model, None)
+        }
 
         # Wire process registry into session store for reset protection.
         # A background process older than the configured threshold (default 24h,
@@ -9904,13 +9910,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         return None
 
-    def _refresh_fallback_model(
+    def _refresh_fallback_state(
         self,
         *,
         primary_route: dict | None = None,
         configured_default_route: dict | None = None,
-    ) -> list | None:
-        """Re-read fallback_providers from disk for the next agent create/reuse.
+    ) -> tuple[list | None, dict | None]:
+        """Return the active profile's effective chain and retained default.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway
         previously froze ``self._fallback_model`` at process start, so a chain
@@ -9921,19 +9927,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         A TRANSIENT read/parse failure (user mid-edit of config.yaml with a
         non-atomic write) keeps the last known-good chain instead of wiping a
         cached agent's working fallback for that turn.  Only a successful read
-        that genuinely lacks the key clears the chain.
+        that genuinely lacks the key clears the chain. Last-known-good state is
+        keyed by the context-local profile home so multiplexed profiles cannot
+        consume each other's fallback policy after a transient parse failure.
         """
+        home = _gateway_config_home()
+        state_key = str(home.resolve())
+        states = getattr(self, "_fallback_state_by_home", None)
+        if states is None:
+            # Backward compatibility for lightweight test doubles and callers
+            # constructed before this state became profile-scoped.
+            states = {
+                state_key: (
+                    getattr(self, "_fallback_model", None),
+                    getattr(self, "_configured_default_route", None),
+                )
+            }
+            self._fallback_state_by_home = states
+        last_fallback, last_default = states.get(state_key, (None, None))
         try:
             from hermes_cli.config import read_user_config_raw
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = home / "config.yaml"
             if not cfg_path.exists():
-                self._fallback_model = None
-                self._configured_default_route = None
-                return compose_fallback_chain(
+                states[state_key] = (None, None)
+                chain = compose_fallback_chain(
                     None,
                     primary=primary_route,
                     configured_default=None,
                 ) or None
+                return chain, None
             # Raw primitive (raises on parse failure) is required here: the
             # canonical fail-open loader would return {} on a torn mid-edit
             # write and WIPE the last known-good chain. The overlay/expansion
@@ -9957,20 +9979,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "fallback_providers refresh: config.yaml read failed; "
                 "keeping last known-good chain", exc_info=True,
             )
-            return compose_fallback_chain(
-                self._fallback_model,
+            chain = compose_fallback_chain(
+                last_fallback,
                 primary=primary_route,
-                configured_default=getattr(
-                    self, "_configured_default_route", configured_default_route
-                ),
+                configured_default=last_default,
             ) or None
-        self._fallback_model = get_fallback_chain(cfg) or None
-        self._configured_default_route = configured_default_route
-        return compose_fallback_chain(
-            self._fallback_model,
+            return chain, last_default
+        fallback_model = get_fallback_chain(cfg) or None
+        states[state_key] = (fallback_model, configured_default_route)
+        # Preserve the legacy process-level snapshot for external/test
+        # introspection only. Runtime consumers use the turn-local tuple above.
+        self._fallback_model = fallback_model
+        chain = compose_fallback_chain(
+            fallback_model,
             primary=primary_route,
-            configured_default=self._configured_default_route,
+            configured_default=configured_default_route,
         ) or None
+        return chain, configured_default_route
+
+    def _refresh_fallback_model(
+        self,
+        *,
+        primary_route: dict | None = None,
+        configured_default_route: dict | None = None,
+    ) -> list | None:
+        """Re-read and compose the active profile's fallback provider chain."""
+        chain, _ = GatewayRunner._refresh_fallback_state(
+            self,
+            primary_route=primary_route,
+            configured_default_route=configured_default_route,
+        )
+        return chain
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
@@ -22820,7 +22859,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
-                fallback_model = self._refresh_fallback_model(
+                (
+                    fallback_model,
+                    effective_configured_default_route,
+                ) = self._refresh_fallback_state(
                     primary_route=_fallback_primary_route,
                     configured_default_route=_configured_default_route,
                 )
@@ -22855,7 +22897,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=fallback_model,
                 )
-                agent._configured_default_route = self._configured_default_route
+                agent._configured_default_route = effective_configured_default_route
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,

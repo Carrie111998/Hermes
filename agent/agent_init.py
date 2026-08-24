@@ -1550,11 +1550,11 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
-    agent._configured_default_route = {
-        "provider": getattr(agent, "requested_provider", None) or agent.provider,
-        "model": agent.model,
-        "base_url": agent.base_url,
-    }
+    # Generic agents do not have a separate configured-default route. Gateway
+    # and API session overrides assign this explicitly after resolving the
+    # global default; treating every agent's initial primary as that route
+    # would reinsert a provider an ordinary /model switch deliberately left.
+    agent._configured_default_route = None
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:
