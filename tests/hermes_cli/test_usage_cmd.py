@@ -71,6 +71,19 @@ def test_usage_command_json_single(monkeypatch, capsys):
     assert "xai-oauth" in payload
 
 
+def test_usage_command_empty_install_is_explicit(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hermes_cli.usage_cmd.collect_usage_report",
+        lambda provider: {"provider": provider, "status": "unavailable", "reason": "quota endpoint unavailable"},
+    )
+    code = usage_command(SimpleNamespace(provider="", json=False))
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "No official quota sources are signed in." in out
+    assert "unavailable" in out
+    assert "unsupported" in out
+
+
 def test_usage_command_unknown_exit_code(monkeypatch, capsys):
     monkeypatch.setattr(
         "hermes_cli.usage_cmd.collect_usage_report",
