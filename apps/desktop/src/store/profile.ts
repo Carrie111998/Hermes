@@ -189,6 +189,152 @@ export function setProfileColor(name: string, color: null | string): void {
   $profileColors.set(next)
 }
 
+// ── Rail groups ────────────────────────────────────────────────────────────
+// Optional user-defined grouping for the named-profile rail: profile name →
+// group name. The rail renders each group as its own labelled strip, so a
+// dozen profiles reads as a few named clusters instead of one undifferentiated
+// strip. Profiles without a group fall into a trailing "Other" strip. Like
+// colors, this is a local-only cosmetic preference — the backend is never
+// touched, so single-profile users never see it.
+const PROFILE_GROUPS_STORAGE_KEY = 'hermes.desktop.profileGroups'
+const PROFILE_GROUP_ORDER_STORAGE_KEY = 'hermes.desktop.profileGroupOrder'
+
+export const $profileGroups = atom<Record<string, string>>(storedStringRecord(PROFILE_GROUPS_STORAGE_KEY))
+
+$profileGroups.subscribe(value => persistStringRecord(PROFILE_GROUPS_STORAGE_KEY, value))
+
+// Group display order (first-seen order for groups absent from this list).
+export const $profileGroupOrder = atom<string[]>(storedStringArray(PROFILE_GROUP_ORDER_STORAGE_KEY))
+
+$profileGroupOrder.subscribe(value => persistStringArray(PROFILE_GROUP_ORDER_STORAGE_KEY, [...value]))
+
+export function setProfileGroupOrder(names: string[]): void {
+  if (!arraysEqual($profileGroupOrder.get(), names)) {
+    $profileGroupOrder.set(names)
+  }
+}
+
+// Set (or, with null, clear) a profile's group. A trimmed non-empty group name
+// assigns; anything else removes the profile from its group.
+export function setProfileGroup(name: string, group: null | string): void {
+  const key = normalizeProfileKey(name)
+  const next = { ...$profileGroups.get() }
+  const trimmed = group?.trim()
+
+  if (trimmed) {
+    next[key] = trimmed
+  } else {
+    delete next[key]
+  }
+
+  $profileGroups.set(next)
+}
+
+// Rename a group across every member, keeping its rail position. Renaming to
+// an existing group merges the two (members move, position of the target wins).
+export function renameProfileGroup(from: string, to: string): void {
+  const trimmed = to.trim()
+
+  if (!trimmed || trimmed === from) {
+    return
+  }
+
+  const groups = { ...$profileGroups.get() }
+  let changed = false
+
+  for (const [profile, group] of Object.entries(groups)) {
+    if (group === from) {
+      groups[profile] = trimmed
+      changed = true
+    }
+  }
+
+  if (changed) {
+    $profileGroups.set(groups)
+    // Renaming a group onto an existing one merges them — dedupe so the order
+    // list never carries the same group twice.
+    setProfileGroupOrder([...new Set($profileGroupOrder.get().map(name => (name === from ? trimmed : name)))])
+  }
+}
+
+export interface ProfileGroup<T> {
+  name: string
+  profiles: T[]
+}
+
+// ── Rail group colors ─────────────────────────────────────────────────────
+// Optional per-group color override (right-click a group pill to pick). The
+// pill renders tinted; member squares keep their own profile colors. Same
+// local-only cosmetic family as profile colors.
+const PROFILE_GROUP_COLORS_STORAGE_KEY = 'hermes.desktop.profileGroupColors'
+
+export const $profileGroupColors = atom<Record<string, string>>(storedStringRecord(PROFILE_GROUP_COLORS_STORAGE_KEY))
+
+$profileGroupColors.subscribe(value => persistStringRecord(PROFILE_GROUP_COLORS_STORAGE_KEY, value))
+
+// Set (or, with null, clear) a group's color override.
+export function setProfileGroupColor(group: string, color: null | string): void {
+  const next = { ...$profileGroupColors.get() }
+
+  if (color) {
+    next[group] = color
+  } else {
+    delete next[group]
+  }
+
+  $profileGroupColors.set(next)
+}
+
+// Sentinel group name for profiles with no group assignment; the rail renders
+// this strip without a label so ungrouped profiles just trail quietly.
+export const UNGROUPED_GROUP = '__ungrouped__'
+
+// Partition rail-ordered items into labelled groups. Group order: explicit
+// $profileGroupOrder first, then groups discovered in item order (fresh
+// groups from a rename/import), then the ungrouped tail last.
+export function groupProfiles<T extends { name: string }>(
+  items: T[],
+  groups: Record<string, string>,
+  order: string[]
+): ProfileGroup<T>[] {
+  const byGroup = new Map<string, T[]>()
+
+  for (const item of items) {
+    const group = groups[normalizeProfileKey(item.name)]
+    const key = group ?? UNGROUPED_GROUP
+    const list = byGroup.get(key) ?? []
+    list.push(item)
+    byGroup.set(key, list)
+  }
+
+  const seen = new Set<string>()
+  const named: ProfileGroup<T>[] = []
+
+  for (const name of order) {
+    const list = byGroup.get(name)
+
+    if (list && !seen.has(name)) {
+      named.push({ name, profiles: list })
+      seen.add(name)
+    }
+  }
+
+  for (const [key, list] of byGroup) {
+    if (key !== UNGROUPED_GROUP && !seen.has(key)) {
+      named.push({ name: key, profiles: list })
+      seen.add(key)
+    }
+  }
+
+  const ungrouped = byGroup.get(UNGROUPED_GROUP)
+
+  if (ungrouped) {
+    named.push({ name: UNGROUPED_GROUP, profiles: ungrouped })
+  }
+
+  return named
+}
+
 interface ActiveProfileResponse {
   active: string
   current: string

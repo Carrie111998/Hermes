@@ -15,7 +15,8 @@ import {
   horizontalListSortingStrategy,
   SortableContext,
   sortableKeyboardCoordinates,
-  useSortable
+  useSortable,
+  verticalListSortingStrategy
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
@@ -40,8 +41,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
+import { Field } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import type { DesktopRegistryConnection } from '@/global'
 import { getProfileSoul, updateProfileSoul } from '@/hermes'
@@ -69,18 +73,26 @@ import {
   $activeGatewayProfile,
   $profileColors,
   $profileCreateRequest,
+  $profileGroupColors,
+  $profileGroupOrder,
+  $profileGroups,
   $profileOrder,
   $profiles,
   $profileScope,
   ALL_PROFILES,
+  groupProfiles,
   normalizeProfileKey,
   profileLabel,
   refreshActiveProfile,
+  renameProfileGroup,
   selectProfile,
   setProfileColor,
+  setProfileGroup,
+  setProfileGroupColor,
   setProfileOrder,
   setShowAllProfiles,
-  sortByProfileOrder
+  sortByProfileOrder,
+  UNGROUPED_GROUP
 } from '@/store/profile'
 import {
   $profileRemoteOverrides,
@@ -158,10 +170,15 @@ export function ProfileRail() {
   const registry = useStore($connectionsRegistry)
   const activeConnectionId = useStore($activeConnectionId)
   const roster = useStore($fleetRoster)
+  const groups = useStore($profileGroups)
+  const groupOrder = useStore($profileGroupOrder)
+  const groupColors = useStore($profileGroupColors)
   const navigate = useNavigate()
   const [createOpen, setCreateOpen] = useState(false)
   const [pendingRename, setPendingRename] = useState<null | ProfileInfo>(null)
   const [pendingDelete, setPendingDelete] = useState<null | ProfileInfo>(null)
+  const [pendingGroup, setPendingGroup] = useState<null | ProfileInfo>(null)
+  const [pendingGroupRename, setPendingGroupRename] = useState<null | string>(null)
   const [pendingSoul, setPendingSoul] = useState<null | string>(null)
   // Fleet-side counterparts: the at-rest square being acted on. Its route is
   // the dialog's scope, so the edit executes on the owning gateway.
@@ -171,6 +188,9 @@ export function ProfileRail() {
   // Route key of the at-rest square whose switch is dialing (spinner on that
   // square, not in the statusbar — the previous source stays painted).
   const [pendingRoute, setPendingRoute] = useState<null | string>(null)
+  // Accordion: which group's squares are visible right now (null = all
+  // collapsed to pills). Pure window presentation — deliberately not persisted.
+  const [expandedGroup, setExpandedGroup] = useState<null | string>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useFleetRoster(multipleConnections)
@@ -273,6 +293,13 @@ export function ProfileRail() {
     order
   )
 
+  const grouped = groupProfiles(named, groups, groupOrder)
+
+  // Grouping is opt-in: with no group assignments, keep the classic flat square
+  // strip (drag-sort, long-press recolor, per-square menu). Once any profile is
+  // grouped, collapse to labelled pills that expand vertically.
+  const hasAnyGroups = grouped.some(group => group.name !== UNGROUPED_GROUP)
+
   const multiProfile = profiles.length > 1
 
   // distance constraint: a small drag reorders, a tap still selects the profile.
@@ -305,6 +332,9 @@ export function ProfileRail() {
       return
     }
 
+    // Accordion mode: only the expanded group's squares are droppable, so a
+    // drag is always within one group. Cross-group moves go through the
+    // right-click "Group…" dialog instead.
     const ids = named.map(profile => profile.name)
     const from = ids.indexOf(String(active.id))
     const to = ids.indexOf(String(over.id))
@@ -361,31 +391,64 @@ export function ProfileRail() {
           onDragStart={handleDragStart}
           sensors={sensors}
         >
-          <SortableContext items={named.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
-            {/* relative → the strip is the dragged square's offsetParent, so the
-              clamp modifier bounds drags to the occupied cells (not the +). */}
-            <div className="relative flex items-center gap-1">
-              {named.map(profile => (
-                <ProfileSquare
-                  active={!isAll && normalizeProfileKey(profile.name) === activeKey}
-                  color={resolveProfileColor(profile.name, colors)}
-                  key={profile.name}
-                  label={profileLabel(profile)}
-                  // The legacy per-profile remote override predates the
-                  // gateway registry; once the rail shows machines directly
-                  // it only confuses, so it is offered on single-gateway
-                  // setups only.
-                  onConnectRemote={multipleConnections ? undefined : () => openRemoteOverrideDialog(profile.name)}
-                  onDelete={() => setPendingDelete(profile)}
-                  onEditSoul={() => setPendingSoul(profile.name)}
-                  onRecolor={color => setProfileColor(profile.name, color)}
-                  onRename={() => setPendingRename(profile)}
-                  onSelect={() => selectProfile(profile.name)}
-                  remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
+          {hasAnyGroups ? (
+            grouped.map(group => {
+              const displayName = group.name === UNGROUPED_GROUP ? p.groupUngrouped : group.name
+              const groupActive = !isAll && group.profiles.some(profile => normalizeProfileKey(profile.name) === activeKey)
+
+              return (
+                <GroupPill
+                  active={groupActive}
+                  activeKey={activeKey}
+                  color={resolveProfileColor(group.name, groupColors)}
+                  colors={colors}
+                  count={group.profiles.length}
+                  key={group.name}
+                  label={displayName}
+                  onOpenChange={next => setExpandedGroup(next ? group.name : null)}
+                  onProfileConnectRemote={openRemoteOverrideDialog}
+                  onProfileDelete={setPendingDelete}
+                  onProfileEditSoul={profile => setPendingSoul(profile.name)}
+                  onProfileGroup={setPendingGroup}
+                  onProfileRecolor={(name, color) => setProfileColor(name, color)}
+                  onProfileRename={setPendingRename}
+                  onRecolor={color => setProfileGroupColor(group.name, color)}
+                  onRename={() => setPendingGroupRename(group.name)}
+                  onSelectProfile={selectProfile}
+                  open={expandedGroup === group.name}
+                  profileRemoteHost={name => remoteOverrides[normalizeProfileKey(name)]?.host ?? null}
+                  profiles={group.profiles}
                 />
-              ))}
-            </div>
-          </SortableContext>
+              )
+            })
+          ) : (
+            <SortableContext items={named.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
+              {/* relative → the strip is the dragged square's offsetParent, so the
+                  clamp modifier bounds drags to the occupied cells (not the +). */}
+              <div className="relative flex items-center gap-1">
+                {named.map(profile => (
+                  <ProfileSquare
+                    active={!isAll && normalizeProfileKey(profile.name) === activeKey}
+                    color={resolveProfileColor(profile.name, colors)}
+                    key={profile.name}
+                    label={profileLabel(profile)}
+                    // The legacy per-profile remote override predates the
+                    // gateway registry; once the rail shows machines directly
+                    // it only confuses, so it is offered on single-gateway
+                    // setups only.
+                    onConnectRemote={multipleConnections ? undefined : () => openRemoteOverrideDialog(profile.name)}
+                    onDelete={() => setPendingDelete(profile)}
+                    onEditSoul={() => setPendingSoul(profile.name)}
+                    onGroup={() => setPendingGroup(profile)}
+                    onRecolor={color => setProfileColor(profile.name, color)}
+                    onRename={() => setPendingRename(profile)}
+                    onSelect={() => selectProfile(profile.name)}
+                    remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          )}
         </DndContext>
       )}
     </>
@@ -451,6 +514,8 @@ export function ProfileRail() {
           <ProfileDropdown
             activeKey={isAll ? null : activeKey}
             colors={colors}
+            groupOrder={groupOrder}
+            groups={groups}
             onCreate={() => setCreateOpen(true)}
             onImport={() => void runImportProfileFlow()}
             onSelect={selectProfile}
@@ -561,6 +626,17 @@ export function ProfileRail() {
         onDeleted={refreshActiveProfile}
         open={pendingDelete !== null}
         profile={pendingDelete}
+      />
+
+      <GroupProfileDialog
+        onClose={() => setPendingGroup(null)}
+        open={pendingGroup !== null}
+        profile={pendingGroup}
+      />
+
+      <RenameGroupDialog
+        from={pendingGroupRename}
+        onClose={() => setPendingGroupRename(null)}
       />
 
       <EditSoulDialog onClose={() => setPendingSoul(null)} profileName={pendingSoul} />
@@ -727,6 +803,8 @@ function ProfileDropdown({
   colors,
   onCreate,
   onImport,
+  groups,
+  groupOrder,
   onSelect,
   onSelectRest,
   profiles,
@@ -736,6 +814,8 @@ function ProfileDropdown({
   colors: Record<string, string>
   onCreate: () => void
   onImport: () => void
+  groups: Record<string, string>
+  groupOrder: string[]
   onSelect: (name: string) => void
   onSelectRest: (agent: FleetAgent) => void
   profiles: ProfileInfo[]
@@ -788,13 +868,18 @@ function ProfileDropdown({
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuRadioGroup onValueChange={name => name && onSelect(name)} value={value}>
-          {profiles.map(profile => (
-            <ProfileDropdownItem
-              color={resolveProfileColor(profile.name, colors)}
-              key={profile.name}
-              label={profileLabel(profile)}
-              name={profile.name}
-            />
+          {groupProfiles(profiles, groups, groupOrder).map(group => (
+            <Fragment key={group.name}>
+              {group.name !== UNGROUPED_GROUP && <DropdownMenuLabel>{group.name}</DropdownMenuLabel>}
+              {group.profiles.map(profile => (
+                <ProfileDropdownItem
+                  color={resolveProfileColor(profile.name, colors)}
+                  key={profile.name}
+                  label={profileLabel(profile)}
+                  name={profile.name}
+                />
+              ))}
+            </Fragment>
           ))}
         </DropdownMenuRadioGroup>
         {restGroups.map(group => (
@@ -1140,6 +1225,7 @@ interface ProfileSquareProps {
   // Absent on multi-gateway setups: the legacy per-profile remote override
   // is superseded by the fleet rail there.
   onConnectRemote?: () => void
+  onGroup: () => void
   onDelete: () => void
   // hostname[:port] of this profile's remote override, or null when the
   // profile runs locally. Drives the "remote" badge on the square.
@@ -1164,6 +1250,7 @@ function ProfileSquare({
   onConnectRemote,
   onDelete,
   onEditSoul,
+  onGroup,
   onRecolor,
   onRename,
   onSelect,
@@ -1310,6 +1397,10 @@ function ProfileSquare({
             <Codicon name="symbol-color" size="0.875rem" />
             <span>{p.color}</span>
           </ContextMenuItem>
+          <ContextMenuItem onSelect={onGroup}>
+            <Codicon name="list-unordered" size="0.875rem" />
+            <span>{p.groupMenu}</span>
+          </ContextMenuItem>
           <ContextMenuItem onSelect={onRename}>
             <Codicon name="text-size" size="0.875rem" />
             <span>{p.renameMenu}</span>
@@ -1355,5 +1446,478 @@ function ProfileSquare({
         />
       </PopoverContent>
     </Popover>
+  )
+}
+
+interface GroupPillProps {
+  active: boolean
+  activeKey: string
+  color: null | string
+  colors: Record<string, string>
+  count: number
+  label: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onProfileConnectRemote: (name: string) => void
+  onProfileDelete: (profile: ProfileInfo) => void
+  onProfileEditSoul: (profile: ProfileInfo) => void
+  onProfileGroup: (profile: ProfileInfo) => void
+  onProfileRecolor: (name: string, color: null | string) => void
+  onProfileRename: (profile: ProfileInfo) => void
+  onRecolor: (color: null | string) => void
+  onRename: () => void
+  onSelectProfile: (name: string) => void
+  profileRemoteHost: (name: string) => null | string
+  profiles: ProfileInfo[]
+}
+
+// A group's collapsed state is a compact pill: name + member count. Clicking
+// opens a vertical popover (rail sits at the bottom, so it pops upward) listing
+// the group's profiles as draggable rows — one group open at a time, so a
+// dozen profiles read as a few pills plus at most one open panel. Right-click
+// renames the group or recolors the pill. The active profile's group stays
+// highlighted so "where am I" survives the collapse.
+function GroupPill({
+  active,
+  activeKey,
+  color,
+  colors,
+  count,
+  label,
+  onOpenChange,
+  onProfileConnectRemote,
+  onProfileDelete,
+  onProfileEditSoul,
+  onProfileGroup,
+  onProfileRecolor,
+  onProfileRename,
+  onRecolor,
+  onRename,
+  onSelectProfile,
+  open,
+  profileRemoteHost,
+  profiles
+}: GroupPillProps) {
+  const { t } = useI18n()
+  const p = t.profiles
+  const hue = color ?? 'var(--ui-text-quaternary)'
+  const [pickerOpen, setPickerOpen] = useState(false)
+
+  const pickColor = (next: null | string) => {
+    onRecolor(next)
+    setPickerOpen(false)
+    triggerHaptic('selection')
+  }
+
+  return (
+    <Popover
+      onOpenChange={next => {
+        if (!next) {
+          setPickerOpen(false)
+        }
+
+        onOpenChange(next)
+      }}
+      open={open}
+    >
+      <ContextMenu>
+        <TooltipProvider delayDuration={0}>
+          <Tooltip>
+            <PopoverAnchor asChild>
+              <ContextMenuTrigger asChild>
+                <TooltipTrigger asChild>
+                  <button
+                    aria-expanded={open}
+                    className={cn(
+                      'flex h-5 shrink-0 items-center gap-1 rounded-[3px] px-1.5 text-[0.5625rem] font-semibold tracking-wide transition',
+                      active || open
+                        ? 'bg-(--ui-control-active-background) text-foreground'
+                        : 'text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground'
+                    )}
+                    onClick={() => onOpenChange(!open)}
+                    style={{ color: color ?? undefined }}
+                    type="button"
+                  >
+                    <span
+                      className="size-2 rounded-[2px]"
+                      style={{ backgroundColor: profileColorSoft(hue, 70), boxShadow: color ? `0 0 0 1px ${color}` : undefined }}
+                    />
+                    <span className="max-w-14 truncate">{label}</span>
+                    {!open && <span className="opacity-60">{count}</span>}
+                    <Codicon name={open ? 'chevron-down' : 'chevron-right'} size="0.625rem" />
+                  </button>
+                </TooltipTrigger>
+              </ContextMenuTrigger>
+            </PopoverAnchor>
+            <TooltipContent>{label}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+
+        <ContextMenuContent
+          aria-label={p.actions}
+          className="w-44"
+          collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
+          onCloseAutoFocus={event => event.preventDefault()}
+        >
+          <ContextMenuItem
+            onSelect={() => {
+              setPickerOpen(true)
+              onOpenChange(true)
+            }}
+          >
+            <Codicon name="symbol-color" size="0.875rem" />
+            <span>{p.groupColor}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={onRename}>
+            <Codicon name="edit" size="0.875rem" />
+            <span>{p.groupRename}</span>
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+
+      <PopoverContent
+        aria-label={label}
+        className="w-56 p-1"
+        collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
+        side="top"
+      >
+        {pickerOpen ? (
+          <div className="p-2">
+            <ColorSwatches
+              clearIcon="sync"
+              clearLabel={p.autoColor}
+              onChange={pickColor}
+              swatches={PROFILE_SWATCHES}
+              swatchLabel={p.setColor}
+              value={color}
+            />
+          </div>
+        ) : (
+          <SortableContext items={profiles.map(profile => profile.name)} strategy={verticalListSortingStrategy}>
+            {profiles.map(profile => (
+              <ProfileRow
+                active={normalizeProfileKey(profile.name) === activeKey}
+                color={resolveProfileColor(profile.name, colors)}
+                key={profile.name}
+                label={profile.name}
+                onConnectRemote={() => onProfileConnectRemote(profile.name)}
+                onDelete={() => onProfileDelete(profile)}
+                onEditSoul={() => onProfileEditSoul(profile)}
+                onGroup={() => onProfileGroup(profile)}
+                onRecolor={color => onProfileRecolor(profile.name, color)}
+                onRename={() => onProfileRename(profile)}
+                onSelect={() => onSelectProfile(profile.name)}
+                remoteHost={profileRemoteHost(profile.name)}
+              />
+            ))}
+          </SortableContext>
+        )}
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// One row inside a group's open panel: color chip + name + active check. The
+// whole row is draggable (reorder within the group), click selects, right-click
+// opens the same profile menu as the rail squares. Hover pre-warms that
+// profile's backend so a click doesn't pay the full boot.
+function ProfileRow({
+  active,
+  color,
+  label,
+  onConnectRemote,
+  onDelete,
+  onEditSoul,
+  onGroup,
+  onRecolor,
+  onRename,
+  onSelect,
+  remoteHost
+}: ProfileSquareProps) {
+  const { t } = useI18n()
+  const p = t.profiles
+  const hue = color ?? 'var(--ui-text-quaternary)'
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(label)
+
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    id: label,
+    transition: RAIL_TRANSITION
+  })
+
+  const pickColor = (next: null | string) => {
+    onRecolor(next)
+    setPickerOpen(false)
+    triggerHaptic('selection')
+  }
+
+  return (
+    <Popover onOpenChange={setPickerOpen} open={pickerOpen}>
+      <ContextMenu>
+        <TooltipProvider delayDuration={0}>
+          <Tooltip>
+            <PopoverAnchor asChild>
+              <ContextMenuTrigger asChild>
+                <TooltipTrigger asChild>
+                  <button
+                    className={cn(
+                      'flex w-full cursor-grab touch-none items-center gap-1.5 rounded-sm px-2 py-1.5 text-xs select-none transition',
+                      isDragging && 'opacity-70',
+                      active
+                        ? 'bg-(--ui-control-active-background) text-foreground'
+                        : 'hover:bg-(--ui-control-hover-background)'
+                    )}
+                    ref={setNodeRef}
+                    style={{
+                      backgroundColor: active ? undefined : undefined,
+                      transform: CSS.Transform.toString(transform),
+                      transition
+                    }}
+                    type="button"
+                    {...attributes}
+                    {...listeners}
+                    onClick={onSelect}
+                    onPointerEnter={startPrewarm}
+                    onPointerLeave={cancelPrewarm}
+                  >
+                    <span
+                      className="grid size-4 shrink-0 place-items-center rounded-[3px] text-[0.5rem] font-semibold uppercase leading-none"
+                      style={{ backgroundColor: profileColorSoft(hue, 22), color: color ?? undefined }}
+                    >
+                      {label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
+                    </span>
+                    <span className="truncate">{label}</span>
+                    {active && <Codicon className="ml-auto shrink-0 opacity-70" name="check" size="0.75rem" />}
+                  </button>
+                </TooltipTrigger>
+              </ContextMenuTrigger>
+            </PopoverAnchor>
+            <TooltipContent>{label}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+
+        <ContextMenuContent
+          aria-label={p.actions}
+          className="w-40"
+          collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
+          onCloseAutoFocus={event => event.preventDefault()}
+        >
+          <ContextMenuItem onSelect={() => setPickerOpen(true)}>
+            <Codicon name="symbol-color" size="0.875rem" />
+            <span>{p.color}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={onGroup}>
+            <Codicon name="list-unordered" size="0.875rem" />
+            <span>{p.groupMenu}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={onRename}>
+            <Codicon name="text-size" size="0.875rem" />
+            <span>{p.renameMenu}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={onEditSoul}>
+            <Codicon name="edit" size="0.875rem" />
+            <span>{p.editSoul}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => void runExportProfileFlow(label)}>
+            <Codicon name="package" size="0.875rem" />
+            <span>{p.exportProfile}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={onConnectRemote}>
+            <Codicon name="globe" size="0.875rem" />
+            <span>{remoteHost ? p.remoteOverride.badge(remoteHost) : p.remoteOverride.menuItem}</span>
+          </ContextMenuItem>
+          <ContextMenuItem
+            className="text-destructive focus:text-destructive"
+            onSelect={onDelete}
+            variant="destructive"
+          >
+            <Codicon name="trash" size="0.875rem" />
+            <span>{t.common.delete}</span>
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+
+      <PopoverContent
+        aria-label={p.colorFor}
+        className="w-auto p-2"
+        collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
+        side="top"
+      >
+        <ColorSwatches
+          clearIcon="sync"
+          clearLabel={p.autoColor}
+          onChange={pickColor}
+          swatches={PROFILE_SWATCHES}
+          swatchLabel={p.setColor}
+          value={color}
+        />
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// Rename a group across all its members (right-click a group pill → rename).
+function RenameGroupDialog({ from, onClose }: { from: null | string; onClose: () => void }) {
+  const { t } = useI18n()
+  const p = t.profiles
+  const [name, setName] = useState('')
+  const open = from !== null
+
+  useEffect(() => {
+    if (open) {
+      setName(from)
+    }
+  }, [from, open])
+
+  const trimmed = name.trim()
+  const canSave = trimmed !== '' && trimmed !== from
+
+  const save = () => {
+    if (!from || !canSave) {
+      return
+    }
+
+    renameProfileGroup(from, trimmed)
+    notify({ kind: 'success', title: p.groupRenamed, message: trimmed })
+    onClose()
+  }
+
+  return (
+    <Dialog onOpenChange={next => !next && onClose()} open={open}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>{p.groupRenameTitle}</DialogTitle>
+        </DialogHeader>
+        <Field label={p.groupNewLabel}>
+          <Input
+            autoFocus
+            onChange={event => setName(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && canSave) {
+                save()
+              }
+            }}
+            value={name}
+          />
+        </Field>
+        <DialogFooter>
+          <Button disabled={!canSave} onClick={onClose} type="button" variant="ghost">
+            {t.common.cancel}
+          </Button>
+          <Button disabled={!canSave} onClick={() => void save()}>
+            {t.common.save}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+const NEW_GROUP_VALUE = '__new_group__'
+
+// Assign a profile to a group (or pull it out). Existing groups come from the
+// live mapping; picking "New group…" reveals a name field. Group assignment is
+// local-only — the same store family as colors/order, never the backend.
+function GroupProfileDialog({
+  onClose,
+  open,
+  profile
+}: {
+  onClose: () => void
+  open: boolean
+  profile: null | ProfileInfo
+}) {
+  const { t } = useI18n()
+  const p = t.profiles
+  const groups = useStore($profileGroups)
+  const groupOrder = useStore($profileGroupOrder)
+  const [selected, setSelected] = useState('')
+  const [newName, setNewName] = useState('')
+
+  const current = profile ? groups[normalizeProfileKey(profile.name)] ?? '' : ''
+
+  // Existing group names, ordered by $profileGroupOrder then alphabetically.
+  const existingGroups = useMemo(() => {
+    const unique = [...new Set(Object.values(groups).filter((group): group is string => Boolean(group)))]
+    const rank = new Map(groupOrder.map((name, index) => [name, index]))
+    const max = Number.MAX_SAFE_INTEGER
+
+    return unique.sort(
+      (a, b) => (rank.get(a) ?? max) - (rank.get(b) ?? max) || a.localeCompare(b)
+    )
+  }, [groupOrder, groups])
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+
+    setSelected(current)
+    setNewName('')
+  }, [current, open])
+
+  const creating = selected === NEW_GROUP_VALUE
+  const trimmedNew = newName.trim()
+  const canSave = !creating || trimmedNew !== ''
+
+  const save = () => {
+    if (!profile || !canSave) {
+      return
+    }
+
+    setProfileGroup(profile.name, creating ? trimmedNew : selected || null)
+    notify({ kind: 'success', title: p.groupSaved, message: profile.name })
+    onClose()
+  }
+
+  return (
+    <Dialog onOpenChange={openChange => !openChange && onClose()} open={open}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>{profile ? `${profile.name} · ${p.groupTitle}` : p.groupTitle}</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <Field label={p.groupLabel}>
+            <Select onValueChange={setSelected} value={selected}>
+              <SelectTrigger aria-label={p.groupLabel} size="sm">
+                <SelectValue placeholder={p.groupSelect} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="">{p.groupRemove}</SelectItem>
+                {existingGroups.map(group => (
+                  <SelectItem key={group} value={group}>
+                    {group}
+                  </SelectItem>
+                ))}
+                <SelectItem value={NEW_GROUP_VALUE}>{p.groupNew}</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          {creating && (
+            <Field label={p.groupNewLabel}>
+              <Input
+                autoFocus
+                onChange={event => setNewName(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter' && canSave) {
+                    save()
+                  }
+                }}
+                placeholder={p.groupNewPlaceholder}
+                value={newName}
+              />
+            </Field>
+          )}
+        </div>
+        <DialogFooter>
+          <Button disabled={!canSave} onClick={onClose} type="button" variant="ghost">
+            {t.common.cancel}
+          </Button>
+          <Button disabled={!canSave} onClick={() => void save()}>
+            {t.common.save}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

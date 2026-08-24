@@ -1578,7 +1578,21 @@ export const zhHant = defineLocale({
     failedLoadSoul: '載入 SOUL.md 失敗',
     failedSaveSoul: '儲存 SOUL.md 失敗',
     failedCreate: '建立設定檔失敗',
-    failedRename: '重新命名設定檔失敗'
+    failedRename: '重新命名設定檔失敗',
+    groupMenu: '分組…',
+    groupTitle: '編輯分組',
+    groupLabel: '分組',
+    groupSelect: '選擇分組…',
+    groupRemove: '無分組',
+    groupNew: '新增分組…',
+    groupNewLabel: '分組名稱',
+    groupNewPlaceholder: '例如：團隊A',
+    groupSaved: '分組已更新',
+    groupUngrouped: '其他',
+    groupColor: '分組顏色…',
+    groupRename: '重新命名分組…',
+    groupRenameTitle: '重新命名分組',
+    groupRenamed: '分組已重新命名'
   },
 
   cron: {

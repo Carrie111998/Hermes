@@ -2137,7 +2137,21 @@ export const zh: Translations = {
     failedLoadSoul: '加载 SOUL.md 失败',
     failedSaveSoul: '保存 SOUL.md 失败',
     failedCreate: '创建配置档案失败',
-    failedRename: '重命名配置档案失败'
+    failedRename: '重命名配置档案失败',
+    groupMenu: '分组…',
+    groupTitle: '编辑分组',
+    groupLabel: '分组',
+    groupSelect: '选择分组…',
+    groupRemove: '无分组',
+    groupNew: '新建分组…',
+    groupNewLabel: '分组名称',
+    groupNewPlaceholder: '例如：团队A',
+    groupSaved: '分组已更新',
+    groupUngrouped: '其他',
+    groupColor: '分组颜色…',
+    groupRename: '重命名分组…',
+    groupRenameTitle: '重命名分组',
+    groupRenamed: '分组已重命名'
   },
 
   cron: {

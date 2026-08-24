@@ -1669,6 +1669,20 @@ export interface Translations {
     failedSaveSoul: string
     failedCreate: string
     failedRename: string
+    groupMenu: string
+    groupTitle: string
+    groupLabel: string
+    groupSelect: string
+    groupRemove: string
+    groupNew: string
+    groupNewLabel: string
+    groupNewPlaceholder: string
+    groupSaved: string
+    groupUngrouped: string
+    groupColor: string
+    groupRename: string
+    groupRenameTitle: string
+    groupRenamed: string
   }
 
   cron: {

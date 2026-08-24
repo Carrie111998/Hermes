@@ -1955,7 +1955,21 @@ export const en: Translations = {
     failedLoadSoul: 'Failed to load SOUL.md',
     failedSaveSoul: 'Failed to save SOUL.md',
     failedCreate: 'Failed to create profile',
-    failedRename: 'Failed to rename profile'
+    failedRename: 'Failed to rename profile',
+    groupMenu: 'Group…',
+    groupTitle: 'Edit group',
+    groupLabel: 'Group',
+    groupSelect: 'Select a group…',
+    groupRemove: 'No group',
+    groupNew: 'New group…',
+    groupNewLabel: 'Group name',
+    groupNewPlaceholder: 'e.g. Team A',
+    groupSaved: 'Group updated',
+    groupUngrouped: 'Other',
+    groupColor: 'Group color…',
+    groupRename: 'Rename group…',
+    groupRenameTitle: 'Rename group',
+    groupRenamed: 'Group renamed'
   },
 
   cron: {

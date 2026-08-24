@@ -46,16 +46,22 @@ vi.mock('@/store/profile', () => ({
   $activeGatewayProfile: atom('default'),
   $profileColors: atom({}),
   $profileCreateRequest: atom(0),
+  $profileGroupColors: atom({}),
+  $profileGroups: atom({}),
+  $profileGroupOrder: atom([]),
   $profileOrder: atom([]),
   $profiles: atom([{ is_default: true, name: 'default' }]),
   $profileScope: atom('default'),
   ALL_PROFILES: '*',
+  UNGROUPED_GROUP: '__ungrouped__',
+  groupProfiles: (items: unknown[]) => [{ name: '__ungrouped__', profiles: items }],
   normalizeProfileKey: (name: string) => name,
   profileLabel: (profile: { display_name?: string; name: string }) =>
     (profile.display_name ?? '').trim() || profile.name,
   refreshActiveProfile: vi.fn().mockResolvedValue(undefined),
   selectProfile: vi.fn(),
   setProfileColor: vi.fn(),
+  setProfileGroupColor: vi.fn(),
   setProfileOrder: vi.fn(),
   setShowAllProfiles: vi.fn(),
   sortByProfileOrder: (profiles: unknown[]) => profiles
@@ -66,6 +72,16 @@ vi.mock('@/store/connections', () => ({
   $connectionsRegistry: atom(null),
   $hasMultipleConnections: atom(false),
   selectConnection: vi.fn()
+}))
+
+vi.mock('@/store/profile-remote-override', () => ({
+  $profileRemoteOverrides: atom({}),
+  $remoteOverrideDialogProfile: atom(null),
+  closeRemoteOverrideDialog: vi.fn(),
+  notifyRemoteOverrideAuthFailure: vi.fn(),
+  openRemoteOverrideDialog: vi.fn(),
+  refreshProfileRemoteOverrides: vi.fn(),
+  remoteHostLabel: (url: string) => url
 }))
 
 vi.mock('@/store/profile-share', () => ({

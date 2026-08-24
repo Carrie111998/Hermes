@@ -22,11 +22,20 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
 const {
   $activeGatewayProfile,
+  $profileGroupColors,
+  $profileGroups,
+  $profileGroupOrder,
   $profiles,
   ensureGatewayProfile,
+  groupProfiles,
   invalidateProfileListFetches,
   prewarmProfileBackend,
-  refreshProfiles
+  refreshProfiles,
+  renameProfileGroup,
+  setProfileGroup,
+  setProfileGroupColor,
+  setProfileGroupOrder,
+  UNGROUPED_GROUP
 } = await import('./profile')
 
 const { $connection } = await import('./session')
@@ -289,5 +298,104 @@ describe('stale profile-list fetches across a backend switch (#85731)', () => {
     await oldFetch
 
     expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'coder'])
+  })
+})
+
+describe('groupProfiles (rail grouping)', () => {
+  beforeEach(() => {
+    $profileGroups.set({})
+    $profileGroupOrder.set([])
+  })
+
+  const items = ['alpha', 'beta', 'gamma', 'delta', 'epsilon'].map(name => profile(name))
+
+  it('partitions profiles by their group assignment', () => {
+    $profileGroups.set({ alpha: 'Team A', 'beta': 'Team A', 'gamma': 'Team B', 'delta': 'Team B' })
+
+    const grouped = groupProfiles(items, $profileGroups.get(), [])
+
+    expect(grouped).toEqual([
+      { name: 'Team A', profiles: [profile('alpha'), profile('beta')] },
+      { name: 'Team B', profiles: [profile('gamma'), profile('delta')] },
+      { name: UNGROUPED_GROUP, profiles: [profile('epsilon')] }
+    ])
+  })
+
+  it('orders groups by $profileGroupOrder, then first appearance, with ungrouped last', () => {
+    $profileGroups.set({ alpha: 'A', 'beta': 'B', 'gamma': 'C' })
+    setProfileGroupOrder(['C', 'A'])
+
+    const grouped = groupProfiles(items, $profileGroups.get(), $profileGroupOrder.get())
+
+    expect(grouped.map(group => group.name)).toEqual(['C', 'A', 'B', UNGROUPED_GROUP])
+  })
+
+  it('keeps per-group profile order stable for unknown groups (first-seen)', () => {
+    $profileGroups.set({ 'gamma': 'Team B', 'delta': 'Team B', alpha: 'X' })
+
+    const grouped = groupProfiles(items, $profileGroups.get(), [])
+
+    expect(grouped.find(group => group.name === 'Team B')?.profiles.map(item => item.name)).toEqual(['gamma', 'delta'])
+  })
+
+  it('renders the ungrouped tail only when ungrouped profiles exist', () => {
+    $profileGroups.set({ alpha: 'X' })
+
+    const grouped = groupProfiles([profile('alpha'), profile('beta')], $profileGroups.get(), [])
+
+    expect(grouped).toEqual([
+      { name: 'X', profiles: [profile('alpha')] },
+      { name: UNGROUPED_GROUP, profiles: [profile('beta')] }
+    ])
+
+    const allGrouped = groupProfiles([profile('alpha')], $profileGroups.get(), [])
+    expect(allGrouped).toEqual([{ name: 'X', profiles: [profile('alpha')] }])
+  })
+
+  it('setProfileGroup assigns and clears a profile group', () => {
+    setProfileGroup('alpha', 'Work')
+
+    expect($profileGroups.get()).toEqual({ alpha: 'Work' })
+
+    setProfileGroup('alpha', null)
+
+    expect($profileGroups.get()).toEqual({})
+  })
+
+  it('setProfileGroup trims whitespace-only assignments into a clear', () => {
+    setProfileGroup('alpha', '  ')
+
+    expect($profileGroups.get()).toEqual({})
+  })
+
+  it('renameProfileGroup renames across every member and keeps rail position', () => {
+    $profileGroups.set({ alpha: 'A', 'beta': 'A', 'gamma': 'B' })
+    setProfileGroupOrder(['A', 'B'])
+
+    renameProfileGroup('A', 'Team A')
+
+    expect($profileGroups.get()).toEqual({ alpha: 'Team A', 'beta': 'Team A', 'gamma': 'B' })
+    expect($profileGroupOrder.get()).toEqual(['Team A', 'B'])
+  })
+
+  it('renameProfileGroup merges into an existing target group', () => {
+    $profileGroups.set({ alpha: 'A', 'beta': 'B', 'gamma': 'B' })
+    setProfileGroupOrder(['A', 'B'])
+
+    renameProfileGroup('A', 'B')
+
+    expect($profileGroups.get()).toEqual({ alpha: 'B', 'beta': 'B', 'gamma': 'B' })
+    // The target's position wins; the renamed-away slot is dropped.
+    expect($profileGroupOrder.get()).toEqual(['B'])
+  })
+
+  it('setProfileGroupColor assigns and clears a group color', () => {
+    setProfileGroupColor('Team A', '#ff8800')
+
+    expect($profileGroupColors.get()).toEqual({ 'Team A': '#ff8800' })
+
+    setProfileGroupColor('Team A', null)
+
+    expect($profileGroupColors.get()).toEqual({})
   })
 })
