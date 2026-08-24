@@ -24,12 +24,15 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use fs2::FileExt;
 use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
 
@@ -98,6 +101,118 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve the private Git metadata directory used for the installation lock.
+/// This is deliberately outside the worktree: `git stash --include-untracked`
+/// never traverses Git metadata, so it cannot remove a held lock.
+fn install_lock_path(install_root: &Path) -> PathBuf {
+    let dot_git = install_root.join(".git");
+    let metadata = if dot_git.is_dir() {
+        dot_git
+    } else {
+        std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|raw| raw.lines().next().map(str::trim).map(str::to_owned))
+            .and_then(|line| {
+                line.strip_prefix("gitdir:")
+                    .or_else(|| line.strip_prefix("GITDIR:"))
+                    .map(str::trim)
+                    .map(PathBuf::from)
+            })
+            .map(|candidate| {
+                if candidate.is_absolute() {
+                    candidate
+                } else {
+                    install_root.join(candidate)
+                }
+            })
+            .and_then(|candidate| candidate.canonicalize().ok().or(Some(candidate)))
+            .unwrap_or(dot_git)
+    };
+    metadata.join("hermes-update.lock")
+}
+
+struct InstallLockGuard {
+    path: PathBuf,
+    file: File,
+    token: String,
+    started_at: u64,
+    released: bool,
+}
+
+impl InstallLockGuard {
+    fn acquire(install_root: &Path) -> std::io::Result<Self> {
+        let path = install_lock_path(install_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        if let Err(err) = file.try_lock_exclusive() {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Some(pid) = raw.lines().next().and_then(|line| line.parse::<u32>().ok()) {
+                    tracing::info!(%pid, path = ?path, "installation update lock is held");
+                }
+            }
+            return Err(err);
+        }
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let token = uuid::Uuid::new_v4().to_string();
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writeln!(
+            file,
+            "{}\n{}\n{}\nactive",
+            std::process::id(),
+            started_at,
+            token
+        )?;
+        file.flush()?;
+        Ok(Self {
+            path,
+            file,
+            token,
+            started_at,
+            released: false,
+        })
+    }
+
+    fn complete(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Err(err) = (|| -> std::io::Result<()> {
+            self.file.set_len(0)?;
+            self.file.seek(SeekFrom::Start(0))?;
+            writeln!(
+                self.file,
+                "{}\n{}\n{}\nreleased",
+                std::process::id(),
+                self.started_at,
+                self.token
+            )?;
+            self.file.flush()
+        })() {
+            tracing::debug!(path = ?self.path, %err, "could not mark installation lock released");
+        }
+        if let Err(err) = FileExt::unlock(&self.file) {
+            tracing::debug!(path = ?self.path, %err, "installation lock was already released");
+        }
+    }
+}
+
+impl Drop for InstallLockGuard {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
 /// RAII guard that owns the "update in progress" marker (see
 /// `paths::update_in_progress_marker`). Created at the top of `run_update`;
 /// its `Drop` removes the marker on EVERY exit path — success, early
@@ -107,12 +222,8 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// so the desktop's launch gate can detect a stale marker (dead PID / past a
 /// hard ceiling) and self-heal rather than wait forever.
 ///
-/// The marker is also the cross-process update lock: `hermes update` claims
-/// the same file (see `hermes_cli/update_lock.py`) so a dashboard-spawned
-/// update and this updater can't mutate one checkout at the same time.
-/// `acquire` therefore REFUSES when a live foreign owner holds it rather than
-/// overwriting — the pre-fix clobber is what let a dashboard `hermes update`
-/// keep running while install-mode bootstrap rewrote the tree underneath it.
+/// This marker is a backend-start compatibility gate. The authoritative
+/// cross-process single-flight lock is the OS-locked installation file above.
 struct UpdateMarkerGuard {
     path: PathBuf,
     /// False when a live foreign updater already owns the marker: we hold no
@@ -253,6 +364,35 @@ async fn run_update(app: AppHandle) -> Result<()> {
     let hermes_home = crate::paths::hermes_home();
     let install_root = hermes_home.join("hermes-agent");
 
+    // Atomic installation-scoped single flight. The compatibility marker below
+    // remains under HERMES_HOME for Electron startup gating. The advisory file
+    // lock is the sole installation-wide winner decision shared with Python.
+    let mut _install_lock = match InstallLockGuard::acquire(&install_root) {
+        Ok(guard) => guard,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            let msg = "Another Hermes update is already running for this installation. Wait for it to finish, then try again.";
+            emit(
+                &app,
+                BootstrapEvent::Failed {
+                    stage: Some("update".to_string()),
+                    error: msg.to_string(),
+                },
+            );
+            return Err(anyhow!(msg));
+        }
+        Err(err) => {
+            let msg = format!("Could not acquire the installation update lock: {err}");
+            emit(
+                &app,
+                BootstrapEvent::Failed {
+                    stage: Some("update".to_string()),
+                    error: msg.clone(),
+                },
+            );
+            return Err(anyhow!(msg));
+        }
+    };
+
     // Mutual exclusion (#50238): publish an "update in progress" marker for the
     // entire duration of this update. A desktop instance the user relaunches
     // mid-update consults this before spawning its own local backend — without
@@ -260,10 +400,9 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // straggler-cleanup kills it, and the relaunch/kill cycle loops. The guard
     // removes the marker on every exit path (incl. early returns / panics).
     //
-    // The same marker is the cross-process update lock (hermes_cli/
-    // update_lock.py claims it too), so a live foreign owner means another
-    // updater — most often a dashboard-spawned `hermes update` — is already
-    // mutating this checkout. Refuse instead of running a second one over it.
+    // The OS advisory lock above is authoritative for install mutation. This
+    // compatibility marker independently gates backend startup and preserves
+    // handoff behavior for older desktop/updater combinations.
     let _update_marker = match UpdateMarkerGuard::acquire(
         crate::paths::update_in_progress_marker(),
     ) {
@@ -598,6 +737,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // make a completed update look active — blocking desktop startup and
     // every other updater until the age ceiling expires.
     _update_marker.complete();
+    _install_lock.complete();
 
     if let Some(target_app) = launch_target {
         if let Err(err) = launch_macos_app_and_exit(&app, &target_app).await {
@@ -1302,6 +1442,121 @@ mod tests {
     }
 
     #[test]
+    fn install_lock_path_uses_git_metadata_contract() {
+        let dir = unique_tmp_dir("install-lock-path");
+        let root = dir.join("hermes-agent");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        assert_eq!(
+            install_lock_path(&root),
+            root.join(".git").join("hermes-update.lock")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_lock_path_resolves_gitfile_metadata() {
+        let dir = unique_tmp_dir("install-lock-gitfile");
+        let root = dir.join("worktree");
+        let metadata = dir.join("repo.git").join("worktrees").join("worktree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            "gitdir: ../repo.git/worktrees/worktree\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            install_lock_path(&root),
+            metadata.join("hermes-update.lock")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_lock_is_a_persistent_advisory_file() {
+        let dir = unique_tmp_dir("persistent-install-lock");
+        let root = dir.join("hermes-agent");
+        let lock = install_lock_path(&root);
+
+        {
+            let guard = InstallLockGuard::acquire(&root).expect("first advisory lock wins");
+            assert!(lock.is_file(), "canonical lock path must be a regular file");
+            let body = std::fs::read_to_string(&lock).unwrap();
+            let lines: Vec<_> = body.lines().collect();
+            assert_eq!(lines[0].parse::<u32>().unwrap(), std::process::id());
+            assert!(lines[1].parse::<u64>().is_ok());
+            assert!(!lines[2].is_empty(), "metadata includes a unique owner token");
+            assert_eq!(lines[3], "active");
+            drop(guard);
+        }
+
+        assert!(lock.is_file(), "normal release never unlinks the canonical file");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().lines().nth(3),
+            Some("released")
+        );
+        let guard = InstallLockGuard::acquire(&root).expect("released OS lock is reacquirable");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_install_guard_cannot_lock_the_same_file() {
+        let dir = unique_tmp_dir("contended-install-lock");
+        let root = dir.join("hermes-agent");
+        let first = InstallLockGuard::acquire(&root).expect("first advisory lock wins");
+
+        let err = match InstallLockGuard::acquire(&root) {
+            Ok(_) => panic!("second guard must lose while first file handle is locked"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        drop(first);
+        assert!(install_lock_path(&root).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_complete_then_old_drop_cannot_affect_fresh_guard() {
+        let dir = unique_tmp_dir("manual-complete-install-lock");
+        let root = dir.join("hermes-agent");
+        let mut old = InstallLockGuard::acquire(&root).expect("old guard acquires");
+        old.complete();
+        assert_eq!(
+            std::fs::read_to_string(install_lock_path(&root))
+                .unwrap()
+                .lines()
+                .nth(3),
+            Some("released")
+        );
+
+        let fresh = InstallLockGuard::acquire(&root).expect("fresh guard acquires");
+        old.complete();
+        drop(old);
+        let err = match InstallLockGuard::acquire(&root) {
+            Ok(_) => panic!("old drop must not unlock the fresh guard"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        drop(fresh);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_lock_conflict_event_keeps_frontend_schema() {
+        let event = BootstrapEvent::Failed {
+            stage: Some("update".to_string()),
+            error: "Another Hermes update is already running".to_string(),
+        };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["type"], "failed");
+        assert_eq!(json["stage"], "update");
+        assert!(json["error"].as_str().unwrap().contains("already running"));
+    }
+
+    #[test]
     fn update_marker_guard_drop_is_quiet_when_already_gone() {
         let dir = unique_tmp_dir("marker-guard-gone");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1368,7 +1623,10 @@ mod tests {
         assert_eq!(owner.pid, foreign_pid);
 
         // The refused guard must not delete the live owner's marker.
-        assert!(marker.exists(), "refused acquire must leave the marker intact");
+        assert!(
+            marker.exists(),
+            "refused acquire must leave the marker intact"
+        );
         let _ = foreign.kill();
         let _ = foreign.wait();
         let _ = std::fs::remove_dir_all(&dir);

@@ -20,6 +20,8 @@ import path from 'path'
 import { test } from 'vitest'
 
 import {
+  INSTALL_LOCK_OWNER_WRITE_GRACE_MS,
+  installLockPath,
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
@@ -46,6 +48,102 @@ const DEAD: typeof process.kill = () => {
   ;(err as any).code = 'ESRCH'
   throw err
 }
+
+test('installation lock path is the git metadata contract shared with Python and Rust', () => {
+  const home = tmpHome('install-lock-path')
+  const installRoot = path.join(home, 'hermes-agent')
+  fs.mkdirSync(path.join(installRoot, '.git'), { recursive: true })
+
+  assert.equal(installLockPath(installRoot), path.join(installRoot, '.git', 'hermes-update.lock'))
+})
+
+test('installation lock path resolves a gitfile metadata directory', () => {
+  const home = tmpHome('install-lock-gitfile')
+  const installRoot = path.join(home, 'worktree')
+  const metadata = path.join(home, 'repo.git', 'worktrees', 'worktree')
+  fs.mkdirSync(installRoot)
+  fs.mkdirSync(metadata, { recursive: true })
+  fs.writeFileSync(path.join(installRoot, '.git'), 'gitdir: ../repo.git/worktrees/worktree\n')
+
+  assert.equal(installLockPath(installRoot), path.join(metadata, 'hermes-update.lock'))
+})
+
+test('legacy handoff marker remains under HERMES_HOME', () => {
+  const home = tmpHome('legacy-marker-path')
+  assert.equal(markerPath(home), path.join(home, '.hermes-update-in-progress'))
+})
+
+test('dead installation lock owner does not conflict and file is never deleted', () => {
+  const home = tmpHome('dead-install-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `999999\n${Math.floor(Date.now() / 1000)}\ndead-token\n`)
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: DEAD }), null)
+  assert.ok(fs.existsSync(lock), 'Electron never removes the canonical lock file')
+})
+
+test('fresh empty installation lock preserves the owner-write grace window', () => {
+  const home = tmpHome('fresh-ownerless-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, '')
+
+  assert.ok(updateHandoffConflict(home, { installRoot }))
+  assert.ok(fs.existsSync(lock))
+})
+
+test('stale malformed installation metadata does not conflict and is not deleted', () => {
+  const home = tmpHome('stale-ownerless-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, 'not-a-pid\n123\ntoken\n')
+  const old = new Date(Date.now() - INSTALL_LOCK_OWNER_WRITE_GRACE_MS - 1_000)
+  fs.utimesSync(lock, old, old)
+
+  assert.equal(updateHandoffConflict(home, { installRoot }), null)
+  assert.ok(fs.existsSync(lock))
+})
+
+test('PID parsing rejects a numeric prefix instead of accepting parseInt garbage', () => {
+  const home = tmpHome('strict-lock-pid')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `4242junk\n${Math.floor(Date.now() / 1000)}\ntoken\n`)
+  const old = new Date(Date.now() - INSTALL_LOCK_OWNER_WRITE_GRACE_MS - 1_000)
+  fs.utimesSync(lock, old, old)
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: ALIVE }), null)
+  assert.ok(fs.existsSync(lock))
+})
+
+test('released installation metadata never blocks while the old pid remains alive', () => {
+  const home = tmpHome('released-live-pid')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `${process.pid}\n${Math.floor(Date.now() / 1000)}\ntoken\nreleased\n`)
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: ALIVE }), null)
+})
+
+test('expired active metadata does not block after pid reuse', () => {
+  const home = tmpHome('expired-live-pid')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  const now = Date.now()
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(
+    lock,
+    `${process.pid}\n${Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 1_000) / 1000)}\ntoken\nactive\n`
+  )
+
+  assert.equal(updateHandoffConflict(home, { installRoot, kill: ALIVE, now: () => now }), null)
+})
 
 test('absent marker => no live update', () => {
   const home = tmpHome('absent')
@@ -82,6 +180,13 @@ test('expired marker (past age ceiling) => no live update and pruned', () => {
 test('malformed marker => no live update and pruned', () => {
   const home = tmpHome('malformed')
   fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
+  assert.ok(!fs.existsSync(markerPath(home)))
+})
+
+test('compatibility marker rejects numeric-prefix pid garbage', () => {
+  const home = tmpHome('numeric-prefix-marker')
+  fs.writeFileSync(markerPath(home), `${process.pid}junk\n${Math.floor(Date.now() / 1000)}`)
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
   assert.ok(!fs.existsSync(markerPath(home)))
 })
@@ -166,6 +271,19 @@ test('writeUpdateMarker + dead pid => self-heals on read', () => {
 test('no marker => hand-off is not blocked', () => {
   const home = tmpHome('conflict-none')
   assert.equal(updateHandoffConflict(home, { kill: ALIVE }), null)
+})
+
+test('advisory installation lock metadata blocks hand-off even when another profile has no marker', () => {
+  const home = tmpHome('conflict-install-lock')
+  const installRoot = path.join(home, 'hermes-agent')
+  const lock = installLockPath(installRoot)
+  fs.mkdirSync(path.dirname(lock), { recursive: true })
+  fs.writeFileSync(lock, `4242\n${Math.floor(Date.now() / 1000)}\nlive-token\n`)
+
+  const conflict = updateHandoffConflict(home, { kill: ALIVE, installRoot })
+  assert.ok(conflict)
+  assert.equal(conflict.pid, 4242)
+  assert.match(conflict.message, /installation/)
 })
 
 test('a different live updater already owns the marker => hand-off is blocked', () => {
