@@ -1661,7 +1661,7 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         endpoint = resp.json()["endpoints"][0]
         assert endpoint["api_mode"] == "codex_responses"
-        assert endpoint["model"] == "gpt-5.6-sol"
+        assert endpoint["model"] == "gpt-5.6-sol-high"
         alias = next(model for model in endpoint["model_details"] if model["id"] == "gpt-5.6-sol-high")
         assert alias["canonical_model"] == "gpt-5.6-sol"
 
@@ -1757,6 +1757,42 @@ class TestWebServerEndpoints:
         cfg = load_config()
         assert cfg["providers"]["responses-proxy"]["models"]["old-high"] == {}
         assert cfg["agent"]["reasoning_overrides"]["gpt"] == "low"
+
+    def test_selected_reasoning_alias_wins_in_multi_effort_catalog(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [
+                {"id": "gpt-low", "canonical_model": "gpt", "reasoning_effort": "low"},
+                {"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"},
+            ],
+            "make_default": True,
+        }
+        response = self.client.post("/api/providers/custom-endpoints", json=payload)
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "responses-proxy")
+        assert endpoint["model"] == "gpt-high"
+        cfg = load_config()
+        assert cfg["providers"]["responses-proxy"]["model"] == "gpt"
+        assert cfg["agent"]["reasoning_overrides"]["gpt"] == "high"
+
+    def test_empty_model_details_clear_discovery_metadata(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [{"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"}],
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        payload["model"] = "gpt"
+        payload["model_details"] = []
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        metadata = load_config()["providers"]["responses-proxy"]["models"]["gpt-high"]
+        assert "canonical_model" not in metadata
+        assert "reasoning_effort" not in metadata
 
     def test_active_endpoint_reasoning_override_follows_activation_and_delete(self):
         """Generated reasoning state follows the endpoint's active lifecycle."""

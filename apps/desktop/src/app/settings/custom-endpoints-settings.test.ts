@@ -38,6 +38,13 @@ describe('custom endpoint transport and model metadata', () => {
     expect(payload.model_details).toEqual(ENDPOINT.model_details)
   })
 
+  it('sends an explicit empty catalogue after an empty discovery', () => {
+    const payload = toPayload(formFromEndpoint(ENDPOINT), [])
+
+    expect(payload.models).toEqual([])
+    expect(payload.model_details).toEqual([])
+  })
+
   it('falls back to Chat Completions and string catalogs from older backends', () => {
     const legacy = { ...ENDPOINT, api_mode: undefined, model_details: undefined }
 

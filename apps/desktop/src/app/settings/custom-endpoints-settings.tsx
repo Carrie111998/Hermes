@@ -81,8 +81,8 @@ export function toPayload(form: EndpointForm, models?: CustomEndpointModel[]): C
     context_length: Number.isFinite(contextLength) && contextLength > 0 ? contextLength : undefined,
     discover_models: form.discoverModels,
     make_default: form.makeDefault,
-    models: models?.length ? models.map(model => model.id) : undefined,
-    model_details: models?.length ? models : undefined
+    models: models ? models.map(model => model.id) : undefined,
+    model_details: models
   }
 }
 

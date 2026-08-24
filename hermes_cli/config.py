@@ -1389,6 +1389,7 @@ def _normalize_custom_provider_entry(
         "key_cmd",
         "api_mode", "transport", "model", "default_model", "models",
         "_reasoning_override_state",
+        "_selected_model_alias",
         "models_discovered",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",

@@ -8339,6 +8339,16 @@ def _custom_endpoint_reasoning(entry: Any) -> Tuple[str, str]:
     if not canonical_model or not isinstance(raw_models, dict):
         return canonical_model, ""
 
+    selected_alias = str(entry.get("_selected_model_alias") or "").strip()
+    selected_metadata = raw_models.get(selected_alias)
+    if selected_alias and isinstance(selected_metadata, dict):
+        selected_canonical = str(
+            selected_metadata.get("canonical_model") or selected_alias
+        ).strip()
+        effort = str(selected_metadata.get("reasoning_effort") or "").strip().lower()
+        if selected_canonical == canonical_model:
+            return canonical_model, effort
+
     candidates = []
     for model_id, metadata in raw_models.items():
         if not isinstance(metadata, dict):
@@ -8449,7 +8459,12 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             endpoint_id = str(provider_id)
             model_ids = _models_from_custom_endpoint_entry(raw_entry)
             models = _model_catalog_from_custom_endpoint_entry(raw_entry)
-            endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (model_ids[0] if model_ids else ""))
+            endpoint_model = str(
+                raw_entry.get("_selected_model_alias")
+                or raw_entry.get("model")
+                or raw_entry.get("default_model")
+                or (model_ids[0] if model_ids else "")
+            )
             has_api_key, api_key_preview = _api_key_display(raw_entry)
             endpoints.append({
                 "id": endpoint_id,
@@ -8608,6 +8623,7 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     current = models_map.get(canonical_model)
     models_map[canonical_model] = dict(current) if isinstance(current, dict) else {}
     entry["model"] = canonical_model
+    entry["_selected_model_alias"] = model
     entry["models"] = models_map
     if body.context_length and body.context_length > 0:
         entry["context_length"] = int(body.context_length)
