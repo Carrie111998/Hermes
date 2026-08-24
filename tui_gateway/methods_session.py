@@ -3263,6 +3263,7 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
+            branch_cwd = _session_cwd(session)
             tokens = _set_session_context(new_key)
             try:
                 agent = _make_agent(
@@ -3271,7 +3272,7 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
-                    cwd_override=_session_cwd(session),
+                    cwd_override=branch_cwd,
                 )
             finally:
                 _clear_session_context(tokens)
@@ -3281,7 +3282,7 @@ def _(rid, params: dict) -> dict:
                 agent,
                 list(history),
                 cols=session.get("cols", 80),
-                cwd=_session_cwd(session),
+                cwd=branch_cwd,
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
