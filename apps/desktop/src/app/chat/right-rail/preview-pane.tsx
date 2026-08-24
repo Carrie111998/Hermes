@@ -82,6 +82,7 @@ interface GuestContextMenuParams {
 
 interface PreviewPaneProps {
   embedded?: boolean
+  onClose?: () => void
   onRestartServer?: (url: string, context?: string) => Promise<string>
   reloadRequest?: number
   /** The preview tab this pane renders. Keys the per-tab console store the
@@ -146,12 +147,14 @@ function isModuleMimeError(message: string): boolean {
 function PreviewLoadError({
   consoleHeight = 0,
   error,
+  onClose,
   onRestartServer,
   onRetry,
   restarting
 }: {
   consoleHeight?: number
   error: PreviewLoadErrorState
+  onClose?: () => void
   onRestartServer?: () => void
   onRetry: () => void
   restarting?: boolean
@@ -178,6 +181,16 @@ function PreviewLoadError({
           {isRemoteLoopbackUrl(error.url) && (
             <div className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground/70">{copy.remoteLoopback}</div>
           )}
+          {onClose && (
+            <button
+              aria-label={t.common.close}
+              className="pointer-events-auto mt-3 rounded-full border border-border bg-background px-3.5 py-1.5 text-xs font-medium text-foreground shadow-xs transition-colors hover:bg-accent"
+              onClick={onClose}
+              type="button"
+            >
+              {t.common.close}
+            </button>
+          )}
         </>
       }
       consoleHeight={consoleHeight}
@@ -196,7 +209,14 @@ function PreviewLoadError({
   )
 }
 
-export function PreviewPane({ embedded = false, onRestartServer, reloadRequest = 0, tabId, target }: PreviewPaneProps) {
+export function PreviewPane({
+  embedded = false,
+  onClose,
+  onRestartServer,
+  reloadRequest = 0,
+  tabId,
+  target
+}: PreviewPaneProps) {
   const { t } = useI18n()
   const copy = t.preview.web
   // The console store belongs to the TAB, not this render: the toggles live on
@@ -229,6 +249,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
 
   const isRemoteHtml = isRemoteHtmlTarget && target.renderMode !== 'source' && Boolean(target.dataUrl)
+  // The browser bar is absent for sandboxed remote HTML, so that branch still
+  // needs the pane-body close affordance.
+  const showBrowserBar = isWebPreview && !isRemoteHtml
 
   const remoteHtmlDocument = useMemo(
     () => (isRemoteHtml ? remoteHtmlPreviewDocument(target.dataUrl!) : null),
@@ -922,7 +945,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           goForward()
         }
       }}
-      {...(isWebPreview && !isRemoteHtml && tabId ? { [PREVIEW_BROWSER_ATTR]: tabId } : {})}
+      {...(showBrowserBar && tabId ? { [PREVIEW_BROWSER_ATTR]: tabId } : {})}
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {!embedded && (
@@ -948,7 +971,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           </div>
         )}
 
-        {isWebPreview && !isRemoteHtml && (
+        {showBrowserBar && (
           <PreviewBrowserBar
             canGoBack={history.back}
             canGoForward={history.forward}
@@ -956,6 +979,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             devToolsOpen={devtoolsOpen}
             loading={loading}
             onBack={goBack}
+            onClose={onClose}
             onForward={goForward}
             onNavigate={navigateTo}
             onOpenExternal={() => void window.hermesDesktop?.openExternal(currentUrl)}
@@ -1001,10 +1025,21 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             <PreviewLoadError
               consoleHeight={consoleOpen ? consoleHeight : 0}
               error={loadError}
+              onClose={onClose}
               onRestartServer={target.kind === 'url' && onRestartServer ? () => void restartServer() : undefined}
               onRetry={reloadPreview}
               restarting={restartingServer}
             />
+          )}
+          {onClose && !showBrowserBar && (
+            <button
+              aria-label={t.common.close}
+              className="absolute right-2 top-2 z-60 rounded-full border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground shadow-sm transition-colors hover:bg-accent"
+              onClick={onClose}
+              type="button"
+            >
+              {t.common.close}
+            </button>
           )}
 
           {isWebPreview && !isRemoteHtml && consoleOpen && (

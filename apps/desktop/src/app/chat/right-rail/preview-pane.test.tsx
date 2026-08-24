@@ -142,6 +142,49 @@ describe('PreviewPane console state', () => {
     expect(rendered.queryByRole('textbox', { name: 'Address' })).toBeNull()
   })
 
+  it('routes the browser close button through the supplied owner', async () => {
+    const onClose = vi.fn()
+    let rendered!: ReturnType<typeof render>
+
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          onClose={onClose}
+          target={{ kind: 'url', label: 'Preview', source: 'http://localhost:5174', url: 'http://localhost:5174' }}
+        />
+      )
+    })
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Close' }))
+
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a close affordance on file previews without browser chrome', async () => {
+    const onClose = vi.fn()
+    let rendered!: ReturnType<typeof render>
+
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          onClose={onClose}
+          target={{
+            kind: 'file',
+            label: 'notes.txt',
+            path: '/tmp/notes.txt',
+            previewKind: 'text',
+            source: '/tmp/notes.txt',
+            url: 'file:///tmp/notes.txt'
+          }}
+        />
+      )
+    })
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Close' }))
+
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
   it('drives the webview from the bar and tracks its history', async () => {
     let rendered!: ReturnType<typeof render>
     await act(async () => {
@@ -223,12 +266,14 @@ describe('PreviewPane console state', () => {
   })
 
   it('stays quiet about loopback when the gateway is local', async () => {
+    const onClose = vi.fn()
     $connection.set({ mode: 'local' } as never)
 
     let rendered!: ReturnType<typeof render>
     await act(async () => {
       rendered = render(
         <PreviewPane
+          onClose={onClose}
           target={{ kind: 'url', label: 'Preview', source: 'http://localhost:5173', url: 'http://localhost:5173' }}
         />
       )
@@ -249,6 +294,12 @@ describe('PreviewPane console state', () => {
 
     await waitFor(() => expect(rendered.container.textContent).toContain('ERR_CONNECTION_REFUSED'))
     expect(rendered.container.textContent).not.toContain('machine running your agent')
+    const closeButtons = rendered.getAllByRole('button', { name: 'Close' })
+
+    expect(closeButtons).toHaveLength(2)
+    expect(closeButtons[1]!.className).toContain('pointer-events-auto')
+    fireEvent.click(closeButtons[1]!)
+    expect(onClose).toHaveBeenCalledOnce()
   })
 
   // A public host fails for ordinary reasons; the remote-vs-local distinction
@@ -346,8 +397,9 @@ describe('PreviewPane console state', () => {
     }
 
     let rendered!: ReturnType<typeof render>
+    const onClose = vi.fn()
     await act(async () => {
-      rendered = render(<PreviewPane target={target} />)
+      rendered = render(<PreviewPane onClose={onClose} target={target} />)
     })
 
     const iframe = rendered.container.querySelector('iframe')
@@ -358,6 +410,12 @@ describe('PreviewPane console state', () => {
     expect(iframe?.getAttribute('srcdoc')).toContain(`default-src 'none'`)
     expect(iframe?.getAttribute('srcdoc')).toContain('<h1>remote</h1>')
     expect(rendered.container.textContent).not.toContain(dataUrl)
+
+    const closeButton = rendered.getByRole('button', { name: 'Close' })
+
+    expect(closeButton).toBeTruthy()
+    fireEvent.click(closeButton)
+    expect(onClose).toHaveBeenCalledOnce()
 
     await act(async () => {
       rendered.rerender(

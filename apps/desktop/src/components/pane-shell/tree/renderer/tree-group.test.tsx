@@ -1,3 +1,4 @@
+import { fireEvent, screen } from '@testing-library/react'
 import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -74,5 +75,25 @@ describe('TreeGroup', () => {
     render(<TreeGroup node={terminalGroup(true)} parentAxis="column" />)
 
     expect(toggle('Restore').querySelector('i')!.className).toContain('codicon-chevron-up')
+  })
+
+  it('opens the zone menu from ordinary pane body content', () => {
+    disposePane = registry.register({
+      area: 'panes',
+      data: { height: '12rem' },
+      id: 'terminal',
+      render: () => <div>Terminal</div>,
+      title: 'Terminal'
+    })
+    vi.stubGlobal('CSS', { escape: (value: string) => value })
+
+    render(<TreeGroup node={terminalGroup(false)} parentAxis="column" />)
+
+    const body = globalThis.document.querySelector('[data-tree-group="terminal-zone"] .relative.min-h-0')
+
+    expect(body).not.toBeNull()
+    fireEvent.contextMenu(body!)
+
+    expect(screen.getByRole('menuitem', { name: 'Close' })).toBeTruthy()
   })
 })

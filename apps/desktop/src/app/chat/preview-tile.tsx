@@ -15,11 +15,11 @@ import { $activeTreeGroup, $layoutTree, revealTreePane } from '@/components/pane
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '@/store/layout'
-import { $previewTabs, closeRightRailTab, type PreviewTarget } from '@/store/preview'
+import { $previewTabs, type PreviewTarget } from '@/store/preview'
 
 import { paneMirror } from './pane-mirror'
 import { PreviewTilePane } from './right-rail/preview'
-import { forgetPreviewConsole } from './right-rail/preview-console-store'
+import { closePreviewTab } from './right-rail/preview-close'
 
 /** The target behind a tile id, or null once its tab is gone. */
 function targetFor(tabId: string): PreviewTarget | null {
@@ -137,8 +137,5 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   title: previewTitle,
   tabLead: tabId => <PreviewTabLead tabId={tabId} />,
   render: tabId => <PreviewTilePane tabId={tabId} />,
-  close: tabId => {
-    forgetPreviewConsole(tabId)
-    closeRightRailTab(tabId)
-  }
+  close: closePreviewTab
 })
