@@ -103,8 +103,14 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     from hermes_cli import kanban_db as kb
     from hermes_cli._parser import build_top_level_parser
+    import secrets
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        secrets,
+        "token_urlsafe",
+        lambda _size: "-nonce-that-starts-with-a-dash",
+    )
     captured = {}
 
     class FakeProc:
@@ -131,6 +137,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
+    assert args.kanban_worker_launch == "-nonce-that-starts-with-a-dash"
     assert args.query == "work kanban task t_spawn_tools"
 
 

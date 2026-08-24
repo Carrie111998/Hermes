@@ -227,8 +227,11 @@ def test_default_spawn_mints_fresh_one_shot_launch_proof(monkeypatch, tmp_path):
         assert env["HERMES_KANBAN_CLAIM_LOCK"] == "lock-worker"
         assert env["HERMES_KANBAN_WORKER_LAUNCH"] == nonce
         assert env["HERMES_KANBAN_WORKER_LAUNCH"] != task.id
-        launch_index = call["cmd"].index("--kanban-worker-launch")
-        assert call["cmd"][launch_index + 1] == nonce
+        launch_arg = next(
+            arg for arg in call["cmd"]
+            if arg.startswith("--kanban-worker-launch=")
+        )
+        assert launch_arg.partition("=")[2] == nonce
         assert call["kwargs"]["start_new_session"] is True
     assert captured[0]["env"]["HERMES_KANBAN_WORKER_LAUNCH"] != (
         captured[1]["env"]["HERMES_KANBAN_WORKER_LAUNCH"]

@@ -12152,7 +12152,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
-        "--kanban-worker-launch", worker_launch_proof,
+        f"--kanban-worker-launch={worker_launch_proof}",
         "-q", prompt,
     ])
     if task.goal_mode:
