@@ -87,6 +87,28 @@ class TestUnifiedDashboardRouting:
 
 class TestInteractiveDashboardAuthSetup:
 
+    def test_headless_loopback_public_url_skips_auth_setup(
+        self, main_mod, monkeypatch
+    ):
+        """A private Desktop serve child does not prompt for dashboard auth."""
+        from hermes_cli.dashboard_auth import clear_providers
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_PUBLIC_URL",
+            "https://dashboard.example.test:9443",
+        )
+        clear_providers()
+        monkeypatch.setattr(main_mod.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(main_mod.sys.stdout, "isatty", lambda: True)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _prompt: pytest.fail("headless serve must not prompt"),
+        )
+
+        main_mod._maybe_setup_dashboard_auth_interactively(
+            _args(headless_backend=True)
+        )
+
     def test_loopback_proxy_public_url_offers_auth_setup(
         self, main_mod, monkeypatch, capsys
     ):
@@ -108,7 +130,6 @@ class TestInteractiveDashboardAuthSetup:
         assert exc.value.code == 1
         output = capsys.readouterr().out
         assert "configured external dashboard.public_url" in output
-
 
 
 

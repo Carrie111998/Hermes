@@ -725,6 +725,8 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
 def should_require_dashboard_auth(
     host: str,
     trusted_public_hosts: Optional[frozenset[str]] = None,
+    *,
+    headless: bool = False,
 ) -> bool:
     """Return whether the dashboard auth gate must be active.
 
@@ -732,7 +734,16 @@ def should_require_dashboard_auth(
     ``dashboard.public_url`` requires authentication even when a reverse proxy
     reaches a backend bound to loopback. Callers may pass the already-resolved
     host set so startup and request validation use the same snapshot.
+
+    A loopback-only ``hermes serve`` process is not that browser-facing
+    dashboard. It is Desktop's private control plane: no SPA is mounted and
+    Electron mints a process-lifetime token for its REST/WebSocket traffic.
+    Applying the public dashboard gate there rejects that token in favour of a
+    browser OAuth ticket. Headless mode therefore ignores ``public_url`` only
+    for an actual loopback bind; non-loopback binds remain gated.
     """
+    if headless and not should_require_auth(host):
+        return False
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
     return should_require_auth(host) or any(
@@ -19308,7 +19319,9 @@ def start_server(
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_dashboard_auth(
-        host, app.state.trusted_public_hosts
+        host,
+        app.state.trusted_public_hosts,
+        headless=headless,
     )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
