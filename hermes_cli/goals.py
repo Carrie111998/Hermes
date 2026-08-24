@@ -426,8 +426,11 @@ def parse_contract(text: str) -> Tuple[str, GoalContract]:
 
 # Flags that opt a goal into autonomous mode. Accepted anywhere in the arg
 # (leading or trailing) so both `/goal --auto <text>` and `/goal <text> --auto`
-# work. `autonomous` is the long word form of the same switch.
-_AUTONOMOUS_FLAGS = {"--auto", "--autonomous", "auto", "autonomous"}
+# work. Only the DASHED forms are flags: bare words like "auto"/"autonomous"
+# are indistinguishable from English (e.g. "autonomous drone pipeline") and are
+# treated as ordinary goal text. The config default / GOAL_AUTONOMOUS env cover
+# hands-free use without an explicit flag.
+_AUTONOMOUS_FLAGS = {"--auto", "--autonomous"}
 
 # Upper bound on a goal file we will read inline, so a stray huge/binary file
 # path can never flood the goal text. A real GOAL.md is a handful of KB.
@@ -490,19 +493,31 @@ def resolve_goal_input(
 
 
 def _read_goal_file(token: str, *, cwd: Optional[str] = None) -> Tuple[Optional[str], str]:
-    """Read a goal file, returning (contents, note) or (None, '') on any miss."""
+    """Read a goal file, returning (contents, note).
+
+    On success returns (contents, "loaded goal from <token>"). On a miss returns
+    (None, note): when the token looked like a path but no file was found the
+    note says so (so a typo like ``GOL.md`` is diagnosable rather than silently
+    becoming the literal goal); other misses return (None, "").
+    """
     try:
         path = os.path.expanduser(token)
         if not os.path.isabs(path) and cwd:
             path = os.path.join(cwd, path)
         if not os.path.isfile(path):
-            return None, ""
+            return None, (
+                f"'{token}' looks like a file path but no such file was "
+                "found — using it as the goal text instead."
+            )
         if os.path.getsize(path) > _GOAL_FILE_MAX_BYTES:
-            return None, ""
+            return None, (
+                f"'{token}' exceeds the {_GOAL_FILE_MAX_BYTES // 1024} KB goal-"
+                "file cap — using it as the goal text instead."
+            )
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             contents = fh.read().strip()
         if not contents:
-            return None, ""
+            return None, f"'{token}' is empty — using it as the goal text instead."
         return contents, f"loaded goal from {token}"
     except Exception:  # never raise into the command handler
         return None, ""

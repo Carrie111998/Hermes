@@ -3001,12 +3001,14 @@ class CLICommandsMixin:
         auto_default = bool(
             (self.config.get("goals") or {}).get("autonomous", False)
         )
-        # Single-session override: GOAL_AUTONOMOUS=1 forces autonomous default
-        # on without editing config (mirrors how other goal knobs allow an env
-        # override for one session).
+        # Single-session override: GOAL_AUTONOMOUS forces the autonomous default
+        # on or OFF without editing config. Truthy (1/true/yes/on) and falsy
+        # (0/false/no/off) spellings both override; anything else is ignored.
         _env_auto = os.environ.get("GOAL_AUTONOMOUS", "").strip().lower()
         if _env_auto in {"1", "true", "yes", "on"}:
             auto_default = True
+        elif _env_auto in {"0", "false", "no", "off"}:
+            auto_default = False
         resolved, autonomous, note = resolve_goal_input(
             arg, cwd=os.getcwd(), autonomous_default=auto_default
         )
@@ -3027,6 +3029,11 @@ class CLICommandsMixin:
 
         mode = " · autonomous" if state.autonomous else ""
         _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget{mode}): {state.goal}")
+        if state.autonomous:
+            _cprint(
+                f"  {_DIM}Autonomous mode is recorded on this goal; on its own "
+                f"it is an inert marker — nothing else changes yet.{_RST}"
+            )
         if state.has_contract():
             _cprint(f"  {_DIM}Completion contract:{_RST}")
             for line in state.contract.render_block().splitlines():

@@ -51,6 +51,23 @@ class TestResolveGoalInputFlags:
         assert text == "do the thing"
         assert autonomous is True
 
+    def test_bare_word_autonomous_is_NOT_a_flag(self):
+        # Regression: bare "autonomous"/"auto" are English, not flags — a goal
+        # like "autonomous drone pipeline" must keep its first word and stay
+        # non-autonomous. Only the dashed forms toggle the mode.
+        from hermes_cli.goals import resolve_goal_input
+
+        text, autonomous, _ = resolve_goal_input("autonomous drone pipeline")
+        assert text == "autonomous drone pipeline"
+        assert autonomous is False
+
+    def test_bare_word_auto_trailing_is_NOT_a_flag(self):
+        from hermes_cli.goals import resolve_goal_input
+
+        text, autonomous, _ = resolve_goal_input("wire the relay to auto")
+        assert text == "wire the relay to auto"
+        assert autonomous is False
+
     def test_autonomous_default_seeds_flag_without_explicit_switch(self):
         from hermes_cli.goals import resolve_goal_input
 
@@ -107,13 +124,14 @@ class TestResolveGoalInputFile:
 
     def test_missing_file_path_falls_back_to_literal_text(self):
         # A path-looking token that does not resolve to a file is treated as
-        # literal goal text (fail-open, never raises).
+        # literal goal text (fail-open, never raises), and the note diagnoses
+        # the miss so a typo like GOL.md is visible rather than silent.
         from hermes_cli.goals import resolve_goal_input
 
         text, autonomous, note = resolve_goal_input("./nonexistent-goal.md")
         assert text == "./nonexistent-goal.md"
         assert autonomous is False
-        assert note == ""
+        assert "no such file" in note.lower()
 
     def test_oversized_file_is_not_loaded(self, tmp_path):
         from hermes_cli.goals import resolve_goal_input
@@ -121,9 +139,10 @@ class TestResolveGoalInputFile:
         big = tmp_path / "HUGE.md"
         big.write_text("x" * (64 * 1024 + 10))
         text, _autonomous, note = resolve_goal_input(str(big))
-        # Falls back to the literal token; the giant body is never inlined.
+        # Falls back to the literal token; the giant body is never inlined, and
+        # the note explains why (over the cap) rather than failing silently.
         assert text == str(big)
-        assert note == ""
+        assert "cap" in note.lower()
 
 
 # --------------------------------------------------------------------------- #
