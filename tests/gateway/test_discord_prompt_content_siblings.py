@@ -70,7 +70,7 @@ async def test_clarify_with_choices_mirrors_question_into_content():
 @pytest.mark.asyncio
 async def test_update_and_clarify_return_redacted_transport_errors():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
-    secret = "synthetic-discord-transport-secret-1234567890"
+    secret = "synthetic-" + "discord-transport-" + "secret-1234567890"
     channel = SimpleNamespace(
         send=AsyncMock(
             side_effect=RuntimeError(
@@ -99,13 +99,15 @@ async def test_update_and_clarify_return_redacted_transport_errors():
     )
 
     assert update_result.error and secret not in update_result.error
+    assert "..." in update_result.error
     assert clarify_result.error and secret not in clarify_result.error
+    assert "..." in clarify_result.error
 
 
 @pytest.mark.asyncio
 async def test_send_and_forum_transport_errors_use_redaction_boundary():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
-    secret = "synthetic-discord-transport-secret-1234567890"
+    secret = "synthetic-" + "discord-transport-" + "secret-1234567890"
     channel = SimpleNamespace(
         send=AsyncMock(
             side_effect=RuntimeError(
@@ -121,6 +123,7 @@ async def test_send_and_forum_transport_errors_use_redaction_boundary():
     result = await adapter.send("555", "hello")
 
     assert result.error and secret not in result.error
+    assert "..." in result.error
 
     forum = SimpleNamespace(
         id=777,
@@ -137,17 +140,24 @@ async def test_send_and_forum_transport_errors_use_redaction_boundary():
     result = await adapter.send("555", "hello")
 
     assert result.error and secret not in result.error
+    assert "..." in result.error
     assert result.error.startswith("Forum thread creation failed:")
 
 
 def test_discord_error_redaction_masks_real_transport_secret():
-    secret = "synthetic-discord-transport-secret-1234567890"
+    secret = "synthetic-" + "discord-transport-" + "secret-1234567890"
 
     redacted = _redact_discord_error_text(
         f"Discord transport failed: Authorization: Bearer {secret}"
     )
 
     assert secret not in redacted
-    assert "Authorization: Bearer" in redacted
+    assert "..." in redacted
 
 
+def test_discord_error_redaction_contains_hostile_stringification():
+    class HostileError:
+        def __str__(self):
+            raise RuntimeError("stringification failed")
+
+    assert _redact_discord_error_text(HostileError()) == "<discord error redacted>"

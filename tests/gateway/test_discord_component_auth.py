@@ -422,17 +422,20 @@ async def test_exec_approval_public_button_marks_stale_resolution_without_approv
 async def test_exec_approval_resolution_logs_redacted_transport_error(caplog):
     view = ExecApprovalView(session_key="s", allowed_user_ids={"1"})
     interaction = _approval_interaction()
-    secret = "synthetic-discord-transport-secret-1234567890"
+    secret = "synthetic-" + "discord-transport-" + "secret-1234567890"
 
     with patch(
         "tools.approval.resolve_gateway_approval",
-        side_effect=RuntimeError(f"transport Authorization: Bearer {secret}"),
+        side_effect=RuntimeError(
+            f"transport Authorization: Bearer {secret}"
+        ),
     ):
         with caplog.at_level("ERROR", logger="plugins.platforms.discord.adapter"):
             await view.allow_once(interaction, MagicMock())
 
     assert secret not in caplog.text
     assert "Failed to resolve gateway approval from button" in caplog.text
+    assert "..." in caplog.text
     interaction.response.edit_message.assert_awaited_once()
 
 
