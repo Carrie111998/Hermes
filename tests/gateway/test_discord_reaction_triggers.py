@@ -167,3 +167,24 @@ def test_yaml_bridge_skips_env_write_under_profile_scope(monkeypatch):
         os.environ.pop("DISCORD_REACTION_TRIGGERS", None)
     assert seeded is not None
     assert seeded.get("reaction_triggers") == "👍"
+
+
+def test_hydration_remember_and_lookup():
+    adapter = _make_adapter()
+    adapter._remember_outbound_snippet("111", "hello world")
+    assert adapter._lookup_outbound_snippet("111") == "hello world"
+
+
+def test_hydration_bounds_and_trim():
+    adapter = _make_adapter()
+    for i in range(600):
+        adapter._remember_outbound_snippet(str(i), f"msg {i}")
+    assert len(adapter._reaction_targets) <= 512
+    assert adapter._lookup_outbound_snippet("0") is None      # oldest evicted
+    assert adapter._lookup_outbound_snippet("599") == "msg 599"
+
+
+def test_hydration_snippet_capped_at_200_chars():
+    adapter = _make_adapter()
+    adapter._remember_outbound_snippet("222", "x" * 500)
+    assert len(adapter._lookup_outbound_snippet("222")) == 200

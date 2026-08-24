@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -3387,6 +3387,31 @@ class DiscordAdapter(BasePlatformAdapter):
     def _normalize_reaction_emoji(self, emoji) -> str:
         return normalize_reaction_emoji(emoji)
 
+    # Reaction-trigger hydration map: recently sent outbound message ids ->
+    # first-200-char text snippets, so an inbound reaction can hydrate
+    # "[Replying to your previous message: ...]" without REST fetches.
+    # Bounded LRU (512 entries) keeps memory flat. Lives in the class body so
+    # self._REACTION_TARGET_LIMIT resolves even on bare instances built
+    # without __init__.
+    _REACTION_TARGET_LIMIT = 512
+
+    def _remember_outbound_snippet(self, message_id: Any, text: Optional[str]) -> None:
+        """Track recently sent message ids -> first-200-char text for reaction hydration."""
+        mid = str(getattr(message_id, "id", message_id) or "").strip()
+        if not mid:
+            return
+        snippet = (text or "").strip()[:200]
+        if not getattr(self, "_reaction_targets", None):
+            self._reaction_targets = OrderedDict()
+        self._reaction_targets[mid] = snippet
+        self._reaction_targets.move_to_end(mid)
+        while len(self._reaction_targets) > self._REACTION_TARGET_LIMIT:
+            self._reaction_targets.popitem(last=False)
+
+    def _lookup_outbound_snippet(self, message_id: Any) -> Optional[str]:
+        targets = getattr(self, "_reaction_targets", None) or {}
+        return targets.get(str(message_id))
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
@@ -3590,6 +3615,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                self._remember_outbound_snippet(msg.id, chunk)
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -3663,12 +3689,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Send remaining chunks into the newly created thread.  Track any
         # per-chunk failures so the caller sees partial-send outcomes.
+        self._remember_outbound_snippet(message_id, starter_content)
         message_ids = [message_id]
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
+                self._remember_outbound_snippet(msg.id, chunk)
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
                 logger.warning("[%s] %s", self.name, warning)
@@ -4048,6 +4076,7 @@ class DiscordAdapter(BasePlatformAdapter):
             content=caption if caption else None,
             files=[discord_file],
         )
+        self._remember_outbound_snippet(msg, caption)
         attachments = getattr(msg, "attachments", None) or []
         if not attachments:
             # Discord accepted the message but attached nothing — the failure
