@@ -63,6 +63,43 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.no_progress_block_after == 8
 
 
+def test_mutating_no_progress_thresholds_are_registered_in_shipped_defaults():
+    """The mutating knobs must sit in DEFAULT_CONFIG next to their siblings.
+
+    ``hermes config set`` validates dotted keys by walking DEFAULT_CONFIG, so a
+    threshold that only exists on the dataclass is inert from the CLI: the write
+    is reported as an unrecognized key and the operator can never move it off
+    the built-in 4 / 12.
+    """
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    guardrails = DEFAULT_CONFIG["tool_loop_guardrails"]
+    defaults = ToolCallGuardrailConfig()
+
+    assert (
+        guardrails["warn_after"]["mutating_no_progress"]
+        == defaults.mutating_no_progress_warn_after
+    )
+    assert (
+        guardrails["hard_stop_after"]["mutating_no_progress"]
+        == defaults.mutating_no_progress_block_after
+    )
+    # Shipped defaults must round-trip to the dataclass defaults unchanged.
+    assert ToolCallGuardrailConfig.from_mapping(guardrails) == defaults
+
+
+def test_config_parses_nested_mutating_no_progress_thresholds():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "warn_after": {"mutating_no_progress": 6},
+            "hard_stop_after": {"mutating_no_progress": 20},
+        }
+    )
+
+    assert cfg.mutating_no_progress_warn_after == 6
+    assert cfg.mutating_no_progress_block_after == 20
+
+
 def test_default_repeated_identical_failed_call_warns_without_blocking():
     controller = ToolCallGuardrailController()
     args = {"query": "same"}
