@@ -1951,6 +1951,8 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                        extra={k: v for k, v in entry.extra.items()
+                               if k != "failure_reason"},
                     )
                     self._replace_entry(entry, cleared)
                     entry = cleared
