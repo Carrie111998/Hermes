@@ -51,3 +51,16 @@ def test_override_validation_and_snapshot_not_found(tmp_path):
             kb.set_routing_override(conn, task_id, role="r", model="m")
         with pytest.raises(KeyError):
             kb.get_routing_snapshot(conn, 999, board="unit-board")
+
+
+def test_board_default_role_round_trip_preserves_other_metadata(tmp_path, monkeypatch):
+    """Board role updates preserve unrelated board metadata fields."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.write_board_metadata("routing-board", name="Routing", description="keep")
+
+    result = kb.write_board_metadata("routing-board", default_role="executor")
+
+    assert result["default_role"] == "executor"
+    assert result["name"] == "Routing"
+    assert result["description"] == "keep"
+    assert kb.read_board_metadata("routing-board")["default_role"] == "executor"

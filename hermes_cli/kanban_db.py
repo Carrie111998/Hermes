@@ -892,6 +892,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        "default_role": None,
         # Optional first-class Project this board is scoped to. When set, new
         # tasks inherit it (deterministic worktree + branch under the project's
         # primary repo) and ``default_workdir`` mirrors the project's primary
@@ -925,6 +926,7 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    default_role: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -955,6 +957,8 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if default_role is not None:
+        meta["default_role"] = str(default_role).strip() or None
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)

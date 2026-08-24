@@ -326,6 +326,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_set_role = boards_sub.add_parser(
+        "set-default-role", help="Set the default routing role for a board",
+    )
+    b_set_role.add_argument("slug")
+    b_set_role.add_argument("role", help="Semantic role from roles.yaml")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -1270,6 +1276,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-default-role":
+        return _cmd_boards_set_default_role(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1442,6 +1450,24 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_default_role(args: argparse.Namespace) -> int:
+    """Set a board's semantic routing default without losing other metadata."""
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards set-default-role: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(
+            f"kanban boards set-default-role: board {args.slug!r} does not exist",
+            file=sys.stderr,
+        )
+        return 1
+    meta = kb.write_board_metadata(normed, default_role=args.role)
+    print(f"Board {normed!r} default role set to {meta['default_role']!r}.")
     return 0
 
 
