@@ -206,6 +206,8 @@ def _(rid, params: dict) -> dict:
             return None, None
 
     try:
+        import json as _json
+
         from hermes_cli.profiles import list_profiles
 
         include_sessions = is_truthy_value(params.get("include_sessions", True))
@@ -237,7 +239,6 @@ def _(rid, params: dict) -> dict:
             # order, …) — stored server-side in profile.yaml so every
             # machine connecting to this gateway paints the same roster.
             try:
-                import json as _json
                 import yaml as _yaml
                 from pathlib import Path as _Path
 
