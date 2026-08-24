@@ -40,7 +40,8 @@ def _switch_to_alias(monkeypatch, alias_entry):
 
     probed = {}
 
-    def _fake_validate(model_name, provider, *, api_key=None, base_url=None, api_mode=None):
+    def _fake_validate(model_name, provider, *, api_key=None, base_url=None,
+                       api_mode=None, **_kwargs):
         probed["api_key"] = api_key
         probed["base_url"] = base_url
         return {"accepted": True, "persist": True, "recognized": True, "message": ""}
@@ -270,7 +271,8 @@ class TestBuiltinProviderKeysDoNotLeak:
 
         probed = {}
 
-        def _fake_validate(model_name, prov, *, api_key=None, base_url=None, api_mode=None):
+        def _fake_validate(model_name, prov, *, api_key=None, base_url=None,
+                           api_mode=None, **_kwargs):
             probed["api_key"] = api_key
             probed["base_url"] = base_url
             return {"accepted": True, "persist": True, "recognized": True, "message": ""}
@@ -313,7 +315,8 @@ class TestProviderLabelCannotSelectAKeyForAnArbitraryHost:
         monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda *a, **k: cfg)
         probed = {}
 
-        def _fake_validate(model_name, prov, *, api_key=None, base_url=None, api_mode=None):
+        def _fake_validate(model_name, prov, *, api_key=None, base_url=None,
+                           api_mode=None, **_kwargs):
             probed["api_key"] = api_key
             return {"accepted": True, "persist": True, "recognized": True, "message": ""}
 
