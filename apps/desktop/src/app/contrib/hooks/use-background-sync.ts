@@ -466,10 +466,10 @@ export function useBackgroundSync({
   // transcript signatures, so no-change ticks and closed tiles cost nothing.
   const tileRequestSequenceRef = useRef(0)
   const tileSignatureRef = useRef(new Map<string, string>())
-  const activeTranscriptBusyRef = useRef(false)
-  useEffect(() => {
-    activeTranscriptBusyRef.current = activeTranscriptBusy
-  }, [activeTranscriptBusy])
+  // Read $busy.get() directly inside the reconcile loop instead of mirroring
+  // the atom into a ref (lint: no-restricted-syntax — refs synced from atoms
+  // lag one render). The reconcile runs on tick, not render, so .get() is
+  // always current.
 
   const requestActiveTranscriptRefresh = useCallback(
     (preservePending: boolean) => {
@@ -615,7 +615,7 @@ export function useBackgroundSync({
       // (#93942 scenario A). Signature-gated per tile, so no-change ticks
       // cost nothing.
       void reconcileTileTranscripts({
-        busyRef: activeTranscriptBusyRef,
+        busyRef: { get current() { return $busy.get() } },
         requestSequenceRef: tileRequestSequenceRef,
         signatureRef: tileSignatureRef,
         updateSessionState
@@ -642,7 +642,7 @@ export function useBackgroundSync({
         window.clearTimeout(timer)
       }
     }
-  }, [changeEventsAvailable, gatewayState, refreshMessagingSessions, refreshSessions, requestActiveTranscriptRefresh])
+  }, [changeEventsAvailable, gatewayState, refreshMessagingSessions, refreshSessions, requestActiveTranscriptRefresh, updateSessionState])
 
   // Keep the cron-jobs section live without a user action (scheduler ticks in
   // the background). cron.changed (jobs.json moved: CRUD or a scheduler tick's
