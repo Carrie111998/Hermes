@@ -256,11 +256,13 @@ def test_exec_never_persists_a_bare_interpreter_command(
 def test_exec_keeps_resolver_fallback_when_no_wrapper_on_path(
     tmp_path, xdg_home, monkeypatch
 ):
-    """No PATH wrapper → today's fallback chain stays authoritative.
+    """No wrapper anywhere → #90492's runnable fallback, never a dead Exec.
 
-    #90492's interpreter-prefix semantics are preserved for installs that
-    genuinely have no installed launcher: the repo script is still used,
-    prefixed with sys.executable when its shebang would escape the venv.
+    With argv[0] checkout-internal and PATH + known locations both empty,
+    the resolver returns None and resolve_exec_command emits the runnable
+    `sys.executable -m hermes_cli.main desktop` fallback. Persisting the
+    interpreter itself (`<python> desktop`) would be unrunnable by any DE;
+    persisting the repo script alone dies on its env shebang.
     """
     import sys
 
@@ -277,9 +279,6 @@ def test_exec_keeps_resolver_fallback_when_no_wrapper_on_path(
 
     def fake_resolve():
         # Mirror resolve_hermes_bin's chain: argv[0] → relative → PATH → None.
-        # Injected through the REAL wrapper (resolve_fn parameter) via
-        # resolve_exec_command's plumbing, so the rerouted-None →
-        # keep-primary branch runs for real instead of being stubbed out.
         return sys.argv[0] if sys.argv[0] else None
 
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
@@ -287,9 +286,11 @@ def test_exec_keeps_resolver_fallback_when_no_wrapper_on_path(
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    # Still the interpreter-prefixed repo script (#90492 behavior), never dropped.
-    assert str(repo_script) in exec_line
-    assert exec_line.endswith("desktop")
+    # The runnable module fallback — NOT the bare repo script (its env
+    # shebang would escape the venv under a DE) and NOT `<python> desktop`.
+    assert exec_line.endswith("-m hermes_cli.main desktop")
+    assert Path(exec_line.split(" ")[0].strip('"')).is_absolute()
+    assert str(repo_script) not in exec_line
 
 
 def test_exec_uses_known_wrapper_when_path_lookup_misses(
@@ -355,6 +356,12 @@ def test_exec_uses_known_wrapper_when_path_lookup_misses(
             "/usr/local/bin/hermes",
             id="root-fhs",
         ),
+        pytest.param(
+            "non-root-no-fhs",
+            {"__EUID0__": "0"},
+            "HOME-SET-BY-TEST/.local/bin/hermes",
+            id="non-root-excludes-fhs",
+        ),
     ],
 )
 def test_known_wrapper_candidates_cover_installer_layouts(
@@ -369,7 +376,7 @@ def test_known_wrapper_candidates_cover_installer_layouts(
     """
     import os
 
-    sentinel_home = tmp_path_mark = "/home/__sentinel_home__"
+    sentinel_home = "/home/__sentinel_home__"
     monkeypatch.setenv("HOME", sentinel_home)
     for key, value in env_overrides.items():
         if key == "__EUID0__":
@@ -389,8 +396,9 @@ def test_known_wrapper_candidates_cover_installer_layouts(
         assert candidates.index("/usr/local/bin/hermes") < candidates.index(
             f"{sentinel_home}/.local/bin/hermes"
         )
-    else:
-        assert "/usr/local/bin/hermes" not in candidates or (os.geteuid() == 0)
+    if layout == "non-root-no-fhs":
+        # Non-root euid: /usr/local/bin must be excluded outright.
+        assert "/usr/local/bin/hermes" not in candidates
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
