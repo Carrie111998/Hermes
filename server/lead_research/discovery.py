@@ -44,7 +44,9 @@ class CandidateDiscoveryService:
         indexed = (repository or self.repository).select(
             company_id=company_id,
             countries=query.target_countries,
-            product_terms=query.product_terms or [*query.sector_ids, *query.hs_codes],
+            product_terms=[
+                *query.search_product_terms, *query.sector_ids, *query.hs_codes,
+            ],
             limit=limit,
             exclude=exclude,
         )

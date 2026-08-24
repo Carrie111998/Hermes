@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS research_results (
     created_at REAL NOT NULL, updated_at REAL NOT NULL,
     UNIQUE(company_id, campaign_id, organization_id)
 );
+CREATE TABLE IF NOT EXISTS research_translations (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    fact_key TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source_language TEXT NOT NULL,
+    display_locale TEXT NOT NULL CHECK(display_locale IN ('en','tr')),
+    value_en TEXT NOT NULL,
+    display_value TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(company_id, fact_key, content_hash, source_language, display_locale)
+);
 -- Candidate corpora are service-only shared inputs.  They deliberately have
 -- no company_id: a later campaign may evaluate them, but importing a corpus
 -- cannot create a tenant lead, organization, research row, or evidence.
@@ -117,6 +130,8 @@ CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(compa
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_results_tenant ON research_results(company_id, campaign_id, verdict);
+CREATE INDEX IF NOT EXISTS ix_research_translations_tenant
+    ON research_translations(company_id, fact_key, display_locale);
 -- Evidence reuse reads by tenant, source and age; the tenant index above leads
 -- with campaign_id, which this lookup deliberately does not filter on, so
 -- without this it scanned every evidence row the tenant owns once per run.

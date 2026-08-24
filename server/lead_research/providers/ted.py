@@ -288,7 +288,8 @@ class TedVerifier(CatalogProvider):
 
         buyer_terms = _clean_terms([*query.buyer_types, *candidate.data.get("buyer_types", [])])
         product_terms = _clean_terms([
-            *query.sector_ids, *query.hs_codes, *candidate.data.get("categories", []),
+            *query.search_product_terms, *query.sector_ids, *query.hs_codes,
+            *candidate.data.get("categories", []),
         ])
 
         sources: list[VerificationSource] = []

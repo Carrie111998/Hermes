@@ -71,6 +71,9 @@ def test_campaign_freezes_profile_and_plain_product_terms():
     )
     query = app.state.lead_research.discovery_query(campaign["id"], company_id)
     assert query.product_terms == ["industrial valve", "Valve"]
+    assert "Industriearmatur" in query.market_terms["de"]
+    assert "Einkaufsleiter" in query.market_terms["de"]
+    assert query.search_product_terms != query.product_terms
 
 
 class BlockingVerifier:

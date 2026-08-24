@@ -140,6 +140,12 @@ class CandidateSupply(ApiModel):
     counts: dict[str, int] = Field(default_factory=dict)
 
 
+class MarketTermSet(ApiModel):
+    canonical: list[str] = Field(default_factory=list)
+    by_language: dict[str, list[str]] = Field(default_factory=dict)
+    unmapped_markets: list[str] = Field(default_factory=list)
+
+
 class DiscoveryQuery(ApiModel):
     campaign_id: str
     seller_countries: list[str]
@@ -147,8 +153,25 @@ class DiscoveryQuery(ApiModel):
     sector_ids: list[str] = Field(default_factory=list)
     hs_codes: list[str] = Field(default_factory=list)
     product_terms: list[str] = Field(default_factory=list)
+    market_terms: dict[str, list[str]] = Field(default_factory=dict)
     buyer_types: list[str] = Field(default_factory=list)
     max_records: int = Field(default=100, ge=1, le=10_000)
+
+    @property
+    def search_product_terms(self) -> list[str]:
+        """Canonical plus local query terms, with stable case-insensitive dedupe."""
+        output: list[str] = []
+        seen: set[str] = set()
+        for value in [
+            *self.product_terms,
+            *(term for language in self.market_terms.values() for term in language),
+        ]:
+            text = " ".join(str(value).split())
+            key = text.casefold()
+            if text and key not in seen:
+                output.append(text)
+                seen.add(key)
+        return output
 
 
 class DiscoveryEstimate(ApiModel):

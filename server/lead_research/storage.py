@@ -104,13 +104,14 @@ class EvidenceRepository:
                 "sector_ids": sorted(query.sector_ids),
                 "hs_codes": sorted(query.hs_codes),
                 "buyer_types": sorted(query.buyer_types),
+                "search_product_terms": sorted(query.search_product_terms),
             },
             sort_keys=True,
         ).encode()
         return hashlib.sha256(material).hexdigest()[:16]
 
     def reusable_bundles(
-        self, cutoff_by_source: dict[str, float], query_fingerprint: str
+        self, cutoff_by_source: dict[str, float], query_fingerprint: str | set[str]
     ) -> dict[tuple[str, str], VerificationBundle]:
         """Evidence already held for a candidate, still inside its freshness window.
 
@@ -142,12 +143,15 @@ class EvidenceRepository:
         )
         # provenance_url is the identity of a source within a bundle, so a later
         # row for the same URL supersedes an earlier one.
+        accepted_fingerprints = (
+            {query_fingerprint} if isinstance(query_fingerprint, str) else query_fingerprint
+        )
         collected: dict[tuple[str, str], dict[str, VerificationSource]] = {}
         for row in rows:
             if (row["retrieved_at"] or 0.0) < cutoff_by_source[row["source_id"]]:
                 continue
             payload = json_load(row["payload"], {})
-            if payload.get("query_fingerprint") != query_fingerprint:
+            if payload.get("query_fingerprint") not in accepted_fingerprints:
                 # A different question, or evidence written before fingerprints
                 # existed. Either way it cannot stand in for this run's answer.
                 continue

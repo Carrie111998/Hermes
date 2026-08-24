@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import os
 import sysconfig
 from pathlib import Path
@@ -79,6 +80,7 @@ class Sector(BaseModel):
     buyer_types: list[str]
     applicable_features: list[str]
     sourcing_terms: list[str] = Field(default_factory=list)
+    market_terms: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
     default_source_categories: list[str]
 
     @model_validator(mode="after")
@@ -119,13 +121,20 @@ def render_sector_csv(sectors: tuple[Sector, ...] | list[Sector]) -> str:
     fields = [
         "taxonomy_version", "sector_id", "name", "aliases", "hs_2022", "nace_rev2",
         "naics_2022", "cpv_2008", "cpc", "buyer_types", "applicable_features",
-        "sourcing_terms", "default_source_categories",
+        "sourcing_terms", "market_terms", "default_source_categories",
     ]
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
     for sector in sorted(sectors, key=lambda item: item.sector_id):
-        row = {field: _joined(getattr(sector, field)) for field in fields[3:]}
+        row = {
+            field: (
+                json.dumps(getattr(sector, field), ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+                if field == "market_terms" else _joined(getattr(sector, field))
+            )
+            for field in fields[3:]
+        }
         row.update({"taxonomy_version": "2026.1", "sector_id": sector.sector_id, "name": sector.name})
         writer.writerow(row)
     return stream.getvalue()

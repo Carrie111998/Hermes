@@ -9,6 +9,13 @@
   buyer_types: [importer, distributor, wholesaler, procurement_organization]
   applicable_features: [locations, countries_served, procurement_intent, relevant_import_value, certifications]
   sourcing_terms: [project supplier, distributor wanted, approved vendor]
+  market_terms:
+    de:
+      construction materials: [Baustoffe, Baumaterialien]
+      procurement manager: [Einkaufsleiter]
+    tr:
+      construction materials: [yapı malzemeleri, inşaat malzemeleri]
+      procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: food-and-beverage
   name: Food and beverage
@@ -21,6 +28,13 @@
   buyer_types: [importer, distributor, retailer, wholesaler, procurement_organization]
   applicable_features: [store_count, countries_served, relevant_import_value, certifications, brands_carried]
   sourcing_terms: [private label, food importer, retail supplier]
+  market_terms:
+    de:
+      food importer: [Lebensmittelimporteur]
+      procurement manager: [Einkaufsleiter]
+    tr:
+      food importer: [gıda ithalatçısı]
+      procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: household-appliances
   name: Household appliances
@@ -33,6 +47,15 @@
   buyer_types: [importer, distributor, retailer, brand, wholesaler]
   applicable_features: [store_count, countries_served, relevant_import_value, brands_carried]
   sourcing_terms: [OEM, private label, distributor wanted]
+  market_terms:
+    de:
+      household appliances: [Haushaltsgeräte, Hausgeräte]
+      oven: [Backofen, Backöfen]
+      procurement manager: [Einkaufsleiter]
+    tr:
+      household appliances: [ev aletleri, beyaz eşya]
+      oven: [fırın]
+      procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: industrial-machinery
   name: Industrial machinery
@@ -45,6 +68,15 @@
   buyer_types: [importer, distributor, procurement_organization, manufacturer]
   applicable_features: [countries_served, facilities, relevant_import_value, certifications, procurement_intent]
   sourcing_terms: [equipment tender, machinery distributor, industrial procurement]
+  market_terms:
+    de:
+      industrial valve: [Industriearmatur]
+      industrial machinery: [Industriemaschinen]
+      procurement manager: [Einkaufsleiter]
+    tr:
+      industrial valve: [endüstriyel vana]
+      industrial machinery: [endüstriyel makineler]
+      procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: textiles-and-apparel
   name: Textiles and apparel
@@ -57,4 +89,11 @@
   buyer_types: [importer, distributor, retailer, brand, wholesaler]
   applicable_features: [store_count, countries_served, relevant_import_value, certifications, private_label_fit]
   sourcing_terms: [private label, sourcing office, apparel importer]
+  market_terms:
+    de:
+      apparel importer: [Bekleidungsimporteur]
+      procurement manager: [Einkaufsleiter]
+    tr:
+      apparel importer: [giyim ithalatçısı]
+      procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, exhibition, matchmaking, web]

@@ -207,7 +207,9 @@ class BrightDataVerifier(CatalogProvider):
     ) -> RawPage:
         del cursor
         terms = _clean_terms([
-            *(query.product_terms or query.sector_ids or query.hs_codes),
+            *query.search_product_terms,
+            *query.sector_ids,
+            *query.hs_codes,
             *query.buyer_types,
             *query.target_countries,
         ])
@@ -229,6 +231,8 @@ class BrightDataVerifier(CatalogProvider):
                 "company_name": title,
                 "country": query.target_countries[0] if query.target_countries else "",
                 "domain": domain,
+                # Preserve canonical English in the candidate payload. Local
+                # terms are query mechanics, not stored facts.
                 "categories": query.product_terms or query.sector_ids,
                 "provenance_url": provenance,
             }))

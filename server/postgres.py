@@ -145,7 +145,8 @@ class PostgresDatabase:
                            "010_digest_suppression_parity",
                            "011_candidate_search_text",
                            "012_company_profile_versions")
-    REQUIRED_MIGRATIONS = (*REQUIRED_MIGRATIONS, "013_candidate_visibility")
+    REQUIRED_MIGRATIONS = (*REQUIRED_MIGRATIONS, "013_candidate_visibility",
+                           "014_research_translations")
 
     def _assert_migrations_applied(self) -> None:
         try:

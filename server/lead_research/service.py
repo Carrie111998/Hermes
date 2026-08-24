@@ -12,6 +12,7 @@ from .candidates import CandidateRecord, CandidateRepository
 from .enrichment import FeaturePlanner, satisfied_playbook_fields
 from .discovery import CandidateDiscoveryService
 from .identity import IdentityResolver
+from .languages import build_market_terms
 from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
 from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchReadiness, ResearchResultData
 from .profiles import ProfileRepository
@@ -114,20 +115,31 @@ class LeadResearchService:
 
     def discovery_query(self, campaign_id: str, company_id: str) -> DiscoveryQuery:
         row = self.db.one(
-            "SELECT config,scope_snapshot FROM research_campaigns WHERE id=? AND company_id=?",
+            "SELECT config,scope_snapshot,profile_version_id FROM research_campaigns "
+            "WHERE id=? AND company_id=?",
             (campaign_id, company_id),
         )
         if not row:
             raise KeyError("campaign not found")
         config = CampaignConfig.model_validate(json_load(row["config"], {}))
         snapshot = json_load(row["scope_snapshot"], {})
+        profile = (
+            ProfileRepository(self.db).get(company_id, row["profile_version_id"])
+            if row["profile_version_id"] else None
+        )
+        canonical = snapshot.get("product_terms", self._product_terms(company_id, config))
+        market_terms = (
+            build_market_terms({**snapshot, "product_terms": canonical}, profile.profile)
+            if profile else None
+        )
         return DiscoveryQuery(
             campaign_id=campaign_id,
             seller_countries=snapshot.get("seller_countries", config.seller_countries),
             target_countries=snapshot.get("target_countries", config.target_countries),
             sector_ids=snapshot.get("sector_ids", config.sector_ids),
             hs_codes=snapshot.get("hs_codes", config.hs_codes),
-            product_terms=snapshot.get("product_terms", self._product_terms(company_id, config)),
+            product_terms=canonical,
+            market_terms=market_terms.by_language if market_terms else {},
             buyer_types=snapshot.get("buyer_types", config.buyer_types),
             max_records=config.max_qualified_leads_per_country * 3,
         )
@@ -314,13 +326,31 @@ class LeadResearchService:
         if company_id is None:
             return estimate
         terms = self._product_terms(company_id, config)
+        profile = ProfileRepository(self.db).current(company_id)
+        market_terms = build_market_terms({
+            "product_terms": terms,
+            "sector_ids": config.sector_ids,
+            "target_countries": config.target_countries,
+        }, profile.profile) if profile else None
+        search_terms = (
+            DiscoveryQuery(
+                campaign_id="estimate",
+                seller_countries=config.seller_countries,
+                target_countries=config.target_countries,
+                sector_ids=config.sector_ids,
+                hs_codes=config.hs_codes,
+                product_terms=terms,
+                market_terms=market_terms.by_language if market_terms else {},
+                buyer_types=config.buyer_types,
+            ).search_product_terms
+        )
         matches = self.candidates.term_match_counts(
-            company_id=company_id, countries=config.target_countries, product_terms=terms,
+            company_id=company_id, countries=config.target_countries, product_terms=search_terms,
         )
         selected = self.candidates.select(
             company_id=company_id,
             countries=config.target_countries,
-            product_terms=terms,
+            product_terms=search_terms,
             limit=config.max_qualified_leads_per_country * max(1, len(config.target_countries)) * 3,
         )
         return estimate.model_copy(update={
@@ -329,7 +359,7 @@ class LeadResearchService:
             "indexed_candidates": len(selected),
             "discoverable_candidates": estimate.named_candidate_range,
             "unavailable_sources": estimate.unavailable_source_ids,
-            "unmapped_market_terms": sorted(term for term, count in matches.items() if not count),
+            "unmapped_market_terms": market_terms.unmapped_markets if market_terms else [],
         })
 
     def _lead_ids_by_organization(self, company_id: str) -> dict[str, str]:
@@ -612,7 +642,11 @@ class LeadResearchService:
         return errors
 
     def _reusable_bundles(
-        self, company_id: str, config: CampaignConfig, repo: EvidenceRepository
+        self,
+        company_id: str,
+        config: CampaignConfig,
+        repo: EvidenceRepository,
+        query_fingerprints: set[str] | None = None,
     ) -> dict[tuple[str, str], Any]:
         """Cached evidence this run may stand on instead of re-fetching.
 
@@ -625,7 +659,7 @@ class LeadResearchService:
         if not config.refresh.get("reuse_public_cache", True):
             return {}
         stamp = now()
-        fingerprint = repo.query_fingerprint(DiscoveryQuery(
+        fingerprints = query_fingerprints or {repo.query_fingerprint(DiscoveryQuery(
             campaign_id="fingerprint",
             seller_countries=config.seller_countries,
             target_countries=config.target_countries,
@@ -633,14 +667,14 @@ class LeadResearchService:
             hs_codes=config.hs_codes,
             product_terms=config.product_terms,
             buyer_types=config.buyer_types,
-        ))
+        ))}
         cutoffs = {}
         for source_id in config.enabled_source_ids:
             definition = self.registry.definitions.get(source_id)
             if definition is None:
                 continue
             cutoffs[source_id] = stamp - definition.freshness_days * 86400
-        return repo.reusable_bundles(cutoffs, fingerprint)
+        return repo.reusable_bundles(cutoffs, fingerprints)
 
     def _source_gate(self, source_id: str) -> threading.Semaphore:
         """How many candidates may hit one source at once.
@@ -1060,6 +1094,11 @@ class LeadResearchService:
         if not row:
             raise KeyError("campaign not found")
         config = CampaignConfig.model_validate(json_load(row["config"], {}))
+        scope_snapshot = json_load(row["scope_snapshot"], {})
+        frozen_profile = (
+            ProfileRepository(self.db).get(company_id, row["profile_version_id"])
+            if row["profile_version_id"] else None
+        )
         if row["status"] == "cancelled":
             # Cancelled between queueing and pickup. Claiming it as `running`
             # first would lose the cancellation and research the whole corpus.
@@ -1177,11 +1216,38 @@ class LeadResearchService:
                 )
             })
             metrics["attainable_dimensions"] = sorted(attainable)
+            product_terms = scope_snapshot.get(
+                "product_terms", self._product_terms(company_id, config)
+            )
+            queries: dict[str, DiscoveryQuery] = {}
+            for country in config.target_countries:
+                market_terms = (
+                    build_market_terms({
+                        **scope_snapshot,
+                        "target_countries": [country],
+                        "product_terms": product_terms,
+                    }, frozen_profile.profile)
+                    if frozen_profile else None
+                )
+                queries[country] = DiscoveryQuery(
+                    campaign_id=campaign_id,
+                    seller_countries=config.seller_countries,
+                    target_countries=[country],
+                    sector_ids=config.sector_ids,
+                    hs_codes=config.hs_codes,
+                    product_terms=product_terms,
+                    market_terms=market_terms.by_language if market_terms else {},
+                    buyer_types=config.buyer_types,
+                    max_records=config.max_qualified_leads_per_country * 3,
+                )
             # Evidence already paid for, still fresh enough to stand. Read once
-            # for the whole run: a rerun otherwise re-fetches every page it
-            # already holds, which is the dominant cost in the system.
-            reusable = self._reusable_bundles(company_id, config, repo)
-            product_terms = self._product_terms(company_id, config)
+            # for the whole run, accepting the exact per-market query shapes.
+            reusable = self._reusable_bundles(
+                company_id,
+                config,
+                repo,
+                {repo.query_fingerprint(query) for query in queries.values()},
+            )
             settled, closed_count = self._settled_identities(company_id)
             # Outside FUNNEL_KEYS on purpose: the funnel is monotonic and this
             # describes work never started, not a stage that lost records.
@@ -1189,16 +1255,7 @@ class LeadResearchService:
             for country in config.target_countries:
                 if cancelled:
                     break
-                query = DiscoveryQuery(
-                    campaign_id=campaign_id,
-                    seller_countries=config.seller_countries,
-                    target_countries=[country],
-                    sector_ids=config.sector_ids,
-                    hs_codes=config.hs_codes,
-                    product_terms=product_terms,
-                    buyer_types=config.buyer_types,
-                    max_records=config.max_qualified_leads_per_country * 3,
-                )
+                query = queries[country]
                 supply = self.discovery.supply(
                     company_id,
                     query,
