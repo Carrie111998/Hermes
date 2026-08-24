@@ -66,6 +66,39 @@ _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
 )
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+# ConPTY draws a run of blank cells as a cursor-forward escape instead of
+# literal spaces, so deleting the escape welds the words on either side into one
+# token. Measured against the live TUI on 2026-08-23: 85 of these in a single
+# readiness frame, 7 in one prompt echo, and zero CSI n G (absolute column) --
+# expanding this one form is what keeps drawn text readable as its own words.
+_ANSI_CURSOR_FORWARD_RE = re.compile(r"\x1b\[(\d*)C")
+_MAX_CURSOR_FORWARD_COLUMNS = 1024
+
+
+def _expand_cursor_forward(output: str) -> str:
+    """Restore skipped columns as the spaces the terminal drew in their place."""
+
+    def _columns(match: re.Match[str]) -> str:
+        digits = match.group(1)
+        if not digits or len(digits) > 7:
+            # An absent parameter means one column; an implausibly long one is
+            # garble, and either way the cap below is the only size that matters.
+            columns = 1 if not digits else _MAX_CURSOR_FORWARD_COLUMNS
+        else:
+            # CSI 0 C still advances a single column.
+            columns = int(digits) or 1
+        return " " * min(columns, _MAX_CURSOR_FORWARD_COLUMNS)
+
+    return _ANSI_CURSOR_FORWARD_RE.sub(_columns, output)
+
+
+def _stripped_terminal_text(output: str) -> str:
+    """Remove terminal control sequences, keeping drawn text spaced as drawn."""
+
+    expanded = _expand_cursor_forward(output)
+    return _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", expanded)).replace("\r", "")
+
+
 _CLAUDE_PROVIDER_LIMIT_BANNER_RE = re.compile(
     r"you've hit your (?:(?:session|weekly) )?limit[ \t]*"
     r"\u00b7[ \t]*resets[ \t]+\S[^\r\n]{0,159}"
@@ -1894,7 +1927,7 @@ def _is_provider_limit_before_registration_prompt(
 def _is_exact_registered_text(content: object) -> bool:
     if not isinstance(content, str):
         return False
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", content)).replace("\r", "")
+    cleaned = _stripped_terminal_text(content)
     return cleaned.strip() == "REGISTERED"
 
 
@@ -1986,8 +2019,7 @@ def _is_exact_provider_limit_banner(output: str) -> bool:
     if not isinstance(output, str) or not (1 <= len(output) <= _MAX_RESPONSE_CHARS):
         return False
     folded = (
-        _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output))
-        .replace("\r", "")
+        _stripped_terminal_text(output)
         .replace("Â·", "·")
         .casefold()
         .replace("’", "'")
@@ -2003,8 +2035,7 @@ def _is_provider_limit_failure(output: str) -> bool:
     if not isinstance(output, str) or not (1 <= len(output) <= _MAX_RESPONSE_CHARS):
         return False
     folded = (
-        _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output))
-        .replace("\r", "")
+        _stripped_terminal_text(output)
         .replace("\u00c2\u00b7", "\u00b7")
         .casefold()
         .replace("\u2019", "'")
@@ -2061,7 +2092,7 @@ def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
 
     if _known_claude_input_modal_visible(output):
         return "known_input_modal"
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     if _pasted_input_visible(output):
         return "pasted_input_visible"
     if _claude_main_repl_ready(output):
@@ -2082,7 +2113,7 @@ def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
 
 
 def _prompt_input_visible(output: str, *, prompt: str) -> bool:
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     if _pasted_input_visible(output):
         return True
     compact = _compact_terminal_text(cleaned)
@@ -2094,7 +2125,7 @@ def _prompt_input_visible(output: str, *, prompt: str) -> bool:
 
 
 def _pasted_input_visible(output: str) -> bool:
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
         return True
     compact = _compact_terminal_text(cleaned).casefold()
@@ -2233,7 +2264,7 @@ def _compact_terminal_text_with_raw_offsets(
 def _claude_main_repl_ready(output: str) -> bool:
     """Match the main-only footer forced by ``--permission-mode dontAsk``."""
 
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     return bool(_CLAUDE_MAIN_REPL_FOOTER_RE.search(cleaned)) and not (
         _known_claude_input_modal_visible(cleaned)
     )
@@ -2263,7 +2294,7 @@ def _bracketed_paste_enabled(output: str) -> bool:
 
 
 def _known_claude_input_modal_visible(output: str) -> bool:
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     folded = " ".join(cleaned.casefold().split())
     return any(
         all(value in folded for value in signature)
@@ -2282,7 +2313,7 @@ def _known_claude_input_modal_visible(output: str) -> bool:
 def _normalized_terminal_output(output: str, prompt: str | None) -> str:
     """Remove only recognized terminal echo/UI framing, preserving other output."""
 
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     if prompt is not None:
         for exact_echo in (prompt, prompt.replace("\n", "")):
             if exact_echo in cleaned:
@@ -2321,7 +2352,7 @@ def _interactive_prompt_frame(prompt: str) -> str:
 def _has_exact_registered_response(output: str, prompt: str) -> bool:
     if not isinstance(output, str) or len(output) > _MAX_RESPONSE_CHARS:
         return False
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     prompt_lines = {line.strip() for line in prompt.splitlines()}
     meaningful: list[str] = []
     for raw in cleaned.splitlines():
@@ -2358,7 +2389,7 @@ def _exact_registered_suffix(output: str) -> str | None:
 def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
     if require_complete and not output.endswith(("\r", "\n")):
         return None
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    cleaned = _stripped_terminal_text(output)
     lines = cleaned.splitlines()
     for index, raw in enumerate(lines):
         line = raw.strip()

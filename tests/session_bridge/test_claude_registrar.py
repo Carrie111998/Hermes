@@ -33,7 +33,12 @@ from session_bridge.claude_registrar import (
     _PtyResponseTimeout,
     _WinPtyProcess,
     _claude_main_repl_ready,
+    _has_exact_registered_response,
+    _is_provider_limit_failure,
+    _normalized_terminal_output,
+    _prompt_input_registered_response,
     _registrar_pywinpty_process_type,
+    _stripped_terminal_text,
 )
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
@@ -3963,3 +3968,130 @@ def test_registrar_spawn_does_not_mutate_standard_pywinpty_reader_during_overlap
     assert not changed
     monkeypatch.setattr(winpty_module, "_read_in_thread", original_reader)
     assert winpty_module._read_in_thread is original_reader
+
+
+# --- ConPTY cursor-forward layout ------------------------------------------
+#
+# ConPTY renders a run of blank cells as a cursor-forward escape (CSI n C)
+# instead of literal spaces. Deleting the escape rather than expanding it welds
+# the words on either side together, so the registrar stops recognizing the echo
+# of its own prompt. Measured against the live TUI on 2026-08-23: the readiness
+# frame carried 85 cursor-forward escapes and the prompt echo 7, while CSI n G
+# (absolute column) never appeared once -- which is why only CSI n C is
+# expanded here.
+CONPTY_PROMPT_ECHO_FRAME = (
+    "\x1b[7;3HReply\x1b[1Cwith\x1b[1Cexactly\x1b[1CREGISTERED\x1b[1Cand"
+    "\x1b[1Cnothing\x1b[1Celse.\x1b[7m \x1b[27m\x1b[9;39H\x1b[K\x1b[82C"
+)
+CONPTY_ECHOED_PROMPT = "Reply with exactly REGISTERED and nothing else."
+
+
+def test_cursor_forward_escape_expands_to_the_columns_it_skips() -> None:
+    """The captured live frame must read back as its own text, spaces included."""
+
+    assert (
+        CONPTY_ECHOED_PROMPT
+        in _stripped_terminal_text(CONPTY_PROMPT_ECHO_FRAME)
+    )
+
+
+def test_cursor_forward_echo_is_not_mistaken_for_a_response() -> None:
+    normalized = _normalized_terminal_output(
+        CONPTY_PROMPT_ECHO_FRAME, CONPTY_ECHOED_PROMPT
+    )
+
+    assert normalized == ""
+    assert _prompt_input_registered_response(
+        CONPTY_PROMPT_ECHO_FRAME, prompt=CONPTY_ECHOED_PROMPT
+    ) == (False, None)
+
+
+def test_space_rendered_echo_and_cursor_forward_echo_agree() -> None:
+    """Control: the two encodings of one frame must classify identically."""
+
+    spaced = CONPTY_PROMPT_ECHO_FRAME.replace("\x1b[1C", " ")
+
+    assert _normalized_terminal_output(
+        CONPTY_PROMPT_ECHO_FRAME, CONPTY_ECHOED_PROMPT
+    ) == _normalized_terminal_output(spaced, CONPTY_ECHOED_PROMPT)
+
+
+def test_cursor_forward_prompt_echo_still_submits_and_registers() -> None:
+    """The whole point: an un-submitted echo must not end the attempt."""
+
+    item = claim()
+    expected = build_claude_registration_prompt(
+        candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
+    )
+    process = FakePty(
+        prompt_input_output=_as_cursor_forward_echo(expected),
+        output="REGISTERED\r\n",
+    )
+    source = FakeSource([None, projection_for(item)])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "visible"
+    assert "\r" in process.writes
+    assert process.writes[-1] == "/exit\r"
+
+
+def test_cursor_forward_response_frame_is_still_exactly_registered() -> None:
+    """The reply frame is drawn the same way the echo is."""
+
+    prompt = "Reply with exactly REGISTERED and nothing else."
+    output = "\x1b[7;3H" + _as_cursor_forward_echo(prompt) + "\r\n\x1b[9;3HREGISTERED\r\n"
+
+    assert _has_exact_registered_response(output, prompt)
+
+
+def test_cursor_forward_does_not_hide_a_provider_limit_banner() -> None:
+    """Every multi-word matcher shares the welding hazard, not just the echo."""
+
+    banner = "You've hit your weekly limit · resets 3pm"
+    welded = _as_cursor_forward_echo(banner)
+
+    assert _is_provider_limit_failure(banner)
+    assert _is_provider_limit_failure(welded)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "columns"),
+    [
+        ("", 1),  # an absent parameter means one column
+        ("0", 1),  # CSI 0 C still advances one column
+        ("1", 1),
+        ("82", 82),  # the widest run measured in a live frame
+        # The cap is spelled out rather than read off the module under test: a
+        # test that imports the value it asserts moves whenever the value moves,
+        # and importing a not-yet-added name turns a red baseline into a
+        # collection error that hides every other test in this file.
+        ("1024", 1024),
+        ("4096", 1024),  # capped
+        ("99999999", 1024),  # garble, capped
+    ],
+)
+def test_cursor_forward_expands_to_a_bounded_column_count(
+    parameter: str, columns: int
+) -> None:
+    expanded = _stripped_terminal_text("a\x1b[%sCb" % parameter)
+
+    assert expanded == "a" + " " * columns + "b"
+
+
+def test_cursor_forward_survives_a_column_count_python_cannot_parse() -> None:
+    """Above sys.get_int_max_str_digits() int() raises; a drawn frame must not.
+
+    Nothing else in the strip path catches ValueError, so an unguarded int()
+    here would take down every predicate that reads terminal output.
+    """
+
+    digits = "9" * (sys.get_int_max_str_digits() + 700)
+
+    assert _stripped_terminal_text("a\x1b[" + digits + "Cb") == "a" + " " * 1024 + "b"
+
+
+def _as_cursor_forward_echo(text: str) -> str:
+    """Re-encode inter-word spaces the way ConPTY draws them."""
+
+    return "\x1b[1C".join(text.split(" "))
