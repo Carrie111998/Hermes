@@ -87,6 +87,10 @@ _REVIEW_MIN_KEY_LENGTH = 24
 # Keep overlap review conservative: candidates below this score are more likely
 # to be distinct facts that merely share common memory phrasing.
 _REVIEW_SIMILARITY_THRESHOLD = 0.72
+# A report is advisory context, not an exhaustive pairwise dump. Bounding it
+# prevents mutually similar stores from producing a response larger than the
+# bounded memory itself.
+_REVIEW_MAX_CANDIDATES = 20
 
 
 def _duplicate_key(content: str) -> str:
@@ -475,7 +479,11 @@ class MemoryStore:
             # merging merely related facts risks losing user intent.
             content_key = _duplicate_key(content)
             if any(_duplicate_key(entry) == content_key for entry in entries):
-                return self._success_response(target, "Entry already exists (no duplicate added).")
+                return self._success_response(
+                    target,
+                    "Entry already exists (no duplicate added).",
+                    effective_action="none",
+                )
 
             # Calculate what the new total would be
             new_entries = entries + [content]
@@ -500,7 +508,7 @@ class MemoryStore:
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        return self._success_response(target, "Entry added.", effective_action="add")
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -583,7 +591,11 @@ class MemoryStore:
             if duplicate_exists
             else "Entry replaced."
         )
-        return self._success_response(target, message)
+        return self._success_response(
+            target,
+            message,
+            effective_action="remove" if duplicate_exists else "replace",
+        )
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -625,7 +637,7 @@ class MemoryStore:
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        return self._success_response(target, "Entry removed.", effective_action="remove")
 
     def review(self, target: str) -> Dict[str, Any]:
         """Return advisory overlap candidates without changing the store."""
@@ -658,6 +670,16 @@ class MemoryStore:
                         "similarity": round(similarity, 2),
                     })
 
+        similar_entries.sort(
+            key=lambda candidate: (
+                -candidate["similarity"],
+                _duplicate_key(candidate["entries"][0]),
+                _duplicate_key(candidate["entries"][1]),
+            )
+        )
+        omitted_candidate_count = max(0, len(similar_entries) - _REVIEW_MAX_CANDIDATES)
+        similar_entries = similar_entries[:_REVIEW_MAX_CANDIDATES]
+
         current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
         limit = self._char_limit(target)
         return {
@@ -667,6 +689,8 @@ class MemoryStore:
             "entry_count": len(entries),
             "usage": f"{current:,}/{limit:,}",
             "similar_entries": similar_entries,
+            "has_more": omitted_candidate_count > 0,
+            "omitted_candidate_count": omitted_candidate_count,
             "note": (
                 "Candidates are advisory only. Use one atomic operations batch to "
                 "replace/remove entries you confirm overlap; distinct facts must remain separate."
@@ -710,6 +734,7 @@ class MemoryStore:
             working: List[str] = list(self._entries_for(target))
             limit = self._char_limit(target)
             consolidated_replacements = 0
+            effective_actions = []
 
             for i, op in enumerate(operations):
                 op = op or {}
@@ -723,8 +748,10 @@ class MemoryStore:
                         return self._batch_error(target, f"{pos}: content is required.")
                     content_key = _duplicate_key(content)
                     if any(_duplicate_key(entry) == content_key for entry in working):
+                        effective_actions.append("none")
                         continue  # idempotent -- skip duplicate, don't fail the batch
                     working.append(content)
+                    effective_actions.append("add")
 
                 elif act == "replace":
                     if not old_text:
@@ -750,8 +777,10 @@ class MemoryStore:
                     ):
                         working.pop(match_index)
                         consolidated_replacements += 1
+                        effective_actions.append("remove")
                     else:
                         working[match_index] = content
+                        effective_actions.append("replace")
 
                 elif act == "remove":
                     if not old_text:
@@ -765,6 +794,7 @@ class MemoryStore:
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
                     working.pop(matches[0])
+                    effective_actions.append("remove")
 
                 else:
                     return self._batch_error(
@@ -798,7 +828,7 @@ class MemoryStore:
                 f" Removed {consolidated_replacements} {noun} consolidated "
                 "with identical existing entries."
             )
-        return self._success_response(target, message)
+        return self._success_response(target, message, effective_actions=effective_actions)
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
@@ -831,7 +861,14 @@ class MemoryStore:
         """Truncated one-line previews of entries for error feedback."""
         return [e[:width] + ("..." if len(e) > width else "") for e in entries]
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+    def _success_response(
+        self,
+        target: str,
+        message: str = None,
+        *,
+        effective_action: Optional[str] = None,
+        effective_actions: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         # A successful write means the consolidation loop made progress, so the
         # per-turn failure budget resets (the cap counts consecutive failures,
         # not lifetime ones within a turn) (#42405).
@@ -857,6 +894,10 @@ class MemoryStore:
         }
         if message:
             resp["message"] = message
+        if effective_action is not None:
+            resp["effective_action"] = effective_action
+        if effective_actions is not None:
+            resp["effective_actions"] = effective_actions
         resp["note"] = "Write saved. This update is complete — do not repeat it."
         return resp
 

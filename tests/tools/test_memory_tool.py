@@ -6,6 +6,7 @@ from pathlib import Path
 
 from tools.memory_tool import (
     MemoryStore,
+    _REVIEW_MAX_CANDIDATES,
     memory_tool,
     _scan_memory_content,
 )
@@ -126,6 +127,7 @@ class TestMemoryStoreAdd:
 
         assert result["success"] is True
         assert result["entry_count"] == 1
+        assert result["effective_action"] == "none"
         assert "no duplicate added" in result["message"]
         assert store.memory_entries == ["User prefers concise replies."]
 
@@ -188,6 +190,7 @@ class TestMemoryStoreReplace:
         assert result["message"] == (
             "Entry removed: consolidated with an identical existing entry."
         )
+        assert result["effective_action"] == "remove"
         assert store.memory_entries == ["User prefers concise replies."]
 
 
@@ -288,7 +291,10 @@ class TestMemoryStorePersistence:
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         # Write file with duplicates
         mem_file = tmp_path / "MEMORY.md"
-        mem_file.write_text("duplicate entry\n§\nDUPLICATE   entry\n§\nunique entry")
+        mem_file.write_text(
+            "duplicate entry\n§\nDUPLICATE   entry\n§\nunique entry",
+            encoding="utf-8",
+        )
 
         store = MemoryStore()
         store.load_from_disk()
@@ -390,6 +396,22 @@ class TestMemoryToolDispatcher:
         assert result["success"] is True
         assert result["similar_entries"] == []
 
+    def test_review_bounds_and_orders_similar_candidates(self, store):
+        store.memory_char_limit = 10_000
+        for index in range(9):
+            store.add(
+                "memory",
+                f"Always think through the durable request before acting item {index:02d}.",
+            )
+
+        result = json.loads(memory_tool(action="review", target="memory", store=store))
+
+        assert len(result["similar_entries"]) == _REVIEW_MAX_CANDIDATES
+        assert result["has_more"] is True
+        assert result["omitted_candidate_count"] == 16
+        similarities = [item["similarity"] for item in result["similar_entries"]]
+        assert similarities == sorted(similarities, reverse=True)
+
 
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""
@@ -479,6 +501,7 @@ class TestMemoryBatch:
 
         assert result["success"] is True
         assert "Removed 1 entry consolidated" in result["message"]
+        assert result["effective_actions"] == ["remove"]
         assert store.memory_entries == ["User prefers concise replies."]
 
     def test_batch_injection_blocked_rejects_whole_batch(self, store):
@@ -535,11 +558,11 @@ class TestExternalDriftGuard:
         assert "drift_backup" in result
         # On-disk file is UNTOUCHED — that's the point.
         assert path.stat().st_size == original_size
-        assert "Vendor Master" in path.read_text()
+        assert "Vendor Master" in path.read_text(encoding="utf-8")
         # Backup exists with the drifted content.
         bak = result["drift_backup"]
         assert Path(bak).exists()
-        assert "Vendor Master" in Path(bak).read_text()
+        assert "Vendor Master" in Path(bak).read_text(encoding="utf-8")
         # The model has to know what file to look at and what to do.
         assert ".bak." in result["error"]
         assert "remediation" in result
