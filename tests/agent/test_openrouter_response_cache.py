@@ -220,6 +220,94 @@ class TestEnvVarOverrides:
         assert headers["X-OpenRouter-Cache"] == "true"
         assert headers["X-OpenRouter-Cache-TTL"] == "600"
 
+class TestModelCacheExclusion:
+    """Test model-scoped cache exclusion via response_cache_exclude_models."""
+
+    def test_prefix_match_excludes_stealth(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["stealth/"]}
+        headers = build_or_headers(or_config=cfg, model="stealth/ox-alpha")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_prefix_match_other_stealth_model(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["stealth/"]}
+        headers = build_or_headers(or_config=cfg, model="stealth/some-other")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_unlisted_model_still_cached(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["stealth/"]}
+        headers = build_or_headers(or_config=cfg, model="anthropic/claude-sonnet-4")
+        assert headers["X-OpenRouter-Cache"] == "true"
+
+    def test_exact_match_excluded(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["foo/bar"]}
+        headers = build_or_headers(or_config=cfg, model="foo/bar")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_exact_match_no_substring_bleed(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["foo/bar"]}
+        headers = build_or_headers(or_config=cfg, model="foo/bar-baz")
+        assert headers["X-OpenRouter-Cache"] == "true"
+
+    def test_wildcard_suffix_prefix_match(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["stealth*"]}
+        headers = build_or_headers(or_config=cfg, model="stealth/ox-alpha")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_case_insensitive(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["STEALTH/"]}
+        headers = build_or_headers(or_config=cfg, model="Stealth/Ox-Alpha")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_empty_exclude_list_caches_stealth(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": []}
+        headers = build_or_headers(or_config=cfg, model="stealth/ox-alpha")
+        assert headers["X-OpenRouter-Cache"] == "true"
+
+    def test_json_string_form(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": '["stealth/"]'}
+        headers = build_or_headers(or_config=cfg, model="stealth/ox-alpha")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_comma_separated_string_form(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": "stealth/, foo/bar"}
+        assert "X-OpenRouter-Cache" not in build_or_headers(or_config=cfg, model="stealth/x")
+        assert "X-OpenRouter-Cache" not in build_or_headers(or_config=cfg, model="foo/bar")
+
+    def test_single_bare_string_form(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": "stealth/"}
+        headers = build_or_headers(or_config=cfg, model="stealth/ox-alpha")
+        assert "X-OpenRouter-Cache" not in headers
+
+    def test_no_model_arg_ignores_exclude_list(self):
+        from agent.auxiliary_client import build_or_headers
+
+        cfg = {"response_cache": True, "response_cache_exclude_models": ["stealth/"]}
+        headers = build_or_headers(or_config=cfg)
+        assert headers["X-OpenRouter-Cache"] == "true"
+
+
 class TestDefaultConfig:
     """Verify the openrouter config section is in DEFAULT_CONFIG."""
 
@@ -230,6 +318,12 @@ class TestDefaultConfig:
         or_cfg = DEFAULT_CONFIG["openrouter"]
         assert or_cfg["response_cache"] is True
         assert or_cfg["response_cache_ttl"] == 300
+
+    def test_response_cache_exclude_models_default(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        or_cfg = DEFAULT_CONFIG["openrouter"]
+        assert or_cfg.get("response_cache_exclude_models") == []
 
 
 # ---------------------------------------------------------------------------

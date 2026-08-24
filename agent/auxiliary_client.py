@@ -614,7 +614,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     return merged or headers
 
 
-def build_or_headers(or_config: dict | None = None) -> dict:
+def build_or_headers(or_config: dict | None = None, model: str | None = None) -> dict:
     """Build OpenRouter headers, optionally including response-cache headers.
 
     Precedence for response cache: env var > config.yaml > default (enabled).
@@ -628,6 +628,13 @@ def build_or_headers(or_config: dict | None = None) -> dict:
 
     *or_config* is the ``openrouter`` section from config.yaml.  When *None*,
     falls back to reading config from disk via ``load_config()``.
+
+    *model* optionally scopes the cache decision to a single model.  When
+    given and it matches an entry in ``openrouter.response_cache_exclude_models``
+    (prefix match when the entry ends in ``/`` or ``*``, else exact id), the
+    cache header is omitted — e.g. stealth/* proxy models can return empty
+    responses that get cached and then replay to defeat the empty-response
+    retry loop.
     """
     headers = dict(_OR_HEADERS_BASE)
 
@@ -645,6 +652,37 @@ def build_or_headers(or_config: dict | None = None) -> dict:
         cache_enabled = env_cache in _TRUTHY_ENV_VALUES
     else:
         cache_enabled = or_config.get("response_cache", False)
+
+    # Per-model cache exclusion (config knob).  Prefix match on trailing
+    # "/" or "*", exact match otherwise.  Normalizes a list, a comma-separated
+    # string, or a JSON-encoded list (e.g. from `hermes config set`) to entries.
+    if model:
+        m = str(model).lower()
+        raw_excludes = or_config.get("response_cache_exclude_models", []) or []
+        if isinstance(raw_excludes, str):
+            s = raw_excludes.strip()
+            if s.startswith("["):
+                try:
+                    import json as _json
+                    parsed = _json.loads(s)
+                    raw_excludes = parsed if isinstance(parsed, list) else [s]
+                except Exception:
+                    raw_excludes = [s]
+            elif "," in s:
+                raw_excludes = [p.strip() for p in s.split(",") if p.strip()]
+            else:
+                raw_excludes = [s]
+        for entry in raw_excludes:
+            e = str(entry).lower().strip()
+            if not e:
+                continue
+            if e.endswith(("/", "*")):
+                if m.startswith(e.rstrip("/*") + "/") or m.startswith(e.rstrip("*")):
+                    cache_enabled = False
+                    break
+            elif m == e:
+                cache_enabled = False
+                break
 
     if not cache_enabled:
         return headers

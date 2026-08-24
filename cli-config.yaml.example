@@ -176,6 +176,9 @@ model:
 # openrouter:
 #   response_cache: true         # Enable response caching (default: true)
 #   response_cache_ttl: 300      # Cache TTL in seconds, 1-86400 (default: 300)
+#   response_cache_exclude_models: []   # Model ids/prefixes that bypass the cache.
+#                                #   Trailing "/" or "*" = prefix match; otherwise exact id.
+#                                #   e.g. ["stealth/"] disables caching for every stealth/* model.
 
 # =============================================================================
 # Git Worktree Isolation

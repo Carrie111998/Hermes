@@ -1523,10 +1523,16 @@ DEFAULT_CONFIG = {
     #   pick the strongest available coder (router's documented default
     #   when the plugins block is omitted).
     #   See: https://openrouter.ai/docs/guides/routing/routers/pareto-router
+    # response_cache_exclude_models: list of model ids/prefixes that bypass
+    #   the response cache even when response_cache is enabled.  A trailing
+    #   "/" or "*" is a prefix match; otherwise exact model id.  Useful for
+    #   stealth/* proxy models that can return empty responses which, if
+    #   cached, replay into the empty-response retry loop.
     "openrouter": {
         "response_cache": True,
         "response_cache_ttl": 300,
         "min_coding_score": 0.65,
+        "response_cache_exclude_models": [],
     },
 
     # AWS Bedrock provider configuration.

@@ -1446,6 +1446,24 @@ provider_routing:
 
 **Shortcuts:** Append `:nitro` to any model name for throughput sorting (e.g., `anthropic/claude-sonnet-4:nitro`), or `:floor` for price sorting.
 
+## OpenRouter Response Caching
+
+OpenRouter can serve identical requests from its response cache (zero billing). Enable it under the `openrouter` section of `~/.hermes/config.yaml`:
+
+```yaml
+openrouter:
+  response_cache: true        # Enable OpenRouter response caching (X-OpenRouter-Cache header). Default true.
+  response_cache_ttl: 300     # Seconds a cached response stays valid (1-86400). Default 300.
+  response_cache_exclude_models: []   # Models/prefixes that bypass the cache.
+```
+
+Notes:
+
+- A trailing `/` or `*` in `response_cache_exclude_models` is a **prefix** match; otherwise the entry must equal the full model id. For example, `"stealth/"` excludes every `stealth/*` model while leaving all other OpenRouter models cached.
+- This is useful for proxy models (like `stealth/*`) that can return empty responses — if an empty response gets cached, OpenRouter replays it on retry and defeats Hermes's empty-response retry loop.
+- `response_cache_exclude_models` accepts a YAML list, a comma-separated string, or a JSON-encoded list (what `hermes config set` writes).
+- The `HERMES_OPENROUTER_CACHE` environment variable overrides `response_cache` globally (see [Environment Variables](/reference/environment-variables)).
+
 ## OpenRouter Pareto Code Router
 
 OpenRouter ships an experimental coding-model router at `openrouter/pareto-code` that auto-routes requests to the cheapest model meeting a coding-quality bar (ranked by [Artificial Analysis](https://artificialanalysis.ai/)). Pick this model and tune the `min_coding_score` knob in `~/.hermes/config.yaml`:
