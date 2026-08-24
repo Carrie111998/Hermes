@@ -581,6 +581,7 @@ def _apply_profile_override() -> None:
         "-s", "--skills",
         "--usage-file",
         "--in",
+        "--reasoning",
     }
     optional_value_flags = {"-c", "--continue"}
     i = 0
@@ -11920,6 +11921,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-s", "--skills",
         "--usage-file",
         "--in",
+        "--reasoning",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as
         # value-taking: if the next token is a subcommand-looking word
         # the user almost certainly meant it as the session name, and
