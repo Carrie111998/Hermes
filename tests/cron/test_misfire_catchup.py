@@ -82,6 +82,32 @@ class TestFireOverdueJobs:
         assert provider.wait_fired()
         assert provider.fired == [job["id"]]
 
+    def test_retires_stale_oneshot_instead_of_firing(self, tmp_cron_dir):
+        job = create_job(prompt="p", schedule="1h")
+        _park_in_past(job["id"], minutes=60)
+        provider = RecordingProvider()
+
+        assert fire_overdue_jobs(provider) == 0
+        assert provider.fired == []
+
+        retired = get_job(job["id"])
+        assert retired["enabled"] is False
+        assert retired["state"] == "completed"
+        assert retired["last_status"] == "missed"
+        assert retired["next_run_at"] is None
+
+    def test_fires_oneshot_within_its_grace(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr(
+            "cron.scheduler_provider._misfire_grace_minutes", lambda: 1.0
+        )
+        job = create_job(prompt="p", schedule="1h")
+        _park_in_past(job["id"], minutes=1.5)
+        provider = RecordingProvider()
+
+        assert fire_overdue_jobs(provider) == 1
+        assert provider.wait_fired()
+        assert provider.fired == [job["id"]]
+
     def test_respects_grace_window(self, tmp_cron_dir):
         """A job only a few minutes overdue is still the external
         scheduler's to retry — the backstop must not race it."""

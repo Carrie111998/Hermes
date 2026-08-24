@@ -138,6 +138,37 @@ class TestNaiveScheduleTimezoneDivergence:
             f"one-shot should be due; next_run_at={job['next_run_at']}"
         )
 
+    def test_stale_stored_oneshot_is_retired_without_firing(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A persisted one-shot beyond the miss grace must not fire on restart."""
+        now = datetime(2026, 6, 22, 20, 0, 0, tzinfo=timezone.utc)
+        run_at = (now - timedelta(hours=1)).isoformat()
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs(
+            [{
+                "id": "stale-oneshot",
+                "name": "Stale reminder",
+                "prompt": "old reminder",
+                "schedule": {"kind": "once", "run_at": run_at},
+                "next_run_at": run_at,
+                "repeat": {"times": 1, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+            }]
+        )
+
+        assert get_due_jobs() == []
+
+        retired = get_job("stale-oneshot")
+        assert retired["enabled"] is False
+        assert retired["state"] == "completed"
+        assert retired["last_status"] == "missed"
+        assert retired["next_run_at"] is None
+        assert retired.get("last_run_at") is None
+        assert retired["missed_at"] == now.isoformat()
+        assert retired["repeat"]["completed"] == 0
+
 
 # =========================================================================
 # compute_next_run
@@ -1573,6 +1604,24 @@ class TestCompletedOneshotRetentionSweep:
         assert kept is not None
         assert kept["state"] == "completed"
         assert kept["last_delivery_error"] == "boom"
+
+    def test_sweep_ages_missed_oneshot_from_missed_at(self, tmp_cron_dir):
+        missed_at = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat()
+        save_jobs([{
+            "id": "old-missed",
+            "schedule": {"kind": "once", "run_at": missed_at},
+            "enabled": False,
+            "state": "completed",
+            "next_run_at": None,
+            "last_status": "missed",
+            "missed_at": missed_at,
+        }])
+
+        get_due_jobs()
+
+        assert get_job("old-missed") is None
 
     def test_sweep_ignores_recurring_jobs(self, tmp_cron_dir):
         """Old recurring jobs are never candidates, whatever their history."""

@@ -865,6 +865,31 @@ def _recoverable_oneshot_run_at(
     return None
 
 
+def _oneshot_missed_grace(
+    job: Dict[str, Any], next_run_dt: datetime, now: datetime
+) -> bool:
+    schedule = job.get("schedule")
+    return (
+        isinstance(schedule, dict)
+        and schedule.get("kind") == "once"
+        and (now - next_run_dt).total_seconds() > ONESHOT_GRACE_SECONDS
+    )
+
+
+def _mark_oneshot_missed(job: Dict[str, Any], now: datetime) -> None:
+    """Retire an expired one-shot without recording a run that never happened."""
+    job["enabled"] = False
+    job["state"] = "completed"
+    job["next_run_at"] = None
+    job["last_status"] = "missed"
+    job["last_error"] = (
+        f"One-shot missed its {ONESHOT_GRACE_SECONDS}-second grace window and was not run"
+    )
+    job["missed_at"] = now.isoformat()
+    job["fire_claim"] = None
+    job["run_claim"] = None
+
+
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
@@ -3007,12 +3032,32 @@ def _claim_job_for_fire_locked(
                 job["state"] = "scheduled"
                 job["paused_at"] = None
                 job["paused_reason"] = None
+            kind = job.get("schedule", {}).get("kind")
+            if not force and kind == "once":
+                next_run_at = job.get("next_run_at")
+                try:
+                    next_run_dt = _ensure_aware(datetime.fromisoformat(next_run_at))
+                except (TypeError, ValueError):
+                    next_run_dt = None
+                if next_run_dt is not None and _oneshot_missed_grace(
+                    job, next_run_dt, now
+                ):
+                    _mark_oneshot_missed(job, now)
+                    save_jobs(jobs)
+                    logger.info(
+                        "Job '%s': one-shot missed its scheduled time (%s, grace=%ds); "
+                        "retiring without dispatch",
+                        job.get("name", job_id),
+                        next_run_at,
+                        ONESHOT_GRACE_SECONDS,
+                    )
+                    return False
+
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
             job["fire_claim"] = {"at": now.isoformat(), "by": owner}
-            kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
@@ -3061,8 +3106,9 @@ def _sweep_completed_oneshots(
     ``save_jobs``'s shrink-merge guard (#80624) allows the intentional delete.
     Only one-shot (``schedule.kind == "once"``) records in the terminal
     completed state are candidates; recurring jobs and non-terminal one-shots
-    are never touched. Age is measured from ``last_run_at`` — a completed
-    record without a parseable ``last_run_at`` is kept (never guess a record
+    are never touched. Age is measured from ``last_run_at`` for executed jobs
+    or ``missed_at`` for one-shots retired without execution. A completed
+    record without either parseable timestamp is kept (never guess a record
     into deletion).
     """
     retention_days = _completed_oneshot_retention_days()
@@ -3078,7 +3124,7 @@ def _sweep_completed_oneshots(
             kind = schedule.get("kind") if isinstance(schedule, dict) else None
             if kind != "once":
                 continue
-            last_run = rj.get("last_run_at")
+            last_run = rj.get("last_run_at") or rj.get("missed_at")
             if not isinstance(last_run, str):
                 continue
             try:
@@ -3498,6 +3544,22 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                 rj["next_run_at"] = new_next
                                 needs_save = True
                                 break
+                    continue
+
+                if _oneshot_missed_grace(job, next_run_dt, now):
+                    logger.info(
+                        "Job '%s': one-shot missed its scheduled time (%s, grace=%ds); "
+                        "retiring without dispatch",
+                        job.get("name", job.get("id", "?")),
+                        next_run,
+                        ONESHOT_GRACE_SECONDS,
+                    )
+                    _mark_oneshot_missed(job, now)
+                    for rj in raw_jobs:
+                        if rj["id"] == job["id"]:
+                            _mark_oneshot_missed(rj, now)
+                            needs_save = True
+                            break
                     continue
 
                 # For recurring jobs, check if the scheduled time is stale

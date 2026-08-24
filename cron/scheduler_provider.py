@@ -394,14 +394,6 @@ def fire_overdue_jobs(
         if overdue_seconds < grace_minutes * 60:
             continue
         job_id = str(job.get("id") or "")
-        logger.warning(
-            "Misfire catch-up: job %s (%s) was due %s (%.0f min overdue) and "
-            "no external fire arrived — firing locally.",
-            job_id,
-            job.get("name") or "unnamed",
-            next_run_at,
-            overdue_seconds / 60,
-        )
         try:
             # Two-phase, webhook-style: claim synchronously (fast store
             # CAS — losing means an external retry beat us, which is
@@ -410,6 +402,14 @@ def fire_overdue_jobs(
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
+            logger.warning(
+                "Misfire catch-up: job %s (%s) was due %s (%.0f min overdue) and "
+                "no external fire arrived — firing locally.",
+                job_id,
+                job.get("name") or "unnamed",
+                next_run_at,
+                overdue_seconds / 60,
+            )
             threading.Thread(
                 target=provider.fire_claimed,
                 args=(claimed,),
