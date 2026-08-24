@@ -6,12 +6,12 @@ description: "Expose hermes-agent as an OpenAI-compatible API for any frontend"
 
 # API Server
 
-The API server exposes hermes-agent as an OpenAI-compatible HTTP endpoint. Any frontend that speaks the OpenAI format — Open WebUI, LobeChat, LibreChat, NextChat, ChatBox, and hundreds more — can connect to hermes-agent and use it as a backend.
+The API server exposes hermes-agent as an OpenAI-compatible HTTP endpoint. Any frontend that speaks the OpenAI format â€” Open WebUI, LobeChat, LibreChat, NextChat, ChatBox, and hundreds more â€” can connect to hermes-agent and use it as a backend.
 
 Your agent handles requests with its full toolset (terminal, file operations, web search, memory, skills) and returns the final response. When streaming, tool progress indicators appear inline so frontends can show what the agent is doing.
 
 :::tip One backend covers models + tools
-Hermes itself needs a configured provider and tool backends for the API server to be useful. A [Nous Portal](/user-guide/features/tool-gateway) subscription handles both — 300+ models plus web/image/TTS/browser via the Tool Gateway. Run `hermes setup --portal` once before starting the API server and frontends like Open WebUI or LobeChat get a fully tool-equipped backend.
+Hermes itself needs a configured provider and tool backends for the API server to be useful. A [Nous Portal](/user-guide/features/tool-gateway) subscription handles both â€” 300+ models plus web/image/TTS/browser via the Tool Gateway. Run `hermes setup --portal` once before starting the API server and frontends like Open WebUI or LobeChat get a fully tool-equipped backend.
 :::
 
 ## Quick Start
@@ -51,13 +51,13 @@ curl http://localhost:8642/v1/chat/completions \
   -d '{"model": "hermes-agent", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-Or connect Open WebUI, LobeChat, or any other frontend — see the [Open WebUI integration guide](/user-guide/messaging/open-webui) for step-by-step instructions.
+Or connect Open WebUI, LobeChat, or any other frontend â€” see the [Open WebUI integration guide](/user-guide/messaging/open-webui) for step-by-step instructions.
 
 ## Endpoints
 
 ### POST /v1/chat/completions
 
-Standard OpenAI Chat Completions format. Stateless — the full conversation is included in each request via the `messages` array.
+Standard OpenAI Chat Completions format. Stateless â€” the full conversation is included in each request via the `messages` array.
 
 **Request:**
 ```json
@@ -114,7 +114,7 @@ Uploaded files (`file` / `input_file` / `file_id`) and non-image `data:` URLs re
 
 ### POST /v1/responses
 
-OpenAI Responses API format. Supports server-side conversation state via `previous_response_id` — the server stores full conversation history (including tool calls and results) so multi-turn context is preserved without the client managing it.
+OpenAI Responses API format. Supports server-side conversation state via `previous_response_id` â€” the server stores full conversation history (including tool calls and results) so multi-turn context is preserved without the client managing it.
 
 **Request:**
 ```json
@@ -142,7 +142,7 @@ OpenAI Responses API format. Supports server-side conversation state via `previo
 }
 ```
 
-Tool calls in the `output` array were already executed server-side by the Hermes agent — they are replayed with `"status": "completed"` for structured tool UI, never as pending calls for the client to execute.
+Tool calls in the `output` array were already executed server-side by the Hermes agent â€” they are replayed with `"status": "completed"` for structured tool UI, never as pending calls for the client to execute.
 
 **Inline image input:** `input[].content` can contain `input_text` and `input_image` parts. Both remote URLs and `data:image/...` URLs are supported:
 
@@ -174,7 +174,7 @@ Chain responses to maintain full context (including tool calls) across turns:
 }
 ```
 
-The server reconstructs the full conversation from the stored response chain — all previous tool calls and results are preserved. Chained requests also share the same session, so multi-turn conversations appear as a single entry in the dashboard and session history.
+The server reconstructs the full conversation from the stored response chain â€” all previous tool calls and results are preserved. Chained requests also share the same session, so multi-turn conversations appear as a single entry in the dashboard and session history.
 
 #### Named conversations
 
@@ -338,7 +338,7 @@ are not an identity field. A different controller id or browser profile in the
 same authenticated session lane is a hard replacement: old pending work is
 cancelled before the successor becomes routable. Send
 `browser.controller.detach` on the authenticated controller transport for an
-intentional hard detach — that immediately cancels pending work. Merely closing
+intentional hard detach â€” that immediately cancels pending work. Merely closing
 the socket is treated as a recoverable disconnect.
 
 The authenticated dashboard transport exposes the same registration, result,
@@ -353,9 +353,9 @@ retried through a different browser backend.
 Authenticated clients can override Hermes' default model selection per request
 by sending:
 
-- `model` — the target model id for this turn
-- `provider` — the Hermes provider slug to resolve credentials/runtime for this turn
-- `model_options` — request-scoped reasoning / service-tier controls
+- `model` â€” the target model id for this turn
+- `provider` â€” the Hermes provider slug to resolve credentials/runtime for this turn
+- `model_options` â€” request-scoped reasoning / service-tier controls
 
 The same request fields are accepted on:
 
@@ -391,8 +391,8 @@ gateway:
       direct_model_requests: true
 ```
 
-Requests that include an explicit `provider` — and the Hermes-native
-`/v1/runs` and session-chat endpoints — always honor the requested model
+Requests that include an explicit `provider` â€” and the Hermes-native
+`/v1/runs` and session-chat endpoints â€” always honor the requested model
 regardless of this flag.
 
 Example:
@@ -468,12 +468,12 @@ Server-Sent Events stream of the run's tool-call progress, token deltas, and lif
 
 When the agent delegates work to background subagents, the stream also carries
 `subagent.start` and `subagent.complete` lifecycle events, so clients can
-observe delegation outcomes — including timeouts and failures — instead of the
+observe delegation outcomes â€” including timeouts and failures â€” instead of the
 run going silent while a child works. The `subagent.complete` payload carries
 the child's status, summary, duration, token/cost figures, and a
 `child_session_id` for correlation; free-text fields pass forced secret
 redaction before leaving the process. Per-tool child events
-(`subagent.tool`, progress ticks) are intentionally **not** forwarded — they
+(`subagent.tool`, progress ticks) are intentionally **not** forwarded â€” they
 are high-volume UI noise; use the per-child live transcript files for
 play-by-play.
 
@@ -504,7 +504,7 @@ List all scheduled jobs.
 
 ### POST /api/jobs
 
-Create a new scheduled job. Body accepts the same shape as `hermes cron` — prompt, schedule, skills, provider override, delivery target.
+Create a new scheduled job. Body accepts the same shape as `hermes cron` â€” prompt, schedule, skills, provider override, delivery target.
 
 ### GET /api/jobs/\{job_id\}
 
@@ -536,7 +536,7 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/sessions` | List sessions (paginated — `limit`, `offset`, `source`, `include_children`) |
+| `GET` | `/api/sessions` | List sessions (paginated â€” `limit`, `offset`, `source`, `include_children`) |
 | `POST` | `/api/sessions` | Create an empty session |
 | `GET` | `/api/sessions/{id}` | Read session metadata |
 | `PATCH` | `/api/sessions/{id}` | Update title or `end_reason` |
@@ -544,7 +544,7 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
-| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
+| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn â€” emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 
@@ -567,11 +567,11 @@ curl -N -X POST http://localhost:8642/api/sessions/$ID/chat/stream \
 ```bash
 curl http://localhost:8642/v1/skills \
   -H "Authorization: Bearer $API_SERVER_KEY"
-# → [{"name": "github-pr-workflow", "description": "...", "category": "..."}, ...]
+# â†’ [{"name": "github-pr-workflow", "description": "...", "category": "..."}, ...]
 
 curl http://localhost:8642/v1/toolsets \
   -H "Authorization: Bearer $API_SERVER_KEY"
-# → [{"name": "core", "label": "...", "description": "...", "enabled": true,
+# â†’ [{"name": "core", "label": "...", "description": "...", "enabled": true,
 #     "configured": true, "tools": ["read_file", "write_file", ...]}, ...]
 ```
 
@@ -588,11 +588,11 @@ X-Hermes-Session-Id: transcript-alpha
 X-Hermes-Session-Key: agent:main:webui:dm:user-42
 ```
 
-Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and the value is echoed back on responses (JSON + SSE). `/v1/capabilities` advertises support via `"session_key_header": "X-Hermes-Session-Key"`. Without the key, Honcho's `per-session` strategy produces a different scope per `session_id` — exactly the behavior Hermes had before.
+Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and the value is echoed back on responses (JSON + SSE). `/v1/capabilities` advertises support via `"session_key_header": "X-Hermes-Session-Key"`. Without the key, Honcho's `per-session` strategy produces a different scope per `session_id` â€” exactly the behavior Hermes had before.
 
 ## System Prompt Handling
 
-When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API), hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.
+When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API), hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills â€” the frontend's system prompt adds extra instructions.
 
 This means you can customize behavior per-frontend without losing capabilities:
 - Open WebUI system prompt: "You are a Python expert. Always include type hints."
@@ -608,24 +608,24 @@ Authorization: Bearer ***
 
 Configure the key via `API_SERVER_KEY` env var. If you need a browser to call Hermes directly, also set `API_SERVER_CORS_ORIGINS` to an explicit allowlist.
 
-### Multi-profile routing (`/p/<profile>/…`)
+### Multi-profile routing (`/p/<profile>/â€¦`)
 
 When [multi-profile gateway routing](/user-guide/multi-profile-gateways) is
 enabled (`gateway.multiplex_profiles`), the shared listener serves every
-profile through a `/p/<profile>/` URL prefix — and **authentication is bound
+profile through a `/p/<profile>/` URL prefix â€” and **authentication is bound
 to the routed profile**:
 
 - Requests to `/p/<profile>/v1/...` must present that profile's own
   `API_SERVER_KEY` (from `~/.hermes/profiles/<profile>/.env`). The default
   listener's key is rejected on named-profile prefixes.
 - Unprefixed routes and `/p/default/...` keep using the default profile's key.
-- A named profile with no `API_SERVER_KEY` of its own fails closed — its
+- A named profile with no `API_SERVER_KEY` of its own fails closed â€” its
   prefix is unreachable until you set one.
 
 :::warning Breaking change (July 2026)
 Before this fix, a valid default-profile key was accepted on any
 `/p/<profile>/` prefix. If you relied on one shared key across profile
-prefixes, set a distinct `API_SERVER_KEY` in each profile's `.env` — reused
+prefixes, set a distinct `API_SERVER_KEY` in each profile's `.env` â€” reused
 default keys on named prefixes now return `401`.
 :::
 
@@ -666,13 +666,13 @@ gateway:
 
 ### Concurrent-run cap
 
-The API server limits how many agent runs may execute at once across the OpenAI-compatible and Runs endpoints. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). When the cap is reached, new run-starting requests are rejected with **HTTP 429** `Too many concurrent runs (max N)` — clients should back off and retry.
+The API server limits how many agent runs may execute at once across the OpenAI-compatible and Runs endpoints. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). When the cap is reached, new run-starting requests are rejected with **HTTP 429** `Too many concurrent runs (max N)` â€” clients should back off and retry.
 
 ## Security Headers
 
 All responses include security headers:
-- `X-Content-Type-Options: nosniff` — prevents MIME type sniffing
-- `Referrer-Policy: no-referrer` — prevents referrer leakage
+- `X-Content-Type-Options: nosniff` â€” prevents MIME type sniffing
+- `Referrer-Policy: no-referrer` â€” prevents referrer leakage
 
 ## CORS
 
@@ -687,7 +687,7 @@ API_SERVER_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 When CORS is enabled:
 - **Preflight responses** include `Access-Control-Max-Age: 600` (10 minute cache)
 - **SSE streaming responses** include CORS headers so browser EventSource clients work correctly
-- **`Idempotency-Key`** is an allowed request header — clients can send it for deduplication (responses are cached by key for 5 minutes)
+- **`Idempotency-Key`** is an allowed request header â€” clients can send it for deduplication (responses are cached by key for 5 minutes)
 
 Most documented frontends such as Open WebUI connect server-to-server and do not need CORS at all.
 
@@ -706,8 +706,8 @@ Any frontend that supports the OpenAI API format works. Tested/documented integr
 | Jan | 26k | Remote model config |
 | HF Chat-UI | 8k | OPENAI_BASE_URL |
 | big-AGI | 7k | Custom endpoint |
-| OpenAI Python SDK | — | `OpenAI(base_url="http://localhost:8642/v1")` |
-| curl | — | Direct HTTP requests |
+| OpenAI Python SDK | â€” | `OpenAI(base_url="http://localhost:8642/v1")` |
+| curl | â€” | Direct HTTP requests |
 
 ## Multi-User Setup with Profiles
 
@@ -739,21 +739,25 @@ hermes -p bob gateway &
 
 Each profile's API server automatically advertises the profile name as the model ID:
 
-- `http://localhost:8643/v1/models` → model `alice`
-- `http://localhost:8644/v1/models` → model `bob`
+- `http://localhost:8643/v1/models` â†’ model `alice`
+- `http://localhost:8644/v1/models` â†’ model `bob`
 
 In Open WebUI, add each as a separate connection. The model dropdown shows `alice` and `bob` as distinct models, each backed by a fully isolated Hermes instance. See the [Open WebUI guide](/user-guide/messaging/open-webui#multi-user-setup-with-profiles) for details.
 
 ## Limitations
 
-- **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
-- **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
-- **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
+- **Response storage** â€” stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
+- **No file upload** â€” inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
+- **Simple OpenAI clients still see an alias** â€” `/v1/models` advertises the
   stable Hermes alias (`hermes-agent` or the active profile name). Richer
   clients can send explicit `provider` / `model_options` overrides on requests.
 
 ## Proxy Mode
 
-The API server also serves as the backend for **gateway proxy mode**. When another Hermes gateway instance is configured with `GATEWAY_PROXY_URL` pointing at this API server, it forwards all messages here instead of running its own agent. This enables split deployments — for example, a Docker container handling Matrix E2EE that relays to a host-side agent.
+The API server also serves as the backend for **gateway proxy mode**. When another Hermes gateway instance is configured with `GATEWAY_PROXY_URL` pointing at this API server, it forwards all messages here instead of running its own agent. This enables split deployments â€” for example, a Docker container handling Matrix E2EE that relays to a host-side agent.
 
 See [Matrix Proxy Mode](/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos) for the full setup guide.
+
+## Auxiliary Task KV Priority
+
+Auxiliary tasks (curator, vision, title generation, session_search) can set `extra_body.priority` to control cache eviction order. Tasks with lower priority values are evicted first when the KV cache is under pressure. One-shot tasks should set `priority: 0` to be evicted before long-running conversation sessions. See `agent/auxiliary_client.py::_resolve_auto` for the resolution order.
