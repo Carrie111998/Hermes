@@ -292,6 +292,48 @@ def test_exec_keeps_resolver_fallback_when_no_wrapper_on_path(
     assert exec_line.endswith("desktop")
 
 
+def test_exec_uses_known_wrapper_when_path_lookup_misses(
+    tmp_path, xdg_home, monkeypatch
+):
+    """Stripped-PATH session + wrapper at the known installer location.
+
+    systemd user sessions and autostart relaunches often run without
+    ~/.local/bin on PATH. When shutil.which finds nothing, the resolver
+    must probe the known durable locations directly instead of silently
+    persisting a checkout-internal Exec line.
+    """
+    import sys
+
+    root = _make_project(tmp_path)
+    repo_script = root / "hermes"
+    repo_script.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    repo_script.chmod(0o755)
+
+    # The wrapper exists at the known location but is NOT on PATH.
+    known_wrapper = tmp_path / "known-home" / ".local" / "bin" / "hermes"
+    known_wrapper.parent.mkdir(parents=True)
+    known_wrapper.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    known_wrapper.chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path / "known-home"))
+
+    _argv0_context(monkeypatch, str(repo_script))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    def fake_resolve():
+        return sys.argv[0] if sys.argv[0] else None
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # The probe found the wrapper despite the PATH miss.
+    assert exec_line == f"{known_wrapper} desktop"
+
+
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr(

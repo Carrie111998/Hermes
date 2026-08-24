@@ -19,8 +19,8 @@ for the freedesktop menu cache, and ``kbuildsycoca6``/``kbuildsycoca5``
 for Plasma. Run each tool only when it exists. A missing tool is not an
 error.
 
-Import-light and side-effect-free at import time: the uninstaller and the
-Electron main process both use this without loading the full CLI.
+Import-light and side-effect-free at import time: the uninstaller uses
+this without loading the full CLI.
 """
 
 from __future__ import annotations
@@ -196,14 +196,9 @@ def _known_wrapper_candidates():
     prefix = os.environ.get("PREFIX")
     if prefix:
         candidates.append(Path(prefix) / "bin" / "hermes")
-    if os.geteuid() == 0:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         candidates.append(Path("/usr/local/bin/hermes"))
     candidates.append(home / ".local" / "bin" / "hermes")
-    data_home = os.environ.get("XDG_DATA_HOME")
-    if data_home:
-        candidates.append(
-            Path(data_home) / "hermes-agent" / "hermes-cli" / "bin" / "hermes"
-        )
     return candidates
 
 
