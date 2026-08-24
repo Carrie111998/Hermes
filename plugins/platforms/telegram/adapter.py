@@ -9970,6 +9970,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
+                # Tag the event as a voice note (#92165): the outgoing
+                # auto-TTS reply gate (_should_send_voice_reply) matches on
+                # message_type == VOICE; without this the gate is silently
+                # false and a spoken reply is never synthesized.
+                event.message_type = MessageType.VOICE
                 logger.info("[Telegram] Cached user voice at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache voice: %s", _redact_telegram_error_text(e), exc_info=True)
