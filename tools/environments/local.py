@@ -573,6 +573,7 @@ def _scrub_kanban_lifecycle_ownership(env: dict[str, str]) -> dict[str, str]:
             "HERMES_KANBAN_WORKSPACE",
             "HERMES_KANBAN_WORKSPACES_ROOT",
             "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_WORKER_LAUNCH",
         ):
             env.pop(key, None)
         return env
