@@ -1,8 +1,8 @@
 ---
 name: technical-writing
-description: "Checklist for Hermes docs, runbooks, AGENTS.md, PR descriptions, and commit messages. Not product UI copy."
-version: 1.0.0
-author: Hermes Agent
+description: "Checklist for Hermes docs and PR prose, not UI copy."
+version: 1.0.1
+author: Patrick Gibbs (mcpeezy), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -11,66 +11,72 @@ metadata:
     related_skills: [hermes-agent-skill-authoring, requesting-code-review, github-pr-workflow]
 ---
 
-# Technical writing checklist
+# Technical Writing Skill
 
-Use this when writing or reviewing Hermes documentation and PR prose: `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `website/docs/`, runbooks, PR descriptions, and commit messages. Do not use it for product UI copy.
+Checklist for Hermes documentation and PR prose. Covers `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `website/docs/`, runbooks, PR descriptions, and commit messages. Do not use it for product UI copy.
 
 There is no separate docs-gardener tree in this repo. Load this skill instead.
 
-## 1. Pick one document mode
+## When to Use
 
-Choose first. Do not mix modes in one page.
+- Writing or reviewing `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, or `website/docs/`
+- Drafting a PR description or commit message for this repo
+- Cleaning AI-generated docs that mix tutorial, how-to, and reference in one page
+- Checking that cited paths, commands, flags, and counts exist on the current branch
 
-| Mode | Job |
-|---|---|
-| Tutorial | Walk a new reader through one successful path |
-| How-to | Solve one concrete task |
-| Reference | List facts, flags, paths, and contracts |
-| Explanation | Why the design is this way |
+Do not use for product UI strings, marketing copy, or Cursor-only skill imports.
 
-`CONTRIBUTING.md` is mostly how-to plus reference. `website/docs/developer-guide/architecture.md` is explanation. A PR description is how-to: what changed, how to test.
+## Prerequisites
 
-## 2. Write like a developer talking to a developer
+- Working tree on the branch you will document (paths must exist here, not on memory of main)
+- Ability to open cited files and run cited commands before publishing them
+- For skill PRs, also load `hermes-agent-skill-authoring` so frontmatter and section order stay valid
 
-- Lead with the action: `Run scripts/run_tests.sh`, not "You may want to consider running the test script."
-- One thought per sentence. If you need "and" for a second instruction, start a new sentence.
-- Name the thing. Prefer `hermes_cli/skills_hub.py` over "the skills module" when a path exists.
-- Prefer the imperative in procedures. Prefer the present tense in reference.
+## How to Run
 
-## 3. Remove ambiguous grammar
+1. Load this skill before drafting or reviewing the doc/PR prose.
+2. Pick one document mode (see Quick Reference).
+3. Write or edit with one thought per sentence and grounded paths.
+4. Run the Verification checklist before you commit or open the PR.
 
-Write for readers who do not share your first language.
+## Quick Reference
 
-- Do not use "this" or "it" when two nouns are in play. Repeat the noun.
-- Do not use "should" when you mean must or must not. Say the rule.
-- Do not stack hedges ("might possibly", "fairly unique").
-- Do not use unexplained we/our. Name the actor: the CLI, the gateway, the reviewer.
+| Mode | Job | Typical Hermes targets |
+|---|---|---|
+| Tutorial | Walk a new reader through one successful path | Getting-started guides |
+| How-to | Solve one concrete task | `CONTRIBUTING.md` PR steps, runbooks |
+| Reference | List facts, flags, paths, and contracts | CLI flag pages, config tables |
+| Explanation | Why the design is this way | `website/docs/developer-guide/architecture.md` |
 
-## 4. Ground every symbol in this repo
+A PR description is how-to: what changed, why, how to test.
 
-- Paths, commands, flags, and env vars must exist on the branch you are editing. Open the file or run the command before you cite it.
-- Do not invent counts. If you need a count, show the command that produced it on this branch.
-- For generated or changing counts, paste the regeneration command next to the number.
-
-Examples of honest count commands:
+Honest count commands (run them; do not invent the number):
 
 ```bash
 git grep -l "HERMES_HOME" -- skills | wc -l
 rg -c "def should_allow_install" tools/skills_guard.py
 ```
 
-Do not copy those numbers into a doc unless you just ran the command.
-
 ## Procedure
 
 1. Name the document mode in a heading or the first sentence.
 2. State the reader and the outcome.
-3. Put each instruction in its own sentence.
-4. Check every path and command against the tree.
-5. Drop any count you cannot regenerate.
-6. Read once for leftover "this/it/should/might".
+3. Lead with the action: `Run scripts/run_tests.sh`, not "You may want to consider running the test script."
+4. Put each instruction in its own sentence. If you need "and" for a second instruction, start a new sentence.
+5. Name the thing. Prefer `hermes_cli/skills_hub.py` over "the skills module" when a path exists.
+6. Prefer the imperative in procedures. Prefer the present tense in reference.
+7. Remove ambiguous grammar for global readers:
+   - Do not use "this" or "it" when two nouns are in play. Repeat the noun.
+   - Do not use "should" when you mean must or must not. Say the rule.
+   - Do not stack hedges ("might possibly", "fairly unique").
+   - Do not use unexplained we/our. Name the actor: the CLI, the gateway, the reviewer.
+8. Ground every symbol in this repo:
+   - Paths, commands, flags, and env vars must exist on the branch you are editing.
+   - Open the file or run the command before you cite it.
+   - Do not invent counts. If you need a count, show the command that produced it on this branch.
+9. Drop any count you cannot regenerate. Read once for leftover "this/it/should/might".
 
-## Before / after
+### Before / after
 
 Bad (mixed mode, hedge, stale path, invented count):
 
@@ -106,9 +112,13 @@ paths change. Closes #78355.
 - Do not import Cursor-only skills, slash commands, or runtime names.
 - Do not turn this checklist into a style essay. Keep it short.
 - Do not "fix" UI strings with this skill.
+- Do not cite paths from memory of another branch.
+- Do not ship a skill PR that fails the hardline authoring gates this skill's sibling `hermes-agent-skill-authoring` describes.
 
 ## Verification
 
 - Every path in the draft exists (`test -e <path>` or open the file).
 - Every command in the draft is copied from the repo or from `--help` on this branch.
 - A second reader can tell the document mode from the first heading.
+- No unexplained "this/it/should/might" remains where a noun or rule should be.
+- For this skill itself: description ≤ 60 chars, human author first, modern section headings present, and referenced paths like `tools/skills_guard.py` exist.
