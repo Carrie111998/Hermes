@@ -3226,8 +3226,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # Accumulated text was rewritten (shouldn't happen within a
                 # segment). Fail the frame so the consumer falls back to the
                 # edit path; seal the stream first so it doesn't dangle.
-                await self._seal_stream(chat_id, stream)
-                self._active_streams.pop(chat_id, None)
+                if await self._seal_stream(chat_id, stream):
+                    self._active_streams.pop(chat_id, None)
                 return SendResult(
                     success=False, error="stream prefix mismatch"
                 )
@@ -3337,14 +3337,14 @@ class SlackAdapter(BasePlatformAdapter):
             # Slack message: stop the append-only stream, then replace its
             # contents with the authoritative final text. Plain/interim sends
             # still pass through without touching the live stream.
-            if not metadata or not metadata.get("notify"):
+            if not metadata or not metadata.get("final"):
                 return None
-            self._active_streams.pop(chat_id, None)
             ts = stream["ts"]
             if not await self._seal_stream(chat_id, stream):
                 # The stream may still be live; let the normal send path make
                 # a best-effort delivery rather than swallowing the answer.
                 return None
+            self._active_streams.pop(chat_id, None)
             replaced = await self.edit_message(
                 chat_id,
                 ts,
@@ -3356,7 +3356,6 @@ class SlackAdapter(BasePlatformAdapter):
                 await self.stop_typing(chat_id)
                 return replaced
             return None
-        self._active_streams.pop(chat_id, None)
         ts = stream["ts"]
         ok = await self._seal_stream(chat_id, stream, final_text=text)
         if not ok:
@@ -3364,6 +3363,7 @@ class SlackAdapter(BasePlatformAdapter):
             # gets the final answer; the dangling stream times out on
             # Slack's side.
             return None
+        self._active_streams.pop(chat_id, None)
         # Final Block Kit pass: streamed messages render markdown natively,
         # but the rich block layout (if any) is applied via chat_update on
         # the sealed message, mirroring the finalize path in edit_message.
