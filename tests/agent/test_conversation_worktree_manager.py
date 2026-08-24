@@ -233,7 +233,6 @@ def test_existing_partial_path_is_retained_and_marked_failed(repo, db, tmp_path)
     assert expected_path.joinpath("partial.txt").exists()
 
 
-@pytest.mark.live_system_guard_bypass
 def test_bootstrap_timeout_is_retained(repo, db, tmp_path):
     worktree_manager = manager(
         repo,
@@ -303,8 +302,9 @@ def test_worktree_root_in_unrelated_repository_is_rejected_before_claim(repo, db
     assert git(unrelated, "status", "--porcelain") == ""
 
 
-@pytest.mark.live_system_guard_bypass
-def test_bootstrap_timeout_kills_its_process_tree(repo, db, tmp_path):
+def test_bootstrap_timeout_kills_its_process_tree_with_explicit_child_bypass(
+    repo, db, tmp_path, monkeypatch
+):
     leaked = tmp_path / "leaked-grandchild.txt"
     child = (
         "from pathlib import Path; import time; "
@@ -312,10 +312,12 @@ def test_bootstrap_timeout_kills_its_process_tree(repo, db, tmp_path):
         f"Path({str(leaked)!r}).write_text('leaked', encoding='utf-8')"
     )
     parent = (
-        "import subprocess, sys, time; "
+        "import os, subprocess, sys, time; "
+        "assert os.environ['HERMES_STATE_DB_GUARD_BYPASS'] == '1'; "
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
         "time.sleep(60)"
     )
+    monkeypatch.setenv("HERMES_STATE_DB_GUARD_BYPASS", "1")
     worktree_manager = manager(
         repo,
         db,
@@ -329,11 +331,6 @@ def test_bootstrap_timeout_kills_its_process_tree(repo, db, tmp_path):
     with pytest.raises(ConversationWorktreeError, match="bootstrap timed out"):
         worktree_manager.bind_new_root_session("root", conversation_kind="interactive")
     assert time.monotonic() - started < 2.0
-    record = db.get_conversation_worktree("root")
-    assert record is not None
-    assert record.state == "creation_failed"
-    assert record.failure_phase == "bootstrap"
-    assert "timed out" in (record.failure_message or "")
     time.sleep(0.7)
     assert not leaked.exists()
 

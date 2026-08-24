@@ -125,11 +125,11 @@ def test_fast_path_unaffected(tmp_path):
 
 
 def test_kill_helper_swallow_all_failures():
-    """Cleanup on the fail-open path must never raise, including guard failures."""
+    """Cleanup on the fail-open path must never raise, even for a reaped pid."""
 
     class _Dead:
         pid = 2**22  # extremely unlikely to exist
         def kill(self):
-            raise RuntimeError("live-system guard blocked process cleanup")
+            raise OSError("already reaped")
 
     _kill_git_process_tree(_Dead())  # must not raise

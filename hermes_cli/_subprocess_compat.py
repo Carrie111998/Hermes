@@ -456,7 +456,7 @@ def _legacy_kill_process_tree(proc: "subprocess.Popen") -> None:
             pass
     try:
         proc.kill()
-    except Exception:
+    except OSError:
         pass
     if IS_WINDOWS:
         try:
