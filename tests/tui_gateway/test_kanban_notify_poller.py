@@ -114,6 +114,25 @@ class TestCollectKanbanNotifications:
         assert _collect_kanban_notifications(_session()) == []
         assert _sub_rows(tid) == []
 
+    def test_collect_kanban_notifications_lineage_resolution(self):
+        parent_key = "tui-parent-session-1"
+        child_key = "tui-child-session-1"
+        tid = _create_subscribed_task(chat_id=parent_key)
+        _complete(tid, summary="parent session task done")
+
+        # Mock SessionDB lineage so child_key resolves parent_key as ancestor
+        class DummyDB:
+            def _session_lineage_root_to_tip(self, key):
+                if key == child_key:
+                    return [parent_key, child_key]
+                return [key]
+
+        with patch("hermes_state.SessionDB", return_value=DummyDB()):
+            texts = _collect_kanban_notifications(_session(child_key))
+
+        assert len(texts) == 1
+        assert "parent session task done" in texts[0]
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
