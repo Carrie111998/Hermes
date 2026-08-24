@@ -259,6 +259,7 @@ describe('SkillsView toolset management', () => {
     // Flat by default — no category section headings, all three rows visible.
     await screen.findByRole('switch', { name: 'plot-charts' })
     expect(screen.queryByRole('heading', { level: 4 })).toBeNull()
+    expect(screen.getByText('Flat view').getAttribute('aria-pressed')).toBe('false')
 
     await act(async () => {
       fireEvent.click(screen.getByText('Flat view'))
@@ -269,6 +270,13 @@ describe('SkillsView toolset management', () => {
     expect(headers.map(el => el.textContent)).toEqual(['Creative', 'Github'])
     expect(await screen.findByRole('switch', { name: 'gh-pr-review' })).toBeTruthy()
     expect(await screen.findByRole('switch', { name: 'gh-issue-triage' })).toBeTruthy()
+    expect(screen.getByText('By category').getAttribute('aria-pressed')).toBe('true')
+
+    // Filtering to a single category drops the other section's heading entirely.
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('Search skills...'), { target: { value: 'plot' } })
+    })
+    await waitFor(() => expect(screen.getAllByRole('heading', { level: 4 }).map(el => el.textContent)).toEqual(['Creative']))
   })
 
   it('shows the FULL skill in the detail pane — frontmatter metadata + body', async () => {
