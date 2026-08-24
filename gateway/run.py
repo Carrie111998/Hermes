@@ -12087,7 +12087,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task, "background boot-path send failed after gate release: see traceback"
         )
 
-    async def _claim_pending_obligations(self) -> list:
+    async def _claim_pending_obligations(
+        self,
+        platform: Optional[Platform] = None,
+    ) -> list:
         """Claim recoverable delivery-ledger rows and clear their
         ``resume_pending`` flags. Pure DB work — no network sends.
 
