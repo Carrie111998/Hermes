@@ -250,6 +250,29 @@ class TestConfigIntegration:
         assert ha.token == "env-token"
         assert ha.extra["url"] == "http://10.0.0.5:8123"
 
+    def test_explicit_disabled_survives_hass_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  homeassistant:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HASS_TOKEN", "tool-only-token")
+        monkeypatch.setenv("HASS_URL", "http://10.0.0.5:8123")
+        for var in ["TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN"]:
+            monkeypatch.delenv(var, raising=False)
+
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+        ha = config.platforms[Platform.HOMEASSISTANT]
+        assert ha.enabled is False
+        assert ha.token == "tool-only-token"
+        assert ha.extra["url"] == "http://10.0.0.5:8123"
+
 
 # ---------------------------------------------------------------------------
 # send() via REST API
