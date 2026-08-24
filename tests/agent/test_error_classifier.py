@@ -1222,6 +1222,36 @@ class TestOpenRouterUpstreamRateLimit:
         assert result.error_context.get("upstream_provider") == "DeepSeek"
 
 
+    def test_flat_openrouter_bedrock_dimension_error_routes_to_image_recovery(self):
+        """The live SDK flat wrapper must expose metadata.raw to classification."""
+        e = MockAPIError(
+            "HTTP 400: Provider returned error",
+            status_code=400,
+            body={
+                "message": "Provider returned error",
+                "code": 400,
+                "metadata": {
+                    "provider_name": "Amazon Bedrock",
+                    "raw": (
+                        '{"message":"messages.3.content.57.image.source.base64.data: '
+                        "At least one of the image dimensions exceed max allowed size: "
+                        '8000 pixels"}'
+                    ),
+                    "is_byok": False,
+                },
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openrouter",
+            model="anthropic/claude-opus-5",
+        )
+
+        assert result.reason == FailoverReason.image_too_large
+        assert result.retryable is True
+
+
     def test_account_level_429_still_rotates_credential(self):
         """A real account-level 429 (no upstream wrapper) → rate_limit, rotates."""
         e = MockAPIError(

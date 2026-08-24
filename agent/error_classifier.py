@@ -825,22 +825,29 @@ def classify_api_error(
     _metadata_msg = ""
     if isinstance(body, dict):
         _err_obj = body.get("error", {})
-        if isinstance(_err_obj, dict):
-            _body_msg = str(_err_obj.get("message") or "").lower()
-            # Parse metadata.raw for wrapped provider errors
-            _metadata = _err_obj.get("metadata", {})
-            if isinstance(_metadata, dict):
-                _raw_json = _metadata.get("raw") or ""
-                if isinstance(_raw_json, str) and _raw_json.strip():
-                    try:
-                        import json
-                        _inner = json.loads(_raw_json)
-                        if isinstance(_inner, dict):
-                            _inner_err = _inner.get("error", {})
-                            if isinstance(_inner_err, dict):
-                                _metadata_msg = str(_inner_err.get("message") or "").lower()
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+        # OpenRouter's OpenAI-compatible SDK can expose the same upstream
+        # wrapper in nested ``body.error`` or flat top-level form.
+        _error_payload = (
+            _err_obj if isinstance(_err_obj, dict) and _err_obj else body
+        )
+        _body_msg = str(_error_payload.get("message") or "").lower()
+        _metadata = _error_payload.get("metadata", {})
+        if isinstance(_metadata, dict):
+            _raw_json = _metadata.get("raw") or ""
+            if isinstance(_raw_json, str) and _raw_json.strip():
+                try:
+                    import json
+                    _inner = json.loads(_raw_json)
+                    if isinstance(_inner, dict):
+                        _inner_err = _inner.get("error", {})
+                        if isinstance(_inner_err, dict):
+                            _metadata_msg = str(
+                                _inner_err.get("message") or ""
+                            ).lower()
+                        if not _metadata_msg:
+                            _metadata_msg = str(_inner.get("message") or "").lower()
+                except (json.JSONDecodeError, TypeError):
+                    _metadata_msg = _raw_json.lower()
         if not _body_msg:
             _body_msg = str(body.get("message") or "").lower()
     # Combine all message sources for pattern matching
@@ -2153,9 +2160,8 @@ def _is_openrouter_upstream_error(body: Any, provider: str) -> bool:
     if not isinstance(body, dict):
         return False
     provider_lower = (provider or "").strip().lower()
-    err = body.get("error")
-    if not isinstance(err, dict):
-        return False
+    nested = body.get("error")
+    err = nested if isinstance(nested, dict) and nested else body
     outer_msg = str(err.get("message") or "").strip().lower()
     if outer_msg != "provider returned error":
         return False
@@ -2175,9 +2181,8 @@ def _extract_upstream_provider_name(body: Any) -> Optional[str]:
     """Pull the upstream provider name out of OpenRouter's error metadata."""
     if not isinstance(body, dict):
         return None
-    err = body.get("error")
-    if not isinstance(err, dict):
-        return None
+    nested = body.get("error")
+    err = nested if isinstance(nested, dict) and nested else body
     metadata = err.get("metadata")
     if not isinstance(metadata, dict):
         return None
