@@ -1,4 +1,4 @@
-import { useMemo, useSyncExternalStore } from 'react'
+import { useSyncExternalStore } from 'react'
 
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
@@ -236,18 +236,47 @@ interface ProjectsGroupingStoreSnapshot {
   readonly snapshot: ProjectsGroupingSnapshot
 }
 
+interface ProjectsGroupingStore {
+  getSnapshot(): ProjectsGroupingStoreSnapshot | null
+  subscribe(listener: () => void): () => void
+}
+
 function createStoreAdapter(
   entries: readonly Contribution[],
   initialProvider: ResolvedProjectsGroupingProvider | null
-) {
+): ProjectsGroupingStore {
   let active = initialProvider
+
   let cached: ProjectsGroupingStoreSnapshot | null = active
     ? { contribution: active.contribution, snapshot: active.snapshot }
     : null
 
+  let unsubscribeProvider: (() => void) | null = null
+  const listeners = new Set<() => void>()
+
   const select = (provider: ResolvedProjectsGroupingProvider | null) => {
     active = provider
     cached = provider ? { contribution: provider.contribution, snapshot: provider.snapshot } : null
+  }
+
+  const subscribeToProvider = () => {
+    while (active) {
+      try {
+        const unsubscribe = active.contribution.subscribe(() => listeners.forEach(listener => listener()))
+
+        if (typeof unsubscribe === 'function') {
+          unsubscribeProvider = unsubscribe
+
+          return
+        }
+      } catch {
+        // A provider can pass snapshot validation yet still fail to establish
+        // its subscription. Continue down the same deterministic precedence
+        // ladder instead of letting React's external-store effect crash.
+      }
+
+      select(readValidProvider(entries, active.entryIndex + 1))
+    }
   }
 
   return {
@@ -274,30 +303,42 @@ function createStoreAdapter(
       return cached
     },
     subscribe: (listener: () => void) => {
-      while (active) {
-        try {
-          const unsubscribe = active.contribution.subscribe(listener)
+      listeners.add(listener)
 
-          if (typeof unsubscribe === 'function') {
-            return unsubscribe
-          }
-        } catch {
-          // A provider can pass snapshot validation yet still fail to establish
-          // its subscription. Continue down the same deterministic precedence
-          // ladder instead of letting React's external-store effect crash.
-        }
-
-        select(readValidProvider(entries, active.entryIndex + 1))
+      if (!unsubscribeProvider) {
+        subscribeToProvider()
       }
 
-      return () => undefined
+      return () => {
+        listeners.delete(listener)
+
+        if (listeners.size === 0 && unsubscribeProvider) {
+          unsubscribeProvider()
+          unsubscribeProvider = null
+        }
+      }
     }
   }
 }
 
+const groupingStores = new WeakMap<readonly Contribution[], ProjectsGroupingStore>()
+
+function getProjectsGroupingStore(entries: readonly Contribution[]): ProjectsGroupingStore {
+  const existing = groupingStores.get(entries)
+
+  if (existing) {
+    return existing
+  }
+
+  const store = createStoreAdapter(entries, readValidProvider(entries))
+  groupingStores.set(entries, store)
+
+  return store
+}
+
 function useProjectsGroupingStore() {
   const entries = useContributions(PROJECTS_GROUPING_AREA)
-  const store = useMemo(() => createStoreAdapter(entries, readValidProvider(entries)), [entries])
+  const store = getProjectsGroupingStore(entries)
 
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
 }

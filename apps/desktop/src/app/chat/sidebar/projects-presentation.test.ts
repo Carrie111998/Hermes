@@ -116,6 +116,57 @@ describe('Projects grouping contribution', () => {
     ])
   })
 
+  it('shares call-dependent subscription failover across concurrent consumers', () => {
+    let subscribeCalls = 0
+    const primary = provider([{ id: 'primary', label: 'Primary', projectIds: ['a'] }])
+    primary.assignProject = vi.fn()
+
+    primary.subscribe = () => {
+      subscribeCalls += 1
+
+      if (subscribeCalls === 1) {
+        throw new Error('first subscription failed')
+      }
+
+      return () => undefined
+    }
+
+    const fallback = provider([{ id: 'fallback', label: 'Fallback', projectIds: ['b'] }])
+    fallback.assignProject = vi.fn()
+    register(primary, 0)
+    register(fallback, 10)
+
+    const { result } = renderHook(() => ({
+      dialog: useActiveProjectsGrouping(),
+      menu: useActiveProjectsGrouping(),
+      sessions: useProjectsGrouping([project('a'), project('b')]),
+      sidebar: useProjectsGrouping([project('a'), project('b')])
+    }))
+
+    expect(result.current.dialog?.contribution).toBe(fallback)
+    expect(result.current.menu?.contribution).toBe(fallback)
+    expect(result.current.sessions?.contribution).toBe(fallback)
+    expect(result.current.sidebar?.contribution).toBe(fallback)
+    expect(result.current.dialog?.snapshot.groups[0].id).toBe('fallback')
+    expect(result.current.menu?.snapshot).toBe(result.current.dialog?.snapshot)
+    expect(result.current.sessions?.snapshot).toBe(result.current.dialog?.snapshot)
+    expect(result.current.sidebar?.snapshot).toBe(result.current.dialog?.snapshot)
+    expect(result.current.sessions?.groups[0].id).toBe('fallback')
+    expect(result.current.sidebar?.groups[0].id).toBe('fallback')
+    expect(subscribeCalls).toBe(1)
+
+    const recovered = provider([{ id: 'recovered', label: 'Recovered', projectIds: ['a'] }])
+    act(() => register(recovered, -10))
+
+    expect(result.current.dialog?.contribution).toBe(recovered)
+    expect(result.current.menu?.contribution).toBe(recovered)
+    expect(result.current.sessions?.contribution).toBe(recovered)
+    expect(result.current.sidebar?.contribution).toBe(recovered)
+    expect(result.current.menu?.snapshot).toBe(result.current.dialog?.snapshot)
+    expect(result.current.sessions?.snapshot).toBe(result.current.dialog?.snapshot)
+    expect(result.current.sidebar?.snapshot).toBe(result.current.dialog?.snapshot)
+  })
+
   it('settles on a stable empty state when every valid provider throws while subscribing', () => {
     register({
       getSnapshot: () => ({ groups: [{ id: 'broken', label: 'Broken', projectIds: ['a'] }] }),
