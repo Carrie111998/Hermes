@@ -1381,7 +1381,10 @@ function handleSessionsGatewayTransition() {
 // Older backends without the RPCs fail per-call and are skipped — the
 // relay degrades to whatever subset of connections supports it.
 const RELAY_ROSTER_INTERVAL_MS = 60_000
-const RELAY_DRAIN_INTERVAL_MS = 4_000
+// Push notifications are the normal low-latency path. Keep polling as a
+// compatibility backstop for older gateways, but avoid opening a one-shot
+// secondary socket every few seconds when no envelope is pending.
+const RELAY_DRAIN_INTERVAL_MS = 30_000
 // Push path (#93091): the gateway broadcasts `bot_relay.outbox.pending` when
 // an envelope lands on disk; a burst of signals inside this window collapses
 // to ONE drain. The interval poll above stays as the backstop for older
@@ -1657,8 +1660,8 @@ function startBotRelay() {
 
   // Push path: the gateway change watcher broadcasts when an envelope hits
   // the outbox; drain immediately (debounced) instead of waiting the poll
-  // out. Feature-detected — older shells have no host.onEvent — and the 4s
-  // poll above stays untouched as the backstop either way.
+  // out. Feature-detected — older shells have no host.onEvent — and the 30s
+  // poll above stays as the compatibility backstop either way.
   if (relayPushUnsub === null && typeof host.onEvent === 'function') {
     relayPushUnsub = host.onEvent('bot_relay.outbox.pending', () => scheduleRelayPushDrain())
   }

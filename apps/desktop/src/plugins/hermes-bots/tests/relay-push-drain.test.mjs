@@ -5,12 +5,12 @@ import vm from 'node:vm'
 
 // Push-notified relay drain (#93091, motivated by #92760 slow replies): the
 // gateway broadcasts `bot_relay.outbox.pending` when an envelope lands in the
-// outbox; the plugin drains immediately instead of waiting out the 4s poll.
+// outbox; the plugin drains immediately instead of waiting out the 30s poll.
 // Contracts:
 // - a burst of signals inside RELAY_PUSH_DEBOUNCE_MS collapses to ONE drain;
 // - after the debounce fires, a later signal schedules a fresh drain;
 // - the subscription is feature-detected (host.onEvent) and disposed, and the
-//   4s interval poll remains untouched as the backstop.
+//   30s interval poll remains as the compatibility backstop.
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
@@ -78,9 +78,9 @@ test('subscription is feature-detected, disposed, and the poll backstop stays', 
   const block = pluginSource.slice(start - 400, start + 400)
   assert.match(block, /typeof host\.onEvent === 'function'/)
   assert.match(pluginSource, /relayPushUnsub\(\)/)
-  // The 4s interval poll is untouched — push is an accelerator, not a
-  // replacement (older backends never emit the event).
-  assert.match(pluginSource, /RELAY_DRAIN_INTERVAL_MS = 4_000/)
+  // The 30s interval poll remains as a compatibility backstop — push is the
+  // low-latency path, while older backends never emit the event.
+  assert.match(pluginSource, /RELAY_DRAIN_INTERVAL_MS = 30_000/)
   assert.match(pluginSource, /setInterval\(\(\) => void drainRelayOutboxes\(\), RELAY_DRAIN_INTERVAL_MS\)/)
 })
 
