@@ -837,6 +837,24 @@ class CredentialPool:
             updated_extra["failure_reason"] = failure_reason
         else:
             updated_extra.pop("failure_reason", None)
+        # A non-terminal ``auth`` failure (a lone 401/403 classified as
+        # transient — NOT a terminal OAuth state like token_revoked) must
+        # always be bounded so it self-heals. Some providers (notably
+        # opencode.ai's router) emit spurious 401 "Model is not supported"
+        # responses for VALID keys; if such a lone 401 is persisted with no
+        # reset_at, ``_exhausted_until`` can return None and the entry becomes
+        # a permanent silent block (the ``failure_reason`` lingers in ``extra``
+        # even after ``last_status`` is later cleared by an unrelated write).
+        # Force a bounded 401 cooldown so the entry re-enters rotation after
+        # the TTL. Only terminal OAuth reasons skip this (they go STATUS_DEAD
+        # and require an explicit re-auth to clear). See issue #43747-class.
+        reset_at = normalized_error.get("reset_at")
+        if (
+            terminal_status == STATUS_EXHAUSTED
+            and (failure_reason or "").lower() == "auth"
+            and not reset_at
+        ):
+            reset_at = time.time() + EXHAUSTED_TTL_401_SECONDS
         updated = replace(
             entry,
             last_status=terminal_status,
@@ -844,7 +862,7 @@ class CredentialPool:
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
+            last_error_reset_at=reset_at,
             extra=updated_extra,
         )
         self._replace_entry(entry, updated)
@@ -1897,6 +1915,28 @@ class CredentialPool:
                 if synced is not entry:
                     entry = synced
                     cleared_any = True
+            # Stale ``auth`` poison guard (issue #43747-class): a lone 401 from
+            # a flaky provider can leave ``failure_reason == "auth"`` in extra
+            # while ``last_status`` was later cleared by an unrelated write. The
+            # entry is no longer in any cooldown, so the lingering flag is a
+            # silent permanent block with no recovery path. Treat it as
+            # recovered and drop the stale verdict on next selection.
+            if (
+                entry.last_status not in {STATUS_EXHAUSTED, STATUS_DEAD}
+                and (entry.extra.get("failure_reason") or "").lower() == "auth"
+            ):
+                healed = replace(
+                    entry,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                    extra={k: v for k, v in entry.extra.items()
+                           if k != "failure_reason"},
+                )
+                self._replace_entry(entry, healed)
+                entry = healed
+                cleared_any = True
             if entry.last_status == STATUS_DEAD:
                 # Manual DEAD credentials get pruned after a 24h quiet window
                 # so the pool doesn't accumulate dead entries forever.  The
