@@ -3,6 +3,8 @@
 Phase 0 — establish a baseline pin on the current (pre-OAuth) behavior so
 later phases can prove they didn't break loopback mode.
 """
+from types import SimpleNamespace
+
 import pytest
 
 # Phase 5 / Phase 6: these tests mutate ``web_server.app.state.auth_required``
@@ -287,6 +289,96 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
+
+
+def test_isolated_desktop_ssh_backend_keeps_session_token_auth(monkeypatch):
+    """A private Desktop SSH child must not inherit public dashboard OAuth.
+
+    Desktop connects to this ephemeral loopback-only backend through an SSH
+    tunnel and authenticates HTTP/WS with the per-launch session token.  The
+    machine may simultaneously expose its regular dashboard at ``public_url``.
+    """
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", web_server._SESSION_TOKEN)
+    monkeypatch.setattr(
+        web_server, "_SSH_OWNER_NONCE", web_server._SSH_OWNER_NONCE
+    )
+    clear_providers()
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        headless=True,
+        ssh_session_token="desktop-session-token",
+        ssh_owner_nonce="desktop-owner-nonce",
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+    assert captured["kwargs"].get("proxy_headers") is False
+    reason, credential = web_server._ws_auth_reason(
+        SimpleNamespace(query_params={"token": "desktop-session-token"})
+    )
+    assert reason is None
+    assert credential == "token"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"port": 9119},
+        {"host": "0.0.0.0"},
+        {"headless": False},
+        {"ssh_session_token": None},
+        {"ssh_owner_nonce": None},
+    ],
+)
+def test_desktop_ssh_auth_exception_requires_every_private_marker(
+    monkeypatch, overrides
+):
+    """Dropping any private-backend marker keeps the public auth gate on."""
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    kwargs = {
+        "host": "127.0.0.1",
+        "port": 0,
+        "open_browser": False,
+        "headless": True,
+        "ssh_session_token": "desktop-session-token",
+        "ssh_owner_nonce": "desktop-owner-nonce",
+    }
+    kwargs.update(overrides)
+
+    with pytest.raises(SystemExit, match=r"no auth providers"):
+        web_server.start_server(**kwargs)
+    assert web_server.app.state.auth_required is True
 
 
 def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypatch):

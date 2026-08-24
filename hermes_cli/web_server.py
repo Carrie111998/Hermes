@@ -741,6 +741,34 @@ def should_require_dashboard_auth(
     )
 
 
+def _is_isolated_desktop_ssh_backend(
+    *,
+    host: str,
+    port: int,
+    headless: bool,
+    ssh_session_token: Optional[str],
+    ssh_owner_nonce: Optional[str],
+) -> bool:
+    """Return whether this is Desktop's private SSH-tunnel backend.
+
+    This process is distinct from the operator's browser-facing dashboard: it
+    binds an ephemeral loopback port, serves no SPA, and is protected by a
+    per-launch session token plus owner nonce.  A configured public dashboard
+    URL must not switch this private transport to cookie/OAuth mode because the
+    Desktop client authenticates its WebSocket with that session token.
+
+    Keep every marker mandatory so ordinary dashboard/serve invocations cannot
+    use this path to bypass the public-dashboard auth gate.
+    """
+    return bool(
+        host in _LOOPBACK_HOST_VALUES
+        and port == 0
+        and headless
+        and ssh_session_token
+        and ssh_owner_nonce
+    )
+
+
 def _host_header_hostname(host_header: str) -> str:
     """Return a normalized hostname from a valid HTTP Host authority.
 
@@ -19303,10 +19331,25 @@ def start_server(
     # request middleware never reloads config. Any non-loopback public hostname
     # engages the auth gate even when the backend itself remains on loopback;
     # otherwise the SPA's local session token would become remotely reachable.
-    app.state.trusted_public_hosts = _dashboard_public_hosts()
+    _configured_public_hosts = _dashboard_public_hosts()
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
+    _private_desktop_ssh = _is_isolated_desktop_ssh_backend(
+        host=host,
+        port=port,
+        headless=headless,
+        ssh_session_token=ssh_session_token,
+        ssh_owner_nonce=ssh_owner_nonce,
+    )
+    # This ephemeral backend is not the browser-facing dashboard named by
+    # dashboard.public_url.  Do not inherit that dashboard's Host/Origin trust
+    # declaration or cookie/OAuth gate; the SSH tunnel uses its per-launch
+    # session token instead.  Ordinary dashboard/serve launches keep the
+    # configured public-host behavior unchanged.
+    app.state.trusted_public_hosts = (
+        frozenset() if _private_desktop_ssh else _configured_public_hosts
+    )
     app.state.auth_required = should_require_dashboard_auth(
         host, app.state.trusted_public_hosts
     )
