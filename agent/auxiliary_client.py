@@ -3069,10 +3069,18 @@ def _get_provider_chain() -> List[tuple]:
     fails more often than not.  Codex is used only when the user's main
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
+
+    NOTE: ``nous`` is also NOT in this chain (removed 2026-08-23).  There
+    is no Nous credential in either auth store, so every auto-resolved
+    auxiliary call spent a hop on ``_try_nous`` only to log "no Nous
+    authentication found" and quarantine the label.  ``_try_nous`` is
+    still wired for EXPLICIT selection -- ``provider: nous`` in an
+    auxiliary config, and the vision path -- so this only drops the
+    automatic hop, not Nous support.  To restore it after running
+    ``hermes auth add nous``, put ``("nous", _try_nous),`` back below.
     """
     return [
         ("openrouter", _try_openrouter),
-        ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
     ]
