@@ -30,6 +30,24 @@ The contract is not a replacement for entitlement, billing, wallet, ledger,
 customer-data, approval, or runtime authorities. Mission Control consumes the
 projection; it does not become a second source of truth.
 
+## Capability routing
+
+Paco routes Home Team agents, sessions, tasks, tools, channels, approvals,
+runtime health, and workspace activity through the existing MC-02/04/05/10
+and HOS-04 authorities. Forge routes tenant-safe Player work, runs, usage,
+connections, approvals, outcomes, and sanitized health through MC-20/22/23/24
+and the existing SaaS authorities. Atlas publishes bounded worker/process,
+host-metric, deployment, recovery, and failure health through the read-only
+MC-29 observer. Locker Room consumes customer-safe MC-20 and health
+projections. None of these mappings creates a new store or execution engine.
+
+Command inputs follow the shared lifecycle `ASK → RECOMMEND_BUILD → DECIDE →
+IMPLEMENT → PREVIEW → APPROVE`. Attachment inputs are metadata-only references
+(allowlisted media type, bounded size, SHA-256 digest); bytes, paths, secrets,
+and prompts never enter the control-plane contract. Telegram and Buzz preserve
+conversation identity as context-only channels until an explicit actionable
+bridge is implemented; actionable work remains deny-by-default.
+
 ## Independence acceptance
 
 1. Paco disconnected: Forge and Atlas remain healthy in the adapter contract.
