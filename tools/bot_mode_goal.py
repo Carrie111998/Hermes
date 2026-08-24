@@ -103,11 +103,16 @@ def ensure_goal_manage_tool(agent: Any) -> bool:
                     return True
 
         from tools.bot_mode_dm import _agent_home, _session_title
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, get_bot_mode_protocol_section
+        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
 
         if _session_title(agent) != BOT_CHAT_TITLE:
             return False
-        if not get_bot_mode_protocol_section(_agent_home(agent)):
+        # Match message_agent's managed-install gate rather than the rendered
+        # protocol section. Older Bot Mode builds appended that protocol text
+        # into SOUL.md; current prompt generation correctly deduplicates it to
+        # an empty section, but the install is still managed and must retain
+        # native Bot Chat tools after upgrade.
+        if not is_bot_mode_managed(_agent_home(agent)):
             return False
         if agent.tools is None:
             agent.tools = []
@@ -157,11 +162,11 @@ def goal_manage_tool(
 ) -> str:
     """Execute one native GoalManager mutation for the calling Bot Chat."""
     from tools.bot_mode_dm import _agent_home, _session_title
-    from tools.bot_mode_probe import BOT_CHAT_TITLE, get_bot_mode_protocol_section
+    from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
 
     if _session_title(agent) != BOT_CHAT_TITLE:
         return _result({"success": False, "error": "goal_manage is only available in a Bot Mode 'Bot Chat' session."})
-    if not get_bot_mode_protocol_section(_agent_home(agent)):
+    if not is_bot_mode_managed(_agent_home(agent)):
         return _result({"success": False, "error": "goal_manage is unavailable because this profile is not Bot-Mode managed."})
 
     sid = str(session_id or "").strip()
