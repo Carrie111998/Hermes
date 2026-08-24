@@ -319,21 +319,21 @@ def _agent_skills_dir(agent: Any) -> Optional[Path]:
 def _profile_name_for_home(home: Path) -> str:
     """Derive the profile name for an explicit agent home.
 
-    ``<root>/profiles/X`` -> ``"X"``; anything else -> ``"default"``.
+    ``<root>/profiles/X`` -> ``"X"``; a symlink-overlay home whose members
+    point into ``profiles/X`` -> ``"X"`` (#93862); anything else ->
+    ``"default"``.
 
-    Uses :func:`get_default_hermes_root` (NOT ``get_hermes_home()``): on a
+    Uses :func:`hermes_constants.profile_name_for_home`, which resolves
+    against ``get_default_hermes_root()`` (NOT ``get_hermes_home()``): on a
     correctly bound profile session the ambient home IS the profile dir, so
     ``get_hermes_home()/profiles`` would never contain ``home`` and every
     profile would misreport as "default".
     """
     try:
-        from hermes_constants import get_default_hermes_root
+        from hermes_constants import profile_name_for_home
 
-        root = get_default_hermes_root()
-        rel = home.resolve().relative_to((root / "profiles").resolve())
-        return rel.parts[0] if rel.parts else "default"
-    except (ValueError, OSError):
-        # Home IS the root (default profile) or unrelatable -> default.
+        return profile_name_for_home(home)
+    except Exception:
         return "default"
 
 

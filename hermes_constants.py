@@ -227,6 +227,115 @@ def get_default_hermes_root() -> Path:
     return result
 
 
+# Overlay members whose symlink targets can identify the backing profile.
+# Ordered: SOUL.md is the most distinctive single file, then the
+# profile-scoped areas. Keep this list short — it is walked on prompt build.
+_PROFILE_OVERLAY_MEMBERS = (
+    "SOUL.md",
+    "plugins",
+    "cron",
+    "skills",
+    "hooks",
+    "memories",
+    "sessions",
+)
+
+
+def profile_identity_for_home(
+    home: Path | str | None = None,
+) -> tuple[str, "Path | None"]:
+    """Derive ``(profile_name, backing_root)`` for a Hermes home directory.
+
+    ``backing_root`` is the Hermes root that owns the resolved profile (the
+    parent of its ``profiles`` dir) — for symlink-overlay homes this is the
+    root the symlink TARGETS live under, which is what profile-scoped path
+    classification must use. ``(\"default\", None)`` when no named profile can
+    be derived.
+
+    Resolution order:
+
+    1. ``<root>/profiles/<name>`` (after resolving symlinks) -> ``<name>``.
+    1b. Resolved home IS ``<other-root>/profiles/<name>`` (a HERMES_HOME
+       symlinked to a profile under a different root).
+    2. Symlink-overlay recovery: when *home* is neither the root nor a
+       profile dir, but contains well-known members (``SOUL.md``,
+       ``plugins/``, ``cron/``, ...) that are symlinks whose targets match
+       the exact layout ``<root>/profiles/<name>/<member>``, the identity is
+       recovered from those targets. Multi-agent orchestration platforms
+       produce this layout: a per-task ``HERMES_HOME`` whose contents are
+       symlinks into a shared named profile (#93862).
+    3. Anything else -> ``(\"default\", None)``.
+
+    Import-safe, never raises; falls back to ``(\"default\", None)``.
+    """
+    try:
+        if home is None:
+            home_path = get_hermes_home()
+        else:
+            home_path = Path(home)
+        home_real = home_path.resolve()
+        profiles_dir = (get_default_hermes_root() / "profiles").resolve()
+
+        # 1. Direct profile dir (symlinked HERMES_HOME to a profile also
+        # lands here, because home_real is fully resolved).
+        try:
+            rel = home_real.relative_to(profiles_dir)
+            if rel.parts:
+                return rel.parts[0], profiles_dir.parent
+        except ValueError:
+            pass
+
+        # 1b. The resolved home IS a profile dir under some OTHER root
+        # (e.g. HERMES_HOME is a symlink to <custom-root>/profiles/<name>,
+        # where root derivation from the unresolved env path picked the
+        # wrong root). The layout convention is unambiguous either way.
+        if home_real.parent.name == "profiles" and home_real.name:
+            return home_real.name, home_real.parent.parent
+
+        # 2. Symlink-overlay recovery. Only inspect members that are
+        # actually symlinks — a real (copied) file identifies nothing — and
+        # only trust targets that (a) exist, (b) match the exact layout
+        # ``<root>/profiles/<name>/<member>`` at the tail (a "profiles" dir
+        # elsewhere in the path identifies nothing), and (c) agree: if two
+        # members VALIDLY identify DIFFERENT profiles the overlay is
+        # ambiguous or crafted, and the conservative answer is "default" —
+        # this identity feeds the cross-profile write guard's active side,
+        # so a conflicting link must not be able to reassign it. Dangling
+        # or malformed links identify nothing and are ignored (overlay
+        # decay — e.g. a pruned profile area — is legitimate and must not
+        # nuke an otherwise-unanimous identity).
+        recovered: set[tuple[str, Path]] = set()
+        for member in _PROFILE_OVERLAY_MEMBERS:
+            candidate = home_path / member
+            try:
+                if not candidate.is_symlink() or not candidate.exists():
+                    continue
+                target = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            # Exact tail: target == <root>/profiles/<name>/<member>
+            if (
+                target.name == member
+                and target.parent.parent.name == "profiles"
+                and target.parent.name
+            ):
+                recovered.add((target.parent.name, target.parent.parent.parent))
+        if len(recovered) == 1:
+            return next(iter(recovered))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return "default", None
+
+
+def profile_name_for_home(home: Path | str | None = None) -> str:
+    """Derive the profile name for a Hermes home directory.
+
+    Thin wrapper over :func:`profile_identity_for_home` for callers that
+    only need the name. Import-safe, never raises.
+    """
+    return profile_identity_for_home(home)[0]
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 
