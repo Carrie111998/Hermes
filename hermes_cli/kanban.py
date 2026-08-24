@@ -86,6 +86,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "permission_mode": t.permission_mode,
         "routed_by": t.routed_by,
         "swarm_preset": t.swarm_preset,
+        "workflow_ref": t.workflow_ref,
+        "workflow_args": t.workflow_args,
     }
 
 
@@ -422,6 +424,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "instruction only: kimi workers get a '/swarm ' "
                                "kickoff prefix, omp workers a parallel "
                                "sub-agents instruction line.")
+    p_create.add_argument("--workflow", default=None, dest="workflow_ref",
+                          metavar="KEY",
+                          help="Bind the card to a workflow catalog key "
+                               "(contracts/workflows.json, spec 042 §5). The "
+                               "resolver turns the key into the harness-native "
+                               "invocation at dispatch.")
+    p_create.add_argument("--args", default=None, dest="workflow_args",
+                          metavar="JSON",
+                          help="JSON object of arguments for --workflow, "
+                               "validated against the catalog row's "
+                               "args_schema at resolve time. Requires "
+                               "--workflow.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1533,6 +1547,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             getattr(args, "prompt_template", None),
             getattr(args, "yolo", False),
             getattr(args, "swarm_preset", None),
+            getattr(args, "workflow_ref", None),
+            getattr(args, "workflow_args", None),
         ]
     )
     with kb.connect_closing() as conn:
@@ -1563,6 +1579,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             permission_mode="yolo" if getattr(args, "yolo", False) else None,
             routed_by="operator" if execution_pinned else None,
             swarm_preset=getattr(args, "swarm_preset", None),
+            workflow_ref=getattr(args, "workflow_ref", None),
+            workflow_args=getattr(args, "workflow_args", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1750,6 +1768,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  routed-by: {task.routed_by}")
     if task.swarm_preset:
         print(f"  swarm:     {task.swarm_preset}")
+    if task.workflow_ref:
+        print(f"  workflow:  {task.workflow_ref}")
+    if task.workflow_args:
+        print(f"  workflow-args: {task.workflow_args}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

@@ -1019,6 +1019,14 @@ class Task:
     # kimi workers get a `/swarm ` kickoff prefix, omp workers a parallel
     # sub-agents instruction line. None = no swarm.
     swarm_preset: Optional[str] = None
+    # Workflow binding (spec 042 §5). ``workflow_ref`` is the key into the
+    # workflow catalog (contracts/workflows.json) that the resolver turns
+    # into the harness-native invocation; ``workflow_args`` is its
+    # JSON-object argument blob, validated against the catalog row's
+    # args_schema at resolve time. None = no workflow binding (classic
+    # free-prompt worker).
+    workflow_ref: Optional[str] = None
+    workflow_args: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1132,6 +1140,16 @@ class Task:
             swarm_preset=(
                 row["swarm_preset"]
                 if "swarm_preset" in keys and row["swarm_preset"]
+                else None
+            ),
+            workflow_ref=(
+                row["workflow_ref"]
+                if "workflow_ref" in keys and row["workflow_ref"]
+                else None
+            ),
+            workflow_args=(
+                row["workflow_args"]
+                if "workflow_args" in keys and row["workflow_args"]
                 else None
             ),
         )
@@ -1336,7 +1354,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Named swarm preset (spec 042 §8). A prompt-level instruction, not an
     -- enforcement mechanism: kimi cards get a `/swarm ` kickoff prefix, omp
     -- cards a parallel-sub-agents instruction line. NULL = no swarm.
-    swarm_preset         TEXT
+    swarm_preset         TEXT,
+    -- Workflow binding (spec 042 §5). ``workflow_ref`` is the key into the
+    -- workflow catalog (contracts/workflows.json); the resolver turns it
+    -- into the harness-native invocation. ``workflow_args`` is a JSON
+    -- object validated against the catalog row's args_schema at resolve
+    -- time. NULL = no workflow binding (classic free-prompt worker).
+    workflow_ref         TEXT,
+    workflow_args        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2557,6 +2582,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "swarm_preset", "swarm_preset TEXT"
         )
+    if "workflow_ref" not in cols:
+        # Workflow binding (spec 042 §5). NULL on existing rows = no
+        # workflow binding, exactly the free-prompt behaviour they had.
+        _add_column_if_missing(
+            conn, "tasks", "workflow_ref", "workflow_ref TEXT"
+        )
+    if "workflow_args" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "workflow_args", "workflow_args TEXT"
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2990,6 +3025,8 @@ def create_task(
     permission_mode: Optional[str] = None,
     routed_by: Optional[str] = None,
     swarm_preset: Optional[str] = None,
+    workflow_ref: Optional[str] = None,
+    workflow_args: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3047,6 +3084,11 @@ def create_task(
     ``swarm_preset`` names a swarm preset (spec 042 §8); it is a
     prompt-level instruction only (``/swarm `` prefix for kimi, a parallel
     sub-agents line for omp), never an enforcement mechanism.
+    ``workflow_ref`` binds the card to a workflow catalog key (spec 042
+    §5, ``contracts/workflows.json``) that the resolver turns into the
+    harness-native invocation. ``workflow_args`` is its JSON-object
+    argument blob, validated against the catalog row's ``args_schema`` at
+    resolve time; it requires ``workflow_ref``.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3065,6 +3107,21 @@ def create_task(
     prompt_template = (prompt_template or "").strip() or None
     routed_by = (routed_by or "").strip().lower() or None
     swarm_preset = (swarm_preset or "").strip() or None
+    workflow_ref = (workflow_ref or "").strip() or None
+    workflow_args = (workflow_args or "").strip() or None
+    if workflow_args and not workflow_ref:
+        raise ValueError("workflow_args requires a workflow_ref")
+    if workflow_args is not None:
+        # Args are meaningless unless they parse to a JSON object — fail at
+        # filing, not at resolve time. Stored canonicalised (sorted keys) so
+        # semantically identical input round-trips byte-identically.
+        try:
+            parsed_workflow_args = json.loads(workflow_args)
+        except Exception:
+            raise ValueError("workflow_args must be a JSON object") from None
+        if not isinstance(parsed_workflow_args, dict):
+            raise ValueError("workflow_args must be a JSON object")
+        workflow_args = json.dumps(parsed_workflow_args, sort_keys=True)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3335,8 +3392,8 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         runner, prompt_template, permission_mode, routed_by,
-                        swarm_preset
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        swarm_preset, workflow_ref, workflow_args
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3367,6 +3424,8 @@ def create_task(
                         permission_mode,
                         routed_by,
                         swarm_preset,
+                        workflow_ref,
+                        workflow_args,
                     ),
                 )
                 for pid in parents:
@@ -3395,6 +3454,8 @@ def create_task(
                         "permission_mode": permission_mode,
                         "routed_by": routed_by,
                         "swarm_preset": swarm_preset,
+                        "workflow_ref": workflow_ref,
+                        "workflow_args": workflow_args,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
