@@ -2654,7 +2654,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise
                 except Exception as exc:
                     self._dedup.discard(message_id)
-                    self._record_recovery_attempt(message, status="failed", error=str(exc))
+                    self._record_recovery_attempt(
+                        message,
+                        status="failed",
+                        error=_redact_discord_error_text(exc),
+                    )
                     raise
                 if dispatched >= max_dispatches:
                     break
@@ -2691,9 +2695,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 scanned=scanned,
                 missed=missed,
                 dispatched=dispatched,
-                error=str(exc),
+                error=_redact_discord_error_text(exc),
             )
-            logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
+            logger.warning(
+                "[%s] Missed-message backfill failed: %s",
+                self.name,
+                _redact_discord_error_text(exc),
+            )
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
@@ -3593,8 +3601,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return result
 
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            result = SendResult(success=False, error=str(e))
+            safe_error = _redact_discord_error_text(e)
+            logger.error("[%s] Failed to send Discord message: %s", self.name, safe_error)
+            result = SendResult(success=False, error=safe_error)
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
@@ -3631,8 +3640,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 content=starter_content,
             )
         except Exception as e:
-            logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
-            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+            safe_error = _redact_discord_error_text(e)
+            logger.error(
+                "[%s] Failed to create forum thread in %s: %s",
+                self.name,
+                forum_channel.id,
+                safe_error,
+            )
+            return SendResult(success=False, error=f"Forum thread creation failed: {safe_error}")
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
@@ -3648,7 +3663,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
             except Exception as e:
-                warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
+                safe_error = _redact_discord_error_text(e)
+                warning = (
+                    f"Failed to send follow-up chunk to forum thread {thread_id}: "
+                    f"{safe_error}"
+                )
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
 
@@ -3703,13 +3722,14 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             thread = await forum_channel.create_thread(**kwargs)
         except Exception as e:
+            safe_error = _redact_discord_error_text(e)
             logger.error(
                 "[%s] Failed to create forum thread with file in %s: %s",
                 self.name,
                 getattr(forum_channel, "id", "?"),
-                e,
+                safe_error,
             )
-            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+            return SendResult(success=False, error=f"Forum thread creation failed: {safe_error}")
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
@@ -3844,8 +3864,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             return result
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
-            return SendResult(success=False, error=_redact_discord_error_text(e))
+            safe_error = _redact_discord_error_text(e)
+            logger.error(
+                "[%s] Failed to edit Discord message %s: %s",
+                self.name,
+                message_id,
+                safe_error,
+            )
+            return SendResult(success=False, error=safe_error)
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
@@ -3899,11 +3925,13 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             await msg.edit(content=chunks[0])
         except Exception as e:
+            safe_error = _redact_discord_error_text(e)
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s",
-                self.name, e, exc_info=True,
+                self.name,
+                safe_error,
             )
-            return SendResult(success=False, error=_redact_discord_error_text(e))
+            return SendResult(success=False, error=safe_error)
 
         # Step 2 — send each remaining chunk threaded as a reply to the prior.
         continuation_ids: list[str] = []
@@ -3928,16 +3956,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Drop the reply anchor and retry once — a deleted/expired
                 # anchor (10008) or system-message reply (50035) shouldn't lose
                 # the chunk.
+                safe_error = _redact_discord_error_text(send_err)
                 logger.warning(
                     "[%s] Overflow continuation send failed (%s); retrying without reply reference",
-                    self.name, send_err,
+                    self.name, safe_error,
                 )
                 try:
                     sent = await channel.send(content=chunk, reference=None)
                 except Exception as retry_err:
+                    safe_retry_error = _redact_discord_error_text(retry_err)
                     logger.warning(
                         "[%s] Overflow split: stopped at %d/%d chunks delivered: %s",
-                        self.name, delivered, len(chunks), retry_err,
+                        self.name, delivered, len(chunks), safe_retry_error,
                     )
                     last_id = continuation_ids[-1] if continuation_ids else message_id
                     return SendResult(
@@ -4082,7 +4112,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
                 return
         except Exception as e:
-            logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
+            safe_error = _redact_discord_error_text(e)
+            logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, safe_error)
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
 
@@ -4140,7 +4171,8 @@ class DiscordAdapter(BasePlatformAdapter):
                                 ext = "webp"
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
-                            logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            safe_error = _redact_discord_error_text(dl_err)
+                            logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], safe_error)
                             continue
 
                 if not files:
@@ -4162,10 +4194,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:
                     await channel.send(content=content, files=files)
             except Exception as e:
+                safe_error = _redact_discord_error_text(e)
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
-                    self.name, chunk_idx + 1, len(chunks), e,
-                    exc_info=True,
+                    self.name, chunk_idx + 1, len(chunks), safe_error,
                 )
                 await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
             finally:
@@ -4281,7 +4313,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=str(msg_data["id"]))
             except Exception as voice_err:
-                logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
+                logger.debug(
+                    "Voice message flag failed, falling back to file: %s",
+                    _redact_discord_error_text(voice_err),
+                )
                 file = discord.File(io.BytesIO(file_data), filename=filename)
                 try:
                     msg = await channel.send(file=file, reference=reference)
@@ -4302,7 +4337,12 @@ class DiscordAdapter(BasePlatformAdapter):
                         raise
                 return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
+            safe_error = _redact_discord_error_text(e)
+            logger.error(
+                "[%s] Failed to send audio, falling back to base adapter: %s",
+                self.name,
+                safe_error,
+            )
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
 
     # ------------------------------------------------------------------
@@ -5389,7 +5429,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 return
             except Exception as e:
-                logger.debug("[Discord] Admin notify via %s failed: %s", target, e)
+                logger.debug(
+                    "[Discord] Admin notify via %s failed: %s",
+                    target,
+                    _redact_discord_error_text(e),
+                )
 
     async def send_image_file(
         self,
@@ -5405,7 +5449,11 @@ class DiscordAdapter(BasePlatformAdapter):
         except FileNotFoundError:
             return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send local image, falling back to base adapter: %s", self.name, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to send local image, falling back to base adapter: %s",
+                self.name,
+                _redact_discord_error_text(e),
+            )
             return await super().send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
 
     async def send_image(
@@ -5485,8 +5533,7 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error(
                 "[%s] Failed to send image attachment, falling back to URL: %s",
                 self.name,
-                e,
-                exc_info=True,
+                _redact_discord_error_text(e),
             )
             return await super().send_image(chat_id, image_url, caption, reply_to)
 
@@ -5557,8 +5604,7 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error(
                 "[%s] Failed to send animation attachment, falling back to URL: %s",
                 self.name,
-                e,
-                exc_info=True,
+                _redact_discord_error_text(e),
             )
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
 
@@ -5576,7 +5622,11 @@ class DiscordAdapter(BasePlatformAdapter):
         except FileNotFoundError:
             return SendResult(success=False, error=f"Video file not found: {video_path}")
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send local video, falling back to base adapter: %s", self.name, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to send local video, falling back to base adapter: %s",
+                self.name,
+                _redact_discord_error_text(e),
+            )
             return await super().send_video(chat_id, video_path, caption, reply_to, metadata=metadata)
 
     async def send_document(
@@ -5594,7 +5644,11 @@ class DiscordAdapter(BasePlatformAdapter):
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to send document, falling back to base adapter: %s",
+                self.name,
+                _redact_discord_error_text(e),
+            )
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -5697,8 +5751,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 "guild_name": channel.guild.name if hasattr(channel, "guild") and channel.guild else None,
             }
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
-            return {"name": str(chat_id), "type": "dm", "error": str(e)}
+            safe_error = _redact_discord_error_text(e)
+            logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, safe_error)
+            return {"name": str(chat_id), "type": "dm", "error": safe_error}
 
     async def _resolve_allowed_usernames(self) -> None:
         """
@@ -7209,10 +7264,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     "thread_name": getattr(thread, "name", None) or name,
                 }
             except Exception as fallback_error:
+                direct_text = _redact_discord_error_text(direct_error)
+                fallback_text = _redact_discord_error_text(fallback_error)
                 return {
                     "error": (
                         "Discord rejected direct thread creation and the fallback also failed. "
-                        f"Direct error: {direct_error}. Fallback error: {fallback_error}"
+                        f"Direct error: {direct_text}. Fallback error: {fallback_text}"
                     )
                 }
 
@@ -7292,8 +7349,8 @@ class DiscordAdapter(BasePlatformAdapter):
         logger.warning(
             "[%s] Auto-thread creation failed after retry. Direct error: %s. Fallback error: %s",
             self.name,
-            last_direct_error,
-            last_fallback_error,
+            _redact_discord_error_text(last_direct_error),
+            _redact_discord_error_text(last_fallback_error),
         )
         return None
 
@@ -7386,7 +7443,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning(
                 "[%s] Handoff thread: cannot resolve parent %s: %s",
-                self.name, parent_chat_id, exc,
+                self.name, parent_chat_id, _redact_discord_error_text(exc),
             )
             return None
 
@@ -7414,7 +7471,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as direct_error:
             logger.debug(
                 "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
+                self.name, _redact_discord_error_text(direct_error),
             )
 
         # Fallback: post a seed message and create the thread from it.
@@ -7432,7 +7489,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as fallback_error:
             logger.warning(
                 "[%s] Handoff thread: both create paths failed for parent %s: %s",
-                self.name, parent_chat_id, fallback_error,
+                self.name, parent_chat_id, _redact_discord_error_text(fallback_error),
             )
             return None
 
@@ -9051,7 +9108,8 @@ def _define_discord_view_classes() -> None:
                     self.session_key, choice, interaction.user.display_name,
                 )
             except Exception as exc:
-                logger.error("Discord slash-confirm resolve failed: %s", exc, exc_info=True)
+                safe_error = _redact_discord_error_text(exc)
+                logger.error("Discord slash-confirm resolve failed: %s", safe_error)
 
         @discord.ui.button(label="Approve Once", style=discord.ButtonStyle.green)
         async def approve_once(
@@ -9149,7 +9207,8 @@ def _define_discord_view_classes() -> None:
                     answer=answer,
                 )
             except Exception as exc:
-                logger.error("Failed to write update response: %s", exc)
+                safe_error = _redact_discord_error_text(exc)
+                logger.error("Failed to write update response: %s", safe_error)
                 written = False
 
             if not written:
@@ -9454,7 +9513,8 @@ def _define_discord_view_classes() -> None:
                     self._selected_provider,
                 )
             except Exception as exc:
-                result_text = f"Error switching model: {exc}"
+                safe_error = _redact_discord_error_text(exc)
+                result_text = f"Error switching model: {safe_error}"
 
             await interaction.edit_original_response(
                 embed=discord.Embed(
@@ -9631,8 +9691,9 @@ def _define_discord_view_classes() -> None:
                     str(interaction.channel_id), value
                 )
             except Exception as exc:
-                logger.error("Choice picker selection failed: %s", exc)
-                result_text = f"Error applying selection: {exc}"
+                safe_error = _redact_discord_error_text(exc)
+                logger.error("Choice picker selection failed: %s", safe_error)
+                result_text = f"Error applying selection: {safe_error}"
 
             embed = discord.Embed(
                 description=result_text,
@@ -9823,9 +9884,11 @@ def _define_discord_view_classes() -> None:
                     resolved,
                 )
             except Exception as exc:
+                safe_error = _redact_discord_error_text(exc)
                 logger.error(
                     "Discord clarify resolve_gateway_clarify failed (id=%s): %s",
-                    self.clarify_id, exc,
+                    self.clarify_id,
+                    safe_error,
                 )
 
         async def _on_other(self, interaction: "discord.Interaction") -> None:
@@ -9848,9 +9911,11 @@ def _define_discord_view_classes() -> None:
                 from tools.clarify_gateway import mark_awaiting_text
                 mark_awaiting_text(self.clarify_id)
             except Exception as exc:
+                safe_error = _redact_discord_error_text(exc)
                 logger.warning(
                     "Discord clarify mark_awaiting_text failed (id=%s): %s",
-                    self.clarify_id, exc,
+                    self.clarify_id,
+                    safe_error,
                 )
 
             self.resolved = True
@@ -9939,12 +10004,13 @@ def _standalone_sanitize_error(text) -> str:
     s = str(text)
     # Mask anything that looks like a Bot token in an Authorization header.
     import re as _re_san
-    return _re_san.sub(
+    sanitized = _re_san.sub(
         r"(Authorization:\s*Bot\s+)\S+",
         r"\1***",
         s,
         flags=_re_san.IGNORECASE,
     )
+    return _redact_discord_error_text(sanitized)
 
 
 def _standalone_close_response(resp: Any) -> None:
@@ -10159,7 +10225,11 @@ async def _standalone_send(
                                         resp,
                                         _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                                     )
-                                    return {"error": f"Discord forum thread creation error ({resp.status}): {body}"}
+                                    return {
+                                        "error": _standalone_sanitize_error(
+                                            f"Discord forum thread creation error ({resp.status}): {body}"
+                                        )
+                                    }
                                 data = await _standalone_read_json_limited(
                                     resp,
                                     _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
@@ -10183,7 +10253,11 @@ async def _standalone_send(
                                     resp,
                                     _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                                 )
-                                return {"error": f"Discord forum thread creation error ({resp.status}): {body}"}
+                                return {
+                                    "error": _standalone_sanitize_error(
+                                        f"Discord forum thread creation error ({resp.status}): {body}"
+                                    )
+                                }
                             data = await _standalone_read_json_limited(
                                 resp,
                                 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
@@ -10213,7 +10287,11 @@ async def _standalone_send(
                             resp,
                             _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                         )
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
+                        return {
+                            "error": _standalone_sanitize_error(
+                                f"Discord API error ({resp.status}): {body}"
+                            )
+                        }
                     last_data = await _standalone_read_json_limited(
                         resp,
                         _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,

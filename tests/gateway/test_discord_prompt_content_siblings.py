@@ -102,3 +102,45 @@ async def test_update_and_clarify_return_redacted_transport_errors():
     assert redact.call_count == 3
 
 
+@pytest.mark.asyncio
+async def test_send_and_forum_transport_errors_use_redaction_boundary():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("transport secret=do-not-leak")),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with patch(
+        "plugins.platforms.discord.adapter._redact_discord_error_text",
+        return_value="<safe transport error>",
+    ) as redact:
+        result = await adapter.send("555", "hello")
+
+    assert result.error == "<safe transport error>"
+    assert redact.called
+
+    forum = SimpleNamespace(
+        id=777,
+        create_thread=AsyncMock(
+            side_effect=RuntimeError("forum secret=do-not-leak")
+        ),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._is_forum_parent = lambda _channel: True
+
+    with patch(
+        "plugins.platforms.discord.adapter._redact_discord_error_text",
+        return_value="<safe forum error>",
+    ) as redact:
+        result = await adapter.send("555", "hello")
+
+    assert result.error == "Forum thread creation failed: <safe forum error>"
+    assert redact.call_count >= 1
+
+
