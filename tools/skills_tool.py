@@ -577,6 +577,33 @@ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return parse_frontmatter(content)
 
 
+def _skill_reasoning_effort(frontmatter: Dict[str, Any]) -> Optional[str]:
+    """Return the reasoning-effort suggestion a skill declares, or None.
+
+    Reads the optional ``metadata.hermes.reasoning`` frontmatter key
+    (agentskills.io convention, same slot as tags/related_skills). Only
+    recognized effort levels are accepted — anything unknown is ignored
+    so a typo can never crash resolution. Skills that declare nothing
+    contribute None (the reasoning resolver keeps its existing behavior).
+    """
+    if not isinstance(frontmatter, dict):
+        return None
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    hermes_meta = metadata.get("hermes")
+    if not isinstance(hermes_meta, dict):
+        return None
+    effort = hermes_meta.get("reasoning")
+    if not effort:
+        return None
+    from hermes_constants import parse_reasoning_effort
+    parsed = parse_reasoning_effort(effort)
+    if parsed is None or not parsed.get("enabled"):
+        return None
+    return parsed.get("effort")
+
+
 def _get_category_from_path(skill_path: Path) -> Optional[str]:
     """
     Extract category from skill path based on directory structure.
