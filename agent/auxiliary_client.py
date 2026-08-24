@@ -2066,6 +2066,9 @@ class _AnthropicCompletionsAdapter:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
+        # Anthropic-compatible endpoints reject a tool choice without tools.
+        if not tools:
+            kwargs.pop("tool_choice", None)
         tool_choice = kwargs.get("tool_choice")
         reasoning_config = kwargs.get("_reasoning_config")
         # ZAI's Anthropic-compatible endpoint rejects max_tokens on vision
@@ -2101,6 +2104,8 @@ class _AnthropicCompletionsAdapter:
                 if isinstance(_rc, dict):
                     _reasoning_cfg = _rc
 
+        if not tools:
+            normalized_tool_choice = None
         anthropic_kwargs = build_anthropic_kwargs(
             model=model,
             messages=messages,

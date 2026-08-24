@@ -561,7 +561,14 @@ def _translate_tools_to_gemini(tools: Any) -> List[Dict[str, Any]]:
     return [{"functionDeclarations": declarations}] if declarations else []
 
 
-def _translate_tool_choice_to_gemini(tool_choice: Any) -> Optional[Dict[str, Any]]:
+def _translate_tool_choice_to_gemini(
+    tool_choice: Any,
+    *,
+    has_tool_declarations: bool,
+) -> Optional[Dict[str, Any]]:
+    """Translate tool choice only when the request declares callable tools."""
+    if not has_tool_declarations:
+        return None
     if tool_choice is None:
         return None
     if isinstance(tool_choice, str):
@@ -662,7 +669,10 @@ def build_gemini_request(
     if gemini_tools:
         request["tools"] = gemini_tools
 
-    tool_config = _translate_tool_choice_to_gemini(tool_choice)
+    tool_config = _translate_tool_choice_to_gemini(
+        tool_choice,
+        has_tool_declarations=bool(gemini_tools),
+    )
     if tool_config:
         request["toolConfig"] = tool_config
 

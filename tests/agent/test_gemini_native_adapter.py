@@ -567,3 +567,37 @@ class TestGemini3ToolCallIds:
         result = translate_gemini_response(resp, model="gemini-2.5-flash")
         tool_calls = result.choices[0].message.tool_calls
         assert tool_calls[0].id.startswith("call_")
+
+def test_tool_choice_is_omitted_without_tool_declarations():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    request = build_gemini_request(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        tool_choice="required",
+    )
+
+    assert "tools" not in request
+    assert "toolConfig" not in request
+
+
+def test_required_tool_choice_is_translated_when_tools_are_declared():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Run a command",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    request = build_gemini_request(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        tool_choice="required",
+    )
+
+    assert request["tools"]
+    assert request["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+
