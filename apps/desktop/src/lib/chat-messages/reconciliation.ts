@@ -18,6 +18,51 @@ const latestBoundary = (...values: (number | undefined)[]) => {
 
 const normalizedTimelineText = (message: ChatMessage) => chatMessageText(message).replace(/\s+/g, ' ').trim()
 
+/** How far back a redelivered interim is matched against the transcript tail. */
+const REDELIVERY_SCAN_LIMIT = 8
+
+/**
+ * Whether `text` restates the visible text of one of the trailing assistant
+ * messages in `messages`.
+ *
+ * Interim commentary arrives over a reconnecting websocket, so any
+ * `message.interim` event can be redelivered — immediately or long after its
+ * bubble was sealed. The standalone-append path used to take every copy,
+ * producing visibly doubled commentary (#93926). Redelivery is recognized by
+ * normalized visible text within a small window of the transcript tail.
+ * Distinct texts never match, so genuinely new commentary still appends.
+ *
+ * Known bound: identical legitimate commentary inside the scan window (e.g. a
+ * repeated "Still working..." line) is indistinguishable from redelivery by
+ * text alone and is dropped once. Text-equality is the only identity the wire
+ * offers for these events.
+ */
+export function isRedeliveredAssistantText(messages: ChatMessage[], text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+
+  if (!normalized) {
+    return false
+  }
+
+  let scanned = 0
+
+  for (let index = messages.length - 1; index >= 0 && scanned < REDELIVERY_SCAN_LIMIT; index -= 1) {
+    const message = messages[index]
+
+    if (message.hidden) {
+      continue
+    }
+
+    scanned += 1
+
+    if (message.role === 'assistant' && normalizedTimelineText(message) === normalized) {
+      return true
+    }
+  }
+
+  return false
+}
+
 const assistantTimelineMatch = (stored: ChatMessage, local: ChatMessage) => {
   if (stored.id === local.id) {
     return true
