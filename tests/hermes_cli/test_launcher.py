@@ -2,6 +2,7 @@
 
 import builtins
 import runpy
+import shlex
 import subprocess
 import sys
 import types
@@ -151,6 +152,110 @@ def test_classify_hermes_cli_name_from_outside_is_not_internal(tmp_path):
     missing, internal = classify(exc, pkg_dir=pkg_dir)
     assert missing == "hermes_cli.definitely_missing_submodule"
     assert internal is False
+
+
+def test_classify_attributes_re_raised_import_to_cause_chain(tmp_path):
+    """An import failure re-raised via `raise ... from err` keeps the original
+    import site on `__cause__`. Classification must use the deepest traceback
+    in that chain — here a frame inside hermes_cli — not the innermost frame
+    of the re-raise site (which lives outside the package and would wrongly
+    demote an internal bug to a missing dependency)."""
+    classify = _launcher_namespace()["_classify_import_failure"]
+    pkg_dir = tmp_path / "hermes_cli"
+
+    inner = tmp_path / "hermes_cli" / "broken.py"
+    inner.parent.mkdir(parents=True, exist_ok=True)
+    inner.write_text("import hermes_cli.definitely_missing_submodule\n")
+
+    outer = tmp_path / "re_raise_site.py"  # deliberately outside the package
+    outer_code = (
+        "import builtins\n"
+        "try:\n"
+        f"    exec(compile({inner.read_text()!r}, {str(inner)!r}, 'exec'),"
+        " {'__builtins__': builtins.__dict__})\n"
+        "except ModuleNotFoundError as err:\n"
+        "    raise ModuleNotFoundError(err.name) from err\n"
+    )
+    try:
+        exec(
+            compile(outer_code, str(outer), "exec"),
+            {"__builtins__": builtins.__dict__},
+        )
+    except ModuleNotFoundError as exc:
+        wrapped = exc
+    else:
+        raise AssertionError("expected a re-raised ModuleNotFoundError")
+
+    assert wrapped.__cause__ is not None
+    missing, internal = classify(wrapped, pkg_dir=pkg_dir)
+    assert missing == "hermes_cli.definitely_missing_submodule"
+    assert internal is True
+
+
+def test_classify_normalizes_unnamed_module_error_to_module_token():
+    """When `exc.name` is empty, the raw `No module named 'x'` message must be
+    normalized to just the module token so the `missing dependency:` report
+    field stays machine-greppable."""
+    classify = _launcher_namespace()["_classify_import_failure"]
+
+    exc = ModuleNotFoundError("No module named 'definitely_missing_dependency'")
+    assert exc.name is None
+
+    missing, internal = classify(exc)
+    assert missing == "definitely_missing_dependency"
+    assert internal is False
+
+
+def test_report_launcher_failure_missing_dependency_field_is_bare_token(capsys):
+    """The `missing dependency:` field must carry just the module token, never
+    the whole `No module named 'x'` sentence."""
+    ns = _launcher_namespace()
+    globs = ns["_report_launcher_failure"].__globals__
+    globs["_find_install_venv_python"] = lambda checkout: None
+
+    exc = ModuleNotFoundError("No module named 'definitely_missing_dependency'")
+    missing, internal = ns["_classify_import_failure"](exc)
+    ns["_report_launcher_failure"](missing, internal=internal)
+
+    err = capsys.readouterr().err
+    assert "missing dependency:  definitely_missing_dependency" in err
+    assert "missing dependency:  No module named" not in err
+
+
+def test_report_launcher_failure_fix_command_is_shell_quoted(monkeypatch, capsys):
+    """argv entries containing spaces must be shell-quoted in the suggested
+    fix so the printed command copy-pastes correctly (`--model "a b"` must
+    not flatten into `--model a b`)."""
+    ns = _launcher_namespace()
+    ns["_report_launcher_failure"].__globals__["_find_install_venv_python"] = (
+        lambda checkout: "/opt/hermes/venv/bin/python"
+    )
+    monkeypatch.setattr(
+        sys, "argv", [str(_launcher()), "gateway", "run", "--model", "a b"]
+    )
+
+    ns["_report_launcher_failure"]("yaml")
+
+    err = capsys.readouterr().err
+    fix_lines = [line for line in err.splitlines() if line.startswith("  fix:")]
+    assert len(fix_lines) == 1
+    command = fix_lines[0][len("  fix:") :].strip()
+    expected_prefix = f"/opt/hermes/venv/bin/python {_launcher()} "
+    assert command.startswith(expected_prefix)
+    assert command[len(expected_prefix) :] == shlex.join([
+        "gateway",
+        "run",
+        "--model",
+        "a b",
+    ])
+    # The argv portion must round-trip through a POSIX shell: 'a b' stays one
+    # argument, not two.
+    assert shlex.split(command[len(expected_prefix) :]) == [
+        "gateway",
+        "run",
+        "--model",
+        "a b",
+    ]
 
 
 def test_report_launcher_failure_distinguishes_internal_bug(capsys):

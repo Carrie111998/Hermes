@@ -14,6 +14,7 @@ from inside the package itself is reported as an internal error, never as
 a missing dependency.
 """
 
+import shlex
 import sys
 from pathlib import Path
 
@@ -39,17 +40,34 @@ def _classify_import_failure(
 
     A missing third-party dependency (``yaml``, ``dotenv``, ...) is an
     install problem and gets the venv fix. A ``ModuleNotFoundError`` for a
-    ``hermes_cli.*`` module raised from a file *inside* the package is the
-    package failing to import its own code — an internal bug that must not
-    be misreported as a missing dependency.
+    ``hermes_cli.*`` module whose original import site is a file *inside*
+    the package is the package failing to import its own code — an internal
+    bug that must not be misreported as a missing dependency. The original
+    import site is the innermost frame of the deepest traceback in the
+    ``__cause__`` chain, so a failure re-raised via ``raise ... from err``
+    is attributed to its real origin, not to whatever re-raised it.
     """
-    missing = getattr(exc, "name", "") or str(exc)
+    name = getattr(exc, "name", "")
+    if name:
+        missing = name
+    else:
+        message = str(exc)
+        prefix = "No module named "
+        if message.startswith(prefix):
+            missing = message[len(prefix) :].strip("'\"")
+        else:
+            missing = message
     if not (missing == "hermes_cli" or missing.startswith("hermes_cli.")):
         return missing, False
     if pkg_dir is None:
         pkg_dir = Path(__file__).resolve().parent / "hermes_cli"
     pkg_dir = Path(pkg_dir).resolve()
-    tb = exc.__traceback__
+    cause: BaseException | None = exc
+    tb = None
+    while cause is not None:
+        if cause.__traceback__ is not None:
+            tb = cause.__traceback__
+        cause = cause.__cause__
     frame = None
     while tb is not None:
         frame = tb.tb_frame
@@ -94,7 +112,7 @@ def _report_launcher_failure(
     expected = _find_install_venv_python(script.parent)
     if expected:
         lines.append(f"  expected interpreter: {expected}")
-        lines.append(f"  fix: {expected} {script} " + " ".join(sys.argv[1:]))
+        lines.append(f"  fix: {expected} {script} " + shlex.join(sys.argv[1:]))
     else:
         lines.append(
             "  fix: run this script with the venv Python Hermes was installed "
