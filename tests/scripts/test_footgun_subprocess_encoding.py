@@ -232,3 +232,119 @@ class TestFullRepoScan:
                 f"a `# windows-footgun: ok` suppression."
             )
         # All matches are the expected PR #60741 sites — OK on this branch.
+
+
+# ---------------------------------------------------------------------------
+# AST pass — multi-line subprocess calls the line-based rule misses
+# ---------------------------------------------------------------------------
+
+MULTI_LINE_FIXTURE = '''import subprocess
+
+
+def fetch(cmd):
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return result.stdout
+'''
+
+MULTI_LINE_FIXED = '''import subprocess
+
+
+def fetch(cmd):
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    return result.stdout
+'''
+
+
+def _scan_source(linter, source: str) -> list:
+    from pathlib import Path
+
+    return linter.scan_file_ast(Path("x.py"), source, linter.FOOTGUNS)
+
+
+class TestAstPassMultiLine:
+    def test_flags_text_true_on_continuation_line(self, linter):
+        findings = _scan_source(linter, MULTI_LINE_FIXTURE)
+        assert findings, "multi-line text=True must be flagged by the AST pass"
+        lineno, line, fg = findings[0]
+        assert fg.name == RULE_NAME
+        assert lineno == 5  # the subprocess.run( call opener
+
+    def test_encoding_on_later_line_is_clean(self, linter):
+        assert _scan_source(linter, MULTI_LINE_FIXED) == []
+
+    def test_suppression_marker_on_any_call_line_suppresses(self, linter):
+        src = MULTI_LINE_FIXTURE.replace(
+            "        text=True,",
+            "        text=True,  # windows-footgun: ok — POSIX-only path",
+        )
+        assert _scan_source(linter, src) == []
+
+    def test_from_import_direct_call_is_flagged(self, linter):
+        src = (
+            "from subprocess import run\n"
+            "\n"
+            "\n"
+            "def go(cmd):\n"
+            "    return run(cmd, text=True)\n"
+        )
+        assert _scan_source(linter, src)
+
+    def test_module_alias_is_flagged(self, linter):
+        src = (
+            "import subprocess as sp\n"
+            "\n"
+            "\n"
+            "def go(cmd):\n"
+            "    return sp.Popen(cmd, text=True)\n"
+        )
+        assert _scan_source(linter, src)
+
+    def test_non_subprocess_text_kwarg_is_ignored(self, linter):
+        src = (
+            "class Frame:\n"
+            "    def rename(self, *, text=False):\n"
+            "        return text\n"
+            "\n"
+            "\n"
+            "Frame().rename(text=True)\n"
+        )
+        assert _scan_source(linter, src) == []
+
+    def test_unparsable_file_returns_no_findings(self, linter):
+        from pathlib import Path
+
+        assert linter.scan_file_ast(Path("x.py"), "def broken(:\n", linter.FOOTGUNS) == []
+
+    def test_line_and_ast_rules_do_not_double_report(self, linter):
+        """A single-line call must appear exactly once after dedupe."""
+        src = (
+            "import subprocess\n"
+            "\n"
+            "subprocess.run(cmd, text=True)\n"
+        )
+        from pathlib import Path
+
+        findings = linter.scan_file(Path("x.py"), src, linter.FOOTGUNS) if False else None
+        # scan_file needs a real Path it can read; exercise via tmp file instead.
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as fh:
+            fh.write(src)
+            tmp = Path(fh.name)
+        try:
+            findings = linter.scan_file(tmp, linter.FOOTGUNS)
+        finally:
+            tmp.unlink()
+        assert len([f for f in findings if f[2].name == RULE_NAME]) == 1

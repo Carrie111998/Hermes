@@ -71,6 +71,8 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_MINT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
