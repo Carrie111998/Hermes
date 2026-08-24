@@ -177,7 +177,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             stored: session.stored,
             title: session.title
           })
-          const reply = turnScript(session.profile, params.text, calls.length, session)
+          const reply = await turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
           return {}
         }
@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, runGroupChatMemberTurn, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -402,6 +402,35 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   const betaSession = gc.sessions.get(betaFirst.stored)
   assert.equal(alphaSession.messages.some(message => String(message.content).includes('BETA_ONLY')), false)
   assert.equal(betaSession.messages.some(message => String(message.content).includes('ALPHA_ONLY')), false)
+})
+
+test('one member cannot run two turns concurrently across threads in the same room', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  const gc = load(async (_profile, prompt) => {
+    if (prompt === 'first thread') {
+      markFirstStarted()
+      await firstGate
+      return 'first reply'
+    }
+    return 'second reply'
+  })
+  const member = { name: 'research', title: '' }
+
+  const first = gc.runGroupChatMemberTurn('Room', member, 'first thread', 'thread-a', [])
+  await firstStarted
+  const second = gc.runGroupChatMemberTurn('Room', member, 'second thread', 'thread-b', [])
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(gc.calls.length, 1, 'the second thread must not submit into a busy member session')
+
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, second]), ['first reply', 'second reply'])
+  assert.equal(gc.calls.length, 2)
+  assert.equal(gc.calls[0].prompt, 'first thread')
+  assert.equal(gc.calls[1].prompt, 'second thread')
 })
 
 test('recreating a same-name group after disband mints fresh member sessions', async () => {

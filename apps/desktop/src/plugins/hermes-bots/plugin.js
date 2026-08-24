@@ -7254,6 +7254,16 @@ async function answerGroupClarify(entry, member, answers) {
   }
 }
 
+// A profile owns one persistent session per room. Different room threads may
+// drive concurrently, but they must never submit into or poll that SAME member
+// session concurrently: both pollers can otherwise claim one completion and
+// append it to different threads (#93127 follow-up). Rooms remain independent.
+const groupMemberTurnFlights = new Map()
+
+function groupMemberTurnFlightKey(group, member) {
+  return `${group}::${groupMemberKey(member)}`
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -7262,16 +7272,32 @@ async function answerGroupClarify(entry, member, answers) {
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
 async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
-  // #93602: hold the member's route socket for the whole turn. Without the
-  // lease, every RPC below rides its own request-scoped socket lease; the
-  // socket that minted `runtime` can close between RPCs, the gateway reaps
-  // the runtime session, and prompt.submit dies 4001 — the bot goes silent.
-  const releaseTurnLease = await retainGroupTurnRoute(member)
+  const key = groupMemberTurnFlightKey(group, member)
+  const prior = groupMemberTurnFlights.get(key)
+  const start = async () => {
+    // #93602: hold the member's route socket for the whole turn. Without the
+    // lease, every RPC below rides its own request-scoped socket lease; the
+    // socket that minted `runtime` can close between RPCs, the gateway reaps
+    // the runtime session, and prompt.submit dies 4001 — the bot goes silent.
+    const releaseTurnLease = await retainGroupTurnRoute(member)
+
+    try {
+      return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images)
+    } finally {
+      releaseTurnLease()
+    }
+  }
+  // A failed earlier turn must release ownership and must not poison the next
+  // thread. Its original caller still observes the failure independently.
+  const flight = prior ? prior.catch(() => undefined).then(start) : start()
+  groupMemberTurnFlights.set(key, flight)
 
   try {
-    return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images)
+    return await flight
   } finally {
-    releaseTurnLease()
+    if (groupMemberTurnFlights.get(key) === flight) {
+      groupMemberTurnFlights.delete(key)
+    }
   }
 }
 
@@ -7516,7 +7542,8 @@ async function harvestStrandedGroupReply(group, member) {
  *
  *  The re-drive premise is only true for a send in the SAME thread (delta
  *  filters are thread-scoped): a cross-thread epoch bump must NOT discard
- *  finished work no fresh loop will regenerate. Callers pass whether a newer
+ *  finished work that belongs to the old thread. Per-member turn ownership
+ *  serializes the newer thread behind this one. Callers pass whether a newer
  *  USER entry landed in this thread since dispatch; the default (true)
  *  preserves the conservative drop when the caller can't tell. */
 function shouldCommitMemberTurn(epochAtDispatch, currentEpoch, newerUserEntryInThread = true) {

@@ -50,11 +50,11 @@ test('a current turn commits — epoch unchanged since dispatch', () => {
   assert.equal(shouldCommitMemberTurn(0, 0), true)
 })
 
-test('a cross-thread epoch bump does NOT discard finished work (no fresh loop re-drives it)', () => {
+test('a cross-thread epoch bump preserves the old thread reply', () => {
   const { shouldCommitMemberTurn } = loadHelpers()
   // Epoch moved, but no newer user entry landed in THIS thread: the
-  // superseding send lives in another thread whose loop filters this one
-  // out — dropping the reply would lose completed work forever.
+  // superseding send lives in another thread. Member-turn ownership keeps
+  // its later prompt from consuming this completion.
   assert.equal(shouldCommitMemberTurn(3, 4, false), true)
 })
 
