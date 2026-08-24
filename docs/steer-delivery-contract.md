@@ -121,9 +121,13 @@ The dispatcher now pins an internal **run-start baseline** env var
 (`HERMES_KANBAN_COMMENT_BASELINE`, set to the task's max comment id at spawn —
 an internal dispatcher→worker process bridge, not a user-facing config knob)
 and the injector seeds to that baseline and injects comments past it. The
-spawn→first-poll window is closed: every comment after the run started is
-injected, and comments already in the context are not re-injected. This is
-core behavior; surfaces must not re-implement it.
+spawn→first-poll swallow window is closed: every comment written after the run
+started is delivered. One precision note: a comment landing between the
+baseline pin (spawn) and the worker's first context build is delivered TWICE —
+once in-thread (it is already in `build_worker_context`'s comment thread) and
+once as a live injection. That is a duplicate, never a loss: the guarantee is
+"never swallowed," not "exactly once." This is core behavior; surfaces must not
+re-implement it.
 
 ## 4. Why the 200-with-deferred shape (design notes)
 
