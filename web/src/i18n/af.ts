@@ -1,4 +1,5 @@
 import type { Translations } from "./types";
+import { wisdomCopy } from "./wisdom-copy";
 
 export const af: Translations = {
   common: {
@@ -360,6 +361,7 @@ export const af: Translations = {
   },
 
   skills: {
+    wisdom: wisdomCopy,
     title: "Vaardighede",
     searchPlaceholder: "Soek vaardighede en gereedskapstelle...",
     enabledOf: "{enabled}/{total} geaktiveer",

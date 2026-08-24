@@ -1,0 +1,43 @@
+export const wisdomCopy = {
+  title: 'Collective Wisdom',
+  loading: 'Loading Collective Wisdom…',
+  unavailable: 'Collective Wisdom is unavailable.',
+  setup: 'Run hermes wisdom setup for this profile.',
+  orgWide: 'organization-wide collective',
+  sharedSkills: (count: number) => `${count} shared skills`,
+  localCandidates: (count: number) => `${count} local candidates`,
+  noShared: 'No shared skills match this search.',
+  noDescription: 'No owner-authored description',
+  serverScanPassed: 'server scan passed',
+  localOnly: 'Local-only qualification; manual owner consent required.',
+  prepare: 'Prepare',
+  reviewExact: 'Review exact bytes',
+  authoritative: 'Gateway is authoritative for publication and server scan decisions.',
+  versionHistory: 'Version history',
+  prepareTitle: 'Review local package before upload',
+  prepareNotice: 'Local candidate signals are excluded. No bytes leave this profile until Submit.',
+  ownerDescription: 'Owner-authored description',
+  systemSpecification: 'System Specification',
+  cancel: 'Cancel',
+  submit: 'Submit for owner-only server review',
+  readEvery: 'Read every file. Approval is bound to the exact three hashes below.',
+  close: 'Close',
+  approve: 'Approve exact content & publish',
+  proposalTitle: 'Publish to collective — approval required',
+  localSuggestion: 'local suggestion',
+  proposalNotice:
+    'Hermes recognized a reusable skill after this task. Its qualification reasons stay on this device; nothing is shared until you review and approve the exact package.',
+  openCollective: 'Open Collective',
+  prepareExact: 'Prepare exact package',
+  specificationNotice:
+    'Review the owner-authored copy and declarative System Specification. No dependency action is authorized.',
+  openFullReview: 'Open full review',
+  sendPrivateReview: 'Send for owner-only server review',
+  serverEnforced: 'server enforced',
+  localAdvisory: 'local advisory: separate pre-submit scan',
+  serverReviewNotice: 'Read every raw file below. Approval is bound to these exact server-authoritative hashes.',
+  decline: 'Decline',
+  approvePublish: 'Approve & publish'
+} as const
+
+export type WisdomCopy = typeof wisdomCopy

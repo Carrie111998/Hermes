@@ -5,6 +5,8 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
+import type { WisdomCopy } from './wisdom-copy'
+
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
 
 export type ToolTitleKey =
@@ -1069,13 +1071,16 @@ export interface Translations {
   }
 
   skills: {
+    collective: WisdomCopy
     tabSkills: string
     tabToolsets: string
     configuringProfile: string
     tabMcp: string
+    tabCollective: string
     all: string
     searchSkills: string
     searchToolsets: string
+    searchCollective: string
     refresh: string
     refreshing: string
     loading: string

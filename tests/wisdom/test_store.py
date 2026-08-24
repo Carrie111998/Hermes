@@ -33,6 +33,47 @@ def test_delete_recreate_does_not_inherit_identity(tmp_path: Path):
     assert first != second
 
 
+def test_rename_falls_back_to_unambiguous_content_hash_without_filesystem_identity(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr("hermes_wisdom.store.filesystem_identity", lambda _path: None)
+    store = WisdomStore(tmp_path / "wisdom")
+    original = tmp_path / "original"
+    original.mkdir()
+    (original / "SKILL.md").write_text("same", encoding="utf-8")
+    first = store.register_skill(
+        original, content_hash="sha256:same", source_kind="local"
+    )
+    renamed = tmp_path / "renamed"
+    original.rename(renamed)
+    store.mark_missing_skills({str(renamed.resolve())})
+    second = store.register_skill(
+        renamed, content_hash="sha256:same", source_kind="local"
+    )
+    assert second == first
+
+
+def test_ambiguous_content_hash_move_creates_new_identity(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("hermes_wisdom.store.filesystem_identity", lambda _path: None)
+    store = WisdomStore(tmp_path / "wisdom")
+    for name in ("one", "two"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "SKILL.md").write_text("same", encoding="utf-8")
+        store.register_skill(path, content_hash="sha256:same", source_kind="local")
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (moved / "SKILL.md").write_text("same", encoding="utf-8")
+    new_id = store.register_skill(
+        moved, content_hash="sha256:same", source_kind="local"
+    )
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM local_skill").fetchone()[0] == 3
+        assert db.execute(
+            "SELECT canonical_path FROM local_skill WHERE id=?", (new_id,)
+        ).fetchone()[0] == str(moved.resolve())
+
+
 def test_operation_journal_survives_restart(tmp_path: Path):
     root = tmp_path / "wisdom"
     store = WisdomStore(root)

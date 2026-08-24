@@ -7,13 +7,15 @@ import {
   getSkills,
   getToolsets,
   getUsageAnalytics,
+  getWisdomStatus,
   installSkillFromHub,
   profileScopeKey,
   saveMcpServers,
   setApiRequestConnection,
   setApiRequestProfile,
   setSkillEnabled,
-  setToolsetEnabled
+  setToolsetEnabled,
+  suggestWisdomSkill
 } from './hermes'
 
 // Contract: the Capabilities surface (skills / toolsets / MCP / hub / config)
@@ -82,11 +84,39 @@ describe('capability helpers are connection-scoped', () => {
     void setToolsetEnabled('browser', true, { connectionId: 'homelab', profile: 'inbox-bot' })
     void saveMcpServers({}, { connectionId: 'homelab', profile: 'inbox-bot' })
     void installSkillFromHub('official/research/arxiv', { connectionId: 'homelab', profile: 'inbox-bot' })
+    void getWisdomStatus({ connectionId: 'homelab', profile: 'inbox-bot' })
+    void suggestWisdomSkill(
+      'local-skill',
+      { connectionId: 'homelab', profile: 'inbox-bot' },
+      {
+        description: 'Owner copy',
+        systemSpecification: { hermes: { minimum_version: '0.17.0' } }
+      }
+    )
 
     for (const call of api.mock.calls) {
       expect((call[0] as { connectionId?: string }).connectionId).toBe('homelab')
       expect(call[0].profile).toBe('inbox-bot')
     }
+  })
+
+  it('keeps local candidate evidence out of Wisdom mutation bodies', () => {
+    void suggestWisdomSkill('local-skill', 'research', {
+      description: 'Owner copy',
+      systemSpecification: { hermes: { minimum_version: '0.17.0' } }
+    })
+
+    expect(api.mock.calls.at(-1)?.[0]).toMatchObject({
+      body: {
+        description: 'Owner copy',
+        skill: 'local-skill',
+        system_specification: { hermes: { minimum_version: '0.17.0' } }
+      },
+      method: 'POST',
+      path: '/api/wisdom/suggest',
+      profile: 'research'
+    })
+    expect(JSON.stringify(api.mock.calls.at(-1)?.[0])).not.toMatch(/usage|refinement|candidate|ranking|stability/)
   })
 
   it("a 'local' pin routes to the local pool even while a remote gateway is active", () => {

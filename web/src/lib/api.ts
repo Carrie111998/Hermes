@@ -749,6 +749,71 @@ export const api = {
   // runs under. Omitted/empty profile = the dashboard's own profile.
   getSkills: (profile?: string) =>
     fetchJSON<SkillInfo[]>(`/api/skills${profileQuery(profile)}`),
+  getWisdomStatus: (profile?: string) =>
+    fetchJSON<WisdomStatus>(`/api/wisdom/status${profileQuery(profile)}`),
+  getWisdomCandidates: (profile?: string) =>
+    fetchJSON<{ candidates: WisdomCandidate[] }>(
+      `/api/wisdom/candidates${profileQuery(profile)}`,
+    ),
+  getWisdomEvents: (profile?: string, sessionId?: string) => {
+    const params = new URLSearchParams();
+    if (profile) params.set("profile", profile);
+    if (sessionId) params.set("session_id", sessionId);
+    const query = params.toString();
+    return fetchJSON<{ events: WisdomCandidateEvent[] }>(
+      `/api/wisdom/events${query ? `?${query}` : ""}`,
+    );
+  },
+  getWisdomDiscovery: (profile?: string) =>
+    fetchJSON<WisdomDiscovery>(`/api/wisdom/discovery${profileQuery(profile)}`),
+  getWisdomDrafts: (profile?: string) =>
+    fetchJSON<{ drafts: WisdomDraft[] }>(
+      `/api/wisdom/drafts${profileQuery(profile)}`,
+    ),
+  getWisdomSkill: (skillId: string, profile?: string) =>
+    fetchJSON<WisdomSkillDetail>(
+      `/api/wisdom/skills/${encodeURIComponent(skillId)}${profileQuery(profile)}`,
+    ),
+  suggestWisdomSkill: (
+    skill: string,
+    profile?: string,
+    description?: string,
+    systemSpecification?: Record<string, unknown>,
+  ) =>
+    fetchJSON<WisdomPreparedDraft | { draft: WisdomDraft }>("/api/wisdom/suggest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        skill,
+        description,
+        system_specification: systemSpecification,
+        profile: profile || undefined,
+      }),
+    }),
+  reviewWisdomDraft: (
+    draftId: string,
+    acknowledge: boolean,
+    profile?: string,
+  ) =>
+    fetchJSON<WisdomDraftReview>("/api/wisdom/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        draft_id: draftId,
+        acknowledge,
+        profile: profile || undefined,
+      }),
+    }),
+  decideWisdomDraft: (
+    draftId: string,
+    decision: "approve" | "decline",
+    profile?: string,
+  ) =>
+    fetchJSON<Record<string, unknown>>(`/api/wisdom/${decision}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft_id: draftId, profile: profile || undefined }),
+    }),
   toggleSkill: (name: string, enabled: boolean, profile?: string) =>
     fetchJSON<{ ok: boolean }>("/api/skills/toggle", {
       method: "PUT",
@@ -2314,6 +2379,95 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+}
+
+export interface WisdomStatus {
+  configured: boolean;
+  gateway_available: boolean;
+  capability_advertised: boolean;
+  verified_org_id: string | null;
+  display_scopes: string[];
+  error?: string | null;
+}
+
+export interface WisdomCandidate {
+  local_skill_id: string;
+  name: string;
+  path: string;
+  content_hash: string;
+  eligibility: "eligible" | "instruction_only_fork_required";
+  reason: string | null;
+  qualification: string;
+}
+
+export interface WisdomCandidateEvent {
+  id: string;
+  kind: "wisdom.candidate";
+  session_id: string | null;
+  task_id: string | null;
+  content_hash: string;
+  payload: {
+    skill_name: string;
+    qualification: string;
+    local_reasons: Record<string, unknown>;
+    consent_required: boolean;
+    networked: false;
+  };
+}
+
+export interface WisdomPreparedDraft {
+  network_submission: false;
+  local_draft_id: string;
+  overlay_path: string;
+  drafted_description: string;
+  system_specification: Record<string, unknown>;
+  next_step: string;
+}
+
+export interface WisdomSkillSummary {
+  id: string;
+  slug: string;
+  state: string;
+  latest_version: number | null;
+  author_description: string | null;
+  install_count: number;
+  scan_verdict?: string | null;
+  system_spec?: Record<string, unknown> | null;
+}
+
+export interface WisdomDiscovery {
+  skills: WisdomSkillSummary[];
+  next_cursor: string | null;
+}
+
+export interface WisdomDraft {
+  id: string;
+  slug: string;
+  state: string;
+  authorDescription: string | null;
+  scanVerdict: string | null;
+  updatedAt: string;
+}
+
+export interface WisdomSkillDetail {
+  skill: Record<string, unknown>;
+  versions: Array<Record<string, unknown>>;
+}
+
+export interface WisdomDraftReview {
+  draft: WisdomDraft & Record<string, unknown>;
+  files: Array<{
+    path: string;
+    mode: "file" | "exec";
+    hash: string;
+    content_utf8: string;
+  }>;
+  hashes: {
+    content: string;
+    author_description: string;
+    package_manifest: string;
+  };
+  receipt: string | null;
 }
 
 export interface SkillContent {

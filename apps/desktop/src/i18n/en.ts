@@ -1,6 +1,7 @@
 import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 
 import type { Translations } from './types'
+import { wisdomCopy } from './wisdom-copy'
 
 export const en: Translations = {
   common: {
@@ -1225,13 +1226,16 @@ export const en: Translations = {
   },
 
   skills: {
+    collective: wisdomCopy,
     tabSkills: 'Skills',
     tabToolsets: 'Tools',
     configuringProfile: 'Configuring:',
     tabMcp: 'MCP',
+    tabCollective: 'Collective',
     all: 'All',
     searchSkills: 'Search skills...',
     searchToolsets: 'Search tools...',
+    searchCollective: 'Search the collective...',
     refresh: 'Refresh skills',
     refreshing: 'Refreshing skills',
     loading: 'Loading capabilities...',

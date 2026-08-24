@@ -1,4 +1,5 @@
 import { defineLocale } from './define-locale'
+import { wisdomCopy } from './wisdom-copy'
 
 export const ar = defineLocale({
   sendDiagnostics: {
@@ -984,6 +985,9 @@ export const ar = defineLocale({
     }
   },
   skills: {
+    collective: wisdomCopy,
+    tabCollective: 'المعرفة الجماعية',
+    searchCollective: 'البحث في المعرفة الجماعية...',
     tabSkills: 'المهارات',
     tabToolsets: 'مجموعات الأدوات',
     all: 'الكل',

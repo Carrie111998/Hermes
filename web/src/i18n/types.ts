@@ -17,6 +17,8 @@ export type Locale =
   | "hu"
   | "ar";
 
+import type { WisdomCopy } from "./wisdom-copy";
+
 export interface Translations {
   // ── Common ──
   common: {
@@ -437,6 +439,7 @@ export interface Translations {
 
   // ── Skills page ──
   skills: {
+    wisdom: WisdomCopy;
     title: string;
     searchPlaceholder: string;
     enabledOf: string;

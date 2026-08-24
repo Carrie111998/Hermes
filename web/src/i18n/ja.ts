@@ -1,4 +1,5 @@
 import type { Translations } from "./types";
+import { wisdomCopy } from "./wisdom-copy";
 
 export const ja: Translations = {
   common: {
@@ -359,6 +360,7 @@ export const ja: Translations = {
   },
 
   skills: {
+    wisdom: wisdomCopy,
     title: "スキル",
     searchPlaceholder: "スキルとツールセットを検索...",
     enabledOf: "{enabled}/{total} 有効",

@@ -19,8 +19,8 @@ stored row, audit event, Portal response, or publication consent artifact.
 | Owner-private submission, exact server review, receipt, publish recovery | foundation | `client.py`, `service.py` | `test_client.py`, `test_service.py` | complete; Gateway remains authority |
 | Explicit managed install and four deterministic local outcomes | foundation | `compatibility.py`, `service.py` | `test_compatibility.py`, `test_service.py` | complete; local inventory is never uploaded |
 | CLI and natural-language plan/apply install | foundation | `hermes_cli/subcommands/wisdom.py`, built-in skill | `test_cli.py`, `tests/skills` | complete in foundation |
-| Continuous local qualification and durable candidate event | contribution loop | local qualification/event modules | contribution tests | partial until stacked PR 2 |
-| In-chat promotion card and dashboard/native candidate UI | contribution loop | local API and client renderers | web/desktop visual E2E | partial until stacked PR 2 |
+| Continuous local qualification and durable candidate event | contribution loop | `hermes_wisdom/qualification.py`, `store.py`, `tools/skill_usage.py` | `tests/wisdom/test_qualification.py`, legacy skill-usage suites | complete in stacked PR 2; all reasons and counters stay on-device |
+| In-chat promotion card and dashboard/native candidate UI | contribution loop | `hermes_cli/web_server.py`, dashboard `CollectiveWisdomPanel`, desktop `CollectiveTab` and `WisdomCandidateCard` | focused web/desktop component, scope, XSS, consent, and hydration tests | complete in stacked PR 2; live cross-repo visual E2E remains a rollout gate |
 | Update modes, required forks, feed, cadence, Telegram, uninstall | consumption | update/feed modules | failure-injection and feed suites | partial until stacked PR 3 |
 | Completed discovery/detail/install/update dashboard/native UX | consumption | web and desktop capability surfaces | accessibility and visual E2E | partial until stacked PR 3 |
 | Two-identity same-org and negative cross-org live E2E | cross-repo rollout | Agent + Gateway + Portal | live dogfood harness | blocked on deployed pinned stack and sign-off |

@@ -1,4 +1,5 @@
 import type { Translations } from "./types";
+import { wisdomCopy } from "./wisdom-copy";
 
 export const zh: Translations = {
   common: {
@@ -355,6 +356,7 @@ export const zh: Translations = {
   },
 
   skills: {
+    wisdom: wisdomCopy,
     title: "技能",
     searchPlaceholder: "搜索技能和工具集...",
     enabledOf: "已启用 {enabled}/{total}",

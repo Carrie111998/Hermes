@@ -26,7 +26,9 @@ from .compatibility import CompatibilityResult, detect_local_capabilities, evalu
 from .contract import (
     CONTRACT_PIN,
     PackageManifest,
+    SystemSpecification,
     author_description_hash,
+    canonical_json_bytes,
     sha256_address,
 )
 from .package import (
@@ -295,6 +297,10 @@ class WisdomService:
 
     def scan_candidates(self) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
+        qualified = {
+            (str(event["skill_id"]), str(event["content_hash"])): event
+            for event in self.store.local_events(kind="wisdom.candidate")
+        }
         eligible_paths = self._eligible_paths()
         self.store.mark_missing_skills({str(path.resolve()) for path in eligible_paths})
         for path in eligible_paths:
@@ -317,14 +323,23 @@ class WisdomService:
             except PackagePolicyError as exc:
                 eligibility = "instruction_only_fork_required"
                 reason = str(exc)
+            event = qualified.get((skill_id, source_hash))
             candidates.append({
                 "local_skill_id": skill_id,
                 "name": path.name,
                 "path": str(path),
                 "content_hash": source_hash,
                 "eligibility": eligibility,
-                "reason": reason,
-                "qualification": "manual_selection",
+                "reason": (
+                    reason
+                    if reason
+                    else json.dumps(event["payload"]["local_reasons"], sort_keys=True)
+                    if event
+                    else None
+                ),
+                "qualification": (
+                    str(event["qualification"]) if event else "manual_selection"
+                ),
             })
         return candidates
 
@@ -346,6 +361,7 @@ class WisdomService:
         skill_name: str | None = None,
         *,
         description: str | None = None,
+        system_specification: dict[str, Any] | None = None,
         allow_private_secret_review: bool = False,
     ) -> dict[str, Any]:
         if not skill_name:
@@ -397,15 +413,39 @@ class WisdomService:
                 ),
             }
         if description is None:
+            manifest = PackageManifest.model_validate_json(
+                (Path(prepared["overlay_path"]) / "skill.manifest.json").read_bytes()
+            )
             return {
                 "network_submission": False,
                 "local_draft_id": prepared["id"],
                 "overlay_path": prepared["overlay_path"],
                 "drafted_description": prepared["description"],
+                "system_specification": manifest.requirements.model_dump(mode="json"),
                 "next_step": "Provide the owner-approved description to submit the edited overlay.",
             }
+        if system_specification is None:
+            raise PackagePolicyError(
+                "submission requires explicit owner approval of the System Specification"
+            )
+        overlay = Path(prepared["overlay_path"])
+        existing_manifest = PackageManifest.model_validate_json(
+            (overlay / "skill.manifest.json").read_bytes()
+        )
+        approved_manifest = PackageManifest(
+            schema_version=existing_manifest.schema_version,
+            name=existing_manifest.name,
+            requirements=SystemSpecification.model_validate(system_specification),
+        )
+        manifest_path = overlay / "skill.manifest.json"
+        temporary_manifest = manifest_path.with_suffix(".json.pending")
+        temporary_manifest.write_bytes(
+            canonical_json_bytes(approved_manifest.model_dump(mode="json"))
+        )
+        temporary_manifest.chmod(0o600)
+        os.replace(temporary_manifest, manifest_path)
         package = prepare_package(
-            Path(prepared["overlay_path"]),
+            overlay,
             overlay_root=self.store.root / "submissions",
             author_description=description,
             owner=str(self.client.identity.get("owner")),
@@ -545,6 +585,12 @@ class WisdomService:
 
     def decline(self, draft_id: str) -> dict[str, Any]:
         result = self.client.decline(draft_id)
+        local = self.store.draft(draft_id)
+        if local:
+            self.store.dismiss_candidate(
+                str(local["skill_id"]), str(local["source_hash"])
+            )
+            self.store.set_draft_state(draft_id, "declined")
         self.store.consume_receipt(draft_id)
         return result
 

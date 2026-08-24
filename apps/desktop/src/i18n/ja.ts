@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
+import { wisdomCopy } from './wisdom-copy'
 
 export const ja = defineLocale({
   common: {
@@ -1135,6 +1136,9 @@ export const ja = defineLocale({
   },
 
   skills: {
+    collective: wisdomCopy,
+    tabCollective: 'コレクティブ',
+    searchCollective: 'コレクティブを検索...',
     tabSkills: 'スキル',
     tabToolsets: 'ツールセット',
     tabMcp: 'MCP',

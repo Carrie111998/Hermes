@@ -64,7 +64,11 @@ def test_prepare_requires_local_owner_edit_before_any_network(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
 
-    submitted = service.suggest("my-skill", description="Owner-approved copy.")
+    submitted = service.suggest(
+        "my-skill",
+        description="Owner-approved copy.",
+        system_specification=manifest["requirements"],
+    )
     assert submitted["draft"]["id"] == "draft-1"
     assert fake.uploaded > 0
     assert fake.submissions[0].keys() == {

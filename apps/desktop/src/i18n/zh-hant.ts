@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
+import { wisdomCopy } from './wisdom-copy'
 
 export const zhHant = defineLocale({
   common: {
@@ -1095,6 +1096,9 @@ export const zhHant = defineLocale({
   },
 
   skills: {
+    collective: wisdomCopy,
+    tabCollective: '集體智慧',
+    searchCollective: '搜尋集體智慧...',
     tabSkills: '技能',
     tabToolsets: '工具集',
     tabMcp: 'MCP',
