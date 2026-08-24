@@ -185,6 +185,22 @@ function toolPayloadMatchValues(payload: GatewayEventPayload | undefined): strin
   return collectToolMatchValues(query, context, preview)
 }
 
+function toolPayloadRequestId(payload: GatewayEventPayload | undefined): string {
+  const requestId = liveToolArgs(payload).request_id
+
+  return typeof requestId === 'string' ? requestId : ''
+}
+
+function toolPartRequestId(part: ChatMessagePart): string {
+  if (part.type !== 'tool-call') {
+    return ''
+  }
+
+  const requestId = parseMaybeJsonObject(part.args).request_id
+
+  return typeof requestId === 'string' ? requestId : ''
+}
+
 /**
  * The batch-clarify counterpart of the `question` correlation key: a batch
  * payload has no top-level `question`, only `questions[]`, so without this
@@ -249,6 +265,7 @@ function findToolPartIndex(
   phase: 'running' | 'complete'
 ): number {
   const matchValues = toolPayloadMatchValues(payload)
+  const requestId = toolPayloadRequestId(payload)
   const overlaps = (index: number) => hasToolMatchOverlap(matchValues, toolPartMatchValues(parts[index]))
 
   if (stableId) {
@@ -268,7 +285,19 @@ function findToolPartIndex(
 
   const pendingIndices = parts
     .map((part, index) => ({ part, index }))
-    .filter(({ part }) => part.type === 'tool-call' && part.toolName === name && part.result === undefined)
+    .filter(({ part }) => {
+      if (part.type !== 'tool-call' || part.toolName !== name || part.result !== undefined) {
+        return false
+      }
+
+      const pendingRequestId = toolPartRequestId(part)
+
+      // A clarify.request carries the authoritative request identity. Never
+      // correlate it by question text with a card already owned by another
+      // request: identical prompts can legitimately recur. A tool.start has
+      // no request_id, so it can still merge with the synthetic request row.
+      return !requestId || !pendingRequestId || requestId === pendingRequestId
+    })
     .map(({ index }) => index)
 
   if (pendingIndices.length === 0) {

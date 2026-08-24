@@ -276,6 +276,20 @@ describe('clarify.request stream hydration', () => {
     expect(stream.state().needsInput).toBe(false)
   })
 
+  it('does not rebind an identical single-question card owned by a newer request identity', () => {
+    mountStream()
+
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-old' })
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-new' })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(2)
+    expect(parts.map(part => (part.type === 'tool-call' ? part.args?.request_id : null))).toEqual([
+      'req-old',
+      'req-new'
+    ])
+  })
+
   it('merges a BATCH tool.start row with its clarify.request (no top-level question)', () => {
     mountStream()
 
@@ -317,5 +331,24 @@ describe('clarify.request stream hydration', () => {
 
     expect(clarifyParts()).toHaveLength(1)
     expect($clarifyRequests.get()[SID]?.questions).toHaveLength(2)
+  })
+
+  it('does not rebind an identical batch card owned by a newer request identity', () => {
+    mountStream()
+
+    const questions = [
+      { qid: 'q0', question: 'Drink?' },
+      { qid: 'q1', question: 'Productive when?' }
+    ]
+
+    clarifyRequest({ questions, request_id: 'req-batch-old' })
+    clarifyRequest({ questions, request_id: 'req-batch-new' })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(2)
+    expect(parts.map(part => (part.type === 'tool-call' ? part.args?.request_id : null))).toEqual([
+      'req-batch-old',
+      'req-batch-new'
+    ])
   })
 })
