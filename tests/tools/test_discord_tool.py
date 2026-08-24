@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools.discord_tool import (
+    DISCORD_MESSAGE_CONTENT_MAX_LENGTH,
     DiscordAPIError,
     _ACTIONS,
     _ADMIN_ACTIONS,
@@ -305,6 +306,132 @@ class TestCreateThread:
             "POST", "/channels/11/messages/1001/threads", "test-token",
             body={"name": "Discussion", "auto_archive_duration": 1440},
         )
+
+
+# ---------------------------------------------------------------------------
+# Action: send_message
+# ---------------------------------------------------------------------------
+
+class TestSendMessageSchema:
+    def test_send_message_in_core_actions(self):
+        assert "send_message" in _CORE_ACTIONS
+        assert "send_message" not in _ADMIN_ACTIONS
+
+    def test_send_message_required_params(self):
+        from tools.discord_tool import _REQUIRED_PARAMS
+        assert _REQUIRED_PARAMS["send_message"] == ["channel_id", "content"]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_in_core_schema(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": ""}},
+        )
+        mock_req.return_value = {"flags": (1 << 14) | (1 << 18)}
+        schema = get_dynamic_schema_core()
+        actions = schema["parameters"]["properties"]["action"]["enum"]
+        assert "send_message" in actions
+        assert "content" in schema["parameters"]["properties"]
+
+
+class TestSendMessageValidation:
+    def test_missing_channel_id(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", content="hi"))
+        assert "error" in result
+        assert "channel_id" in result["error"]
+
+    def test_missing_content(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", channel_id="11"))
+        assert "error" in result
+        assert "content" in result["error"]
+
+    def test_empty_string_content_is_treated_as_missing(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", channel_id="11", content=""))
+        assert "error" in result
+        assert "content" in result["error"]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_content_over_2000_chars_rejected(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        long_content = "x" * (DISCORD_MESSAGE_CONTENT_MAX_LENGTH + 1)
+        result = json.loads(discord_core(action="send_message", channel_id="11", content=long_content))
+        assert "error" in result
+        assert "2000" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_content_at_exactly_2000_chars_allowed(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "999"}
+        exact_content = "x" * DISCORD_MESSAGE_CONTENT_MAX_LENGTH
+        result = json.loads(discord_core(action="send_message", channel_id="11", content=exact_content))
+        assert result["success"] is True
+        mock_req.assert_called_once()
+
+
+class TestSendMessageSuccess:
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_payload_and_response(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "123456789"}
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="Hello there"))
+
+        assert result == {"success": True, "channel_id": "11", "message_id": "123456789"}
+
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/messages", "test-token",
+            body={"content": "Hello there", "allowed_mentions": {"parse": []}},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_mentions_suppressed_by_default(self, mock_req, monkeypatch):
+        """Agent-authored text containing @everyone/@role/@user must never ping."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "1"}
+        discord_core(action="send_message", channel_id="11", content="@everyone hi <@123> <@&456>")
+
+        body = mock_req.call_args[1]["body"]
+        assert body["allowed_mentions"] == {"parse": []}
+
+    @patch("tools.discord_tool._discord_request")
+    def test_thread_id_treated_exactly_as_channel_id(self, mock_req, monkeypatch):
+        """Discord thread IDs use the same /channels/{id}/messages endpoint —
+        no special-casing needed since threads ARE channels in the API."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "42"}
+        thread_id = "999888777"
+        result = json.loads(discord_core(action="send_message", channel_id=thread_id, content="in-thread"))
+
+        assert result["success"] is True
+        assert result["channel_id"] == thread_id
+        mock_req.assert_called_once_with(
+            "POST", f"/channels/{thread_id}/messages", "test-token",
+            body={"content": "in-thread", "allowed_mentions": {"parse": []}},
+        )
+
+
+class TestSendMessageApiFailure:
+    @patch("tools.discord_tool._discord_request")
+    def test_403_forbidden_returns_structured_error(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = DiscordAPIError(403, '{"message": "Missing Access"}')
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="hi"))
+        assert "error" in result
+        assert "403" in result["error"]
+        assert "success" not in result
+
+    @patch("tools.discord_tool._discord_request")
+    def test_404_unknown_channel_returns_structured_error(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = DiscordAPIError(404, '{"message": "Unknown Channel"}')
+        result = json.loads(discord_core(action="send_message", channel_id="bad-id", content="hi"))
+        assert "error" in result
+        assert "404" in result["error"]
+        assert "Unknown Channel" in result["error"]
 
 
 # ---------------------------------------------------------------------------
