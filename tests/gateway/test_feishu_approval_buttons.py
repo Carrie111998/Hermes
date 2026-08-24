@@ -574,6 +574,146 @@ class TestCardActionCallbackResponse:
         mock_submit.assert_not_called()
 
 
+class TestFeishuOutboundChatIdValidation:
+    """Outbound text and media sends reject missing chat IDs before I/O."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_send_rejects_empty_or_whitespace_chat_id_before_sending(self, chat_id):
+        adapter = _make_adapter()
+
+        with patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock) as mock_send:
+            result = await adapter.send(chat_id=chat_id, content="hello")
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_normalizes_chat_id_before_sending(self):
+        adapter = _make_adapter()
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_text"))
+
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock, return_value=response
+        ) as mock_send:
+            result = await adapter.send(chat_id="  oc_trimmed  ", content="hello")
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_send_image_file_rejects_empty_chat_id_before_file_io(self, chat_id, tmp_path):
+        adapter = _make_adapter()
+        with (
+            patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock) as mock_send,
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock) as mock_blocking,
+        ):
+            result = await adapter.send_image_file(
+                chat_id=chat_id,
+                image_path=str(tmp_path / "missing.png"),
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        mock_blocking.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_normalizes_chat_id_before_sending(self, tmp_path):
+        adapter = _make_adapter()
+        image_path = tmp_path / "image.png"
+        image_path.write_bytes(b"image")
+        upload_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="img_1"))
+        message_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_image"))
+        adapter._build_image_upload_body = MagicMock(return_value=object())
+        adapter._build_image_upload_request = MagicMock(return_value=object())
+
+        with (
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock, return_value=upload_response),
+            patch.object(
+                adapter,
+                "_feishu_send_with_retry",
+                new_callable=AsyncMock,
+                return_value=message_response,
+            ) as mock_send,
+        ):
+            result = await adapter.send_image_file(
+                chat_id="  oc_trimmed  ",
+                image_path=str(image_path),
+            )
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_uploaded_file_message_rejects_empty_chat_id_before_file_io(self, chat_id, tmp_path):
+        adapter = _make_adapter()
+        with (
+            patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock) as mock_send,
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock) as mock_blocking,
+        ):
+            result = await adapter._send_uploaded_file_message(
+                chat_id=chat_id,
+                file_path=str(tmp_path / "missing.txt"),
+                reply_to=None,
+                metadata=None,
+            )
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_send.assert_not_called()
+        mock_blocking.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uploaded_file_message_normalizes_chat_id_before_sending(self, tmp_path):
+        adapter = _make_adapter()
+        file_path = tmp_path / "note.txt"
+        file_path.write_text("file")
+        upload_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(file_key="file_1"))
+        message_response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_file"))
+        adapter._build_file_upload_body = MagicMock(return_value=object())
+        adapter._build_file_upload_request = MagicMock(return_value=object())
+
+        with (
+            patch.object(adapter, "_run_blocking", new_callable=AsyncMock, return_value=upload_response),
+            patch.object(
+                adapter,
+                "_feishu_send_with_retry",
+                new_callable=AsyncMock,
+                return_value=message_response,
+            ) as mock_send,
+        ):
+            result = await adapter._send_uploaded_file_message(
+                chat_id="  oc_trimmed  ",
+                file_path=str(file_path),
+                reply_to=None,
+                metadata=None,
+            )
+
+        assert result.success is True
+        assert mock_send.call_args.kwargs["chat_id"] == "oc_trimmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", ["send_image", "send_animation"])
+    @pytest.mark.parametrize("chat_id", [None, "", " \t\n"])
+    async def test_media_url_wrappers_reject_empty_chat_id_before_download(self, method_name, chat_id):
+        adapter = _make_adapter()
+        downloader = "_download_remote_image" if method_name == "send_image" else "_download_remote_document"
+
+        with patch.object(adapter, downloader, new_callable=AsyncMock) as mock_download:
+            if method_name == "send_image":
+                result = await adapter.send_image(chat_id=chat_id, image_url="https://example.test/image.png")
+            else:
+                result = await adapter.send_animation(chat_id=chat_id, animation_url="https://example.test/image.gif")
+
+        assert result.success is False
+        assert result.error == "chat_id is required"
+        mock_download.assert_not_called()
+
+
 class TestResolveUpdatePrompt:
     """Test update prompt resolution persists the response file."""
 

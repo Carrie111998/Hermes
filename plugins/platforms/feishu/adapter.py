@@ -1953,6 +1953,9 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Feishu message."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -1975,7 +1978,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 try:
                     response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
+                        chat_id=normalized_chat_id,
                         msg_type=msg_type,
                         payload=payload,
                         reply_to=reply_to,
@@ -1986,7 +1989,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
                     response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
+                        chat_id=normalized_chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
@@ -1999,7 +2002,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 ):
                     logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
                     response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
+                        chat_id=normalized_chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
@@ -2313,6 +2316,9 @@ class FeishuAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file to Feishu."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(image_path):
@@ -2345,7 +2351,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     media_tag={"tag": "img", "image_key": image_key},
                 )
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type="post",
                     payload=post_payload,
                     reply_to=reply_to,
@@ -2353,7 +2359,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             else:
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type="image",
                     payload=json.dumps({"image_key": image_key}, ensure_ascii=False),
                     reply_to=reply_to,
@@ -2377,19 +2383,22 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Download a remote image then send it through the native Feishu image flow."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         try:
             image_path = await self._download_remote_image(image_url)
         except Exception as exc:
             logger.error("[Feishu] Failed to download image %s: %s", image_url, exc, exc_info=True)
             return await super().send_image(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 image_url=image_url,
                 caption=caption,
                 reply_to=reply_to,
                 metadata=metadata,
             )
         return await self.send_image_file(
-            chat_id=chat_id,
+            chat_id=normalized_chat_id,
             image_path=image_path,
             caption=caption,
             reply_to=reply_to,
@@ -2405,6 +2414,9 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Feishu has no native GIF bubble; degrade to a downloadable file."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         try:
             file_path, file_name = await self._download_remote_document(
                 animation_url,
@@ -2414,7 +2426,7 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to download animation %s: %s", animation_url, exc, exc_info=True)
             return await super().send_animation(
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 animation_url=animation_url,
                 caption=caption,
                 reply_to=reply_to,
@@ -2422,7 +2434,7 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         degraded_caption = f"[GIF downgraded to file]\n{caption}" if caption else "[GIF downgraded to file]"
         return await self.send_document(
-            chat_id=chat_id,
+            chat_id=normalized_chat_id,
             file_path=file_path,
             file_name=file_name,
             caption=degraded_caption,
@@ -4719,6 +4731,9 @@ class FeishuAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         outbound_message_type: str = "file",
     ) -> SendResult:
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return SendResult(success=False, error="chat_id is required")
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(file_path):
@@ -4757,7 +4772,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "file_name": display_name,
                 }
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type="post",
                     payload=self._build_media_post_payload(caption=caption, media_tag=media_tag),
                     reply_to=reply_to,
@@ -4765,7 +4780,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             else:
                 message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
+                    chat_id=normalized_chat_id,
                     msg_type=resolved_message_type,
                     payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
                     reply_to=reply_to,
@@ -4786,7 +4801,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     if thread_msg_id:
                         logger.info("[Feishu] Audio: retrying via reply API in thread")
                         message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
+                            chat_id=normalized_chat_id,
                             msg_type=resolved_message_type,
                             payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
                             reply_to=thread_msg_id,
@@ -4795,7 +4810,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     if not self._response_succeeded(message_response):
                         logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
                         message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
+                            chat_id=normalized_chat_id,
                             msg_type=resolved_message_type,
                             payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
                             reply_to=None,
