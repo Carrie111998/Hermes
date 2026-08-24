@@ -5157,8 +5157,8 @@ def claim_task(
                 started_at,
                 routing_role, routing_model, routing_provider,
                 routing_contract, routing_reason, roster_digest,
-                routing_policy, ac_revision
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                routing_policy, ac_revision, routing_source
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5176,6 +5176,7 @@ def claim_task(
                 routing_snapshot["roster_digest"],
                 routing_snapshot["routing_policy"],
                 routing_snapshot["ac_revision"],
+                routing_snapshot["routing_source"],
             ),
         )
         run_id = run_cur.lastrowid
@@ -5280,8 +5281,8 @@ def claim_review_task(
                 started_at,
                 routing_role, routing_model, routing_provider,
                 routing_contract, routing_reason, roster_digest,
-                routing_policy, ac_revision
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                routing_policy, ac_revision, routing_source
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5299,6 +5300,7 @@ def claim_review_task(
                 routing_snapshot["roster_digest"],
                 routing_snapshot["routing_policy"],
                 routing_snapshot["ac_revision"],
+                routing_snapshot["routing_source"],
             ),
         )
         run_id = run_cur.lastrowid
