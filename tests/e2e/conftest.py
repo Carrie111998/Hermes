@@ -279,7 +279,11 @@ async def send_and_capture(adapter, text: str, platform: Platform, **event_kwarg
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
     await adapter.handle_message(event)
-    for _ in range(40):  # up to ~2s; returns as soon as the send lands
+    # The first agent-routed case in a process can pay cold SQLite setup on a
+    # worker thread. Two seconds was below observed hosted-runner latency and
+    # made a completed response look missing; five seconds remains bounded
+    # while leaving ample headroom over the normal sub-second command path.
+    for _ in range(100):  # up to ~5s; returns as soon as the send lands
         if adapter.send.called:
             break
         await asyncio.sleep(0.05)
