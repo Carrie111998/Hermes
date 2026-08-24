@@ -320,6 +320,12 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 
+# PTB processes updates sequentially by default. Optional Bot API enrichment
+# must therefore be bounded: getUpdates has already advanced its offset before
+# these awaits run, so one orphaned request would otherwise park every later
+# update while Telegram's server-side pending count falls to zero (#93506).
+_INBOUND_PREPROCESS_TIMEOUT_SECS = 30.0
+
 
 def _flood_cap_result(wait: float) -> "SendResult":
     """The shared fail-closed SendResult for an over-cap flood wait."""
@@ -9438,6 +9444,28 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         logger.info("[Telegram] Cached replied-to %s at %s", cached.kind, cached.path)
 
+    async def _await_inbound_preprocess(self, awaitable: Any, *, stage: str) -> bool:
+        """Bound optional enrichment that runs on PTB's update processor."""
+        timeout = float(
+            getattr(
+                self,
+                "_inbound_preprocess_timeout_seconds",
+                _INBOUND_PREPROCESS_TIMEOUT_SECS,
+            )
+        )
+        try:
+            await _await_with_thread_deadline(awaitable, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                "[Telegram] Inbound %s timed out after %.0fs; continuing "
+                "without optional enrichment so later updates can dispatch",
+                stage,
+                timeout,
+                exc_info=True,
+            )
+            return False
+
     def _observed_media_source(self, msg: Message):
         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
         if msg.photo:
@@ -9708,11 +9736,17 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
-        await self._ensure_forum_commands(update.message)
+        await self._await_inbound_preprocess(
+            self._ensure_forum_commands(msg),
+            stage="forum-command registration",
+        )
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
-        await self._cache_replied_media(msg, event)
+        await self._await_inbound_preprocess(
+            self._cache_replied_media(msg, event),
+            stage="replied-media lookup",
+        )
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
@@ -9730,11 +9764,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
-        await self._ensure_forum_commands(msg)
+        await self._await_inbound_preprocess(
+            self._ensure_forum_commands(msg),
+            stage="forum-command registration",
+        )
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
-        await self._cache_replied_media(msg, event)
+        await self._await_inbound_preprocess(
+            self._cache_replied_media(msg, event),
+            stage="replied-media lookup",
+        )
         event = self._apply_telegram_group_observe_attribution(event)
         # Telegram clients split messages above 4096 chars into multiple
         # updates.  A long command paste (e.g. ``/queue <huge prompt>``)
