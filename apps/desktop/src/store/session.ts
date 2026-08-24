@@ -437,15 +437,19 @@ export function mergeSessionPage(
   // root so a mid-turn refresh can't drop a touchSessionActivity bump.
   const prevByLineage = new Map(previous.map(session => [session._lineage_root_id ?? session.id, session]))
 
-  const merged = incoming.map(session => {
-    const prev = prevById.get(session.id) ?? prevByLineage.get(session._lineage_root_id ?? session.id)
-    // User-send stamps last_active before the DB flushes the user row
-    // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
-    const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)
-    const title = session.title?.trim() ? session.title : prev?.title?.trim() ? prev.title : session.title
+  const merged = incoming
+    .filter(session => !session.is_internal_child)
+    .map(session => {
+      const prev = prevById.get(session.id) ?? prevByLineage.get(session._lineage_root_id ?? session.id)
+      // User-send stamps last_active before the DB flushes the user row
+      // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
+      const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)
+      const title = session.title?.trim() ? session.title : prev?.title?.trim() ? prev.title : session.title
 
-    return last_active === session.last_active && title === session.title ? session : { ...session, last_active, title }
-  })
+      return last_active === session.last_active && title === session.title
+        ? session
+        : { ...session, last_active, title }
+    })
 
   if (keep.size === 0) {
     return merged
@@ -461,6 +465,7 @@ export function mergeSessionPage(
 
   const survivors = previous.filter(
     session =>
+      !session.is_internal_child &&
       !incomingIds.has(session.id) &&
       !incomingLineageKeys.has(session._lineage_root_id ?? session.id) &&
       (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))

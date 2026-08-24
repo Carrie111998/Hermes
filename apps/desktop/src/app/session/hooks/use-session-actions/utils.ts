@@ -1290,6 +1290,14 @@ export function sessionShouldHaveTranscript(session: SessionInfo | undefined): b
 }
 
 function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
+  // Exact-id lookup intentionally resolves internal delegate children so a
+  // watch tile can open them. They are not ordinary user conversations,
+  // though, and the authoritative list endpoints omit them; caching one here
+  // would bypass that boundary and leak it into the Sessions sidebar.
+  if (session.is_internal_child) {
+    return
+  }
+
   const lineage = session._lineage_root_id ?? session.id
 
   setSessions(prev => [
