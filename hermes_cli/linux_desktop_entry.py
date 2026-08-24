@@ -181,6 +181,13 @@ def _resolve_hermes_bin_for_desktop_entry(
     primary = resolve_fn()
     if primary and _inside_checkout(primary) and rerouted:
         return rerouted
+    if primary and _inside_checkout(primary):
+        # argv[0] was checkout-internal AND no durable wrapper exists
+        # anywhere (PATH miss, known locations miss). Persisting the
+        # interpreter itself would produce an unrunnable `<python>
+        # desktop`; dropping to None lets resolve_exec_command emit its
+        # runnable `sys.executable -m hermes_cli.main desktop` fallback.
+        return None
     return primary
 
 
