@@ -147,6 +147,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     active.parts = [...active.parts, ...parts]
     active.timestamp = earliestTimestamp(active.timestamp, timestamp, ...parts.map(part => part.timestamp))
+    active.durableTimestamp = earliestTimestamp(active.durableTimestamp, timestamp)
 
     return true
   }
@@ -161,7 +162,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
         role: 'assistant',
         parts: pendingToolParts,
-        timestamp: pendingToolTimestamp
+        timestamp: pendingToolTimestamp,
+        durableTimestamp: pendingToolTimestamp
       })
       activeAssistantIndex = result.length - 1
     }
@@ -286,6 +288,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
           message.timestamp,
           ...parts.map(part => part.timestamp)
         )
+        activeAssistant.durableTimestamp = earliestTimestamp(activeAssistant.durableTimestamp, message.timestamp)
 
         return
       }
@@ -304,6 +307,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       role: displayRole,
       parts,
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
+      durableTimestamp: message.timestamp,
       ...(rowId !== undefined ? { rowId } : {}),
       ...(reactions.length ? { reactions } : {}),
       ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})

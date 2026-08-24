@@ -5,10 +5,12 @@ import {
   $voiceConversationStartRequest,
   addComposerAttachment,
   clearSessionDraft,
+  clearSessionDraftIfRevision,
   type ComposerAttachment,
   createComposerAttachmentOccurrenceId,
   createComposerAttachmentScope,
   migrateSessionDraft,
+  reloadPersistedDrafts,
   removeComposerAttachment,
   requestVoiceConversationStart,
   SESSION_DRAFTS_STORAGE_KEY,
@@ -256,6 +258,39 @@ describe('session drafts', () => {
     clearSessionDraft('session-a')
 
     expect(takeSessionDraft('session-a')).toEqual({ attachments: [], text: '' })
+  })
+
+  it('compare-and-clear preserves a newer draft revision', () => {
+    const submitted = stashSessionDraft('session-a', 'submitted', [])
+    stashSessionDraft('session-a', 'typed while pending', [])
+
+    expect(clearSessionDraftIfRevision('session-a', submitted)).toBe(false)
+    expect(takeSessionDraft('session-a').text).toBe('typed while pending')
+  })
+
+  it('compare-and-clear removes only the matching submitted revision', () => {
+    const submitted = stashSessionDraft('session-a', 'submitted', [])
+
+    expect(clearSessionDraftIfRevision('session-a', submitted)).toBe(true)
+    expect(takeSessionDraft('session-a').text).toBe('')
+  })
+
+  it('cross-window reload invalidates an older submit revision', () => {
+    const submitted = stashSessionDraft('session-a', 'submitted', [])
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ 'session-a': 'other window draft' }))
+    reloadPersistedDrafts()
+
+    expect(clearSessionDraftIfRevision('session-a', submitted)).toBe(false)
+    expect(takeSessionDraft('session-a').text).toBe('other window draft')
+  })
+
+  it('cross-window deletion also invalidates an older submit revision', () => {
+    const submitted = stashSessionDraft('session-a', 'submitted', [])
+    window.localStorage.removeItem(SESSION_DRAFTS_STORAGE_KEY)
+    reloadPersistedDrafts()
+
+    expect(clearSessionDraftIfRevision('session-a', submitted)).toBe(false)
+    expect(takeSessionDraft('session-a').text).toBe('')
   })
 
   it('returns clones so callers cannot mutate the stash', () => {

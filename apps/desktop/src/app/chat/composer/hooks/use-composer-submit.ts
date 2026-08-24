@@ -3,8 +3,12 @@ import { type RefObject, useLayoutEffect, useRef } from 'react'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
-import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
+import { hasClarifyRequest } from '@/store/clarify'
+import {
+  clearSessionDraftIfRevision,
+  type ComposerAttachment,
+  isSessionDraftRevisionCurrent
+} from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
@@ -23,8 +27,9 @@ interface UseComposerSubmitArgs {
   attachments: ComposerAttachment[]
   busy: boolean
   compacting: boolean
-  clearDraft: () => void
+  clearDraft: (preservePersistedDraft?: boolean) => void
   disabled: boolean
+  draftIntentGenerationRef: RefObject<number>
   draftRef: RefObject<string>
   drainNextQueued: () => Promise<boolean>
   editorRef: RefObject<HTMLDivElement | null>
@@ -38,9 +43,27 @@ interface UseComposerSubmitArgs {
   queueCurrentDraft: () => boolean
   queueEdit: QueueEditState | null
   queuedPrompts: QueuedPromptEntry[]
+  releasePersistedDraftReceipt: () => void
   sessionId: string | null | undefined
   setComposerText: (value: string) => void
-  stashAt: (scope: string | null, text?: string, attachments?: ComposerAttachment[]) => void
+  stashAt: (scope: string | null, text: string, attachments: ComposerAttachment[]) => number
+}
+
+function sameAttachmentReceipt(current: ComposerAttachment[], submitted: ComposerAttachment[]): boolean {
+  if (current.length !== submitted.length) {
+    return false
+  }
+
+  return current.every((attachment, index) => {
+    const receipt = submitted[index]!
+
+    return attachment.occurrenceId !== undefined || receipt.occurrenceId !== undefined
+      ? attachment.id === receipt.id && attachment.occurrenceId === receipt.occurrenceId
+      : attachment.id === receipt.id &&
+          attachment.kind === receipt.kind &&
+          attachment.path === receipt.path &&
+          attachment.refText === receipt.refText
+  })
 }
 
 /**
@@ -60,6 +83,7 @@ export function useComposerSubmit({
   compacting,
   clearDraft,
   disabled,
+  draftIntentGenerationRef,
   draftRef,
   drainNextQueued,
   editorRef,
@@ -73,6 +97,7 @@ export function useComposerSubmit({
   queueCurrentDraft,
   queueEdit,
   queuedPrompts,
+  releasePersistedDraftReceipt,
   sessionId,
   setComposerText,
   stashAt
@@ -83,25 +108,98 @@ export function useComposerSubmit({
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[], displayKind?: 'hidden') => {
+  const dispatchSubmit = (
+    text: string,
+    attachments?: ComposerAttachment[],
+    displayKind?: 'hidden',
+    clearRehydratedReceipt = false,
+    ownsComposerReceipt = true
+  ) => {
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
+    const receiptIntentGeneration = draftIntentGenerationRef.current
 
-    const restore = () => {
-      loadIntoComposer(text, submittedAttachments)
-      // Use the scope captured at dispatch, not whatever session is focused
-      // now — the gateway can reject well after the user has switched away,
-      // and re-stashing into the currently-focused session would overwrite
-      // its draft with the rejected text from a different session (#54527).
-      stashAt(submittedScope, text, submittedAttachments)
-    }
-
-    void Promise.resolve(
+    const submit = () =>
       attachments
         ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
         : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
-    )
-      .then(accepted => void (accepted === false ? restore() : clearSessionDraft(submittedScope)))
+
+    // Review-pane and other routed submits do not originate in this composer.
+    // Their retry/receipt state belongs to the caller; borrowing this session's
+    // stash would overwrite an unrelated unsent draft.
+    if (!ownsComposerReceipt) {
+      void Promise.resolve()
+        .then(submit)
+        .catch(() => undefined)
+
+      return
+    }
+
+    // Keep one durable local copy until the gateway explicitly accepts the
+    // submit. The visible editor can clear immediately, but a hung RPC,
+    // reconnect, or late rejection must still have words to restore.
+    const receiptRevision = stashAt(submittedScope, text, submittedAttachments)
+
+    const restore = () => {
+      // A later keystroke/attachment owns newer visible intent even before its
+      // debounce advances the persisted revision. Restore only into the still
+      // empty submitted composer or over the exact same rehydrated receipt.
+      const liveAttachments = scope.attachments.$attachments.get()
+      const composerEmpty = !draftRef.current && liveAttachments.length === 0
+
+      const visibleReceiptMatches =
+        draftIntentGenerationRef.current === receiptIntentGeneration &&
+        draftRef.current === text &&
+        sameAttachmentReceipt(liveAttachments, submittedAttachments)
+
+      if (
+        isSessionDraftRevisionCurrent(submittedScope, receiptRevision) &&
+        draftIntentGenerationRef.current === receiptIntentGeneration &&
+        activeQueueSessionKeyRef.current === submittedScope &&
+        (composerEmpty || visibleReceiptMatches)
+      ) {
+        loadIntoComposer(text, submittedAttachments)
+      }
+    }
+
+    const settleAcceptance = () => {
+      const activeScopeMatches = activeQueueSessionKeyRef.current === submittedScope
+
+      if (!activeScopeMatches) {
+        clearSessionDraftIfRevision(submittedScope, receiptRevision)
+
+        return
+      }
+
+      const liveAttachments = scope.attachments.$attachments.get()
+      const composerEmpty = !draftRef.current && liveAttachments.length === 0
+
+      const visibleReceiptMatches =
+        clearRehydratedReceipt &&
+        draftIntentGenerationRef.current === receiptIntentGeneration &&
+        draftRef.current === text &&
+        sameAttachmentReceipt(liveAttachments, submittedAttachments)
+
+      // A normal submit leaves the composer empty while the receipt waits in
+      // the stash. A session round-trip can repaint that exact receipt; clear
+      // both copies on acceptance. Any other visible state is a newer draft.
+      if (composerEmpty) {
+        // Release clearDraft(true)'s receipt guard once the matching request is
+        // accepted, so the next attachment-only draft persists normally.
+        releasePersistedDraftReceipt()
+      } else if (visibleReceiptMatches) {
+        clearDraft()
+        scope.attachments.removeOccurrences(submittedAttachments)
+      }
+
+      if (composerEmpty || visibleReceiptMatches) {
+        clearSessionDraftIfRevision(submittedScope, receiptRevision)
+      }
+    }
+
+    void Promise.resolve()
+      .then(submit)
+      .then(accepted => void (accepted === false ? restore() : settleAcceptance()))
       .catch(restore)
   }
 
@@ -122,7 +220,7 @@ export function useComposerSubmit({
           paneVisible &&
           !inputDisabled
         ) {
-          dispatchSubmitRef.current(text, undefined, displayKind)
+          dispatchSubmitRef.current(text, undefined, displayKind, false, false)
         }
       }),
     [inputDisabled, paneVisible, scope.target, surfaceId]
@@ -158,19 +256,17 @@ export function useComposerSubmit({
     const text = pathifyRefs(draftRef.current)
     const payloadPresent = text.trim().length > 0 || attachments.length > 0
 
-    // A clarify card parked on this session owns the turn: the agent is blocked
-    // inside its tool batch waiting on `clarify.respond`, so a follow-up routed
-    // through steer/queue sits undelivered until the clarify's own timeout
-    // (default 5 min) — the message looks sent and nothing happens. Typing a
-    // real message instead of picking an option IS the answer "none of these":
-    // skip the question so the tool returns, then route the words normally.
-    //
-    // Fire-and-forget, not awaited: the skip clears the card synchronously and
-    // both RPCs ride the same socket in call order, so the gateway resolves the
-    // clarify before it sees the follow-up. Awaiting first would leave the draft
-    // live for a tick — long enough for a second Enter to send it twice.
-    if (payloadPresent && !queueEdit && hasClarifyRequest(sessionId)) {
-      void skipClarifyRequest(sessionId)
+    // A clarify card is an explicit user decision surface. Typing unrelated
+    // prose must not silently answer it with an empty value and tear the card
+    // down. Park the prose visibly as the next queued turn; the card remains
+    // live until the user chooses an option or presses its explicit Skip.
+    const pendingClarify = payloadPresent && !queueEdit && hasClarifyRequest(sessionId)
+
+    if (pendingClarify) {
+      queueCurrentDraft()
+      focusInput()
+
+      return
     }
 
     // Same deal for a pending MCP setup card: the agent is blocked on
@@ -200,8 +296,8 @@ export function useComposerSubmit({
       // for the current turn to finish, which is how the TUI never behaves.
       if (!attachments.length && SLASH_COMMAND_RE.test(text.trim())) {
         triggerHaptic('submit')
-        clearDraft()
-        dispatchSubmit(text)
+        dispatchSubmit(text, undefined, undefined, true)
+        clearDraft(true)
       } else if (!compacting && !blockingPrompt && !attachments.length && text.trim()) {
         // Cursor-style stop-and-correct: interrupt the live turn and redirect
         // it with this text. redirect() preserves the shown reasoning/work; if
@@ -225,9 +321,9 @@ export function useComposerSubmit({
       const submittedAttachments = cloneAttachments(attachments)
       triggerHaptic('submit')
       resetBrowseState(sessionId)
-      clearDraft()
+      dispatchSubmit(text, submittedAttachments, undefined, true)
+      clearDraft(true)
       scope.attachments.clear()
-      dispatchSubmit(text, submittedAttachments)
     }
 
     focusInput()
@@ -245,14 +341,73 @@ export function useComposerSubmit({
       return
     }
 
-    triggerHaptic('submit')
-    clearDraft()
+    const submittedScope = activeQueueSessionKeyRef.current
+    const submittedAttachments: ComposerAttachment[] = []
+    const receiptIntentGeneration = draftIntentGenerationRef.current
+    const receiptRevision = stashAt(submittedScope, text, submittedAttachments)
 
-    void Promise.resolve(onSteer(text)).then(accepted => {
-      if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+    const restore = () => {
+      const liveAttachments = scope.attachments.$attachments.get()
+      const composerEmpty = !draftRef.current && liveAttachments.length === 0
+
+      const visibleReceiptMatches =
+        draftIntentGenerationRef.current === receiptIntentGeneration &&
+        draftRef.current === text &&
+        sameAttachmentReceipt(liveAttachments, submittedAttachments)
+
+      if (
+        isSessionDraftRevisionCurrent(submittedScope, receiptRevision) &&
+        draftIntentGenerationRef.current === receiptIntentGeneration &&
+        activeQueueSessionKeyRef.current === submittedScope &&
+        (composerEmpty || visibleReceiptMatches)
+      ) {
+        loadIntoComposer(text, submittedAttachments)
       }
-    })
+    }
+
+    const settleSteerReceipt = () => {
+      const activeScopeMatches = activeQueueSessionKeyRef.current === submittedScope
+
+      if (!activeScopeMatches) {
+        clearSessionDraftIfRevision(submittedScope, receiptRevision)
+
+        return
+      }
+
+      const liveAttachments = scope.attachments.$attachments.get()
+      const composerEmpty = !draftRef.current && liveAttachments.length === 0
+
+      const visibleReceiptMatches =
+        draftIntentGenerationRef.current === receiptIntentGeneration &&
+        draftRef.current === text &&
+        sameAttachmentReceipt(liveAttachments, submittedAttachments)
+
+      if (composerEmpty) {
+        releasePersistedDraftReceipt()
+        clearSessionDraftIfRevision(submittedScope, receiptRevision)
+      } else if (visibleReceiptMatches) {
+        clearDraft()
+        clearSessionDraftIfRevision(submittedScope, receiptRevision)
+      }
+    }
+
+    // Same durability contract as an idle submit: the editor may clear, but
+    // the per-session stash remains until steer acceptance or queue fallback.
+    triggerHaptic('submit')
+    clearDraft(true)
+
+    void Promise.resolve()
+      .then(() => onSteer(text))
+      .then(accepted => {
+        if (accepted) {
+          settleSteerReceipt()
+        } else if (submittedScope && enqueueQueuedPrompt(submittedScope, { text, attachments: submittedAttachments })) {
+          settleSteerReceipt()
+        } else {
+          restore()
+        }
+      })
+      .catch(restore)
   }
 
   const queueDraft = () => {

@@ -4,6 +4,7 @@ import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { useSessionSlice } from '@/lib/use-session-slice'
+import { $clarifyRequests } from '@/store/clarify'
 import { type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
@@ -80,6 +81,8 @@ export function useComposerQueue({
   // is fine; the auto-drain effect below reads it as a gate.
   const parkedSessions = useStore($parkedQueueSessions)
   const queueParked = Boolean(activeQueueSessionKey && parkedSessions[activeQueueSessionKey])
+  const clarifyRequests = useStore($clarifyRequests)
+  const clarifyPending = Boolean(clarifyRequests[sessionId ?? ''])
 
   const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
   queueEditRef.current = queueEdit
@@ -200,7 +203,7 @@ export function useComposerQueue({
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
-      if (drainingQueueRef.current || !activeQueueSessionKey) {
+      if (drainingQueueRef.current || !activeQueueSessionKey || clarifyPending) {
         return false
       }
 
@@ -243,7 +246,7 @@ export function useComposerQueue({
         drainingQueueRef.current = false
       }
     },
-    [activeQueueSessionKey, onSubmit, sessionId]
+    [activeQueueSessionKey, clarifyPending, onSubmit, sessionId]
   )
 
   const pickDrainHead = useCallback(
@@ -259,7 +262,7 @@ export function useComposerQueue({
 
   const sendQueuedNow = useCallback(
     (id: string) => {
-      if (!activeQueueSessionKey || id === queueEdit?.entryId) {
+      if (!activeQueueSessionKey || id === queueEdit?.entryId || clarifyPending) {
         return false
       }
 
@@ -283,7 +286,7 @@ export function useComposerQueue({
 
       return runDrain(entries => entries.find(e => e.id === id))
     },
-    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
+    [activeQueueSessionKey, busy, clarifyPending, onCancel, queueEdit, runDrain]
   )
 
   // Deliver a queued entry as a mid-turn redirect — the queue-panel sibling of
@@ -294,7 +297,13 @@ export function useComposerQueue({
   // busy — idle has no turn to redirect, and `sendQueuedNow` already covers it.
   const steerQueuedNow = useCallback(
     async (id: string): Promise<boolean> => {
-      if (!onSteer || !busy || !activeQueueSessionKey || id === queueEditRef.current?.entryId) {
+      if (
+        !onSteer ||
+        !busy ||
+        !activeQueueSessionKey ||
+        id === queueEditRef.current?.entryId ||
+        clarifyPending
+      ) {
         return false
       }
 
@@ -323,7 +332,7 @@ export function useComposerQueue({
 
       return true
     },
-    [activeQueueSessionKey, busy, onSteer, queueEditRef]
+    [activeQueueSessionKey, busy, clarifyPending, onSteer, queueEditRef]
   )
 
   // Edge-independent auto-drain: send the head whenever the session is idle and
@@ -331,7 +340,7 @@ export function useComposerQueue({
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
   // drain lock serializes sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey) {
+    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey || clarifyPending) {
       return
     }
 
@@ -362,7 +371,7 @@ export function useComposerQueue({
         }
       })
       .catch(onFail)
-  }, [activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
+  }, [activeQueueSessionKey, busy, clarifyPending, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
   // never churns, so a change there is a real session switch and must NOT

@@ -27,6 +27,51 @@ export function transcriptBackfillAvailable(
   return Boolean(transcriptTailState(storedSessionId, profile)?.possiblyTruncated)
 }
 
+/** Strip renderer-only timing before deterministic semantic serialization. */
+function durablePartValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(durablePartValue)
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== 'timestamp' && key !== 'completedAt')
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, durablePartValue(entry)])
+  )
+}
+
+/**
+ * Identity that survives compaction's protected-tail copy. A compaction epoch
+ * preserves durable row time + semantic parts but assigns a fresh DB row id.
+ * Live timeline reconciliation may rewrite display timestamps/completedAt, so
+ * those fields are excluded. Timestamp-less optimistic projections return null.
+ */
+export function logicalTranscriptMessageKey(message: ChatMessage): null | string {
+  const durableTimestamp = message.durableTimestamp ?? message.timestamp
+
+  if (durableTimestamp === undefined) {
+    return null
+  }
+
+  return JSON.stringify([
+    message.role,
+    durableTimestamp,
+    durablePartValue(message.parts),
+    message.attachmentRefs ?? []
+  ])
+}
+
+function sameLogicalTranscriptMessage(left: ChatMessage, right: ChatMessage): boolean {
+  const leftKey = logicalTranscriptMessageKey(left)
+
+  return leftKey !== null && leftKey === logicalTranscriptMessageKey(right)
+}
+
 /**
  * Prepend an older page onto the in-memory transcript, deduplicating rows the
  * store already holds (offset drift makes overlap normal — see module doc).
@@ -43,6 +88,7 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
 
   const existingRowIds = new Set<number>()
   const existingIds = new Set<string>()
+  const unmatchedLogicalCounts = new Map<string, number>()
 
   for (const message of existing) {
     if (message.rowId !== undefined) {
@@ -50,11 +96,46 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
     }
 
     existingIds.add(message.id)
+    const logicalKey = logicalTranscriptMessageKey(message)
+
+    if (logicalKey !== null) {
+      unmatchedLogicalCounts.set(logicalKey, (unmatchedLogicalCounts.get(logicalKey) ?? 0) + 1)
+    }
   }
 
-  const fresh = olderPage.filter(
-    message => !(message.rowId !== undefined && existingRowIds.has(message.rowId)) && !existingIds.has(message.id)
-  )
+  const consumeLogicalOverlap = (message: ChatMessage): boolean => {
+    const logicalKey = logicalTranscriptMessageKey(message)
+    const remaining = logicalKey === null ? 0 : (unmatchedLogicalCounts.get(logicalKey) ?? 0)
+
+    if (logicalKey === null || remaining <= 0) {
+      return false
+    }
+
+    unmatchedLogicalCounts.set(logicalKey, remaining - 1)
+
+    return true
+  }
+
+  // Reserve semantic multiplicity for exact row/id overlaps before page-order
+  // filtering. Older pages are chronological, so a distinct identical row may
+  // appear before the exact boundary row that proves the overlap.
+  for (const message of olderPage) {
+    if ((message.rowId !== undefined && existingRowIds.has(message.rowId)) || existingIds.has(message.id)) {
+      consumeLogicalOverlap(message)
+    }
+  }
+
+  const fresh = olderPage.filter(message => {
+    if ((message.rowId !== undefined && existingRowIds.has(message.rowId)) || existingIds.has(message.id)) {
+      return false
+    }
+
+    if (consumeLogicalOverlap(message)) {
+      return false
+    }
+
+    return true
+  })
 
   if (fresh.length === 0) {
     return existing
@@ -77,13 +158,46 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
     return refreshedTail
   }
 
-  const first = refreshedTail[0]
+  const sameTranscriptOccurrence = (left: ChatMessage, right: ChatMessage) =>
+    (left.rowId !== undefined && right.rowId !== undefined && left.rowId === right.rowId) ||
+    left.id === right.id ||
+    sameLogicalTranscriptMessage(left, right)
 
-  const anchor = previous.findIndex(
-    message =>
-      (first.rowId !== undefined && message.rowId !== undefined && message.rowId === first.rowId) ||
-      message.id === first.id
-  )
+  let anchor = -1
+  let longestOverlap = 0
+  let bestStartsExact = false
+
+  // Align the longest previous suffix segment with the refreshed prefix. A
+  // first-row reverse match duplicates repeated runs; sequence alignment maps
+  // all N refreshed copies onto the corresponding N previous occurrences.
+  for (let index = 0; index < previous.length; index += 1) {
+    let overlap = 0
+
+    while (
+      index + overlap < previous.length &&
+      overlap < refreshedTail.length &&
+      sameTranscriptOccurrence(previous[index + overlap]!, refreshedTail[overlap]!)
+    ) {
+      overlap += 1
+    }
+
+    const startsExact =
+      overlap > 0 &&
+      ((previous[index]!.rowId !== undefined &&
+        refreshedTail[0]!.rowId !== undefined &&
+        previous[index]!.rowId === refreshedTail[0]!.rowId) ||
+        previous[index]!.id === refreshedTail[0]!.id)
+
+    if (
+      overlap > longestOverlap ||
+      (overlap > 0 && overlap === longestOverlap && startsExact && !bestStartsExact) ||
+      (overlap > 0 && overlap === longestOverlap && startsExact === bestStartsExact && index > anchor)
+    ) {
+      anchor = index
+      longestOverlap = overlap
+      bestStartsExact = startsExact
+    }
+  }
 
   if (anchor <= 0) {
     return refreshedTail

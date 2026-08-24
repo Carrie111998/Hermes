@@ -122,6 +122,87 @@ describe('mergeOlderTranscriptPage', () => {
     expect(mergeOlderTranscriptPage(existing, older).map(m => m.rowId)).toEqual([1, 2, 3])
   })
 
+  it('dedupes a compaction-generation copy by logical identity when row ids changed', () => {
+    const existing = [{ ...chat('new-generation', 20), timestamp: 1_700_000_000 }]
+    const older = [{ ...chat('old-generation', 2), timestamp: 1_700_000_000, parts: existing[0].parts }]
+
+    expect(mergeOlderTranscriptPage(existing, older)).toBe(existing)
+  })
+
+  it('ignores locally enriched timeline metadata when matching a compaction copy', () => {
+    const text = { text: 'same durable content', type: 'text' as const }
+
+    const existing = [
+      {
+        ...chat('warm-generation', 20),
+        timestamp: 900,
+        durableTimestamp: 1_000,
+        parts: [{ ...text, timestamp: 900, completedAt: 950 }]
+      }
+    ]
+
+    const older = [
+      {
+        ...chat('fresh-generation', 2),
+        timestamp: 1_000,
+        durableTimestamp: 1_000,
+        parts: [{ ...text, timestamp: 1_000 }]
+      }
+    ]
+
+    expect(mergeOlderTranscriptPage(existing, older)).toBe(existing)
+  })
+
+  it('preserves multiplicity for distinct identical persisted rows', () => {
+    const existing = [{ ...chat('warm-copy', 20), timestamp: 1_000, durableTimestamp: 1_000 }]
+
+    const older = [
+      { ...chat('older-copy', 2), timestamp: 1_000, durableTimestamp: 1_000, parts: existing[0].parts },
+      { ...chat('distinct-repeat', 3), timestamp: 1_000, durableTimestamp: 1_000, parts: existing[0].parts }
+    ]
+
+    expect(mergeOlderTranscriptPage(existing, older).map(message => message.rowId)).toEqual([3, 20])
+  })
+
+  it('consumes an exact overlap before preserving a distinct identical row', () => {
+    const existing = [{ ...chat('warm-copy', 20), timestamp: 1_000, durableTimestamp: 1_000 }]
+
+    const older = [
+      { ...chat('exact-overlap', 20), timestamp: 1_000, durableTimestamp: 1_000, parts: existing[0].parts },
+      { ...chat('distinct-repeat', 3), timestamp: 1_000, durableTimestamp: 1_000, parts: existing[0].parts }
+    ]
+
+    expect(mergeOlderTranscriptPage(existing, older).map(message => message.rowId)).toEqual([3, 20])
+  })
+
+  it('pre-accounts a later exact overlap before an earlier distinct identical row', () => {
+    const existing = [{ ...chat('warm-copy', 20), timestamp: 1_000, durableTimestamp: 1_000 }]
+
+    const older = [
+      { ...chat('distinct-repeat', 3), timestamp: 1_000, durableTimestamp: 1_000, parts: existing[0].parts },
+      { ...chat('exact-overlap', 20), timestamp: 1_000, durableTimestamp: 1_000, parts: existing[0].parts }
+    ]
+
+    expect(mergeOlderTranscriptPage(existing, older).map(message => message.rowId)).toEqual([3, 20])
+  })
+
+  it('keeps truly repeated text when timestamps differ', () => {
+    const existing = [{ ...chat('new-generation', 20), timestamp: 1_700_000_001 }]
+    const older = [{ ...chat('old-generation', 2), timestamp: 1_700_000_000, parts: existing[0].parts }]
+
+    expect(mergeOlderTranscriptPage(existing, older)).toHaveLength(2)
+  })
+
+  it('keeps distinct tool calls even when timestamp and visible result match', () => {
+    const toolPart = (toolCallId: string) =>
+      ({ args: {}, toolCallId, toolName: 'terminal', type: 'tool-call' }) as ChatMessage['parts'][number]
+
+    const existing = [{ ...chat('tool-new', 20), timestamp: 1_700_000_000, parts: [toolPart('call-new')] }]
+    const older = [{ ...chat('tool-old', 2), timestamp: 1_700_000_000, parts: [toolPart('call-old')] }]
+
+    expect(mergeOlderTranscriptPage(existing, older)).toHaveLength(2)
+  })
+
   it('keeps reference identity when every older row is already present', () => {
     const existing = [chat('a', 1), chat('b', 2)]
     const older = [chat('a', 1)]
@@ -142,6 +223,45 @@ describe('graftRefreshedTailOntoBackfill', () => {
     const refreshed = [chat('b', 2), chat('c', 3), chat('d', 4)]
 
     expect(graftRefreshedTailOntoBackfill(refreshed, previous).map(m => m.rowId)).toEqual([1, 2, 3, 4])
+  })
+
+  it('anchors a refreshed compaction generation by logical identity instead of duplicating it', () => {
+    const copied = { ...chat('old-generation', 2), timestamp: 1_700_000_000 }
+    const refreshedCopy = { ...chat('new-generation', 20), timestamp: 1_700_000_000, parts: copied.parts }
+    const previous = [chat('prefix', 1), copied, chat('stale-tail', 3)]
+    const refreshed = [refreshedCopy, chat('fresh-tail', 21)]
+
+    expect(graftRefreshedTailOntoBackfill(refreshed, previous).map(m => m.rowId)).toEqual([1, 20, 21])
+  })
+
+  it('anchors ambiguous identical rows at the newest occurrence and preserves multiplicity', () => {
+    const first = { ...chat('repeat-one', 2), timestamp: 1_000, durableTimestamp: 1_000 }
+    const second = { ...chat('repeat-two', 3), timestamp: 1_000, durableTimestamp: 1_000, parts: first.parts }
+    const refreshedCopy = { ...chat('refreshed-repeat', 20), timestamp: 1_000, durableTimestamp: 1_000, parts: first.parts }
+    const previous = [chat('prefix', 1), first, second, chat('stale-tail', 4)]
+
+    expect(graftRefreshedTailOntoBackfill([refreshedCopy, chat('fresh-tail', 21)], previous).map(m => m.rowId)).toEqual([
+      1, 2, 20, 21
+    ])
+  })
+
+  it('sequence-aligns a refreshed run of identical persisted rows', () => {
+    const first = { ...chat('repeat-one', 2), timestamp: 1_000, durableTimestamp: 1_000 }
+    const second = { ...chat('repeat-two', 3), timestamp: 1_000, durableTimestamp: 1_000, parts: first.parts }
+    const third = { ...chat('repeat-three', 4), timestamp: 1_000, durableTimestamp: 1_000, parts: first.parts }
+
+    const refreshed = [20, 21, 22].map(rowId => ({
+      ...chat(`refreshed-${rowId}`, rowId),
+      timestamp: 1_000,
+      durableTimestamp: 1_000,
+      parts: first.parts
+    }))
+
+    const previous = [chat('prefix', 1), first, second, third, chat('stale-tail', 5)]
+
+    expect(graftRefreshedTailOntoBackfill([...refreshed, chat('fresh-tail', 23)], previous).map(m => m.rowId)).toEqual([
+      1, 20, 21, 22, 23
+    ])
   })
 
   it('returns the refreshed tail unchanged when no anchor is found', () => {

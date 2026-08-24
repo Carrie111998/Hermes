@@ -19,6 +19,10 @@ export type ChatMessage = {
   role: SessionMessage['role']
   parts: ChatMessagePart[]
   timestamp?: number
+  /** Original backend row timestamp. Unlike `timestamp`, local timeline
+   * reconciliation never rewrites it, so compaction generations retain one
+   * stable semantic identity across warm-cache and fresh hydration. */
+  durableTimestamp?: number
   completedAt?: number
   pending?: boolean
   error?: string

@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $clarifyRequests } from '@/store/clarify'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
@@ -52,9 +53,22 @@ function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void; onS
   return { hook, onCancel, onSubmit }
 }
 
+function setPendingClarify(): void {
+  $clarifyRequests.set({
+    'rt-session-queue-hook': {
+      requestId: 'req-queue-hook',
+      question: 'choose first',
+      choices: ['a', 'b'],
+      multiSelect: false,
+      sessionId: 'rt-session-queue-hook'
+    }
+  })
+}
+
 describe('useComposerQueue park integration', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    $clarifyRequests.set({})
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
   })
@@ -62,6 +76,7 @@ describe('useComposerQueue park integration', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    $clarifyRequests.set({})
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
   })
@@ -70,6 +85,32 @@ describe('useComposerQueue park integration', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'flows' })
 
     const { onSubmit } = renderQueueHook()
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('holds every drain path while clarify is pending', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'wait for answer' })!
+    setPendingClarify()
+    const onSteer = vi.fn(async () => true)
+    const { hook, onCancel, onSubmit } = renderQueueHook({ busy: true, onSteer })
+
+    expect(hook.result.current.sendQueuedNow(entry.id)).toBe(false)
+    expect(await hook.result.current.steerQueuedNow(entry.id)).toBe(false)
+    expect(await hook.result.current.drainNextQueued()).toBe(false)
+    hook.rerender({ busy: false })
+
+    await act(async () => Promise.resolve())
+    expect(onCancel).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+
+    act(() => {
+      $clarifyRequests.set({})
+      hook.rerender({ busy: false })
+    })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)

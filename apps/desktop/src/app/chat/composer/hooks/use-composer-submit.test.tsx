@@ -4,7 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { $clarifyRequests } from '@/store/clarify'
-import type { ComposerAttachment } from '@/store/composer'
+import {
+  clearSessionDraft,
+  type ComposerAttachment,
+  stashSessionDraft,
+  takeSessionDraft
+} from '@/store/composer'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -48,6 +53,7 @@ function renderSubmitHook({
 }: SubmitHarnessOptions = {}) {
   const resolvedSurfaceId = surfaceId === undefined ? `test-surface-${++surfaceSequence}` : surfaceId
   const draftRef = { current: text }
+  const draftIntentGenerationRef = { current: 0 }
   const editor = window.document.createElement('div')
   editor.dataset.slot = 'composer-rich-input'
   editor.textContent = text
@@ -56,6 +62,10 @@ function renderSubmitHook({
   const onSteer = vi.fn(async () => true)
   const onSubmit = vi.fn(async () => true)
   const queueCurrentDraft = vi.fn(() => true)
+  const loadIntoComposer = vi.fn()
+  const releasePersistedDraftReceipt = vi.fn()
+  const stashAt = vi.fn(stashSessionDraft)
+  const activeQueueSessionKeyRef = { current: sessionKey }
   let updatePaneVisible: Dispatch<SetStateAction<boolean>> | undefined
 
   const clearDraft = vi.fn(() => {
@@ -94,39 +104,47 @@ function renderSubmitHook({
     () =>
       useComposerSubmit({
         activeQueueSessionKey: sessionKey,
-        activeQueueSessionKeyRef: { current: sessionKey },
+        activeQueueSessionKeyRef,
         attachments,
         busy,
         compacting,
         clearDraft,
         disabled: false,
+        draftIntentGenerationRef,
         draftRef,
         drainNextQueued: vi.fn(async () => false),
         editorRef,
         exitQueuedEdit: vi.fn(() => false),
         focusInput: vi.fn(),
         inputDisabled,
-        loadIntoComposer: vi.fn(),
+        loadIntoComposer,
         onCancel,
         onSteer,
         onSubmit,
         queueCurrentDraft,
         queueEdit: null,
         queuedPrompts: [],
+        releasePersistedDraftReceipt,
         sessionId: 'runtime-session',
         setComposerText: vi.fn(),
-        stashAt: vi.fn()
+        stashAt
       }),
     { wrapper: Wrapper }
   )
 
   return {
+    activeQueueSessionKeyRef,
     clearDraft,
+    draftIntentGenerationRef,
+    draftRef,
+    editorRef,
     hook,
+    loadIntoComposer,
     onCancel,
     onSteer,
     onSubmit,
     queueCurrentDraft,
+    stashAt,
     composerSurfaceId: resolvedSurfaceId,
     setPaneVisible(nextVisible: boolean) {
       if (!updatePaneVisible) {
@@ -137,6 +155,12 @@ function renderSubmitHook({
     }
   }
 }
+
+afterEach(() => {
+  clearSessionDraft('stored-session')
+  clearSessionDraft(null)
+  MAIN_COMPOSER_SCOPE.attachments.clear()
+})
 
 describe('useComposerSubmit external request routing', () => {
   afterEach(() => {
@@ -166,6 +190,16 @@ describe('useComposerSubmit external request routing', () => {
     expect(hiddenMain.onSubmit).not.toHaveBeenCalled()
     expect(visibleTile.onSubmit).not.toHaveBeenCalled()
     expect(hiddenTile.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unrelated persisted draft when an external submit is accepted', async () => {
+    stashSessionDraft('stored-session', 'unsent composer draft', [])
+    const visibleMain = renderSubmitHook({ sessionKey: 'stored-session', text: 'unsent composer draft' })
+
+    expect(requestComposerSubmit('ship review result', { target: 'main' })).toBe(true)
+    await waitFor(() => expect(visibleMain.onSubmit).toHaveBeenCalledTimes(1))
+
+    expect(takeSessionDraft('stored-session').text).toBe('unsent composer draft')
   })
 
   it('routes a tile-targeted submit to that tile only', async () => {
@@ -372,6 +406,246 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onCancel).not.toHaveBeenCalled()
   })
 
+  it('stashes an idle submit before clearing the visible draft while acceptance is pending', () => {
+    const { clearDraft, hook, onSubmit, stashAt } = renderSubmitHook({ text: 'do not lose this' })
+    onSubmit.mockReturnValueOnce(new Promise(() => {}))
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(stashAt).toHaveBeenCalledWith('stored-session', 'do not lose this', [])
+    expect(stashAt.mock.invocationCallOrder[0]).toBeLessThan(clearDraft.mock.invocationCallOrder[0])
+  })
+
+  it('stashes a steer before clearing the visible draft', () => {
+    const { clearDraft, hook, onSteer, stashAt } = renderSubmitHook({ busy: true, text: 'redirect safely' })
+    onSteer.mockReturnValueOnce(new Promise(() => {}))
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(stashAt).toHaveBeenCalledWith('stored-session', 'redirect safely', [])
+    expect(stashAt.mock.invocationCallOrder[0]).toBeLessThan(clearDraft.mock.invocationCallOrder[0])
+  })
+
+  it('restores a steer draft when the handler throws synchronously', async () => {
+    const { hook, loadIntoComposer, onSteer, stashAt } = renderSubmitHook({ busy: true, text: 'restore sync throw' })
+    onSteer.mockImplementationOnce(() => {
+      throw new Error('socket closed before promise')
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(loadIntoComposer).toHaveBeenCalledWith('restore sync throw', []))
+    expect(stashAt).toHaveBeenLastCalledWith('stored-session', 'restore sync throw', [])
+  })
+
+  it('does not overwrite newer visible text when a steer throws late', async () => {
+    let rejectSteer!: (error: Error) => void
+
+    const pendingSteer = new Promise<boolean>((_resolve, reject) => {
+      rejectSteer = reject
+    })
+
+    const { draftIntentGenerationRef, draftRef, editorRef, hook, loadIntoComposer, onSteer } = renderSubmitHook({
+      busy: true,
+      text: 'redirect first'
+    })
+
+    onSteer.mockReturnValueOnce(pendingSteer)
+
+    act(() => hook.result.current.submitDraft())
+    draftIntentGenerationRef.current += 1
+    draftRef.current = 'newer steer intent'
+    editorRef.current!.textContent = 'newer steer intent'
+    rejectSteer(new Error('late redirect failure'))
+
+    await act(async () => pendingSteer.catch(() => false))
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(draftRef.current).toBe('newer steer intent')
+  })
+
+  it('does not overwrite a newer attachment-only draft when a steer throws late', async () => {
+    let rejectSteer!: (error: Error) => void
+
+    const pendingSteer = new Promise<boolean>((_resolve, reject) => {
+      rejectSteer = reject
+    })
+
+    const { draftIntentGenerationRef, hook, loadIntoComposer, onSteer } = renderSubmitHook({
+      busy: true,
+      text: 'redirect first'
+    })
+
+    onSteer.mockReturnValueOnce(pendingSteer)
+
+    act(() => hook.result.current.submitDraft())
+    draftIntentGenerationRef.current += 1
+    MAIN_COMPOSER_SCOPE.attachments.add({ id: 'steer-next', kind: 'file', label: 'next.txt', occurrenceId: 'next' })
+    rejectSteer(new Error('late redirect failure'))
+
+    await act(async () => pendingSteer.catch(() => false))
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(MAIN_COMPOSER_SCOPE.attachments.$attachments.get()).toHaveLength(1)
+  })
+
+  it('does not clear a newer draft when an older idle submit is accepted late', async () => {
+    let resolveAccepted!: (accepted: boolean) => void
+
+    const accepted = new Promise<boolean>(resolve => {
+      resolveAccepted = resolve
+    })
+
+    const { hook, onSubmit } = renderSubmitHook({ text: 'submitted first' })
+    onSubmit.mockReturnValueOnce(accepted)
+
+    act(() => hook.result.current.submitDraft())
+    stashSessionDraft('stored-session', 'typed while pending', [])
+    resolveAccepted(true)
+
+    await act(async () => accepted)
+    expect(takeSessionDraft('stored-session').text).toBe('typed while pending')
+  })
+
+  it('does not overwrite newer visible text when the old submit rejects before debounce', async () => {
+    let resolveAccepted!: (accepted: boolean) => void
+
+    const accepted = new Promise<boolean>(resolve => {
+      resolveAccepted = resolve
+    })
+
+    const { draftIntentGenerationRef, draftRef, editorRef, hook, loadIntoComposer, onSubmit } = renderSubmitHook({ text: 'submitted first' })
+    onSubmit.mockReturnValueOnce(accepted)
+
+    act(() => hook.result.current.submitDraft())
+    draftIntentGenerationRef.current += 1
+    draftRef.current = 'new intent before debounce'
+    editorRef.current!.textContent = 'new intent before debounce'
+    resolveAccepted(false)
+
+    await act(async () => accepted)
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(draftRef.current).toBe('new intent before debounce')
+  })
+
+  it('does not overwrite a newer attachment-only draft when the old submit rejects', async () => {
+    let resolveAccepted!: (accepted: boolean) => void
+
+    const accepted = new Promise<boolean>(resolve => {
+      resolveAccepted = resolve
+    })
+
+    const { draftIntentGenerationRef, hook, loadIntoComposer, onSubmit } = renderSubmitHook({ text: 'submitted first' })
+    onSubmit.mockReturnValueOnce(accepted)
+
+    act(() => hook.result.current.submitDraft())
+    draftIntentGenerationRef.current += 1
+    MAIN_COMPOSER_SCOPE.attachments.add({ id: 'new-file', kind: 'file', label: 'new.txt', occurrenceId: 'new-occ' })
+    resolveAccepted(false)
+
+    await act(async () => accepted)
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(MAIN_COMPOSER_SCOPE.attachments.$attachments.get()).toHaveLength(1)
+  })
+
+  it('clears a rehydrated receipt when its late acceptance arrives after a session round-trip', async () => {
+    let resolveAccepted!: (accepted: boolean) => void
+
+    const accepted = new Promise<boolean>(resolve => {
+      resolveAccepted = resolve
+    })
+
+    const { activeQueueSessionKeyRef, clearDraft, draftRef, editorRef, hook, onSubmit } = renderSubmitHook({
+      text: 'accepted once'
+    })
+
+    onSubmit.mockReturnValueOnce(accepted)
+
+    act(() => hook.result.current.submitDraft())
+    activeQueueSessionKeyRef.current = 'session-b'
+    activeQueueSessionKeyRef.current = 'stored-session'
+    draftRef.current = 'accepted once'
+    editorRef.current!.textContent = 'accepted once'
+    resolveAccepted(true)
+
+    await act(async () => accepted)
+    expect(clearDraft).toHaveBeenCalledTimes(2)
+    expect(draftRef.current).toBe('')
+    expect(takeSessionDraft('stored-session')).toEqual({ attachments: [], text: '' })
+  })
+
+  it('preserves newer A-B-A text when an older submit is accepted', async () => {
+    let resolveAccepted!: (accepted: boolean) => void
+
+    const accepted = new Promise<boolean>(resolve => {
+      resolveAccepted = resolve
+    })
+
+    const { clearDraft, draftIntentGenerationRef, draftRef, editorRef, hook, onSubmit } = renderSubmitHook({ text: 'A' })
+    onSubmit.mockReturnValueOnce(accepted)
+
+    act(() => hook.result.current.submitDraft())
+    draftIntentGenerationRef.current += 2
+    draftRef.current = 'A'
+    editorRef.current!.textContent = 'A'
+    resolveAccepted(true)
+
+    await act(async () => accepted)
+    expect(clearDraft).toHaveBeenCalledTimes(1)
+    expect(draftRef.current).toBe('A')
+  })
+
+  it.each([
+    ['accepted', true],
+    ['queued after rejection', false]
+  ])('preserves newer A-B-A text when a steer is %s', async (_label, steerAccepted) => {
+    let resolveSteer!: (accepted: boolean) => void
+
+    const pendingSteer = new Promise<boolean>(resolve => {
+      resolveSteer = resolve
+    })
+
+    const { clearDraft, draftIntentGenerationRef, draftRef, editorRef, hook, onSteer } = renderSubmitHook({
+      busy: true,
+      text: 'A'
+    })
+
+    onSteer.mockReturnValueOnce(pendingSteer)
+
+    act(() => hook.result.current.submitDraft())
+    draftIntentGenerationRef.current += 2
+    draftRef.current = 'A'
+    editorRef.current!.textContent = 'A'
+    resolveSteer(steerAccepted)
+
+    await act(async () => pendingSteer)
+    expect(clearDraft).toHaveBeenCalledTimes(1)
+    expect(draftRef.current).toBe('A')
+  })
+
+  it('does not repaint a rejected submit into a different active session', async () => {
+    let resolveAccepted!: (accepted: boolean) => void
+
+    const accepted = new Promise<boolean>(resolve => {
+      resolveAccepted = resolve
+    })
+
+    const { activeQueueSessionKeyRef, hook, loadIntoComposer, onSubmit } = renderSubmitHook({ text: 'session-a text' })
+    onSubmit.mockReturnValueOnce(accepted)
+
+    act(() => hook.result.current.submitDraft())
+    activeQueueSessionKeyRef.current = 'session-b'
+    resolveAccepted(false)
+
+    await act(async () => accepted)
+    expect(loadIntoComposer).not.toHaveBeenCalledWith('session-a text', [])
+    expect(takeSessionDraft('stored-session').text).toBe('session-a text')
+  })
+
   it('threads the loaded composer scope through onSubmit for the #59305 submit-time guard', async () => {
     const { hook, onSubmit } = renderSubmitHook({ text: 'hello' })
 
@@ -409,36 +683,33 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
     vi.restoreAllMocks()
   })
 
-  it('skips the question and still sends the typed message on an idle session', async () => {
+  it('keeps the question visible and queues typed prose instead of silently skipping it', () => {
     parkClarify('runtime-session')
-    const { hook, onSubmit } = renderSubmitHook({ text: 'actually do this instead' })
+    const { hook, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({ text: 'actually do this instead' })
 
     act(() => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() =>
-      expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', {
-        request_id: 'req-runtime-session',
-        answer: ''
-      })
-    )
-    await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith('actually do this instead', expect.objectContaining({ attachments: [] }))
-    )
-    expect($clarifyRequests.get()['runtime-session']).toBeUndefined()
+    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(gatewayRequest).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+    expect($clarifyRequests.get()['runtime-session']).toBeDefined()
   })
 
-  it('skips the question before steering a busy turn', async () => {
+  it('keeps the question visible and queues a busy-turn follow-up', () => {
     parkClarify('runtime-session')
-    const { hook, onSteer } = renderSubmitHook({ busy: true, text: 'change course' })
+    const { hook, onSteer, queueCurrentDraft } = renderSubmitHook({ busy: true, text: 'change course' })
 
     act(() => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
-    expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-runtime-session', answer: '' })
+    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(gatewayRequest).not.toHaveBeenCalled()
+    expect($clarifyRequests.get()['runtime-session']).toBeDefined()
   })
 
   it('leaves the question alone for an empty Enter (Stop, not an answer)', () => {
