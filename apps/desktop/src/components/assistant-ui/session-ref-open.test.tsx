@@ -47,10 +47,10 @@ describe('session refs open the session', () => {
   })
 })
 
-// A url the user sent renders as a chip too, and it opens in the IN-APP
-// browser — the same door the composer's hover pill uses, so a link behaves
-// the same before and after send.
-describe('url refs open in the browser pane', () => {
+// A url the user sent renders as a chip too, and a bare click opens the
+// system browser — the same door the composer's hover pill uses, so a link
+// behaves the same before and after send. ⌘/Ctrl-click is the in-app pane.
+describe('url refs open in the system browser', () => {
   it('opens a url chip in the user transcript', async () => {
     const openExternal = vi.fn().mockResolvedValue(undefined)
 
@@ -63,7 +63,7 @@ describe('url refs open in the browser pane', () => {
     expect(chip.tagName).toBe('BUTTON')
     fireEvent.click(chip)
 
-    expect(openExternal).not.toHaveBeenCalled()
-    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/docs'))
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/docs')
+    expect($previewTabs.get()).toHaveLength(0)
   })
 })
