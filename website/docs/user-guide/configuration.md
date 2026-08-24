@@ -1984,6 +1984,25 @@ Signal is listed as a valid platform key because the setting can be saved per pl
 
 `show_commentary` (default `true`) controls Codex Responses models' commentary channel — the polished progress narration these models produce alongside their private reasoning. When enabled, each completed commentary message is delivered as a visible mid-turn update (on the gateway this also requires `interim_assistant_messages`). Set it to `false` if the extra narration annoys you: commentary then falls back to the reasoning channel and is only shown when `show_reasoning` is enabled.
 
+## Pricing Overrides
+
+Hermes derives per-turn dollar costs (the `display.show_cost` status bar, `hermes insights`, the model cost guard) from token counts × per-model pricing. Pricing is auto-discovered from provider APIs and a bundled snapshot, but some providers (e.g. Fireworks AI) don't publish pricing through their API, and the bundled snapshot can lag a vendor price change. The root-level `pricing_overrides:` list lets you declare rates yourself — user entries win over every auto-discovery source:
+
+```yaml
+pricing_overrides:
+  - provider: custom:fireworks   # provider string Hermes resolves to; `custom:<name>` and the bare name both match
+    model: kimi-k2p6             # full model id or its basename — either form matches
+    input_per_million: 0.95      # required, USD per 1M input tokens
+    output_per_million: 4.00     # required, USD per 1M output tokens
+    cache_read_per_million: 0.16 # optional
+    cache_write_per_million: 0   # optional
+    request_cost: 0              # optional — flat USD per request
+    source_url: https://docs.fireworks.ai/serverless/pricing  # optional, free-form
+    pricing_version: fireworks-2026-05                        # optional, free-form
+```
+
+Entries missing either required rate are skipped (a malformed item never masks a later valid one or breaks cost computation). Costs resolved this way are labeled `user_override` in cost surfaces.
+
 ## Privacy
 
 ```yaml

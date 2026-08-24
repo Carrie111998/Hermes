@@ -2014,6 +2014,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
     "signal",            # Signal settings bridged to env vars by gateway/config.py
     "timeouts",          # unified timeout resolution section (agent/deadline.py, #85125)
+    "pricing_overrides", # user-supplied per-model pricing (agent/usage_pricing.py)
 }
 _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
