@@ -338,15 +338,20 @@ _SAFE_SPEC = re.compile(
 _OPENWAKEWORD_MAX_PYTHON = (3, 12)
 
 
-def openwakeword_supported(version_info=None) -> bool:
-    """Whether the released openWakeWord/tflite path is supported.
+def openwakeword_supported(version_info=None, *, sys_platform=None) -> bool:
+    """Whether the released openWakeWord path is supported on this platform.
 
-    ``openwakeword==0.6.0`` requires ``tflite-runtime`` on Linux, and the
+    ``openwakeword==0.6.0`` requires ``tflite-runtime`` only on Linux, and the
     published wheels for the supported Linux architectures stop at CPython
-    3.11. Keep this predicate shared by the lazy installer and wake runtime so
-    a resolver marker cannot drift from the first-use behavior.
+    3.11. Non-Linux platforms use their existing openWakeWord backend; on
+    macOS ARM64 the wake engine separately bridges ``ai-edge-litert`` for its
+    tflite path. Keep this predicate shared by the lazy installer and wake
+    runtime so a resolver marker cannot drift from first-use behavior.
     """
     version = version_info if version_info is not None else sys.version_info
+    platform_name = sys_platform if sys_platform is not None else sys.platform
+    if platform_name != "linux":
+        return True
     return tuple(version[:2]) < _OPENWAKEWORD_MAX_PYTHON
 
 
@@ -355,7 +360,7 @@ def openwakeword_unsupported_reason() -> Optional[str]:
     if openwakeword_supported():
         return None
     return (
-        "unsupported on Python 3.12 or newer: openwakeword==0.6.0 depends on "
+        "unsupported on Python 3.12 or newer on Linux: openwakeword==0.6.0 depends on "
         "tflite-runtime wheels that are published only for CPython 3.11. "
         "Use Python 3.11 for openWakeWord, select another configured wake "
         "provider, or wait for the upstream LiteRT-based release"

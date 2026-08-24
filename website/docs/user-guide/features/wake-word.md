@@ -86,15 +86,16 @@ its shared feature-extraction models — a small one-time fetch.)
 
 Wake engines are lazy-installed the first time you enable the wake word (desktop
 installs made with `--include-desktop` pre-install them, so the ear works
-instantly). The released openWakeWord 0.6.0 path has an explicit compatibility
-boundary: its Linux `tflite-runtime` dependency has published wheels only for
-CPython 3.11. On Linux, that means openWakeWord is supported on CPython 3.11
-for x86_64, aarch64, and armv7l where the existing wheels resolve. On Python
-3.12 and newer Hermes reports openWakeWord unavailable and does not attempt an
+instantly). The released openWakeWord 0.6.0 path has an explicit platform-aware
+compatibility boundary: its Linux `tflite-runtime` dependency has published
+wheels only for CPython 3.11. On Linux, that means openWakeWord is supported on
+CPython 3.11 for x86_64, aarch64, and armv7l where the existing wheels resolve.
+On macOS ARM64, the dependency remains selectable on supported CPython 3.12 and
+3.13 runtimes and the existing `ai-edge-litert` bridge supplies the tflite path.
+It is not a silent replacement for the Linux runtime. On Linux Python 3.12 and
+newer Hermes reports openWakeWord unavailable and does not attempt an
 incompatible lazy install; use Python 3.11, select sherpa or Porcupine, or wait
-for the upstream LiteRT-based release. The existing macOS ARM64
-`ai-edge-litert` bridge remains unchanged for supported openWakeWord installs;
-it is not silently substituted for the Linux runtime.
+for the upstream LiteRT-based release.
 
 The normal `[all]` profile deliberately does not include the `wake` extra, so
 this optional compatibility boundary cannot break a regular all-features sync.

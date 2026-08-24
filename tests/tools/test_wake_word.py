@@ -351,6 +351,31 @@ def test_openwakeword_ensures_base_models_for_custom_path(monkeypatch):
     assert eng._labels == ["hey_hermes"]
 
 
+def test_darwin_arm64_openwakeword_uses_existing_tflite_bridge(monkeypatch):
+    """Darwin ARM64 remains available on CPython 3.12+ via the bridge."""
+    import tools.lazy_deps as lazy_deps
+
+    real_reason = lazy_deps.openwakeword_unsupported_reason
+    _install_fake_openwakeword(monkeypatch)
+    monkeypatch.setattr(lazy_deps, "openwakeword_unsupported_reason", real_reason)
+    monkeypatch.setattr(lazy_deps.sys, "version_info", (3, 13, 0, "final", 0))
+    monkeypatch.setattr(lazy_deps.sys, "platform", "darwin")
+    monkeypatch.setattr(ww, "_is_macos_arm64", lambda: True)
+
+    bridge_calls = []
+    monkeypatch.setattr(
+        ww,
+        "ensure_tflite_runtime",
+        lambda: bridge_calls.append("bridge") or True,
+    )
+
+    assert real_reason() is None
+    engine = ww._OpenWakeWordEngine({"provider": "openwakeword"})
+
+    assert engine._labels == ["hey_hermes"]
+    assert bridge_calls == ["bridge"]
+
+
 def test_bundled_hey_hermes_model_ships_on_disk():
     # The "hey hermes" wake word works out of the box only if the model is
     # actually bundled. Both framework artifacts must exist and be non-trivial.

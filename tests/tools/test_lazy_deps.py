@@ -85,10 +85,14 @@ class TestAllowlist:
         assert ld.feature_install_command("not.real") is None
         assert ld.feature_install_command("not.real", venv_pip=True) is None
 
-    def test_openwakeword_python_boundary(self):
-        assert ld.openwakeword_supported((3, 11)) is True
-        assert ld.openwakeword_supported((3, 12)) is False
-        assert ld.openwakeword_supported((3, 14)) is False
+    def test_openwakeword_linux_python_boundary(self):
+        assert ld.openwakeword_supported((3, 11), sys_platform="linux") is True
+        assert ld.openwakeword_supported((3, 12), sys_platform="linux") is False
+        assert ld.openwakeword_supported((3, 14), sys_platform="linux") is False
+
+    def test_openwakeword_darwin_bridge_is_not_blocked_by_linux_tflite_boundary(self):
+        assert ld.openwakeword_supported((3, 12), sys_platform="darwin") is True
+        assert ld.openwakeword_supported((3, 13), sys_platform="darwin") is True
 
     def test_openwakeword_unsupported_fails_before_pip(self, monkeypatch):
         monkeypatch.setattr(ld, "openwakeword_supported", lambda: False)

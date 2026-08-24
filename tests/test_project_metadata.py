@@ -33,14 +33,16 @@ def _locked_package(name):
     return packages[0]
 
 
-def _wake_marker_environment(version):
+def _wake_marker_environment(version, *, sys_platform="linux", platform_machine="x86_64"):
     environment = default_environment()
     environment.update(
         {
             "python_version": f"{version[0]}.{version[1]}",
             "python_full_version": f"{version[0]}.{version[1]}.0",
             "extra": "wake",
-            "sys_platform": "linux",
+            "sys_platform": sys_platform,
+            "platform_system": "Darwin" if sys_platform == "darwin" else "Linux",
+            "platform_machine": platform_machine,
         }
     )
     return environment
@@ -73,21 +75,22 @@ def test_matrix_extra_not_in_all():
     )
 
 
-def test_wake_openwakeword_has_explicit_python_compatibility_boundary():
-    """The released openWakeWord path is limited to CPython 3.11."""
+def test_wake_openwakeword_has_explicit_python_platform_compatibility_boundary():
+    """The Linux tflite path is limited to CPython 3.11, not Darwin."""
     optional_dependencies = _load_optional_dependencies()
     wake = optional_dependencies["wake"]
 
-    assert "openwakeword==0.6.0; python_version < '3.12'" in wake
-    assert not any(
-        spec.startswith("openwakeword==0.6.0")
-        and spec != "openwakeword==0.6.0; python_version < '3.12'"
-        for spec in wake
-    )
+    openwakeword_spec = next(spec for spec in wake if spec.startswith("openwakeword==0.6.0"))
+    marker = Marker(openwakeword_spec.split(";", 1)[1].strip())
+    assert marker.evaluate(_wake_marker_environment((3, 11), sys_platform="linux")) is True
+    assert marker.evaluate(_wake_marker_environment((3, 12), sys_platform="linux")) is False
+    assert marker.evaluate(
+        _wake_marker_environment((3, 13), sys_platform="darwin", platform_machine="arm64")
+    ) is True
 
 
-def test_wake_lock_markers_select_openwakeword_only_on_supported_python():
-    """The committed lock must select the CPython 3.11 wake stack only."""
+def test_wake_lock_markers_preserve_linux_boundary_and_darwin_bridge():
+    """The lock follows the platform-aware project marker."""
     optional_dependencies = _load_optional_dependencies()
     project_spec = next(
         spec for spec in optional_dependencies["wake"] if spec.startswith("openwakeword==")
@@ -102,17 +105,30 @@ def test_wake_lock_markers_select_openwakeword_only_on_supported_python():
     )
     locked_marker = Marker(locked_spec["marker"])
 
-    for version in ((3, 11),):
-        environment = _wake_marker_environment(version)
-        assert project_marker.evaluate(environment) is True
-        assert locked_marker.evaluate(environment) is True
-    for version in ((3, 12), (3, 13), (3, 14)):
-        environment = _wake_marker_environment(version)
-        assert project_marker.evaluate(environment) is False
-        assert locked_marker.evaluate(environment) is False
+    environments = {
+        "linux-cp311": _wake_marker_environment((3, 11), sys_platform="linux"),
+        "linux-cp312": _wake_marker_environment((3, 12), sys_platform="linux"),
+        "linux-cp314": _wake_marker_environment((3, 14), sys_platform="linux"),
+        "darwin-arm64-cp312": _wake_marker_environment(
+            (3, 12), sys_platform="darwin", platform_machine="arm64"
+        ),
+        "darwin-arm64-cp313": _wake_marker_environment(
+            (3, 13), sys_platform="darwin", platform_machine="arm64"
+        ),
+    }
+    expected = {
+        "linux-cp311": True,
+        "linux-cp312": False,
+        "linux-cp314": False,
+        "darwin-arm64-cp312": True,
+        "darwin-arm64-cp313": True,
+    }
+    for name, environment in environments.items():
+        assert project_marker.evaluate(environment) is expected[name], name
+        assert locked_marker.evaluate(environment) is expected[name], name
 
     assert locked_spec["specifier"] == "==0.6.0"
-    assert locked_spec["marker"] == "python_full_version < '3.12' and extra == 'wake'"
+    assert "extra == 'wake'" in locked_spec["marker"]
 
     openwakeword = _locked_package("openwakeword")
     tflite_dependency = next(
@@ -121,6 +137,14 @@ def test_wake_lock_markers_select_openwakeword_only_on_supported_python():
         if dependency["name"] == "tflite-runtime"
     )
     assert tflite_dependency["marker"] == "sys_platform == 'linux'"
+
+    ai_edge_spec = next(
+        requirement
+        for requirement in locked_root["metadata"]["requires-dist"]
+        if requirement["name"] == "ai-edge-litert" and requirement["marker"]
+    )
+    assert ai_edge_spec["marker"] == "sys_platform == 'darwin' and extra == 'wake'"
+    assert ai_edge_spec["specifier"] == "==2.1.6"
 
 
 def test_tflite_lock_contains_supported_cp311_linux_architectures():
