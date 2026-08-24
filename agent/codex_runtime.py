@@ -827,7 +827,23 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         from agent.message_metadata import append_message
 
-        for projected_message in turn.projected_messages:
+        projected_messages = turn.projected_messages
+        # ``turn/start`` materializes the submitted input as the leading
+        # ``userMessage`` item.  That item is a transport echo, not a second
+        # user action: build_turn_context already appended and persisted the
+        # same input before this early-return runtime was entered.  Drop only
+        # that exact leading echo.  Later/non-matching user projections remain
+        # intact so a distinct user event (for example a future turn/steer
+        # projection) is never erased by broad role- or content-based dedupe.
+        first_projected = projected_messages[0]
+        if (
+            isinstance(first_projected, dict)
+            and first_projected.get("role") == "user"
+            and first_projected.get("content") == user_message
+        ):
+            projected_messages = projected_messages[1:]
+
+        for projected_message in projected_messages:
             append_message(messages, projected_message)
 
         # Persist the newly-projected assistant/tool messages ourselves.
@@ -938,8 +954,8 @@ def run_codex_app_server_turn(
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
-        # messages.extend). The inbound user turn was already flushed at turn
-        # start (turn_context._persist_session) and the flush dedups via
+        # the projection splice). The inbound user turn was already flushed at
+        # turn start (turn_context._persist_session) and the flush dedups via
         # _DB_PERSISTED_MARKER, so state.db ends up with each real message
         # exactly once and session_search / conversation-distill see the full
         # gateway conversation. Report agent_persisted=True so the gateway

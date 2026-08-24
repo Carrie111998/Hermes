@@ -14,13 +14,19 @@ The fix has the codex runtime flush its own projected messages via
 skips its own ``append_to_transcript`` DB write. This is critical: the inbound
 user turn is already flushed at turn start (``turn_context._persist_session``),
 and ``append_message`` is a raw INSERT with no dedup — a gateway re-write would
-duplicate the user turn (#860 / #42039). This test locks in:
+duplicate the user turn (#860 / #42039).
+
+Codex also projects the submitted input as a fresh leading ``userMessage``
+dict. The persistence marker cannot identify that semantically equal copy, so
+the runtime must discard the exact leading transport echo before splicing the
+remaining projected messages. This test locks in:
 
 1. ``run_codex_app_server_turn`` flushes projected messages and returns
    ``agent_persisted=True``.
 2. Exactly-once persistence: the already-flushed user turn is NOT re-written,
-   and the new projected assistant message lands once.
-3. The gateway resolution expression preserves standard-runtime behaviour.
+   the projected input echo is NOT inserted, and the assistant lands once.
+3. A later distinct user projection is preserved.
+4. The gateway resolution expression preserves standard-runtime behaviour.
 """
 
 import tempfile
@@ -33,13 +39,17 @@ from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _make_turn():
+def _make_turn(*, user_echo=None):
+    projected_messages = []
+    if user_echo is not None:
+        projected_messages.append({"role": "user", "content": user_echo})
+    projected_messages.append({"role": "assistant", "content": "CODEX_ASSISTANT"})
     return SimpleNamespace(
         interrupted=False,
         error=None,
         thread_id="thread-1",
         turn_id="turn-1",
-        projected_messages=[{"role": "assistant", "content": "CODEX_ASSISTANT"}],
+        projected_messages=projected_messages,
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
         should_retire=False,
@@ -105,12 +115,41 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert agent._interrupt_requested is False
 
 
+def test_codex_drops_only_the_leading_matching_user_echo():
+    """A later distinct user projection must survive the input-echo filter."""
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.projected_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "INTERIM"},
+        {"role": "user", "content": "STEER"},
+        {"role": "assistant", "content": "CODEX_ASSISTANT"},
+    ]
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", "hello"),
+        ("assistant", "INTERIM"),
+        ("user", "STEER"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+
+
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the
     real AIAgent._flush_messages_to_session_db to prove no #860/#42039
     duplicate-write regression on the codex path."""
     tmp = tempfile.mkdtemp(prefix="codex_persist_")
+    db = None
     try:
         db = SessionDB(Path(tmp) / "state.db")
         sid = "sess-codex-once"
@@ -128,7 +167,11 @@ def test_codex_turn_persists_each_message_exactly_once():
         )
         agent._session_db_created = True
         agent._codex_session = MagicMock()
-        agent._codex_session.run_turn.return_value = _make_turn()
+        # A real app-server turn projects the submitted input back as a
+        # leading userMessage before the assistant response.  Hermes already
+        # owns and flushed that input at turn start, so the transport echo
+        # must not become a second durable user row.
+        agent._codex_session.run_turn.return_value = _make_turn(user_echo="USER_TURN")
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start
@@ -163,6 +206,8 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
+        if db is not None:
+            db.close()
         shutil.rmtree(tmp)
 
 
