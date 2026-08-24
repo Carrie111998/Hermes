@@ -161,6 +161,43 @@ def test_pet_fragments_render_kitty_placeholders(boba_like):
     assert cli_obj._pet_kitty_pending == ""
 
 
+def test_pet_off_clears_pending_kitty_frame(boba_like):
+    from hermes_cli.config import load_config, save_config
+
+    cli_obj = _make_cli()
+    cli_obj._pet_kitty_pending = "stale-apc"
+    cfg = load_config()
+    cfg.setdefault("display", {}).setdefault("pet", {}).update(
+        {"enabled": True, "slug": "boba", "render_mode": "off"}
+    )
+    save_config(cfg)
+
+    cli_obj._pet_resolve_config()
+
+    assert cli_obj._pet_enabled is False
+    assert cli_obj._pet_renderer is None
+    assert cli_obj._pet_kitty_pending == ""
+
+
+def test_pet_resolve_config_detects_wezterm_kitty(boba_like, monkeypatch):
+    from hermes_cli.config import load_config, save_config
+
+    monkeypatch.delenv("KITTY_WINDOW_ID", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("TERM_PROGRAM", "WezTerm")
+    cli_obj = _make_cli()
+    cfg = load_config()
+    cfg.setdefault("display", {}).setdefault("pet", {}).update(
+        {"enabled": True, "slug": "boba", "render_mode": "auto"}
+    )
+    save_config(cfg)
+
+    cli_obj._pet_resolve_config()
+
+    assert cli_obj._pet_renderer is not None
+    assert cli_obj._pet_renderer.mode == "kitty"
+
+
 def test_pet_resolve_config_enables_and_disables(boba_like, monkeypatch):
     from hermes_cli.config import load_config, save_config
 

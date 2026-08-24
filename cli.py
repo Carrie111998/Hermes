@@ -6774,12 +6774,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # prompt_toolkit. iTerm and sixel stay on the Unicode fallback.
             renderer_mode = "kitty" if detected_mode == "kitty" else "unicode"
 
-            if not enabled:
+            if not enabled or detected_mode == "off":
                 with self._pet_lock:
                     self._pet_enabled = False
                     self._pet_renderer = None
                     self._pet_frames_cache.clear()
                     self._pet_kitty_cache.clear()
+                    self._pet_kitty_pending = ""
                 return
 
             pet = store.resolve_active_pet(slug)
@@ -6789,6 +6790,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_renderer = None
                     self._pet_frames_cache.clear()
                     self._pet_kitty_cache.clear()
+                    self._pet_kitty_pending = ""
                 return
 
             with self._pet_lock:
@@ -6808,6 +6810,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_scale = scale
                     self._pet_frames_cache.clear()
                     self._pet_kitty_cache.clear()
+                    self._pet_kitty_pending = ""
                     self._pet_kitty_image_id = render.kitty_image_id(pet.slug)
                     self._pet_frame_idx = 0
                 self._pet_enabled = True
@@ -6891,18 +6894,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _pet_kitty_payload_for(self, state: str) -> dict | None:
         """Return and cache a Kitty virtual-placeholder payload for *state*."""
-        cached = self._pet_kitty_cache.get(state)
-        if cached is not None:
-            return cached
-        renderer = self._pet_renderer
-        if renderer is None or renderer.mode != "kitty":
-            return None
+        with self._pet_lock:
+            cached = self._pet_kitty_cache.get(state)
+            if cached is not None:
+                return cached
+            renderer = self._pet_renderer
+            image_id = self._pet_kitty_image_id
+            if renderer is None or renderer.mode != "kitty":
+                return None
         try:
-            payload = renderer.kitty_payload(state, image_id=self._pet_kitty_image_id)
+            # PNG encoding is deliberately outside _pet_lock: this may run the
+            # first time a state appears and must not stall prompt rendering.
+            payload = renderer.kitty_payload(state, image_id=image_id)
         except Exception:
             payload = None
         if payload is not None:
-            self._pet_kitty_cache[state] = payload
+            with self._pet_lock:
+                if self._pet_renderer is renderer and self._pet_kitty_image_id == image_id:
+                    self._pet_kitty_cache[state] = payload
         return payload
 
     def _pet_queue_kitty_frame(self, state: str) -> None:
@@ -6910,7 +6919,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         payload = self._pet_kitty_payload_for(state)
         if not payload or not payload.get("frames"):
             return
-        self._pet_kitty_pending = payload["frames"][self._pet_frame_idx % len(payload["frames"])]
+        with self._pet_lock:
+            if self._pet_renderer is not None and self._pet_renderer.mode == "kitty":
+                self._pet_kitty_pending = payload["frames"][self._pet_frame_idx % len(payload["frames"])]
 
     def _pet_flush_kitty_frame(self, app) -> None:
         """Write a queued APC after prompt_toolkit has finished its screen diff."""
@@ -6933,19 +6944,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not self._pet_enabled or self._pet_renderer is None:
                 return []
             state = self._derive_pet_state()
-            if self._pet_renderer.mode == "kitty":
-                from agent.pet import render
+            kitty = self._pet_renderer.mode == "kitty"
+            image_id = self._pet_kitty_image_id
+        if kitty:
+            from agent.pet import render
 
-                payload = self._pet_kitty_payload_for(state)
-                if not payload:
-                    return []
-                color = render.kitty_color_hex(self._pet_kitty_image_id)
-                frags = []
-                for y, row in enumerate(payload["placeholder"]):
-                    if y:
-                        frags.append(("", "\n"))
-                    frags.append((f"fg:{color}", row))
-                return frags
+            payload = self._pet_kitty_payload_for(state)
+            if not payload:
+                return []
+            color = render.kitty_color_hex(image_id)
+            frags = []
+            for y, row in enumerate(payload["placeholder"]):
+                if y:
+                    frags.append(("", "\n"))
+                frags.append((f"fg:{color}", row))
+            return frags
+        with self._pet_lock:
             grids = self._pet_frames_for(state)
             if not grids:
                 return []
@@ -6977,10 +6991,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         with self._pet_lock:
             if not self._pet_enabled or self._pet_renderer is None:
                 return 0
-            if self._pet_renderer.mode == "kitty":
-                payload = self._pet_kitty_payload_for(self._derive_pet_state())
-                return int(payload.get("rows", 0)) if payload else 0
-            grids = self._pet_frames_for(self._derive_pet_state())
+            state = self._derive_pet_state()
+            kitty = self._pet_renderer.mode == "kitty"
+        if kitty:
+            payload = self._pet_kitty_payload_for(state)
+            return int(payload.get("rows", 0)) if payload else 0
+        with self._pet_lock:
+            grids = self._pet_frames_for(state)
             if not grids or not grids[0]:
                 return 0
             return len(grids[0])
@@ -7001,8 +7018,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             with self._pet_lock:
                 self._pet_frame_idx += 1
                 state = self._derive_pet_state()
-                if self._pet_renderer is not None and self._pet_renderer.mode == "kitty":
-                    self._pet_queue_kitty_frame(state)
+                kitty = self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
+            if kitty:
+                self._pet_queue_kitty_frame(state)
             app = getattr(self, "_app", None)
             if app is not None:
                 try:
@@ -7019,8 +7037,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         self._pet_resolve_config()
         with self._pet_lock:
-            if self._pet_enabled and self._pet_renderer is not None and self._pet_renderer.mode == "kitty":
-                self._pet_queue_kitty_frame(self._derive_pet_state())
+            kitty = self._pet_enabled and self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
+            state = self._derive_pet_state()
+        if kitty:
+            self._pet_queue_kitty_frame(state)
         self._pet_anim_running = True
         self._pet_anim_thread = threading.Thread(target=self._pet_anim_loop, daemon=True)
         self._pet_anim_thread.start()
@@ -20127,6 +20147,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # in _strip_leaked_terminal_responses still guards residual leaks.
         _cpr_disabled_output = _select_classic_cli_pt_output(sys.stdout)
 
+        from agent.pet.render import detect_terminal_graphics
+
         # Create the application
         app = Application(
             layout=layout,
@@ -20137,9 +20159,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             **({"output": _cpr_disabled_output} if _cpr_disabled_output is not None else {}),
             color_depth=(
                 ColorDepth.DEPTH_24_BIT
-                if os.environ.get("KITTY_WINDOW_ID")
-                or "kitty" in os.environ.get("TERM", "").lower()
-                or "ghostty" in os.environ.get("TERM", "").lower()
+                if detect_terminal_graphics() == "kitty"
                 else None
             ),
             # Read from display.cli_refresh_interval (default 0 = disabled).
