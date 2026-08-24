@@ -2802,7 +2802,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
+        if not callback_chat_id or (expected_chat_id and callback_chat_id != expected_chat_id):
             logger.warning(
                 "[Feishu] Approval callback chat mismatch for %s (expected=%s, got=%s)",
                 approval_id,
@@ -2862,7 +2862,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
+        if not callback_chat_id or (expected_chat_id and callback_chat_id != expected_chat_id):
             logger.warning(
                 "[Feishu] Update prompt callback chat mismatch for %s (expected=%s, got=%s)",
                 prompt_id,
@@ -2912,7 +2912,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        if not chat_id or (expected_chat_id and expected_chat_id != chat_id):
             logger.warning(
                 "[Feishu] Approval %s chat mismatch (expected=%s, got=%s)",
                 approval_id, expected_chat_id, chat_id,
@@ -2963,7 +2963,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        if not chat_id or (expected_chat_id and expected_chat_id != chat_id):
             logger.warning(
                 "[Feishu] Update prompt %s chat mismatch (expected=%s, got=%s)",
                 prompt_id,
