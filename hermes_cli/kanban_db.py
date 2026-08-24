@@ -4933,18 +4933,40 @@ def claim_review_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         routing = conn.execute(
-            "SELECT assignee, review_assignee FROM tasks "
+            "SELECT assignee, review_assignee, review_protocol, review_artifacts "
+            "FROM tasks "
             "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
             (task_id,),
         ).fetchone()
         if routing is None:
             return None
-        effective_reviewer = _canonical_assignee(
-            routing["review_assignee"] or routing["assignee"]
-        )
-        if actor_profile is not None and (
-            _canonical_assignee(actor_profile) != effective_reviewer
-        ):
+        native_v2 = routing["review_protocol"] != "legacy"
+        try:
+            effective_reviewer = _canonical_assignee(
+                routing["review_assignee"] if native_v2
+                else (routing["review_assignee"] or routing["assignee"])
+            )
+            writer = _canonical_assignee(routing["assignee"])
+            actor = (
+                _canonical_assignee(actor_profile)
+                if isinstance(actor_profile, str) and actor_profile.strip()
+                else None
+            )
+        except (TypeError, ValueError):
+            return None
+        if native_v2:
+            # Native reviewer authority is never inferred from an omitted
+            # argument, the writer identity, or legacy assignee routing.
+            if actor is None or actor != effective_reviewer or actor == writer:
+                return None
+            try:
+                frozen = json.loads(routing["review_artifacts"])
+            except (json.JSONDecodeError, TypeError):
+                return None
+            canonical_frozen, artifact_error = _validate_frozen_review_artifacts(frozen)
+            if artifact_error or canonical_frozen != frozen:
+                return None
+        elif actor is not None and actor != effective_reviewer:
             return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -9994,19 +10016,19 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 
 
 def review_dispatch_enabled() -> bool:
-    """Return whether first-class review tasks should dispatch automatically.
-
-    The default is true because Hermes ships the ``sdlc-review`` skill and the
-    review lifecycle includes a supported reviewer-owned changes-requested
-    transition. Operators can disable it for human-only review boards.
-    """
+    """Return True only for an explicit, exact managed Boolean activation."""
     try:
         from hermes_cli.config import load_config
-        return bool(
-            (load_config() or {}).get("kanban", {}).get("review_dispatch", True)
-        )
+
+        config = load_config()
+        if not isinstance(config, dict):
+            return False
+        kanban_config = config.get("kanban")
+        if not isinstance(kanban_config, dict):
+            return False
+        return kanban_config.get("review_dispatch") is True
     except Exception:
-        return True
+        return False
 
 
 def native_scheduling_enabled() -> bool:
@@ -10721,10 +10743,9 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    # Auto-dispatch is enabled by default because Hermes bundles the
-    # ``sdlc-review`` skill and reviewer workers can now approve, request
-    # changes without block-loop accounting, or escalate a genuine blocker.
-    # Human-only boards can disable it with ``kanban.review_dispatch``.
+    # Auto-dispatch is fail closed. It activates only when the managed
+    # ``kanban.review_dispatch`` value is the exact Boolean true; missing,
+    # malformed, or unreadable configuration leaves Review parked.
     #
     # ``review_rows`` was enumerated before the ready loop; when it is
     # non-empty the ready loop ran against ``ready_budget`` (one slot held

@@ -9,6 +9,8 @@ The same card retains `assignee` as the implementation owner. Native review rout
 
 A reviewer claim creates a separately attributable run whose `profile` is the effective reviewer and whose claim event records `source_status=review`. PASS and REQUEST_CHANGES require the bound reviewer profile and active run id. PASS emits `review_passed` and moves to Done. REQUEST_CHANGES emits `changes_requested`, clears the current frozen artifact set, and returns to Ready/Todo for the preserved writer. Generic completion cannot approve a native review run.
 
+Native reviewer claims require a nonempty authenticated actor exactly matching `review_assignee`; argument omission is not authority. Autonomous review dispatch is fail closed: the default is false and only the exact managed Boolean `kanban.review_dispatch=true` activates it. Missing keys, nulls, integers, strings, malformed containers, and configuration-loader failures all leave Review parked. Gateway stuck detection calls the same gate as the dispatcher.
+
 Review and writer lanes share the existing global and per-profile concurrency accounting. Queue order remains priority descending, then creation time ascending. Existing crash, timeout, stale-claim, restart, spawn-failure, and orphan reconciliation use claim provenance to restore interrupted reviewer runs to Review rather than Ready.
 
 The existing `kanban_notify_subs` cursor protocol remains the single notification mechanism. It already provides ordered event ids, transactional cursor claim, CAS rewind, deduplication, per-subscription failure isolation, retry, and dead-route removal. Native review verdict and scheduling event kinds are added to the notifier allowlist; no second outbox or dispatcher is introduced.

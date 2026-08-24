@@ -211,8 +211,16 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
+    """Create an explicit pre-native fixture for queue-budget tests.
+
+    These tests exercise dispatcher fairness rather than native claim authority;
+    native rows must enter Review through request_review with frozen artifacts.
+    """
     tid = kb.create_task(conn, title=title, assignee=assignee)
-    _set_task_status(conn, tid, "review")
+    conn.execute(
+        "UPDATE tasks SET status = 'review', review_protocol = 'legacy' WHERE id = ?",
+        (tid,),
+    )
     return tid
 
 

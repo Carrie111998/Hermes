@@ -294,6 +294,198 @@ def test_native_request_changes_argument_omission_fails_closed(conn) -> None:
     assert _event_count(conn, task_id) == before
 
 
+@pytest.mark.parametrize("actor", [None, "", "intruder", "writer"])
+def test_native_review_claim_requires_bound_independent_actor(conn, actor) -> None:
+    task_id = kb.create_task(conn, title="claim authority", assignee="writer")
+    writer_run = kb.claim_task(conn, task_id)
+    assert writer_run is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        artifacts=_frozen(),
+        actor_profile="writer",
+        expected_run_id=writer_run.current_run_id,
+    )
+    before = _event_count(conn, task_id)
+
+    assert kb.claim_review_task(conn, task_id, actor_profile=actor) is None
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "review"
+    assert unchanged.current_run_id is None
+    assert _event_count(conn, task_id) == before
+
+
+def test_native_review_claim_accepts_exact_actor_and_legacy_is_explicit(conn) -> None:
+    native_id = kb.create_task(conn, title="native claim", assignee="writer")
+    writer_run = kb.claim_task(conn, native_id)
+    assert writer_run is not None
+    assert kb.request_review(
+        conn,
+        native_id,
+        reviewer="reviewer",
+        artifacts=_frozen(),
+        actor_profile="writer",
+        expected_run_id=writer_run.current_run_id,
+    )
+    claimed = kb.claim_review_task(conn, native_id, actor_profile=" reviewer ")
+    assert claimed is not None
+    assert kb.latest_run(conn, native_id).profile == "reviewer"
+
+    legacy_id = kb.create_task(conn, title="pre-migration review", assignee="writer")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = 'reviewer', "
+            "review_protocol = 'legacy' WHERE id = ?",
+            (legacy_id,),
+        )
+    legacy_claim = kb.claim_review_task(conn, legacy_id)
+    assert legacy_claim is not None
+    assert kb.latest_run(conn, legacy_id).profile == "reviewer"
+
+
+def test_native_review_claim_rejects_stale_or_malformed_routing(conn) -> None:
+    for mutation in (
+        "review_assignee = NULL",
+        "review_assignee = 'writer'",
+        "review_artifacts = NULL",
+        "review_artifacts = '{\"commit\":\"bad\"}'",
+    ):
+        task_id = kb.create_task(conn, title="stale routing", assignee="writer")
+        writer_run = kb.claim_task(conn, task_id)
+        assert writer_run is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            artifacts=_frozen(),
+            actor_profile="writer",
+            expected_run_id=writer_run.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute(f"UPDATE tasks SET {mutation} WHERE id = ?", (task_id,))
+        before = _event_count(conn, task_id)
+
+        assert kb.claim_review_task(
+            conn, task_id, actor_profile="reviewer"
+        ) is None
+        assert kb.get_task(conn, task_id).status == "review"
+        assert _event_count(conn, task_id) == before
+
+
+def test_gateway_stuck_probe_uses_dispatchers_exact_review_gate() -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "gateway" / "kanban_watchers.py"
+    ).read_text(encoding="utf-8")
+    assert "_review_probe = _kb.review_dispatch_enabled()" in source
+    assert "if _review_probe and _kb.has_spawnable_review(conn):" in source
+
+
+@pytest.mark.parametrize(
+    ("config_value", "expected"),
+    [
+        ({}, False),
+        ({"kanban": {}}, False),
+        ({"kanban": {"review_dispatch": False}}, False),
+        ({"kanban": {"review_dispatch": True}}, True),
+        ({"kanban": {"review_dispatch": None}}, False),
+        ({"kanban": {"review_dispatch": 0}}, False),
+        ({"kanban": {"review_dispatch": 1}}, False),
+        ({"kanban": {"review_dispatch": "true"}}, False),
+        ({"kanban": []}, False),
+        ([], False),
+    ],
+)
+def test_review_dispatch_gate_requires_explicit_boolean_true(
+    monkeypatch: pytest.MonkeyPatch,
+    config_value,
+    expected: bool,
+) -> None:
+    from hermes_cli import config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda: config_value)
+    assert kb.review_dispatch_enabled() is expected
+
+
+def test_review_dispatch_gate_fails_closed_on_loader_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import config as cfgmod
+
+    def broken_loader():
+        raise RuntimeError("unreadable managed config")
+
+    monkeypatch.setattr(cfgmod, "load_config", broken_loader)
+    assert kb.review_dispatch_enabled() is False
+
+
+def test_dispatcher_does_not_claim_review_until_explicitly_enabled(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import config as cfgmod
+    from hermes_cli import profiles
+
+    task_id = kb.create_task(conn, title="staged dispatch", assignee="writer")
+    writer_run = kb.claim_task(conn, task_id)
+    assert writer_run is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        artifacts=_frozen(),
+        actor_profile="writer",
+        expected_run_id=writer_run.current_run_id,
+    )
+    claimed_before = len([
+        event for event in kb.list_events(conn, task_id) if event.kind == "claimed"
+    ])
+    spawned = []
+    monkeypatch.setattr(profiles, "profile_exists", lambda profile: profile == "reviewer")
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {})
+    disabled = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace: spawned.append(task.assignee) or 123,
+    )
+    assert disabled.spawned == []
+    assert spawned == []
+    assert kb.get_task(conn, task_id).status == "review"
+    assert len([
+        event for event in kb.list_events(conn, task_id) if event.kind == "claimed"
+    ]) == claimed_before
+
+    def broken_loader():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(cfgmod, "load_config", broken_loader)
+    failed_closed = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace: spawned.append(task.assignee) or 124,
+    )
+    assert failed_closed.spawned == []
+    assert spawned == []
+    assert kb.get_task(conn, task_id).status == "review"
+
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda: {"kanban": {"review_dispatch": True}},
+    )
+    enabled = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace: spawned.append(task.assignee) or 125,
+    )
+    assert [item[0] for item in enabled.spawned] == [task_id]
+    assert spawned == ["reviewer"]
+    running = kb.get_task(conn, task_id)
+    assert running is not None
+    assert running.status == "running"
+    assert running.assignee == "writer"
+    assert kb.latest_run(conn, task_id).profile == "reviewer"
+
+
 def test_generic_complete_cannot_approve_malformed_native_review(conn) -> None:
     """The generic-complete gate keys off protocol, not nullable artifacts."""
     task_id = kb.create_task(conn, title="malformed native review", assignee="writer")

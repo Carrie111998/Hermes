@@ -292,7 +292,7 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "metadata=..." in KANBAN_GUIDANCE
     kanban_defaults = DEFAULT_CONFIG["kanban"]
     assert isinstance(kanban_defaults, dict)
-    assert kanban_defaults["review_dispatch"] is True
+    assert kanban_defaults["review_dispatch"] is False
 
     repo_root = Path(__file__).resolve().parents[2]
     review_skill = repo_root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
