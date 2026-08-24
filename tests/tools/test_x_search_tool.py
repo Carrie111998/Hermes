@@ -101,6 +101,29 @@ def test_x_search_explicit_model_override_reaches_request(monkeypatch):
     assert captured["json"]["model"] == "grok-4.6"
 
 
+def test_x_search_handler_forwards_model_override(monkeypatch):
+    from tools import x_search_tool as tool_module
+
+    captured = {}
+    monkeypatch.setattr(
+        tool_module,
+        "x_search_tool",
+        lambda **kwargs: captured.update(kwargs) or "ok",
+    )
+
+    assert tool_module._handle_x_search(
+        {"query": "latest xAI news", "model": "grok-4.6"}
+    ) == "ok"
+    assert captured["model"] == "grok-4.6"
+    assert tool_module.X_SEARCH_SCHEMA["parameters"]["properties"]["model"] == {
+        "type": "string",
+        "description": (
+            "Optional Grok model ID for this search. Defaults to "
+            "x_search.model from config."
+        ),
+    }
+
+
 def test_x_search_rejects_non_grok_model_override_before_request(monkeypatch):
     from tools.x_search_tool import x_search_tool
 

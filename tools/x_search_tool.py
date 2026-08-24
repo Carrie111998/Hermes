@@ -519,6 +519,13 @@ X_SEARCH_SCHEMA = {
                 "type": "string",
                 "description": "What to look up on X.",
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional Grok model ID for this search. Defaults to "
+                    "x_search.model from config."
+                ),
+            },
             "allowed_x_handles": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -556,6 +563,7 @@ X_SEARCH_SCHEMA = {
 def _handle_x_search(args, **kw):
     return x_search_tool(
         query=args.get("query", ""),
+        model=args.get("model", ""),
         allowed_x_handles=args.get("allowed_x_handles"),
         excluded_x_handles=args.get("excluded_x_handles"),
         from_date=args.get("from_date", ""),
