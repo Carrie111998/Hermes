@@ -2310,7 +2310,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
             if resp.status_code == 200:
                 data = resp.json()
                 # vLLM returns max_model_len
-                ctx = data.get("max_model_len") or data.get("context_length") or data.get("max_tokens")
+                ctx = data.get("max_model_len") or data.get("context_length")
                 if ctx and isinstance(ctx, (int, float)):
                     return int(ctx)
 
@@ -2344,7 +2344,6 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                             "context_window",
                             "max_model_len",
                             "max_context_length",
-                            "max_tokens",
                             "n_ctx_train",
                         ):
                             val = source.get(key)
