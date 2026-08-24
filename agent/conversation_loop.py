@@ -1053,10 +1053,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     }
     _runtime_policy = getattr(agent, "runtime_policy", None)
     if _runtime_policy:
-        from hermes_cli.plugins import activate_authoritative_session
+        from hermes_cli.plugins import activate_authoritative_run
 
-        _session_start_results = [activate_authoritative_session(
-            str(_runtime_policy), str(agent.session_id or ""), **_start_payload,
+        # Key the lease by the run's immutable fire identity, not by
+        # agent.session_id — compression rotates that id mid-run, and a lease
+        # keyed by it disappears at the rotation boundary.
+        _session_start_results = [activate_authoritative_run(
+            str(_runtime_policy),
+            str(getattr(agent, "runtime_task_id", "") or agent.session_id or ""),
+            str(agent.session_id or ""),
+            **_start_payload,
         )]
     else:
         try:

@@ -405,6 +405,22 @@ must register all four callbacks with
 Missing, raising, or malformed required callbacks fail closed. Jobs without
 `runtime_policy` retain the ordinary observer-hook behavior.
 
+Every required callback receives the run's identity: `run_id` (the run's
+immutable fire id), `session_id` (the transcript session the run is on right
+now), and `root_session_id` (the session it started on). The policy lease is
+keyed by `run_id`, so it survives the session rotation a context compression
+performs mid-run, and it outlives plugin unload — an unloaded policy makes
+in-flight authoritative calls fail closed instead of silently downgrading to
+the observer bus.
+
+A trusted stop is authoritative the moment its triggering result is persisted:
+no later call in the same assistant batch is dispatched, and MCP calls inside a
+policy-bound run are always ordered barriers rather than parallel siblings. The
+validated typed outcome is written to the cron execution ledger bound to both
+the fire and the session the run ended on — read it back with
+`cron.executions.get_settlement_for_session()`. A settlement failure fails the
+run, but never skips session teardown.
+
 ### Cache-safe system prompt sections
 
 Plugins that need durable, always-on guidance can register a bounded system

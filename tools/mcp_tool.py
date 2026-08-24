@@ -5858,28 +5858,33 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         request_meta: Dict[str, Any] = {}
         try:
             from hermes_cli.plugins import (
-                authoritative_session_policy,
-                invoke_authoritative_session_hook,
+                invoke_authoritative_run_hook,
                 invoke_hook,
+                resolve_authoritative_run,
             )
             _session_id = str(kwargs.get("session_id") or "")
-            _policy_id = authoritative_session_policy(_session_id)
-            if _policy_id:
-                values = [invoke_authoritative_session_hook(
-                    _session_id, "mcp_request_metadata",
+            _task_id = str(kwargs.get("task_id") or "")
+            # Resolve by the immutable run identity first; the session id is
+            # only the fallback, because compression rotates it mid-run.
+            _run_id = resolve_authoritative_run(
+                run_id=_task_id, session_id=_session_id,
+            )
+            if _run_id:
+                values = [invoke_authoritative_run_hook(
+                    _run_id, "mcp_request_metadata", session_id=_session_id,
                     server_name=server_name, tool_name=tool_name,
-                    task_id=str(kwargs.get("task_id") or ""),
+                    task_id=_task_id,
                 )]
             else:
                 values = invoke_hook(
                     "mcp_request_metadata", server_name=server_name,
                     tool_name=tool_name, session_id=_session_id,
-                    task_id=str(kwargs.get("task_id") or ""),
+                    task_id=_task_id,
                 )
             for value in values:
                 supplied = value.get("meta") if isinstance(value, dict) else None
                 if not isinstance(supplied, dict):
-                    if _policy_id:
+                    if _run_id:
                         raise RuntimeError("authoritative metadata callback returned no meta")
                     continue
                 overlap = request_meta.keys() & supplied.keys()
@@ -6046,48 +6051,58 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         def _record_runtime_stop(result: str) -> str:
             _session_id = str(kwargs.get("session_id") or "")
+            _task_id = str(kwargs.get("task_id") or "")
+            _run_id = None
             _policy_id = None
             try:
                 from hermes_cli.plugins import (
-                    authoritative_session_policy,
-                    invoke_authoritative_session_hook,
+                    authoritative_run_policy,
+                    invoke_authoritative_run_hook,
                     invoke_hook,
+                    resolve_authoritative_run,
                 )
-                _policy_id = authoritative_session_policy(_session_id)
-                if _policy_id:
-                    decisions = [invoke_authoritative_session_hook(
-                        _session_id, "mcp_tool_result",
+                _run_id = resolve_authoritative_run(
+                    run_id=_task_id, session_id=_session_id,
+                )
+                _policy_id = authoritative_run_policy(_run_id) if _run_id else None
+                if _run_id:
+                    decisions = [invoke_authoritative_run_hook(
+                        _run_id, "mcp_tool_result", session_id=_session_id,
                         server_name=server_name, tool_name=tool_name,
-                        task_id=str(kwargs.get("task_id") or ""), meta=response_meta,
+                        task_id=_task_id, meta=response_meta,
                     )]
                 else:
                     decisions = invoke_hook(
                         "mcp_tool_result", server_name=server_name,
                         tool_name=tool_name, session_id=_session_id,
-                        task_id=str(kwargs.get("task_id") or ""), meta=response_meta,
+                        task_id=_task_id, meta=response_meta,
                     )
                 for decision in decisions:
                     if not isinstance(decision, dict):
-                        if _policy_id:
+                        if _run_id:
                             raise RuntimeError("authoritative result callback returned no decision")
                         continue
                     if decision.get("action") == "stop":
                         reason = str(decision.get("reason") or "mcp_result")
                         status = str(decision.get("status") or "success")
-                        if _policy_id and status not in {"success", "failure"}:
+                        if _run_id and status not in {"success", "failure"}:
                             raise RuntimeError("authoritative stop status is invalid")
                         directive = {"reason": reason}
-                        if _policy_id:
-                            directive.update(status=status, policy=str(_policy_id))
+                        if _run_id:
+                            directive.update(
+                                status=status,
+                                policy=str(_policy_id or _run_id),
+                                run_id=str(_run_id),
+                            )
                         _mcp_runtime_stop.set(directive)
                         break
-                    if _policy_id and decision.get("action") != "continue":
+                    if _run_id and decision.get("action") != "continue":
                         raise RuntimeError("authoritative result action is invalid")
             except Exception as exc:
-                if _policy_id:
+                if _run_id:
                     _mcp_runtime_stop.set({
                         "reason": "policy_error", "status": "failure",
-                        "policy": str(_policy_id),
+                        "policy": str(_policy_id or _run_id), "run_id": str(_run_id),
                     })
                     return tool_error(
                         f"Trusted MCP result policy failed: {type(exc).__name__}"
