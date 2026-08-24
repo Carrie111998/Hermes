@@ -27,8 +27,28 @@ const LOCAL_HOST_RE = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?$/
 const ERROR_TITLE_RE =
   /\b(?:access denied|attention required|captcha|error|forbidden|just a moment|not found|request blocked|too many requests)\b/i
 
+// Wire-format directive wrapper, e.g. `@url:`https://x`` — the chip markup can
+// reach this module verbatim from transcript text that was never parsed into
+// chips (artifacts scan raw message text; third-party callers pass stored
+// strings). Handing the wrapper to `new URL()` yields a bogus host
+// (`@url`), which is how ERR_NAME_NOT_RESOLVED noise leaked into the main
+// process (#93893).
+const DIRECTIVE_WRAPPER_RE = /^@(?:url|image|file|folder):(`[^`\n]*`|"[^"\n]*"|'[^'\n]*'|(\S+))/
+
 export function normalizeExternalUrl(value: string): string {
-  const trimmed = value.trim()
+  let trimmed = value.trim()
+
+  const wrapped = DIRECTIVE_WRAPPER_RE.exec(trimmed)
+
+  if (wrapped) {
+    const inner = wrapped[1]
+
+    trimmed = (
+      inner.length >= 2 && (inner[0] === '`' || inner[0] === '"' || inner[0] === "'") && inner.at(-1) === inner[0]
+        ? inner.slice(1, -1)
+        : inner
+    ).trim()
+  }
 
   if (!trimmed || /^https?:\/\//i.test(trimmed)) {
     return trimmed

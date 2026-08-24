@@ -5254,6 +5254,26 @@ function canonicalTitleCacheKey(rawUrl) {
   }
 }
 
+// The ONLY shape allowed anywhere near curl or a hidden-window loadURL: an
+// absolute http(s) URL that parses. Renderer callers normally pre-validate,
+// but this module is the trust boundary — a wire-format directive token
+// (`@url:`https://…``) or any other junk reaching the IPC handler must die
+// here instead of spamming ERR_NAME_NOT_RESOLVED from a hidden BrowserWindow
+// (and leaking whatever the placeholder expands to into DNS lookups, #93893).
+function sanitizableTitleUrl(rawUrl: string) {
+  const value = String(rawUrl || '').trim()
+
+  if (!/^https?:\/\//i.test(value)) {
+    return null
+  }
+
+  try {
+    return new URL(value)
+  } catch {
+    return null
+  }
+}
+
 function cacheTitle(key, title) {
   if (titleCache.size >= TITLE_CACHE_LIMIT) {
     titleCache.delete(titleCache.keys().next().value)
@@ -5360,7 +5380,9 @@ function dequeueRenderTitle() {
 
 function runRenderTitleJob(rawUrl) {
   return new Promise(resolve => {
-    if (!app.isReady()) {
+    const parsed = sanitizableTitleUrl(rawUrl)
+
+    if (!app.isReady() || !parsed) {
       return resolve('')
     }
 
@@ -5431,7 +5453,7 @@ function runRenderTitleJob(rawUrl) {
     })
 
     window
-      .loadURL(rawUrl, {
+      .loadURL(parsed.href, {
         httpReferrer: 'https://www.google.com/',
         userAgent: TITLE_USER_AGENT
       })
@@ -5453,7 +5475,15 @@ function usableTitle(value: string): string {
 }
 
 function fetchLinkTitle(rawUrl) {
-  const url = String(rawUrl || '').trim()
+  const parsed = sanitizableTitleUrl(rawUrl)
+
+  // Unparseable / non-http(s) input (directive wrappers, template URLs with
+  // unexpanded `%s`, bare hostnames): no fetch, no cache entry, no noise.
+  if (!parsed || !/^https?:$/.test(parsed.protocol)) {
+    return Promise.resolve('')
+  }
+
+  const url = String(rawUrl).trim()
   const key = canonicalTitleCacheKey(url)
 
   if (!key) {
