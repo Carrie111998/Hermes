@@ -36,20 +36,26 @@ export interface TerminalIpcApi {
 // containers have no /bin/zsh or /bin/bash), then the traditional absolute
 // locations, then PATH `sh`, then a bare `/bin/sh` so node-pty always gets
 // something spawnable.
-export function resolvePosixInteractiveShell(findOnPath: (name: string) => null | string): string {
-  const fromPath = ['zsh', 'bash'].map(name => findOnPath(name)).find(Boolean)
-
-  const absolute = ['/bin/zsh', '/bin/bash', '/bin/sh'].find(candidate => {
+export function resolvePosixInteractiveShell(
+  findOnPath: (name: string) => null | string,
+  isExecutable: (candidate: string) => boolean = candidate => {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
-
       return true
     } catch {
       return false
     }
-  })
+  }
+): string {
+  const fromPath = ['zsh', 'bash']
+    .map(name => findOnPath(name))
+    .find((candidate): candidate is string => Boolean(candidate) && isExecutable(candidate))
 
-  return fromPath || absolute || findOnPath('sh') || '/bin/sh'
+  const absolute = ['/bin/zsh', '/bin/bash', '/bin/sh'].find(isExecutable)
+  const pathSh = findOnPath('sh')
+  const executablePathSh = pathSh && isExecutable(pathSh) ? pathSh : null
+
+  return fromPath || absolute || executablePathSh || '/bin/sh'
 }
 
 export function registerTerminalIpc({
@@ -140,7 +146,7 @@ export function registerTerminalIpc({
       return windowsShellSpec()
     }
 
-    return posixShellSpec(resolvePosixInteractiveShell(findOnPath))
+    return posixShellSpec(resolvePosixInteractiveShell(findOnPath, isExecutableFile))
   }
 
   function safeTerminalCwd(cwd) {

@@ -1503,7 +1503,7 @@ def _run_cua_driver_installer(
     The scripts are idempotent: they always download the latest release, so
     re-running on an already-installed system performs an upgrade.
 
-    * macOS / Linux → ``curl -fsSL …/install.sh | /bin/bash``.
+    * macOS / Linux → ``curl -fsSL …/install.sh | bash``.
     * Windows       → ``powershell -NoProfile -ExecutionPolicy Bypass -Command
       "irm …/install.ps1 | iex"``.
 

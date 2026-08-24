@@ -23,7 +23,7 @@ describe('resolvePosixInteractiveShell', () => {
     })
 
     try {
-      expect(resolvePosixInteractiveShell(findOnPath)).toBe('/run/current-system/sw/bin/zsh')
+      expect(resolvePosixInteractiveShell(findOnPath, () => true)).toBe('/run/current-system/sw/bin/zsh')
     } finally {
       vi.restoreAllMocks()
     }
@@ -31,9 +31,19 @@ describe('resolvePosixInteractiveShell', () => {
 
   it('falls back to an absolute shell when PATH has neither zsh nor bash', () => {
     const findOnPath = vi.fn(() => null)
-    const result = resolvePosixInteractiveShell(findOnPath)
-    // Whatever exists on this host: /bin/zsh, /bin/bash, /bin/sh, or PATH sh.
-    expect(result).toBeTruthy()
+    const result = resolvePosixInteractiveShell(findOnPath, () => false)
+    expect(result).toBe('/bin/sh')
+  })
+
+  it('skips a non-executable PATH shell and uses an executable candidate', () => {
+    const findOnPath = vi.fn((name: string) => {
+      if (name === 'zsh') return '/tmp/noexec/zsh'
+      if (name === 'bash') return '/usr/bin/bash'
+      return null
+    })
+    const isExecutable = (candidate: string) => candidate === '/usr/bin/bash'
+
+    expect(resolvePosixInteractiveShell(findOnPath, isExecutable)).toBe('/usr/bin/bash')
   })
 
   it('returns bare /bin/sh as last resort when no candidate exists anywhere', () => {
