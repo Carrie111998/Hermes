@@ -8106,6 +8106,8 @@ def cmd_gui(args: argparse.Namespace):
         sys.exit(1)
 
     launch_command = [str(packaged_executable)]
+    if getattr(args, "quick_entry", False):
+        launch_command.append("--quick-entry")
     if not _desktop_linux_sandbox_fixup(packaged_executable):
         if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
             print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")

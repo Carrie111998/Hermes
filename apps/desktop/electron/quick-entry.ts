@@ -418,4 +418,15 @@ export function quickEntryWindowBounds(workArea?: { height: number; width: numbe
   return { height, width, x, y }
 }
 
+/**
+ * True when the given process argv requests the floating Quick Entry composer.
+ * Used by the compositor-keybind workaround for wlroots/Wayland, where the
+ * GlobalShortcuts portal is not implemented: the compositor spawns
+ * `hermes desktop --quick-entry`, the second instance exits through the
+ * single-instance lock, and the live instance routes here via argv.
+ */
+export function hasQuickEntryFlag(argv: readonly string[]): boolean {
+  return argv.includes('--quick-entry')
+}
+
 export { DEFAULT_QUICK_ENTRY_SHORTCUT, QUICK_ENTRY_TOP_FRACTION, QUICK_ENTRY_WINDOW_HEIGHT, QUICK_ENTRY_WINDOW_WIDTH }

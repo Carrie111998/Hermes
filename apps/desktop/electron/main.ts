@@ -271,7 +271,7 @@ import {
   type RegistrySessionSource,
   spliceRegistrySessionRows
 } from './profile-session-routing'
-import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { createQuickEntryShortcut, hasQuickEntryFlag, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
@@ -15400,6 +15400,15 @@ if (!isPrimaryInstance) {
   app.on('second-instance', (_event, argv) => {
     const url = _extractDeepLink(argv)
 
+    // niri/Wayland workaround: wlroots compositors do not implement the
+    // GlobalShortcuts portal, so the OS-level quick-entry shortcut never
+    // fires. Bind it in the compositor instead and route here:
+    // `hermes desktop --quick-entry`.
+    if (hasQuickEntryFlag(argv)) {
+      toggleQuickEntryWindow()
+      return
+    }
+
     if (url) {
       handleDeepLink(url)
     }
@@ -15473,6 +15482,12 @@ app.whenReady().then(() => {
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
   applyQuickEntrySettings(readQuickEntrySettings())
+
+  // niri/Wayland workaround (see 'second-instance' above): a cold start with
+  // the --quick-entry flag opens the floating composer immediately.
+  if (hasQuickEntryFlag(process.argv)) {
+    showQuickEntryWindow()
+  }
 
   if (IS_MAC) {
     const reposition = () => wakeIndicatorController.reposition()
