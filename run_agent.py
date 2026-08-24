@@ -2198,7 +2198,19 @@ class AIAgent:
         if getattr(self, "_persist_disabled", False):
             return None
         if not self._session_db:
-            return
+            return None
+        # Persist user-message override (#48677 chokepoint): historically this
+        # mutated the live `messages` list in place, which — on the early
+        # crash-resilience persist that runs BEFORE the API call is built —
+        # stripped observed group-chat context off the live user message and
+        # silently dropped it. Instead, resolve the override here and apply it
+        # ONLY to the value written to the DB (see the write loop below); the
+        # live dict is never mutated, so every caller (early persist, mid-loop
+        # flush, /resume, /branch) is protected uniformly. Timestamp override is
+        # metadata and is likewise applied only to the written row.
+        _ov_idx = getattr(self, "_persist_user_message_idx", None)
+        _ov_content = getattr(self, "_persist_user_message_override", None)
+        _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
@@ -2286,14 +2298,8 @@ class AIAgent:
                 if id(msg) in history_ids or id(msg) in seed_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
-                # Use the persistence-only override helper so the live message
-                # dict is never mutated by the flush (multimodal callers retain
-                # their media-bearing list). The helper applies the active turn's
-                # _persist_user_message_override/timestamp and returns a shallow
-                # copy — safe to read role/content/timestamp from.
-                persisted_msg = self._message_for_persistence(msg, _msg_idx)
-                role = persisted_msg.get("role", "unknown")
-                content = persisted_msg.get("content")
+                role = msg.get("role", "unknown")
+                content = msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
                 # they differ from the clean content (stamped by the turn
                 # prologue for prefetch/plugin injections). Written verbatim
@@ -2301,23 +2307,48 @@ class AIAgent:
                 _row_api_content = msg.get("api_content")
                 if not isinstance(_row_api_content, str):
                     _row_api_content = None
-                _row_timestamp = persisted_msg.get("timestamp")
-                # If the persistence override changed the content (text
-                # override applied to a multimodal live message, or a clean
-                # text substitution), keep the original sent bytes in the
-                # sidecar so replay matches the wire. Preflight compaction
-                # can re-anchor the override index at a message whose
-                # content was MERGED with the compaction summary; the merge
-                # is wire-consistent so never overwrite it.
-                _original_content = msg.get("content")
-                if (
-                    _row_api_content is None
-                    and isinstance(_original_content, str)
-                    and isinstance(content, str)
-                    and content != _original_content
-                    and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                ):
-                    _row_api_content = _original_content
+                _row_timestamp = msg.get("timestamp")
+                # Apply the persist override to THIS row's written values only
+                # (never to the live dict). A multimodal override is a complete
+                # clean replacement for an API-local noted payload. Preserve the
+                # historical text-only guard for a list payload, though: a plain
+                # text override must not erase its image/audio transcript summary.
+                # The close safety-net may flush a shortened snapshot while
+                # turn setup still owns its staged CLI dict. In that shape the
+                # normal turn index refers to the full history, not this list;
+                # preserve the API-local override by recognizing the same dict.
+                pending_cli_message = getattr(self, "_pending_cli_user_message", None)
+                is_current_turn_user = (
+                    _ov_idx == _msg_idx or msg is pending_cli_message
+                )
+                if is_current_turn_user and msg.get("role") == "user":
+                    # Preflight compaction can re-anchor the override index at
+                    # a message whose content was MERGED with the compaction
+                    # summary (merge-summary-into-tail). Overwriting that with
+                    # the clean gateway text would silently drop the summary
+                    # from the durable transcript. The wire is already
+                    # consistent — the merge popped the sidecar and the merged
+                    # content is what gets sent — so keep it.
+                    if (
+                        _ov_content is not None
+                        and (not isinstance(content, list) or isinstance(_ov_content, list))
+                        and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                    ):
+                        # The live content is what the API call sends; the
+                        # override is the cleaned transcript value. If they
+                        # differ and no injection already stamped the sidecar,
+                        # keep the sent bytes in api_content so replay matches
+                        # the wire (#48677 divergence, closed for the cache
+                        # prefix too).
+                        if (
+                            _row_api_content is None
+                            and isinstance(content, str)
+                            and content != _ov_content
+                        ):
+                            _row_api_content = content
+                        content = _ov_content
+                    if _ov_timestamp is not None:
+                        _row_timestamp = _ov_timestamp
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None
@@ -2377,9 +2408,7 @@ class AIAgent:
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
-                    "deferred_notification_ids": persisted_msg.get(
-                        "_deferred_notification_ids"
-                    ),
+                    "deferred_notification_ids": msg.get("_deferred_notification_ids"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
                     # Standalone reference handoffs are always hidden, even

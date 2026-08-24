@@ -13,19 +13,14 @@ import {
 } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
-import { $clarifyRequests } from '@/store/clarify'
-
 import { useMessageStream } from '@/app/session/hooks/use-message-stream'
 import { usePromptActions } from '@/app/session/hooks/use-prompt-actions'
 import type { ClientSessionState } from '@/app/types'
+import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { clearQueuedPrompts, getQueuedPrompts } from '@/store/composer-queue'
-import { setAwaitingResponse, setBusy } from '@/store/session'
-import type { RpcEvent } from '@/types/hermes'
-
-
+import { $clarifyRequests } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
+import { clearQueuedPrompts, getQueuedPrompts } from '@/store/composer-queue'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -34,11 +29,12 @@ import {
   setSecretRequest,
   setSudoRequest
 } from '@/store/prompts'
-
-import { type ComposerTarget, requestComposerSubmit } from '../focus'
-import { ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } from '../scope'
+import { setAwaitingResponse, setBusy } from '@/store/session'
+import type { RpcEvent } from '@/types/hermes'
 
 import type { QueueEditState } from '../composer-utils'
+import { type ComposerTarget, requestComposerSubmit } from '../focus'
+import { ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useComposerQueue } from './use-composer-queue'
 import { useComposerSubmit } from './use-composer-submit'
@@ -623,10 +619,10 @@ function NotificationPreemptionHarness({
   const [state, setState] = useState(initialStateRef.current)
   const activeSessionIdRef = useRef<string | null>(RUNTIME_SESSION_ID)
   const selectedStoredSessionIdRef = useRef<string | null>(STORED_SESSION_ID)
+  const runtimeIdByStoredSessionIdRef = useRef(new Map([[STORED_SESSION_ID, RUNTIME_SESSION_ID]]))
   const busyRef = useRef(true)
   const sessionStateByRuntimeIdRef = useRef(new Map([[RUNTIME_SESSION_ID, initialStateRef.current]]))
   const queryClientRef = useRef(new QueryClient())
-  const runtimeIdByStoredSessionIdRef = useRef(new Map([[STORED_SESSION_ID, RUNTIME_SESSION_ID]]))
   const draftRef: RefObject<string> = { current: 'Human question' }
   const editorRef = useRef<HTMLDivElement | null>(null)
   const queueEditRef = useRef<QueueEditState | null>(null)
