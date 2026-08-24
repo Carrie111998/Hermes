@@ -2408,6 +2408,8 @@ def _(rid, params: dict) -> dict:
       - ``install`` → git-clone into ``~/.hermes/plugins/`` (non-interactive).
                        Params: ``identifier`` or ``repo``, optional ``force``,
                        ``enable`` (default True). Returns dashboard install dict.
+      - ``reload_dashboard_routes`` → refresh enabled dashboard plugin API
+                       routers in the live backend. Requires ``confirm: true``.
 
     Accepts an optional ``profile`` param (same contract as mcp.servers.*):
     plugins live under each profile's HERMES_HOME, so a client can list or
@@ -2518,6 +2520,32 @@ def _(rid, params: dict) -> dict:
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "install failed")
             return _ok(rid, result)
+
+        if action == "reload_dashboard_routes":
+            if params.get("confirm") is not True:
+                return _err(
+                    rid,
+                    4019,
+                    "plugins.reload_dashboard_routes requires confirm=true",
+                )
+            protocol_version = params.get("protocol_version", 1)
+            if protocol_version != 1:
+                return _err(
+                    rid,
+                    4020,
+                    "unsupported dashboard route remount protocol version",
+                )
+            from hermes_cli import web_server
+
+            receipt = web_server.remount_dashboard_plugin_api_routes()
+            return _ok(
+                rid,
+                {
+                    **receipt,
+                    "protocol": web_server.DASHBOARD_ROUTE_REMOUNT_PROTOCOL,
+                    "protocol_version": web_server.DASHBOARD_ROUTE_REMOUNT_PROTOCOL_VERSION,
+                },
+            )
 
         return _err(rid, 4017, f"unknown plugins action: {action}")
     except Exception as e:

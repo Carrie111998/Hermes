@@ -18944,6 +18944,52 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+_dashboard_plugin_api_route_ids: set[int] = set()
+_dashboard_plugin_api_module_names: set[str] = set()
+_dashboard_plugin_api_mount_lock = threading.RLock()
+DASHBOARD_ROUTE_REMOUNT_PROTOCOL = "fleet-graph.dashboard-routes"
+DASHBOARD_ROUTE_REMOUNT_PROTOCOL_VERSION = 1
+
+
+def _remove_dashboard_plugin_api_routes() -> None:
+    """Remove only routes previously mounted from dashboard plugin APIs."""
+    if _dashboard_plugin_api_route_ids:
+        app.router.routes = [
+            route
+            for route in app.router.routes
+            if id(route) not in _dashboard_plugin_api_route_ids
+        ]
+        _dashboard_plugin_api_route_ids.clear()
+    for module_name in tuple(_dashboard_plugin_api_module_names):
+        sys.modules.pop(module_name, None)
+    _dashboard_plugin_api_module_names.clear()
+
+
+def remount_dashboard_plugin_api_routes() -> dict[str, Any]:
+    """Refresh enabled dashboard plugin API routes in the live server.
+
+    Hermes normally mounts plugin routers once during module import.  Plugin
+    enablement can change later through ``plugins.manage``; this helper makes
+    that state change effective without duplicating routes or restarting the
+    dashboard process.  Only routes and modules previously owned by this
+    loader are removed.
+    """
+    with _dashboard_plugin_api_mount_lock:
+        _remove_dashboard_plugin_api_routes()
+        global _dashboard_plugins_cache
+        _dashboard_plugins_cache = None
+        _invalidate_plugins_hub_cache()
+        _mount_plugin_api_routes()
+        mounted = sorted(
+            {
+                str(getattr(route, "_hermes_dashboard_plugin", ""))
+                for route in app.router.routes
+                if getattr(route, "_hermes_dashboard_plugin", "")
+            }
+        )
+        return {"ok": True, "mounted": mounted, "count": len(mounted)}
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
 
@@ -19043,16 +19089,23 @@ def _mount_plugin_api_routes():
             # "is not fully defined" because the module namespace isn't
             # reachable by name for string-annotation resolution.
             sys.modules[module_name] = mod
+            _dashboard_plugin_api_module_names.add(module_name)
             try:
                 spec.loader.exec_module(mod)
             except Exception:
                 sys.modules.pop(module_name, None)
+                _dashboard_plugin_api_module_names.discard(module_name)
                 raise
             router = getattr(mod, "router", None)
             if router is None:
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
                 continue
+            existing_route_ids = {id(route) for route in app.router.routes}
             app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
+            for route in app.router.routes:
+                if id(route) not in existing_route_ids:
+                    setattr(route, "_hermes_dashboard_plugin", plugin["name"])
+                    _dashboard_plugin_api_route_ids.add(id(route))
             _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
