@@ -17,9 +17,9 @@ import { describe, test } from 'vitest'
 
 import {
   probeGatewayRpc,
-  rpcProbeBootError,
   RPC_PROBE_FAILED_ERROR_CODE,
-  RPC_PROBE_UNAVAILABLE_ERROR_CODE
+  RPC_PROBE_UNAVAILABLE_ERROR_CODE,
+  rpcProbeBootError
 } from './gateway-rpc-probe'
 
 // Minimal WebSocket double: records listeners synchronously and exposes emit()

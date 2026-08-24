@@ -194,8 +194,8 @@ import {
   pumpStreamToFile,
   resolveGatewayFileBackend
 } from './gateway-file-download'
-import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { probeGatewayRpc, rpcProbeBootError } from './gateway-rpc-probe'
+import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
