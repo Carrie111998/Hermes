@@ -656,6 +656,47 @@ class TestCheckForSkillUpdates:
         assert results[0]["status"] == "update_available"
         assert lock.get_installed("demo-skill")["content_hash"] == corrupt_hash
 
+    def test_current_lock_hash_is_not_rewritten_during_update_check(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_guard import content_hash
+        import tools.skills_hub as hub
+
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "demo-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("installed content", encoding="utf-8")
+        canonical_hash = content_hash(skill_dir)
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="demo-skill",
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+            scan_verdict="pass",
+            skill_hash=canonical_hash,
+            install_path="demo-skill",
+            files=["SKILL.md"],
+        )
+        migrate = MagicMock(wraps=lock.migrate_content_hash)
+        monkeypatch.setattr(lock, "migrate_content_hash", migrate)
+        source = MagicMock()
+        source.source_id.return_value = "github"
+        source.fetch.return_value = SkillBundle(
+            name="demo-skill",
+            files={"SKILL.md": "new upstream content"},
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+        monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results[0]["status"] == "update_available"
+        migrate.assert_not_called()
+
+
 class TestCreateSourceRouter:
 
     def test_url_source_runs_before_github_source(self):

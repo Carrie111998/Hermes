@@ -4551,9 +4551,10 @@ def check_for_skill_updates(
             # The installed tree proves this was a real old-format lock hash.
             # Re-baseline to its canonical identity before do_update performs
             # its independent local-edit check.
-            lock.migrate_content_hash(
-                entry.get("name", ""), current_hash, resolved_tree_hash
-            )
+            if resolved_tree_hash != current_hash:
+                lock.migrate_content_hash(
+                    entry.get("name", ""), current_hash, resolved_tree_hash
+                )
             status = (
                 "up_to_date"
                 if resolved_tree_hash == latest_hash
