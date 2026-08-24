@@ -2267,6 +2267,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
                 )
+                # Re-arming a consumed finite one-shot via a schedule edit
+                # (#93524): "reschedule my report to tomorrow" means a fresh
+                # run. Without resetting the budget, the record re-enables
+                # with completed >= times and the due-scan's stale-entry
+                # guard silently deletes it at the new fire time instead of
+                # firing — and its last_run_at suppresses the wedged-oneshot
+                # diagnostic, so the run just vanishes.
+                _repeat = updated.get("repeat")
+                if isinstance(_repeat, dict):
+                    _times = _repeat.get("times")
+                    if (
+                        _times is not None
+                        and _times > 0
+                        and _repeat.get("completed", 0) >= _times
+                    ):
+                        _fresh = dict(_repeat)
+                        _fresh["completed"] = 0
+                        updated["repeat"] = _fresh
                 if updated.get("state") != "paused":
                     updated_next_run = compute_next_run(updated_schedule)
                     # Same guard as create_job: an UPDATE that sets a one-shot
@@ -2364,16 +2382,25 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-        },
-    )
+    updates: Dict[str, Any] = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": _hermes_now().isoformat(),
+    }
+    # An explicit trigger of a consumed finite one-shot is a request for a
+    # fresh run (#93524): without resetting the budget, the due-scan's
+    # stale-entry guard would delete the re-armed record at fire time
+    # instead of running it.
+    _repeat = job.get("repeat")
+    if isinstance(_repeat, dict):
+        _times = _repeat.get("times")
+        if _times is not None and _times > 0 and _repeat.get("completed", 0) >= _times:
+            _fresh = dict(_repeat)
+            _fresh["completed"] = 0
+            updates["repeat"] = _fresh
+    return update_job(job["id"], updates)
 
 
 def remove_job(job_id: str) -> bool:
