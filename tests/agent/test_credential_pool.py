@@ -1844,6 +1844,95 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Explicit reset vs. disk-cooldown merge (#84711)
+# ---------------------------------------------------------------------------
+
+def _seed_exhausted_pool(tmp_path, monkeypatch) -> None:
+    import time
+
+    now = time.time()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    # Block external-credential autodiscovery for exact-id assertions (see
+    # test_persist_preserves_concurrent_disk_only_entry).
+    monkeypatch.setattr("agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None)
+    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-A",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-A",
+                        "last_status": "exhausted",
+                        "last_status_at": now - 60,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "limit reached",
+                        "last_error_reset_at": now + 3 * 86400,
+                    }
+                ]
+            },
+        },
+    )
+
+
+def _persisted_entry(tmp_path) -> dict:
+    store = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    return store["credential_pool"]["anthropic"][0]
+
+
+def test_reset_statuses_persists_cleared_cooldown_over_disk(tmp_path, monkeypatch):
+    """#84711: `hermes auth reset` must clear the persisted cooldown, not
+    resurrect it. reset_statuses() writes entries with last_status_at=None;
+    the default disk-status merge read that as a stale snapshot and restored
+    the exhausted state from auth.json after every reset."""
+    _seed_exhausted_pool(tmp_path, monkeypatch)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.reset_statuses() == 1
+
+    persisted = _persisted_entry(tmp_path)
+    assert persisted["last_status"] is None
+    assert persisted["last_status_at"] is None
+    assert persisted["last_error_code"] is None
+    assert persisted["last_error_reason"] is None
+    assert persisted["last_error_message"] is None
+    assert persisted["last_error_reset_at"] is None
+
+
+def test_default_write_still_defers_to_newer_disk_cooldown(tmp_path, monkeypatch):
+    """The #84711 escape hatch is opt-in: ordinary writers keep deferring to a
+    newer on-disk cooldown so a stale snapshot cannot erase one."""
+    _seed_exhausted_pool(tmp_path, monkeypatch)
+
+    from hermes_cli.auth import write_credential_pool
+
+    cleared = _persisted_entry(tmp_path)
+    for key in (
+        "last_status",
+        "last_status_at",
+        "last_error_code",
+        "last_error_reason",
+        "last_error_message",
+        "last_error_reset_at",
+    ):
+        cleared[key] = None
+
+    write_credential_pool("anthropic", [cleared])
+
+    persisted = _persisted_entry(tmp_path)
+    assert persisted["last_status"] == "exhausted"
+    assert persisted["last_error_reset_at"] is not None
+
+
 # _sync_anthropic_entry_from_credentials_file — parity fix tests
 # ---------------------------------------------------------------------------
 
