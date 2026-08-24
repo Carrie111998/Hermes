@@ -581,7 +581,7 @@ curl 'http://localhost:8642/v1/tools?platform=api_server' \
 #       "source_server": null, "added_below_explicit_config": false}}, ...]}
 ```
 
-`/v1/skills` returns the same metadata the skills hub uses internally. `/v1/tools` resolves the complete available catalog for `api_server` by default; pass `platform=<name>` to audit another configured platform. Each entry includes its full function schema and provenance (`configurable`, `mcp`, `recently_shipped`, or `default_injected`), the MCP server when applicable, and whether the toolset was added below the platform's explicit configuration layer. `/v1/toolsets` remains the configuration-oriented view of toolsets and the concrete tool names each one expands to. All three are advertised under `endpoints.*` in `/v1/capabilities`.
+`/v1/skills` returns the same metadata the skills hub uses internally. `/v1/tools` resolves the complete available catalog for `api_server` by default; pass `platform=<name>` to audit another configured platform. Each entry includes its full function schema and provenance (`configurable`, `mcp`, `recently_shipped`, `default_injected`, or `unresolved`), the MCP server when applicable, and whether the toolset was added below the platform's explicit configuration layer. Resolving a catalog runs the same availability probes used for an agent, so the first request can be slower and may contact dependencies used by the selected platform's tools. `/v1/toolsets` remains the configuration-oriented view of toolsets and the concrete tool names each one expands to. All three are advertised under `endpoints.*` in `/v1/capabilities`.
 
 ## Long-term memory scoping (`X-Hermes-Session-Key`)
 

@@ -4205,7 +4205,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
             source_server = None
-            if canonical_toolset and canonical_toolset.startswith("mcp-"):
+            if entry is None:
+                source = "unresolved"
+            elif canonical_toolset and canonical_toolset.startswith("mcp-"):
                 source = "mcp"
                 source_server = canonical_toolset[len("mcp-"):]
             elif explicitly_enabled:

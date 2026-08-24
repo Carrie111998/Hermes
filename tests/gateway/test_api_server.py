@@ -971,6 +971,7 @@ class TestToolsEndpoint:
             {"type": "function", "function": {"name": "mcp__audit__inspect", "parameters": {}}},
             {"type": "function", "function": {"name": "bfl_flux", "parameters": {}}},
             {"type": "function", "function": {"name": "kanban_show", "parameters": {}}},
+            {"type": "function", "function": {"name": "missing_entry", "parameters": {}}},
         ]
         entries = {
             "read_file": types.SimpleNamespace(toolset="file"),
@@ -1018,6 +1019,13 @@ class TestToolsEndpoint:
         assert by_name["bfl_flux"]["provenance"]["source"] == "recently_shipped"
         assert by_name["bfl_flux"]["provenance"]["added_below_explicit_config"] is True
         assert by_name["kanban_show"]["provenance"]["source"] == "default_injected"
+        assert by_name["missing_entry"]["provenance"] == {
+            "source": "unresolved",
+            "toolset": None,
+            "requested_toolsets": [],
+            "source_server": None,
+            "added_below_explicit_config": True,
+        }
         get_definitions.assert_called_once_with(
             enabled_toolsets=["audit", "bfl", "file", "kanban"],
             quiet_mode=True,
