@@ -4182,7 +4182,7 @@ class APIServerAdapter(BasePlatformAdapter):
             update_last_resolved=False,
         )
         dynamic_definitions, dynamic_toolsets = (
-            APIServerAdapter._dynamic_platform_tool_definitions(config, enabled)
+            APIServerAdapter._dynamic_platform_tool_definitions(config, platform, enabled)
         )
         known_names = {
             (definition.get("function") or {}).get("name")
@@ -4248,6 +4248,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _dynamic_platform_tool_definitions(
         config: Dict[str, Any],
+        platform: str,
         enabled_toolsets: set[str],
     ) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
         """Return agent-injected provider schemas absent from the tool registry."""
@@ -4273,9 +4274,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     else None
                 )
                 if provider is not None and provider.is_available():
-                    for raw_schema in provider.get_tool_schemas():
+                    for raw_schema in provider.get_tool_schemas_for_catalog(
+                        platform=platform
+                    ):
                         schema = normalize_tool_schema(raw_schema)
-                        if schema is not None:
+                        if schema is not None and schema["name"] not in toolsets:
                             definitions.append({"type": "function", "function": schema})
                             toolsets[schema["name"]] = "memory"
             except Exception:
@@ -4286,8 +4289,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if "context_engine" in enabled_toolsets:
             try:
+                import copy
+
+                context_config = config.get("context")
+                if not isinstance(context_config, dict):
+                    context_config = {}
                 engine_name = str(
-                    (config.get("context") or {}).get("engine") or "compressor"
+                    context_config.get("engine") or "compressor"
                 ).strip()
                 engine = None
                 if engine_name != "compressor":
@@ -4299,11 +4307,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
                         candidate = get_plugin_context_engine()
                         if candidate is not None and candidate.name == engine_name:
-                            engine = candidate
+                            engine = copy.deepcopy(candidate)
                 if engine is not None:
+                    model_config = config.get("model")
+                    if not isinstance(model_config, dict):
+                        model_config = {}
+                    raw_model = model_config.get("model") or model_config.get("default") or ""
+                    if isinstance(raw_model, dict):
+                        from hermes_cli.config import split_model_config_default
+
+                        raw_model, _ = split_model_config_default(raw_model)
+                    model = str(raw_model or "").strip()
+                    raw_context_length = model_config.get("context_length")
+                    configured_context_length = (
+                        raw_context_length
+                        if isinstance(raw_context_length, int) and raw_context_length > 0
+                        else None
+                    )
+                    from agent.model_metadata import get_model_context_length
+
+                    context_length = get_model_context_length(
+                        model,
+                        base_url=str(model_config.get("base_url") or ""),
+                        config_context_length=configured_context_length,
+                        provider=str(model_config.get("provider") or ""),
+                        custom_providers=config.get("custom_providers"),
+                    )
+                    engine.update_model(
+                        model=model,
+                        context_length=context_length,
+                        base_url=str(model_config.get("base_url") or ""),
+                        provider=str(model_config.get("provider") or ""),
+                        api_mode=str(model_config.get("api_mode") or ""),
+                    )
                     for raw_schema in engine.get_tool_schemas():
                         schema = normalize_tool_schema(raw_schema)
-                        if schema is not None:
+                        if schema is not None and schema["name"] not in toolsets:
                             definitions.append({"type": "function", "function": schema})
                             toolsets[schema["name"]] = "context_engine"
             except Exception:

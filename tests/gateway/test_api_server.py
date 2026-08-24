@@ -1135,11 +1135,12 @@ class TestToolsEndpoint:
     def test_dynamic_tool_catalog_loads_available_configured_providers(self):
         memory_provider = types.SimpleNamespace(
             is_available=lambda: True,
-            get_tool_schemas=lambda: [
+            get_tool_schemas_for_catalog=lambda *, platform: [
                 {"name": "memory_search", "description": "Search memory", "parameters": {}}
             ],
         )
         context_engine = types.SimpleNamespace(
+            update_model=MagicMock(),
             get_tool_schemas=lambda: [
                 {"name": "lcm_grep", "description": "Search context", "parameters": {}}
             ],
@@ -1158,9 +1159,13 @@ class TestToolsEndpoint:
         ) as load_memory, patch(
             "plugins.context_engine.load_context_engine",
             return_value=context_engine,
-        ) as load_context:
+        ) as load_context, patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=0,
+        ):
             definitions, toolsets = APIServerAdapter._dynamic_platform_tool_definitions(
                 config,
+                "api_server",
                 {"memory", "context_engine"},
             )
 
@@ -1174,6 +1179,13 @@ class TestToolsEndpoint:
         }
         load_memory.assert_called_once_with("test-memory", register_skills=False)
         load_context.assert_called_once_with("test-context")
+        context_engine.update_model.assert_called_once_with(
+            model="",
+            context_length=0,
+            base_url="",
+            provider="",
+            api_mode="",
+        )
 
     @pytest.mark.asyncio
     async def test_tools_requires_api_key_when_configured(self, auth_adapter):
