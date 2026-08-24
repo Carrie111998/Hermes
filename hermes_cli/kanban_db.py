@@ -9172,17 +9172,48 @@ def detect_no_progress_running(
         if recent is not None:
             continue
 
-        last_hb = row["last_heartbeat_at"]
-        hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is None:
-            liveness = "never"
-        elif hb_age <= _NO_PROGRESS_LIVENESS_FRESH_SECONDS:
-            liveness = "fresh"
-        else:
-            liveness = "stale"
-
         hold_until = now + NO_PROGRESS_DEFER_GRACE_SECONDS
         with write_txn(conn):
+            # The candidate snapshot and host-local PID probe deliberately
+            # happen before this writer transaction. Re-read the authoritative
+            # progress clock after acquiring the writer lock: record_progress()
+            # or a durable board transition may have renewed it meanwhile.
+            current = conn.execute(
+                "SELECT t.id, t.worker_pid, t.claim_lock, t.claim_expires, "
+                "       t.current_run_id, t.last_heartbeat_at, "
+                "       t.last_progress_at, "
+                "       COALESCE(t.last_progress_at, r.started_at, t.started_at) "
+                "           AS progress_at "
+                "FROM tasks t "
+                "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+                "WHERE t.id = ? AND t.status = 'running'",
+                (tid,),
+            ).fetchone()
+            if (
+                current is None
+                or current["claim_lock"] != lock
+                or current["current_run_id"] != run_id
+                or current["claim_expires"] is None
+                or current["progress_at"] is None
+            ):
+                continue
+            progress_age = now - int(current["progress_at"])
+            if progress_age <= no_progress_timeout_seconds:
+                continue
+
+            # From here on the receipt describes the state revalidated under
+            # the writer lock, not the stale candidate snapshot.
+            row = current
+            pid = row["worker_pid"]
+            last_hb = row["last_heartbeat_at"]
+            hb_age = (now - int(last_hb)) if last_hb is not None else None
+            if hb_age is None:
+                liveness = "never"
+            elif hb_age <= _NO_PROGRESS_LIVENESS_FRESH_SECONDS:
+                liveness = "fresh"
+            else:
+                liveness = "stale"
+
             # Hold the claim for the grace: a floor, never a reset, so a live
             # worker's own renewals are not brought forward. CAS on the
             # claim and run we classified so a concurrent transition wins.

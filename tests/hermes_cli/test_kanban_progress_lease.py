@@ -568,6 +568,76 @@ def test_expired_progress_lease_is_deferred_not_reclaimed(kanban_home, monkeypat
         assert [(r["status"], r["outcome"]) for r in run] == [("running", None)]
 
 
+def test_progress_recorded_after_snapshot_prevents_stale_receipt(
+    kanban_home, monkeypatch,
+):
+    """A second writer can renew progress from the liveness probe window.
+    The detector must revalidate that evidence after acquiring its writer lock."""
+    with kb.connect() as detector_conn, kb.connect() as progress_conn:
+        tid = _running_task(detector_conn)
+        _age_progress(detector_conn, tid, 7200)
+        row = _row(detector_conn, tid)
+        old_progress_at = row["last_progress_at"]
+        progress_receipts = []
+
+        def _record_progress_then_report_alive(_pid):
+            progress_receipts.append(kb.record_progress(
+                progress_conn,
+                tid,
+                source=kb.PROGRESS_SOURCE_TOOL,
+                expected_run_id=row["current_run_id"],
+                claim_lock=row["claim_lock"],
+            ))
+            return True
+
+        monkeypatch.setattr(kb, "_pid_alive", _record_progress_then_report_alive)
+        deferred = kb.detect_no_progress_running(
+            detector_conn, no_progress_timeout_seconds=60,
+        )
+        receipts = _events(detector_conn, tid, "no_progress_deferred")
+
+        assert progress_receipts == [{
+            "recorded": True,
+            "reason": "recorded",
+            "source": kb.PROGRESS_SOURCE_TOOL,
+            "run_id": row["current_run_id"],
+            "last_progress_at": _row(detector_conn, tid)["last_progress_at"],
+        }]
+        assert _row(detector_conn, tid)["last_progress_at"] > old_progress_at
+        assert (deferred, len(receipts)) == ([], 0)
+
+
+def test_board_transition_after_snapshot_prevents_stale_receipt(
+    kanban_home, monkeypatch,
+):
+    """A durable non-terminal board transition in the same window is fresh
+    progress and must defeat the detector's stale snapshot."""
+    with kb.connect() as detector_conn, kb.connect() as board_conn:
+        tid = _running_task(detector_conn)
+        _age_progress(detector_conn, tid, 7200)
+        old_progress_at = _row(detector_conn, tid)["last_progress_at"]
+        comment_ids = []
+
+        def _comment_then_report_alive(_pid):
+            comment_ids.append(kb.add_comment(
+                board_conn, tid, author="operator", body="durable progress",
+            ))
+            return True
+
+        monkeypatch.setattr(kb, "_pid_alive", _comment_then_report_alive)
+        deferred = kb.detect_no_progress_running(
+            detector_conn, no_progress_timeout_seconds=60,
+        )
+        receipts = _events(detector_conn, tid, "no_progress_deferred")
+
+        assert len(comment_ids) == 1
+        assert [comment.body for comment in kb.list_comments(detector_conn, tid)] == [
+            "durable progress"
+        ]
+        assert _row(detector_conn, tid)["last_progress_at"] > old_progress_at
+        assert (deferred, len(receipts)) == ([], 0)
+
+
 def test_holding_the_claim_never_shortens_it(kanban_home, monkeypatch):
     """A live worker renews its own claim well past the grace; the hold is a
     floor, not a reset, so it cannot bring a healthy claim forward."""
