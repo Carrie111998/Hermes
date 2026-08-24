@@ -1442,6 +1442,28 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+def _load_skill_usage(skills_dir: Path) -> dict[str, int]:
+    """Skill name -> use_count from the .usage.json sidecar (best-effort).
+
+    Powers usage-frequency ranking of the skills index: skills the agent
+    actually uses surface before idle ones, so the model's semantic match
+    biases toward proven skills. Failures are silent — ranking degrades to
+    plain alphabetical.
+    """
+    usage_path = skills_dir / ".usage.json"
+    try:
+        data = json.loads(usage_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, int] = {}
+    for name, rec in data.items():
+        try:
+            out[name] = int(rec.get("use_count") or 0)
+        except (TypeError, ValueError):
+            out[name] = 0
+    return out
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1479,6 +1501,12 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    usage_path = skills_dir / ".usage.json"
+    try:
+        usage_mtime = usage_path.stat().st_mtime
+    except OSError:
+        usage_mtime = 0.0
+    usage = _load_skill_usage(skills_dir)
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1488,6 +1516,7 @@ def build_skills_system_prompt(
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
         platform,
+        usage_mtime,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1647,7 +1676,13 @@ def build_skills_system_prompt(
         result = ""
     else:
         index_lines = []
-        for category in sorted(skills_by_category.keys()):
+        def _cat_usage(cat: str) -> int:
+            return max((usage.get(n, 0) for n, _ in skills_by_category[cat]), default=0)
+
+        for category in sorted(
+            skills_by_category.keys(),
+            key=lambda c: (-_cat_usage(c), c),
+        ):
             # Deduplicate and sort skills within each category
             seen = set()
             if category in demoted:
@@ -1659,14 +1694,19 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc in sorted(
+                skills_by_category[category],
+                key=lambda x: (-usage.get(x[0], 0), x[0]),
+            ):
                 if name in seen:
                     continue
                 seen.add(name)
+                _uses = usage.get(name, 0)
+                _suffix = f" (used {_uses})" if _uses else ""
                 if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                    index_lines.append(f"    - {name}{_suffix}: {desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"    - {name}{_suffix}")
 
         _is_messaging = platform in ("weixin", "slack", "telegram", "wecom", "qqbot", "yuanbao")
 
