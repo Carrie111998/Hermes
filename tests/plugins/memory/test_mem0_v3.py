@@ -270,7 +270,7 @@ class TestMem0V3Config:
         block = provider.system_prompt_block()
         assert "keep searching until" not in block.lower()
         assert "after 2 attempts" in block
-        assert "stop" in block.lower()
+        assert "Always stop immediately if the user says to skip or stop searching memory" in block
 
     def test_search_schema_has_search_circuit_breaker(self):
         # Regression for #93485 follow-up: SEARCH_SCHEMA["description"] is
@@ -287,7 +287,7 @@ class TestMem0V3Config:
         description = search_schema["description"].lower()
         assert "one search is rarely enough" not in description
         assert "after 2 attempts" in description
-        assert "stop" in description
+        assert "always stop immediately if the user says to skip or stop searching memory" in description
 
 
 class TestMem0ModeSwitch:
