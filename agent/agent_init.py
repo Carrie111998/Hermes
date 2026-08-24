@@ -660,6 +660,23 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    # A gateway AIAgent owns one provider destination for its entire model
+    # conversation.  Keep the original, provider-sourced route immutable so a
+    # cached transcript (including plugin-injected private context) cannot be
+    # reused after an accidental in-place destination mutation.
+    agent._destination_binding = (
+        (
+            platform or "",
+            user_id or "",
+            user_id_alt or "",
+            chat_id or "",
+            chat_type or "",
+            thread_id or "",
+            gateway_session_key or "",
+        )
+        if gateway_session_key
+        else None
+    )
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy

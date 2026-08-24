@@ -446,13 +446,26 @@ def wire_env():
     db = SessionDB(db_path=Path(test_home) / "state.db")
     sid = "sess-wire"
 
-    def make_agent():
+    def make_agent(**route_overrides):
+        route = {
+            "platform": "cli",
+            "user_id": None,
+            "chat_id": None,
+            "chat_type": None,
+            "gateway_session_key": None,
+        }
+        route.update(route_overrides)
         agent = AIAgent(
             api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
             provider="openai-compat", model="test-model",
             max_iterations=10, enabled_toolsets=[],
             quiet_mode=True, skip_context_files=True, skip_memory=True,
-            save_trajectories=False, platform="cli",
+            save_trajectories=False,
+            platform=route["platform"],
+            user_id=route["user_id"],
+            chat_id=route["chat_id"],
+            chat_type=route["chat_type"],
+            gateway_session_key=route["gateway_session_key"],
             session_db=db, session_id=sid,
         )
         agent.valid_tool_names = {"read_file"}
@@ -487,6 +500,72 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_pre_llm_hook_receives_bound_destination_context(self, wire_env):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent(
+            platform="photon",
+            user_id="provider-sender",
+            chat_id="provider-space",
+            chat_type="dm",
+            gateway_session_key="agent:main:photon:dm:provider-space",
+        )
+        handler.response_queue.append(_text_resp("done"))
+        seen = {}
+
+        def capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                seen.update(kwargs)
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=capture):
+            agent.run_conversation("hello", conversation_history=[], task_id="t")
+
+        assert seen["platform"] == "photon"
+        assert seen["sender_id"] == "provider-sender"
+        assert seen["destination_chat_id"] == "provider-space"
+        assert seen["destination_chat_type"] == "dm"
+
+    @pytest.mark.parametrize(
+        ("field", "changed_value"),
+        [
+            ("_chat_type", "group"),
+            ("_chat_type", "unknown"),
+            ("_chat_id", "different-space"),
+        ],
+    )
+    def test_destination_drift_fails_before_hook_or_model_call(
+        self, wire_env, field, changed_value
+    ):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent(
+            platform="photon",
+            user_id="provider-sender",
+            chat_id="private-space",
+            chat_type="dm",
+            gateway_session_key="agent:main:photon:dm:private-space",
+        )
+        hook_calls = []
+
+        def capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                hook_calls.append(kwargs)
+                return [{"context": "PRIVATE-CONTEXT"}]
+            return []
+
+        handler.response_queue.append(_text_resp("private answer"))
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=capture):
+            agent.run_conversation("private turn", conversation_history=[], task_id="t1")
+            model_calls_before_drift = len(_chat_requests(handler))
+            hook_calls_before_drift = len(hook_calls)
+
+            setattr(agent, field, changed_value)
+
+            with pytest.raises(RuntimeError, match="destination binding changed"):
+                agent.run_conversation("reuse attempt", conversation_history=[], task_id="t2")
+
+        assert len(_chat_requests(handler)) == model_calls_before_drift
+        assert len(hook_calls) == hook_calls_before_drift
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the
