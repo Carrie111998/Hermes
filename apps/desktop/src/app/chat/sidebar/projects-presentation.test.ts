@@ -167,13 +167,15 @@ describe('Projects grouping contribution', () => {
     expect(result.current.sidebar?.snapshot).toBe(result.current.dialog?.snapshot)
   })
 
-  it('retries the highest-priority provider after every shared consumer unmounts', () => {
+  it('keeps the proven fallback rendered until an idle retry successfully subscribes to the primary', () => {
     let primaryRecovered = false
     let primarySubscribeCalls = 0
+    const events: string[] = []
     const primary = provider([{ id: 'primary', label: 'Primary', projectIds: ['a'] }])
 
     primary.subscribe = () => {
       primarySubscribeCalls += 1
+      events.push('subscribe:primary')
 
       if (!primaryRecovered) {
         throw new Error('transient subscription failure')
@@ -193,18 +195,37 @@ describe('Projects grouping contribution', () => {
     expect(second.result.current?.contribution).toBe(fallback)
 
     first.unmount()
-    primaryRecovered = true
     second.rerender()
 
     expect(second.result.current?.contribution).toBe(fallback)
 
     second.unmount()
+    events.length = 0
 
-    const laterConsumer = renderHook(() => useActiveProjectsGrouping())
+    const brokenRemount = renderHook(() => {
+      const active = useActiveProjectsGrouping()
+      events.push(`render:${active?.snapshot.groups[0]?.id ?? 'empty'}`)
 
-    expect(laterConsumer.result.current?.contribution).toBe(primary)
-    expect(laterConsumer.result.current?.snapshot.groups[0].id).toBe('primary')
-    expect(primarySubscribeCalls).toBe(2)
+      return active
+    })
+
+    expect(brokenRemount.result.current?.contribution).toBe(fallback)
+    expect(events.filter(event => event.startsWith('render:'))).toEqual(['render:fallback'])
+
+    brokenRemount.unmount()
+    primaryRecovered = true
+    events.length = 0
+
+    const recoveredRemount = renderHook(() => {
+      const active = useActiveProjectsGrouping()
+      events.push(`render:${active?.snapshot.groups[0]?.id ?? 'empty'}`)
+
+      return active
+    })
+
+    expect(recoveredRemount.result.current?.contribution).toBe(primary)
+    expect(events).toEqual(['render:fallback', 'subscribe:primary', 'render:primary'])
+    expect(primarySubscribeCalls).toBe(3)
   })
 
   it('settles on a stable empty state when every valid provider throws while subscribing', () => {

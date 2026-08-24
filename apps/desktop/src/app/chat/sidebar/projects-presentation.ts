@@ -252,6 +252,7 @@ function createStoreAdapter(
     : null
 
   let unsubscribeProvider: (() => void) | null = null
+  let retryPreferredProviders = false
   const listeners = new Set<() => void>()
 
   const select = (provider: ResolvedProjectsGroupingProvider | null) => {
@@ -259,13 +260,19 @@ function createStoreAdapter(
     cached = provider ? { contribution: provider.contribution, snapshot: provider.snapshot } : null
   }
 
-  const subscribeToProvider = () => {
-    while (active) {
+  const subscribeToProvider = (initialCandidate = active, preserveActive = false) => {
+    let candidate = initialCandidate
+
+    while (candidate) {
       try {
-        const unsubscribe = active.contribution.subscribe(() => listeners.forEach(listener => listener()))
+        const unsubscribe = candidate.contribution.subscribe(() => listeners.forEach(listener => listener()))
 
         if (typeof unsubscribe === 'function') {
           unsubscribeProvider = unsubscribe
+
+          if (candidate.contribution !== active?.contribution) {
+            select(candidate)
+          }
 
           return
         }
@@ -275,7 +282,11 @@ function createStoreAdapter(
         // ladder instead of letting React's external-store effect crash.
       }
 
-      select(readValidProvider(entries, active.entryIndex + 1))
+      candidate = readValidProvider(entries, candidate.entryIndex + 1)
+    }
+
+    if (!preserveActive) {
+      select(null)
     }
   }
 
@@ -306,7 +317,9 @@ function createStoreAdapter(
       listeners.add(listener)
 
       if (!unsubscribeProvider) {
-        subscribeToProvider()
+        const retrying = retryPreferredProviders
+        retryPreferredProviders = false
+        subscribeToProvider(retrying ? readValidProvider(entries) : active, retrying)
       }
 
       return () => {
@@ -315,7 +328,7 @@ function createStoreAdapter(
         if (listeners.size === 0) {
           unsubscribeProvider?.()
           unsubscribeProvider = null
-          select(readValidProvider(entries))
+          retryPreferredProviders = true
         }
       }
     }
