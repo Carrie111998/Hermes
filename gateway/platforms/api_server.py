@@ -7218,6 +7218,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        frontier_required: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7238,6 +7239,17 @@ class APIServerAdapter(BasePlatformAdapter):
         active the completed agent's actual provider/model must match the
         locked selection or the turn fails, and the response carries
         sanitized ``runtime`` metadata reporting actual vs requested.
+
+        *frontier_required* is the caller's explicit, per-call assertion that
+        this turn must be served by a frontier-class model (HF-04 Layer A,
+        IGN-196).  It is deliberately caller-supplied rather than inferred from
+        the message content: inferring it would make correctness depend on a
+        second, separately-fallible classifier, which is the silent-failure
+        surface HF-04 is remediating in the first place.  When it is True *and*
+        the shared ``HERMES_FRONTIER_DOWNGRADE_CHECK`` flag is on, a frontier
+        request served by a non-frontier model appends a ``frontier_downgrade``
+        entry to ``result["warnings"]``.  It never blocks the response — unlike
+        *confirmed_runtime_lock*, which is an exact pin and hard-fails.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -7401,6 +7413,57 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(result, dict):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
+                    # HF-04 Layer A (IGN-196): fail-loud requested-vs-served
+                    # model-class check for the API-server call path.  This is
+                    # the point fallback resolution has completed and the
+                    # serving model is final — the same point the
+                    # confirmed_runtime_lock hard-check above reads.  It lives
+                    # outside the ``include_runtime`` branch on purpose: that
+                    # branch only decides whether to *report* runtime metadata,
+                    # and a downgrade must be caught whether or not the caller
+                    # asked for that metadata.
+                    #
+                    # Doubly gated: the caller's per-call ``frontier_required``
+                    # AND the shared HERMES_FRONTIER_DOWNGRADE_CHECK env flag
+                    # (default off, read per call so unsetting it takes effect
+                    # on the next request with no restart).  The guard module is
+                    # shared with the CLI/cron hook (IGN-197) so there is one
+                    # flag, not two.  This path does not pass
+                    # ``frontier_required`` down into ``run_conversation``, so
+                    # that turn-end hook stays inert here and the two cannot
+                    # double-warn for one call.
+                    if frontier_required and isinstance(result, dict):
+                        from agent.frontier_guard import check_frontier_downgrade
+
+                        # Requested model mirrors the confirmed-lock block's
+                        # ``expected_model`` precedence (route then
+                        # requested_runtime), then falls back to the explicit
+                        # per-request value and the session-persisted one, so a
+                        # caller that asserts frontier_required without the
+                        # Browser lock contract is still checked against
+                        # something it actually asked for.
+                        _requested_for_check = (
+                            self._split_provider_prefixed_model(
+                                (route or {}).get("model")
+                                or (requested_runtime or {}).get("model")
+                                or requested_model
+                                or session_model
+                                or ""
+                            )[1]
+                        )
+                        check_frontier_downgrade(
+                            result,
+                            requested_model=_requested_for_check,
+                            # Strip any ``provider::model`` prefix before
+                            # classifying: the classifier matches on exact
+                            # membership, so a prefixed string would come back
+                            # 'unknown' and read as a downgrade that never
+                            # happened.
+                            served_model=self._split_provider_prefixed_model(
+                                getattr(agent, "model", "") or ""
+                            )[1],
+                            frontier_required=True,
+                        )
                     return result, usage
                 except _ProviderAuthResolutionError as exc:
                     # Only _ProviderAuthResolutionError — raised exclusively
