@@ -6922,11 +6922,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    def set_session_health_state(
-        self, session_id: str, state: Dict[str, Any]
+    def compare_and_set_session_health_state(
+        self,
+        session_id: str,
+        expected_state: Dict[str, Any],
+        state: Dict[str, Any],
     ) -> bool:
-        """Persist bounded adviser state on the durable session row."""
-        if not session_id or not _valid_session_health_state(state):
+        """Atomically persist adviser state only from an exact durable snapshot."""
+        if (
+            not session_id
+            or not _valid_session_health_state(expected_state)
+            or not _valid_session_health_state(state)
+        ):
             return False
         try:
             payload = json.dumps(
@@ -6941,6 +6948,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            row = conn.execute(
+                "SELECT session_health_json FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current_payload = row[0]
+            if current_payload in (None, ""):
+                current_state: Any = {}
+            else:
+                try:
+                    current_state = json.loads(current_payload)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return False
+            if (
+                not _valid_session_health_state(current_state)
+                or current_state != expected_state
+            ):
+                return False
             updated = conn.execute(
                 "UPDATE sessions SET session_health_json = ? WHERE id = ?",
                 (payload, session_id),
@@ -6956,7 +6982,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
         with self._lock:
-            row = self._conn.execute(
+            conn = self._conn
+            if conn is None:
+                return None
+            row = conn.execute(
                 "SELECT session_health_json FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()

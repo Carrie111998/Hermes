@@ -1263,10 +1263,13 @@ hermes config set gateway.session_health.enabled true
 
 The policy is hard-scoped to Telegram and cannot be retargeted to another
 platform through configuration. It requires at least two independent signals
-before the first suggestion. State is stored both in the active gateway routing
-entry and on the durable session row, so cooldowns survive gateway restarts and
-`/resume` restores the same session's notice cap. A failed turn updates the
-failure streak but never adds a tip to an error response.
+before the first suggestion. The durable session row is the authoritative
+cooldown/quota state, so the limits survive gateway restarts and `/resume`
+restores the same session's notice cap. Gateway routes that alias the same session
+reserve transitions with an atomic snapshot comparison and synchronize their
+local metadata from the durable row; a stale alias therefore cannot bypass the
+cooldown or two-notice cap. A failed turn updates the failure streak but never
+adds a tip to an error response.
 
 ```yaml
 gateway:

@@ -480,11 +480,8 @@ class TestSessionStoreSwitchSession:
             "compression_count": 1,
         }
 
-        assert store.set_session_metadata_if_current(
-            original.session_key,
-            original.session_id,
-            "session_health",
-            health_state,
+        assert db.compare_and_set_session_health_state(
+            original.session_id, {}, health_state
         )
         replacement = store.reset_session(original.session_key)
         assert replacement is not None
@@ -495,6 +492,69 @@ class TestSessionStoreSwitchSession:
 
         assert resumed is not None
         assert resumed.metadata["session_health"] == health_state
+        db.close()
+
+    def test_session_health_reservation_is_shared_across_alias_routes(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        first = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="health-alias-a",
+                chat_type="dm",
+                user_id="health-user-a",
+            )
+        )
+        second = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="health-alias-b",
+                chat_type="dm",
+                user_id="health-user-b",
+            )
+        )
+        second = store.switch_session(second.session_key, first.session_id)
+        assert second is not None
+        assert second.session_id == first.session_id
+
+        initial = {}
+        first_notice = {
+            "suggestion_count": 1,
+            "last_suggested_at": 1_000.0,
+            "failure_streak": 0,
+            "compression_count": 0,
+        }
+        stale_duplicate = {
+            "suggestion_count": 1,
+            "last_suggested_at": 1_001.0,
+            "failure_streak": 0,
+            "compression_count": 0,
+        }
+
+        assert store.get_session_health_state_if_current(
+            first.session_key, first.session_id
+        ) == initial
+        assert store.get_session_health_state_if_current(
+            second.session_key, second.session_id
+        ) == initial
+        assert store.compare_and_set_session_health_if_current(
+            first.session_key, first.session_id, initial, first_notice
+        )
+        assert not store.compare_and_set_session_health_if_current(
+            second.session_key, second.session_id, initial, stale_duplicate
+        )
+        assert store.get_session_health_state_if_current(
+            second.session_key, second.session_id
+        ) == first_notice
+        assert second.metadata["session_health"] == first_notice
+
         db.close()
 
     def test_switch_session_reopens_target_session_in_db(self, tmp_path):
@@ -1360,6 +1420,33 @@ class TestSessionMetadata:
         # And the restart freshness gate must still see it as idle.
         assert store.suspend_recently_active(max_age_seconds=120) == 0
 
+    def test_session_health_rejects_generic_metadata_setter(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+        entry = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="reserved-health-key",
+                chat_type="dm",
+                user_id="reserved-health-user",
+            )
+        )
+
+        assert not store.set_session_metadata_if_current(
+            entry.session_key,
+            entry.session_id,
+            "session_health",
+            {"suggestion_count": 1},
+        )
+        assert db.get_session_health_state(entry.session_id) == {}
+        db.close()
+
     def test_metadata_compare_and_swap_rejects_replaced_session(self, tmp_path):
         config = GatewayConfig()
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1379,18 +1466,18 @@ class TestSessionMetadata:
         assert not store.set_session_metadata_if_current(
             original.session_key,
             original.session_id,
-            "session_health",
-            {"suggestion_count": 1},
+            "turn_bookkeeping",
+            {"count": 1},
         )
-        assert store.get_session_metadata(original.session_key, "session_health") is None
+        assert store.get_session_metadata(original.session_key, "turn_bookkeeping") is None
         assert store.set_session_metadata_if_current(
             replacement.session_key,
             replacement.session_id,
-            "session_health",
-            {"suggestion_count": 1},
+            "turn_bookkeeping",
+            {"count": 1},
         )
-        assert store.get_session_metadata(replacement.session_key, "session_health") == {
-            "suggestion_count": 1
+        assert store.get_session_metadata(replacement.session_key, "turn_bookkeeping") == {
+            "count": 1
         }
 
     def test_session_health_cas_checks_route_before_durable_write(self, tmp_path):
@@ -1407,22 +1494,30 @@ class TestSessionMetadata:
         assert replacement is not None
         store._db = MagicMock()
 
-        assert not store.set_session_metadata_if_current(
+        initial = {}
+        next_state = {
+            "suggestion_count": 1,
+            "last_suggested_at": 1_000.0,
+            "failure_streak": 0,
+            "compression_count": 0,
+        }
+        assert not store.compare_and_set_session_health_if_current(
             original.session_key,
             original.session_id,
-            "session_health",
-            {"suggestion_count": 1},
+            initial,
+            next_state,
         )
-        store._db.set_session_health_state.assert_not_called()
+        store._db.compare_and_set_session_health_state.assert_not_called()
 
-        store._db.set_session_health_state.return_value = False
-        assert not store.set_session_metadata_if_current(
+        store._db.compare_and_set_session_health_state.return_value = False
+        store._db.get_session_health_state.return_value = initial
+        assert not store.compare_and_set_session_health_if_current(
             replacement.session_key,
             replacement.session_id,
-            "session_health",
-            {"suggestion_count": 1},
+            initial,
+            next_state,
         )
-        assert store.get_session_metadata(replacement.session_key, "session_health") is None
+        assert store.get_session_metadata(replacement.session_key, "session_health") == {}
 
 
 class TestRewriteTranscriptPreservesReasoning:

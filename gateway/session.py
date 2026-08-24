@@ -3093,20 +3093,71 @@ class SessionStore:
         This compare-and-swap prevents an old async turn from writing bookkeeping
         into a replacement entry created by ``/new``, ``/reset``, or ``/resume``.
         """
-        if not session_key or not expected_session_id:
+        if not session_key or not expected_session_id or key == "session_health":
             return False
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or entry.session_id != expected_session_id:
                 return False
-            if key == "session_health" and self._db:
-                persist = getattr(self._db, "set_session_health_state", None)
-                if not callable(persist) or not persist(expected_session_id, value):
-                    return False
             entry.metadata[key] = value
             self._save()
             return True
+
+    def get_session_health_state_if_current(
+        self,
+        session_key: str,
+        expected_session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Load the durable adviser snapshot while the route still owns it."""
+        if not session_key or not expected_session_id:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id or not self._db:
+                return None
+            load = getattr(self._db, "get_session_health_state", None)
+            if not callable(load):
+                return None
+            state = load(expected_session_id)
+            if not isinstance(state, dict):
+                return None
+            for alias in self._entries.values():
+                if alias.session_id == expected_session_id:
+                    alias.metadata["session_health"] = dict(state)
+            return dict(state)
+
+    def compare_and_set_session_health_if_current(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        expected_state: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> bool:
+        """Reserve one durable adviser transition and refresh all local aliases."""
+        if not session_key or not expected_session_id:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id or not self._db:
+                return False
+            persist = getattr(
+                self._db, "compare_and_set_session_health_state", None
+            )
+            load = getattr(self._db, "get_session_health_state", None)
+            if not callable(persist) or not callable(load):
+                return False
+            reserved = bool(persist(expected_session_id, expected_state, state))
+            durable_state = state if reserved else load(expected_session_id)
+            if not isinstance(durable_state, dict):
+                return False
+            for alias in self._entries.values():
+                if alias.session_id == expected_session_id:
+                    alias.metadata["session_health"] = dict(durable_state)
+            self._save()
+            return reserved
 
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]

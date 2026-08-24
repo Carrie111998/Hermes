@@ -21009,11 +21009,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_health_turn_failed as _session_health_turn_failed,
                     )
 
-                    _old_health_state = session_entry.metadata.get(
-                        "session_health", {}
+                    _old_health_state = (
+                        await self.async_session_store.get_session_health_state_if_current(
+                            session_key,
+                            session_entry.session_id,
+                        )
                     )
                     if not isinstance(_old_health_state, dict):
-                        _old_health_state = {}
+                        raise RuntimeError("durable session health state unavailable")
                     _health_message_count, _health_tool_call_count = (
                         _count_session_activity(agent_messages)
                     )
@@ -21060,10 +21063,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and _health_decision.next_state != _old_health_state
                     ):
                         _health_state_persisted = bool(
-                            await self.async_session_store.set_session_metadata_if_current(
+                            await self.async_session_store.compare_and_set_session_health_if_current(
                                 session_key,
                                 session_entry.session_id,
-                                "session_health",
+                                _old_health_state,
                                 _health_decision.next_state,
                             )
                         )
