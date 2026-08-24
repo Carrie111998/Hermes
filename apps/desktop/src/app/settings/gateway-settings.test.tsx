@@ -4,6 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
 
+// This test owns the machine-level GatewaySettings contract. Phase 4 mounts
+// FleetUpdatesSection below it, whose refresh lifecycle has its own focused
+// coverage; keep that independent async work out of this single-purpose test.
+vi.mock('./fleet-updates-section', () => ({ FleetUpdatesSection: () => null }))
+
 const localConnection = {
   cloudOrg: '',
   envOverride: false,
