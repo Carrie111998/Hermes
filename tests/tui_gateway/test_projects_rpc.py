@@ -58,6 +58,11 @@ def test_methods_registered():
         "projects.archive",
         "projects.set_active",
         "projects.for_cwd",
+        "projects.set_organization",
+        "organizations.list",
+        "organizations.create",
+        "organizations.update",
+        "organizations.delete",
     ):
         assert m in server._methods
 
@@ -820,5 +825,91 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
     assert _cached_repo_labels(launch_home) == ["only"]
     assert not (coder_home / "projects.db").exists()
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
+
+
+# ---------------------------------------------------------------------------
+# Organizations RPC (t_8b6e58a9)
+# ---------------------------------------------------------------------------
+
+
+def test_organizations_create_list_update_delete():
+    created = _call("organizations.create", {"name": "Family Office", "color": "#ff8800"})[
+        "organization"
+    ]
+    assert created["name"] == "Family Office"
+    assert created["slug"] == "family-office"
+    assert created["color"] == "#ff8800"
+
+    listed = _call("organizations.list")["organizations"]
+    assert [o["id"] for o in listed] == [created["id"]]
+
+    updated = _call(
+        "organizations.update", {"id": created["id"], "name": "Renamed Office"}
+    )["organization"]
+    assert updated["name"] == "Renamed Office"
+    assert updated["slug"] == "family-office"  # rename doesn't reslug
+
+    remaining = _call("organizations.delete", {"id": created["id"]})["organizations"]
+    assert remaining == []
+
+
+def test_organizations_get_unknown_id_errors():
+    resp = server._methods["organizations.update"](1, {"id": "o_nope", "name": "x"})
+    assert "error" in resp
+    assert resp["error"]["code"] == 5062
+
+
+def test_projects_set_organization_assign_move_and_unset():
+    """End-to-end: create project + two orgs, assign, move, unset back to null."""
+    proj = _call("projects.create", {"name": "Saylent Swarm", "folders": []})["project"]
+    assert proj["organization"] is None  # ungrouped by default, no backfill
+
+    org1 = _call("organizations.create", {"name": "Org One"})["organization"]
+    org2 = _call("organizations.create", {"name": "Org Two"})["organization"]
+
+    assigned = _call(
+        "projects.set_organization", {"id": proj["id"], "organization_id": org1["id"]}
+    )["project"]
+    assert assigned["organization_id"] == org1["id"]
+    assert assigned["organization"] == {
+        "id": org1["id"], "slug": "org-one", "name": "Org One",
+        "color": None, "description": None, "created_at": org1["created_at"],
+    }
+
+    moved = _call(
+        "projects.set_organization", {"id": proj["id"], "organization_id": org2["id"]}
+    )["project"]
+    assert moved["organization_id"] == org2["id"]
+
+    unset = _call(
+        "projects.set_organization", {"id": proj["id"], "organization_id": None}
+    )["project"]
+    assert unset["organization_id"] is None
+    assert unset["organization"] is None
+
+    # projects.list also reflects the null/ungrouped shape.
+    listed = _call("projects.list")["projects"]
+    assert listed[0]["organization"] is None
+
+
+def test_projects_set_organization_rejects_unknown_org():
+    proj = _call("projects.create", {"name": "App", "folders": []})["project"]
+    resp = server._methods["projects.set_organization"](
+        1, {"id": proj["id"], "organization_id": "o_nope"}
+    )
+    assert "error" in resp
+    assert resp["error"]["code"] == 5063  # bad-argument code, not a raw sqlite error
+
+
+def test_delete_organization_ungroups_project_via_rpc():
+    proj = _call("projects.create", {"name": "App", "folders": []})["project"]
+    org = _call("organizations.create", {"name": "Org"})["organization"]
+    _call("projects.set_organization", {"id": proj["id"], "organization_id": org["id"]})
+
+    _call("organizations.delete", {"id": org["id"]})
+
+    refreshed = _call("projects.get", {"id": proj["id"]})["project"]
+    assert refreshed["organization_id"] is None
+    assert refreshed["organization"] is None
 
 

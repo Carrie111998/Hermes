@@ -93,6 +93,21 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
     label         TEXT,
     last_seen     INTEGER NOT NULL
 );
+
+-- Optional grouping bucket for projects (t_8b6e58a9). A project's
+-- `organization_id` FK is nullable — a project does not have to belong to
+-- an org, and existing pre-feature projects stay NULL ("ungrouped") forever
+-- unless a human explicitly assigns them. Created here (not via
+-- _add_column_if_missing) so it always exists before the projects.organization_id
+-- ADD COLUMN's REFERENCES clause below runs on a legacy DB.
+CREATE TABLE IF NOT EXISTS organizations (
+    id            TEXT PRIMARY KEY,
+    slug          TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    color         TEXT,
+    description   TEXT,
+    created_at    INTEGER NOT NULL
+);
 """
 
 
@@ -133,6 +148,10 @@ def normalize_slug(slug: Optional[str]) -> Optional[str]:
 
 def _new_project_id() -> str:
     return "p_" + secrets.token_hex(4)
+
+
+def _new_organization_id() -> str:
+    return "o_" + secrets.token_hex(4)
 
 
 def _now() -> int:
@@ -209,6 +228,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
             _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+    if "organization_id" not in cols:
+        # References `organizations(id)`, which SCHEMA_SQL always creates
+        # before this runs — safe even on a legacy DB that predates orgs.
+        # ON DELETE SET NULL: deleting an org ungroups its projects instead
+        # of orphaning the FK or cascading a project delete.
+        _add_column_if_missing(
+            conn,
+            "projects",
+            "organization_id",
+            "organization_id TEXT REFERENCES organizations(id) ON DELETE SET NULL",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +274,9 @@ class Project:
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
     archived: bool = False
+    organization_id: Optional[str] = None
     folders: List[ProjectFolder] = field(default_factory=list)
+    organization: Optional["Organization"] = None
 
     def to_dict(self) -> dict:
         return {
@@ -259,7 +291,43 @@ class Project:
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
+            "organization_id": self.organization_id,
+            # Stable nested shape for downstream consumers (mobile payload,
+            # cockpit UI): {id, name, color, ...} when assigned, else null —
+            # never a bare id string, so a client never has to branch on type.
+            "organization": self.organization.to_dict() if self.organization else None,
         }
+
+
+@dataclass
+class Organization:
+    id: str
+    slug: str
+    name: str
+    created_at: int
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "slug": self.slug,
+            "name": self.name,
+            "color": self.color,
+            "description": self.description,
+            "created_at": self.created_at,
+        }
+
+
+def _organization_from_row(row: sqlite3.Row) -> Organization:
+    return Organization(
+        id=row["id"],
+        slug=row["slug"],
+        name=row["name"],
+        created_at=row["created_at"],
+        color=row["color"],
+        description=row["description"],
+    )
 
 
 def _project_from_row(row: sqlite3.Row) -> Project:
@@ -275,6 +343,7 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
         archived=bool(row["archived"]) if "archived" in keys else False,
+        organization_id=row["organization_id"] if "organization_id" in keys else None,
     )
 
 
@@ -300,18 +369,38 @@ def _attach_folders(conn: sqlite3.Connection, project: Project) -> Project:
     return project
 
 
+def _attach_organization(
+    conn: sqlite3.Connection, project: Project, *, cache: Optional[dict] = None
+) -> Project:
+    """Hydrate ``project.organization`` from ``organization_id`` (or leave None).
+
+    ``cache`` (org_id -> Organization) lets ``list_projects`` batch-load every
+    org once instead of one query per project.
+    """
+    if not project.organization_id:
+        return project
+    if cache is not None:
+        project.organization = cache.get(project.organization_id)
+        return project
+    row = conn.execute(
+        "SELECT * FROM organizations WHERE id = ?", (project.organization_id,)
+    ).fetchone()
+    project.organization = _organization_from_row(row) if row else None
+    return project
+
+
 # ---------------------------------------------------------------------------
 # CRUD
 # ---------------------------------------------------------------------------
 
 
-def _unique_slug(conn: sqlite3.Connection, candidate: str) -> str:
-    """Return ``candidate`` or ``candidate-2``, ``-3`` ... if taken."""
+def _unique_slug(conn: sqlite3.Connection, candidate: str, *, table: str = "projects") -> str:
+    """Return ``candidate`` or ``candidate-2``, ``-3`` ... if taken (in ``table``)."""
     base = candidate
     n = 1
     slug = base
     while conn.execute(
-        "SELECT 1 FROM projects WHERE slug = ?", (slug,)
+        f"SELECT 1 FROM {table} WHERE slug = ?", (slug,)
     ).fetchone() is not None:
         n += 1
         suffix = f"-{n}"
@@ -435,7 +524,14 @@ def list_projects(
         sql += " WHERE archived = 0"
     sql += " ORDER BY created_at ASC"
     rows = conn.execute(sql).fetchall()
-    return [_attach_folders(conn, _project_from_row(r)) for r in rows]
+    org_cache = {
+        row["id"]: _organization_from_row(row)
+        for row in conn.execute("SELECT * FROM organizations")
+    }
+    return [
+        _attach_organization(conn, _attach_folders(conn, _project_from_row(r)), cache=org_cache)
+        for r in rows
+    ]
 
 
 def get_project(
@@ -451,7 +547,7 @@ def get_project(
         ).fetchone()
     if row is None:
         return None
-    return _attach_folders(conn, _project_from_row(row))
+    return _attach_organization(conn, _attach_folders(conn, _project_from_row(row)))
 
 
 def update_project(
@@ -628,6 +724,133 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     """Hard-delete a project and its folders (cascade)."""
     with write_txn(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Organizations (t_8b6e58a9) — optional grouping bucket for projects
+# ---------------------------------------------------------------------------
+#
+# A project's organization_id is nullable by design: nothing here ever
+# backfills existing projects into an org. Renaming/deleting an org never
+# touches project rows beyond the FK itself (ON DELETE SET NULL ungroups).
+
+
+def create_organization(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    slug: Optional[str] = None,
+    color: Optional[str] = None,
+    description: Optional[str] = None,
+) -> str:
+    """Create an organization and return its id."""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("organization name must not be empty")
+
+    slug_candidate = (normalize_slug(slug) or _slugify(name)) if slug else _slugify(name)
+    oid = _new_organization_id()
+    now = _now()
+
+    with write_txn(conn):
+        unique = _unique_slug(conn, slug_candidate, table="organizations")
+        conn.execute(
+            "INSERT INTO organizations (id, slug, name, color, description, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (oid, unique, name, color, description, now),
+        )
+    return oid
+
+
+def list_organizations(conn: sqlite3.Connection) -> List[Organization]:
+    rows = conn.execute(
+        "SELECT * FROM organizations ORDER BY created_at ASC"
+    ).fetchall()
+    return [_organization_from_row(r) for r in rows]
+
+
+def get_organization(conn: sqlite3.Connection, id_or_slug: str) -> Optional[Organization]:
+    """Look up an organization by id first, then by slug."""
+    row = conn.execute(
+        "SELECT * FROM organizations WHERE id = ?", (id_or_slug,)
+    ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT * FROM organizations WHERE slug = ?", (str(id_or_slug).lower(),)
+        ).fetchone()
+    return _organization_from_row(row) if row else None
+
+
+def update_organization(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    *,
+    name: Optional[str] = None,
+    color: Optional[str] = None,
+    description: Optional[str] = None,
+) -> bool:
+    """Patch top-level organization fields (rename, recolor, ...).
+
+    ``color``/``description`` accept an empty string to clear (store NULL) —
+    ``None`` leaves the field untouched, matching ``update_project``'s contract.
+    """
+    sets: List[str] = []
+    params: List[object] = []
+    if name is not None:
+        n = str(name).strip()
+        if not n:
+            raise ValueError("organization name must not be empty")
+        sets.append("name = ?")
+        params.append(n)
+    if color is not None:
+        sets.append("color = ?")
+        params.append(color or None)
+    if description is not None:
+        sets.append("description = ?")
+        params.append(description or None)
+    if not sets:
+        return False
+    params.append(organization_id)
+    with write_txn(conn):
+        cur = conn.execute(
+            f"UPDATE organizations SET {', '.join(sets)} WHERE id = ?", params
+        )
+    return cur.rowcount > 0
+
+
+def delete_organization(conn: sqlite3.Connection, organization_id: str) -> bool:
+    """Hard-delete an organization. Member projects ungroup (FK ON DELETE SET NULL)."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM organizations WHERE id = ?", (organization_id,)
+        )
+    return cur.rowcount > 0
+
+
+def set_project_organization(
+    conn: sqlite3.Connection, project_id: str, organization_id: Optional[str]
+) -> bool:
+    """Assign/move a project to ``organization_id``, or unset it (``None`` -> ungrouped).
+
+    Raises ``ValueError`` if ``project_id`` or a non-None ``organization_id``
+    doesn't exist — the FK would also catch this, but a explicit check gives
+    callers (RPC/CLI) a clean 4xx-shaped error instead of a raw sqlite one.
+    """
+    proj = get_project(conn, project_id)
+    if proj is None:
+        raise ValueError(f"no such project: {project_id}")
+    resolved_org_id = None
+    if organization_id is not None:
+        org = get_organization(conn, organization_id)
+        if org is None:
+            raise ValueError(f"no such organization: {organization_id}")
+        resolved_org_id = org.id
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE projects SET organization_id = ? WHERE id = ?",
+            (resolved_org_id, proj.id),
+        )
     return cur.rowcount > 0
 
 

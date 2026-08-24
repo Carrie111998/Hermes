@@ -12800,6 +12800,95 @@ def _(rid, params, pdb, conn) -> dict:
     return _ok(rid, {"active_id": pdb.get_active_id(conn)})
 
 
+@_projects_method("projects.set_organization")
+def _(rid, params, pdb, conn) -> dict:
+    """Assign/move a project into an org, or unset it (organization_id: null/omitted)."""
+    proj = _require_project(pdb, conn, params)
+    raw = params.get("organization_id")
+    org_id = str(raw).strip() if raw else None
+    pdb.set_project_organization(conn, proj.id, org_id)
+    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+
+
+# ---------------------------------------------------------------------------
+# Organizations — optional grouping bucket for projects (t_8b6e58a9)
+# ---------------------------------------------------------------------------
+
+
+class _NoOrganization(Exception):
+    """Raised inside an organizations handler when ``params['id']`` resolves to None."""
+
+
+def _organizations_method(name: str):
+    """Register an organizations RPC — same (pdb, conn) + error-mapping shape
+    as ``_projects_method``, sharing the projects.db connection/profile scope
+    (organizations live in the same per-profile store as projects)."""
+
+    def decorator(fn):
+        @method(name)
+        @_profile_scoped
+        def handler(rid, params: dict) -> dict:
+            try:
+                from hermes_cli import projects_db as pdb
+
+                with pdb.connect_closing() as conn:
+                    return fn(rid, params, pdb, conn)
+            except _NoOrganization:
+                return _err(rid, _E_NO_PROJECT, "no such organization")
+            except ValueError as e:
+                return _err(rid, _E_PROJECT_ARG, str(e))
+            except Exception as e:
+                return _err(rid, _E_PROJECTS, str(e))
+
+        return handler
+
+    return decorator
+
+
+def _require_organization(pdb, conn, params: dict):
+    org = pdb.get_organization(conn, str(params.get("id") or ""))
+    if org is None:
+        raise _NoOrganization
+    return org
+
+
+@_organizations_method("organizations.list")
+def _(rid, params, pdb, conn) -> dict:
+    return _ok(rid, {"organizations": [o.to_dict() for o in pdb.list_organizations(conn)]})
+
+
+@_organizations_method("organizations.create")
+def _(rid, params, pdb, conn) -> dict:
+    oid = pdb.create_organization(
+        conn,
+        name=str(params.get("name") or ""),
+        slug=params.get("slug"),
+        color=params.get("color"),
+        description=params.get("description"),
+    )
+    return _ok(rid, {"organization": pdb.get_organization(conn, oid).to_dict()})
+
+
+@_organizations_method("organizations.update")
+def _(rid, params, pdb, conn) -> dict:
+    org = _require_organization(pdb, conn, params)
+    pdb.update_organization(
+        conn,
+        org.id,
+        name=params.get("name"),
+        color=params.get("color"),
+        description=params.get("description"),
+    )
+    return _ok(rid, {"organization": pdb.get_organization(conn, org.id).to_dict()})
+
+
+@_organizations_method("organizations.delete")
+def _(rid, params, pdb, conn) -> dict:
+    org = _require_organization(pdb, conn, params)
+    pdb.delete_organization(conn, org.id)
+    return _ok(rid, {"organizations": [o.to_dict() for o in pdb.list_organizations(conn)]})
+
+
 @_projects_method("projects.for_cwd")
 def _(rid, params, pdb, conn) -> dict:
     cwd = _completion_cwd({"cwd": str(params.get("cwd") or "").strip()} if params.get("cwd") else {})
