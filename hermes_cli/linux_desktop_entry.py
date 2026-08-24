@@ -105,8 +105,8 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
         # loader is self-sufficient.
         return False
-    shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    shebang = head.decode("utf-8", errors="replace").strip()
+    if "python" not in shebang.lower():
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
@@ -116,9 +116,42 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # Compare against BOTH the venv bin dir and the resolved base bin dir:
     # a shebang naming either one already lands in an environment that can
     # import Hermes' dependencies.
+    #
+    # Match on path COMPONENTS, not substrings: a sibling directory such as
+    # ``/srv/x/venv/bin-extra/python`` starts with ``/srv/x/venv/bin`` and a
+    # substring test would wrongly accept it as "inside the venv", skipping
+    # the interpreter prefix the entry needs.
     exe = Path(sys.executable)
-    candidates = {str(exe.parent), str(exe.resolve().parent)}
-    return not any(d in shebang for d in candidates)
+    candidates = {exe.parent, exe.resolve().parent}
+    interpreter = _shebang_interpreter(shebang)
+    if interpreter is None:
+        return True
+    return not any(_is_within(interpreter, d) for d in candidates)
+
+
+def _shebang_interpreter(shebang: str) -> Optional[Path]:
+    """The interpreter path out of a ``#!`` line, or ``None`` if unusable.
+
+    Handles the ``#!/usr/bin/env python3`` form by taking the argument after
+    ``env`` rather than ``env`` itself.
+    """
+    parts = shebang.lstrip("#!").split()
+    if not parts:
+        return None
+    candidate = parts[0]
+    if Path(candidate).name in ("env", "env.exe"):
+        # ``#!/usr/bin/env python3`` — the real interpreter is resolved from
+        # PATH at exec time, so it is NOT a known-good absolute path.
+        return None
+    return Path(candidate)
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    """Whether ``path`` sits directly inside ``directory`` (component-wise)."""
+    try:
+        return path.parent == directory or path.parent.resolve() == directory
+    except OSError:
+        return path.parent == directory
 
 
 def _quote_exec_arg(arg: str) -> str:

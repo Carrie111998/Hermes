@@ -119,6 +119,7 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
 # Regression guard for the venv-symlink escape: when the running interpreter
 # is a venv whose bin/python symlinks to a base interpreter, the Exec line
 # must keep the venv path (which can import Hermes' deps), not the base one.
+@pytest.mark.linux_only
 def test_exec_keeps_venv_interpreter_not_symlink_target(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
 
@@ -147,6 +148,30 @@ def test_exec_keeps_venv_interpreter_not_symlink_target(tmp_path, xdg_home, monk
 
     assert exec_line.split(" ")[0].strip('"') == str(venv_python)
     assert str(base_python) not in exec_line
+
+
+# A shebang naming a SIBLING of the venv bin dir (``…/bin-extra/python``)
+# shares a string prefix with it but is a different directory, outside the
+# venv. Substring matching accepted it and skipped the interpreter prefix,
+# so the entry launched an interpreter that cannot import Hermes' deps.
+def test_needs_interpreter_rejects_sibling_of_venv_bin(tmp_path, monkeypatch):
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.write_text("#!/bin/false\n", encoding="utf-8")
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+
+    sibling = tmp_path / "venv" / "bin-extra"
+    sibling.mkdir()
+    script = tmp_path / "hermes-sibling"
+    script.write_text(f"#!{sibling / 'python'}\nimport hermes_cli\n", encoding="utf-8")
+
+    # Outside the venv despite the shared ``…/venv/bin`` prefix.
+    assert lde._needs_interpreter(script) is True
+
+    inside = tmp_path / "hermes-inside"
+    inside.write_text(f"#!{venv_bin / 'python'}\nimport hermes_cli\n", encoding="utf-8")
+    assert lde._needs_interpreter(inside) is False
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
