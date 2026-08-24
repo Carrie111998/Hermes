@@ -39,8 +39,10 @@ def test_customer_research_results_workspace_is_served_and_routed():
     assert all(label in source for label in (
         "Active", "Rejected", "Fit", "Confidence", "Country", "Buyer role", "Sources",
         "Why this verdict", "Supporting claims", "Conflicting claims", "Missing evidence",
-        "Snapshot", "SHA-256",
+        "Unknown", "Canonical English", "Original source text", "Source language",
+        "Observed", "Retrieved", "Archived", "Exact source span verified", "Snapshot", "SHA-256",
     ))
+    assert "Find decision-maker" in source
     assert "outreach" not in source.casefold()
 
 

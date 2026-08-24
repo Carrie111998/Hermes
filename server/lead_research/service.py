@@ -1,29 +1,41 @@
 """Campaign orchestration over candidate, verification, and verdict contracts."""
 from __future__ import annotations
 
+import datetime as dt
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
 from ..db import json_dump, json_load, new_id, now
+from ..agent_service import AgentRunService
+from .acquisition import CANDIDATE_STAGES, stage_index
+from .agentic import AgenticResearchService, SCHEMA_KNOWN_FACT_FIELDS
 from .candidates import CandidateRecord, CandidateRepository
-from .enrichment import FeaturePlanner, satisfied_playbook_fields
 from .discovery import CandidateDiscoveryService
 from .facts import FactRepository, FreshnessPolicy
+from .gaps import GapPlanner
 from .identity import IdentityResolver
 from .languages import build_market_terms
-from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
+from .metrics import (
+    CampaignMetricsRecorder,
+    FUNNEL_KEYS,
+    count_candidate_stage,
+    estimate_campaign,
+    zero_result_explanation,
+)
 from .models import (
-    CampaignConfig, Claim, DiscoveryQuery, ResearchFact, ResearchReadiness, ResearchResultData,
+    CampaignConfig, CampaignContext, Claim, DiscoveryQuery, LeadCandidate, LeadScore,
+    PersistedOutcome, ResearchFact, ResearchReadiness, ResearchResultData,
+    ResolvedIdentity,
 )
 from .profiles import ProfileRepository
 from .qualification import EligibilityService
 from .registry import ProviderRegistry, build_registry
 from .quotes import EvidenceRejected, accept_fact
 from .scoring import attainable_dimensions, score_lead
-from .sectors import load_sectors
 from .storage import EvidenceRepository
 from .verdicts import SourceCoverage, evaluate_verdict, terminal_value
 
@@ -48,6 +60,92 @@ class CampaignAlreadyRunning(RuntimeError):
     """A campaign cannot be queued twice; the in-flight run owns its results."""
 
 
+ACTIONABLE_VERDICTS = frozenset({"strong_fit", "review"})
+
+
+class ResearchRefreshService:
+    """Create bounded durable refresh work for stale facts already in use."""
+
+    def __init__(self, db, runs: AgentRunService, facts: FactRepository | None = None) -> None:
+        self.db = db
+        self.runs = runs
+        self.facts = facts or FactRepository(db)
+
+    def enqueue_due(self, at: dt.datetime, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        created = 0
+        for fact in self.facts.due_for_refresh(at.timestamp(), limit):
+            idempotency_key = f"lead-research-refresh:{fact.refresh_key}"
+            if self.db.one(
+                "SELECT id FROM agent_runs WHERE company_id=? AND idempotency_key=?",
+                (fact.company_id, idempotency_key),
+            ):
+                continue
+            run = self.runs.create(
+                fact.company_id,
+                "lead_research_refresh",
+                {
+                    "fact_id": fact.id,
+                    "fact_pool": fact.pool,
+                    "field": fact.field,
+                    "dedupe_key": fact.refresh_key,
+                    "organization_id": fact.organization_id,
+                    "company_name": fact.organization_name,
+                    "canonical_domain": fact.canonical_domain,
+                    "campaign_id": fact.campaign_id,
+                    "previous_value_en": fact.value_en,
+                    "previous_evidence_id": fact.evidence_id,
+                    "previous_expires_at": fact.expires_at,
+                    # Refresh is deliberately much smaller than foreground
+                    # company research. The durable run remains cancellable
+                    # and cannot expand this budget from model output.
+                    "budget": {
+                        "page_limit": 2,
+                        "request_limit": 3,
+                        "time_limit_seconds": 45,
+                        "token_limit": 2_000,
+                    },
+                },
+                idempotency_key=idempotency_key,
+            )
+            self.runs.start(fact.company_id, run["id"])
+            created += 1
+        return created
+
+
+def result_snapshot(
+    context: CampaignContext,
+    organization: ResolvedIdentity,
+    score: LeadScore,
+    fact_ids: list[str],
+    verdict,
+) -> dict:
+    evidence_ids = list(dict.fromkeys(
+        evidence_id
+        for ids in score.dimension_evidence_ids.values()
+        for evidence_id in ids
+    ))
+    return {
+        "campaign_id": context.campaign_id,
+        "profile_version_id": context.profile_version.id,
+        "scope": context.scope,
+        "playbook_versions": context.profile_version.profile.playbook_versions,
+        "source_policy": context.config.enrichment.source_policy,
+        "weights": context.config.scoring.weights.model_dump(mode="json"),
+        "organization": organization.model_dump(mode="json"),
+        "score": score.model_dump(mode="json"),
+        "fact_ids": list(dict.fromkeys(fact_ids)),
+        "evidence_ids": evidence_ids,
+        "verdict": {
+            "kind": verdict.kind,
+            "reasons": verdict.reasons,
+            "missing_evidence": verdict.missing_evidence,
+            "conflicting_claims": verdict.conflicting_claims,
+        },
+    }
+
+
 class LeadResearchService:
     def __init__(
         self,
@@ -56,12 +154,16 @@ class LeadResearchService:
         *,
         workers: int = 2,
         verify_workers: int = 4,
+        agent_runs: AgentRunService | None = None,
     ):
         self.db = db
         self.registry = registry or build_registry()
         self.candidates = CandidateRepository(db)
         self.discovery = CandidateDiscoveryService(db, self.registry)
-        self._planner = FeaturePlanner()
+        self._gap_planner = GapPlanner()
+        self._facts = FactRepository(db)
+        self._agent_runs = agent_runs
+        self._agentic: AgenticResearchService | None = None
         # A campaign is minutes-to-hours of blocking HTTP: three Web Unlocker
         # fetches per candidate, hundreds of candidates. It cannot run inside a
         # request handler, so it runs here — same shape as
@@ -115,7 +217,14 @@ class LeadResearchService:
         }
         if not available.intersection(config.enabled_source_ids):
             missing.append("runnable_candidate_source")
-        return ResearchReadiness(ready=not missing, missing=missing)
+        return ResearchReadiness(
+            ready=not missing,
+            missing=missing,
+            zero_result_explanation=(
+                "no_candidate_source_runnable"
+                if "runnable_candidate_source" in missing else None
+            ),
+        )
 
     def discovery_query(self, campaign_id: str, company_id: str) -> DiscoveryQuery:
         row = self.db.one(
@@ -185,6 +294,7 @@ class LeadResearchService:
             result = {
                 "status": "failed", "campaign_id": campaign_id,
                 "metrics": {}, "failed_source_ids": [], "processing_error": diagnostic,
+                "zero_result_explanation": "sources_failed",
             }
             self._try_save_processing_issue(
                 company_id, campaign_id, None, "campaign_processing_failed", diagnostic,
@@ -211,6 +321,51 @@ class LeadResearchService:
             return
         self._closed = True
         self._pool.shutdown(wait=False, cancel_futures=True)
+        if self._agent_runs is not None:
+            self._agent_runs.pool.shutdown(wait=False, cancel_futures=True)
+
+    def _agentic_service(self) -> AgenticResearchService:
+        if self._agent_runs is None:
+            self._agent_runs = AgentRunService(self.db)
+        if self._agentic is None:
+            self._agentic = AgenticResearchService(
+                self.db, runs=self._agent_runs, facts=self._facts,
+            )
+        return self._agentic
+
+    def _checkpoint_candidate(
+        self,
+        company_id: str,
+        campaign_id: str,
+        partition: dict,
+        candidate_id: str,
+        stage: str,
+        *,
+        requests_started: int | None = None,
+    ) -> None:
+        """Persist monotonic per-candidate progress in the partition checkpoint."""
+        stage_index(stage)
+        checkpoints = partition.setdefault("checkpoints", {})
+        previous = checkpoints.get(candidate_id, {})
+        previous_stage = previous.get("stage")
+        if previous_stage and stage_index(stage) < stage_index(previous_stage):
+            raise ValueError("candidate stage cannot move backwards")
+        checkpoints[candidate_id] = {
+            "stage": stage,
+            "requests_started": (
+                previous.get("requests_started", 0)
+                if requests_started is None else int(requests_started)
+            ),
+            "updated_at": now(),
+        }
+        self.db.execute(
+            "UPDATE campaign_partitions SET checkpoint=?,updated_at=? "
+            "WHERE id=? AND company_id=? AND campaign_id=?",
+            (
+                json_dump({"candidates": checkpoints}), now(), partition["id"],
+                company_id, campaign_id,
+            ),
+        )
 
     def _cancellation_requested(self, company_id: str, campaign_id: str) -> bool:
         """Whether the tenant has asked this campaign to stop.
@@ -381,9 +536,13 @@ class LeadResearchService:
         """
         index: dict[str, str] = {}
         for row in self.db.all(
-            "SELECT id,data FROM leads WHERE company_id=?", (company_id,)
+            "SELECT id,data,resolved_organization_id FROM leads WHERE company_id=?",
+            (company_id,),
         ):
-            organization_id = json_load(row["data"], {}).get("organization_id")
+            organization_id = (
+                row["resolved_organization_id"]
+                or json_load(row["data"], {}).get("organization_id")
+            )
             if organization_id and organization_id not in index:
                 index[organization_id] = row["id"]
         return index
@@ -401,12 +560,17 @@ class LeadResearchService:
         status: str = "observed",
         validated: bool = False,
         observed_at: float | None = None,
+        period: str | None = None,
+        unit: str | None = None,
+        currency: str | None = None,
     ) -> Claim:
         numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
         claim = Claim(
             field=field,
             value=value,
-            period="2025" if numeric else None,
+            period=period or ("2025" if numeric else None),
+            unit=unit,
+            currency=currency,
             status=status,
             confidence=confidence,
             method="observed",
@@ -905,38 +1069,6 @@ class LeadResearchService:
             "sector_ids": config.sector_ids,
         }
 
-    def _enrichment_query(
-        self, query: DiscoveryQuery, config: CampaignConfig
-    ) -> DiscoveryQuery | None:
-        """A second query aimed at what the first pass did not establish.
-
-        The first pass searches the candidate's name against the campaign's own
-        terms. This one searches it against the sector's vocabulary — the words
-        a distributor actually puts on a page ("white goods", "private label",
-        "distributor wanted") — so it reaches different pages rather than
-        re-fetching the same ones at extra cost.
-        """
-        sectors = {sector.sector_id: sector for sector in load_sectors()}
-        product: list[str] = []
-        buyer: list[str] = []
-        for sector_id in config.sector_ids:
-            sector = sectors.get(sector_id)
-            if sector is None:
-                continue
-            product.extend(sector.aliases)
-            product.extend(sector.sourcing_terms)
-            buyer.extend(sector.buyer_types)
-        product = [term for term in dict.fromkeys(product) if term not in query.sector_ids]
-        buyer = [term for term in dict.fromkeys(buyer) if term not in query.buyer_types]
-        if not product and not buyer:
-            # No sector vocabulary means no new search to run. Repeating the
-            # first query would cost the same and return the same pages.
-            return None
-        return query.model_copy(update={
-            "sector_ids": product or query.sector_ids,
-            "buyer_types": buyer or query.buyer_types,
-        })
-
     def _enrich_candidate(
         self,
         config: CampaignConfig,
@@ -945,10 +1077,14 @@ class LeadResearchService:
         providers: dict,
         available_source_ids: list[str],
         bundles: list,
+        *,
+        profile_version=None,
+        organization_id: str | None = None,
+        reusable_facts=None,
     ) -> tuple[list, list[str], int]:
-        """Re-verify a candidate against the gaps its first pass left open.
+        """Fill structured criterion gaps in one field-batched pass per source.
 
-        Returns the extra bundles, the playbook fields still missing after them,
+        Returns the extra bundles, criterion fields still missing after them,
         and the requests they cost — so a run can say what it looked for,
         whether it found it, and what looking was worth.
         """
@@ -974,31 +1110,29 @@ class LeadResearchService:
             for source in bundle.sources
             for field in source.facts
         }
-        satisfied = satisfied_playbook_fields(fact_fields)
-        missing = [
-            request.field
-            for request in self._planner.missing_claims(
-                {"claims": {field: True for field in satisfied}}, config.sector_ids
-            )
-        ]
-        if not missing:
-            return [], [], 0
-
-        gap_query = self._enrichment_query(query, config)
-        if gap_query is None:
-            return [], missing, 0
-
-        # Only ask sources whose answer can actually change with the terms.
-        # TED retrieves by winner name and country, so a re-query returns the
-        # same notices and costs a request to learn nothing; a web verifier
-        # searches the terms and reaches different pages. `web_evidence` is
-        # what separates the two, and it is already declared in the catalog.
-        searchable = [
-            source_id for source_id in available_source_ids
-            if "web_evidence" in (self.registry.definitions[source_id].capabilities
-                                  if source_id in self.registry.definitions else [])
-        ]
-        if not searchable:
+        lead_candidate = LeadCandidate(
+            organization_id=organization_id or candidate.source_record_id,
+            display_name=candidate.company_name,
+            domain=candidate.domain,
+            country=candidate.country,
+            qualifying_evidence=[],
+        )
+        capabilities = self.registry.source_capabilities(
+            available_source_ids, provider_overrides=providers,
+        )
+        plan = self._gap_planner.plan(
+            profile_version,
+            config,
+            lead_candidate,
+            reusable_facts=list(reusable_facts or []),
+            capabilities=capabilities,
+            observed_fields=fact_fields,
+        )
+        missing = sorted({
+            field for gap in plan.gaps if gap.route != "reuse" for field in gap.fields
+        })
+        structured_batches = [batch for batch in plan.batches if batch.route == "structured"]
+        if not structured_batches:
             return [], missing, 0
 
         spent = 0
@@ -1007,9 +1141,14 @@ class LeadResearchService:
             for _, bundle in bundles for source in bundle.sources
         }
         extra = []
-        for source_id in searchable:
+        for batch in structured_batches:
+            source_id = batch.source_ids[0] if batch.source_ids else batch.source_hint
+            provider = providers.get(source_id)
+            research_fields = getattr(provider, "research_fields", None)
+            if not callable(research_fields):
+                continue
             try:
-                bundle = providers[source_id].verify(gap_query, candidate)
+                bundle = research_fields(candidate, frozenset(batch.fields), query)
             except Exception:
                 # A failed enrichment must never lose the first pass's evidence.
                 # The candidate keeps whatever it already had.
@@ -1025,21 +1164,249 @@ class LeadResearchService:
             seen.update(source.provenance_url for source in fresh)
             extra.append((source_id, bundle.model_copy(update={"sources": fresh})))
 
-        still_missing = [
-            request.field
-            for request in self._planner.missing_claims(
-                {"claims": {
-                    field: True for field in satisfied_playbook_fields(fact_fields | {
-                        field
-                        for _, bundle in extra
-                        for source in bundle.sources
-                        for field in source.facts
-                    })
-                }},
-                config.sector_ids,
-            )
-        ]
+        completed_fields = fact_fields | {
+            field
+            for _, bundle in extra
+            for source in bundle.sources
+            for field in source.facts
+        }
+        completed_plan = self._gap_planner.plan(
+            profile_version,
+            config,
+            lead_candidate,
+            reusable_facts=list(reusable_facts or []),
+            capabilities=capabilities,
+            observed_fields=completed_fields,
+        )
+        still_missing = sorted({
+            field
+            for gap in completed_plan.gaps
+            if gap.route != "reuse"
+            for field in gap.fields
+        })
         return extra, still_missing, spent
+
+    def _agentic_gap_plan(
+        self,
+        config: CampaignConfig,
+        candidate: CandidateRecord,
+        organization_id: str,
+        available_source_ids: list[str],
+        providers: dict,
+        reusable_facts,
+        observed_fields: set[str],
+        profile_version,
+        *,
+        fit_score: int | None = None,
+        priority_band: str | None = None,
+        qualifying_evidence=None,
+    ):
+        lead_candidate = LeadCandidate(
+            organization_id=organization_id,
+            display_name=candidate.company_name,
+            domain=candidate.domain,
+            country=candidate.country,
+            qualifying_evidence=list(qualifying_evidence or []),
+            fit_score=fit_score,
+            priority_band=priority_band,
+        )
+        plan = self._gap_planner.plan(
+            profile_version,
+            config,
+            lead_candidate,
+            reusable_facts=list(reusable_facts or []),
+            capabilities=self.registry.source_capabilities(
+                available_source_ids, provider_overrides=providers,
+            ),
+            observed_fields=observed_fields,
+        )
+        return lead_candidate, plan
+
+    def _run_agentic_gap(
+        self,
+        company_id: str,
+        campaign_id: str,
+        candidate: LeadCandidate,
+        plan,
+        config: CampaignConfig,
+    ):
+        """Run one durable gap worker, honoring campaign cancellation and time."""
+        agentic = self._agentic_service()
+        ref = agentic.enqueue_if_needed(company_id, campaign_id, candidate, plan)
+        if ref is None:
+            return [], None
+        run = self._agent_runs.start(company_id, ref.run_id)
+        deadline = time.monotonic() + config.enrichment.max_seconds_per_company
+        while run["status"] not in {"succeeded", "failed", "cancelled"}:
+            if self._cancellation_requested(company_id, campaign_id):
+                try:
+                    self._agent_runs.cancel(company_id, ref.run_id)
+                except Exception:
+                    pass
+                return [], ref
+            if time.monotonic() >= deadline:
+                try:
+                    self._agent_runs.cancel(company_id, ref.run_id)
+                except Exception:
+                    pass
+                return [], ref
+            time.sleep(.02)
+            run = self._agent_runs.get(company_id, ref.run_id)
+        if run["status"] != "succeeded":
+            return [], ref
+        return agentic.accept_result(company_id, ref.run_id), ref
+
+    def _claims_from_stored_facts(
+        self,
+        company_id: str,
+        campaign_id: str,
+        organization_id: str,
+        stored_facts,
+    ) -> list[Claim]:
+        claims: list[Claim] = []
+        for fact in stored_facts:
+            claims.append(self._save_claim(
+                company_id,
+                campaign_id,
+                organization_id,
+                fact.field,
+                fact.value_en,
+                [fact.evidence_id],
+                [fact.source_class],
+                fact.confidence,
+                status=fact.status,
+                validated=(
+                    fact.mechanically_validated
+                    and fact.source_class in {"official", "registry"}
+                ),
+                observed_at=fact.observed_at,
+                period=fact.period,
+                unit=fact.unit,
+                currency=fact.currency,
+            ))
+        return claims
+
+    def _append_score_snapshot(
+        self,
+        context: CampaignContext,
+        organization: ResolvedIdentity,
+        result_id: str,
+        score: LeadScore,
+        verdict,
+        fact_ids: list[str],
+    ) -> tuple[str, dict]:
+        snapshot = result_snapshot(context, organization, score, fact_ids, verdict)
+        snapshot_id = new_id("score")
+        self.db.execute(
+            "INSERT INTO research_score_snapshots("
+            "id,company_id,result_id,campaign_id,profile_version_id,organization_id,"
+            "snapshot_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                snapshot_id, context.company_id, result_id, context.campaign_id,
+                context.profile_version.id, organization.organization_id,
+                json_dump(snapshot), now(),
+            ),
+        )
+        self.db.execute(
+            "UPDATE research_results SET profile_version_id=?,snapshot_json=?,updated_at=? "
+            "WHERE id=? AND company_id=?",
+            (
+                context.profile_version.id, json_dump(snapshot), now(), result_id,
+                context.company_id,
+            ),
+        )
+        return snapshot_id, snapshot
+
+    def persist_outcome(
+        self,
+        context: CampaignContext,
+        organization: ResolvedIdentity,
+        score: LeadScore,
+        verdict,
+        facts,
+    ) -> PersistedOutcome:
+        """Persist one decision; rejected results never become operational leads."""
+        context = CampaignContext.model_validate(context)
+        organization = ResolvedIdentity.model_validate(organization)
+        score = LeadScore.model_validate(score)
+        fact_ids = [fact.id for fact in facts]
+        snapshot = result_snapshot(context, organization, score, fact_ids, verdict)
+        repo = EvidenceRepository(self.db, context.company_id)
+        result_id = repo.upsert_result(
+            campaign_id=context.campaign_id,
+            organization_id=organization.organization_id,
+            lead_id=None,
+            verdict=verdict.kind,
+            fit_score=score.fit_score,
+            evidence_confidence=score.evidence_confidence,
+            data=snapshot,
+        )
+        lead_id = None
+        if verdict.kind in ACTIONABLE_VERDICTS:
+            existing = self.db.one(
+                "SELECT id FROM leads WHERE company_id=? AND resolved_organization_id=?",
+                (context.company_id, organization.organization_id),
+            )
+            lead_id = existing["id"] if existing else new_id("lead")
+            stored_org = self.db.one(
+                "SELECT display_name,domain,country FROM organizations "
+                "WHERE id=? AND company_id=?",
+                (organization.organization_id, context.company_id),
+            )
+            if stored_org is None:
+                raise ValueError("resolved organization is outside the tenant")
+            stamp = now()
+            lead_data = {
+                "organization_id": organization.organization_id,
+                "research_campaign_id": context.campaign_id,
+                "fit_score": score.fit_score,
+                "evidence_confidence": score.evidence_confidence,
+                "priority_band": score.priority_band,
+                "verdict": verdict.kind,
+            }
+            if existing:
+                self.db.execute(
+                    "UPDATE leads SET company_name=?,website=?,country=?,status=?,data=?,"
+                    "resolved_organization_id=?,updated_at=? WHERE id=? AND company_id=?",
+                    (
+                        stored_org["display_name"], stored_org["domain"], stored_org["country"],
+                        "qualified" if verdict.kind == "strong_fit" else "review",
+                        json_dump(lead_data), organization.organization_id, stamp,
+                        lead_id, context.company_id,
+                    ),
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO leads("
+                    "id,company_id,scan_id,company_name,website,country,status,do_not_contact,"
+                    "data,created_at,updated_at,resolved_organization_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        lead_id, context.company_id, None, stored_org["display_name"],
+                        stored_org["domain"], stored_org["country"],
+                        "qualified" if verdict.kind == "strong_fit" else "review",
+                        0, json_dump(lead_data), stamp, stamp, organization.organization_id,
+                    ),
+                )
+            repo.upsert_result(
+                campaign_id=context.campaign_id,
+                organization_id=organization.organization_id,
+                lead_id=lead_id,
+                verdict=verdict.kind,
+                fit_score=score.fit_score,
+                evidence_confidence=score.evidence_confidence,
+                data=snapshot,
+                result_id=result_id,
+            )
+        snapshot_id, snapshot = self._append_score_snapshot(
+            context, organization, result_id, score, verdict, fact_ids,
+        )
+        return PersistedOutcome(
+            result_id=result_id,
+            lead_id=lead_id,
+            score_snapshot_id=snapshot_id,
+            snapshot=snapshot,
+        )
 
     def _product_terms(self, company_id: str, config: CampaignConfig) -> list[str]:
         terms = [*config.product_terms, *config.sector_ids, *config.hs_codes]
@@ -1087,6 +1454,10 @@ class LeadResearchService:
             "fit_score": score.fit_score,
             "evidence_confidence": score.evidence_confidence,
             "priority_band": score.priority_band,
+            "known_weight": score.known_weight,
+            "unknown_weight": score.unknown_weight,
+            "unknown_dimensions": score.unknown_dimensions,
+            "not_applicable_dimensions": score.not_applicable_dimensions,
             "verdict": verdict.kind,
             "score_dimensions": score.dimensions,
             "confidence_factors": score.confidence_factors,
@@ -1099,13 +1470,15 @@ class LeadResearchService:
         lead_status = "qualified" if verdict.kind == "strong_fit" else "review"
         if existing_id:
             self.db.execute(
-                "UPDATE leads SET company_name=?,website=?,country=?,status=?,data=?,updated_at=? WHERE id=?",
+                "UPDATE leads SET company_name=?,website=?,country=?,status=?,data=?,"
+                "resolved_organization_id=?,updated_at=? WHERE id=?",
                 (
                     organization["display_name"],
                     organization["domain"],
                     organization["country"],
                     lead_status,
                     json_dump(lead_data),
+                    organization_id,
                     now(),
                     existing_id,
                 ),
@@ -1114,7 +1487,10 @@ class LeadResearchService:
         lead_id = new_id("lead")
         stamp = now()
         self.db.execute(
-            "INSERT INTO leads VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO leads("
+            "id,company_id,scan_id,company_name,website,country,status,do_not_contact,"
+            "data,created_at,updated_at,resolved_organization_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 lead_id,
                 company_id,
@@ -1127,6 +1503,7 @@ class LeadResearchService:
                 json_dump(lead_data),
                 stamp,
                 stamp,
+                organization_id,
             ),
         )
         # Kept current within the run: two candidates can resolve to one
@@ -1140,7 +1517,12 @@ class LeadResearchService:
         result: dict | None = None
         outer_error: Exception | None = None
         fallback_run_id: str | None = None
-        fallback_output: dict = {"campaign_id": campaign_id, "metrics": {}, "failed_source_ids": []}
+        fallback_output: dict = {
+            "campaign_id": campaign_id,
+            "metrics": {},
+            "failed_source_ids": [],
+            "zero_result_explanation": "sources_failed",
+        }
         try:
             result = self._run_campaign(company_id, campaign_id)
         except Exception as exc:
@@ -1187,8 +1569,14 @@ class LeadResearchService:
         if row["status"] == "cancelled":
             # Cancelled between queueing and pickup. Claiming it as `running`
             # first would lose the cancellation and research the whole corpus.
-            return {"status": "cancelled", "run_id": None, "campaign_id": campaign_id,
-                    "metrics": {}, "failed_source_ids": []}
+            return {
+                "status": "cancelled",
+                "run_id": None,
+                "campaign_id": campaign_id,
+                "metrics": {},
+                "failed_source_ids": [],
+                "zero_result_explanation": "campaign_cancelled",
+            }
         self.ensure_catalog(company_id)
         stamp = now()
         run_id = new_id("run")
@@ -1256,6 +1644,7 @@ class LeadResearchService:
         reused_bundles = 0
         provider_requests = 0
         unresolved_gaps: set[str] = set()
+        unmapped_markets: set[str] = set()
         cancelled = False
         try:
             catalog = {item["source_id"]: item for item in self.catalog(company_id)}
@@ -1276,6 +1665,7 @@ class LeadResearchService:
                         "completed": 0,
                         "evidence": 0,
                         "errors": [],
+                        "checkpoints": {},
                     }
                     self.db.execute(
                         "INSERT INTO campaign_partitions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -1314,6 +1704,8 @@ class LeadResearchService:
                     }, frozen_profile.profile)
                     if frozen_profile else None
                 )
+                if market_terms is not None:
+                    unmapped_markets.update(market_terms.unmapped_markets)
                 queries[country] = DiscoveryQuery(
                     campaign_id=campaign_id,
                     seller_countries=config.seller_countries,
@@ -1401,6 +1793,22 @@ class LeadResearchService:
                         # already in flight instead of the whole market.
                         cancelled = True
                         break
+                    primary_source_id = (
+                        available_source_ids[0]
+                        if available_source_ids else config.enabled_source_ids[0]
+                    )
+                    primary_partition = partitions[(primary_source_id, country)]
+                    for pending in batch:
+                        self._checkpoint_candidate(
+                            company_id, campaign_id, primary_partition,
+                            pending.source_record_id, "supplied",
+                        )
+                        count_candidate_stage(metrics, "supplied")
+                        self._checkpoint_candidate(
+                            company_id, campaign_id, primary_partition,
+                            pending.source_record_id, "gated",
+                        )
+                        count_candidate_stage(metrics, "gated")
                     outcomes = self._verify_batch(
                         batch, query, available_source_ids, providers, reusable, verify_pool,
                     )
@@ -1441,26 +1849,6 @@ class LeadResearchService:
                             )
                             continue
 
-                        # A source match says the company exists and is roughly
-                        # right. It does not say whether it is worth contacting, and
-                        # the sector playbook knows what else to look for — so ask
-                        # again, aimed at what is still unknown, before scoring.
-                        if (config.enrichment.research_each_lead
-                                and enriched < config.enrichment.max_companies):
-                            extra, still_missing, enrichment_requests = self._enrich_candidate(
-                                config, query, candidate, providers, available_source_ids, bundles,
-                            )
-                            provider_requests += enrichment_requests
-                            if extra:
-                                enriched += 1
-                                bundles.extend(extra)
-                                for source_id, bundle in extra:
-                                    partition = partitions[(source_id, country)]
-                                    partition["enriched"] = partition.get("enriched", 0) + 1
-                                    partition["evidence"] += len(bundle.sources)
-                            if still_missing:
-                                unresolved_gaps.update(still_missing)
-
                         organization_id: str | None = None
                         evaluated_verdict = None
                         stage = "evidence"
@@ -1490,6 +1878,11 @@ class LeadResearchService:
                             )
                             organization_id = resolved["organization_id"]
                             metrics["resolved_organizations"] += 1
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "identified",
+                            )
+                            count_candidate_stage(metrics, "identified")
                             stage = "evidence"
                             repo.save_verification(prepared_evidence, campaign_id, organization_id)
                             self._persist_accepted_facts(
@@ -1544,6 +1937,216 @@ class LeadResearchService:
                                 ),
                             }
                             gate = eligibility.evaluate(candidate_for_gate, config)
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "eligible",
+                            )
+                            count_candidate_stage(metrics, "eligible")
+
+                            # Identity and a first eligibility assessment exist
+                            # before deep work. Fresh accepted facts are reused
+                            # before asking any structured or agentic source.
+                            stage = "reuse"
+                            reusable_facts = self._facts.reusable(
+                                company_id,
+                                organization_id,
+                                set(SCHEMA_KNOWN_FACT_FIELDS),
+                                now(),
+                            )
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "reused",
+                            )
+                            count_candidate_stage(metrics, "reused")
+
+                            # Geography, closure, an explicit tenant exclusion,
+                            # and unresolved identity are terminal for this run.
+                            # Buyer role and source coverage are researchable
+                            # gaps, so a preliminary fail on those does not prune.
+                            hard_gate_reasons = {
+                                "resolved_identity", "target_geography",
+                                "lifecycle", "exclusion_list",
+                            }
+                            may_research = not hard_gate_reasons.intersection(gate.reasons)
+
+                            stage = "structured"
+                            if (
+                                may_research
+                                and config.enrichment.research_each_lead
+                                and enriched < config.enrichment.max_companies
+                                and not self._cancellation_requested(company_id, campaign_id)
+                            ):
+                                extra, still_missing, enrichment_requests = self._enrich_candidate(
+                                    config,
+                                    query,
+                                    candidate,
+                                    providers,
+                                    available_source_ids,
+                                    bundles,
+                                    profile_version=frozen_profile,
+                                    organization_id=organization_id,
+                                    reusable_facts=reusable_facts,
+                                )
+                                provider_requests += enrichment_requests
+                                if extra:
+                                    enriched += 1
+                                    bundles.extend(extra)
+                                    for source_id, bundle in extra:
+                                        partition = partitions[(source_id, country)]
+                                        partition["enriched"] = partition.get("enriched", 0) + 1
+                                        partition["evidence"] += len(bundle.sources)
+                                    prepared_evidence = [
+                                        stored
+                                        for source_id, bundle in bundles
+                                        for stored in repo.prepare_verification(
+                                            bundle, source_id, repo.query_fingerprint(query),
+                                        )
+                                    ]
+                                    repo.save_verification(
+                                        prepared_evidence, campaign_id, organization_id,
+                                    )
+                                    self._persist_accepted_facts(
+                                        company_id, campaign_id, organization_id,
+                                        prepared_evidence,
+                                    )
+                                    # Claims are the current aggregate of all
+                                    # accepted pages, not an append of stale
+                                    # partial aggregates from the first pass.
+                                    self.db.execute(
+                                        "DELETE FROM feature_claims WHERE company_id=? "
+                                        "AND campaign_id=? AND organization_id=?",
+                                        (company_id, campaign_id, organization_id),
+                                    )
+                                    claims = self._save_claim_plan(
+                                        company_id,
+                                        campaign_id,
+                                        organization_id,
+                                        self._claim_plan(prepared_evidence),
+                                    )
+                                    reusable_facts = self._facts.reusable(
+                                        company_id,
+                                        organization_id,
+                                        set(SCHEMA_KNOWN_FACT_FIELDS),
+                                        now(),
+                                    )
+                                if still_missing:
+                                    unresolved_gaps.update(still_missing)
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "structured",
+                                requests_started=provider_requests,
+                            )
+                            count_candidate_stage(metrics, "structured")
+
+                            # Rebuild coverage and preliminary eligibility after
+                            # structured research before deciding the remaining
+                            # agentic gaps.
+                            official_domains = {
+                                _domain(source.provenance_url)
+                                for _, bundle in bundles for source in bundle.sources
+                                if source.classification == "official" and _domain(source.provenance_url)
+                            }
+                            independent_domains = {
+                                _domain(source.provenance_url)
+                                for _, bundle in bundles for source in bundle.sources
+                                if source.classification == "independent" and _domain(source.provenance_url)
+                            }
+                            registry_domains = {
+                                _domain(source.provenance_url)
+                                for source_id, bundle in bundles for source in bundle.sources
+                                if self._is_registry(source_id) and _domain(source.provenance_url)
+                            }
+                            candidate_for_gate.update({
+                                "buyer_types": list(dict.fromkeys([
+                                    *(payload.get("buyer_types") or []),
+                                    *_claimed_values(claims, "buyer_role"),
+                                ])),
+                                "official_domains": sorted(official_domains),
+                                "independent_domain_count": len(independent_domains),
+                                "lifecycle_status": next(
+                                    iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
+                                ),
+                            })
+                            gate = eligibility.evaluate(candidate_for_gate, config)
+                            stage = "scoring"
+                            preliminary_score = score_lead(
+                                candidate_for_gate, claims, config.scoring, attainable,
+                            )
+
+                            stage = "agentic"
+                            observed_fields = {claim.field for claim in claims if claim.status == "observed"}
+                            lead_candidate, remaining_plan = self._agentic_gap_plan(
+                                config,
+                                candidate,
+                                organization_id,
+                                available_source_ids,
+                                providers,
+                                reusable_facts,
+                                observed_fields,
+                                frozen_profile,
+                                fit_score=preliminary_score.fit_score,
+                                priority_band=preliminary_score.priority_band,
+                                qualifying_evidence=claims,
+                            )
+                            agentic_facts = []
+                            agentic_ref = None
+                            if (
+                                may_research
+                                and config.enrichment.enabled
+                                and enriched < config.enrichment.max_companies
+                                and not self._cancellation_requested(company_id, campaign_id)
+                            ):
+                                agentic_facts, agentic_ref = self._run_agentic_gap(
+                                    company_id, campaign_id, lead_candidate,
+                                    remaining_plan, config,
+                                )
+                                if agentic_ref is not None:
+                                    enriched += 1
+                                if agentic_facts:
+                                    claims.extend(self._claims_from_stored_facts(
+                                        company_id,
+                                        campaign_id,
+                                        organization_id,
+                                        agentic_facts,
+                                    ))
+                            if self._cancellation_requested(company_id, campaign_id):
+                                cancelled = True
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "agentic",
+                                requests_started=provider_requests,
+                            )
+                            count_candidate_stage(metrics, "agentic")
+
+                            if agentic_facts:
+                                for evidence in self.db.all(
+                                    "SELECT source_id,provenance_url,payload FROM evidence_records "
+                                    "WHERE company_id=? AND campaign_id=? AND organization_id=? "
+                                    "AND source_record_id LIKE ?",
+                                    (company_id, campaign_id, organization_id, "agentic:%"),
+                                ):
+                                    evidence_domain = _domain(evidence["provenance_url"] or "")
+                                    if not evidence_domain:
+                                        continue
+                                    details = json_load(evidence["payload"], {})
+                                    if details.get("classification") == "official":
+                                        official_domains.add(evidence_domain)
+                                    else:
+                                        independent_domains.add(evidence_domain)
+                                    if self._is_registry(evidence["source_id"]):
+                                        registry_domains.add(evidence_domain)
+                            candidate_for_gate.update({
+                                "buyer_types": list(dict.fromkeys([
+                                    *(payload.get("buyer_types") or []),
+                                    *_claimed_values(claims, "buyer_role"),
+                                ])),
+                                "official_domains": sorted(official_domains),
+                                "independent_domain_count": len(independent_domains),
+                                "lifecycle_status": next(
+                                    iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
+                                ),
+                            })
+                            gate = eligibility.evaluate(candidate_for_gate, config)
                             if gate.eligible:
                                 metrics["eligible_companies"] += 1
                             else:
@@ -1555,6 +2158,11 @@ class LeadResearchService:
                             score = score_lead(
                                 candidate_for_gate, claims, config.scoring, attainable,
                             )
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "scored",
+                            )
+                            count_candidate_stage(metrics, "scored")
                             stage = "verdict"
                             evaluated_verdict = evaluate_verdict(
                                 candidate, claims, score, gate,
@@ -1564,6 +2172,36 @@ class LeadResearchService:
                             )
                             stage = "result"
                             source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
+                            fact_ids = list(dict.fromkeys([
+                                *(fact.id for fact in reusable_facts),
+                                *(fact.id for fact in agentic_facts),
+                            ]))
+                            evidence_ids = list(dict.fromkeys(
+                                evidence_id
+                                for claim in claims
+                                for evidence_id in claim.evidence_ids
+                            ))
+                            snapshot_context = (
+                                CampaignContext(
+                                    company_id=company_id,
+                                    campaign_id=campaign_id,
+                                    profile_version=frozen_profile,
+                                    config=config,
+                                    scope=scope_snapshot,
+                                )
+                                if frozen_profile is not None else None
+                            )
+                            resolved_identity = ResolvedIdentity.model_validate(resolved)
+                            frozen_snapshot = (
+                                result_snapshot(
+                                    snapshot_context,
+                                    resolved_identity,
+                                    score,
+                                    fact_ids,
+                                    evaluated_verdict,
+                                )
+                                if snapshot_context is not None else {}
+                            )
                             result_data = ResearchResultData(
                                 reasons=evaluated_verdict.reasons,
                                 missing_evidence=evaluated_verdict.missing_evidence,
@@ -1573,13 +2211,26 @@ class LeadResearchService:
                                 independent_domains=sorted(independent_domains),
                                 score_dimensions=score.dimensions,
                                 confidence_factors=score.confidence_factors,
+                                profile_version_id=(
+                                    frozen_profile.id if frozen_profile is not None else None
+                                ),
+                                scope=scope_snapshot,
+                                playbook_versions=(
+                                    frozen_profile.profile.playbook_versions
+                                    if frozen_profile is not None else {}
+                                ),
+                                source_policy=config.enrichment.source_policy,
+                                score=score.model_dump(mode="json"),
+                                fact_ids=fact_ids,
+                                evidence_ids=evidence_ids,
+                                verdict_snapshot=frozen_snapshot.get("verdict", {}),
                             ).model_dump(mode="json")
                             previous = prior_results.get(organization_id)
                             result_identity = {
                                 "result_id": previous["id"] if previous else None,
                                 "created_at": previous["created_at"] if previous else None,
                             }
-                            repo.upsert_result(
+                            result_id = repo.upsert_result(
                                 campaign_id=campaign_id,
                                 organization_id=organization_id,
                                 lead_id=None,
@@ -1589,7 +2240,7 @@ class LeadResearchService:
                                 data=result_data,
                                 **result_identity,
                             )
-                            if evaluated_verdict.kind in {"strong_fit", "review"}:
+                            if evaluated_verdict.kind in ACTIONABLE_VERDICTS:
                                 stage = "lead"
                                 lead_id = self._upsert_lead(
                                     company_id, campaign_id, organization_id, config,
@@ -1599,7 +2250,7 @@ class LeadResearchService:
                                 )
                                 metrics["qualified_leads"] += 1
                                 stage = "result"
-                                repo.upsert_result(
+                                result_id = repo.upsert_result(
                                     campaign_id=campaign_id,
                                     organization_id=organization_id,
                                     lead_id=lead_id,
@@ -1609,6 +2260,20 @@ class LeadResearchService:
                                     data=result_data,
                                     **result_identity,
                                 )
+                            if snapshot_context is not None:
+                                self._append_score_snapshot(
+                                    snapshot_context,
+                                    resolved_identity,
+                                    result_id,
+                                    score,
+                                    evaluated_verdict,
+                                    fact_ids,
+                                )
+                            self._checkpoint_candidate(
+                                company_id, campaign_id, primary_partition,
+                                candidate.source_record_id, "materialized",
+                            )
+                            count_candidate_stage(metrics, "materialized")
                             for source_id, _ in bundles:
                                 partitions[(source_id, country)]["completed"] += 1
                         except Exception as exc:
@@ -1658,6 +2323,7 @@ class LeadResearchService:
         # never returns its bundle, so its requests are not counted.
         metrics["provider_requests"] = provider_requests
         metrics["unresolved_gaps"] = sorted(unresolved_gaps)
+        metrics["unmapped_markets"] = sorted(unmapped_markets)
 
         partition_statuses: list[str] = []
         failed_sources: set[str] = set()
@@ -1718,7 +2384,6 @@ class LeadResearchService:
             and not contact["do_not_contact"]
             and (contact["email"] or contact["phone"] or contact["linkedin_url"])
         })
-        CampaignMetricsRecorder(self.db, company_id, campaign_id).save(metrics, now())
         if cancelled:
             # Not "partial": a cancelled run stopped because it was told to,
             # and reporting a source failure would send someone to look for a
@@ -1730,10 +2395,19 @@ class LeadResearchService:
             final_status = "partial"
         else:
             final_status = "failed"
+        explanation = zero_result_explanation(
+            status=final_status,
+            metrics=metrics,
+            failed_source_ids=failed_sources,
+            unmapped_markets=unmapped_markets,
+        )
+        metrics["zero_result_explanation"] = explanation
+        CampaignMetricsRecorder(self.db, company_id, campaign_id).save(metrics, now())
         output = {
             "campaign_id": campaign_id,
             "metrics": metrics,
             "failed_source_ids": sorted(failed_sources),
+            "zero_result_explanation": explanation,
         }
         self._finalize_terminal_state(
             company_id, campaign_id, run_id, final_status, output,

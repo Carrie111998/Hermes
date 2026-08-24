@@ -11,6 +11,7 @@ from . import compliance
 from .crypto import CredentialCipher
 from .db import Database, json_dump, json_load, new_id, now
 from .email_providers import EMAIL_PROVIDERS, OutgoingEmail
+from .lead_research.contacts import eligible_cc_contact, eligible_primary_contact
 from .quality import EMAIL_IN_TEXT_RE, content_hash, is_bounce, preflight_message
 from .whatsapp_provider import WhatsAppCloudProvider
 
@@ -69,7 +70,8 @@ class OutreachService:
     def create_message(self, company_id: str, content: dict, *, channel: str = "email",
                        campaign_id: str | None = None, lead_id: str | None = None,
                        contact_id: str | None = None, data: dict | None = None) -> dict:
-        verdict = self._preflight(company_id, channel, content)
+        message = {"channel": channel, "lead_id": lead_id, "contact_id": contact_id}
+        verdict = self._message_preflight(company_id, message, content)
         status = "pending_approval" if verdict["pass"] else "qa_failed"
         message_id, stamp = new_id("msg"), now()
         self.db.execute(
@@ -105,12 +107,73 @@ class OutreachService:
             fixed_subject = fixed_subject.get(str(content.get("language") or "en").lower())
         return preflight_message(content, fixed_subject=fixed_subject).as_dict()
 
+    @staticmethod
+    def _contact_dict(row) -> dict:
+        value = dict(row)
+        value["data"] = json_load(value.get("data"), {})
+        return value
+
+    def _recipient_failures(self, company_id: str, message, content: dict) -> list[str]:
+        if message["channel"] != "email":
+            return []
+        failures: list[str] = []
+        lead_id = message["lead_id"]
+        contact_id = message["contact_id"]
+        lead = self.db.one(
+            "SELECT * FROM leads WHERE id=? AND company_id=?", (lead_id, company_id),
+        ) if lead_id else None
+        contact = self.db.one(
+            "SELECT * FROM contacts WHERE id=? AND company_id=?", (contact_id, company_id),
+        ) if contact_id else None
+        if lead and lead["do_not_contact"]:
+            failures.append("do_not_contact")
+        if contact_id and (not contact or not eligible_primary_contact(self._contact_dict(contact))):
+            failures.append("unsafe_primary_contact")
+        if contact and str(content.get("to") or "").casefold() != str(contact["email"] or "").casefold():
+            failures.append("recipient_contact_mismatch")
+
+        recipients = [content.get("to"), *(content.get("cc") or [])]
+        if any(compliance.is_suppressed(self.db, company_id, str(address or "")) for address in recipients):
+            failures.append("suppressed_recipient")
+
+        if lead_id:
+            allowed_cc = {
+                str(row["email"] or "").casefold()
+                for row in self.db.all(
+                    "SELECT * FROM contacts WHERE company_id=? AND lead_id=? AND email IS NOT NULL",
+                    (company_id, lead_id),
+                )
+                if eligible_cc_contact(self._contact_dict(row))
+                and not compliance.is_suppressed(self.db, company_id, str(row["email"] or ""))
+            }
+            if any(str(address or "").casefold() not in allowed_cc for address in (content.get("cc") or [])):
+                failures.append("unsafe_cc_contact")
+        return list(dict.fromkeys(failures))
+
+    def _message_preflight(self, company_id: str, message, content: dict) -> dict:
+        verdict = self._preflight(company_id, message["channel"], content)
+        failures = list(dict.fromkeys([
+            *verdict.get("failures", []),
+            *self._recipient_failures(company_id, message, content),
+        ]))
+        return {"pass": not failures, "failures": failures}
+
     def update_message(self, company_id: str, message_id: str, patch: dict) -> dict:
         row = self.get(company_id, message_id)
         if row["status"] in {"sent", "draft"}:
             raise HTTPException(409, "Delivered messages are immutable")
-        content = {**json_load(row["content"], {}), **patch}
-        verdict = self._preflight(company_id, row["channel"], content)
+        previous = json_load(row["content"], {})
+        previous_language = str(previous.get("language") or "en").casefold()
+        patched_language = str(patch.get("language") or previous_language).casefold()
+        if "language" in patch and patched_language != previous_language:
+            raise HTTPException(422, {
+                "code": "custom_text_language_mismatch",
+                "message": "Custom text must use the message's selected language; regenerate to change language",
+                "selected_language": previous_language,
+                "declared_language": patched_language,
+            })
+        content = {**previous, **patch, "language": previous_language}
+        verdict = self._message_preflight(company_id, row, content)
         status = "pending_approval" if verdict["pass"] else "qa_failed"
         data = {**json_load(row["data"], {}), "qa_verdict": verdict}
         self.db.execute(
@@ -123,7 +186,7 @@ class OutreachService:
     def approve(self, company_id: str, message_id: str, actor_id: str) -> dict:
         row = self.get(company_id, message_id)
         content = json_load(row["content"], {})
-        verdict = self._preflight(company_id, row["channel"], content)
+        verdict = self._message_preflight(company_id, row, content)
         if not verdict["pass"]:
             raise HTTPException(422, {"message": "Message failed deterministic preflight", **verdict})
         digest, stamp = content_hash(content), now()
@@ -226,8 +289,13 @@ class OutreachService:
         )
 
     def _eligibility(self, company_id: str, message, content: dict, mode: str) -> None:
-        if mode == "draft":
-            return
+        verdict = self._message_preflight(company_id, message, content)
+        if not verdict["pass"]:
+            if "suppressed_recipient" in verdict["failures"]:
+                raise HTTPException(409, "A recipient has unsubscribed from this company's outreach")
+            raise HTTPException(
+                409, f"Message recipients or content are no longer eligible: {', '.join(verdict['failures'])}",
+            )
         lead = self.db.one("SELECT * FROM leads WHERE id=? AND company_id=?",
                            (message["lead_id"], company_id)) if message["lead_id"] else None
         contact = self.db.one("SELECT * FROM contacts WHERE id=? AND company_id=?",
@@ -238,6 +306,11 @@ class OutreachService:
             for address in [content.get("to"), *content.get("cc", [])]:
                 if compliance.is_suppressed(self.db, company_id, str(address or "")):
                     raise HTTPException(409, f"{address} has unsubscribed from this company's outreach")
+        # Creating a provider draft is still an outbound disclosure of contact
+        # data, so recipient and QA checks above apply. Time windows, cadence,
+        # and daily send limits apply only to a real send.
+        if mode == "draft":
+            return
         country = str(content.get("country") or (lead["country"] if lead else "")).upper()
         section = self.db.one("SELECT data FROM company_sections WHERE company_id=? AND section='market_preferences'",
                               (company_id,))

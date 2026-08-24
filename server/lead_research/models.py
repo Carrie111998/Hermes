@@ -445,7 +445,12 @@ class Claim(ApiModel):
 
 class LeadCandidate(ApiModel):
     organization_id: str | None
+    display_name: str | None = None
+    domain: str | None = None
+    country: str | None = None
     qualifying_evidence: list[Any]
+    fit_score: int | None = Field(default=None, ge=0, le=100)
+    priority_band: Literal["A", "B", "C", "Rejected"] | None = None
 
     @model_validator(mode="after")
     def named_company_required(self):
@@ -453,6 +458,131 @@ class LeadCandidate(ApiModel):
             raise ValueError("a named organization is required")
         if any(isinstance(item, MarketSignal) for item in self.qualifying_evidence):
             raise ValueError("aggregate market signals cannot qualify a named lead")
+        return self
+
+
+class ResearchGap(ApiModel):
+    dimension: str
+    weight: int = Field(gt=0, le=100)
+    fields: list[str]
+    route: Literal["reuse", "structured", "agentic"]
+    required: bool
+    structured_fields: list[str] = Field(default_factory=list)
+    agentic_fields: list[str] = Field(default_factory=list)
+    reused_fact_ids: list[str] = Field(default_factory=list)
+    suppressed_fields: list[str] = Field(default_factory=list)
+
+
+class ResearchBatch(ApiModel):
+    source_hint: str
+    fields: list[str] = Field(min_length=1)
+    route: Literal["structured", "agentic"]
+    source_ids: list[str] = Field(default_factory=list)
+
+
+class ResearchGapPlan(ApiModel):
+    organization_id: str
+    gaps: list[ResearchGap]
+    batches: list[ResearchBatch]
+
+    def for_dimension(self, dimension: str) -> ResearchGap:
+        for gap in self.gaps:
+            if gap.dimension == dimension:
+                return gap
+        raise KeyError(dimension)
+
+
+class AgentRunRef(ApiModel):
+    run_id: str
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+
+
+class AgenticResearchBudget(ApiModel):
+    page_limit: int = Field(default=8, ge=1, le=50)
+    request_limit: int = Field(default=12, ge=1, le=100)
+    time_limit_seconds: int = Field(default=120, ge=1, le=1800)
+    token_limit: int = Field(default=6000, ge=1, le=100_000)
+    pages_used: int = Field(default=0, ge=0)
+    requests_used: int = Field(default=0, ge=0)
+    elapsed_seconds: float = Field(default=0, ge=0)
+    tokens_used: int = Field(default=0, ge=0)
+
+
+class AgenticResearchRequest(ApiModel):
+    campaign_id: str
+    organization_id: str
+    company_name: str
+    canonical_domain: str | None = None
+    batches: list[ResearchBatch] = Field(min_length=1)
+    market_terms: dict[str, list[str]] = Field(default_factory=dict)
+    decision_model: str = Field(min_length=1)
+    extractor_model: str | None = None
+    budget: AgenticResearchBudget = Field(default_factory=AgenticResearchBudget)
+
+
+class ResearchPage(ApiModel):
+    page_id: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    canonical_url: str
+    snapshot_content: str = Field(min_length=1)
+    raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_language: str = Field(min_length=2)
+    source_class: Literal["official", "registry", "public", "licensed", "customer"]
+    visibility: Literal["public", "licensed", "private"]
+    retrieved_at: datetime
+    observed_at: datetime | None = None
+    archive_snapshot_at: datetime | None = None
+
+    @field_validator("canonical_url")
+    @classmethod
+    def canonical_url_is_https(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("research pages require a canonical https URL")
+        return value
+
+
+class ProposedFact(ApiModel):
+    field: str = Field(min_length=1)
+    value_en: Any
+    original_text: str = Field(min_length=1)
+    source_language: str = Field(min_length=2)
+    derivation_kind: Literal["observed", "translated", "calculated"]
+    status: Literal["observed", "unknown", "conflicted", "withdrawn"] = "observed"
+    confidence: float = Field(ge=0, le=1)
+    validation_basis: str = Field(min_length=1)
+    page_id: str = Field(min_length=1)
+    span: EvidenceSpan
+    period: str | None = None
+    unit: str | None = None
+    currency: str | None = None
+    observed_at: float | None = None
+    requires_decision_model: bool = False
+
+    @model_validator(mode="after")
+    def span_matches_original_text(self):
+        if self.span.original != self.original_text:
+            raise ValueError("proposed fact original text must equal its evidence span")
+        return self
+
+
+class AgenticResearchResult(ApiModel):
+    pages: list[ResearchPage] = Field(default_factory=list)
+    facts: list[ProposedFact] = Field(default_factory=list)
+    unresolved_fields: list[str] = Field(default_factory=list)
+    requests_started: int = Field(default=0, ge=0)
+    tokens_used: int = Field(default=0, ge=0)
+    stop_reason: Literal[
+        "required_coverage", "page_limit", "request_limit", "time_limit",
+        "token_limit", "source_exhausted", "cancelled", "top_band_no_required_gap",
+    ]
+
+    @model_validator(mode="after")
+    def facts_reference_returned_pages(self):
+        page_ids = {page.page_id for page in self.pages}
+        missing = sorted({fact.page_id for fact in self.facts if fact.page_id not in page_ids})
+        if missing:
+            raise ValueError(f"facts reference unknown research pages: {missing}")
         return self
 
 
@@ -514,6 +644,7 @@ class EnrichmentProfile(ApiModel):
     enabled: bool = False
     research_each_lead: bool = False
     model_profile: str | None = None
+    extractor_model_profile: str | None = None
     trigger: Literal["missing_required", "below_completeness", "manual"] = "missing_required"
     completeness_target: int = Field(default=80, ge=0, le=100)
     max_companies: int = Field(default=25, ge=1, le=500)
@@ -592,13 +723,19 @@ class CampaignConfig(ApiModel):
 class ResearchReadiness(ApiModel):
     ready: bool
     missing: list[str] = Field(default_factory=list)
+    zero_result_explanation: str | None = None
 
 
 class LeadScore(ApiModel):
     fit_score: int = Field(ge=0, le=100)
     evidence_confidence: float = Field(ge=0, le=1)
     priority_band: Literal["A", "B", "C", "Rejected"]
+    known_weight: int = Field(default=0, ge=0, le=100)
+    unknown_weight: int = Field(default=0, ge=0, le=100)
+    unknown_dimensions: dict[str, int] = Field(default_factory=dict)
+    not_applicable_dimensions: dict[str, int] = Field(default_factory=dict)
     dimensions: dict[str, float | None]
+    dimension_evidence_ids: dict[str, list[str]] = Field(default_factory=dict)
     confidence_factors: dict[str, float]
 
 
@@ -611,6 +748,51 @@ class ResearchResultData(ApiModel):
     independent_domains: list[str] = Field(default_factory=list)
     score_dimensions: dict[str, float | None] = Field(default_factory=dict)
     confidence_factors: dict[str, float] = Field(default_factory=dict)
+    profile_version_id: str | None = None
+    scope: dict[str, Any] = Field(default_factory=dict)
+    playbook_versions: dict[str, str] = Field(default_factory=dict)
+    source_policy: str | None = None
+    score: dict[str, Any] = Field(default_factory=dict)
+    fact_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    verdict_snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class CampaignContext(ApiModel):
+    company_id: str
+    campaign_id: str
+    profile_version: CompanyProfileVersion
+    config: CampaignConfig
+    scope: dict[str, Any] = Field(default_factory=dict)
+
+
+class PersistedOutcome(ApiModel):
+    result_id: str
+    lead_id: str | None = None
+    score_snapshot_id: str
+    snapshot: dict[str, Any]
+
+
+class LabelAssignment(ApiModel):
+    id: str
+    company_id: str
+    result_id: str
+    label_id: str
+    value: str
+    scope: str
+    source: Literal["system", "admin", "outcome_analysis"]
+    actor_id: str
+    reason: str
+    profile_version_id: str
+    effective_from: float
+    effective_until: float | None = None
+
+
+class CorrectionImpact(ApiModel):
+    fact_id: str
+    result_ids: list[str] = Field(default_factory=list)
+    lead_ids: list[str] = Field(default_factory=list)
+    recomputed_result_ids: list[str] = Field(default_factory=list)
 
 
 class CampaignEstimate(ApiModel):

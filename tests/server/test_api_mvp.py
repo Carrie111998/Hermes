@@ -334,6 +334,45 @@ def test_csv_export_is_tenant_scoped():
     assert download.status_code == 200 and "Buyer GmbH" in download.content.decode("utf-8-sig")
 
 
+def test_contact_verification_does_not_treat_valid_syntax_as_evidence():
+    app, client, headers, company_id = make_client()
+    lead = client.post(
+        "/api/v1/leads", headers=headers, json={"company_name": "Buyer GmbH", "country": "DE"},
+    ).json()
+    contact_id, stamp = new_id("con"), now()
+    app.state.db.execute(
+        "INSERT INTO contacts(id,company_id,lead_id,email,status,data,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (contact_id, company_id, lead["id"], "plausible@buyer.example", "active", "{}", stamp, stamp),
+    )
+
+    response = client.post(f"/api/v1/contacts/{contact_id}/verify", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["verification_tier"] == "red"
+    assert response.json()["status"] == "active"
+    assert response.json()["method"] == "uncorroborated_address"
+
+
+def test_contacts_are_ranked_as_people_before_generic_addresses():
+    app, client, headers, company_id = make_client()
+    lead = client.post(
+        "/api/v1/leads", headers=headers, json={"company_name": "Buyer GmbH", "country": "DE"},
+    ).json()
+    for email, name in (("info@buyer.example", None), ("ayse@buyer.example", "Ayşe")):
+        response = client.post(
+            "/api/v1/contacts", headers=headers,
+            json={"lead_id": lead["id"], "email": email, "data": {"name": name} if name else {}},
+        )
+        assert response.status_code == 201, response.text
+
+    contacts = client.get(
+        f"/api/v1/contacts?lead_id={lead['id']}", headers=headers,
+    ).json()
+
+    assert [contact["contact_kind"] for contact in contacts] == ["person", "generic"]
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

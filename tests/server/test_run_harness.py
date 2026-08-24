@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from server.agent_service import (AgentRunService, BaseRunExecutor, StubRunExecutor,
                                   extract_json)
 from server.db import Database, json_dump, new_id, now
-from server.run_types import REGISTRY
+from server.run_types import READ_ONLY, REGISTRY
 
 
 def service(executor=None):
@@ -39,6 +39,14 @@ def wait(runs, company_id, run_id):
 def test_company_profile_research_run_is_registered_read_only():
     skill, builder = REGISTRY["company_profile_research"]
 
+    assert skill == "lead-research"
+    assert callable(builder)
+
+
+def test_lead_research_gap_run_is_registered_read_only():
+    skill, builder = REGISTRY["lead_research_gap"]
+
+    assert "lead_research_gap" in READ_ONLY
     assert skill == "lead-research"
     assert callable(builder)
 

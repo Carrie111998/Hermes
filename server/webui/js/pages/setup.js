@@ -2231,7 +2231,11 @@ export async function mount(root, ctx) {
         el('div', { class: 'ifz-setup-editor-actions' },
           button('Try again', { onClick: () => load({ soft: true }) })));
     }
-    const languages = languageOptions();
+    const configuredLanguages = arrayOf(state.preferences.languages);
+    const allowedLanguages = configuredLanguages.length
+      ? new Set(configuredLanguages)
+      : new Set([state.preferences.default_language || 'en']);
+    const languages = languageOptions().filter(language => allowedLanguages.has(language.value));
     let active = state.preferences.default_language || languages[0]?.value || 'en';
     if (!languages.some(language => language.value === active)) active = languages[0]?.value || 'en';
     const host = el('div', { class: 'ifz-setup-template-editor' });
@@ -2284,9 +2288,11 @@ export async function mount(root, ctx) {
         ),
         el('div', { class: 'ifz-setup-template-fields' },
           field('Subject guidance', subject, {
-            hint: 'Use a fixed subject only when your company requires one.',
+            hint: `${languageLabel(active)} only. This exact language and template version are recorded on every generated message.`,
           }),
-          field('Email body guidance', body)),
+          field('Email body guidance', body, {
+            hint: 'Both fields are required before this language can be selected for outreach.',
+          })),
         el('div', { class: 'ifz-setup-placeholders' },
           el('span', {}, 'Available details'),
           PLACEHOLDERS.map(value => el('code', {}, value))),

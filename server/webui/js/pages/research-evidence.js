@@ -1,18 +1,8 @@
 import { call } from '../api.js';
 import { badge, card, el, emptyState, fmt, modal } from '../ui.js';
+import { renderEvidence } from './research-results.js';
 
 const unwrap = value => value?.items || value || [];
-const SOURCE_LABELS = Object.freeze({
-  web: 'Public company source',
-  web_search: 'Public company source',
-  trade_data: 'Trade data',
-  exhibitor_lists: 'Trade fair listing',
-  company_registries: 'Company registry',
-  linkedin_reference: 'Public professional profile',
-  uploaded_internal_data: 'Your company records',
-  manual: 'Added by your team',
-});
-
 function sentenceLabel(value, fallback = 'Buyer signal') {
   const text = String(value || fallback).replace(/[_-]+/g, ' ').trim();
   return text ? text.charAt(0).toUpperCase() + text.slice(1) : fallback;
@@ -35,19 +25,9 @@ function confidenceCopy(claim) {
   return 'Early evidence';
 }
 
-function evidenceLink(evidence) {
-  const label = SOURCE_LABELS[evidence.source_id]
-    || sentenceLabel(evidence.source_id, 'Saved source');
-  const retrieved = evidence.retrieved_at ? ` · checked ${fmt.date(evidence.retrieved_at)}` : '';
-  if (!evidence.provenance_url) return el('span', {}, `${label}${retrieved}`);
-  return el('a', {
-    href: evidence.provenance_url,
-    target: '_blank',
-    rel: 'noreferrer',
-  }, `${label}${retrieved}`);
-}
-
-export async function openLeadEvidence(lead) {
+export async function openLeadEvidence(lead, requestedLocale = null) {
+  const locale = String(requestedLocale || document.documentElement?.lang || 'en')
+    .toLowerCase().startsWith('tr') ? 'tr' : 'en';
   const loading = el('div', { class: 'ifz-research-evidence-loading' }, 'Loading source evidence…');
   const dialog = modal({
     title: `Why ${lead.company_name} may fit`,
@@ -55,7 +35,10 @@ export async function openLeadEvidence(lead) {
     wide: true,
   });
   try {
-    const claims = unwrap(await call('research.leadClaims', { params: { leadId: lead.id } }));
+    const claims = unwrap(await call('research.leadClaims', {
+      params: { leadId: lead.id },
+      ...(locale === 'tr' ? { query: { locale } } : {}),
+    }));
     loading.replaceWith(claims.length
       ? el('div', { class: 'ifz-research-claims' }, claims.map(claim =>
           card({
@@ -71,11 +54,13 @@ export async function openLeadEvidence(lead) {
                 ? el('p', { class: 'ifz-hint ifz-mt-2' },
                     [
                       claim.period ? sentenceLabel(claim.period, 'No date range') : null,
-                      claim.verified_at ? `Checked ${fmt.dateTime(claim.verified_at)}` : null,
+                      claim.verified_at ? `Checked ${fmt.date(claim.verified_at)} ${fmt.time(claim.verified_at)}` : null,
                     ].filter(Boolean).join(' · '))
                 : null,
-              el('div', { class: 'ifz-evidence-links' },
-                (claim.evidence || []).map(evidence => evidenceLink(evidence)))),
+              (claim.evidence || []).length
+                ? el('div', { class: 'ifz-result-citations' },
+                    claim.evidence.map(evidence => renderEvidence(evidence, locale)))
+                : el('p', { class: 'ifz-hint ifz-mt-2' }, 'No cited source is attached to this claim.')),
           })))
       : emptyState({
           icon: 'search',

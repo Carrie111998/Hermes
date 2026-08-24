@@ -19,8 +19,197 @@ const ADMIN_TABS = [
   ['/admin/integrations', 'Integrations'],
   ['/admin/errors', 'Errors'],
   ['/admin/logs', 'Logs'],
+  ['/admin/research-quality', 'Research quality'],
   ['/admin/data-sources', 'Data sources'],
 ];
+
+const QUALITY_COPY = Object.freeze({
+  en: {
+    excluded: 'Excluded candidates', collapsed: 'Collapsed rows', reuse: 'Fact reuse',
+    sourceChanges: 'Source changes', requests: 'Requests', retries: 'Retries',
+    cacheHits: 'Fresh-cache hits', negativeHits: 'Negative-cache hits', failures: 'Failures',
+    tokens: 'Tokens', cost: 'Cost', budgetStops: 'Budget stops', warnings: 'Quality warnings',
+  },
+  tr: {
+    excluded: 'Hariç tutulan adaylar', collapsed: 'Birleştirilen satırlar', reuse: 'Olgu yeniden kullanımı',
+    sourceChanges: 'Kaynak değişiklikleri', requests: 'İstekler', retries: 'Yeniden denemeler',
+    cacheHits: 'Taze önbellek eşleşmeleri', negativeHits: 'Negatif önbellek eşleşmeleri', failures: 'Hatalar',
+    tokens: 'Tokenlar', cost: 'Maliyet', budgetStops: 'Bütçe duruşları', warnings: 'Kalite uyarıları',
+  },
+});
+
+function qualityLocale(value) {
+  return String(value || 'en').toLowerCase().startsWith('tr') ? 'tr' : 'en';
+}
+
+function qualityMetric(label, value, detail = null) {
+  return el('div', { class: 'ifz-quality-metric' },
+    el('dt', {}, label),
+    el('dd', {}, value ?? '—'),
+    detail ? el('small', {}, detail) : null);
+}
+
+export function renderResearchQuality(report, requestedLocale = 'en', actions = {}) {
+  const labels = QUALITY_COPY[qualityLocale(requestedLocale)];
+  const warnings = report.warnings || [];
+  const exclusions = report.exclusions || {};
+  const costs = report.costs || {};
+  const sources = report.sources || [];
+  const warningList = warnings.length
+    ? el('div', { class: 'ifz-quality-warnings' }, warnings.map(warning =>
+        el('article', { class: 'ifz-quality-warning', role: 'alert' },
+          el('div', {},
+            el('strong', {}, String(warning.code || 'quality warning').replace(/_/g, ' ')),
+            el('p', {}, warning.message || 'Research quality needs review.')),
+          warning.fact_id && actions.correctFact
+            ? button('Review correction impact', {
+                kind: 'ghost', size: 'sm', onClick: () => actions.correctFact(warning.fact_id),
+              })
+            : warning.source_id && actions.openSources
+              ? button('Review source', { kind: 'ghost', size: 'sm', onClick: actions.openSources })
+              : null)))
+    : emptyState({ icon: 'check', title: 'No research quality warnings' });
+
+  const sourceRows = sources.map(source => ({
+    ...source,
+    name: providerLabel(source.source_id).replace(/[-_]+/g, ' '),
+  }));
+  return el('div', { class: 'ifz-quality-report' },
+    el('section', { class: 'ifz-quality-section', 'aria-labelledby': 'quality-warnings-title' },
+      el('h2', { id: 'quality-warnings-title' }, labels.warnings),
+      warningList),
+    el('section', { class: 'ifz-quality-section', 'aria-labelledby': 'quality-decisions-title' },
+      el('h2', { id: 'quality-decisions-title' }, 'Candidate decisions'),
+      el('dl', { class: 'ifz-quality-ledger' },
+        qualityMetric(labels.excluded,
+          Object.values(exclusions).reduce((sum, value) => sum + Number(value || 0), 0),
+          `${exclusions.excluded_by_range || 0} excluded by range`),
+        qualityMetric(labels.collapsed, report.candidates?.collapsed_rows || 0),
+        qualityMetric(labels.reuse, report.facts?.reused_facts || 0,
+          `${report.facts?.max_consumers || 0} maximum customers per fact`),
+        qualityMetric(labels.sourceChanges,
+          warnings.filter(warning => warning.code === 'source_change').length),
+        qualityMetric('Profile versions', report.profiles?.versions || 0,
+          `${report.profiles?.thin || 0} thin`),
+        qualityMetric('Label history', report.labels?.history || 0,
+          `${report.labels?.active || 0} active`))),
+    el('section', { class: 'ifz-quality-section', 'aria-labelledby': 'quality-cost-title' },
+      el('h2', { id: 'quality-cost-title' }, 'Research cost and cache'),
+      el('dl', { class: 'ifz-quality-ledger compact' },
+        qualityMetric(labels.requests, costs.requests || 0),
+        qualityMetric(labels.retries, costs.retries || 0),
+        qualityMetric(labels.cacheHits, costs.fresh_cache_hits || 0),
+        qualityMetric(labels.negativeHits, costs.negative_cache_hits || 0),
+        qualityMetric(labels.failures, costs.failures || 0),
+        qualityMetric(labels.tokens, fmt.num(costs.tokens || 0)),
+        qualityMetric(labels.cost, Number(costs.cost || 0).toLocaleString('en-US', {
+          style: 'currency', currency: 'USD', maximumFractionDigits: 4,
+        })),
+        qualityMetric(labels.budgetStops, report.agentic?.budget_stops || 0))),
+    el('section', { class: 'ifz-quality-section', 'aria-labelledby': 'quality-sources-title' },
+      el('h2', { id: 'quality-sources-title' }, 'Source accounting'),
+      dataTable({
+        columns: [
+          { key: 'name', label: 'Source' },
+          { key: 'status', label: 'Status', render: row => badge(row.status || 'active') },
+          { key: 'requests', label: labels.requests, align: 'right' },
+          { key: 'cache_hits', label: labels.cacheHits, align: 'right' },
+          { key: 'failures', label: labels.failures, align: 'right' },
+          { key: 'partitions', label: 'Partitions', align: 'right' },
+        ],
+        rows: sourceRows,
+        empty: emptyState({ icon: 'database', title: 'No source runs have been recorded' }),
+      })),
+    el('section', { class: 'ifz-quality-section', 'aria-labelledby': 'quality-operations-title' },
+      el('h2', { id: 'quality-operations-title' }, 'Agentic and operational accounting'),
+      el('dl', { class: 'ifz-quality-ledger compact' },
+        qualityMetric('Agentic companies', report.agentic?.companies || 0),
+        qualityMetric('Pages', report.agentic?.pages || 0),
+        qualityMetric('Elapsed seconds', report.agentic?.elapsed_seconds || 0),
+        qualityMetric(labels.budgetStops, report.agentic?.budget_stops || 0),
+        qualityMetric('Derived contacts', report.contacts?.derived || 0),
+        qualityMetric('Cancellations', report.operations?.cancellations || 0),
+        qualityMetric('Provider errors', report.operations?.provider_errors || 0),
+        qualityMetric('Correction previews', report.corrections?.previews || 0))));
+}
+
+function correctionValue(raw) {
+  const text = String(raw || '').trim();
+  if (!text) throw new Error('Enter the corrected canonical English value.');
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+async function openFactCorrection(factId, afterApply) {
+  const impact = await call('admin.research.factImpact', { params: { factId } });
+  const value = input({ placeholder: 'Corrected canonical English value', autocomplete: 'off' });
+  const reason = input({ placeholder: 'Why the source fact is wrong', autocomplete: 'off' });
+  const status = el('div', { class: 'ifz-policy-lock', role: 'status' },
+    `${impact.result_ids?.length || 0} decisions and ${impact.lead_ids?.length || 0} leads may be recalculated.`);
+  const preview = button('Preview correction', { kind: 'ghost' });
+  const apply = button('Apply correction', { kind: 'danger', disabled: true });
+  const dialog = modal({
+    title: 'Correct shared research fact',
+    wide: true,
+    body: el('div', { class: 'ifz-research-stack' },
+      status,
+      field('Corrected value', value, {
+        required: true,
+        hint: 'Strings may be entered directly. Arrays, numbers and booleans use JSON.',
+      }),
+      field('Reason', reason, {
+        required: true,
+        hint: 'This is stored in the append-only correction history.',
+      })),
+    actions: [button('Cancel', { kind: 'ghost', onClick: () => dialog.close() }), preview, apply],
+  });
+
+  async function submit(shouldApply, action) {
+    if (reason.value.trim().length < 3) {
+      status.textContent = 'Explain the correction in at least three characters.';
+      return;
+    }
+    let parsed;
+    try { parsed = correctionValue(value.value); } catch (error) {
+      status.textContent = error.message;
+      return;
+    }
+    setBusy(action, true, shouldApply ? 'Applying' : 'Previewing');
+    try {
+      const result = await call('admin.research.correctFact', {
+        params: { factId },
+        body: { value_en: parsed, reason: reason.value.trim(), apply: shouldApply },
+      });
+      status.textContent = `${result.result_ids?.length || 0} decisions and ${result.lead_ids?.length || 0} leads are affected.`;
+      apply.disabled = shouldApply;
+      if (shouldApply) {
+        toast('Research fact corrected; affected decision snapshots were appended.', 'success');
+        dialog.close();
+        afterApply?.();
+      }
+    } catch (error) {
+      status.textContent = error.message || 'The correction could not be prepared.';
+    } finally {
+      setBusy(action, false);
+      if (!shouldApply && status.textContent.includes('affected')) apply.disabled = false;
+    }
+  }
+  preview.addEventListener('click', () => void submit(false, preview));
+  apply.addEventListener('click', () => void submit(true, apply));
+}
+
+export async function mountResearchQuality(root, ctx) {
+  const report = await call('admin.research.quality');
+  const locale = qualityLocale(document.documentElement?.lang || 'en');
+  withAdmin(
+    root, ctx, 'Research quality',
+    'Advisory evidence, exclusion, reuse, cost and outcome accounting across customer workspaces.',
+    '/admin/research-quality',
+    renderResearchQuality(report, locale, {
+      correctFact: factId => openFactCorrection(factId, () => ctx.navigate('/admin/research-quality')),
+      openSources: () => ctx.navigate('/admin/data-sources'),
+    }),
+  );
+}
 
 function adminNav(ctx, activePath) {
   return el('div', { class: 'ifz-admin-tabs ifz-mb-4' },

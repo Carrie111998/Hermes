@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
+from server.agent_service import StubRunExecutor
 from server.lead_research.models import (
+    AgenticResearchResult,
     DatasetDefinition,
     DiscoveryEstimate,
     DiscoveryQuery,
@@ -13,6 +17,9 @@ from server.lead_research.models import (
     ProviderHealth,
     RawPage,
     RawRecord,
+    EvidenceSpan,
+    ProposedFact,
+    ResearchPage,
     SnapshotRef,
     VerificationBundle,
     VerificationSource,
@@ -182,3 +189,301 @@ class DeterministicProvider:
 
 def deterministic_provider(definition: DatasetDefinition) -> DeterministicProvider:
     return DeterministicProvider(definition)
+
+
+def contract_definition() -> DatasetDefinition:
+    """Public verifier contract used by cross-tenant release tests."""
+    return fixture_definition().model_copy(update={
+        "display_name": "Lead research contract source",
+        "emits": ["company_name", "country", "domain", "buyer_role", "product_term"],
+    })
+
+
+class ContractProvider(DeterministicProvider):
+    """Verifier with intentionally unequal scoring dimensions.
+
+    Product evidence has breadth while buyer-role evidence is narrow. Two
+    tenants assigning those dimensions different weights must therefore reach
+    different scores even though they share the same public facts.
+    """
+
+    def verify(self, query, candidate) -> VerificationBundle:
+        del query
+        if candidate.data.get("contract_source_failure"):
+            raise RuntimeError("deterministic contract source failure")
+        if candidate.data.get("contract_abstain"):
+            return VerificationBundle(
+                candidate_source_record_id=candidate.source_record_id,
+                sources=[],
+                independent_source_count=0,
+                requests=1,
+            )
+
+        roles = [str(value) for value in candidate.data.get("buyer_types") or []] or [
+            "distributor"
+        ]
+        product_terms = ["industrial valve", "control valve", "process valve"]
+        domain = candidate.domain or f"{candidate.source_record_id}.example.test"
+        role_text = " and ".join(roles)
+        product_text = ", ".join(product_terms)
+        official_text = (
+            f"{candidate.company_name} is a {role_text} in {candidate.country}. "
+            f"Its range includes {product_text}. Website: {domain}."
+        )
+        registry_text = (
+            f"Registry profile for {candidate.company_name}: {role_text}; "
+            f"industrial valve supplier in {candidate.country}."
+        )
+        official_facts = {
+            "company_name": [candidate.company_name],
+            "country": [candidate.country],
+            "domain": [domain],
+            "buyer_role": roles,
+            "product_term": product_terms,
+        }
+        registry_facts = {
+            "company_name": [candidate.company_name],
+            "country": [candidate.country],
+            "buyer_role": roles,
+            "product_term": ["industrial valve"],
+        }
+        return VerificationBundle(
+            candidate_source_record_id=candidate.source_record_id,
+            sources=[
+                cited_source(
+                    provenance_url=f"https://{domain}",
+                    classification="official",
+                    retrieved_via=f"https://{domain}",
+                    facts=official_facts,
+                    content=official_text,
+                ),
+                cited_source(
+                    provenance_url=(
+                        "https://registry.example.test/"
+                        f"{candidate.source_record_id}"
+                    ),
+                    classification="independent",
+                    retrieved_via="https://search.example.test",
+                    facts=registry_facts,
+                    content=registry_text,
+                ),
+            ],
+            independent_source_count=1,
+            requests=2,
+        )
+
+
+class ContractRunExecutor(StubRunExecutor):
+    """Credential-free agentic gap result with exact, accepted page spans."""
+
+    def execute(self, service, run: dict) -> dict[str, Any]:
+        if run["run_type"] != "lead_research_gap":
+            return super().execute(service, run)
+        payload = run["payload"]
+        company = payload["company_name"]
+        content = f"{company} employs 450 people and serves 12 countries."
+        employee_literal = "450 people"
+        countries_literal = "12 countries"
+
+        def fact(field: str, value: str, literal: str) -> ProposedFact:
+            start = content.index(literal)
+            return ProposedFact(
+                field=field,
+                value_en=value,
+                original_text=literal,
+                source_language="en",
+                derivation_kind="observed",
+                confidence=.9,
+                validation_basis="deterministic contract extraction",
+                page_id="contract-about",
+                span=EvidenceSpan(
+                    original=literal,
+                    start=start,
+                    end=start + len(literal),
+                ),
+                period="2026",
+                observed_at=1_787_520_000.0,
+            )
+
+        page = ResearchPage(
+            page_id="contract-about",
+            source_id="agentic-web",
+            canonical_url=f"https://{payload['canonical_domain']}/about",
+            snapshot_content=content,
+            raw_hash=hashlib.sha256(content.encode()).hexdigest(),
+            source_language="en",
+            source_class="official",
+            visibility="public",
+            retrieved_at=datetime.now(timezone.utc),
+        )
+        result = AgenticResearchResult(
+            pages=[page],
+            facts=[
+                fact("employee_count", employee_literal, employee_literal),
+                fact("countries_served", countries_literal, countries_literal),
+            ],
+            unresolved_fields=[],
+            requests_started=1,
+            tokens_used=180,
+            stop_reason="required_coverage",
+        )
+        return result.model_dump(mode="json")
+
+
+@dataclass(frozen=True)
+class ContractTenant:
+    company_id: str
+    headers: dict[str, str]
+    profile_version_id: str
+
+
+@dataclass(frozen=True)
+class ContractScenarioOutcome:
+    leads: list[dict]
+    zero_result_explanation: str | None
+    status: str
+
+
+def _profile(name: str) -> dict:
+    slug = name.casefold().replace(" ", "-")
+    return {
+        "identity": {"name": name, "website": f"https://{slug}.example.test"},
+        "seller_countries": ["TR"],
+        "products": [{
+            "id": f"prd_{slug}",
+            "name": "Endüstriyel vana",
+            "english_name": "Industrial valve",
+            "hs_codes": ["8481"],
+            "sector_ids": ["industrial-machinery"],
+            "emphasis": 1,
+        }],
+        "market_preferences": {
+            "target_countries": ["DE"],
+            "languages": ["de", "en"],
+        },
+        "hidden_label_ids": ["high_export_readiness"],
+        "hidden_label_provenance": {
+            "high_export_readiness": "contract test admin policy"
+        },
+        "playbook_versions": {"industrial-machinery": "1"},
+    }
+
+
+def onboard_two_companies(client, admin_headers: dict[str, str]) -> tuple[ContractTenant, ContractTenant]:
+    tenants: list[ContractTenant] = []
+    for name in ("Contract Tenant A", "Contract Tenant B"):
+        company = client.post(
+            "/api/v1/admin/companies", headers=admin_headers, json={"name": name},
+        )
+        assert company.status_code == 201, company.text
+        admin_company_headers = {
+            **admin_headers,
+            "X-Company-ID": company.json()["id"],
+        }
+        profile = client.put(
+            "/api/v1/company/research-profile",
+            headers=admin_company_headers,
+            json=_profile(name),
+        )
+        assert profile.status_code == 200, profile.text
+        slug = name.casefold().replace(" ", "-")
+        email = f"researcher@{slug}.example.test"
+        password = "contract-test-password"
+        user = client.post(
+            "/api/v1/admin/users",
+            headers=admin_headers,
+            json={
+                "email": email,
+                "password": password,
+                "role": "customer",
+                "company_id": company.json()["id"],
+            },
+        )
+        assert user.status_code == 201, user.text
+        login = client.post(
+            "/api/v1/auth/login", json={"email": email, "password": password},
+        )
+        assert login.status_code == 200, login.text
+        headers = {
+            "Authorization": f"Bearer {login.json()['access_token']}",
+            "X-Company-ID": company.json()["id"],
+        }
+        tenants.append(ContractTenant(
+            company_id=company.json()["id"],
+            headers=headers,
+            profile_version_id=profile.json()["id"],
+        ))
+    return tenants[0], tenants[1]
+
+
+def create_and_run_campaign(
+    app,
+    client,
+    tenant: ContractTenant,
+    *,
+    product_terms: list[str],
+    countries: list[str] | None = None,
+    weights: dict[str, int] | None = None,
+    enrichment: bool = True,
+) -> dict:
+    scoring = {"weights": weights} if weights else {}
+    response = client.post(
+        "/api/v1/research-campaigns",
+        headers=tenant.headers,
+        json={
+            "name": "Contract valve buyers",
+            "target_countries": countries or ["DE"],
+            "product_terms": product_terms,
+            "sector_ids": ["industrial-machinery"],
+            "buyer_types": ["distributor"],
+            "enabled_source_ids": ["fixture-directory"],
+            "scoring": scoring,
+            "enrichment": {
+                "enabled": enrichment,
+                "model_profile": "contract-decision" if enrichment else None,
+                "extractor_model_profile": "contract-extractor" if enrichment else None,
+                "max_pages_per_company": 2,
+                "max_seconds_per_company": 10,
+                "max_tokens": 500,
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    campaign = response.json()
+    started = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start",
+        headers=tenant.headers,
+    )
+    assert started.status_code == 202, started.text
+    settled = app.state.lead_research.wait_until_settled(
+        tenant.company_id, campaign["id"], timeout=30,
+    )
+    assert settled is not None, "contract campaign did not settle"
+    return {**campaign, "settled": settled}
+
+
+def wait_for_results(app, client, tenant: ContractTenant, campaign_id: str) -> list[dict]:
+    del app
+    response = client.get(
+        f"/api/v1/research-campaigns/{campaign_id}/results",
+        headers=tenant.headers,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def contract_scenario(
+    client,
+    tenant: ContractTenant,
+    outcome: dict,
+) -> ContractScenarioOutcome:
+    """Normalize a blocked-readiness or settled-run outcome for assertions."""
+    detail = outcome.get("detail") if isinstance(outcome.get("detail"), dict) else {}
+    return ContractScenarioOutcome(
+        leads=client.get("/api/v1/leads", headers=tenant.headers).json(),
+        zero_result_explanation=(
+            outcome.get("zero_result_explanation")
+            or detail.get("zero_result_explanation")
+        ),
+        status=str(outcome.get("status") or "blocked"),
+    )

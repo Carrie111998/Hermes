@@ -12,6 +12,7 @@ from ..auth import Principal, company_scope, current_principal, require_admin
 from ..db import json_dump, json_load, new_id, now
 from ..lead_research.models import CampaignConfig
 from ..lead_research.candidates import CandidateRepository
+from ..lead_research.languages import FIXED_TR
 from ..lead_research.profiles import ProfileRepository
 from ..lead_research.sectors import load_sectors
 from ..lead_research.service import CampaignAlreadyRunning
@@ -133,7 +134,11 @@ def _insert_campaign(request: Request, company_id: str, actor_id: str, raw: dict
         raise HTTPException(422, detail={"path": "enabled_source_ids", "message": f"Unknown sources: {', '.join(unknown)}"})
     readiness = request.app.state.lead_research.validate_readiness(company_id, config)
     if not readiness.ready:
-        raise HTTPException(409, detail={"message": "Research campaign is not ready", "missing": readiness.missing})
+        raise HTTPException(409, detail={
+            "message": "Research campaign is not ready",
+            "missing": readiness.missing,
+            "zero_result_explanation": readiness.zero_result_explanation,
+        })
     campaign_id, stamp = new_id("rc"), now()
     request.app.state.db.execute(
         "INSERT INTO research_campaigns("
@@ -189,8 +194,249 @@ def _result_rows(request: Request, company_id: str, campaign_id: str, view: Resu
     return request.app.state.db.all(sql, (company_id, campaign_id))
 
 
-def _serialize_result(request: Request, row) -> dict:
+_CUSTOMER_RESULT_FIELDS = (
+    "reasons", "missing_evidence", "conflicting_claims", "source_ids",
+    "official_domains", "independent_domains", "score_dimensions",
+    "confidence_factors", "profile_version_id", "scope", "playbook_versions",
+    "source_policy",
+)
+_CUSTOMER_SCORE_FIELDS = (
+    "priority_band", "known_weight", "unknown_weight", "unknown_dimensions",
+    "not_applicable_dimensions", "dimensions", "dimension_evidence_ids",
+    "confidence_factors",
+)
+
+
+def _result_contract(row) -> tuple[dict, dict, dict]:
+    """Return only customer-safe result, score, and verdict fields.
+
+    Facts and labels can be reused across tenants, but the customer contract is
+    a campaign decision rather than a view into that storage machinery.  An
+    allow-list here prevents a future internal key from leaking merely because
+    it was added to ``research_results.data``.
+    """
     data = json_load(row["data"], {})
+    snapshot = json_load(row["snapshot_json"], {}) if "snapshot_json" in row.keys() else {}
+    score = snapshot.get("score") or data.get("score") or {}
+    verdict = snapshot.get("verdict") or data.get("verdict_snapshot") or {}
+    customer = {key: data[key] for key in _CUSTOMER_RESULT_FIELDS if key in data}
+    for key in ("reasons", "missing_evidence", "conflicting_claims"):
+        if key not in customer and key in verdict:
+            customer[key] = verdict[key]
+    customer.update({key: score[key] for key in _CUSTOMER_SCORE_FIELDS if key in score})
+    return customer, score, snapshot
+
+
+def _criteria_for_evidence(score: dict, snapshot: dict, evidence_id: str) -> list[dict]:
+    weights = snapshot.get("weights") or {}
+    result = []
+    for dimension, evidence_ids in (score.get("dimension_evidence_ids") or {}).items():
+        if evidence_id in (evidence_ids or []):
+            result.append({"dimension": dimension, "weight": int(weights.get(dimension, 0))})
+    return result
+
+
+def _display_value(request: Request, company_id: str, fact_key: str, value, locale: str):
+    if locale != "tr" or not isinstance(value, str):
+        return value
+    translated = request.app.state.db.one(
+        "SELECT display_value FROM research_translations "
+        "WHERE company_id=? AND fact_key=? AND value_en=? AND display_locale='tr' "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (company_id, fact_key, value),
+    )
+    return translated["display_value"] if translated else FIXED_TR.get(value.casefold(), value)
+
+
+def _fact_rows_for_evidence(
+    request: Request,
+    company_id: str,
+    organization_id: str,
+    field: str,
+    evidence_id: str,
+    shared_evidence_id: str | None,
+):
+    tenant = request.app.state.db.all(
+        "SELECT id,value_en,original_text,source_language,observed_at,retrieved_at,"
+        "span_start,span_end,mechanically_validated,source_class "
+        "FROM tenant_facts WHERE company_id=? AND organization_id=? "
+        "AND field=? AND evidence_id=? ORDER BY id",
+        (company_id, organization_id, field, evidence_id),
+    )
+    shared_id = shared_evidence_id or (evidence_id if evidence_id.startswith("sev_") else None)
+    shared = []
+    if shared_id:
+        shared = request.app.state.db.all(
+            "SELECT f.id,f.value_en,e.original_text,e.source_language,f.observed_at,"
+            "f.retrieved_at,e.span_start,e.span_end,f.mechanically_validated,f.source_class "
+            "FROM shared_facts f "
+            "JOIN shared_fact_evidence x ON x.fact_id=f.id "
+            "JOIN shared_evidence_records e ON e.id=x.evidence_id "
+            "JOIN research_fact_consumers c ON c.shared_fact_id=f.id AND c.company_id=? "
+            "JOIN organizations o ON o.id=? AND o.company_id=? "
+            "AND o.shared_organization_id=f.organization_id "
+            "WHERE f.field=? AND e.id=? ORDER BY f.id",
+            (company_id, organization_id, company_id, field, shared_id),
+        )
+    return [*tenant, *shared]
+
+
+def _customer_evidence(
+    request: Request,
+    company_id: str,
+    organization_id: str,
+    field: str,
+    evidence_id: str,
+    *,
+    score: dict | None = None,
+    snapshot: dict | None = None,
+    locale: str = "en",
+) -> dict | None:
+    stored = request.app.state.db.one(
+        "SELECT source_id,provenance_url,retrieved_at,observed_at,snapshot_id,raw_hash,"
+        "method,confidence,payload,shared_evidence_id FROM evidence_records "
+        "WHERE id=? AND company_id=? AND organization_id=?",
+        (evidence_id, company_id, organization_id),
+    )
+    shared_id = stored["shared_evidence_id"] if stored else None
+    shared = None
+    if not stored and evidence_id.startswith("sev_"):
+        shared = request.app.state.db.one(
+            "SELECT e.source_id,e.provenance_url,e.retrieved_at,e.raw_hash,e.source_language,"
+            "e.original_text,e.span_start,e.span_end "
+            "FROM shared_evidence_records e "
+            "JOIN shared_fact_evidence x ON x.evidence_id=e.id "
+            "JOIN shared_facts f ON f.id=x.fact_id "
+            "JOIN research_fact_consumers c ON c.shared_fact_id=f.id AND c.company_id=? "
+            "JOIN organizations o ON o.id=? AND o.company_id=? "
+            "AND o.shared_organization_id=f.organization_id "
+            "WHERE e.id=? AND f.field=? LIMIT 1",
+            (company_id, organization_id, company_id, evidence_id, field),
+        )
+        if not shared:
+            return None
+        shared_id = evidence_id
+    elif not stored:
+        return None
+
+    payload = json_load(stored["payload"], {}) if stored else {}
+    rows = _fact_rows_for_evidence(
+        request, company_id, organization_id, field, evidence_id, shared_id,
+    )
+    facts = []
+    for row in rows:
+        value = json_load(row["value_en"], None)
+        facts.append({
+            "value_en": value,
+            "display_value": _display_value(request, company_id, row["id"], value, locale),
+            "original_text": row["original_text"],
+            "source_language": row["source_language"],
+            "observed_at": row["observed_at"],
+            "retrieved_at": row["retrieved_at"],
+            "span_start": row["span_start"],
+            "span_end": row["span_end"],
+            "mechanically_validated": bool(row["mechanically_validated"]),
+            "source_class": row["source_class"],
+        })
+
+    # Older evidence rows predate fact persistence.  Their verified payload is
+    # still useful, but it is explicitly described as payload evidence rather
+    # than silently pretending a shared/tenant fact exists.
+    if not facts and stored:
+        values = (payload.get("facts") or {}).get(field) or []
+        spans = (payload.get("fact_spans") or {}).get(field) or []
+        snapshot_content = payload.get("snapshot_content") or ""
+        for index, value in enumerate(values):
+            span = spans[index] if index < len(spans) else {}
+            original = str(span.get("original") or value)
+            start, end = int(span.get("start") or 0), int(span.get("end") or 0)
+            exact = bool(
+                snapshot_content and end > start
+                and snapshot_content[start:end] == original
+            )
+            facts.append({
+                "value_en": value,
+                "display_value": FIXED_TR.get(str(value).casefold(), value) if locale == "tr" else value,
+                "original_text": original,
+                "source_language": payload.get("source_language") or "en",
+                "observed_at": stored["observed_at"],
+                "retrieved_at": stored["retrieved_at"],
+                "span_start": start,
+                "span_end": end,
+                "mechanically_validated": exact,
+                "source_class": payload.get("classification") or "public",
+            })
+
+    first = facts[0] if facts else {
+        "value_en": None, "display_value": None, "original_text": None,
+        "source_language": shared["source_language"] if shared else payload.get("source_language"),
+        "observed_at": stored["observed_at"] if stored else None,
+        "retrieved_at": stored["retrieved_at"] if stored else shared["retrieved_at"],
+        "span_start": shared["span_start"] if shared else None,
+        "span_end": shared["span_end"] if shared else None,
+        "mechanically_validated": False,
+        "source_class": payload.get("classification") or "public",
+    }
+    url = stored["provenance_url"] if stored else shared["provenance_url"]
+    return {
+        "source_id": stored["source_id"] if stored else shared["source_id"],
+        "provenance_url": url if str(url or "").startswith("https://") else None,
+        "retrieved_at": first["retrieved_at"],
+        "observed_at": first["observed_at"],
+        "archive_snapshot_at": payload.get("archive_snapshot_at"),
+        "snapshot_id": stored["snapshot_id"] if stored else None,
+        "raw_hash": stored["raw_hash"] if stored else shared["raw_hash"],
+        "method": stored["method"] if stored else "observed",
+        "confidence": stored["confidence"] if stored else None,
+        "value_en": first["value_en"],
+        "display_value": first["display_value"],
+        "original_text": first["original_text"],
+        "source_language": first["source_language"],
+        "span_start": first["span_start"],
+        "span_end": first["span_end"],
+        "mechanically_validated": first["mechanically_validated"],
+        "source_class": first["source_class"],
+        "facts": facts,
+        "criteria": _criteria_for_evidence(score or {}, snapshot or {}, evidence_id),
+    }
+
+
+def _result_evidence(request: Request, row, score: dict, snapshot: dict) -> list[dict]:
+    """Flatten the result's customer-safe citations for ranked-list display.
+
+    The claims endpoint remains the grouped detail view.  A result also needs
+    enough receipts to honor the lead-list contract without making the client
+    discover internal fact identifiers or issue one request per row.
+    """
+    citations: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for claim in request.app.state.db.all(
+        "SELECT field,evidence_ids FROM feature_claims "
+        "WHERE company_id=? AND campaign_id=? AND organization_id=? "
+        "ORDER BY field,verified_at DESC",
+        (row["company_id"], row["campaign_id"], row["organization_id"]),
+    ):
+        for evidence_id in json_load(claim["evidence_ids"], []):
+            key = (claim["field"], evidence_id)
+            if key in seen:
+                continue
+            citation = _customer_evidence(
+                request,
+                row["company_id"],
+                row["organization_id"],
+                claim["field"],
+                evidence_id,
+                score=score,
+                snapshot=snapshot,
+            )
+            if citation is not None:
+                citations.append({"field": claim["field"], **citation})
+                seen.add(key)
+    return citations
+
+
+def _serialize_result(request: Request, row) -> dict:
+    data, score, snapshot = _result_contract(row)
     organization = request.app.state.db.one(
         "SELECT display_name,domain,country FROM organizations WHERE id=? AND company_id=?",
         (row["organization_id"], row["company_id"]),
@@ -232,6 +478,7 @@ def _serialize_result(request: Request, row) -> dict:
         "evidence_confidence": row["evidence_confidence"],
         "source_ids": source_ids,
         "source_count": len(source_ids),
+        "evidence": _result_evidence(request, row, score, snapshot),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -321,7 +568,11 @@ def start_campaign(campaign_id: str, request: Request,
     config = CampaignConfig.model_validate(json_load(row["config"], {}))
     readiness = request.app.state.lead_research.validate_readiness(company_id, config)
     if not readiness.ready:
-        raise HTTPException(409, detail={"message": "Research campaign is not ready", "missing": readiness.missing})
+        raise HTTPException(409, detail={
+            "message": "Research campaign is not ready",
+            "missing": readiness.missing,
+            "zero_result_explanation": readiness.zero_result_explanation,
+        })
     # Queued, not run: a campaign is hundreds of blocking HTTP fetches, so
     # running it here held the request open for the whole campaign and any proxy
     # timeout killed it mid-run, leaving the campaign `running` forever. Poll
@@ -591,13 +842,20 @@ def campaign_results(campaign_id: str, request: Request,
 
 @router.get("/research/leads/{lead_id}/claims")
 def lead_claims(lead_id: str, request: Request,
+                locale: Literal["en", "tr"] = Query(default="en"),
                 principal: Principal = Depends(current_principal),
                 x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
     lead = request.app.state.db.one("SELECT * FROM leads WHERE id=? AND company_id=?", (lead_id, company_id))
     if not lead:
         raise HTTPException(404, "Lead not found")
-    organization_id = json_load(lead["data"], {}).get("organization_id")
+    organization_id = lead["resolved_organization_id"] or json_load(lead["data"], {}).get("organization_id")
+    latest_result = request.app.state.db.one(
+        "SELECT * FROM research_results WHERE company_id=? AND organization_id=? "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (company_id, organization_id),
+    )
+    _, score, snapshot = _result_contract(latest_result) if latest_result else ({}, {}, {})
     result = []
     for row in request.app.state.db.all(
         "SELECT * FROM feature_claims WHERE company_id=? AND organization_id=? ORDER BY field",
@@ -605,34 +863,38 @@ def lead_claims(lead_id: str, request: Request,
     ):
         data = json_load(row["data"], {})
         evidence_ids = json_load(row["evidence_ids"], [])
-        evidence = []
-        for evidence_id in evidence_ids:
-            ev = request.app.state.db.one(
-                "SELECT source_id,provenance_url,retrieved_at,snapshot_id FROM evidence_records "
-                "WHERE id=? AND company_id=?", (evidence_id, company_id),
-            )
-            if ev:
-                evidence.append(dict(ev))
+        evidence = [
+            item for evidence_id in evidence_ids
+            if (item := _customer_evidence(
+                request, company_id, organization_id, row["field"], evidence_id,
+                score=score, snapshot=snapshot, locale=locale,
+            )) is not None
+        ]
         result.append({
             "id": row["id"], "field": row["field"], "value": json_load(row["value"], None),
             "status": row["status"], "confidence": row["confidence"], "method": row["method"],
-            "evidence_ids": evidence_ids, "evidence": evidence, "verified_at": row["verified_at"], **data,
+            "evidence": evidence, "verified_at": row["verified_at"],
+            **{key: data.get(key) for key in (
+                "source_ids", "period", "unit", "currency", "applicability", "validated", "observed_at"
+            ) if key in data},
         })
     return result
 
 
 @router.get("/research/results/{result_id}/claims")
 def result_claims(result_id: str, request: Request,
+                  locale: Literal["en", "tr"] = Query(default="en"),
                   principal: Principal = Depends(current_principal),
                   x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
     result_row = request.app.state.db.one(
-        "SELECT company_id,campaign_id,organization_id FROM research_results "
+        "SELECT * FROM research_results "
         "WHERE id=? AND company_id=?",
         (result_id, company_id),
     )
     if not result_row:
         raise HTTPException(404, "Research result not found")
+    _, score, snapshot = _result_contract(result_row)
     claims = []
     for row in request.app.state.db.all(
         "SELECT * FROM feature_claims "
@@ -641,29 +903,25 @@ def result_claims(result_id: str, request: Request,
     ):
         data = json_load(row["data"], {})
         evidence_ids = json_load(row["evidence_ids"], [])
-        evidence = []
-        for evidence_id in evidence_ids:
-            stored = request.app.state.db.one(
-                "SELECT source_id,provenance_url,retrieved_at,snapshot_id,raw_hash,method,confidence "
-                "FROM evidence_records WHERE id=? AND company_id=? AND organization_id=?",
-                (evidence_id, company_id, result_row["organization_id"]),
-            )
-            if stored:
-                item = dict(stored)
-                url = item.get("provenance_url")
-                item["provenance_url"] = url if str(url or "").startswith("https://") else None
-                evidence.append(item)
+        evidence = [
+            item for evidence_id in evidence_ids
+            if (item := _customer_evidence(
+                request, company_id, result_row["organization_id"], row["field"],
+                evidence_id, score=score, snapshot=snapshot, locale=locale,
+            )) is not None
+        ]
         claims.append({
-            **data,
             "id": row["id"],
             "field": row["field"],
             "value": json_load(row["value"], None),
             "status": row["status"],
             "confidence": row["confidence"],
             "method": row["method"],
-            "evidence_ids": evidence_ids,
             "evidence": evidence,
             "verified_at": row["verified_at"],
+            **{key: data.get(key) for key in (
+                "source_ids", "period", "unit", "currency", "applicability", "validated", "observed_at"
+            ) if key in data},
         })
     return claims
 
@@ -680,8 +938,9 @@ def export_campaign(campaign_id: str, request: Request,
     ]
     fields = [
         "id", "company_name", "website", "country", "buyer_role", "verdict", "fit_score",
-        "evidence_confidence", "source_count", "reasons", "missing_evidence",
-        "conflicting_claims", "source_ids",
+        "evidence_confidence", "priority_band", "known_weight", "unknown_weight",
+        "unknown_dimensions", "not_applicable_dimensions", "source_count", "reasons",
+        "missing_evidence", "conflicting_claims", "source_ids",
     ]
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
@@ -693,6 +952,12 @@ def export_campaign(campaign_id: str, request: Request,
             "missing_evidence": ";".join(row.get("missing_evidence", [])),
             "conflicting_claims": ";".join(row.get("conflicting_claims", [])),
             "source_ids": ";".join(row.get("source_ids", [])),
+            "unknown_dimensions": ";".join(
+                f"{key}:{value}" for key, value in row.get("unknown_dimensions", {}).items()
+            ),
+            "not_applicable_dimensions": ";".join(
+                f"{key}:{value}" for key, value in row.get("not_applicable_dimensions", {}).items()
+            ),
         })
     return Response(
         content="\ufeff" + stream.getvalue(), media_type="text/csv",

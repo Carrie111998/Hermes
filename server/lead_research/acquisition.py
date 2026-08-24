@@ -6,6 +6,20 @@ from dataclasses import dataclass, field
 from .models import DiscoveryQuery
 
 
+CANDIDATE_STAGES = (
+    "supplied", "gated", "identified", "eligible", "reused",
+    "structured", "agentic", "scored", "materialized",
+)
+
+
+def stage_index(stage: str) -> int:
+    """Stable monotonic ordering for persisted candidate checkpoints."""
+    try:
+        return CANDIDATE_STAGES.index(stage)
+    except ValueError as exc:
+        raise ValueError(f"unknown research candidate stage: {stage}") from exc
+
+
 @dataclass(frozen=True)
 class CheapVerification:
     matched: bool

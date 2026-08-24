@@ -4,7 +4,7 @@ from __future__ import annotations
 import yaml
 
 from ..config import Settings
-from .models import DatasetDefinition
+from .models import DatasetDefinition, SourceCapability
 from .providers.base import CatalogProvider, Provider
 from .providers.base import CandidateSource, StructuredFactSource
 from .providers.bright_data import BrightDataVerifier
@@ -36,6 +36,45 @@ class ProviderRegistry:
 
     def list(self) -> list[DatasetDefinition]:
         return sorted(self.definitions.values(), key=lambda item: item.display_name.lower())
+
+    def source_capabilities(
+        self,
+        source_ids: list[str] | None = None,
+        provider_overrides: dict | None = None,
+    ) -> list[SourceCapability]:
+        selected = set(source_ids or self.definitions)
+        result: list[SourceCapability] = []
+        for definition in self.list():
+            if definition.source_id not in selected:
+                continue
+            provider = (provider_overrides or {}).get(
+                definition.source_id, self.get(definition.source_id),
+            )
+            access_class = {
+                "customer_upload": "customer_upload",
+                "licensed": "licensed",
+                "credentialed_public": "credentialed",
+            }.get(definition.access_tier, "public")
+            authority = (
+                "customer" if access_class == "customer_upload"
+                else "licensed" if access_class == "licensed"
+                else "registry" if "authoritative_registry" in definition.capabilities
+                else "credible"
+            )
+            result.append(SourceCapability(
+                source_id=definition.source_id,
+                candidate_discovery=isinstance(provider, CandidateSource),
+                emitted_fields=frozenset(definition.emits),
+                countries=frozenset(definition.countries),
+                sector_ids=frozenset(definition.sector_ids),
+                access_class=access_class,
+                freshness_days={field: definition.freshness_days for field in definition.emits},
+                max_concurrency=definition.max_concurrency,
+                authority=authority,
+                redistributable=definition.access_tier in {"public", "credentialed_public"},
+                executable=callable(getattr(provider, "research_fields", None)),
+            ))
+        return result
 
     def customer_catalog(self) -> list[dict]:
         result = []

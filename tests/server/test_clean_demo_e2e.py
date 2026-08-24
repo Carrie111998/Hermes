@@ -76,6 +76,33 @@ def make_clean_demo(tmp_path: Path, fake_verifier: ProviderRegistry):
     })
     assert login.status_code == 200, login.text
     headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    # Provisioning creates the account; the user still explicitly confirms the
+    # versioned research inputs before any campaign can exist.
+    profile = client.put(
+        "/api/v1/company/research-profile",
+        headers=headers,
+        json={
+            "identity": {
+                "name": "Release Gate Company",
+                "website": "https://example.test",
+            },
+            "seller_countries": ["TR"],
+            "products": [{
+                "id": "prd_release_appliance",
+                "name": "Ankastre fırın",
+                "english_name": "Built-in oven",
+                "hs_codes": ["8516"],
+                "sector_ids": ["household-appliances"],
+                "emphasis": 1,
+            }],
+            "market_preferences": {
+                "target_countries": ["DE"],
+                "languages": ["de", "en"],
+            },
+            "playbook_versions": {"household-appliances": "1"},
+        },
+    )
+    assert profile.status_code == 200, profile.text
     return db, client, headers, provisioned["company_id"]
 
 
@@ -134,6 +161,7 @@ def test_clean_demo_first_research_run(
         company_id, campaign["id"], timeout=60
     )
     assert settled is not None and settled["status"] == "succeeded", settled
+    assert settled["zero_result_explanation"] is None
 
     active = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/results", headers=headers,
@@ -147,6 +175,15 @@ def test_clean_demo_first_research_run(
     assert not ({row["id"] for row in active} & {row["id"] for row in rejected})
     assert all(row["source_ids"] for row in active)
     for row in active:
+        assert {
+            "profile_version_id", "scope", "priority_band", "known_weight",
+            "unknown_weight", "unknown_dimensions", "not_applicable_dimensions",
+            "evidence",
+        } <= row.keys()
+        assert row["known_weight"] + row["unknown_weight"] + sum(
+            row["not_applicable_dimensions"].values()
+        ) == 100
+        assert row["evidence"]
         claims = client.get(
             f"/api/v1/research/results/{row['id']}/claims", headers=headers,
         ).json()

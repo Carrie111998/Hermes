@@ -113,6 +113,14 @@ def test_every_migration_is_required_at_startup():
     assert not on_disk - set(PostgresDatabase.REQUIRED_MIGRATIONS)
 
 
+def test_verify_script_denies_direct_authenticated_shared_fact_access():
+    verify = (MIGRATIONS.parent / "verify.sql").read_text(encoding="utf-8").lower()
+
+    for table in ("shared_organizations", "shared_evidence_records", "shared_facts", "shared_fact_evidence"):
+        assert table in verify
+    assert "direct authenticated policies" in verify
+
+
 # ── dialect parity ────────────────────────────────────────────────────────────
 
 # Statements SQLite accepts and Postgres does not. Each one is a production

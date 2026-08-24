@@ -64,6 +64,9 @@ class Settings:
     digest_plan_hour: int = 8
     digest_report_hour: int = 18
     scheduler_interval_seconds: int = 300
+    research_refresh_enabled: bool = False
+    research_refresh_hour: int = 3
+    research_refresh_batch_limit: int = 10
     # Local document processing. Behavior, not deployment wiring, so these live
     # in config.yaml rather than the environment: an operator tunes them to the
     # machine's cores and the size of the documents their tenants upload.
@@ -79,6 +82,9 @@ class Settings:
     @classmethod
     def load(cls) -> "Settings":
         cfg = _config_values()
+        research_refresh = cfg.get("research_refresh") or {}
+        if not isinstance(research_refresh, dict):
+            research_refresh = {}
         home = get_hermes_home() / "interfaze"
         origins = cfg.get("cors_origins") or [
             "http://localhost:3000",
@@ -120,6 +126,11 @@ class Settings:
             digest_plan_hour=min(23, max(0, int(cfg.get("digest_plan_hour", 8)))),
             digest_report_hour=min(23, max(0, int(cfg.get("digest_report_hour", 18)))),
             scheduler_interval_seconds=max(30, int(cfg.get("scheduler_interval_seconds", 300))),
+            research_refresh_enabled=bool(research_refresh.get("enabled")),
+            research_refresh_hour=min(23, max(0, int(research_refresh.get("hour", 3)))),
+            research_refresh_batch_limit=min(
+                100, max(1, int(research_refresh.get("batch_limit", 10))),
+            ),
             document_workers=max(1, int(cfg.get("document_workers", 2))),
             document_processing_timeout_seconds=max(
                 1, int(cfg.get("document_processing_timeout_seconds", 180))

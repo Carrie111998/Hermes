@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from server.agent_service import extract_json
-from server.quality import normalize_name, preflight_message
+from server.quality import normalize_name, preflight_message, validate_outreach_text
 
 
 BASE = {"to": "anna@example.com", "cc": []}
@@ -40,6 +40,20 @@ def test_turkish_language_email_passes():
         "body": "Sayın yetkili, ürünlerimizi tanıtmak isteriz. Saygılarımızla.",
     })
     assert result.passed, result.failures
+
+
+def test_turkish_ascii_substitution_fails_quality_guard():
+    failures = validate_outreach_text(
+        "tr", "Sirketiniz icin cozum", "Urunlerimizi tanitmak ve isbirligi yapmak isteriz.",
+    )
+    assert "turkish_character_quality" in failures
+
+
+def test_turkish_character_guard_does_not_require_every_word_to_have_diacritics():
+    failures = validate_outreach_text(
+        "tr", "İş birliği fırsatı", "Sayın yetkili, yeni ürün ailemizi paylaşmak isteriz.",
+    )
+    assert "turkish_character_quality" not in failures
 
 
 def test_null_cc_does_not_crash():

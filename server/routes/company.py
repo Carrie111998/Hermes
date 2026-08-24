@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import Database, json_dump, json_load, now
 from ..lead_research.models import CompanyResearchProfile
 from ..lead_research.profiles import ProfileRepository
+from ..quality import validate_outreach_text
 from ..schemas import DataPatch
 
 
 router = APIRouter(prefix="/company", tags=["company"])
+LANGUAGE_KEY_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$")
 
 
 def _scope(principal: Principal, company_header: str | None) -> str:
@@ -117,6 +121,31 @@ def patch_email_templates(body: DataPatch, request: Request,
                           principal: Principal = Depends(current_principal),
                           x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
+    templates = body.data.get("templates")
+    if templates is not None:
+        if not isinstance(templates, dict):
+            raise HTTPException(422, {
+                "code": "invalid_email_templates", "message": "templates must be keyed by language",
+            })
+        for language, template in templates.items():
+            if not isinstance(language, str) or not LANGUAGE_KEY_RE.fullmatch(language):
+                raise HTTPException(422, {
+                    "code": "invalid_template_language", "language": language,
+                    "message": "template language must be a lowercase language code",
+                })
+            if not isinstance(template, dict) or not str(template.get("subject") or "").strip() \
+                    or not str(template.get("body") or "").strip():
+                raise HTTPException(422, {
+                    "code": "incomplete_email_template", "language": language,
+                    "message": f"{language} template requires both subject and body",
+                })
+            failures = validate_outreach_text(language, template["subject"], template["body"])
+            if failures:
+                raise HTTPException(422, {
+                    "code": "template_language_quality", "language": language,
+                    "message": f"{language} template failed language quality checks",
+                    "failures": failures,
+                })
     result = _put_section(request.app.state.db, company_id, "email_templates", body.data)
     request.app.state.db.activity(company_id, principal.id, "email_templates_updated",
                                   "company", company_id)

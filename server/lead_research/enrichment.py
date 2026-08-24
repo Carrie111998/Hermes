@@ -62,6 +62,32 @@ class FeaturePlanner:
                     requests.setdefault(field, FeatureRequest(field, "useful", 2))
         return sorted(requests.values(), key=lambda item: (item.priority, item.field))
 
+    def research_dimensions(self, sector_ids: list[str]) -> dict[str, dict]:
+        """Merged criterion fields and page hints for deterministic gap plans."""
+        defaults = (self.playbooks.get("_research_defaults") or {}).get("dimensions", {})
+        merged = {
+            dimension: {
+                **config,
+                "required": list(config.get("required", [])),
+                "useful": list(config.get("useful", [])),
+            }
+            for dimension, config in defaults.items()
+        }
+        for sector_id in sector_ids:
+            overrides = (self.playbooks.get(sector_id) or {}).get("research_dimensions", {})
+            for dimension, config in overrides.items():
+                current = merged.setdefault(dimension, {})
+                current.update({
+                    key: value for key, value in config.items()
+                    if key not in {"required", "useful"}
+                })
+                for key in ("required", "useful"):
+                    if key in config:
+                        current[key] = list(dict.fromkeys([
+                            *current.get(key, []), *config.get(key, []),
+                        ]))
+        return merged
+
 
 class EnrichmentService:
     def __init__(self, evidence_exists=None):

@@ -89,6 +89,7 @@ export async function mount(root, ctx) {
         { key: 'fit_score', label: 'Fit score', render: row => `${row.fit_score} / 100` },
         { key: 'evidence_confidence', label: 'Evidence confidence', render: row => `${Math.round(row.evidence_confidence * 100)}%` },
         { key: 'priority_band', label: 'Priority', render: row => badge(row.priority_band, row.priority_band) },
+        { key: 'unknown_weight', label: 'Unknown weight', render: row => `${row.unknown_weight ?? 0}%` },
         { key: 'buyer_type', label: 'Buyer type' },
         { key: 'applicable_feature_completeness', label: 'Completeness', render: row => `${row.applicable_feature_completeness}%` },
         { key: 'evidence', label: '', render: row => button('Inspect evidence', { kind: 'ghost', size: 'sm', onClick: () => openLeadEvidence(row) }) },

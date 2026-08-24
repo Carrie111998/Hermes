@@ -176,6 +176,16 @@ def test_a_provider_stated_dimension_score_is_still_respected():
     assert _fit([stated]) == 90
 
 
+def test_more_support_cannot_reduce_a_dimension_score():
+    one = derive_dimension_scores([_claim("product_sector_fit", .7)])["product_sector_fit"]
+    two = derive_dimension_scores([
+        _claim("product_sector_fit", .7),
+        _claim("product_sector_fit", .8, evidence=("ev_2",)),
+    ])["product_sector_fit"]
+
+    assert two >= one
+
+
 @pytest.mark.parametrize("value", [0, False, "", []])
 def test_an_empty_or_negative_observation_scores_zero_not_a_bonus(value):
     assert _dimension(_claim("product_term", value)) == 0.0
@@ -298,7 +308,7 @@ def test_a_dimension_no_source_can_reach_does_not_cost_confidence():
 
     assert attainable.evidence_confidence > fixed_denominator.evidence_confidence
     assert attainable.confidence_factors["completeness"] == 1.0
-    assert fixed_denominator.confidence_factors["completeness"] < .5
+    assert fixed_denominator.confidence_factors["completeness"] == .5
 
 
 def test_fit_is_untouched_by_the_completeness_denominator():
@@ -321,7 +331,9 @@ def test_a_missing_but_reachable_dimension_still_costs_confidence():
 
     partial = score_lead({}, without_domain, ScoringProfile(), ATTAINABLE)
 
-    assert partial.confidence_factors["completeness"] == round(2 / 3, 3)
+    # Coverage is weighted by the campaign's own criterion importance:
+    # product (25) + buyer (20) known out of those plus contactability (5).
+    assert partial.confidence_factors["completeness"] == .9
     assert partial.evidence_confidence < score_lead(
         {}, _ordinary(), ScoringProfile(), ATTAINABLE
     ).evidence_confidence
@@ -367,7 +379,7 @@ def test_no_declaration_falls_back_to_the_full_set():
 
     score = score_lead({}, single, ScoringProfile(), set())
 
-    assert score.confidence_factors["completeness"] < .2
+    assert score.confidence_factors["completeness"] == .25
 
 
 def test_attainable_dimensions_are_derived_from_declared_fields():

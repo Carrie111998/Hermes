@@ -24,6 +24,14 @@ UNKNOWN_RE = re.compile(r"\bunknown\b", re.I)
 # and would fail every legitimate "Frau Müller" email; ı/İ/ğ/Ğ/ş/Ş appear in
 # essentially all leaked Turkish operator text without false-positives.
 TURKISH_CHARS_RE = re.compile(r"[ıİğĞşŞ]")
+# Common Turkish outreach words whose ASCII-only spellings change meaning or
+# make customer-facing copy look mechanically transliterated.  This is
+# intentionally a narrow deterministic lint, not a language classifier.
+TURKISH_ASCII_SUBSTITUTIONS = frozenset({
+    "sirket", "sirketiniz", "sirketimize", "icin", "cozum", "cozumler",
+    "urun", "urunler", "urunlerimiz", "urunlerimizi", "tanitmak", "isbirligi",
+    "firsat", "firsati", "sayin", "tesekkur", "gorusebiliriz", "calisma",
+})
 BOUNCE_RE = re.compile(
     r"mailer-daemon|postmaster|undeliverable|delivery (?:failed|failure|status)|"
     r"returned mail|failure notice|spam quarantine", re.I,
@@ -87,6 +95,28 @@ def validate_contact_record(record: dict) -> list[str]:
     return failures
 
 
+def validate_outreach_text(language: str, subject: str, body: str) -> list[str]:
+    """Return deterministic language-quality failures for outreach copy.
+
+    The product's existing safety boundary is directional: distinctive
+    Turkish characters must not leak into a foreign-language send.  For
+    Turkish, catch a concentrated run of common ASCII substitutions such as
+    ``Sirketiniz icin cozum`` while allowing ordinary ASCII words, names, and
+    URLs inside otherwise correct Turkish copy.
+    """
+    language = str(language or "en").strip().lower()
+    combined = f"{subject or ''}\n{body or ''}"
+    if language != "tr":
+        return ["operator_language_contamination"] if TURKISH_CHARS_RE.search(combined) else []
+
+    tokens = re.findall(r"[A-Za-zÀ-ɏıİğĞşŞ]+", combined.casefold())
+    ascii_tokens = [token for token in tokens if token.isascii()]
+    substitutions = [token for token in ascii_tokens if token in TURKISH_ASCII_SUBSTITUTIONS]
+    if len(substitutions) >= 2 and len(substitutions) / max(len(tokens), 1) > 0.15:
+        return ["turkish_character_quality"]
+    return []
+
+
 @dataclass
 class PreflightResult:
     passed: bool
@@ -122,11 +152,7 @@ def preflight_message(
         failures.append("double_dash")
     if fixed_subject is not None and subject.strip() != fixed_subject.strip():
         failures.append("subject_mismatch")
-    # The prototype's highest-impact contamination was Turkish operator text
-    # leaking into non-Turkish messages. Full language classification remains
-    # a model/evaluation concern; this deterministic guard catches that class.
-    if language != "tr" and TURKISH_CHARS_RE.search(combined):
-        failures.append("operator_language_contamination")
+    failures.extend(validate_outreach_text(language, subject, body))
     if allowed_asset_hosts is not None:
         links = re.findall(r"https?://[^\s<>'\"]+", body)
         if any((urlparse(link).hostname or "").lower() not in allowed_asset_hosts for link in links):
@@ -136,4 +162,3 @@ def preflight_message(
 
 def is_bounce(sender: str, subject: str) -> bool:
     return bool(BOUNCE_RE.search(f"{sender} {subject}"))
-

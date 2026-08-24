@@ -165,6 +165,7 @@ const routes = [
   { path: '/admin/errors',         mount: appPage('Errors', admin.mountErrors) },
   { path: '/admin/logs',           mount: appPage('Logs', admin.mountLogs) },
   { path: '/admin/data-sources',   mount: appPage('Data Sources', admin.mountDataSources) },
+  { path: '/admin/research-quality', mount: appPage('Research Quality', admin.mountResearchQuality) },
   // Research configuration is operator machinery: scoring weights, enrichment and
   // model profiles. It stays available, behind the admin guard.
   { path: '/admin/research',       mount: appPage('Research', research.mount) },

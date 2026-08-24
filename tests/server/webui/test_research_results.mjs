@@ -40,6 +40,8 @@ function responseFor(url) {
   if (url === '/api/v1/research-campaigns/rc_1/results?view=active') return [{
     id: 'result_active', organization_id: 'org_1', company_name: 'Atlas DE',
     verdict: 'strong_fit', fit_score: 91, evidence_confidence: 0.88,
+    priority_band: 'A', known_weight: 70, unknown_weight: 30,
+    unknown_dimensions: { commercial_scale: 30 },
     country: 'DE', buyer_role: 'Distributor', source_count: 2,
     reasons: ['a_band_with_official_and_independent_evidence'],
     conflicting_claims: [], missing_evidence: [],
@@ -55,11 +57,70 @@ function responseFor(url) {
     confidence: 0.92, evidence: [{
       provenance_url: 'https://atlas.example.test', source_id: 'fixture-directory',
       retrieved_at: 1786900000, snapshot_id: 'snap_1', raw_hash: 'a'.repeat(64),
+      value_en: 'distributor', original_text: 'Distribütör', source_language: 'tr',
+      observed_at: 1786810000, archive_snapshot_at: '2026-08-20T10:00:00Z',
+      mechanically_validated: true,
+      criteria: [{ dimension: 'buyer_channel_fit', weight: 20 }],
     }],
   }];
   if (url === '/api/v1/research/results/result_rejected/claims') return [];
   throw new Error(`unstubbed request: ${url}`);
 }
+
+test('result summary separates fit, confidence, band, and unknown weight', async () => {
+  const { renderResearchResult } = await import('../../../server/webui/js/pages/research-results.js');
+  const summary = renderResearchResult({
+    company_name: 'Acme', fit_score: 82, evidence_confidence: .61,
+    priority_band: 'A', known_weight: 70, unknown_weight: 30,
+    unknown_dimensions: { commercial_scale: 30 }, reasons: ['strong_product_match'],
+  });
+
+  assert.match(summary.textContent, /Fit\s*82/);
+  assert.match(summary.textContent, /Confidence\s*61%/);
+  assert.match(summary.textContent, /Band\s*A/);
+  assert.match(summary.textContent, /Unknown\s*30%/);
+  assert.match(summary.textContent, /Commercial scale.*30%/);
+});
+
+test('evidence citation preserves canonical English beside the exact source span', async () => {
+  const { renderEvidence } = await import('../../../server/webui/js/pages/research-results.js');
+  const citation = renderEvidence({
+    value_en: 'distributor', original_text: 'Distribütör', source_language: 'tr',
+    observed_at: '2026-07-01T00:00:00Z', retrieved_at: '2026-08-24T00:00:00Z',
+    archive_snapshot_at: '2026-08-20T00:00:00Z',
+    provenance_url: 'https://example.test', mechanically_validated: true,
+    criteria: [{ dimension: 'buyer_channel_fit', weight: 20 }],
+  }, 'en');
+
+  assert.match(citation.textContent, /Canonical English.*distributor/);
+  assert.match(citation.textContent, /Original source text.*Distribütör/);
+  assert.match(citation.textContent, /Source language.*Turkish/);
+  assert.match(citation.textContent, /Observed/);
+  assert.match(citation.textContent, /Retrieved/);
+  assert.match(citation.textContent, /Archived/);
+  assert.match(citation.textContent, /Buyer and channel fit.*20%/);
+  assert.match(citation.textContent, /Exact source span verified/);
+  assert.ok(citation.querySelector('a[href="https://example.test"]'));
+});
+
+test('result and evidence fixed vocabulary has a Turkish view without changing source text', async () => {
+  const { renderResearchResult, renderEvidence } = await import('../../../server/webui/js/pages/research-results.js');
+  const result = renderResearchResult({
+    company_name: 'Acme', fit_score: 82, evidence_confidence: .61,
+    priority_band: 'A', known_weight: 70, unknown_weight: 30,
+    unknown_dimensions: { buying_intent: 30 }, reasons: [],
+  }, 'tr');
+  const evidence = renderEvidence({
+    value_en: 'distributor', original_text: 'Dystrybutor', source_language: 'pl',
+    retrieved_at: '2026-08-24T00:00:00Z', mechanically_validated: false,
+  }, 'tr');
+
+  assert.match(result.textContent, /Uyum\s*82/);
+  assert.match(result.textContent, /Kanıt güveni\s*61%/);
+  assert.match(result.textContent, /Bilinmeyen\s*30%/);
+  assert.match(evidence.textContent, /Kanonik İngilizce.*distributor/);
+  assert.match(evidence.textContent, /Orijinal kaynak metni.*Dystrybutor/);
+});
 
 function activeResultPair() {
   return [
@@ -177,6 +238,37 @@ test('company selection uses a native button inside an unmodified table row', as
 
   assert.match(root.querySelector('.ifz-results-detail').textContent, /Beacon AT/);
   assert.ok(requests.includes('/api/v1/research/results/result_second/claims'));
+  dispose?.();
+});
+
+test('an actionable result can start contact discovery on demand', async () => {
+  const requests = [];
+  globalThis.fetch = async (url, init = {}) => {
+    requests.push({ url, init });
+    if (url === '/api/v1/research-campaigns/rc_1/results?view=active') {
+      const [result] = responseFor(url);
+      return Response.json([{ ...result, lead_id: 'lead_1' }]);
+    }
+    if (url === '/api/v1/contacts/discover' && init.method === 'POST') {
+      return Response.json({ id: 'run_contacts', status: 'queued' }, { status: 202 });
+    }
+    return Response.json(responseFor(url));
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, params: {}, navigate() {} });
+  const action = byText(root, 'button', 'Find decision-maker');
+  assert.ok(action);
+  action.click();
+  await nextTurn();
+  await nextTurn();
+
+  const request = requests.find(item => item.url === '/api/v1/contacts/discover');
+  assert.equal(request?.init.method, 'POST');
+  assert.deepEqual(JSON.parse(request.init.body), { lead_ids: ['lead_1'] });
+  assert.match(dom.document.body.querySelector('.ifz-toasts')?.textContent || '', /Contact research started/);
   dispose?.();
 });
 

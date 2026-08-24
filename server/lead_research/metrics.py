@@ -8,6 +8,10 @@ FUNNEL_KEYS = (
     "raw_records", "named_candidates", "resolved_organizations",
     "eligible_companies", "qualified_leads", "contactable_leads",
 )
+CANDIDATE_STAGE_METRICS = tuple(f"stage_{stage}" for stage in (
+    "supplied", "gated", "identified", "eligible", "reused",
+    "structured", "agentic", "scored", "materialized",
+))
 CHEAP_GATE_REASONS = (
     "shared_relevance",
     "corpus_term",
@@ -15,6 +19,41 @@ CHEAP_GATE_REASONS = (
     "excluded_by_range",
     "cheap_verification_no_scope_signal",
 )
+
+
+def zero_result_explanation(
+    *,
+    status: str,
+    metrics: dict,
+    failed_source_ids: list[str] | tuple[str, ...] | set[str],
+    unmapped_markets: list[str] | tuple[str, ...] | set[str],
+) -> str | None:
+    """Name the terminal reason a campaign produced no actionable lead.
+
+    These values are a stable product contract, not prose inferred by the UI.
+    The precedence follows the funnel: an explicit cancellation or source
+    failure outranks downstream counters; otherwise the first stage that
+    eliminated the remaining supply explains the empty outcome.
+    """
+    if int(metrics.get("qualified_leads", 0) or 0) > 0:
+        return None
+    if status == "cancelled":
+        return "campaign_cancelled"
+    if failed_source_ids and status in {"failed", "partial"}:
+        return "sources_failed"
+    if unmapped_markets and int(metrics.get("named_candidates", 0) or 0) == 0:
+        return "product_terms_missing_local_mapping"
+
+    supplied = int(metrics.get("candidate_supply_supplied", 0) or 0)
+    excluded = int(metrics.get("candidate_supply_excluded_by_range", 0) or 0)
+    passed = int(metrics.get("candidate_supply_passed_cheap_gate", 0) or 0)
+    if supplied and excluded == supplied and passed == 0:
+        return "candidates_excluded_by_range"
+    if int(metrics.get("named_candidates", 0) or 0) == 0:
+        return "sources_named_no_candidate"
+    if int(metrics.get("eligible_companies", 0) or 0) == 0:
+        return "candidates_failed_eligibility"
+    return "researched_below_threshold"
 
 
 def count_cheap_gate(counts: dict[str, int], decision) -> None:
@@ -26,6 +65,13 @@ def count_cheap_gate(counts: dict[str, int], decision) -> None:
     )
     if decision.passed:
         counts["passed_cheap_gate"] = counts.get("passed_cheap_gate", 0) + 1
+
+
+def count_candidate_stage(metrics: dict, stage: str) -> None:
+    key = f"stage_{stage}"
+    if key not in CANDIDATE_STAGE_METRICS:
+        raise ValueError(f"unknown candidate stage metric: {stage}")
+    metrics[key] = metrics.get(key, 0) + 1
 
 
 def estimate_campaign(config: CampaignConfig, providers, history=None) -> CampaignEstimate:

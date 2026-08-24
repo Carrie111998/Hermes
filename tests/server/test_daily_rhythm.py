@@ -79,6 +79,20 @@ def test_scheduler_writes_nothing_before_the_first_hour():
     assert scheduler.tick(dawn) == 0
 
 
+def test_disabled_research_refresh_does_not_enqueue_background_runs():
+    app, _, _, company_id = make_client()
+    scheduler = DailyDigestScheduler(
+        app.state.db, plan_hour=23, report_hour=23,
+        research_refresh=app.state.research_refresh,
+        research_refresh_enabled=False,
+        research_refresh_hour=0,
+    )
+    noon = dt.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+
+    assert scheduler.tick(noon) == 0
+    assert [run for run in app.state.runs.list(company_id) if run["run_type"] == "lead_research_refresh"] == []
+
+
 def test_digest_endpoint_reports_whether_anything_was_scheduled():
     _, client, headers, _ = make_client()
 

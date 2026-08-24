@@ -94,3 +94,28 @@ def test_bright_data_behavior_is_not_read_from_environment(home, monkeypatch):
 
     assert settings.brightdata_enabled is False
     assert settings.brightdata_unlocker_zone == "cli_unlocker"
+
+
+def test_research_refresh_reads_bounded_nested_yaml_settings(home):
+    _write_config(
+        home,
+        """
+        interfaze_server:
+          scheduler_enabled: true
+          research_refresh:
+            enabled: true
+            hour: 27
+            batch_limit: 10000
+        """,
+    )
+
+    settings = Settings.load()
+
+    assert settings.research_refresh_enabled is True
+    assert settings.research_refresh_hour == 23
+    assert settings.research_refresh_batch_limit == 100
+
+
+def test_research_refresh_is_not_enabled_by_environment(home, monkeypatch):
+    monkeypatch.setenv("INTERFAZE_RESEARCH_REFRESH_ENABLED", "true")
+    assert Settings.load().research_refresh_enabled is False

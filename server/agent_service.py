@@ -24,6 +24,8 @@ from .agent_evidence import evidence_from_log, evidence_from_output
 from .db import Database, json_dump, json_load, new_id, now
 from .quality import (canonical_linkedin_url, content_hash, normalize_name,
                       preflight_message, validate_contact_record)
+from .lead_research.models import AgenticResearchRequest, AgenticResearchResult
+from .lead_research.contacts import verify_contact as verify_contact_evidence
 
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -39,6 +41,12 @@ OUTPUT_KEYS: dict[str, set[str]] = {
     },
     "lead_scan": {"leads"},
     "lead_research": {"profile", "fit", "signals", "approach_angle", "score_inputs"},
+    "lead_research_gap": {
+        "pages", "facts", "unresolved_fields", "requests_started", "tokens_used", "stop_reason",
+    },
+    "lead_research_refresh": {
+        "pages", "facts", "unresolved_fields", "requests_started", "tokens_used", "stop_reason",
+    },
     "contact_discovery": {"contacts"},
     "outreach_generation": {"body", "language", "to", "cc", "qa_verdict"},
     "email_send": {"provider_message_id", "status"},
@@ -70,6 +78,36 @@ def validate_payload(run_type: str, payload: dict, db: Database, company_id: str
         )
     if not isinstance(payload, dict):
         raise HTTPException(422, "payload must be an object")
+    if run_type == "lead_research_gap":
+        try:
+            AgenticResearchRequest.model_validate(payload)
+        except Exception as exc:
+            raise HTTPException(422, f"invalid lead research gap payload: {exc}") from exc
+    if run_type == "lead_research_refresh":
+        required = {"fact_id", "field", "dedupe_key", "organization_id", "budget"}
+        missing_refresh = sorted(required - set(payload))
+        if missing_refresh:
+            raise HTTPException(422, {
+                "message": "Missing research refresh payload fields", "fields": missing_refresh,
+            })
+        fact_id = str(payload.get("fact_id") or "")
+        if fact_id.startswith("sf_"):
+            allowed = db.one(
+                "SELECT 1 FROM research_fact_consumers WHERE company_id=? AND shared_fact_id=?",
+                (company_id, fact_id),
+            )
+        else:
+            allowed = db.one(
+                "SELECT 1 FROM tenant_facts WHERE company_id=? AND id=?",
+                (company_id, fact_id),
+            )
+        if not allowed:
+            raise HTTPException(422, "research refresh fact is outside the tenant")
+        budget = payload.get("budget") or {}
+        if int(budget.get("page_limit", 0)) > 2 or int(budget.get("request_limit", 0)) > 3 \
+                or int(budget.get("time_limit_seconds", 0)) > 45 \
+                or int(budget.get("token_limit", 0)) > 2_000:
+            raise HTTPException(422, "research refresh exceeds the background budget")
     if run_type == "company_profile_research":
         website = payload.get("official_website")
         parsed = urlsplit(str(website or ""))
@@ -186,13 +224,17 @@ class StubRunExecutor(BaseRunExecutor):
 
 
 def _stub_value(key: str):
-    if key in {"records", "rejects", "products", "leads", "contacts", "cc", "signals", "missing_data", "source_spans"}:
+    if key in {"records", "rejects", "products", "leads", "contacts", "cc", "signals", "missing_data", "source_spans", "pages", "facts", "unresolved_fields"}:
         return []
     if key == "qa_verdict":
         return {"pass": True, "failures": []}
     if key in {"score_inputs", "profile", "fit", "product_understanding", "ideal_customer_profile",
                "buyer_roles", "market_assumptions", "sales_arguments", "business_rules_digest"}:
         return {}
+    if key in {"requests_started", "tokens_used"}:
+        return 0
+    if key == "stop_reason":
+        return "source_exhausted"
     return ""
 
 
@@ -211,6 +253,8 @@ class HermesProcessExecutor(BaseRunExecutor):
         if skill is None:
             return {"metrics": service.analytics(run["company_id"])}
         command = ["hermes", "-z", prompt, "--skills", skill, "--yolo"]
+        if run["run_type"] == "lead_research_gap":
+            command.extend(["--model", run["payload"]["decision_model"]])
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, env={**os.environ},
@@ -384,6 +428,8 @@ class AgentRunService:
         missing = OUTPUT_KEYS[run_type] - set(output)
         if missing:
             raise ValueError(f"run output missing fields: {sorted(missing)}")
+        if run_type in {"lead_research_gap", "lead_research_refresh"}:
+            AgenticResearchResult.model_validate(output)
         if run_type == "company_profile_research":
             spans = output.get("source_spans")
             products = output.get("products")
@@ -403,6 +449,20 @@ class AgentRunService:
                 references = product.get("source_span_ids") if isinstance(product, dict) else None
                 if not isinstance(references, list) or not references or not set(references) <= span_ids:
                     raise ValueError("each derived product requires a valid exact source span")
+        if run_type == "contact_discovery":
+            contacts = output.get("contacts")
+            if not isinstance(contacts, list):
+                raise ValueError("contact discovery contacts must be a list")
+            for contact in contacts:
+                if not isinstance(contact, dict):
+                    raise ValueError("discovered contact must be an object")
+                evidence = contact.get("evidence", [])
+                if not isinstance(evidence, list) or any(not isinstance(item, dict) for item in evidence):
+                    raise ValueError("discovered contact evidence must be a list of objects")
+                for item in evidence:
+                    url = item.get("provenance_url")
+                    if url is not None and not str(url).startswith("https://"):
+                        raise ValueError("contact evidence provenance must use https")
 
     def _sync_parent_status(self, run: dict, status: str) -> None:
         payload = run["payload"]
@@ -615,14 +675,23 @@ class AgentRunService:
                         )
                 elif record_type in {"contact", "current_contacts"}:
                     failures = validate_contact_record(record)
+                    contact_id = new_id("con")
+                    tenant_evidence = {
+                        "evidence_id": f"document-contact:{document_id}:{contact_id}",
+                        "source_class": "customer", "tenant_supplied": True,
+                    }
+                    verification = verify_contact_evidence(record, [tenant_evidence])
                     self.db.execute(
-                        "INSERT INTO contacts(id,company_id,lead_id,email,phone,linkedin_url,status,data,created_at,updated_at) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (new_id("con"), company_id, record.get("lead_id"), record.get("email"),
+                        "INSERT INTO contacts(id,company_id,lead_id,email,phone,linkedin_url,status,data,"
+                        "verification_tier,contact_kind,verification_method,verification_evidence_ids,"
+                        "verification_checked_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (contact_id, company_id, record.get("lead_id"), record.get("email"),
                          record.get("phone"), canonical_linkedin_url(record.get("linkedin_url")),
-                         "invalid" if failures else "active",
+                         "invalid" if failures else "verified" if verification.tier == "green" else "active",
                          json_dump({**record, "source_document_id": document_id,
-                                    "validation_failures": failures}), stamp, stamp),
+                                    "validation_failures": failures, "evidence": [tenant_evidence]}),
+                         verification.tier, verification.contact_kind, verification.method,
+                         json_dump(verification.evidence_ids), verification.checked_at, stamp, stamp),
                     )
                 else:
                     section = self.db.one(
@@ -710,6 +779,18 @@ class AgentRunService:
                  json_dump(output), run["id"], stamp, stamp),
             )
             self.db.execute("UPDATE agent_runs SET output_ref=? WHERE id=?", (research_id, run["id"]))
+        elif run_type == "lead_research_refresh":
+            # Imported lazily to preserve the agent_service -> models dependency
+            # direction; agentic orchestration itself depends on this service.
+            from .lead_research.agentic import AgenticResearchService
+
+            accepted = AgenticResearchService(
+                self.db, runs=self,
+            ).accept_refresh_output(company_id, run["id"], payload, output)
+            self.event(
+                run["id"], company_id, "refresh_persisted",
+                f"accepted {len(accepted)} refreshed fact(s)",
+            )
         elif run_type == "contact_discovery":
             cap = int(payload.get("max_contacts_per_company", 5))
             per_lead: dict[str | None, int] = {}
@@ -724,22 +805,32 @@ class AgentRunService:
                     continue
                 failures = validate_contact_record(contact)
                 blocked = bool(contact.get("do_not_contact"))
+                verification = verify_contact_evidence(contact, contact.get("evidence") or [])
                 self.db.execute(
-                    "INSERT INTO contacts(id,company_id,lead_id,email,phone,linkedin_url,status,do_not_contact,data,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO contacts(id,company_id,lead_id,email,phone,linkedin_url,status,do_not_contact,data,"
+                    "verification_tier,contact_kind,verification_method,verification_evidence_ids,"
+                    "verification_checked_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (new_id("con"), company_id, lead_id, contact.get("email"), contact.get("phone"),
                      canonical_linkedin_url(contact.get("linkedin_url")),
-                     "blocked" if blocked else "invalid" if failures else "active", int(blocked),
-                     json_dump({**contact, "validation_failures": failures}), stamp, stamp),
+                     "blocked" if blocked else "invalid" if failures else
+                     "verified" if verification.tier == "green" else "active", int(blocked),
+                     json_dump({**contact, "validation_failures": failures,
+                                "verification": verification.model_dump(mode="json")}),
+                     verification.tier, verification.contact_kind, verification.method,
+                     json_dump(verification.evidence_ids), verification.checked_at, stamp, stamp),
                 )
                 per_lead[lead_id] = per_lead.get(lead_id, 0) + 1
         elif run_type == "outreach_generation":
             recipients = payload.get("recipients") or {}
+            selected_language = str(payload.get("language") or "en").strip().lower()
+            reported_language = str(output.get("language") or selected_language).strip().lower()
             content = {
                 "to": recipients.get("to") or output.get("to"),
                 "cc": recipients.get("cc", []),
                 "subject": output.get("subject"), "body": output.get("body"),
-                "language": output.get("language") or payload.get("language", "en"),
+                # The selected campaign language is authoritative. Model output
+                # may be rejected for disagreeing, but never relabels a send.
+                "language": selected_language,
             }
             content.update({key: value for key, value in (payload.get("delivery_context") or {}).items()
                             if key in {"country", "reply_to"}})
@@ -752,14 +843,25 @@ class AgentRunService:
             if isinstance(fixed_subject, dict):
                 fixed_subject = fixed_subject.get(str(content.get("language") or "en").lower())
             verdict = preflight_message(content, fixed_subject=fixed_subject).as_dict()
+            if reported_language != selected_language:
+                verdict["failures"] = list(dict.fromkeys([
+                    *verdict["failures"], "language_mismatch",
+                ]))
+                verdict["pass"] = False
             message_id = new_id("msg")
             status = "pending_approval" if verdict["pass"] else "qa_failed"
+            generation = {
+                "language": selected_language,
+                "template_version": payload.get("template_version"),
+                "run_id": run["id"],
+            }
             self.db.execute(
                 "INSERT INTO outreach_messages(id,company_id,campaign_id,lead_id,contact_id,channel,status,revision,"
                 "content_hash,content,data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (message_id, company_id, payload.get("campaign_id"), payload.get("lead_id"),
                  payload.get("contact_id"), payload.get("channel", "email"), status, 1,
-                 content_hash(content), json_dump(content), json_dump({"qa_verdict": verdict}), stamp, stamp),
+                 content_hash(content), json_dump(content),
+                 json_dump({"qa_verdict": verdict, "generation": generation}), stamp, stamp),
             )
             self.db.execute("UPDATE agent_runs SET output_ref=? WHERE id=?", (message_id, run["id"]))
             # A rewrite retires the message it replaced, but only once the

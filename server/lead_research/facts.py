@@ -3,15 +3,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Literal
 
 from ..db import json_dump, json_load, new_id, now
 from ..quality import normalize_name
-from .models import EvidenceSpan, ResearchFact, StoredFact
+from .models import CorrectionImpact, EvidenceSpan, ResearchFact, StoredFact
 
 
 FactPool = Literal["shared", "tenant"]
 DAY_SECONDS = 86_400.0
+
+
+@dataclass(frozen=True)
+class DueResearchFact:
+    id: str
+    pool: FactPool
+    company_id: str
+    organization_id: str
+    organization_name: str
+    canonical_domain: str | None
+    field: str
+    value_en: object
+    evidence_id: str
+    expires_at: float
+    campaign_id: str | None = None
+
+    @property
+    def refresh_key(self) -> str:
+        # Accepted facts are immutable.  Including the expiry distinguishes a
+        # future replacement/version while making repeated scheduler ticks for
+        # this exact stale observation idempotent.
+        return f"{self.pool}:{self.id}:{self.expires_at:.6f}"
 
 # A fact's shelf life belongs to the field, not to the page or bundle that
 # happened to carry it. Stable identity facts can outlive volatile intent and
@@ -360,6 +383,62 @@ class FactRepository:
             self._consume(company_id, row["id"], stamp)
         return facts
 
+    def due_for_refresh(self, at: float, limit: int) -> list[DueResearchFact]:
+        """Return a bounded tenant-scoped queue of stale, previously used facts.
+
+        Shared-fact consumption is explicit in ``research_fact_consumers``.
+        Tenant facts count as consumed when they were accepted for a campaign;
+        ad-hoc facts with no campaign never trigger background work.
+        Each pool is limited before rows enter Python, keeping the scheduler's
+        database work bounded even when a deployment has years of stale data.
+        """
+        if limit <= 0:
+            return []
+        shared_rows = self.db.all(
+            "SELECT f.id,f.field,f.value_en,f.primary_evidence_id AS evidence_id,"
+            "f.expires_at,c.company_id,o.id AS tenant_organization_id,"
+            "o.display_name,o.domain "
+            "FROM shared_facts f JOIN research_fact_consumers c ON c.shared_fact_id=f.id "
+            "JOIN organizations o ON o.company_id=c.company_id "
+            "AND o.shared_organization_id=f.organization_id "
+            "WHERE f.status='observed' AND f.expires_at<=? "
+            "ORDER BY f.expires_at,f.id,c.company_id LIMIT ?",
+            (at, limit),
+        )
+        tenant_rows = self.db.all(
+            "SELECT f.id,f.company_id,f.campaign_id,f.organization_id,f.field,f.value_en,"
+            "f.evidence_id,f.expires_at,o.display_name,o.domain "
+            "FROM tenant_facts f JOIN organizations o ON o.id=f.organization_id "
+            "AND o.company_id=f.company_id "
+            "WHERE f.status='observed' AND f.campaign_id IS NOT NULL AND f.expires_at<=? "
+            "ORDER BY f.expires_at,f.id LIMIT ?",
+            (at, limit),
+        )
+        due = [
+            DueResearchFact(
+                id=row["id"], pool="shared", company_id=row["company_id"],
+                organization_id=row["tenant_organization_id"],
+                organization_name=row["display_name"], canonical_domain=row["domain"],
+                field=row["field"], value_en=json_load(row["value_en"]),
+                evidence_id=row["evidence_id"], expires_at=row["expires_at"],
+            )
+            for row in shared_rows
+        ]
+        due.extend(
+            DueResearchFact(
+                id=row["id"], pool="tenant", company_id=row["company_id"],
+                organization_id=row["organization_id"],
+                organization_name=row["display_name"], canonical_domain=row["domain"],
+                field=row["field"], value_en=json_load(row["value_en"]),
+                evidence_id=row["evidence_id"], expires_at=row["expires_at"],
+                campaign_id=row["campaign_id"],
+            )
+            for row in tenant_rows
+        )
+        return sorted(
+            due, key=lambda fact: (fact.expires_at, fact.company_id, fact.id),
+        )[:limit]
+
     def relevance(
         self,
         company_id: str,
@@ -430,3 +509,323 @@ class FactRepository:
             for row in [*tenant_rows, *shared_rows]
             if supported(json_load(row["value_en"]))
         ))
+
+    def consumers(self, fact_id: str) -> CorrectionImpact:
+        if fact_id.startswith("sf_"):
+            companies = [
+                row["company_id"] for row in self.db.all(
+                    "SELECT company_id FROM research_fact_consumers WHERE shared_fact_id=?",
+                    (fact_id,),
+                )
+            ]
+            exists = self.db.one("SELECT id FROM shared_facts WHERE id=?", (fact_id,))
+        else:
+            row = self.db.one(
+                "SELECT company_id FROM tenant_facts WHERE id=?", (fact_id,),
+            )
+            companies = [row["company_id"]] if row else []
+            exists = row
+        if exists is None:
+            raise ValueError("research fact not found")
+        result_ids: set[str] = set()
+        if companies:
+            placeholders = ",".join("?" for _ in companies)
+            rows = self.db.all(
+                "SELECT result_id,snapshot_json FROM research_score_snapshots "
+                f"WHERE company_id IN ({placeholders}) ORDER BY created_at",
+                tuple(companies),
+            )
+            for row in rows:
+                if fact_id in (json_load(row["snapshot_json"], {}).get("fact_ids") or []):
+                    result_ids.add(row["result_id"])
+        lead_ids = [
+            row["lead_id"]
+            for result_id in sorted(result_ids)
+            if (row := self.db.one(
+                "SELECT lead_id FROM research_results WHERE id=? AND lead_id IS NOT NULL",
+                (result_id,),
+            )) is not None
+        ]
+        return CorrectionImpact(
+            fact_id=fact_id,
+            result_ids=sorted(result_ids),
+            lead_ids=list(dict.fromkeys(lead_ids)),
+        )
+
+    def _claims_for_snapshot_dimension(
+        self,
+        company_id: str,
+        organization_id: str,
+        fact_ids: list[str],
+        dimension: str,
+    ) -> list:
+        """Rehydrate the accepted facts behind one frozen score dimension.
+
+        Score snapshots deliberately keep fact ids rather than mutable claim
+        rows.  A correction can therefore rebuild just the affected dimension
+        from its accepted inputs while every prior snapshot remains untouched.
+        """
+        from .models import Claim
+        from .scoring import DIMENSION_CLAIM_FIELDS
+
+        relevant_fields = set(DIMENSION_CLAIM_FIELDS[dimension])
+        claims: list[Claim] = []
+        for fact_id in dict.fromkeys(fact_ids):
+            if fact_id.startswith("sf_"):
+                row = self.db.one(
+                    "SELECT f.*,f.primary_evidence_id AS evidence_id "
+                    "FROM shared_facts f JOIN organizations o "
+                    "ON o.shared_organization_id=f.organization_id "
+                    "WHERE f.id=? AND o.id=? AND o.company_id=?",
+                    (fact_id, organization_id, company_id),
+                )
+            else:
+                row = self.db.one(
+                    "SELECT * FROM tenant_facts WHERE id=? AND organization_id=? "
+                    "AND company_id=?",
+                    (fact_id, organization_id, company_id),
+                )
+            if row is None or row["field"] not in relevant_fields:
+                continue
+            status = row["status"]
+            if status not in {"observed", "calculated", "estimated_range", "conflicted"}:
+                continue
+            claims.append(Claim(
+                field=row["field"],
+                value=json_load(row["value_en"]),
+                period=row["period"],
+                unit=row["unit"],
+                currency=row["currency"],
+                status=status,
+                confidence=row["confidence"],
+                # Stored facts reached this pool through observed evidence;
+                # derivation_kind describes translation/calculation lineage,
+                # not a permission to detach the value from its cited page.
+                method="observed",
+                evidence_ids=[row["evidence_id"]],
+                validated=(
+                    bool(row["mechanically_validated"])
+                    and row["source_class"] in {"official", "registry"}
+                ),
+                observed_at=row["observed_at"],
+            ))
+        return claims
+
+    def _recompute_snapshot_score(self, result, snapshot: dict, fact_field: str):
+        """Return a new current score when ``fact_field`` contributes to fit."""
+        from .models import LeadScore, ScoringProfile, ScoringWeights
+        from .scoring import (
+            DIMENSION_CLAIM_FIELDS,
+            derive_dimension_scores,
+            dimension_evidence_ids,
+        )
+
+        current = LeadScore.model_validate(snapshot.get("score") or {})
+        field_dimension = {
+            field: dimension
+            for dimension, fields in DIMENSION_CLAIM_FIELDS.items()
+            for field in fields
+        }
+        dimension = field_dimension.get(fact_field)
+        if dimension is None:
+            return current
+        claims = self._claims_for_snapshot_dimension(
+            result["company_id"],
+            result["organization_id"],
+            list(snapshot.get("fact_ids") or []),
+            dimension,
+        )
+        dimensions = {
+            **current.dimensions,
+            dimension: derive_dimension_scores(claims)[dimension],
+        }
+        weights = ScoringWeights.model_validate(
+            snapshot.get("weights") or {},
+        ).model_dump()
+        not_applicable = set(current.not_applicable_dimensions)
+        unknown_dimensions = {
+            name: weight
+            for name, weight in weights.items()
+            if weight > 0 and name not in not_applicable and dimensions.get(name) is None
+        }
+        known_weight = sum(
+            weight
+            for name, weight in weights.items()
+            if weight > 0 and name not in not_applicable and dimensions.get(name) is not None
+        )
+        numerator = sum(
+            float(dimensions[name]) * weight
+            for name, weight in weights.items()
+            if weight > 0 and name not in not_applicable and dimensions.get(name) is not None
+        )
+        fit_score = int(round(numerator / known_weight)) if known_weight else 0
+        campaign = self.db.one(
+            "SELECT config FROM research_campaigns WHERE id=? AND company_id=?",
+            (result["campaign_id"], result["company_id"]),
+        )
+        scoring_data = (
+            json_load(campaign["config"], {}).get("scoring", {}) if campaign else {}
+        )
+        profile = ScoringProfile.model_validate(scoring_data).model_copy(
+            update={"weights": ScoringWeights.model_validate(weights)},
+        )
+        priority_band = "Rejected"
+        for name in ("A", "B", "C"):
+            threshold = profile.bands[name]
+            if (
+                fit_score >= threshold.min_fit
+                and current.evidence_confidence >= threshold.min_confidence
+            ):
+                priority_band = name
+                break
+        evidence_ids = {
+            **current.dimension_evidence_ids,
+            dimension: dimension_evidence_ids(claims)[dimension],
+        }
+        return current.model_copy(update={
+            "fit_score": fit_score,
+            "priority_band": priority_band,
+            "known_weight": known_weight,
+            "unknown_weight": sum(unknown_dimensions.values()),
+            "unknown_dimensions": unknown_dimensions,
+            "dimensions": dimensions,
+            "dimension_evidence_ids": evidence_ids,
+        })
+
+    def correct(
+        self,
+        fact_id: str,
+        corrected_value_en,
+        actor_id: str,
+        reason: str,
+        apply: bool,
+    ) -> CorrectionImpact:
+        reason = str(reason).strip()
+        if len(reason) < 3:
+            raise ValueError("fact correction requires a reason")
+        impact = self.consumers(fact_id)
+        if not apply:
+            return impact
+        stamp = now()
+        encoded = json_dump(corrected_value_en)
+        value_hash = _hash(corrected_value_en)
+        if fact_id.startswith("sf_"):
+            fact_row = self.db.one("SELECT field FROM shared_facts WHERE id=?", (fact_id,))
+            self.db.execute(
+                "UPDATE shared_facts SET value_en=?,value_hash=?,updated_at=? WHERE id=?",
+                (encoded, value_hash, stamp, fact_id),
+            )
+            company_id = None
+        else:
+            fact_row = self.db.one(
+                "SELECT company_id,field FROM tenant_facts WHERE id=?", (fact_id,),
+            )
+            company_id = fact_row["company_id"] if fact_row else None
+            self.db.execute(
+                "UPDATE tenant_facts SET value_en=?,value_hash=?,updated_at=? WHERE id=?",
+                (encoded, value_hash, stamp, fact_id),
+            )
+        fact_field = fact_row["field"]
+
+        recomputed: list[str] = []
+        for result_id in impact.result_ids:
+            result = self.db.one(
+                "SELECT * FROM research_results WHERE id=?", (result_id,),
+            )
+            if result is None:
+                continue
+            current = json_load(result["snapshot_json"], {})
+            if not current:
+                continue
+            score = self._recompute_snapshot_score(result, current, fact_field)
+            revised = {
+                **current,
+                "score": score.model_dump(mode="json"),
+                "correction": {
+                    "fact_id": fact_id,
+                    "value_en": corrected_value_en,
+                    "actor_id": actor_id,
+                    "reason": reason,
+                    "applied_at": stamp,
+                },
+            }
+            snapshot_id = new_id("score")
+            self.db.execute(
+                "INSERT INTO research_score_snapshots("
+                "id,company_id,result_id,campaign_id,profile_version_id,organization_id,"
+                "snapshot_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    snapshot_id, result["company_id"], result_id, result["campaign_id"],
+                    result["profile_version_id"], result["organization_id"],
+                    json_dump(revised), stamp,
+                ),
+            )
+            data = json_load(result["data"], {})
+            corrections = [*(data.get("corrections") or []), revised["correction"]]
+            self.db.execute(
+                "UPDATE research_results SET fit_score=?,evidence_confidence=?,snapshot_json=?,"
+                "data=?,updated_at=? WHERE id=?",
+                (
+                    score.fit_score,
+                    score.evidence_confidence,
+                    json_dump(revised),
+                    json_dump({
+                        **data,
+                        "score": score.model_dump(mode="json"),
+                        "score_dimensions": score.dimensions,
+                        "confidence_factors": score.confidence_factors,
+                        "corrections": corrections,
+                    }),
+                    stamp,
+                    result_id,
+                ),
+            )
+            recomputed.append(result_id)
+
+        # One resolved organization can be reused by several campaigns and all
+        # of their results can point at the same operational lead.  Sync that
+        # lead once from its newest campaign result; loop order must not decide
+        # which customer's weight snapshot appears in the lead row.
+        for lead_id in impact.lead_ids:
+            lead = self.db.one("SELECT company_id,data FROM leads WHERE id=?", (lead_id,))
+            if lead is None:
+                continue
+            latest = self.db.one(
+                "SELECT fit_score,evidence_confidence,snapshot_json "
+                "FROM research_results WHERE lead_id=? AND company_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 1",
+                (lead_id, lead["company_id"]),
+            )
+            if latest is None:
+                continue
+            latest_snapshot = json_load(latest["snapshot_json"], {})
+            latest_score = latest_snapshot.get("score") or {}
+            lead_data = json_load(lead["data"], {})
+            self.db.execute(
+                "UPDATE leads SET data=?,updated_at=? WHERE id=? AND company_id=?",
+                (
+                    json_dump({
+                        **lead_data,
+                        "fit_score": latest["fit_score"],
+                        "evidence_confidence": latest["evidence_confidence"],
+                        "priority_band": latest_score.get(
+                            "priority_band", lead_data.get("priority_band")
+                        ),
+                    }),
+                    stamp,
+                    lead_id,
+                    lead["company_id"],
+                ),
+            )
+
+        correction_id = new_id("correction")
+        self.db.execute(
+            "INSERT INTO research_fact_corrections("
+            "id,company_id,fact_id,corrected_value_en,actor_id,reason,applied,impact,created_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                correction_id, company_id, fact_id, encoded, actor_id, reason, 1,
+                json_dump(impact.model_dump(mode="json")), stamp,
+            ),
+        )
+        return impact.model_copy(update={"recomputed_result_ids": recomputed})

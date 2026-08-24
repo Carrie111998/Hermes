@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), lead_id TEXT REFERENCES leads(id),
     email TEXT, phone TEXT, linkedin_url TEXT, status TEXT NOT NULL DEFAULT 'active',
     do_not_contact INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL DEFAULT '{}',
+    verification_tier TEXT, contact_kind TEXT, verification_method TEXT,
+    verification_evidence_ids TEXT, verification_checked_at REAL,
     created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 -- Tenant-wide opt-out. Keyed on the address, not on a lead/contact row, so
@@ -279,6 +281,14 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("organizations", "shared_organization_id", "TEXT REFERENCES shared_organizations(id)"),
     ("evidence_records", "shared_evidence_id", "TEXT REFERENCES shared_evidence_records(id)"),
     ("feature_claims", "shared_fact_id", "TEXT REFERENCES shared_facts(id)"),
+    ("leads", "resolved_organization_id", "TEXT"),
+    ("research_results", "profile_version_id", "TEXT REFERENCES company_profile_versions(id)"),
+    ("research_results", "snapshot_json", "TEXT"),
+    ("contacts", "verification_tier", "TEXT"),
+    ("contacts", "contact_kind", "TEXT"),
+    ("contacts", "verification_method", "TEXT"),
+    ("contacts", "verification_evidence_ids", "TEXT"),
+    ("contacts", "verification_checked_at", "REAL"),
 )
 
 

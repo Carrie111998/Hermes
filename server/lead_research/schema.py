@@ -75,6 +75,27 @@ CREATE TABLE IF NOT EXISTS research_results (
     created_at REAL NOT NULL, updated_at REAL NOT NULL,
     UNIQUE(company_id, campaign_id, organization_id)
 );
+CREATE TABLE IF NOT EXISTS research_score_snapshots (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    result_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL REFERENCES research_campaigns(id),
+    profile_version_id TEXT REFERENCES company_profile_versions(id),
+    organization_id TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_label_assignments (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    result_id TEXT NOT NULL REFERENCES research_results(id), label_id TEXT NOT NULL,
+    value TEXT NOT NULL, scope TEXT NOT NULL, source TEXT NOT NULL,
+    actor_id TEXT NOT NULL, reason TEXT NOT NULL, profile_version_id TEXT NOT NULL,
+    effective_from REAL NOT NULL, effective_until REAL
+);
+CREATE TABLE IF NOT EXISTS research_fact_corrections (
+    id TEXT PRIMARY KEY, company_id TEXT REFERENCES companies(id), fact_id TEXT NOT NULL,
+    corrected_value_en TEXT NOT NULL, actor_id TEXT NOT NULL, reason TEXT NOT NULL,
+    applied INTEGER NOT NULL DEFAULT 0, impact TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS research_translations (
     id TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES companies(id),
@@ -237,6 +258,12 @@ CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(compa
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_results_tenant ON research_results(company_id, campaign_id, verdict);
+CREATE INDEX IF NOT EXISTS ix_research_score_snapshots_result
+    ON research_score_snapshots(company_id, result_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_research_labels_result_history
+    ON research_label_assignments(company_id, result_id, effective_from DESC);
+CREATE INDEX IF NOT EXISTS ix_research_fact_corrections_fact
+    ON research_fact_corrections(fact_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_research_translations_tenant
     ON research_translations(company_id, fact_key, display_locale);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_shared_organizations_domain
@@ -282,6 +309,16 @@ WHEN OLD.status IN ('confirmed','superseded')
 BEGIN
     SELECT RAISE(ABORT, 'confirmed company profiles are immutable');
 END;
+CREATE TRIGGER IF NOT EXISTS protect_research_score_snapshot_update
+BEFORE UPDATE ON research_score_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'research score snapshots are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS protect_research_score_snapshot_delete
+BEFORE DELETE ON research_score_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'research score snapshots are immutable');
+END;
 """
 
 
@@ -292,4 +329,7 @@ CREATE INDEX IF NOT EXISTS ix_candidate_datasets_visibility_owner
     ON candidate_datasets(visibility, owner_company_id, dataset_id, version);
 CREATE INDEX IF NOT EXISTS ix_organizations_shared_identity
     ON organizations(company_id, shared_organization_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_leads_resolved_organization
+    ON leads(company_id, resolved_organization_id)
+    WHERE resolved_organization_id IS NOT NULL;
 """

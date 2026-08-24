@@ -1,14 +1,93 @@
 from __future__ import annotations
 
 import httpx
+from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
 
 from ..auth import Principal, hash_password, require_admin
 from ..db import Database, json_dump, json_load, new_id, now
 from ..schemas import AssignCompany, CompanyCreate, CompanyPatch, ResetPassword, UserCreate, UserPatch
+from ..lead_research.facts import FactRepository
+from ..lead_research.labels import LabelRepository
+from ..lead_research.quality import ResearchQualityService
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+class FactCorrection(BaseModel):
+    value_en: Any
+    reason: str = Field(min_length=3, max_length=500)
+    apply: bool = False
+
+
+class HiddenLabelRequest(BaseModel):
+    company_id: str
+    label_id: str = Field(min_length=1, max_length=120)
+    value: str = Field(min_length=1, max_length=500)
+    scope: str = Field(default="result", min_length=1, max_length=120)
+    source: Literal["system", "admin", "outcome_analysis"] = "admin"
+    reason: str = Field(min_length=3, max_length=500)
+    profile_version_id: str
+
+
+@router.get("/research/quality")
+def research_quality(
+    request: Request, _: Principal = Depends(require_admin),
+):
+    return ResearchQualityService(request.app.state.db).report()
+
+
+@router.get("/research/facts/{fact_id}/impact")
+def research_fact_impact(
+    fact_id: str, request: Request, _: Principal = Depends(require_admin),
+):
+    try:
+        return FactRepository(request.app.state.db).consumers(fact_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/research/facts/{fact_id}/corrections")
+def correct_research_fact(
+    fact_id: str,
+    body: FactCorrection,
+    request: Request,
+    actor: Principal = Depends(require_admin),
+):
+    try:
+        return FactRepository(request.app.state.db).correct(
+            fact_id, body.value_en, actor.id, body.reason, body.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/research/results/{result_id}/labels", status_code=201)
+def assign_research_label(
+    result_id: str,
+    body: HiddenLabelRequest,
+    request: Request,
+    actor: Principal = Depends(require_admin),
+):
+    try:
+        return LabelRepository(request.app.state.db).assign(
+            body.company_id, result_id, body.label_id, body.value, body.scope,
+            body.source, actor.id, body.reason, body.profile_version_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/research/results/{result_id}/labels")
+def research_label_history(
+    result_id: str,
+    company_id: str,
+    request: Request,
+    _: Principal = Depends(require_admin),
+):
+    return LabelRepository(request.app.state.db).history(company_id, result_id)
 
 
 def _company(row, db: Database | None = None) -> dict:

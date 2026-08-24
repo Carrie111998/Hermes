@@ -93,3 +93,32 @@ Return claims as JSON objects matching the application `Claim` contract:
   private value ranges, and addressable market value as distinct concepts.
 - Use `observed`, `calculated`, `estimated_range`, `conflicted`, `unknown`, or
   `not_applicable`; never convert missing evidence to zero.
+
+### Durable weighted-gap runs
+
+When the payload contains weighted research batches, return the durable
+`lead_research_gap` shape requested by the prompt. Research is still read-only:
+never submit a form, send a message, place a call, or otherwise contact the
+lead.
+
+- Fetch a page once and extract every application-schema fact it contains,
+  including useful incidental facts that were not named in the batch. This
+  prevents paying for the same page again when another score dimension needs
+  it later.
+- Preserve the immutable page text and its SHA-256 hash. Every proposed fact
+  cites a returned `page_id` and an exact original-language substring with
+  zero-based `start` and exclusive `end` offsets. Never paraphrase a quote.
+- Return both the original text and `value_en`, plus `source_language`, the
+  canonical HTTPS URL, retrieval/observation dates, and an archive snapshot
+  date when the source is historical. An archived page cannot establish a
+  current observation.
+- Identity tokens (`company_name`, domain, registry id) are byte-preserved;
+  never translate or normalize them inside evidence.
+- The optional extractor model handles clear literal extraction only. Mark
+  `requires_decision_model=true` for ambiguity, calculated interpretation, or
+  source disagreement; the configured decision model resolves or records the
+  conflict.
+- Stop for terminal closure/dissolution evidence, cancellation, required
+  coverage, source exhaustion, top-band completion with no required gap, or a
+  page/request/time/token budget. Never stop solely because the current fit
+  estimate is low: missing weighted evidence may change that estimate.

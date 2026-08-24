@@ -1,6 +1,8 @@
 """Durable negative-search cache with explicit public/private scope."""
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Literal
 
 from ..db import new_id, now
@@ -15,6 +17,21 @@ def query_scope(query: ResearchQuery) -> SearchScope:
         company_id=None if shareable else query.company_id,
         shareable=shareable,
     )
+
+
+def research_query_hash(query: ResearchQuery, source_id: str) -> str:
+    material = {
+        "organization_id": query.organization_id,
+        "field": query.field,
+        "normalized_query_class": query.normalized_query_class,
+        "customer_terms": sorted({item.casefold() for item in query.customer_terms}),
+        "hidden_label_ids": sorted(set(query.hidden_label_ids)),
+        "licensed_source_ids": sorted(set(query.licensed_source_ids)),
+        "source_id": source_id,
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class SearchAttemptRepository:

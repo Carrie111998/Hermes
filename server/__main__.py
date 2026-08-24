@@ -17,6 +17,7 @@ from .postgres import create_database
 from .provisioning import provision_demo_account
 from .run_types import REGISTRY
 from .lead_research.candidates import CandidateRepository
+from .lead_research.backfill import backfill_contract
 
 
 def _market_gate(company: str, payload: dict) -> None:
@@ -121,6 +122,10 @@ def main(argv=None) -> None:
         help="Rows per transaction; a corpus can be large and one transaction "
              "over all of it holds a write lock for as long as it takes",
     )
+    sub.add_parser(
+        "backfill-lead-research-contract",
+        help="Conservatively upgrade legacy lead-research rows after migration 020",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -175,6 +180,25 @@ def main(argv=None) -> None:
                     "note: nothing to backfill; every corpus row already has "
                     "search text", file=sys.stderr,
                 )
+        finally:
+            close = getattr(db, "close", None)
+            if close:
+                close()
+        return
+
+    if args.command == "backfill-lead-research-contract":
+        settings = Settings.load()
+        db = create_database(settings)
+        try:
+            report = backfill_contract(db)
+            print(json.dumps({
+                "profile_versions_created": report.profile_versions_created,
+                "datasets_classified": report.datasets_classified,
+                "tenant_facts_created": report.tenant_facts_created,
+                "results_snapshotted": report.results_snapshotted,
+                "contacts_classified": report.contacts_classified,
+                "total_changes": report.total_changes,
+            }))
         finally:
             close = getattr(db, "close", None)
             if close:

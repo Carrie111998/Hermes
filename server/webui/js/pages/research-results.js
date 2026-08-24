@@ -18,6 +18,52 @@ const LIVE_CAMPAIGN_STATES = new Set(['queued', 'running']);
 // minutes.
 const LIVE_REFRESH_MS = 5000;
 const SUPPORTING_CLAIM_STATUSES = new Set(['observed', 'estimated_range']);
+const COPY = Object.freeze({
+  en: {
+    fit: 'Fit', confidence: 'Confidence', band: 'Band', known: 'Known', unknown: 'Unknown',
+    sources: 'Sources', criterion: 'Criterion', displayed: 'Displayed value',
+    canonical: 'Canonical English', original: 'Original source text', sourceLanguage: 'Source language',
+    observed: 'Observed', retrieved: 'Retrieved', archived: 'Archived', snapshot: 'Snapshot', hash: 'SHA-256',
+    verified: 'Exact source span verified', unverified: 'Source span not mechanically verified',
+    openSource: 'Open source', noUnknowns: 'No weighted criteria remain unknown.',
+  },
+  tr: {
+    fit: 'Uyum', confidence: 'Kanıt güveni', band: 'Grup', known: 'Bilinen', unknown: 'Bilinmeyen',
+    sources: 'Kaynaklar', criterion: 'Kriter', displayed: 'Gösterilen değer',
+    canonical: 'Kanonik İngilizce', original: 'Orijinal kaynak metni', sourceLanguage: 'Kaynak dili',
+    observed: 'Gözlemlendi', retrieved: 'Alındı', archived: 'Arşivlendi', snapshot: 'Anlık görüntü', hash: 'SHA-256',
+    verified: 'Kaynak alıntısı birebir doğrulandı', unverified: 'Kaynak alıntısı mekanik olarak doğrulanmadı',
+    openSource: 'Kaynağı aç', noUnknowns: 'Ağırlıklı bilinmeyen kriter kalmadı.',
+  },
+});
+const DIMENSION_LABELS = Object.freeze({
+  en: {
+    product_sector_fit: 'Product and sector fit', buyer_channel_fit: 'Buyer and channel fit',
+    buying_intent: 'Buying intent', market_coverage: 'Market coverage',
+    commercial_scale: 'Commercial scale', trade_activity: 'Trade activity', contactability: 'Contactability',
+  },
+  tr: {
+    product_sector_fit: 'Ürün ve sektör uyumu', buyer_channel_fit: 'Alıcı ve kanal uyumu',
+    buying_intent: 'Satın alma niyeti', market_coverage: 'Pazar kapsamı',
+    commercial_scale: 'Ticari ölçek', trade_activity: 'Ticaret faaliyeti', contactability: 'Ulaşılabilirlik',
+  },
+});
+const LANGUAGE_NAMES = Object.freeze({
+  en: { en: 'English', tr: 'Turkish', de: 'German', pl: 'Polish', fr: 'French', ar: 'Arabic', ro: 'Romanian', nl: 'Dutch' },
+  tr: { en: 'İngilizce', tr: 'Türkçe', de: 'Almanca', pl: 'Lehçe', fr: 'Fransızca', ar: 'Arapça', ro: 'Romence', nl: 'Felemenkçe' },
+});
+
+function supportedLocale(value) {
+  return String(value || 'en').toLowerCase().startsWith('tr') ? 'tr' : 'en';
+}
+
+function copy(locale) {
+  return COPY[supportedLocale(locale)];
+}
+
+function dimensionLabel(dimension, locale = 'en') {
+  return DIMENSION_LABELS[supportedLocale(locale)][dimension] || sentence(dimension);
+}
 
 function sentence(value, fallback = 'Not known') {
   const text = String(value || '').replace(/[_-]+/g, ' ').trim();
@@ -108,7 +154,7 @@ function loadingNode(label = 'Loading research results') {
     el('span', { class: 'ifz-results-loading-block' }));
 }
 
-function safeSourceLink(evidence) {
+function safeSourceLink(evidence, locale = 'en') {
   const value = String(evidence?.provenance_url || '');
   if (!value.startsWith('https://')) return null;
   return el('a', {
@@ -116,34 +162,70 @@ function safeSourceLink(evidence) {
     target: '_blank',
     rel: 'noreferrer',
     class: 'ifz-result-source-link',
-  }, 'Open source');
+  }, copy(locale).openSource);
 }
 
-function evidenceNode(evidence) {
-  const link = safeSourceLink(evidence);
-  const checked = evidence.retrieved_at
-    ? `${fmt.date(evidence.retrieved_at)} at ${fmt.time(evidence.retrieved_at)}`
-    : 'Not recorded';
+function dated(value) {
+  return value ? `${fmt.date(value)} ${fmt.time(value)}` : 'Not recorded';
+}
+
+export function renderEvidence(evidence, locale = 'en') {
+  const labels = copy(locale);
+  const link = safeSourceLink(evidence, locale);
+  const canonical = evidence.value_en ?? evidence.facts?.[0]?.value_en;
+  const displayed = evidence.display_value ?? evidence.facts?.[0]?.display_value ?? canonical;
+  const original = evidence.original_text ?? evidence.facts?.[0]?.original_text;
+  const language = evidence.source_language ?? evidence.facts?.[0]?.source_language;
+  const criteria = evidence.criteria || [];
+  const definitionRows = [
+    criteria.length ? [labels.criterion, criteria.map(item =>
+      `${dimensionLabel(item.dimension, locale)} · ${item.weight}%`).join(', ')] : null,
+    supportedLocale(locale) !== 'en' && displayed !== canonical ? [labels.displayed, claimValue(displayed)] : null,
+    [labels.canonical, claimValue(canonical)],
+    [labels.original, original || 'Not recorded'],
+    [labels.sourceLanguage, LANGUAGE_NAMES[supportedLocale(locale)][language] || sentence(language)],
+    [labels.observed, dated(evidence.observed_at)],
+    [labels.retrieved, dated(evidence.retrieved_at)],
+    evidence.archive_snapshot_at ? [labels.archived, dated(evidence.archive_snapshot_at)] : null,
+    [labels.snapshot, evidence.snapshot_id || 'Not recorded'],
+    [labels.hash, evidence.raw_hash || 'Not recorded'],
+  ].filter(Boolean);
   return el('div', { class: 'ifz-result-citation' },
     el('div', { class: 'ifz-result-citation-head' },
       el('strong', {}, sentence(evidence.source_id, 'Saved source')),
       link),
-    el('dl', { class: 'ifz-result-citation-meta' },
-      el('div', {}, el('dt', {}, 'Checked'), el('dd', {}, checked)),
-      el('div', {}, el('dt', {}, 'Snapshot'), el('dd', {}, evidence.snapshot_id || 'Not recorded')),
-      el('div', {}, el('dt', {}, 'SHA-256'),
-        el('dd', {}, el('code', {}, evidence.raw_hash || 'Not recorded')))));
+    el('dl', { class: 'ifz-result-citation-meta' }, definitionRows.map(([label, value]) =>
+      el('div', {}, el('dt', {}, label), el('dd', {}, label === labels.hash ? el('code', {}, value) : value)))),
+    el('p', {
+      class: `ifz-result-validation ${evidence.mechanically_validated ? 'verified' : 'unverified'}`,
+    }, evidence.mechanically_validated ? labels.verified : labels.unverified));
 }
 
-function claimNode(claim) {
+function claimNode(claim, locale = 'en') {
   return el('article', { class: 'ifz-result-claim' },
     el('div', { class: 'ifz-result-claim-head' },
       el('strong', {}, sentence(claim.field)),
       el('span', {}, confidencePercent(claim.confidence))),
     el('div', { class: 'ifz-result-claim-value ifz-prose' }, claimValue(claim.value)),
     (claim.evidence || []).length
-      ? el('div', { class: 'ifz-result-citations' }, claim.evidence.map(evidenceNode))
+      ? el('div', { class: 'ifz-result-citations' }, claim.evidence.map(item => renderEvidence(item, locale)))
       : el('p', { class: 'ifz-result-uncited ifz-prose' }, 'No cited source is attached to this claim.'));
+}
+
+export function renderResearchResult(result, locale = 'en') {
+  const labels = copy(locale);
+  const unknown = Object.entries(result.unknown_dimensions || {});
+  return el('section', { class: 'ifz-result-summary', 'aria-label': `${labels.fit} and evidence coverage` },
+    el('dl', { class: 'ifz-result-evidence-metrics' },
+      el('div', {}, el('dt', {}, labels.fit), el('dd', {}, String(result.fit_score ?? 0))),
+      el('div', {}, el('dt', {}, labels.confidence), el('dd', {}, confidencePercent(result.evidence_confidence))),
+      el('div', {}, el('dt', {}, labels.band), el('dd', {}, result.priority_band || '—')),
+      el('div', {}, el('dt', {}, labels.known), el('dd', {}, `${result.known_weight ?? 0}%`)),
+      el('div', {}, el('dt', {}, labels.unknown), el('dd', {}, `${result.unknown_weight ?? 0}%`))),
+    unknown.length
+      ? el('ul', { class: 'ifz-result-unknowns ifz-prose' }, unknown.map(([dimension, weight]) =>
+          el('li', {}, `${dimensionLabel(dimension, locale)} · ${weight}%`)))
+      : el('p', { class: 'ifz-result-none ifz-prose' }, labels.noUnknowns));
 }
 
 function textList(values, emptyCopy) {
@@ -153,7 +235,7 @@ function textList(values, emptyCopy) {
     : el('p', { class: 'ifz-result-none ifz-prose' }, emptyCopy);
 }
 
-function evidencePanel(result, claimState) {
+function evidencePanel(result, claimState, locale = 'en', onDiscover = null) {
   if (!result) return emptyState({
     icon: 'search',
     title: 'Select a company',
@@ -173,36 +255,37 @@ function evidencePanel(result, claimState) {
     !SUPPORTING_CLAIM_STATUSES.has(claim.status) && claim.status !== 'conflicted');
   const conflictNames = new Set(result.conflicting_claims || []);
   for (const claim of conflicting) conflictNames.delete(claim.field);
+  const discoverAction = result.lead_id && onDiscover
+    ? button('Find decision-maker', { kind: 'ghost', size: 'sm', icon: 'search' })
+    : null;
+  if (discoverAction) {
+    discoverAction.addEventListener('click', () => void onDiscover(result, discoverAction));
+  }
 
   return el('section', { class: 'ifz-result-evidence', 'aria-label': `Evidence for ${result.company_name}` },
     el('header', { class: 'ifz-result-evidence-head' },
-      el('div', {},
-        el('span', { class: 'ifz-overline' }, 'Selected company'),
-        el('h2', {}, result.company_name)),
-      verdictBadge(result.verdict)),
-    el('div', { class: 'ifz-result-evidence-metrics' },
-      el('div', {}, el('span', {}, 'Fit'), el('strong', {}, `${result.fit_score} / 100`)),
-      el('div', {}, el('span', {}, 'Confidence'), el('strong', {}, confidencePercent(result.evidence_confidence))),
-      el('div', {}, el('span', {}, 'Sources'), el('strong', {}, String(result.source_count ?? 0)))),
+      el('h2', {}, result.company_name),
+      el('div', { class: 'ifz-result-evidence-actions' }, verdictBadge(result.verdict), discoverAction)),
+    renderResearchResult(result, locale),
     el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Why this verdict'),
       textList(result.reasons, 'No verdict reason was recorded.')),
     el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Supporting claims'),
       supporting.length
-        ? el('div', { class: 'ifz-result-claim-list' }, supporting.map(claimNode))
+        ? el('div', { class: 'ifz-result-claim-list' }, supporting.map(claim => claimNode(claim, locale)))
         : el('p', { class: 'ifz-result-none ifz-prose' }, 'No supporting claims were recorded.')),
     el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Conflicting claims'),
       conflicting.length || conflictNames.size
         ? el('div', { class: 'ifz-result-claim-list' },
-            conflicting.map(claimNode),
+            conflicting.map(claim => claimNode(claim, locale)),
             [...conflictNames].map(field => el('p', { class: 'ifz-result-conflict ifz-prose' }, sentence(field))))
         : el('p', { class: 'ifz-result-none ifz-prose' }, 'No conflicting claims were recorded.')),
     el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Unknown or not applicable'),
       neutral.length
-        ? el('div', { class: 'ifz-result-claim-list neutral' }, neutral.map(claimNode))
+        ? el('div', { class: 'ifz-result-claim-list neutral' }, neutral.map(claim => claimNode(claim, locale)))
         : el('p', { class: 'ifz-result-none ifz-prose' }, 'No neutral claims were recorded.')),
     el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Missing evidence'),
@@ -212,9 +295,10 @@ function evidencePanel(result, claimState) {
       textList(result.missing_evidence, 'Nothing is marked missing.')));
 }
 
-function resultTable(results, selectedId, onSelect) {
+function resultTable(results, selectedId, onSelect, locale = 'en') {
   if (!results.length) return null;
-  const headers = ['Company', 'Verdict', 'Fit', 'Confidence', 'Country', 'Buyer role', 'Sources'];
+  const labels = copy(locale);
+  const headers = ['Company', 'Verdict', labels.fit, labels.confidence, labels.unknown, 'Country', 'Buyer role', labels.sources];
   return el('div', { class: 'ifz-result-tablewrap' },
     el('table', { class: 'ifz-result-table' },
       el('thead', {}, el('tr', {}, headers.map(label => el('th', {}, label)))),
@@ -231,6 +315,7 @@ function resultTable(results, selectedId, onSelect) {
         el('td', {}, verdictBadge(result.verdict)),
         el('td', { class: 'cell-num' }, `${result.fit_score} / 100`),
         el('td', { class: 'cell-num' }, confidencePercent(result.evidence_confidence)),
+        el('td', { class: 'cell-num' }, `${result.unknown_weight ?? 0}%`),
         el('td', {}, result.country || 'Not known'),
         el('td', {}, sentence(result.buyer_role)),
         el('td', { class: 'cell-num' }, String(result.source_count ?? 0)));
@@ -239,6 +324,7 @@ function resultTable(results, selectedId, onSelect) {
 
 export async function mount(root, ctx) {
   let disposed = false;
+  const locale = supportedLocale(ctx.locale || document.documentElement?.lang || 'en');
   const pageEl = root.closest('.ifz-page') || root;
   pageEl.classList.add('ifz-page--research-results');
   const state = {
@@ -282,7 +368,10 @@ export async function mount(root, ctx) {
     state.claims.set(result.id, { status: 'loading', items: [] });
     render();
     try {
-      const response = await call('researchResults.claims', { params: { resultId: result.id } });
+      const response = await call('researchResults.claims', {
+        params: { resultId: result.id },
+        ...(locale === 'tr' ? { query: { locale } } : {}),
+      });
       if (!contextMatches(context, { selection: true })) return;
       state.claims.set(result.id, { status: 'loaded', items: itemsOf(response) });
     } catch (error) {
@@ -290,6 +379,19 @@ export async function mount(root, ctx) {
       state.claims.set(result.id, { status: 'error', error, items: [] });
     }
     render();
+  }
+
+  async function discoverContacts(result, action) {
+    if (!result?.lead_id) return;
+    setBusy(action, true, 'Starting');
+    try {
+      await call('contacts.discover', { body: { lead_ids: [result.lead_id] } });
+      toast(`Contact research started for ${result.company_name}.`, 'success');
+    } catch {
+      toast('Contact research could not be started. The lead is unchanged.', 'error');
+    } finally {
+      setBusy(action, false);
+    }
   }
 
   function chooseResult(result) {
@@ -458,7 +560,7 @@ export async function mount(root, ctx) {
           : 'This brief did not reject any researched companies.',
       });
     } else {
-      listBody = resultTable(viewState.items, state.selected[state.view], chooseResult);
+      listBody = resultTable(viewState.items, state.selected[state.view], chooseResult, locale);
     }
 
     const newSearchAction = button('New lead search', {
@@ -478,7 +580,7 @@ export async function mount(root, ctx) {
       el('div', { class: 'ifz-results-workspace' },
         el('section', { class: 'ifz-results-list', 'aria-label': `${sentence(state.view)} company results` }, listBody),
         el('aside', { class: 'ifz-results-detail', 'aria-live': 'polite' },
-          evidencePanel(selected, selected ? state.claims.get(selected.id) : null))),
+          evidencePanel(selected, selected ? state.claims.get(selected.id) : null, locale, discoverContacts))),
     );
   }
 

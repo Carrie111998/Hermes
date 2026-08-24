@@ -93,6 +93,7 @@ export function statCard({ label, value, delta, deltaDir = 'flat', spark }) {
 const STATUS_KIND = {
   // generic
   active: 'success', completed: 'success', connected: 'success', verified: 'success', approved: 'success',
+  green: 'success',
   processed: 'success',
   sent: 'success', sent_manually: 'success', replied: 'accent', interested: 'accent', done: 'success',
   running: 'info', processing: 'info', generating: 'info', queued: 'neutral', in_progress: 'info',
@@ -100,10 +101,12 @@ const STATUS_KIND = {
   qualified: 'info', researched: 'info', contacted: 'info',
   pending: 'warning', pending_approval: 'warning', awaiting_approval: 'warning', partially_sent: 'warning',
   draft_generated: 'warning', unverified: 'warning', paused: 'warning',
+  yellow: 'warning',
   not_connected: 'neutral', not_configured: 'neutral', not_built: 'neutral',
   new: 'neutral', draft: 'neutral', archived: 'neutral', uploaded: 'neutral',
   opted_out: 'neutral',
   failed: 'error', error: 'error', qa_failed: 'error', paused_bounce_rate: 'error',
+  red: 'error',
   cancelled: 'error', do_not_contact: 'error', not_found: 'error', lost: 'error',
 };
 

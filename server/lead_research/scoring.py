@@ -141,7 +141,11 @@ def _claim_score(claim: Claim) -> float | None:
         if isinstance(value, bool):
             return 100.0 if value else 0.0
         if isinstance(value, (int, float)):
-            return float(max(0, min(100, value)))
+            # Direct dimension adapters may use either the normalized [0, 1]
+            # contract or the display [0, 100] contract. Preserve both without
+            # confusing ordinary numeric evidence fields with percentages.
+            normalized = value * 100 if 0 <= value <= 1 else value
+            return float(max(0, min(100, normalized)))
         return 100.0 if value else 0.0
 
     value = (claim.low + claim.high) / 2 if claim.status == "estimated_range" else claim.value
@@ -208,6 +212,58 @@ def derive_dimension_scores(claims: Iterable[Claim]) -> dict[str, float | None]:
     }
 
 
+def dimension_evidence_ids(claims: Iterable[Claim]) -> dict[str, list[str]]:
+    field_dimensions = {
+        field: dimension
+        for dimension, fields in DIMENSION_CLAIM_FIELDS.items()
+        for field in fields
+    }
+    result = {dimension: [] for dimension in SCORE_DIMENSIONS}
+    for claim in claims:
+        dimension = field_dimensions.get(claim.field)
+        if (
+            dimension is None
+            or (claim.status, claim.method) not in _SUPPORTED_CLAIM_KINDS
+            or not claim.evidence_ids
+        ):
+            continue
+        result[dimension].extend(
+            evidence_id
+            for evidence_id in claim.evidence_ids
+            if evidence_id not in result[dimension]
+        )
+    return result
+
+
+def _weighted_fit(
+    dimensions: dict[str, float | None],
+    weights: dict[str, int],
+    not_applicable: set[str],
+) -> tuple[int, int, dict[str, int], dict[str, int]]:
+    not_applicable_dimensions = {
+        name: weight
+        for name, weight in weights.items()
+        if weight > 0 and name in not_applicable
+    }
+    unknown_dimensions = {
+        name: weight
+        for name, weight in weights.items()
+        if weight > 0 and name not in not_applicable and dimensions.get(name) is None
+    }
+    known_weight = sum(
+        weight
+        for name, weight in weights.items()
+        if weight > 0 and name not in not_applicable and dimensions.get(name) is not None
+    )
+    numerator = sum(
+        float(dimensions[name]) * weight
+        for name, weight in weights.items()
+        if weight > 0 and name not in not_applicable and dimensions.get(name) is not None
+    )
+    fit = int(round(numerator / known_weight)) if known_weight else 0
+    return fit, known_weight, unknown_dimensions, not_applicable_dimensions
+
+
 def claim_freshness(claims: Iterable[Claim], at: float) -> float | None:
     """How much of a claim set's shelf life is left, in [0, 1].
 
@@ -251,14 +307,17 @@ def score_lead(
     profile: ScoringProfile,
     attainable: set[str] | None = None,
     at: float | None = None,
+    not_applicable: set[str] | None = None,
 ) -> LeadScore:
     del candidate
     claims = list(claims)
     dimensions = derive_dimension_scores(claims)
     weights = profile.weights.model_dump()
+    not_applicable = set(not_applicable or ())
     known = {key: value for key, value in dimensions.items() if value is not None}
-    known_weight = sum(weights[key] for key in known)
-    fit = round(sum(known[key] * weights[key] for key in known) / known_weight) if known_weight else 0
+    fit, known_weight, unknown_dimensions, not_applicable_dimensions = _weighted_fit(
+        dimensions, weights, not_applicable,
+    )
     supported_claims = [
         claim for claim in claims
         if (claim.status, claim.method) in _SUPPORTED_CLAIM_KINDS and claim.evidence_ids
@@ -288,8 +347,14 @@ def score_lead(
     # rather than being dropped from the numerator. An empty declaration means
     # nobody said anything, which falls back to the full set rather than
     # silently scoring a lead as complete on the strength of one claim.
-    denominator = (attainable | set(known)) if attainable else set(SCORE_DIMENSIONS)
-    completeness = len(known) / len(denominator) if denominator else 0.0
+    denominator = (
+        (attainable | set(known)) if attainable else set(SCORE_DIMENSIONS)
+    ) - not_applicable
+    denominator_weight = sum(weights[name] for name in denominator)
+    covered_weight = sum(
+        weights[name] for name in denominator if dimensions.get(name) is not None
+    )
+    completeness = covered_weight / denominator_weight if denominator_weight else 0.0
     confidence = max(0, min(
         1,
         authority * .45 + corroboration * .15 + freshness * .2 + completeness * .2
@@ -303,7 +368,12 @@ def score_lead(
             break
     return LeadScore(
         fit_score=fit, evidence_confidence=round(confidence, 3), priority_band=band,
+        known_weight=known_weight,
+        unknown_weight=sum(unknown_dimensions.values()),
+        unknown_dimensions=unknown_dimensions,
+        not_applicable_dimensions=not_applicable_dimensions,
         dimensions=dimensions,
+        dimension_evidence_ids=dimension_evidence_ids(claims),
         confidence_factors={
             "authority": round(authority, 3), "corroboration": round(corroboration, 3),
             "freshness": round(freshness, 3), "conflict_penalty": conflict_penalty,

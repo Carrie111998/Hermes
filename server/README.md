@@ -227,6 +227,22 @@ The server refuses to serve traffic when any of them is missing, naming the gap
 named files and restart; each migration records itself in `schema_migrations` and
 is safe to re-run.
 
+For an existing deployment upgrading to the complete lead-research contract:
+
+1. Stop API traffic and take a database snapshot.
+2. Apply migrations through `020_lead_research_contract_backfill.sql` in order.
+3. Run `python -m server backfill-lead-research-contract` once with the same
+   database configuration as the API. The command is idempotent and reports
+   counts only; rerun until `total_changes` is zero.
+4. Run `psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f server/supabase/verify.sql`.
+5. Start the API only after verification returns `VERIFY OK`.
+
+Migration 020 is the rollback boundary: restore the pre-migration database
+snapshot if deployment must roll back. Do not delete generated profile or score
+snapshots individually—confirmed profiles and historical scoring snapshots are
+intentionally immutable. Legacy claims remain tenant-private and unvalidated;
+the backfill never promotes them into shared facts.
+
 Then configure:
 
 ```text

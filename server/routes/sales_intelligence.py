@@ -9,6 +9,7 @@ from ..agent_service import validate_payload
 from ..auth import Principal, company_scope, current_principal
 from ..db import json_dump, json_load, new_id, now
 from ..quality import canonical_linkedin_url, normalize_name, validate_contact_record
+from ..lead_research.contacts import rank_contacts, verify_contact as verify_contact_evidence
 
 
 router = APIRouter(tags=["sales-intelligence"])
@@ -115,6 +116,11 @@ def _contact(row) -> dict:
     return {"id": row["id"], "company_id": row["company_id"], "lead_id": row["lead_id"],
             "email": row["email"], "phone": row["phone"], "linkedin_url": row["linkedin_url"],
             "status": row["status"], "do_not_contact": bool(row["do_not_contact"]),
+            "verification_tier": row["verification_tier"] or "red",
+            "contact_kind": row["contact_kind"] or "person",
+            "verification_method": row["verification_method"] or "not_checked",
+            "verification_evidence_ids": json_load(row["verification_evidence_ids"], []),
+            "verification_checked_at": row["verification_checked_at"],
             "data": json_load(row["data"], {}), "created_at": row["created_at"],
             "updated_at": row["updated_at"]}
 
@@ -499,7 +505,7 @@ def contacts(request: Request, principal: Principal = Depends(current_principal)
             needle in str(value.get(field) or value["data"].get(field) or "").casefold()
             for field in ("email", "phone", "linkedin_url", "full_name", "name", "title")
         )]
-    return values
+    return rank_contacts(values)
 
 
 @router.post("/contacts", status_code=201)
@@ -515,11 +521,23 @@ def create_contact(body: ContactCreate, request: Request,
         get_lead(body.lead_id, request, principal, x_company_id)
     contact_id, stamp = new_id("con"), now()
     linkedin = canonical_linkedin_url(body.linkedin_url)
+    tenant_evidence = {
+        "evidence_id": f"tenant-contact:{contact_id}",
+        "source_class": "customer",
+        "tenant_supplied": True,
+    }
+    data = {**body.data, "origin": "tenant_supplied", "evidence": [tenant_evidence]}
+    verification = verify_contact_evidence(
+        {**record, "linkedin_url": linkedin, "data": data}, [tenant_evidence],
+    )
     request.app.state.db.execute(
-        "INSERT INTO contacts(id,company_id,lead_id,email,phone,linkedin_url,data,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO contacts(id,company_id,lead_id,email,phone,linkedin_url,status,data,"
+        "verification_tier,contact_kind,verification_method,verification_evidence_ids,"
+        "verification_checked_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (contact_id, company_id, body.lead_id, body.email, body.phone, linkedin,
-         json_dump(body.data), stamp, stamp),
+         "verified" if verification.tier == "green" else "active", json_dump(data),
+         verification.tier, verification.contact_kind, verification.method,
+         json_dump(verification.evidence_ids), verification.checked_at, stamp, stamp),
     )
     return get_contact(contact_id, request, principal, x_company_id)
 
@@ -554,6 +572,23 @@ def patch_contact(contact_id: str, body: ContactPatch, request: Request,
     failures = validate_contact_record(candidate)
     if failures:
         raise HTTPException(422, {"message": "Invalid contact", "failures": failures})
+    merged_data = json_load(values.get("data", row["data"]), {})
+    tenant_evidence = {
+        "evidence_id": f"tenant-contact:{contact_id}",
+        "source_class": "customer",
+        "tenant_supplied": True,
+    }
+    merged_data.update({"origin": "tenant_supplied", "evidence": [tenant_evidence]})
+    verification = verify_contact_evidence({**dict(row), **values, "data": merged_data}, [tenant_evidence])
+    values.update({
+        "data": json_dump(merged_data),
+        "status": "verified" if verification.tier == "green" else "active",
+        "verification_tier": verification.tier,
+        "contact_kind": verification.contact_kind,
+        "verification_method": verification.method,
+        "verification_evidence_ids": json_dump(verification.evidence_ids),
+        "verification_checked_at": verification.checked_at,
+    })
     values["updated_at"] = now()
     request.app.state.db.execute(f"UPDATE contacts SET {','.join(f'{key}=?' for key in values)} WHERE id=?",
                                  (*values.values(), contact_id))
@@ -585,11 +620,25 @@ def verify_contact(contact_id: str, request: Request,
                    x_company_id: str | None = Header(default=None)):
     contact = get_contact(contact_id, request, principal, x_company_id)
     failures = validate_contact_record(contact)
-    status_value = "verified" if not failures else "invalid"
-    request.app.state.db.execute("UPDATE contacts SET status=?,updated_at=? WHERE id=?",
-                                 (status_value, now(), contact_id))
-    return {"contact_id": contact_id, "status": status_value, "failures": failures,
-            "verification": "passive"}
+    evidence = contact["data"].get("evidence") or []
+    verification = verify_contact_evidence(contact, evidence)
+    status_value = "invalid" if failures else "verified" if verification.tier == "green" else "active"
+    request.app.state.db.execute(
+        "UPDATE contacts SET status=?,verification_tier=?,contact_kind=?,verification_method=?,"
+        "verification_evidence_ids=?,verification_checked_at=?,updated_at=? "
+        "WHERE id=? AND company_id=?",
+        (
+            status_value, verification.tier, verification.contact_kind, verification.method,
+            json_dump(verification.evidence_ids), verification.checked_at, now(), contact_id,
+            _scope(principal, x_company_id),
+        ),
+    )
+    return {
+        "contact_id": contact_id, "status": status_value, "failures": failures,
+        "verification": "mechanical_evidence", "verification_tier": verification.tier,
+        "contact_kind": verification.contact_kind, "method": verification.method,
+        "evidence_ids": verification.evidence_ids, "checked_at": verification.checked_at,
+    }
 
 
 @router.post("/contacts/{contact_id}/mark-do-not-contact", status_code=204)

@@ -362,7 +362,9 @@ function contactRow(contact, actions = {}) {
     contact.email
       ? el('span', { class: 'ifz-mono' }, contact.email)
       : el('span', { class: 'ifz-muted' }, 'Email not known'),
-    badge(unavailable ? 'do_not_contact' : (contact.email_status || 'unverified'))),
+    badge(unavailable ? 'do_not_contact' : (contact.email_status || 'unverified')),
+    badge(contact.verification_tier || 'red',
+      `${contact.verification_tier || 'red'} · ${contact.contact_kind || 'person'}`)),
   el('div', { class: 'ifz-company-contact-links' },
     profileUrl
       ? el('a', {

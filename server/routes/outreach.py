@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
+from .. import compliance
 from ..db import json_dump, json_load, new_id, now
+from ..lead_research.contacts import (
+    eligible_cc_contact,
+    eligible_primary_contact,
+    rank_contacts,
+)
 from ..outreach_service import message_dict
 from ..quality import canonical_linkedin_url
 from .sales_intelligence import ContactCreate, LeadCreate, create_contact, create_lead, get_contact, get_lead
@@ -31,6 +38,10 @@ class CampaignPatch(BaseModel):
 
 class GenerateMessages(BaseModel):
     lead_ids: list[str] | None = None
+    language: str = "en"
+
+
+class GenerateLeadOutreach(BaseModel):
     language: str = "en"
 
 
@@ -88,6 +99,21 @@ class LinkedInNote(BaseModel):
     language: str = "en"
 
 
+class UnsupportedTemplateLanguage(ValueError):
+    """The tenant has no approved template for the selected language."""
+
+    def __init__(self, language: str):
+        self.language = language
+        super().__init__(f"no approved {language} template")
+
+    def detail(self) -> dict[str, str]:
+        return {
+            "code": "unsupported_template_language",
+            "language": self.language,
+            "message": str(self),
+        }
+
+
 def _scope(principal: Principal, header: str | None) -> str:
     return company_scope(principal, header)
 
@@ -96,6 +122,36 @@ def _campaign(row) -> dict:
     return {"id": row["id"], "company_id": row["company_id"], "name": row["name"],
             "channel": row["channel"], "status": row["status"], "data": json_load(row["data"], {}),
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+
+def _contact_dict(row) -> dict:
+    value = dict(row)
+    value["data"] = json_load(value.get("data"), {})
+    return value
+
+
+def eligible_primary_contacts(db, company_id: str, lead_id: str) -> list[dict]:
+    """Rank safe primary recipients, with generic addresses as last resort."""
+    contacts = [
+        _contact_dict(row)
+        for row in db.all(
+            "SELECT * FROM contacts WHERE company_id=? AND lead_id=? AND email IS NOT NULL",
+            (company_id, lead_id),
+        )
+    ]
+    return rank_contacts([
+        contact for contact in contacts
+        if eligible_primary_contact(contact)
+        and not compliance.is_suppressed(db, company_id, contact["email"])
+    ])
+
+
+def eligible_cc_contacts(db, company_id: str, lead_id: str) -> list[dict]:
+    """Return only unsuppressed green person contacts eligible for CC."""
+    return [
+        contact for contact in eligible_primary_contacts(db, company_id, lead_id)
+        if eligible_cc_contact(contact)
+    ]
 
 
 @router.get("/outreach/campaigns")
@@ -172,16 +228,26 @@ def _generation_run(company_id: str, request: Request, *, lead_id: str, contact_
         raise HTTPException(409, "Lead or contact is do-not-contact")
     if channel == "email" and not contact["email"]:
         raise HTTPException(422, "Contact has no email address")
+    if channel == "email" and not eligible_primary_contact(_contact_dict(contact)):
+        raise HTTPException(409, "Contact is not eligible for primary outreach")
     to = contact["email"] if channel == "email" else contact["phone"]
+    if channel == "email" and compliance.is_suppressed(request.app.state.db, company_id, to):
+        raise HTTPException(409, "Contact has unsubscribed from this company's outreach")
     cc = _resolve_cc(company_id, lead, contact, request) if channel == "email" else []
-    subject, body = _template_for(company_id, request, language, lead, contact)
+    language = str(language or "en").strip().lower()
+    try:
+        subject, body, template_version = _resolved_template(
+            company_id, request, language, lead, contact,
+        )
+    except UnsupportedTemplateLanguage as exc:
+        raise HTTPException(422, exc.detail()) from exc
     payload = {
         "campaign_id": campaign_id, "lead_id": lead_id, "contact_id": contact_id,
-        "channel": channel, "language": language, "to": to,
+        "channel": channel, "language": language, "template_version": template_version, "to": to,
         "recipients": {"to": to, "cc": cc},
         "delivery_context": {"country": lead["country"]},
         "draft_content": {"to": to, "cc": cc, "language": language,
-                          "subject": subject, "body": body},
+                          "template_version": template_version, "subject": subject, "body": body},
     }
     if supersedes_message_id:
         payload["supersedes_message_id"] = supersedes_message_id
@@ -189,21 +255,36 @@ def _generation_run(company_id: str, request: Request, *, lead_id: str, contact_
     return request.app.state.runs.start(company_id, run["id"])
 
 
-def _template_for(company_id: str, request: Request, language: str, lead, contact) -> tuple[str, str]:
-    """UI-authored template for the language, with {{placeholder}} substitution.
-
-    Falls back to English, then a generic partnership draft. Placeholders left
-    unresolved are caught by the deterministic preflight, not silently sent.
-    """
+def _template_record(company_id: str, request: Request, language: str) -> dict:
     section = request.app.state.db.one(
         "SELECT data FROM company_sections WHERE company_id=? AND section='email_templates'",
         (company_id,),
     )
     templates = (json_load(section["data"], {}) if section else {}).get("templates", {})
-    tpl = templates.get(language) or templates.get("en") or {}
-    subject = tpl.get("subject") or "Partnership opportunity"
-    body = tpl.get("body") or (
-        f"Hello, we would like to explore a potential partnership with {lead['company_name']}.")
+    template = templates.get(language) if isinstance(templates, dict) else None
+    # Preserve a safe first-run experience for old tenants that have never
+    # configured templates.  Once any tenant template exists, every requested
+    # language must have its own explicit entry; English is never a fallback.
+    if not templates and language == "en":
+        return {
+            "subject": "Partnership opportunity",
+            "body": "Hello, we would like to explore a potential partnership with {{company_name}}.",
+            "version": "builtin-en-v1",
+        }
+    if not isinstance(template, dict) or not str(template.get("subject") or "").strip() \
+            or not str(template.get("body") or "").strip():
+        raise UnsupportedTemplateLanguage(language)
+    return template
+
+
+def _resolved_template(
+    company_id: str, request: Request, language: str, lead, contact,
+) -> tuple[str, str, str]:
+    """Resolve only the selected language and return its immutable version."""
+    language = str(language or "en").strip().lower()
+    tpl = _template_record(company_id, request, language)
+    subject = str(tpl["subject"])
+    body = str(tpl["body"])
     contact_data = json_load(contact["data"], {}) if contact["data"] else {}
     fields = {
         "company_name": lead["company_name"] or "",
@@ -215,15 +296,28 @@ def _template_for(company_id: str, request: Request, language: str, lead, contac
         token = "{{" + key + "}}"
         subject = subject.replace(token, value)
         body = body.replace(token, value)
+    version = str(tpl.get("version") or "").strip()
+    if not version:
+        digest = hashlib.sha256(
+            f"{language}\0{tpl['subject']}\0{tpl['body']}".encode("utf-8"),
+        ).hexdigest()[:16]
+        version = f"sha256:{digest}"
+    return subject, body, version
+
+
+def _template_for(company_id: str, request: Request, language: str, lead, contact) -> tuple[str, str]:
+    """UI-authored template for exactly one selected language."""
+    subject, body, _version = _resolved_template(company_id, request, language, lead, contact)
     return subject, body
 
 
 def _resolve_cc(company_id: str, lead, primary_contact, request: Request) -> list[str]:
-    addresses = [row["email"] for row in request.app.state.db.all(
-        "SELECT email FROM contacts WHERE company_id=? AND lead_id=? AND id<>? "
-        "AND email IS NOT NULL AND do_not_contact=0 AND status<>'invalid'",
-        (company_id, lead["id"], primary_contact["id"]),
-    )]
+    candidates = [
+        contact for contact in eligible_cc_contacts(request.app.state.db, company_id, lead["id"])
+        if contact["id"] != primary_contact["id"]
+    ]
+    by_email = {str(contact["email"]).casefold(): contact["email"] for contact in candidates}
+    addresses = list(by_email.values())
     rules = request.app.state.db.all("SELECT data FROM cc_rules WHERE company_id=?", (company_id,))
     matching, defaults = [], []
     for row in rules:
@@ -233,7 +327,13 @@ def _resolve_cc(company_id: str, lead, primary_contact, request: Request) -> lis
         if rule.get("market_country") and str(rule["market_country"]).upper() == str(lead["country"]).upper():
             matching.append(rule)
     for rule in matching or defaults:
-        addresses.extend(rule.get("cc_emails", []))
+        # A rule may select an already-verified lead contact, but cannot inject
+        # an arbitrary address that has no green person-contact evidence.
+        addresses.extend(
+            by_email[str(address).casefold()]
+            for address in rule.get("cc_emails", [])
+            if str(address).casefold() in by_email
+        )
     primary = str(primary_contact["email"] or "").lower()
     return list(dict.fromkeys(address for address in addresses if address and address.lower() != primary))
 
@@ -247,11 +347,14 @@ def generate_campaign_messages(campaign_id: str, body: GenerateMessages, request
     lead_ids = body.lead_ids or campaign["data"].get("lead_ids", [])
     runs = []
     for lead_id in lead_ids:
-        contact = request.app.state.db.one(
-            "SELECT * FROM contacts WHERE company_id=? AND lead_id=? AND do_not_contact=0 "
-            "ORDER BY CASE WHEN email IS NOT NULL THEN 0 ELSE 1 END,created_at LIMIT 1",
-            (company_id, lead_id),
-        )
+        if campaign["channel"] == "email":
+            contact = next(iter(eligible_primary_contacts(request.app.state.db, company_id, lead_id)), None)
+        else:
+            contact = request.app.state.db.one(
+                "SELECT * FROM contacts WHERE company_id=? AND lead_id=? AND phone IS NOT NULL "
+                "AND do_not_contact=0 AND status NOT IN ('invalid','blocked') ORDER BY created_at LIMIT 1",
+                (company_id, lead_id),
+            )
         if contact:
             runs.append(_generation_run(company_id, request, lead_id=lead_id, contact_id=contact["id"],
                                         campaign_id=campaign_id, channel=campaign["channel"], language=body.language))
@@ -408,17 +511,17 @@ def mark_replied(message_id: str, request: Request, principal: Principal = Depen
 
 
 @router.post("/leads/{lead_id}/generate-outreach", status_code=202)
-def generate_lead_outreach(lead_id: str, request: Request,
+def generate_lead_outreach(lead_id: str, request: Request, body: GenerateLeadOutreach | None = None,
                            principal: Principal = Depends(current_principal),
                            x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
-    contact = request.app.state.db.one(
-        "SELECT id FROM contacts WHERE company_id=? AND lead_id=? AND email IS NOT NULL AND do_not_contact=0 LIMIT 1",
-        (company_id, lead_id),
-    )
+    contact = next(iter(eligible_primary_contacts(request.app.state.db, company_id, lead_id)), None)
     if not contact:
         raise HTTPException(409, "Lead has no eligible email contact")
-    return _generation_run(company_id, request, lead_id=lead_id, contact_id=contact["id"])
+    return _generation_run(
+        company_id, request, lead_id=lead_id, contact_id=contact["id"],
+        language=(body.language if body else "en"),
+    )
 
 
 @router.post("/custom-outreach/create-lead-and-message", status_code=202)

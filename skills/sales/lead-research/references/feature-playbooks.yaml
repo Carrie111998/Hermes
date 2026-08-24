@@ -1,3 +1,34 @@
+_research_defaults:
+  dimensions:
+    product_sector_fit:
+      required: [product_range]
+      useful: [product_term, product_fit, hs_code, sector_ids, brands_carried]
+      source_hint: official_site
+    buyer_channel_fit:
+      required: [buyer_role]
+      useful: [buyer_type]
+      source_hint: official_site
+    buying_intent:
+      required: [procurement_signal]
+      useful: [buying_intent, procurement_intent, sourcing_intent, tender]
+      source_hint: procurement_portal
+    market_coverage:
+      required: [locations]
+      useful: [countries_served, market_coverage]
+      source_hint: official_site
+    commercial_scale:
+      required: [company_size]
+      useful: [employee_count, store_count, revenue, market_cap]
+      source_hint: official_site
+    trade_activity:
+      required: [relevant_import_value]
+      useful: [relevant_export_value, trade_activity]
+      source_hint: trade_registry
+    contactability:
+      required: [website]
+      useful: [domain, email, phone, linkedin_url]
+      source_hint: official_site
+
 household-appliances:
   required: [identity_scale, market_coverage, product_fit]
   useful: [store_count, relevant_import_value, brands_carried, buying_intent]

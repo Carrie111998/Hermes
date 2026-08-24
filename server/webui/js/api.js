@@ -79,6 +79,9 @@ export const routes = {
   'admin.documents.retry':      ['POST',   '/admin/documents/:documentId/retry'],
   'admin.documents.delete':     ['DELETE', '/admin/documents/:documentId'],
   'admin.agentRuns.detail':     ['GET',    '/admin/agent-runs/:runId/detail'],
+  'admin.research.quality':      ['GET',    '/admin/research/quality'],
+  'admin.research.factImpact':   ['GET',    '/admin/research/facts/:factId/impact'],
+  'admin.research.correctFact':  ['POST',   '/admin/research/facts/:factId/corrections'],
 
   // 7.4 Company profile
   'company.getProfile':         ['GET',    '/company/profile'],

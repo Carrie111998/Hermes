@@ -27,10 +27,46 @@ begin
                     '010_digest_suppression_parity','011_candidate_search_text',
                     '012_company_profile_versions','013_candidate_visibility',
                     '014_research_translations','015_shared_research_facts',
-                    '016_research_search_attempts']) v
+                    '016_research_search_attempts','017_research_result_contract',
+                    '018_research_labels_corrections','019_contact_verification_tiers',
+                    '020_lead_research_contract_backfill']) v
   where v not in (select version from schema_migrations);
   if missing is not null then
     raise exception 'unapplied migrations: %', missing;
+  end if;
+end $$;
+
+-- Shared public facts are served only through the service's guarded reuse
+-- logic. Direct authenticated policies would bypass correction/isolation
+-- checks and expose the pool as a tenant-readable database.
+do $$
+declare exposed text;
+begin
+  select string_agg(tablename || ':' || policyname, ', ') into exposed
+  from pg_policies
+  where schemaname='public'
+    and tablename in ('shared_organizations','shared_evidence_records',
+                      'shared_facts','shared_fact_evidence')
+    and ('authenticated'=any(roles) or 'public'=any(roles));
+  if exposed is not null then
+    raise exception 'shared research tables have direct authenticated policies: %', exposed;
+  end if;
+end $$;
+
+-- Contact verification is an evidence tier, not a status string hidden in
+-- JSON. All five columns must land together or ranking/sending would disagree.
+do $$
+declare missing text;
+begin
+  select string_agg(v, ', ') into missing
+  from unnest(array['verification_tier','contact_kind','verification_method',
+                    'verification_evidence_ids','verification_checked_at']) v
+  where not exists (
+    select 1 from information_schema.columns
+    where table_schema='public' and table_name='contacts' and column_name=v
+  );
+  if missing is not null then
+    raise exception 'contacts verification columns missing: %', missing;
   end if;
 end $$;
 

@@ -27,6 +27,7 @@ from .agent_service import AgentRunService, StubRunExecutor
 from .chat_bridge import ChatBridge
 from .scheduler import DailyDigestScheduler
 from .lead_research import LeadResearchService
+from .lead_research.service import ResearchRefreshService
 from .routes import admin, admin_documents, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, oauth, research_campaigns, sales_intelligence, unsubscribe
 
 
@@ -48,6 +49,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     )
     chat_service = (ChatBridge(database, settings, run_service, agent_factory=chat_agent_factory)
                     if settings.chat_enabled else None)
+    lead_research_service = LeadResearchService(database)
+    research_refresh = ResearchRefreshService(database, run_service)
     # Always constructed so tests and the CLI can drive tick() directly; only
     # the background thread is gated on the setting.
     digest_scheduler = DailyDigestScheduler(
@@ -55,6 +58,10 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         plan_hour=settings.digest_plan_hour,
         report_hour=settings.digest_report_hour,
         interval_seconds=settings.scheduler_interval_seconds,
+        research_refresh=research_refresh,
+        research_refresh_enabled=settings.research_refresh_enabled,
+        research_refresh_hour=settings.research_refresh_hour,
+        research_refresh_batch_limit=settings.research_refresh_batch_limit,
     )
 
     @asynccontextmanager
@@ -86,6 +93,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.state.runs = run_service
     app.state.chat = chat_service
     app.state.scheduler = digest_scheduler
+    app.state.research_refresh = research_refresh
     app.state.cipher = CredentialCipher(settings.credential_key)
     app.state.outreach = OutreachService(
         database, app.state.cipher,
@@ -99,7 +107,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.state.storage = create_storage(settings)
     app.state.document_artifacts = document_artifacts
     app.state.document_processing = document_processing
-    app.state.lead_research = LeadResearchService(database)
+    app.state.lead_research = lead_research_service
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),

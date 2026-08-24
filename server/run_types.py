@@ -1,4 +1,4 @@
-"""Registry of the 11 agent run types (PRODUCT.md §7.24) → skill + prompt.
+"""Registry of durable agent run types (PRODUCT.md §7.24) → skill + prompt.
 
 Each run type maps to a skill in skills/sales/ and a prompt builder that turns
 the run payload into the agent instruction. The company pack directory is
@@ -21,7 +21,8 @@ PACKS = REPO / "company-packs"
 READ_ONLY = {
     "document_processing", "product_extraction", "company_brain_build",
     "lead_scan", "lead_research", "contact_discovery", "outreach_generation",
-    "linkedin_note_generation", "company_profile_research",
+    "linkedin_note_generation", "company_profile_research", "lead_research_gap",
+    "lead_research_refresh",
 }
 SEND_TYPES = {"email_send", "whatsapp_send"}
 
@@ -113,6 +114,38 @@ def _lead_research(company, payload, context=None):
             "JSON: {profile, fit, signals, approach_angle, score_inputs}.")
 
 
+def _lead_research_gap(company, payload, context=None):
+    return (
+        _ctx(company, context)
+        + _p(payload)
+        + "\n\nUsing the lead-research skill, fill only the supplied weighted research "
+          "batches for this resolved organization. This is read-only: never contact the "
+          "company. The decision_model is authoritative for ambiguity and disagreements; "
+          "the optional extractor_model may only extract clear literal facts. Return every "
+          "schema-known fact found on an accepted page, including incidental facts outside "
+          "the requested fields. Every fact must cite a returned page_id and an exact "
+          "original-language span with byte-preserving start/end offsets. Also return its "
+          "canonical English value, source language, https canonical URL, immutable SHA-256 "
+          "snapshot hash, observation date, archive date when applicable, and whether a "
+          "decision model was required. Respect the page, request, time, and token limits; "
+          "stop for required coverage, source exhaustion, cancellation, or a configured "
+          "budget, never merely because the current fit score is low. Output JSON: "
+          "{pages:[...], facts:[...], unresolved_fields:[...], requests_started:int, "
+          "tokens_used:int, stop_reason:string}."
+    )
+
+
+def _lead_research_refresh(company, payload, context=None):
+    return (
+        _ctx(company, context) + _p(payload)
+        + "\n\nRefresh only the named stale field for the named organization using the "
+          "lead-research skill. Do not broaden into company discovery, contact discovery, "
+          "or additional fields. Honor the payload budget as a hard ceiling. Return exact "
+          "source snapshots and spans as JSON: {pages:[...], facts:[...], "
+          "unresolved_fields:[...], requests_started:int, tokens_used:int, stop_reason:string}."
+    )
+
+
 def _contact_discovery(company, payload, context=None):
     return (_ctx(company, context) + _p(payload) + "\n\nUsing the contact-discovery "
             "skill, find buyer-role contacts for the lead(s). Respect the "
@@ -156,6 +189,8 @@ REGISTRY: Dict[str, tuple] = {
     "company_profile_research":("lead-research",       _company_profile_research),
     "lead_scan":               ("lead-discovery",      _lead_scan),
     "lead_research":           ("lead-research",       _lead_research),
+    "lead_research_gap":       ("lead-research",       _lead_research_gap),
+    "lead_research_refresh":   ("lead-research",       _lead_research_refresh),
     "contact_discovery":       ("contact-discovery",   _contact_discovery),
     "outreach_generation":     ("cold-email-outreach", _outreach_generation),
     "email_send":              ("cold-email-outreach", _email_send),
