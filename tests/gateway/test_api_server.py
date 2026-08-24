@@ -2531,6 +2531,52 @@ class TestModelRoutesHandlers:
 
 class TestModelRoutesAgentCreation:
 
+    def test_equal_model_auth_fallback_does_not_manufacture_default_route(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.model = kwargs["model"]
+                self.provider = kwargs["provider"]
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        fallback_route = {
+            "provider": "fallback-b",
+            "requested_provider": "fallback-b",
+            "model": "shared-model",
+            "api_key": "fallback-key",
+            "base_url": "https://fallback.example/v1",
+            "api_mode": "chat_completions",
+        }
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: fallback_route.copy(),
+        )
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda: "shared-model"
+        )
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"model": {"default": "shared-model"}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: [fallback_route]),
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        agent = adapter._create_agent(session_id="s1")
+
+        assert captured["provider"] == "fallback-b"
+        assert captured["model"] == "shared-model"
+        assert captured["fallback_model"] is None
+        assert agent._configured_default_route is None
+
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}
 

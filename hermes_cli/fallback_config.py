@@ -107,11 +107,12 @@ def get_configured_default_route(
         return None
 
     runtime_model = str(runtime.get("model") or "").strip()
-    if runtime_model and runtime_model.lower() != model.lower():
+    if runtime_model:
         # Gateway auth recovery returns the selected fallback model alongside
         # its runtime. That provider describes the fallback route, not a
-        # provider-less configured default, so combining the two would invent
-        # a route that was never configured.
+        # provider-less configured default. This remains true when both routes
+        # use the same model ID, so combining them would invent a route that
+        # was never configured.
         runtime = {}
 
     provider = str(

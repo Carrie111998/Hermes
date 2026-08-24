@@ -139,7 +139,9 @@ def test_fast_session_override_survives_unresolvable_default(monkeypatch):
     assert "_configured_default_route" not in runtime
 
 
-def test_auth_fallback_does_not_supply_provider_for_legacy_default(monkeypatch):
+def test_equal_model_auth_fallback_does_not_supply_provider_for_legacy_default(
+    monkeypatch,
+):
     runner = object.__new__(GatewayRunner)
     runner._session_model_overrides = {
         "sess-1": {
@@ -150,7 +152,7 @@ def test_auth_fallback_does_not_supply_provider_for_legacy_default(monkeypatch):
     fallback_runtime = {
         "provider": "openrouter",
         "requested_provider": "openrouter",
-        "model": "fallback-model",
+        "model": "global-model",
         "api_key": "fallback-key",
         "base_url": "https://openrouter.ai/api/v1",
     }
