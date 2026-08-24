@@ -2061,6 +2061,7 @@ def run_doctor(args):
         # On Windows, canonical launchers live in the managed binary dir (HERMES_HOME\bin)
         from hermes_constants import get_default_hermes_root, project_venv_dir, venv_bin_dir
         from hermes_cli import _install_repair as _ir_mod
+        from hermes_cli._install_repair import _WINDOWS_BIN_LAUNCHERS
 
         try:
             _default_root = Path(get_default_hermes_root())
@@ -2068,7 +2069,7 @@ def run_doctor(args):
             _default_root = Path.home() / ".hermes"
 
         _managed_bin = _default_root / "bin"
-        _launcher_names = getattr(_ir_mod, "_WINDOWS_BIN_LAUNCHERS", ("hermes", "hermes-acp"))
+        _launcher_names = _WINDOWS_BIN_LAUNCHERS
 
         _venv_dir = project_venv_dir(PROJECT_ROOT)
         _venv_scripts = venv_bin_dir(_venv_dir, windows=True) if _venv_dir else None
@@ -2123,9 +2124,10 @@ def run_doctor(args):
             if _norm_bin in _norm_entries:
                 check_ok(f"{_managed_bin} is on PATH")
             else:
+                _escaped_bin = str(_managed_bin).replace("'", "''")
                 check_warn(
                     f"{_managed_bin} is not on your PATH",
-                    f"(run in PowerShell: [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';{_managed_bin}', 'User'))"
+                    f"(run in PowerShell: [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + '{_escaped_bin}', 'User'))"
                 )
                 manual_issues.append(f"Add {_managed_bin} to your User PATH")
 
