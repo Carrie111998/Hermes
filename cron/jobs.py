@@ -2442,6 +2442,13 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
+            # One-shot marker: the arbitrary "now" instant written above is
+            # (almost surely) not an occurrence of the job's cron expression,
+            # and the stale-schedule guard added for #93049 would re-anchor it
+            # without firing — turning every manual trigger into a silent
+            # no-op (#94010). _get_due_jobs_locked consumes the marker to
+            # bypass the guard for exactly this fire, then clears it.
+            "fire_now": True,
         },
     )
 
@@ -3651,8 +3658,20 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # so re-anchor before either can fire. Recomputation uses the
                 # current expression, so this converges — it cannot defer
                 # forever.
-                if kind == "cron" and not _cron_next_run_matches_expr(
-                    schedule, next_run_dt
+                #
+                # The one deliberate exception is trigger_job()'s "run now"
+                # (#94010): its next_run_at is an arbitrary second chosen by
+                # the operator, which is exactly the mismatch this guard
+                # exists to correct — without the fire_now marker every
+                # manual trigger of a recurring cron job became a silent
+                # no-op that still reported success. Consume the marker here
+                # (in both the working record and storage) and fall through
+                # to the fire path.
+                _fire_now = job.pop("fire_now", None)
+                if (
+                    kind == "cron"
+                    and not _cron_next_run_matches_expr(schedule, next_run_dt)
+                    and not _fire_now
                 ):
                     new_next = compute_next_run(schedule, now.isoformat())
                     logger.info(
@@ -3668,9 +3687,22 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         for rj in raw_jobs:
                             if rj["id"] == job["id"]:
                                 rj["next_run_at"] = new_next
+                                rj.pop("fire_now", None)
                                 needs_save = True
                                 break
                     continue
+                elif _fire_now:
+                    for rj in raw_jobs:
+                        if rj["id"] == job["id"]:
+                            rj.pop("fire_now", None)
+                            needs_save = True
+                            break
+                    logger.info(
+                        "Job '%s' fire-now marker honored; firing manual run "
+                        "despite non-occurrence next_run_at %s.",
+                        job.get("name", job.get("id", "?")),
+                        next_run,
+                    )
 
                 # For recurring jobs, check if the scheduled time is stale
                 # (gateway was down and missed the window). Fast-forward to
