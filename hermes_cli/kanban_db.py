@@ -1448,6 +1448,16 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Durable outcome for the host-owned hermes.kanban.atomic-graph v1 facade.
+-- The weekly idempotency key is the lookup identity, while the original full
+-- apply digest prevents a caller from reusing that key for different work.
+CREATE TABLE IF NOT EXISTS atomic_graph_receipts (
+    idempotency_key      TEXT PRIMARY KEY,
+    apply_request_digest TEXT NOT NULL,
+    receipt_json         TEXT NOT NULL,
+    created_at           INTEGER NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple

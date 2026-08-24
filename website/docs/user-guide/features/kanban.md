@@ -245,6 +245,28 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Atomic graph host facade
+
+Hermes includes an opt-in, host-owned `hermes.kanban.atomic-graph` v1
+facade for authenticated automation that must create a complete dependency
+graph or create nothing. It is disabled by default and intentionally pinned
+to the `hermes-overseer-hardening` board; caller input, the active-board
+pointer, and `HERMES_KANBAN_BOARD` / `HERMES_KANBAN_DB` cannot redirect its
+writes. Enable it only when the matching private token-auth route is installed:
+
+```yaml
+kanban:
+  atomic_graph_enabled: true
+```
+
+The facade validates the complete closed envelope and live profiles/workspace
+before opening one `BEGIN IMMEDIATE` transaction. Tasks, links, creation events,
+and a durable digest-bound receipt commit together. Exact retries return the
+original ordered receipt without new writes; reusing an idempotency key for a
+different request is rejected. Disable the flag to roll back access; the
+additive receipt table may remain in place and existing graph tasks are not
+deleted automatically.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
