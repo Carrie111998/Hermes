@@ -196,7 +196,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, groupChatNames, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -1220,6 +1220,26 @@ test('disband: skips source-qualified remote members instead of mutating same-na
   assert.equal(JSON.stringify(gc.$botMeta.get().builder.groups), JSON.stringify(['Keep']))
   assert.equal(gc.$botMeta.get().builder.group, 'Keep')
   assert.equal(gc.$botMeta.get()['[object Object]'], undefined)
+})
+
+test('disband: a zero-member remote row still clears stale bot-meta so the room does not reappear as 0-bots (#93345)', async () => {
+  const gc = load(() => '(pass)')
+
+  gc.$botMeta.set({ builder: { groups: ['앱데브팀'], group: '앱데브팀' } })
+  gc.$groupChats.set({
+    '앱데브팀': { log: [], members: [], watermarks: {}, sessions: {}, running: false }
+  })
+
+  // Remote symptom: member resolution already fell to zero, so Delete Group
+  // receives an empty member array and cannot clear the stale membership.
+  await gc.disbandGroupChat('앱데브팀', [])
+
+  assert.equal(gc.$groupChats.get()['앱데브팀'], undefined, 'room record is deleted')
+  assert.equal(
+    JSON.stringify(gc.groupChatNames(gc.$botMeta.get(), gc.$groupChats.get())),
+    JSON.stringify([]),
+    'deleted room must not be reconstructed from stale bot metadata'
+  )
 })
 
 test('disband: a running room leaves an epoch-bumped empty tombstone so in-flight turns bail', async () => {

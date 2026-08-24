@@ -6420,6 +6420,17 @@ async function disbandGroupChat(group, members) {
     await saveBotMeta(member, groupMembershipPatch(meta, group, false))
   }
 
+  // A remote-resolved rendered row can carry zero members (member resolution
+  // already fell to zero) while durable Bot Mode metadata still names this
+  // group — the loop above then performs no writes and groupChatNames()
+  // reconstructs a metadata-only roster row. Clear the group from every
+  // meta entry that still names it, independent of what was rendered.
+  for (const [key, entry] of Object.entries($botMeta.get())) {
+    if (botGroups(entry).includes(group)) {
+      await saveBotMeta(key, groupMembershipPatch(entry, group, false))
+    }
+  }
+
   // Converge on server truth: the cached roster still carries the pre-disband
   // ui_meta (the write-fence in mergeServerMeta keeps it from resurrecting
   // the membership, but a fresh snapshot is what makes every surface agree).
