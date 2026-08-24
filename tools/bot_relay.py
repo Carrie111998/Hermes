@@ -325,7 +325,7 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
     label = f"@{envelope['target_handle']} on {envelope['target_connection']}"
     code = (
         "import json,os,sys,time\n"
-        f"p = {reply_path!r}\n"
+        f"p = r{reply_path!r}\n"
         f"deadline = time.time() + {REPLY_WAIT_SECONDS}\n"
         "while time.time() < deadline:\n"
         "    if os.path.exists(p):\n"
@@ -349,8 +349,9 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
 
 def local_delivery_command(profile: str, query_file: str) -> list[str]:
     """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
+    _hermes_bin = str(Path(sys.executable).parent / "hermes")
     return [
-        "hermes",
+        _hermes_bin,
         "-p",
         profile,
         "chat",
