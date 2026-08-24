@@ -891,6 +891,24 @@ def _rolling_activity_terminal_header(
     return "✅ Completed"
 
 
+def _resolve_tool_progress_mode(user_config: Any, platform_key: str) -> str:
+    """Resolve tool progress with the legacy env fallback precedence."""
+    from gateway.display_config import resolve_display_setting
+
+    resolved = resolve_display_setting(user_config, platform_key, "tool_progress")
+    env_mode = os.getenv("HERMES_TOOL_PROGRESS_MODE")
+    display = user_config.get("display", {}) if isinstance(user_config, dict) else {}
+    display = display if isinstance(display, dict) else {}
+    platform = (display.get("platforms") or {}).get(platform_key) or {}
+    legacy_overrides = display.get("tool_progress_overrides") or {}
+    configured = (
+        "tool_progress" in display
+        or (isinstance(platform, dict) and "tool_progress" in platform)
+        or (isinstance(legacy_overrides, dict) and platform_key in legacy_overrides)
+    )
+    return env_mode if env_mode and not configured else (resolved or env_mode or "all")
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -19778,7 +19796,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"{_compress_token_threshold:,}",
                     )
 
-                    _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    _hyg_reply_to = self._reply_anchor_for_event(event)
+                    _hyg_meta = self._thread_metadata_for_source(source, _hyg_reply_to)
+                    _hyg_progress_meta = _hyg_meta
+                    if (
+                        source.platform == Platform.DISCORD
+                        and getattr(source, "delivered_via_upstream_relay", False)
+                        and getattr(source, "prospective_thread_id", None)
+                        and not getattr(source, "thread_id", None)
+                        and _hyg_reply_to
+                    ):
+                        _hyg_progress_meta = dict(_hyg_progress_meta or {})
+                        _hyg_progress_meta["reply_to_message_id"] = str(
+                            _hyg_reply_to
+                        )
+                    _hyg_progress_meta = _non_conversational_metadata(
+                        _hyg_progress_meta,
+                        platform=source.platform,
+                    )
 
                     # Rolling activity owns one editable bubble for the whole
                     # turn. Seed it before the potentially minutes-long hygiene
@@ -19787,8 +19822,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         from gateway.display_config import resolve_display_setting
 
                         _hyg_platform_key = _platform_config_key(source.platform)
-                        _hyg_progress_mode = resolve_display_setting(
-                            _hyg_data, _hyg_platform_key, "tool_progress", "all"
+                        _hyg_progress_mode = _resolve_tool_progress_mode(
+                            _hyg_data, _hyg_platform_key
                         )
                         _hyg_progress_grouping = resolve_display_setting(
                             _hyg_data,
@@ -19812,7 +19847,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _hyg_send = await _hyg_adapter.send(
                                 source.chat_id,
                                 "⏳ Compressing conversation context…",
-                                metadata=_hyg_meta,
+                                reply_to=_hyg_reply_to,
+                                metadata=_hyg_progress_meta,
                             )
                             if _hyg_send.success and _hyg_send.message_id:
                                 _hyg_progress_message_id = str(_hyg_send.message_id)
@@ -20345,12 +20381,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and self._is_session_run_current(_quick_key, run_generation)
                     ):
                         try:
-                            await _hyg_adapter.edit_message(
-                                source.chat_id,
-                                _hyg_progress_message_id,
-                                "⏳ Working…",
-                                metadata=_hyg_meta,
-                            )
+                            _hyg_edit_kwargs = {
+                                "chat_id": source.chat_id,
+                                "message_id": _hyg_progress_message_id,
+                                "content": "⏳ Working…",
+                            }
+                            try:
+                                _hyg_edit_params = inspect.signature(
+                                    _hyg_adapter.edit_message
+                                ).parameters
+                                if "metadata" in _hyg_edit_params or any(
+                                    param.kind is inspect.Parameter.VAR_KEYWORD
+                                    for param in _hyg_edit_params.values()
+                                ):
+                                    _hyg_edit_kwargs["metadata"] = _hyg_progress_meta
+                            except (TypeError, ValueError):
+                                pass
+                            await _hyg_adapter.edit_message(**_hyg_edit_kwargs)
                         except Exception:
                             logger.debug(
                                 "Session hygiene progress edit failed",
@@ -28538,28 +28585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
-        _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
-        _display_cfg = display_config if isinstance(display_config, dict) else {}
-        _platforms_cfg = _display_cfg.get("platforms") or {}
-        _platform_cfg = _platforms_cfg.get(platform_key) or {}
-        _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
-        _tool_progress_configured = (
-            "tool_progress" in _display_cfg
-            or (
-                isinstance(_platform_cfg, dict)
-                and "tool_progress" in _platform_cfg
-            )
-            or (
-                isinstance(_legacy_tp_overrides, dict)
-                and platform_key in _legacy_tp_overrides
-            )
-        )
-        progress_mode = (
-            _env_tp
-            if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
-        )
+        progress_mode = _resolve_tool_progress_mode(user_config, platform_key)
         # Tool progress grouping: accumulated history, bounded rolling tail, or
         # one separate message per tool.
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
@@ -30010,24 +30036,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                # Defer recursion until this turn's finally block has flushed
-                # its rolling terminal state and released its running slot.
-                # Awaiting the follow-up here leaves the first activity bubble
-                # at `⏳ Working…` while a second one is already active.
-                queued_parent_result = result
-                queued_followup_args = {
-                    "message": next_message,
-                    "context_prompt": context_prompt,
-                    "history": updated_history,
-                    "source": next_source,
-                    "session_id": session_id,
-                    "session_key": next_session_key,
-                    "run_generation": run_generation,
-                    "_interrupt_depth": _interrupt_depth + 1,
-                    "event_message_id": next_message_id,
-                    "channel_prompt": next_channel_prompt,
-                    "message_type": next_message_type,
-                }
+                if progress_grouping == "rolling" and tool_progress_enabled:
+                    # Defer recursion until this turn's finally block has
+                    # flushed its terminal state and released its running slot.
+                    queued_parent_result = result
+                    queued_followup_args = {
+                        "message": next_message,
+                        "context_prompt": context_prompt,
+                        "history": updated_history,
+                        "source": next_source,
+                        "session_id": session_id,
+                        "session_key": next_session_key,
+                        "run_generation": run_generation,
+                        "_interrupt_depth": _interrupt_depth + 1,
+                        "event_message_id": next_message_id,
+                        "channel_prompt": next_channel_prompt,
+                        "message_type": next_message_type,
+                    }
+                else:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
+                    return _preserve_queued_followup_history_offset(
+                        result, followup_result
+                    )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

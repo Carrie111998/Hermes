@@ -55,8 +55,8 @@ def _make_large_history_tokens(target_tokens: int) -> list:
 
 
 class HygieneCaptureAdapter(BasePlatformAdapter):
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), platform)
         self.sent = []
         self.edits = []
 
@@ -77,13 +77,12 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="hygiene-1")
 
-    async def edit_message(self, chat_id, message_id, content, metadata=None) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
         self.edits.append(
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
-                "metadata": metadata,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -645,9 +644,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     SlowCompressAgent.last_instance.close.assert_called_once()
 
 
+@pytest.mark.parametrize("legacy_progress_mode", [None, "off", "log"])
 @pytest.mark.asyncio
 async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, legacy_progress_mode
 ):
     """Regression for #60947: gateway hygiene should not rely on
     helper-agent session rotation to shrink a live gateway transcript.
@@ -712,35 +712,37 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     fake_run_agent.AIAgent = FakeInPlaceCompressAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
+    if legacy_progress_mode:
+        monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", legacy_progress_mode)
     (tmp_path / "config.yaml").write_text(
         "compression:\n"
         "  enabled: true\n"
         "display:\n"
         "  platforms:\n"
-        "    telegram:\n"
-        "      tool_progress: all\n"
+        "    discord:\n"
         "      tool_progress_grouping: rolling\n"
     )
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
-    adapter = HygieneCaptureAdapter()
+    adapter = HygieneCaptureAdapter(Platform.DISCORD)
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="fake-token")}
     )
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._adapter_for_source = lambda _source: adapter
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
-        session_key="agent:main:telegram:private:12345",
+        session_key="agent:main:discord:channel:12345",
         session_id="sess-1",
         created_at=datetime.now(),
         updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="private",
+        platform=Platform.DISCORD,
+        chat_type="channel",
     )
     runner.session_store.load_transcript.return_value = _make_history(12, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
@@ -774,10 +776,12 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     event = MessageEvent(
         text="hello",
         source=SessionSource(
-            platform=Platform.TELEGRAM,
+            platform=Platform.DISCORD,
             chat_id="12345",
-            chat_type="private",
+            chat_type="channel",
             user_id="12345",
+            delivered_via_upstream_relay=True,
+            prospective_thread_id="1",
         ),
         message_id="1",
     )
@@ -806,9 +810,17 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     # the just-archived rows (#61145). The hygiene handler must skip it.
     runner.session_store.rewrite_transcript.assert_not_called()
     runner._run_agent.assert_awaited_once()
-    assert adapter.sent[0]["content"] == "⏳ Compressing conversation context…"
-    assert adapter.edits[-1]["content"] == "⏳ Working…"
-    assert runner._run_agent.call_args.kwargs["progress_message_id"] == "hygiene-1"
+    if legacy_progress_mode:
+        assert adapter.sent == []
+        assert adapter.edits == []
+        assert runner._run_agent.call_args.kwargs["progress_message_id"] is None
+    else:
+        assert adapter.sent[0]["content"] == "⏳ Compressing conversation context…"
+        assert adapter.sent[0]["reply_to"] == "1"
+        assert adapter.sent[0]["metadata"]["reply_to_message_id"] == "1"
+        assert adapter.sent[0]["metadata"]["non_conversational"] is True
+        assert adapter.edits[-1]["content"] == "⏳ Working…"
+        assert runner._run_agent.call_args.kwargs["progress_message_id"] == "hygiene-1"
     # A real in-place compaction IS a recovery, so the gate must have run and
     # cleared the streak. This is the positive half of the wiring contract.
     assert reset_calls, (

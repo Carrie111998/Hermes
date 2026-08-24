@@ -1017,6 +1017,25 @@ class QueuedSilenceAgent:
         }
 
 
+class QueuedLifecycleAgent:
+    """Record queued-turn execution relative to parent cleanup."""
+
+    calls = 0
+    timeline = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        type(self).timeline.append(f"run-{type(self).calls}")
+        return {
+            "final_response": f"response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -1094,6 +1113,7 @@ async def _run_with_agent(
     user_id=None,
     scope_id=None,
     progress_message_id=None,
+    runner_setup=None,
 ):
     if config_data:
         import yaml
@@ -1110,6 +1130,8 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    if runner_setup:
+        runner_setup(runner)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1528,6 +1550,43 @@ async def test_rolling_queued_followup_starts_after_parent_terminal_flush(
         if content.startswith("⏳ Working…")
     )
     assert parent_terminal < child_start
+
+
+@pytest.mark.parametrize("grouping", ["accumulate", "separate"])
+@pytest.mark.asyncio
+async def test_nonrolling_queued_followup_preserves_nested_recursion(
+    monkeypatch, tmp_path, grouping
+):
+    QueuedLifecycleAgent.calls = 0
+    QueuedLifecycleAgent.timeline = []
+
+    def record_cleanup(runner):
+        original = runner._release_running_agent_state
+
+        def wrapped(*args, **kwargs):
+            QueuedLifecycleAgent.timeline.append("release")
+            return original(*args, **kwargs)
+
+        runner._release_running_agent_state = wrapped
+
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedLifecycleAgent,
+        session_id=f"sess-progress-{grouping}-queued-order",
+        pending_text="follow up",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": grouping,
+                "interim_assistant_messages": False,
+            }
+        },
+        runner_setup=record_cleanup,
+    )
+
+    assert result["final_response"] == "response 2"
+    assert QueuedLifecycleAgent.timeline[:2] == ["run-1", "run-2"]
 
 
 @pytest.mark.asyncio
