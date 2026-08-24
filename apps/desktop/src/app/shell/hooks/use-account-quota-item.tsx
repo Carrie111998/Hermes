@@ -9,6 +9,7 @@ import { $activeGatewayProfile } from '@/store/profile'
 import type { StatusbarItem } from '../statusbar-controls'
 
 const POLL_MS = 5 * 60 * 1000
+const EMPTY_POLL_MS = 30 * 60 * 1000
 
 export function useAccountQuotaStatusbarItem(): StatusbarItem {
   const { statusbar: copy } = useI18n()
@@ -16,7 +17,7 @@ export function useAccountQuotaStatusbarItem(): StatusbarItem {
   const query = useQuery({
     queryKey: ['account-usage', profile],
     queryFn: () => getAccountUsage(profile),
-    refetchInterval: POLL_MS,
+    refetchInterval: current => (formatQuotaChip(current.state.data).label ? POLL_MS : EMPTY_POLL_MS),
     retry: false,
     staleTime: POLL_MS
   })

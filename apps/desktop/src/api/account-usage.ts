@@ -37,6 +37,20 @@ export function getAccountUsage(profile?: ProfileScope, provider?: string): Prom
   })
 }
 
+export function formatResetLabel(iso?: null | string): string {
+  if (!iso) return ''
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) return ''
+  const delta = dt.getTime() - Date.now()
+  if (delta <= 0) return 'now'
+  const minutes = Math.round(delta / 60000)
+  if (minutes < 60) return `in ${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `in ${hours}h ${minutes % 60}m`
+  const days = Math.floor(hours / 24)
+  return `in ${days}d ${hours % 24}h`
+}
+
 const LABELS: Record<string, string> = {
   'openai-codex': 'Codex',
   anthropic: 'Claude',
@@ -62,8 +76,8 @@ export function formatQuotaChip(payload: AccountUsageResponse | null | undefined
       const name = LABELS[row.provider] || row.provider
       const bits = (row.windows || []).map(window => {
         const remaining = window.remaining_percent
-        const reset = window.reset_at ? ` ${window.reset_at}` : ''
-        return `${window.name} ${remaining ?? '—'}%${reset}`
+        const reset = formatResetLabel(window.reset_at)
+        return `${window.name} ${remaining ?? '—'}%${reset ? ` ${reset}` : ''}`
       })
       return `${name}${row.plan ? ` ${row.plan}` : ''}: ${bits.join(' · ') || row.reason || 'ok'}`
     })

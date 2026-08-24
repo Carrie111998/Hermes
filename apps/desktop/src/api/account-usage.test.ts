@@ -27,6 +27,21 @@ describe('formatQuotaChip', () => {
     expect(tip).toContain('Claude')
   })
 
+  it('formats reset times relatively', () => {
+    const soon = new Date(Date.now() + 90 * 60 * 1000).toISOString()
+    const { tip } = formatQuotaChip({
+      providers: [
+        {
+          provider: 'openai-codex',
+          status: 'ok',
+          windows: [{ name: 'Session', remaining_percent: 12, reset_at: soon }]
+        }
+      ]
+    })
+    expect(tip).toMatch(/Session 12% in 1h/)
+    expect(tip).not.toMatch(/T\d{2}:/)
+  })
+
   it('hides unavailable providers', () => {
     const { label } = formatQuotaChip({
       providers: [{ provider: 'openrouter', status: 'unavailable' }]
