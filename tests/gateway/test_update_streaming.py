@@ -149,11 +149,18 @@ class TestUpdateCommandGatewayFlag:
         hermes_home.mkdir()
 
         mock_popen = MagicMock()
-        with patch("gateway.run._hermes_home", hermes_home), \
-             patch("gateway.run.__file__", fake_file), \
-             patch("hermes_cli.runtime_launch.resolve_project_python", return_value="/project/python"), \
-             patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
-             patch("subprocess.Popen", mock_popen):
+        with patch.object(
+            runner, "_try_update_notification_lock", return_value=MagicMock()
+        ), patch.object(runner, "_release_update_notification_lock"), patch(
+            "gateway.run._hermes_home", hermes_home
+        ), patch(
+            "gateway.run.__file__", fake_file
+        ), patch(
+            "hermes_cli.runtime_launch.resolve_project_python",
+            return_value="/project/python",
+        ), patch(
+            "shutil.which", side_effect=lambda x: f"/usr/bin/{x}"
+        ), patch("sys.platform", "linux"), patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
 
         launch_argv = mock_popen.call_args.args[0]
@@ -163,6 +170,50 @@ class TestUpdateCommandGatewayFlag:
         assert launch_kwargs["env"]["PYTHONUNBUFFERED"] == "1"
         assert launch_kwargs["env"]["HERMES_UPDATE_CORRELATION_ID"]
         assert "start_new_session" not in launch_kwargs
+        assert "stream progress" in result
+
+    @pytest.mark.asyncio
+    async def test_spawns_with_gateway_flag_windows(self, tmp_path):
+        """The Windows branch launches Python directly with detach flags."""
+        runner = _make_runner()
+        event = _make_event()
+
+        fake_root = tmp_path / "project"
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway").mkdir()
+        (fake_root / "gateway" / "run.py").touch()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        mock_popen = MagicMock()
+        with patch.object(
+            runner, "_try_update_notification_lock", return_value=MagicMock()
+        ), patch.object(runner, "_release_update_notification_lock"), patch(
+            "gateway.run._hermes_home", hermes_home
+        ), patch(
+            "gateway.run.__file__", fake_file
+        ), patch(
+            "hermes_cli.runtime_launch.resolve_project_python",
+            return_value="/project/python",
+        ), patch(
+            "hermes_cli._subprocess_compat.IS_WINDOWS", True
+        ), patch("sys.platform", "win32"), patch("subprocess.Popen", mock_popen):
+            from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+            expected_detach_kwargs = windows_detach_popen_kwargs()
+            result = await runner._handle_update_command(event)
+
+        launch_argv = mock_popen.call_args.args[0]
+        launch_kwargs = mock_popen.call_args.kwargs
+        assert launch_argv[0] == "/project/python"
+        assert "/usr/bin/setsid" not in launch_argv
+        assert launch_argv[-2:] == ["update", "--gateway"]
+        assert launch_kwargs["creationflags"] == expected_detach_kwargs["creationflags"]
+        assert "start_new_session" not in launch_kwargs
+        assert launch_kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+        assert launch_kwargs["env"]["HERMES_UPDATE_CORRELATION_ID"]
         assert "stream progress" in result
 
 
