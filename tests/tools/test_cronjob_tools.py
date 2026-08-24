@@ -435,6 +435,36 @@ class TestUnifiedCronjobTool:
         )
         assert listed["attach_to_session"] is False
 
+    @pytest.mark.parametrize("attach_to_session", [True, False])
+    def test_handler_forwards_attach_to_session(self, attach_to_session):
+        """The registered handler must forward both boolean override values."""
+        from tools.registry import registry
+
+        created_raw = registry.dispatch(
+            "cronjob",
+            {
+                "action": "create",
+                "prompt": "x",
+                "schedule": "every 1h",
+            },
+        )
+        assert isinstance(created_raw, str)
+        created = json.loads(created_raw)
+
+        updated_raw = registry.dispatch(
+            "cronjob",
+            {
+                "action": "update",
+                "job_id": created["job_id"],
+                "attach_to_session": attach_to_session,
+            },
+        )
+        assert isinstance(updated_raw, str)
+        updated = json.loads(updated_raw)
+
+        assert updated["success"] is True
+        assert updated["job"]["attach_to_session"] is attach_to_session
+
 
 # =========================================================================
 # Agent-facing surface: per-job model pins are user-owned
