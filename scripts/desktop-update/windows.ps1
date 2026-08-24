@@ -73,6 +73,70 @@ try {
 '@ -ErrorAction Stop
     $script:Win32 = $true
 } catch { $script:Win32 = $false }
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class HermesMarkerNoFollow {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint DELETE = 0x00010000;
+    private const uint READ_CONTROL = 0x00020000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_FLAG_DELETE_ON_CLOSE = 0x04000000;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string name, uint access, uint share, IntPtr security, uint creation,
+        uint flags, IntPtr template);
+
+    public static bool TryReadFirstLine(string name, out string firstLine) {
+        firstLine = null;
+        var handle = CreateFile(
+            name, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            var error = Marshal.GetLastWin32Error();
+            if (error == 2 || error == 3) return false;
+            throw new Win32Exception(error);
+        }
+        using (handle)
+        using (var stream = new FileStream(handle, FileAccess.Read))
+        using (var reader = new StreamReader(stream)) {
+            firstLine = reader.ReadLine();
+            return true;
+        }
+    }
+
+    public static bool DeleteIfExists(string name) {
+        var handle = CreateFile(
+            name, DELETE | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE,
+            IntPtr.Zero);
+        if (handle.IsInvalid) {
+            var error = Marshal.GetLastWin32Error();
+            if (error == 2 || error == 3) return false;
+            throw new Win32Exception(error);
+        }
+        handle.Dispose();
+        return true;
+    }
+}
+'@ -ErrorAction Stop
+    $script:MarkerNative = $true
+} catch {
+    $script:MarkerNative = $false
+}
+
 # Render UTF-8 glyphs (checkmarks, arrows) correctly in our own console echo
 # too; the legacy conhost default OEM codepage shows them as mojibake.
 try {
@@ -482,11 +546,16 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
 function Remove-MarkerIfOwned {
     if ($NoMarkerCleanup) { return }
     try {
-        if (Test-Path -LiteralPath $MarkerPath) {
-            $firstLine = (Get-Content -LiteralPath $MarkerPath -TotalCount 1 -ErrorAction SilentlyContinue)
+        # A native no-follow probe is also the absence check. Test-Path first
+        # would create a path-based race in which a junction can appear after
+        # the topology preflight but before the marker read or cleanup.
+        if (-not $script:MarkerNative) { throw "native marker boundary unavailable" }
+        $firstLine = $null
+        if ([HermesMarkerNoFollow]::TryReadFirstLine($MarkerPath, [ref]$firstLine)) {
             if ("$firstLine".Trim() -eq "$PID") {
-                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
-                Write-HandoffLog "removed update marker (owned)"
+                if ([HermesMarkerNoFollow]::DeleteIfExists($MarkerPath)) {
+                    Write-HandoffLog "removed update marker (owned)"
+                }
             } else {
                 Write-HandoffLog "leaving update marker: owned by pid '$firstLine', not us ($PID)"
             }

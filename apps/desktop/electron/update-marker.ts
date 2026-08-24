@@ -21,6 +21,7 @@
  */
 
 import fs from 'fs'
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import path from 'path'
 
@@ -29,32 +30,169 @@ import path from 'path'
 // must never let the desktop start a backend into a mutating checkout.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 const MAX_U32 = 0xffffffff
-const FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0
+
+const WINDOWS_MARKER_NATIVE_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class HermesMarkerNative {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint DELETE = 0x00010000;
+    private const uint FILE_WRITE_ATTRIBUTES = 0x00000100;
+    private const uint FILE_ADD_FILE = 0x00000002;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint CREATE_NEW = 1;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    private const uint FILE_INFO_BY_HANDLE_CLASS_LINK = 11;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string name, uint access, uint share, IntPtr security, uint creation,
+        uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateHardLink(
+        string newFileName, string existingFileName, IntPtr security);
+
+    private static SafeFileHandle Open(string name, uint access, uint creation, uint flags) {
+        var handle = CreateFile(
+            name, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero, creation, flags, IntPtr.Zero);
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return handle;
+    }
+
+    public static string Read(string name) {
+        SafeFileHandle handle;
+        try {
+            handle = Open(name, GENERIC_READ, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
+        } catch (Win32Exception error) {
+            if (error.NativeErrorCode == 2 || error.NativeErrorCode == 3) return "NOT_FOUND";
+            throw;
+        }
+        using (handle)
+        using (var stream = new FileStream(handle, FileAccess.Read))
+        using (var memory = new MemoryStream()) {
+            stream.CopyTo(memory);
+            return Convert.ToBase64String(memory.ToArray());
+        }
+    }
+
+    public static void Create(string name, byte[] payload) {
+        using (var handle = Open(
+            name, GENERIC_WRITE, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT))
+        using (var stream = new FileStream(handle, FileAccess.Write)) {
+            stream.Write(payload, 0, payload.Length);
+            stream.Flush(true);
+        }
+    }
+
+    public static void Link(string sourceName, string destinationName) {
+        // The source is opened with CreateFile + OPEN_REPARSE_POINT before the
+        // native no-clobber publication. CreateHardLinkW refuses an existing
+        // destination, so a concurrent winner or junction is never followed or
+        // replaced by the Electron claim.
+        using (var source = Open(
+            sourceName, GENERIC_READ | FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT)) {
+            if (!CreateHardLink(destinationName, sourceName, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static string Delete(string name) {
+        SafeFileHandle handle;
+        try {
+            handle = Open(name, DELETE, OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | 0x04000000); // DELETE_ON_CLOSE.
+        } catch (Win32Exception error) {
+            if (error.NativeErrorCode == 2 || error.NativeErrorCode == 3) return "NOT_FOUND";
+            throw;
+        }
+        handle.Dispose();
+        return "DELETED";
+    }
+}
+'@
+switch ($env:HERMES_MARKER_OP) {
+  'read' { [Console]::Write([HermesMarkerNative]::Read($env:HERMES_MARKER_PATH)); break }
+  'create' {
+    [HermesMarkerNative]::Create($env:HERMES_MARKER_PATH, [Convert]::FromBase64String($env:HERMES_MARKER_PAYLOAD));
+    break
+  }
+  'link' { [HermesMarkerNative]::Link($env:HERMES_MARKER_SOURCE, $env:HERMES_MARKER_PATH); break }
+  'delete' { [Console]::Write([HermesMarkerNative]::Delete($env:HERMES_MARKER_PATH)); break }
+  default { throw "unknown marker operation: $env:HERMES_MARKER_OP" }
+}
+`
+
+function runWindowsMarkerNative(
+  operation: 'read' | 'create' | 'link' | 'delete',
+  filePath: string,
+  payload?: string,
+  sourcePath?: string
+) {
+  const env = {
+    ...process.env,
+    HERMES_MARKER_OP: operation,
+    HERMES_MARKER_PATH: filePath,
+    HERMES_MARKER_PAYLOAD: payload ? Buffer.from(payload, 'utf8').toString('base64') : '',
+    HERMES_MARKER_SOURCE: sourcePath ?? ''
+  }
+  const encoded = Buffer.from(WINDOWS_MARKER_NATIVE_SCRIPT, 'utf16le').toString('base64')
+  try {
+    return execFileSync(
+      'powershell.exe',
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+      { encoding: 'utf8', env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
+    ).trim()
+  } catch (err) {
+    throw new Error(`Windows marker native operation ${operation} failed: ${String(err)}`)
+  }
+}
+
+function readWindowsMarker(filePath: string) {
+  const result = runWindowsMarkerNative('read', filePath)
+  if (result === 'NOT_FOUND') {
+    const error: NodeJS.ErrnoException = new Error(`Marker path was not found: ${filePath}`)
+    error.code = 'ENOENT'
+    throw error
+  }
+  return Buffer.from(result, 'base64').toString('utf8')
+}
+
+function writeWindowsMarker(filePath: string, payload: string) {
+  runWindowsMarkerNative('create', filePath, payload)
+}
+
+function linkWindowsMarker(sourcePath: string, destinationPath: string) {
+  runWindowsMarkerNative('link', destinationPath, undefined, sourcePath)
+}
+
+function deleteWindowsMarker(filePath: string) {
+  return runWindowsMarkerNative('delete', filePath) !== 'NOT_FOUND'
+}
 
 /**
  * Open a marker through a stable file handle before doing any I/O.
  *
- * POSIX has a native O_NOFOLLOW flag. Node/libuv does not expose the Windows
- * FILE_FLAG_OPEN_REPARSE_POINT bit through fs.openSync, so Windows uses the
- * equivalent handle boundary: open first, immediately re-check the path
- * topology, and read/write only through the already-open descriptor. A handle
- * cannot be redirected after it is opened; the post-open check rejects a
- * reparse-point race that happened while opening. Keep the Windows constant
- * next to this helper as the contract we mirror (and to make the boundary
- * explicit for native-backed Electron builds).
+ * Windows uses the native CreateFile boundary above. Node/libuv's fs.openSync
+ * accepts POSIX open flags, not CreateFile dwFlags, so passing
+ * FILE_FLAG_OPEN_REPARSE_POINT to fs.openSync would not enforce no-follow.
+ * POSIX keeps its native O_NOFOLLOW behavior below.
  */
 function openMarkerNoFollow(filePath: string, flags: number, mode?: number) {
-  const openFlags =
-    process.platform === 'win32' ? flags | FILE_FLAG_OPEN_REPARSE_POINT : flags | O_NOFOLLOW
-  const fd = fs.openSync(filePath, openFlags, mode)
-  try {
-    assertNoReparseTopology(filePath, { allowMissing: false })
-    return fd
-  } catch (err) {
-    fs.closeSync(fd)
-    throw err
-  }
+  return fs.openSync(filePath, flags | O_NOFOLLOW, mode)
 }
 
 export function markerPath(hermesHome) {
@@ -184,11 +322,15 @@ export function readLiveUpdateMarker(
 
   try {
     assertNoReparseTopology(file, { allowMissing: true })
-    const fd = openMarkerNoFollow(file, fs.constants.O_RDONLY)
-    try {
-      raw = fs.readFileSync(fd, 'utf8')
-    } finally {
-      fs.closeSync(fd)
+    if (process.platform === 'win32') {
+      raw = readWindowsMarker(file)
+    } else {
+      const fd = openMarkerNoFollow(file, fs.constants.O_RDONLY)
+      try {
+        raw = fs.readFileSync(fd, 'utf8')
+      } finally {
+        fs.closeSync(fd)
+      }
     }
   } catch (err) {
     if (err && err.code === 'ENOENT') {
@@ -278,28 +420,37 @@ export function writeUpdateMarker(
 
   try {
     // Validate the destination topology before creating a staging file. The
-    // second validation immediately before linkSync closes the replacement
-    // race if a parent or marker is swapped while the payload is staged.
+    // second validation immediately before native publication closes the race
+    // if a parent or marker is swapped while the payload is staged.
     assertNoReparseTopology(file, { allowMissing: true })
     assertNoReparseTopology(temp, { allowMissing: true })
-    tempFd = fs.openSync(temp, 'wx', 0o600)
-    fs.writeFileSync(tempFd, `${pid}\n${acquiredAt}\n`, 'utf8')
-    fs.fsyncSync(tempFd)
-    fs.closeSync(tempFd)
-    tempFd = undefined
+    const payload = `${pid}\n${acquiredAt}\n`
+    if (process.platform === 'win32') {
+      // Node/libuv cannot carry FILE_FLAG_OPEN_REPARSE_POINT as an fs flag.
+      // CreateFile creates the staged inode and keeps the Windows operation on
+      // the native handle boundary instead of falling back to path-based I/O.
+      writeWindowsMarker(temp, payload)
+    } else {
+      tempFd = fs.openSync(temp, 'wx', 0o600)
+      fs.writeFileSync(tempFd, payload, 'utf8')
+      fs.fsyncSync(tempFd)
+      fs.closeSync(tempFd)
+      tempFd = undefined
+    }
 
     assertNoReparseTopology(file, { allowMissing: true })
     assertNoReparseTopology(temp, { allowMissing: false })
-    // Keep a no-follow handle on the complete staged inode through the
-    // no-clobber publish. Readers never consume a path that was reparse-swapped
-    // after the topology check.
-    const tempHandle = openMarkerNoFollow(temp, fs.constants.O_RDONLY)
-    try {
-      // linkSync is atomic and refuses an existing destination. Readers can
-      // observe only the complete staged inode, never an empty/truncated body.
-      fs.linkSync(temp, file)
-    } finally {
-      fs.closeSync(tempHandle)
+    if (process.platform === 'win32') {
+      linkWindowsMarker(temp, file)
+    } else {
+      const tempHandle = openMarkerNoFollow(temp, fs.constants.O_RDONLY)
+      try {
+        // linkSync is atomic and refuses an existing destination. Readers can
+        // observe only the complete staged inode, never an empty/truncated body.
+        fs.linkSync(temp, file)
+      } finally {
+        fs.closeSync(tempHandle)
+      }
     }
   } catch {
     // Best-effort: an existing winner is intentionally left untouched. If
@@ -315,7 +466,11 @@ export function writeUpdateMarker(
     }
     try {
       assertNoReparseTopology(temp, { allowMissing: true })
-      fs.unlinkSync(temp)
+      if (process.platform === 'win32') {
+        deleteWindowsMarker(temp)
+      } else {
+        fs.unlinkSync(temp)
+      }
     } catch {
       // The temp may never have been created, is already gone, or its parent
       // became a reparse point; never follow an unvalidated cleanup path.
