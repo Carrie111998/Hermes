@@ -1815,6 +1815,7 @@ def synthetic_kanban_worker_lifecycle(monkeypatch):
             ok = result[0] if isinstance(result, tuple) else bool(result)
             if ok:
                 kb._release_quiesced_worker_fences(conn)
+                kb.recompute_ready(conn)
             return result
 
         monkeypatch.setattr(kb, name, _wrapped)

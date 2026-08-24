@@ -16,6 +16,8 @@ import time
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 def _clear_worker_tool_evidence(task_id: str) -> None:
     from hermes_cli import kanban_db as kb
@@ -296,9 +298,7 @@ def test_historical_run_evidence_is_rejected(
     try:
         old_run = kb.latest_run(conn, worker_env)
         assert old_run is not None
-        kb._set_worker_pid(conn, worker_env, 98765)
-        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-        assert kb.detect_crashed_workers(conn) == [worker_env]
+        assert kb.reclaim_task(conn, worker_env, reason="test rollover") is True
         kb.claim_task(conn, worker_env)
         current_run = kb.latest_run(conn, worker_env)
         assert current_run is not None
