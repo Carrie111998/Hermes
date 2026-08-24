@@ -18,6 +18,7 @@ import {
   activeGateway,
   activeGatewayConnectionId,
   ensureActiveGatewayOpen,
+  isActivePrimary,
   requestGatewayForAgent
 } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
@@ -382,10 +383,16 @@ interface ActiveProjectsContext {
   connectionId: null | string
   gateway: HermesGateway
   profile: string
+  routeKind: 'primary' | 'secondary'
 }
 
 function stillOnProjectsContext(context: ActiveProjectsContext): boolean {
-  return activeGateway() === context.gateway && projectProfile() === context.profile
+  return (
+    activeGateway() === context.gateway &&
+    activeGatewayConnectionId() === context.connectionId &&
+    isActivePrimary() === (context.routeKind === 'primary') &&
+    projectProfile() === context.profile
+  )
 }
 
 async function activeProjectsContext(): Promise<ActiveProjectsContext> {
@@ -402,17 +409,19 @@ async function activeProjectsContext(): Promise<ActiveProjectsContext> {
   }
 
   const connectionId = activeGatewayConnectionId()
+  const routeKind = isActivePrimary() ? 'primary' : 'secondary'
 
   if (
     !gateway ||
     gateway !== activeGateway() ||
     connectionId !== activeGatewayConnectionId() ||
+    routeKind !== (isActivePrimary() ? 'primary' : 'secondary') ||
     profile !== projectProfile()
   ) {
     throw new Error('Active Hermes profile changed while connecting')
   }
 
-  return { connectionId, gateway, profile }
+  return { connectionId, gateway, profile, routeKind }
 }
 
 async function gatewayRequestForContext<T>(
@@ -420,7 +429,7 @@ async function gatewayRequestForContext<T>(
   method: string,
   params: Record<string, unknown> = {}
 ): Promise<T> {
-  if (context.connectionId === null) {
+  if (context.routeKind === 'primary') {
     if (context.gateway.connectionState !== 'open') {
       throw new Error('Captured primary Hermes gateway is closed; cannot safely reconnect its original source')
     }

@@ -66,6 +66,7 @@ vi.mock('@/store/gateway', () => ({
   $gateway: atom(null),
   activeGateway: vi.fn(),
   activeGatewayConnectionId: vi.fn(),
+  isActivePrimary: vi.fn(),
   requestGatewayForAgent: vi.fn(),
   ensureActiveGatewayOpen: vi.fn()
 }))
@@ -92,6 +93,7 @@ const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
 const activeGatewayConnectionId = vi.mocked(gw.activeGatewayConnectionId)
 const gatewayAtom = gw.$gateway
+const isActivePrimary = vi.mocked(gw.isActivePrimary)
 const requestGatewayForAgent = vi.mocked(gw.requestGatewayForAgent)
 
 const git = await import('@/lib/desktop-git')
@@ -152,6 +154,7 @@ describe('projects RPC profile forwarding', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     activeGatewayConnectionId.mockReturnValue(null)
+    isActivePrimary.mockReturnValue(true)
     requestGatewayForAgent.mockImplementation(async (_connectionId, _profile, method, params) => {
       const gateway = activeGateway()
 
@@ -220,6 +223,7 @@ describe('transactional Project renaming', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     activeGatewayConnectionId.mockReturnValue(null)
+    isActivePrimary.mockReturnValue(true)
     requestGatewayForAgent.mockImplementation(async (_connectionId, _profile, method, params) => {
       const gateway = activeGateway()
 
@@ -484,6 +488,7 @@ describe('transactional Project renaming', () => {
     let current = gatewayA
 
     activeGateway.mockImplementation(() => current as never)
+    isActivePrimary.mockReturnValue(true)
 
     const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
       deleteProjectGroup({
@@ -526,6 +531,80 @@ describe('transactional Project renaming', () => {
     expect($projectTree.get().map(project => project.id)).toEqual(['source-b'])
   })
 
+  it('reconnects a null-ID profile secondary for rollback on the same profile', async () => {
+    const providerFailure = new Error('provider unavailable')
+    let projectNameOnA = alpha.name
+
+    const gatewayA = {
+      connectionState: 'open',
+      request: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (gatewayA.connectionState !== 'open') {
+          throw new Error('gateway A is disconnected')
+        }
+
+        if (method !== 'projects.rename_many') {
+          throw new Error(`unexpected ${method}`)
+        }
+
+        const [rename] = params?.renames as Array<{ expectedName: string; newName: string }>
+        expect(rename.expectedName).toBe(projectNameOnA)
+        projectNameOnA = rename.newName
+
+        if (projectNameOnA === 'Group · Alpha') {
+          gatewayA.connectionState = 'closed'
+        }
+
+        return { projects: [{ ...alpha, name: projectNameOnA }] }
+      })
+    }
+
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+    let current = gatewayA
+
+    activeGateway.mockImplementation(() => current as never)
+    activeGatewayConnectionId.mockReturnValue(null)
+    isActivePrimary.mockReturnValue(false)
+    requestGatewayForAgent.mockImplementation(async (connectionId, profile, method, params) => {
+      expect(connectionId).toBeNull()
+      expect(profile).toBe('profile-a')
+
+      gatewayA.connectionState = 'open'
+
+      return gatewayA.request(method, params) as never
+    })
+    $activeGatewayProfile.set('profile-a')
+
+    const pending = withActiveProjectsContext(({ reconcile, renameMany }) =>
+      deleteProjectGroup({
+        contribution: {
+          deleteGroup: vi.fn(async () => {
+            current = gatewayB
+            $activeGatewayProfile.set('profile-b')
+            throw providerFailure
+          }),
+          getSnapshot: () => ({ groups: [{ id: 'group', label: 'Group', projectIds: [alpha.id] }] }),
+          subscribe: () => () => undefined
+        },
+        group: { id: 'group', label: 'Group', projectIds: [alpha.id] },
+        operationId: 'operation-a',
+        prependGroupName: true,
+        projects: [alpha],
+        reconcile,
+        renameMany
+      })
+    )
+
+    await expect(pending).rejects.toBe(providerFailure)
+    expect(projectNameOnA).toBe('Alpha')
+    expect(requestGatewayForAgent).toHaveBeenCalledTimes(2)
+    expect(
+      requestGatewayForAgent.mock.calls.every(
+        ([connectionId, profile]) => connectionId === null && profile === 'profile-a'
+      )
+    ).toBe(true)
+    expect(gatewayB.request).not.toHaveBeenCalled()
+  })
+
   it('reconnects the original pinned route for rollback after its socket closes and B becomes active', async () => {
     const providerFailure = new Error('provider unavailable')
     let projectNameOnA = alpha.name
@@ -558,6 +637,7 @@ describe('transactional Project renaming', () => {
 
     activeGateway.mockImplementation(() => current as never)
     activeGatewayConnectionId.mockReturnValue('source-a')
+    isActivePrimary.mockReturnValue(false)
     requestGatewayForAgent.mockImplementation(async (connectionId, profile, method, params) => {
       expect(connectionId).toBe('source-a')
       expect(profile).toBe('profile-a')
