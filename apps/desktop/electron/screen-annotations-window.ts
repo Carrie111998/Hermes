@@ -183,9 +183,13 @@ export function createScreenAnnotationsController({
     const moving = current.x !== bounds.x || current.y !== bounds.y
 
     if (moving || resizing) {
-      // The window is created non-resizable, which on Windows/Linux also
-      // blocks programmatic setBounds sizing — flip resizable on for the
-      // call, exactly like the pet overlay's wheel-scale does.
+      // The window is created non-resizable (a transparent click-through
+      // overlay must not expose a system resize hot-zone), which on
+      // Windows/Linux also makes Electron drop the size half of setBounds —
+      // so flip resizable on for the call and restore the lock after. The
+      // same dance appears in pet-overlay-ipc, hud-ipc and hud-geometry's
+      // applyHudResetBounds; if a fifth site turns up, extract one helper
+      // over all of them rather than growing another copy.
       const restoreResizeLock = resizing && !window.isResizable()
 
       try {
