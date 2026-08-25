@@ -10035,6 +10035,199 @@ function EditProfileDialog({ bot, open, onClose }) {
   })
 }
 
+// ── blueprint dialog ─────────────────────────────────────────────────────────
+
+const BLUEPRINT_PLACEHOLDER = [
+  'Describe the team — one per line:',
+  '',
+  '  scout — Researcher: finds and ranks sources',
+  '  scribe — Writer: drafts the weekly summary',
+  '',
+  'or in a sentence: “a researcher named Scout who finds sources,',
+  'and a writer called Scribe who drafts the summary”'
+].join('\n')
+
+/** Create a whole roster from one description. The preview is re-parsed on
+ *  every keystroke and IS the plan — what the list shows is exactly what
+ *  Create makes, handles included. */
+function CreateBlueprintDialog({ open, onClose, roster }) {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState(null)
+
+  // Reset per open so a cancelled draft doesn't leak into the next one.
+  useEffect(() => {
+    if (open) {
+      setText('')
+      setBusy(false)
+      setProgress(null)
+    }
+  }, [open])
+
+  const { specs, warnings } = useMemo(() => parseBotBlueprint(text, roster), [text, roster])
+
+  const create = async () => {
+    setBusy(true)
+
+    try {
+      const { created, failed } = await createBotsFromBlueprint({
+        specs,
+        roster,
+        onProgress: setProgress
+      })
+
+      if (created.length && !failed.length) {
+        host.notify({ kind: 'success', message: `Created ${created.length} bots — ${created.join(', ')}` })
+      } else if (created.length) {
+        host.notify({
+          kind: 'info',
+          message: `Created ${created.length} of ${specs.length} — ${failed.map(entry => entry.name).join(', ')} failed`
+        })
+      } else {
+        host.notify({ kind: 'error', message: `No bots created — ${failed[0]?.message || 'unknown error'}` })
+      }
+
+      if (created.length) {
+        onClose()
+      }
+    } catch (err) {
+      host.notifyError(err, 'Blueprint failed')
+    } finally {
+      setBusy(false)
+      setProgress(null)
+    }
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value && !busy) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-lg',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'New Bots from a Description' }),
+            jsx(DialogDescription, {
+              children:
+                'Describe the team in plain text and every bot in it gets created — handle, role, mission, and avatar. Parsed on this machine; no model call.'
+            })
+          ]
+        }),
+        jsx(Textarea, {
+          'aria-label': 'Team description',
+          autoFocus: true,
+          className: 'min-h-32 font-mono text-xs',
+          disabled: busy,
+          placeholder: BLUEPRINT_PLACEHOLDER,
+          value: text,
+          onChange: event => setText(event.target.value)
+        }),
+        specs.length
+          ? jsxs('div', {
+              className: 'grid gap-1.5',
+              children: [
+                jsx('div', {
+                  className: 'text-xs font-medium text-(--ui-text-secondary)',
+                  children: `${specs.length} ${specs.length === 1 ? 'bot' : 'bots'} to create`
+                }),
+                jsx(ScrollArea, {
+                  className: 'max-h-56 min-h-0',
+                  children: jsx('div', {
+                    className: 'grid gap-0.5 pr-2',
+                    children: specs.map((spec, index) => {
+                      const look = blueprintLook(spec, index)
+
+                      return jsxs(
+                        'div',
+                        {
+                          className: 'flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1',
+                          children: [
+                            jsx(BotFace, { shape: look.shape, color: look.color, size: 28, name: spec.name }),
+                            jsxs('div', {
+                              className: 'grid min-w-0 flex-1 gap-0.5',
+                              children: [
+                                jsxs('div', {
+                                  className: 'flex min-w-0 items-baseline gap-1.5',
+                                  children: [
+                                    jsx('span', {
+                                      className: 'truncate text-xs font-medium text-foreground',
+                                      children: spec.title || spec.name
+                                    }),
+                                    jsx('span', {
+                                      className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                                      children: spec.name
+                                    }),
+                                    spec.renamedFrom
+                                      ? jsx(Tip, {
+                                          label: `“${spec.renamedFrom}” is already taken — this bot gets the next free handle`,
+                                          children: jsx('span', {
+                                            className:
+                                              'shrink-0 rounded bg-(--chrome-action-hover) px-1 text-[0.5625rem] text-(--ui-text-tertiary)',
+                                            children: 'renamed'
+                                          })
+                                        })
+                                      : null
+                                  ]
+                                }),
+                                spec.description
+                                  ? jsx('span', {
+                                      className: 'truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                                      children: spec.description
+                                    })
+                                  : null
+                              ]
+                            })
+                          ]
+                        },
+                        spec.name
+                      )
+                    })
+                  })
+                })
+              ]
+            })
+          : null,
+        warnings.length && text.trim()
+          ? jsx('div', {
+              className: 'grid gap-1',
+              children: warnings.map(warning =>
+                jsxs(
+                  'div',
+                  {
+                    className: 'flex items-start gap-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+                    children: [
+                      jsx(Codicon, { name: 'warning', className: 'mt-px shrink-0 text-[0.625rem]' }),
+                      jsx('span', { children: warning })
+                    ]
+                  },
+                  warning
+                )
+              )
+            })
+          : null,
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: 'Cancel' }),
+            jsx(Button, {
+              disabled: busy || !specs.length,
+              onClick: create,
+              children: busy
+                ? progress
+                  ? `Creating ${progress.name}… (${progress.index + 1}/${progress.total})`
+                  : 'Creating…'
+                : `Create ${specs.length || ''} ${specs.length === 1 ? 'bot' : 'bots'}`.replace(/\s+/g, ' ').trim()
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 // ── create dialog ────────────────────────────────────────────────────────────
 
 function CreateAgentDialog({ open, onClose, roster }) {
@@ -14448,6 +14641,7 @@ function BotsPane() {
   const gatewayUp = gatewayState === 'open'
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
   const [createOpen, setCreateOpen] = useState(false)
+  const [blueprintOpen, setBlueprintOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
@@ -14844,6 +15038,10 @@ function BotsPane() {
                         children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Bot']
                       }),
                       jsxs(DropdownMenuItem, {
+                        onSelect: () => setBlueprintOpen(true),
+                        children: [jsx(Codicon, { name: 'sparkle', className: 'mr-1.5' }), 'New Bots from Description…']
+                      }),
+                      jsxs(DropdownMenuItem, {
                         disabled: activeSourceRoster.length < 2,
                         onSelect: () => setGroupCreateOpen(true),
                         children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
@@ -15146,6 +15344,14 @@ function BotsPane() {
                       ]
                     })
                   }),
+      jsx(CreateBlueprintDialog, {
+        open: blueprintOpen,
+        onClose: () => {
+          setBlueprintOpen(false)
+          void refetch()
+        },
+        roster: activeSourceRoster
+      }),
       jsx(CreateAgentDialog, {
         open: createOpen,
         onClose: () => {

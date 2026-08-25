@@ -191,6 +191,38 @@ test('unit: progress is reported for every spec', async () => {
   assert.deepEqual(seen, ['ada:creating', 'ada:created', 'bob:creating', 'bob:failed'])
 })
 
+// The dialog is a React closure, so the wiring is pinned against the source
+// the way the other create-dialog tests do it.
+
+test('unit: the roster "+" menu offers the blueprint dialog', () => {
+  assert.match(pluginSource, /onSelect: \(\) => setBlueprintOpen\(true\)/)
+  assert.match(pluginSource, /'New Bots from Description…'/)
+})
+
+test('unit: the blueprint dialog is mounted and refetches the roster on close', () => {
+  const mount = pluginSource.slice(
+    pluginSource.indexOf('jsx(CreateBlueprintDialog, {'),
+    pluginSource.indexOf('jsx(CreateAgentDialog, {')
+  )
+
+  assert.match(mount, /open: blueprintOpen/)
+  assert.match(mount, /setBlueprintOpen\(false\)/)
+  assert.match(mount, /void refetch\(\)/)
+  assert.match(mount, /roster: activeSourceRoster/)
+})
+
+test('regression: the preview renders the same look creation persists', () => {
+  const dialog = pluginSource.slice(
+    pluginSource.indexOf('function CreateBlueprintDialog('),
+    pluginSource.indexOf('// ── create dialog ─')
+  )
+
+  // A preview drawn from anything but blueprintLook would drift from the
+  // avatar the bot is actually created with.
+  assert.match(dialog, /const look = blueprintLook\(spec, index\)/)
+  assert.match(dialog, /parseBotBlueprint\(text, roster\)/)
+})
+
 test('regression: an instruction preamble is not read as a bot', () => {
   const { parseBotBlueprint } = load()
   const { specs } = parseBotBlueprint(
@@ -219,4 +251,22 @@ test('unit: a bare list of proper nouns becomes one bot each', () => {
   assert.deepEqual(plain(specs, spec => spec.name), ['alpha', 'beta', 'gamma'])
   // A handle that is the whole clause should not repeat itself as the mission.
   assert.equal(specs[0].description, '')
+})
+
+test('regression: blueprintOpen is declared in the pane that reads it', () => {
+  // `createOpen` is declared TWICE — once in RoutinesPane, once in BotsPane.
+  // The menu item and the dialog mount both live in BotsPane, so a declaration
+  // that lands next to the first one is a ReferenceError the moment the pane
+  // renders. The vm harness never executes these components, so pin the scope.
+  const pane = pluginSource.slice(pluginSource.indexOf('function BotsPane() {'))
+
+  assert.match(pane, /const \[blueprintOpen, setBlueprintOpen\] = useState\(false\)/)
+  assert.match(pane, /setBlueprintOpen\(true\)/)
+  assert.match(pane, /open: blueprintOpen/)
+
+  const routines = pluginSource.slice(
+    pluginSource.indexOf('function RoutinesPane() {'),
+    pluginSource.indexOf('function BotsPane() {')
+  )
+  assert.doesNotMatch(routines, /blueprintOpen/)
 })
