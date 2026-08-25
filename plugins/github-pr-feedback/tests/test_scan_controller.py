@@ -168,6 +168,40 @@ def test_scan_creates_one_bounded_untrusted_task_and_deduplicates_with_sqlite(tm
     ledger.close()
 
 
+def test_scan_suppresses_high_confidence_self_resolution_receipts(tmp_path: Path) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")
+    github = FakeGitHub(
+        admitted_pull_request(sha),
+        (
+            feedback(
+                "addressed",
+                reviewer="owner",
+                body="Addressed the review at exact head abc123. Verification passed.",
+            ),
+            feedback(
+                "superseded",
+                reviewer="owner",
+                body="Confirmed the gap. This narrower PR is superseded by #22.",
+            ),
+            feedback(
+                "still-actionable",
+                reviewer="owner",
+                body="Fixed the first case, but one blocker remains and still needs work.",
+            ),
+        ),
+    )
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 1
+    assert result.skipped["self_resolution_receipt"] == 2
+    assert [task.evidence["feedback_id"] for task in kanban.tasks] == ["still-actionable"]
+    ledger.close()
+
+
 def test_scan_refetches_the_head_and_does_not_claim_or_dispatch_a_race(tmp_path: Path) -> None:
     local_path, sha = initialized_repository(tmp_path)
     policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")

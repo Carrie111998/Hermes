@@ -20,6 +20,24 @@ from .policy import FeedbackReceipt, PluginPolicy, PullRequest, RepositoryTarget
 MAX_ADMISSIONS_PER_SCAN = 25
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 DEFAULT_CLAIM_LEASE = timedelta(minutes=5)
+_SELF_RESOLUTION_PREFIXES = (
+    "addressed ",
+    "implemented in ",
+    "resolved ",
+    "fixed in ",
+    "fixed both ",
+    "fixed the ",
+    "rebased ",
+    "split started with ",
+)
+_ACTION_REMAINS_MARKERS = (
+    "blocker remains",
+    "still needs work",
+    "not fixed",
+    "follow-up required",
+    "todo",
+    "unresolved",
+)
 _DEGRADED_REASONS = frozenset(
     {"github_error", "admission_cap", "dispatch_failed", "exact_head_unavailable"}
 )
@@ -269,7 +287,9 @@ class ScanController:
                     if target is None:
                         skipped["base_repository_not_allowed"] += 1
                         continue
-                    reason = self._feedback_reason(feedback)
+                    reason = self._feedback_reason(
+                        feedback, owner_login=target.owner_login
+                    )
                     if reason is not None:
                         skipped[reason] += 1
                         continue
@@ -382,7 +402,7 @@ class ScanController:
         if target is None:
             skipped["base_repository_not_allowed"] += 1
             return None
-        reason = self._feedback_reason(feedback)
+        reason = self._feedback_reason(feedback, owner_login=target.owner_login)
         if reason is not None:
             skipped[reason] += 1
             return None
@@ -397,7 +417,7 @@ class ScanController:
             return None
         return feedback, admission.target
 
-    def _feedback_reason(self, feedback: Feedback) -> str | None:
+    def _feedback_reason(self, feedback: Feedback, *, owner_login: str) -> str | None:
         try:
             timestamp = feedback.created_at
             if timestamp.tzinfo is None or timestamp.utcoffset() is None:
@@ -406,6 +426,8 @@ class ScanController:
                 return "before_not_before"
         except (AttributeError, ValueError):
             return "invalid_feedback_timestamp"
+        if _is_self_resolution_receipt(feedback, owner_login=owner_login):
+            return "self_resolution_receipt"
         return None
 
     def _dispatch(
@@ -438,6 +460,21 @@ class ScanController:
                 return "exact_head_unavailable"
             return "dispatch_failed"
         return None
+
+
+def _is_self_resolution_receipt(feedback: Feedback, *, owner_login: str) -> bool:
+    """Suppress only high-confidence author receipts that describe completed work."""
+
+    if feedback.kind != "issue_comment":
+        return False
+    if feedback.reviewer.login.casefold() != owner_login.casefold():
+        return False
+    body = " ".join(feedback.body.casefold().split())
+    if not body or any(marker in body for marker in _ACTION_REMAINS_MARKERS):
+        return False
+    if body.startswith(_SELF_RESOLUTION_PREFIXES):
+        return True
+    return body.startswith("confirmed ") and "superseded" in body
 
 
 def _receipt_branch(receipt: FeedbackReceipt) -> str:
