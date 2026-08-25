@@ -530,7 +530,7 @@ def _task(
             "explicitly start any coding work. GitHub push/reply/merge require operator approval."
         ),
         board=policy.board or "",
-        assignee=policy.assignee or "",
+        assignee=policy.assignee_for(body),
         repository_path=prepared.path,
         head_sha=receipt.head_sha,
         branch=prepared.branch,

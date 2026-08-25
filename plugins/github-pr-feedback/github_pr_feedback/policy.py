@@ -12,6 +12,8 @@ from typing import Mapping, Sequence
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _FEEDBACK_KINDS = frozenset({"issue_comment", "review_comment", "review"})
+MAX_ASSIGNEE_RULES = 32
+MAX_MATCH_TERMS_PER_RULE = 32
 
 
 def _nonempty_string(value: object, field: str) -> str:
@@ -134,6 +136,14 @@ class Admission:
 
 
 @dataclass(frozen=True, slots=True)
+class AssigneeRule:
+    """A bounded, deterministic content route with no model invocation."""
+
+    assignee: str
+    match_any: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PluginPolicy:
     enabled: bool
     targets: Mapping[str, RepositoryTarget]
@@ -144,6 +154,21 @@ class PluginPolicy:
     not_before: datetime | None
     assignee: str | None
     board: str | None
+    assignee_rules: tuple[AssigneeRule, ...] = ()
+
+    def assignee_for(self, body: str) -> str:
+        """Choose the unique highest-scoring specialist, otherwise the fallback."""
+
+        normalized = " ".join(body.casefold().split())
+        scores = tuple(
+            (sum(_term_matches(normalized, term) for term in rule.match_any), rule.assignee)
+            for rule in self.assignee_rules
+        )
+        best_score = max((score for score, _assignee in scores), default=0)
+        winners = {assignee for score, assignee in scores if score == best_score and score > 0}
+        if len(winners) == 1:
+            return winners.pop()
+        return self.assignee or ""
 
     def admit_pull_request(self, pull_request: PullRequest) -> Admission:
         """Admit only an exact configured PR before reading any feedback bodies."""
@@ -223,6 +248,26 @@ def _not_before(value: object) -> datetime:
     return boundary.astimezone(timezone.utc)
 
 
+def _term_matches(body: str, term: str) -> int:
+    return int(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", body) is not None)
+
+
+def _parse_assignee_rules(raw: object) -> tuple[AssigneeRule, ...]:
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence) or not raw:
+        raise ValueError("assignee_rules must be a non-empty list")
+    if len(raw) > MAX_ASSIGNEE_RULES:
+        raise ValueError("assignee_rules exceeds its bounded limit")
+    rules: list[AssigneeRule] = []
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {"assignee", "match_any"}:
+            raise ValueError("assignee_rules entries have missing or unknown fields")
+        terms = _string_list(item["match_any"], "match_any", normalize=str.casefold)
+        if len(terms) > MAX_MATCH_TERMS_PER_RULE:
+            raise ValueError("match_any exceeds its bounded limit")
+        rules.append(AssigneeRule(_nonempty_string(item["assignee"], "assignee"), terms))
+    return tuple(rules)
+
+
 def load_policy(raw: object) -> PluginPolicy:
     """Parse plugin configuration, retaining no enabled behavior on any omission."""
 
@@ -242,7 +287,7 @@ def load_policy(raw: object) -> PluginPolicy:
         "assignee",
         "board",
     }
-    optional = {"include_self_feedback", "include_bot_feedback"}
+    optional = {"include_self_feedback", "include_bot_feedback", "assignee_rules"}
     if not required.issubset(raw) or set(raw) - required - optional:
         raise ValueError("enabled configuration has missing or unknown fields")
     include_self_feedback = raw.get("include_self_feedback", False)
@@ -282,4 +327,5 @@ def load_policy(raw: object) -> PluginPolicy:
         _not_before(raw["not_before"]),
         _nonempty_string(raw["assignee"], "assignee"),
         _nonempty_string(raw["board"], "board"),
+        _parse_assignee_rules(raw["assignee_rules"]) if "assignee_rules" in raw else (),
     )

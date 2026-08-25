@@ -264,6 +264,21 @@ def test_doctor_reports_a_disabled_plugin_without_scanning(
     assert context.config_reads == ["enabled"]
 
 
+def test_namespaced_context_loads_assignee_rules_for_runtime_routing(tmp_path: Path) -> None:
+    from github_pr_feedback.cli import _load_policy_from_context
+
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    settings = enabled_settings(repository)
+    settings["assignee_rules"] = [
+        {"assignee": "performance-patch-steward", "match_any": ["latency"]}
+    ]
+
+    policy = _load_policy_from_context(RecordingContext(settings))
+
+    assert policy.assignee_for("Reduce latency") == "performance-patch-steward"
+
+
 def test_doctor_read_only_verifies_every_runtime_dependency(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -501,6 +516,7 @@ def test_doctor_fails_closed_for_an_incomplete_enabled_configuration(
         "reviewer_associations",
         "include_self_feedback",
         "include_bot_feedback",
+        "assignee_rules",
         "not_before",
         "assignee",
         "board",

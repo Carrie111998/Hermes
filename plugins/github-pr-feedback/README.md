@@ -42,7 +42,17 @@ plugins:
         include_self_feedback: false
         include_bot_feedback: false
         not_before: "2026-01-01T00:00:00Z"
-        assignee: repair-agent
+        # Fallback when no rule wins uniquely, including ambiguous ties.
+        assignee: task-orchestrator
+        # Optional, ordered and bounded deterministic routing. Each rule scores
+        # one point per distinct term found in the bounded feedback body.
+        assignee_rules:
+          - assignee: performance-patch-steward
+            match_any: [latency, performance, throughput, profiling]
+          - assignee: data-authority-patch-steward
+            match_any: [market data, option chain, quote, hydration, freshness]
+          - assignee: structural-ratchet-steward
+            match_any: [structural ratchet, extraction, file size, monolith]
         board: repairs
 ```
 
@@ -79,7 +89,8 @@ card after a crash or lost response.
 
 `doctor` is read-only. For an enabled configuration it checks the `gh`
 executable and authentication, the Hermes executable, configured board and
-assignee, ledger access, and each repository's linked-worktree capability.
+every fallback/routed assignee, ledger access, and each repository's
+linked-worktree capability.
 `scan` and `retry` return nonzero with `"status": "degraded"` when canonical
 coverage or dispatch is incomplete.
 

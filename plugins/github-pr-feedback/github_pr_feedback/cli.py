@@ -91,7 +91,13 @@ class DoctorProbe:
                 hermes and self._command_ok([hermes, "--version"])
             ),
             "board": self._board_exists(policy.board or ""),
-            "assignee": self._assignee_exists(policy.assignee or ""),
+            "assignee": all(
+                self._assignee_exists(assignee)
+                for assignee in {
+                    policy.assignee or "",
+                    *(rule.assignee for rule in policy.assignee_rules),
+                }
+            ),
             "ledger_access": self._ledger_access(ledger_path),
             "repository_worktree": self._repositories_ready(
                 tuple(target.local_path for target in policy.targets.values()),
@@ -360,6 +366,7 @@ def _load_policy_from_context(ctx: Any) -> PluginPolicy:
         "reviewer_associations",
         "include_self_feedback",
         "include_bot_feedback",
+        "assignee_rules",
         "not_before",
         "assignee",
         "board",

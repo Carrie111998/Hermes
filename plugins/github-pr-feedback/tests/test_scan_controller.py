@@ -168,6 +168,46 @@ def test_scan_creates_one_bounded_untrusted_task_and_deduplicates_with_sqlite(tm
     ledger.close()
 
 
+def test_scan_routes_actionable_feedback_to_the_best_configured_specialist(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    raw = {
+        "enabled": True,
+        "repositories": [
+            {
+                "base_repository": "acme/widgets",
+                "head_repository": "acme/widgets",
+                "local_path": str(local_path),
+                "owner_login": "owner",
+                "branch_prefixes": ["codex/"],
+            }
+        ],
+        "reviewer_logins": ["reviewer"],
+        "reviewer_associations": [],
+        "not_before": "2026-08-24T00:00:00Z",
+        "assignee": "task-orchestrator",
+        "assignee_rules": [
+            {"assignee": "performance-specialist", "match_any": ["latency", "throughput"]},
+            {"assignee": "market-data-specialist", "match_any": ["market data", "quote"]},
+        ],
+        "board": "repairs",
+    }
+    policy = load_policy(raw)
+    github = FakeGitHub(
+        admitted_pull_request(sha),
+        (feedback("slow", body="[P1] Reduce latency and improve throughput in this hot path."),),
+    )
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 1
+    assert kanban.tasks[0].assignee == "performance-specialist"
+    ledger.close()
+
+
 def test_scan_suppresses_high_confidence_self_resolution_receipts(tmp_path: Path) -> None:
     local_path, sha = initialized_repository(tmp_path)
     policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")

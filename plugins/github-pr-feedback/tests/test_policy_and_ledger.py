@@ -235,6 +235,47 @@ def test_enabled_policy_normalizes_not_before_to_utc(tmp_path: Path) -> None:
     assert policy.not_before == datetime(2026, 8, 24, tzinfo=UTC)
 
 
+def test_enabled_policy_parses_bounded_assignee_rules_and_uses_fallback_on_a_tie(
+    tmp_path: Path,
+) -> None:
+    repository_path = tmp_path / "widgets"
+    initialize_git_worktree(repository_path)
+    raw = enabled_raw_config(repository_path)
+    raw["assignee_rules"] = [
+        {"assignee": "performance-specialist", "match_any": ["latency", "performance"]},
+        {"assignee": "runtime-specialist", "match_any": ["runtime", "crash"]},
+    ]
+
+    policy = load_policy(raw)
+
+    assert policy.assignee_for("Reduce runtime latency and performance overhead") == "performance-specialist"
+    assert policy.assignee_for("Investigate a runtime crash") == "runtime-specialist"
+    assert policy.assignee_for("Documentation typo") == "repair-agent"
+    assert policy.assignee_for("Performance and runtime regression") == "repair-agent"
+
+
+@pytest.mark.parametrize(
+    "assignee_rules",
+    [
+        "performance-specialist",
+        [],
+        [{"assignee": "performance-specialist"}],
+        [{"assignee": "performance-specialist", "match_any": []}],
+        [{"assignee": "performance-specialist", "match_any": ["latency"], "extra": True}],
+    ],
+)
+def test_enabled_policy_rejects_malformed_assignee_rules(
+    tmp_path: Path, assignee_rules: object
+) -> None:
+    repository_path = tmp_path / "widgets"
+    initialize_git_worktree(repository_path)
+    raw = enabled_raw_config(repository_path)
+    raw["assignee_rules"] = assignee_rules
+
+    with pytest.raises(ValueError):
+        load_policy(raw)
+
+
 def test_completed_feedback_identity_is_detected_across_head_changes(tmp_path: Path) -> None:
     ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
     prior = receipt(head_sha="a" * 40)
