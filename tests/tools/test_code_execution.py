@@ -48,11 +48,12 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
     _env_temp_dir,
+    _format_interrupted_output,
     _get_or_create_env,
     _rpc_server_loop,
-    _scrub_child_env,
     _ship_file_to_remote,
 )
+from tools.registry import registry
 
 
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
@@ -84,6 +85,33 @@ class TestSandboxRequirements(unittest.TestCase):
         self.assertEqual(EXECUTE_CODE_SCHEMA["name"], "execute_code")
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["properties"])
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["required"])
+
+
+class TestInterruptedOutput(unittest.TestCase):
+    def tearDown(self):
+        from tools.interrupt import set_interrupt
+
+        set_interrupt(False)
+
+    def test_uses_recorded_interrupt_source(self):
+        from tools.interrupt import set_interrupt
+
+        set_interrupt(True, reason="superseded by a new live turn")
+
+        self.assertEqual(
+            _format_interrupted_output("partial output"),
+            "partial output\n[execution interrupted — superseded by a new live turn]",
+        )
+
+    def test_unknown_interrupt_source_is_neutral(self):
+        from tools.interrupt import set_interrupt
+
+        set_interrupt(True)
+
+        self.assertEqual(
+            _format_interrupted_output(""),
+            "[execution interrupted]",
+        )
 
 
 class TestHermesToolsGeneration(unittest.TestCase):
@@ -203,29 +231,6 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
 
 class TestExecuteCodeHelpers(unittest.TestCase):
-    def test_scrub_child_env_applies_secret_and_allowlist_rules(self):
-        source = {
-            "CUSTOM_ALLOWED": "yes",
-            "API_TOKEN": "secret",
-            "PATH": "/bin",
-            "HERMES_HOME": "/tmp/hermes",
-            "HERMES_KANBAN_DB": "/tmp/kanban.db",
-            "SystemRoot": "C:\\Windows",
-        }
-
-        scrubbed = _scrub_child_env(
-            source,
-            is_passthrough=lambda name: name == "CUSTOM_ALLOWED",
-            is_windows=True,
-        )
-
-        self.assertEqual(scrubbed["CUSTOM_ALLOWED"], "yes")
-        self.assertEqual(scrubbed["PATH"], "/bin")
-        self.assertEqual(scrubbed["HERMES_HOME"], "/tmp/hermes")
-        self.assertEqual(scrubbed["SystemRoot"], "C:\\Windows")
-        self.assertNotIn("API_TOKEN", scrubbed)
-        self.assertNotIn("HERMES_KANBAN_DB", scrubbed)
-
     def test_ship_file_to_remote_writes_base64_payload_to_quoted_path(self):
         class FakeEnv:
             def __init__(self):
@@ -598,6 +603,21 @@ assert escaped.startswith("'")
         self.assertEqual(result["status"], "success")
 
 
+    def test_json_parse_helper_bom(self):
+        """json_parse strips a leading UTF-8 BOM and tolerates control chars (#57870)."""
+        code = """
+from hermes_tools import json_parse
+# A leading UTF-8 BOM (e.g. from Windows CLI output) must also parse (#57870)
+bom_text = "\\ufeff" + '{"body": "bom-ok"}'
+bom_result = json_parse(bom_text)
+assert bom_result == {"body": "bom-ok"}, bom_result
+print("bom:" + bom_result["body"])
+"""
+        result = self._run(code)
+        self.assertEqual(result["status"], "success")
+        self.assertIn("bom:bom-ok", result["output"])
+
+
     def test_retry_helper_all_fail(self):
         """retry raises the last error when all attempts fail."""
         code = """
@@ -808,6 +828,56 @@ class TestEnvVarFiltering(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestExecuteCodeEdgeCases(unittest.TestCase):
+
+    def test_command_argument_points_to_terminal(self):
+        result = json.loads(registry.dispatch(
+            "execute_code",
+            {"command": "git status"},
+            task_id="test",
+            enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+        ))
+        self.assertIn("error", result)
+        self.assertIn("'command' parameter", result["error"])
+        self.assertIn("terminal(command=...)", result["error"])
+        self.assertIn("execute_code(code=...)", result["error"])
+
+    def test_terminal_code_argument_points_to_execute_code(self):
+        """Mirror recovery: terminal(code=...) names the stray argument and
+        redirects to execute_code, instead of the opaque
+        'Invalid command: expected string, got NoneType'."""
+        from tools.terminal_tool import _handle_terminal
+        result = json.loads(_handle_terminal({"code": "print(1)"}, task_id="test"))
+        self.assertIn("error", result)
+        self.assertIn("'code' parameter", result["error"])
+        self.assertIn("execute_code(code=...)", result["error"])
+        self.assertIn("terminal(command=...)", result["error"])
+        self.assertNotIn("NoneType", result["error"])
+
+    def test_empty_code_explains_required_parameter(self):
+        for code in ("", None):
+            with self.subTest(code=code):
+                result = json.loads(registry.dispatch(
+                    "execute_code",
+                    {"code": code},
+                    task_id="test",
+                ))
+                self.assertIn("error", result)
+                self.assertIn("non-empty 'code' parameter", result["error"])
+                self.assertIn("Python source", result["error"])
+                self.assertIn("terminal(command=...)", result["error"])
+
+    def test_non_string_code_redirects_instead_of_attributeerror(self):
+        for code in (123, {"code": "print(1)"}, ["print(1)"]):
+            with self.subTest(code=code):
+                result = json.loads(registry.dispatch(
+                    "execute_code",
+                    {"code": code},
+                    task_id="test",
+                ))
+                self.assertIn("error", result)
+                self.assertIn(type(code).__name__, result["error"])
+                self.assertIn("Python source as a string", result["error"])
+                self.assertNotIn("AttributeError", result["error"])
 
     def test_windows_returns_error(self):
         """When SANDBOX_AVAILABLE is False (e.g. when the backend deems
