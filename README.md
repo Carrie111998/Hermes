@@ -119,16 +119,7 @@ hermes doctor       # Diagnose any issues
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
 
-Route the central task loop through one dispatcher intercept. Shadow: Python [`barycenters`](https://pypi.org/project/barycenters/) (`admit` / `@boundary`).
-Live MCP side door: `https://barycenters-admit.fly.dev/mcp/` (GET 406 is protocol).
-Spec: [barycenters.ai/adapters](https://barycenters.ai/adapters) and [barycenters.ai](https://barycenters.ai)
-```bash
-pip install barycenters
-```
-
-```python
-from barycenters import Barycenters; Barycenters().admit("hermes_tool")  # shadow; or @bary.boundary("hermes_tool")
-```
+Optional third-party: [Barycenters](https://hermes-agent.nousresearch.com/docs/integrations/barycenters) — admit a tool call in shadow before it runs.
 
 ---
 
