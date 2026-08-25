@@ -1971,6 +1971,55 @@ class TestLifecycleGuardDataArgumentExemption:
         check_gateway_lifecycle(prompt, str(script))
 
 
+class TestLifecycleGuardGitDataExemption:
+    """git commit messages and ``--`` pathspecs are pure DATA to git — a
+    lifecycle-shaped string there must not block (the real false positive:
+    a knowledge-clipping commit landing gateway-ops notes, whose message or
+    filenames mention `hermes gateway restart`). But git's execution vectors
+    (top-level `-c` config injection, shell command substitution in the
+    message, `-C` commit-ish) must STILL block. #hermes-infra clipping FP.
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        # Commit MESSAGE carrying a lifecycle-shaped string: git never runs it.
+        'git commit -q -m "how to run hermes gateway restart"',
+        'git commit -m "fix: systemctl restart hermes-gateway crash"',
+        'git commit -m "note: launchctl kickstart ai.hermes.gateway"',
+        # Attached short form and long form.
+        'git commit -m"clip: hermes gateway stop steps"',
+        'git commit --message="hermes gateway restart tips"',
+        # `--` pathspec: filenames are inert data to git.
+        'git add -- "clips/hermes gateway restart guide.md"',
+        'git add -- "01_sources/pkill hermes gateway note.md"',
+        'git commit -m "clip" -- "notes/systemctl restart hermes-gateway.md"',
+    ])
+    def test_git_data_positions_not_blocked(self, command):
+        assert self._scan(command, cwd="/tmp") is False
+
+    @pytest.mark.parametrize("command", [
+        # Top-level `-c` config injection: git executes core.pager.
+        'git -c core.pager="systemctl restart hermes-gateway" log',
+        # Shell command substitution in the message runs BEFORE git.
+        'git commit -m "$(systemctl restart hermes-gateway)"',
+        # A real lifecycle command chained after a benign git commit.
+        'git commit -m "clip"; hermes gateway stop',
+        # Alias definition VALUE is not a message/pathspec — stays visible.
+        'git config alias.x "!hermes gateway restart"',
+        # `-C` takes a commit-ish, not free text — must not be masked.
+        'git commit -C "hermes gateway restart"',
+    ])
+    def test_git_execution_vectors_still_blocked(self, command):
+        assert self._scan(command, cwd="/tmp") is True
+
+
 class TestLifecycleGuardNeverRaises:
     """The guard must return a verdict for every input — binary referenced
     paths, NUL bytes, non-UTF-8, /dev/* nodes, directories, missing files —

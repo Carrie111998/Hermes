@@ -329,6 +329,22 @@ def _is_cloud_placeholder_path(path: Path) -> bool:
 _DATA_SINK_EXECUTABLES = frozenset(
     {"grep", "egrep", "fgrep", "rg", "ag", "ack", "journalctl", "sqlite3", "psql"}
 )
+# git is NOT a generic data sink: `git -c core.pager='systemctl restart
+# hermes-gateway' log` smuggles a command git will execute, so blanket-masking
+# every git argument (as _DATA_SINK_EXECUTABLES does) would open an execution
+# hole. Instead we mask only the two positions git treats as pure, never-executed
+# data — and which produced the real false positives (a clipping commit landing
+# gateway-ops notes: the message text and the `--`-separated pathspec both carry
+# lifecycle-shaped strings that git never runs). Everything else in a git
+# segment (top-level `-c` config, subcommand flags) stays visible and fails
+# closed to the plain regex, so this exemption can only ever ALLOW, never block.
+#
+# Message-carrying flags whose VALUE is arbitrary user text, not a command:
+#   -m/--message <TEXT>, -m<TEXT>, --message=<TEXT>
+# Deliberately excludes -c/-C/--reuse-message/--reedit-message (those take a
+# commit-ish, and top-level `-c` is config injection) and -F/--file (a path we
+# don't want to vouch for) — leaving them visible keeps the guard fail-closed.
+_GIT_MESSAGE_FLAGS = frozenset({"-m", "--message"})
 # Argument shapes that can smuggle execution back INTO a data sink: command
 # and process substitution anywhere, sqlite3 dot-commands (`.shell ...`),
 # psql backslash escapes (`\! ...`). Any hit disables masking for the whole
@@ -618,6 +634,79 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
+def _mask_git_data_positions(segment: list[str]) -> Optional[list[str]]:
+    """Mask ONLY git's pure-data positions (message text, ``--`` pathspec).
+
+    Returns a new token list with lifecycle-shaped strings that git treats as
+    inert data replaced by ``arg``, or ``None`` when this segment's executable
+    is not git (so the caller leaves it untouched). Unlike the blanket
+    data-sink masker, this touches only:
+
+      * the VALUE of ``-m``/``--message`` (``-m X``, ``-mX``, ``--message=X``)
+      * every token after a bare ``--`` (pathspec — git never executes a path)
+
+    Top-level ``-c key=val`` config, ``-C``/``--reuse-message`` commit-ish
+    refs, ``-F``/``--file`` paths, and the subcommand itself stay visible, so a
+    real ``git -c core.pager='systemctl restart hermes-gateway' log`` execution
+    vector is NOT masked and still fails closed. Masking here can only ever
+    relax the plain-regex verdict, never tighten it.
+    """
+    index = _command_token_index(segment)
+    if index is None or Path(segment[index]).name != "git":
+        return None
+    # A git message/pathspec token carrying a command-substitution marker is a
+    # SHELL-level execution vector (`git commit -m "$(systemctl restart
+    # hermes-gateway)"` runs the substitution before git sees anything), so
+    # masking it would ALLOW a real command. Fail closed: if any token in the
+    # segment carries such a marker, don't mask anything here — leave the
+    # segment to the plain regex verdict. Mirrors the data-sink masker's
+    # _UNSAFE_DATA_ARG_MARKERS guard.
+    if any(
+        marker in token
+        for token in segment[index + 1 :]
+        for marker in _UNSAFE_DATA_ARG_MARKERS
+    ):
+        return list(segment)
+    out = list(segment[: index + 1])
+    arguments = segment[index + 1 :]
+    after_separator = False
+    skip_next = False
+    for position, token in enumerate(arguments):
+        if skip_next:
+            out.append("arg")
+            skip_next = False
+            continue
+        if after_separator:
+            # Everything past `--` is a pathspec: pure data to git.
+            out.append("arg")
+            continue
+        if token == "--":
+            after_separator = True
+            out.append(token)
+            continue
+        if token in _GIT_MESSAGE_FLAGS:
+            # Value is the next token (`-m X`, `--message X`).
+            if position + 1 < len(arguments):
+                out.append(token)
+                skip_next = True
+                continue
+            out.append(token)
+            continue
+        if token.startswith("--message="):
+            out.append("--message=arg")
+            continue
+        if (
+            token.startswith("-m")
+            and not token.startswith("--")
+            and len(token) > 2
+        ):
+            # Attached short form `-mSOME TEXT` (git accepts `-mfoo`).
+            out.append("-marg")
+            continue
+        out.append(token)
+    return out
+
+
 def _mask_data_sink_arguments(text: str) -> str:
     """Replace data-sink executables' arguments with a neutral placeholder.
 
@@ -673,6 +762,12 @@ def _mask_data_sink_arguments(text: str) -> str:
         rebuilt: list[str] = []
         for segment in segments:
             if not segment:
+                continue
+            git_masked = _mask_git_data_positions(segment)
+            if git_masked is not None:
+                if git_masked != segment:
+                    changed = True
+                rebuilt.extend(git_masked)
                 continue
             index = _command_token_index(segment)
             if index is not None and Path(segment[index]).name in _DATA_SINK_EXECUTABLES:
